@@ -1,0 +1,7 @@
+# Minimal dependencies for the EXECUTION side only (run_bot + update_candles).
+# The research stack (lightgbm, shap, numba, optuna, ...) stays on the Mac.
+numpy
+pandas
+pyarrow
+requests
+TA-Lib

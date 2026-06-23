@@ -1,0 +1,35 @@
+[project]
+name = "trading-bot"
+version = "0.1.0"
+description = "Multi-timeframe BTCUSDT strategy research + paper/live execution system"
+requires-python = ">=3.9"
+
+# This repo is run as scripts (`python -m src.<module>`) rather than installed,
+# so there is intentionally no build-system / packaging section.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::FutureWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+extend-exclude = [".venv", "data", "outputs"]
+
+[tool.ruff.lint]
+# E/F = pyflakes+pycodestyle, I = isort, UP = pyupgrade, B = bugbear, C4 = comprehensions
+select = ["E", "F", "I", "UP", "B", "C4"]
+ignore = [
+    "E501",  # line length handled by formatter, not enforced hard
+    "B008",  # function calls in argument defaults (common for argparse/np defaults)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.ruff.format]
+quote-style = "double"
