@@ -62,6 +62,7 @@ class DayTradeConfig:
     slippage_bps: float
     horizon_bars: int
     risk_per_trade: float = 0.003
+    max_position_fraction: float = 0.25
     daily_stop_loss: float = -0.02
     max_consecutive_losses: int = 3
     cooldown_bars: int = 24
@@ -292,7 +293,7 @@ try:
         is_long, horizon_bars, take_profit, stop_loss,
         total_cost, position_size, daily_stop_loss,
         max_consecutive_losses, cooldown_bars,
-        atr, use_atr_tp_sl, risk_per_trade,
+        atr, use_atr_tp_sl, risk_per_trade, max_position_fraction,
     ):
         n = len(signal)
         max_entry_index = n - horizon_bars - 1
@@ -363,7 +364,7 @@ try:
             nr = gr - total_cost
 
             if use_atr_tp_sl:
-                trade_position_size = min(risk_per_trade / sl_pct, 1.0)
+                trade_position_size = min(risk_per_trade / sl_pct, max_position_fraction, 1.0)
             else:
                 trade_position_size = position_size
 
@@ -453,7 +454,11 @@ def _simulate_day_trades_python(
     signal = signal_mask.fillna(False).to_numpy()
 
     total_cost = 2 * ((config.fee_bps + config.slippage_bps) / 10_000)
-    position_size = min(config.risk_per_trade / config.stop_loss, 1.0) if config.stop_loss > 0 else 1.0
+    position_size = (
+        min(config.risk_per_trade / config.stop_loss, config.max_position_fraction, 1.0)
+        if config.stop_loss > 0
+        else config.max_position_fraction
+    )
 
     trades = []
     next_allowed_entry = 0
@@ -502,7 +507,7 @@ def _simulate_day_trades_python(
             sl_pct = 0.01
 
         if config.use_atr_tp_sl:
-            trade_position_size = min(config.risk_per_trade / sl_pct, 1.0)
+            trade_position_size = min(config.risk_per_trade / sl_pct, config.max_position_fraction, 1.0)
         else:
             trade_position_size = position_size
 
@@ -600,7 +605,11 @@ def _simulate_day_trades_numba(
     signal = signal_mask.fillna(False).to_numpy()
 
     total_cost = 2 * ((config.fee_bps + config.slippage_bps) / 10_000)
-    position_size = min(config.risk_per_trade / config.stop_loss, 1.0) if config.stop_loss > 0 else 1.0
+    position_size = (
+        min(config.risk_per_trade / config.stop_loss, config.max_position_fraction, 1.0)
+        if config.stop_loss > 0
+        else config.max_position_fraction
+    )
 
     (
         signal_indices, entry_indices, exit_indices, exit_reasons,
@@ -611,7 +620,7 @@ def _simulate_day_trades_numba(
         direction == "long", config.horizon_bars, config.take_profit,
         config.stop_loss, total_cost, position_size, config.daily_stop_loss,
         config.max_consecutive_losses, config.cooldown_bars,
-        atr, config.use_atr_tp_sl, config.risk_per_trade,
+        atr, config.use_atr_tp_sl, config.risk_per_trade, config.max_position_fraction,
     )
 
     if len(signal_indices) == 0:
@@ -1185,6 +1194,7 @@ def add_year_metrics(
             slippage_bps=config_template.slippage_bps,
             horizon_bars=int(strategy["horizon_bars"]),
             risk_per_trade=config_template.risk_per_trade,
+            max_position_fraction=config_template.max_position_fraction,
             daily_stop_loss=config_template.daily_stop_loss,
             max_consecutive_losses=config_template.max_consecutive_losses,
             cooldown_bars=config_template.cooldown_bars,
@@ -1315,6 +1325,7 @@ def _score_candidate_walk_forward_day(
     fee_bps: float,
     slippage_bps: float,
     risk_per_trade: float,
+    max_position_fraction: float,
     daily_stop_loss: float,
     max_consecutive_losses: int,
     cooldown_bars: int,
@@ -1356,6 +1367,7 @@ def _score_candidate_walk_forward_day(
                 slippage_bps=slippage_bps,
                 horizon_bars=candidate.horizon_bars,
                 risk_per_trade=risk_per_trade,
+                max_position_fraction=max_position_fraction,
                 daily_stop_loss=daily_stop_loss,
                 max_consecutive_losses=max_consecutive_losses,
                 cooldown_bars=cooldown_bars,
@@ -1417,6 +1429,7 @@ def _evaluate_holdout_day(
     fee_bps: float,
     slippage_bps: float,
     risk_per_trade: float,
+    max_position_fraction: float,
     daily_stop_loss: float,
     max_consecutive_losses: int,
     cooldown_bars: int,
@@ -1448,6 +1461,7 @@ def _evaluate_holdout_day(
             slippage_bps=slippage_bps,
             horizon_bars=int(row["horizon_bars"]),
             risk_per_trade=risk_per_trade,
+            max_position_fraction=max_position_fraction,
             daily_stop_loss=daily_stop_loss,
             max_consecutive_losses=max_consecutive_losses,
             cooldown_bars=cooldown_bars,
@@ -1491,6 +1505,7 @@ def _dt_score_chunk(indices: Sequence[int]) -> List[Dict[str, object]]:
             fee_bps=_DT_WORKER["fee_bps"],
             slippage_bps=_DT_WORKER["slippage_bps"],
             risk_per_trade=_DT_WORKER["risk_per_trade"],
+            max_position_fraction=_DT_WORKER["max_position_fraction"],
             daily_stop_loss=_DT_WORKER["daily_stop_loss"],
             max_consecutive_losses=_DT_WORKER["max_consecutive_losses"],
             cooldown_bars=_DT_WORKER["cooldown_bars"],
@@ -1625,6 +1640,7 @@ def run(
     cross_tf_mode: str = "pool",
     enabled_kinds: Set[str] = DEFAULT_ENABLED_KINDS,
     risk_per_trade: float = 0.003,
+    max_position_fraction: float = 0.25,
     daily_stop_loss: float = -0.02,
     max_consecutive_losses: int = 3,
     cooldown_bars: int = 24,
@@ -1697,6 +1713,7 @@ def run(
                     slippage_bps=slippage_bps,
                     horizon_bars=candidate.horizon_bars,
                     risk_per_trade=risk_per_trade,
+                    max_position_fraction=max_position_fraction,
                     daily_stop_loss=daily_stop_loss,
                     max_consecutive_losses=max_consecutive_losses,
                     cooldown_bars=cooldown_bars,
@@ -1807,6 +1824,7 @@ def run(
             "cross_tf_mode": cross_tf_mode,
             "enabled_kinds": sorted(enabled_kinds),
             "risk_per_trade": risk_per_trade,
+            "max_position_fraction": max_position_fraction,
             "daily_stop_loss": daily_stop_loss,
             "max_consecutive_losses": max_consecutive_losses,
             "cooldown_bars": cooldown_bars,
@@ -1861,6 +1879,7 @@ def run(
             "fee_bps": fee_bps,
             "slippage_bps": slippage_bps,
             "risk_per_trade": risk_per_trade,
+            "max_position_fraction": max_position_fraction,
             "daily_stop_loss": daily_stop_loss,
             "max_consecutive_losses": max_consecutive_losses,
             "cooldown_bars": cooldown_bars,
@@ -1958,7 +1977,7 @@ def run(
         refit_frame = core.iloc[windows[-1][0]]
         strategies = _evaluate_holdout_day(
             holdout, refit_frame, strategies, base_prefix,
-            fee_bps, slippage_bps, risk_per_trade, daily_stop_loss,
+            fee_bps, slippage_bps, risk_per_trade, max_position_fraction, daily_stop_loss,
             max_consecutive_losses, cooldown_bars, use_atr_tp_sl,
         )
 
@@ -1974,6 +1993,7 @@ def run(
         slippage_bps=slippage_bps,
         horizon_bars=horizons[0],
         risk_per_trade=risk_per_trade,
+        max_position_fraction=max_position_fraction,
         daily_stop_loss=daily_stop_loss,
         max_consecutive_losses=max_consecutive_losses,
         cooldown_bars=cooldown_bars,
@@ -2012,6 +2032,7 @@ def run(
         "cross_tf_mode": cross_tf_mode,
         "enabled_kinds": sorted(enabled_kinds),
         "risk_per_trade": risk_per_trade,
+        "max_position_fraction": max_position_fraction,
         "daily_stop_loss": daily_stop_loss,
         "max_consecutive_losses": max_consecutive_losses,
         "cooldown_bars": cooldown_bars,
@@ -2113,6 +2134,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--enabled-kinds", nargs="+", default=None)
     parser.add_argument("--risk-per-trade", type=float, default=0.003)
+    parser.add_argument("--max-position-fraction", type=float, default=0.25)
     parser.add_argument("--daily-stop-loss", type=float, default=-0.02)
     parser.add_argument("--max-consecutive-losses", type=int, default=3)
     parser.add_argument("--cooldown-bars", type=int, default=24)
@@ -2196,6 +2218,7 @@ def main() -> None:
         cross_tf_mode=args.cross_tf_mode,
         enabled_kinds=enabled_kinds,
         risk_per_trade=args.risk_per_trade,
+        max_position_fraction=args.max_position_fraction,
         daily_stop_loss=args.daily_stop_loss,
         max_consecutive_losses=args.max_consecutive_losses,
         cooldown_bars=args.cooldown_bars,

@@ -95,8 +95,9 @@ def _load_input(path: str) -> pd.DataFrame:
     return df
 
 
-def _build_config(args, strategy_cls) -> BacktestConfig:
-    cfg = strategy_cls.default_config()
+def _build_config(args, strategy) -> BacktestConfig:
+    resolver = getattr(strategy, "resolved_default_config", None)
+    cfg = resolver() if callable(resolver) else strategy.default_config()
     overrides = {
         "fee_bps": args.fee_bps, "slippage_bps": args.slippage_bps,
         "take_profit": args.tp, "stop_loss": args.sl,
@@ -147,7 +148,7 @@ def main(argv=None):
 
     strategy_cls = get(args.strategy)
     strategy = strategy_cls(**_parse_params(args.param))
-    cfg = _build_config(args, strategy_cls)
+    cfg = _build_config(args, strategy)
 
     score_df = df
     if _needs_fit(strategy_cls):

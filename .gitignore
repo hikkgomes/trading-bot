@@ -30,6 +30,10 @@ data/raw/futures/
 # out of git. Snapshot deliberately if a specific artifact must be versioned.
 outputs/
 
+# ---- Runtime state (generated on server) ----
+runtime/*
+!runtime/control.example.json
+
 # ---- Secrets / local config ----
 .env
 .env.*

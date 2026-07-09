@@ -21,6 +21,7 @@ from src.strategies.library import (  # noqa: F401
     ml_regressor,
     momentum_roc,
     multi_tf_trend,
+    regime_filter,
     regression_channel,
     rsi_divergence,
     rsi_reversion,

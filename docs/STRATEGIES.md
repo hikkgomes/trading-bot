@@ -53,8 +53,9 @@ on a later one. The CLI does the chronological split for you.
 | `regression_channel` | channel | Rolling linear-regression channel — fade the bands or follow breaks |
 | `fear_greed_contrarian` | sentiment | Buy extreme fear, sell extreme greed (needs a `fear_greed` column) |
 | `btc_cycle_guard` | regime / BTC-accumulation | Step aside (short) near cycle tops (Mayer/Pi-Cycle) or on a trend-EMA break |
-| `ml_classifier` | machine learning | Gradient boosting predicts next-horizon **direction** |
-| `ml_regressor` | machine learning | Gradient boosting predicts next-horizon **return**; trade above an edge |
+| `regime_filter` | regime wrapper | Runs any registered strategy only inside selected `tf_1d_regime_id` states |
+| `ml_classifier` | machine learning | Gradient boosting predicts next-horizon direction or TP-before-SL triple-barrier labels |
+| `ml_regressor` | machine learning | Gradient boosting predicts forward or TP/SL-capped barrier return; trade above an edge |
 | `condition_grid` | bridge | Runs a `discover_patterns` rule (e.g. from `active_strategies.json`) |
 
 All indicators they use are pure-pandas (no TA-Lib) and live in
@@ -93,11 +94,29 @@ python -m src.run_backtest --strategy sma_cross \
     --input data/processed/train_15m_indicators.parquet --param fast=10 --param slow=40
 python -m src.run_backtest --strategy ml_classifier \
     --input data/processed/train_15m_indicators.parquet --train-fraction 0.7
+python -m src.run_backtest --strategy ml_classifier \
+    --input data/processed/train_5m_indicators.parquet --base-tf 5m \
+    --param label_mode=triple_barrier --param label_tp=0.005 --param label_sl=0.003 \
+    --param feature_screen=spearman --train-fraction 0.7
+python -m src.regime --input data/processed/train_15m_indicators.parquet \
+    --output outputs/train_15m_regime.parquet
+make regime-tag-futures
+python -m src.run_backtest --strategy regime_filter --input outputs/train_15m_regime.parquet \
+    --base-tf 15m --param strategy=sma_cross --param regime_ids=1 \
+    --param child_params='{"fast":5,"slow":20}'
 ```
 
 Override the trade model with `--fee-bps --slippage-bps --tp --sl --horizon --pnl-unit`.
 `--pnl-unit btc` switches to the BTC-accumulation convention (only shorts realise
 a return — being long is just holding BTC), for the **position bot**.
+ML strategies select numeric feature columns with a lightweight Spearman screen
+by default. Use `--param feature_screen=none` for raw first-N feature behavior,
+or pass explicit `feature_cols` from Python when running controlled experiments.
+`regime_filter` preserves the wrapped strategy's trade-model defaults and masks
+signals outside the selected regime ids, which makes it useful in `src.sweep`
+grids such as `--grid strategy=sma_cross,macd_trend --grid regime_ids=0,1,2`.
+Use child strategy defaults in grids; pass `child_params` in direct
+`run_backtest` calls or separate controlled runs when needed.
 
 ## Sweeping & comparing (`src.sweep`)
 
@@ -105,7 +124,9 @@ To triage *which* paradigm is worth an expensive walk-forward search, run the
 batch harness. It scores every (or a chosen) strategy on the **same chronological
 holdout**, ranks them, and benchmarks each against buy-and-hold. Fittable (ML)
 strategies are trained on the earlier slice; rule strategies are scored on the
-identical holdout — so the comparison is apples-to-apples and leakage-free.
+identical holdout, and every row gets a DSR deflated by the number of tried
+strategy/grid rows. Optional walk-forward windows split the post-train region
+into chronological slices and report pass rate, expectancy, and windowed DSR.
 
 ```bash
 # Compare everything on synthetic data (no dataset needed)
@@ -117,11 +138,18 @@ python -m src.sweep --strategies sma_cross,macd_trend,supertrend,ml_classifier \
 
 # Sweep one strategy across a parameter grid
 python -m src.sweep --strategy rsi_reversion --grid period=7,14,21 --grid oversold=20,30 --synthetic 8000
+
+# Require repeated-window robustness and DSR evidence before saving candidates
+python -m src.sweep --all --input data/processed/train_15m_indicators.parquet \
+    --base-tf 15m --walk-forward-windows 6 --min-wf-pass-rate 0.5 --min-dsr 0.6 \
+    --out outputs/sweep_15m_wf.csv
 ```
 
 The `vs_buy_hold` column is the key number for the **position bot**: a strategy
-that can't beat holding has no business in `active_strategies.json`. Same trade-
-model overrides as `run_backtest` apply to the whole sweep.
+that can't beat holding has no business in `active_strategies.json`. Sweep output
+is still triage; executable artifacts must pass the product policy and explicit
+approval path. Same trade-model overrides as `run_backtest` apply to the whole
+sweep.
 
 ## Adding a strategy
 

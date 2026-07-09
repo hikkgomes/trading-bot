@@ -3,8 +3,8 @@
 A single interface the algo-trading system can target regardless of venue. Two
 implementations ship:
 
-* ``PaperBroker``  — simulated fills (default; safe for development + the
-  current paper-trading cron jobs).
+* ``PaperBroker``  — simulated fills (default; safe for development and paper
+  autopilot cycles).
 * ``CcxtBroker``   — any ccxt-supported futures exchange (Binance USDM, Bybit,
   OKX, ...). Live order placement is gated behind explicit env switches.
 
@@ -18,7 +18,6 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 
 class OrderSide(str, Enum):
@@ -37,9 +36,9 @@ class Order:
     side: OrderSide
     qty: float  # absolute base-asset quantity (always positive)
     type: OrderType = OrderType.MARKET
-    price: Optional[float] = None  # required for LIMIT
+    price: float | None = None  # required for LIMIT
     reduce_only: bool = False
-    client_id: Optional[str] = None
+    client_id: str | None = None
 
 
 @dataclass
@@ -63,7 +62,7 @@ class Position:
         return abs(self.qty) < 1e-12
 
     @property
-    def side(self) -> Optional[OrderSide]:
+    def side(self) -> OrderSide | None:
         if self.is_flat:
             return None
         return OrderSide.BUY if self.qty > 0 else OrderSide.SELL
@@ -90,7 +89,7 @@ class Broker(ABC):
     def place_order(self, order: Order) -> Fill:
         ...
 
-    def close_position(self, symbol: str) -> Optional[Fill]:
+    def close_position(self, symbol: str) -> Fill | None:
         """Market-close any open position on ``symbol``. Default impl uses
         ``place_order`` with a reduce-only market order."""
         pos = self.get_position(symbol)

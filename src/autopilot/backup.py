@@ -1,0 +1,496 @@
+"""Create small recovery backups of autopilot runtime state."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import zipfile
+from pathlib import Path
+from posixpath import normpath
+from typing import Any
+
+from src.autopilot.config import DEFAULT_CONFIG_PATH, AutopilotConfig, load_config
+from src.autopilot.io import write_json_atomic
+from src.config import PROJECT_ROOT
+
+DEFAULT_BACKUP_DIR = PROJECT_ROOT / "runtime" / "backups"
+DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024
+BACKUP_ARCHIVE_PATTERN = "autopilot_state_*.zip"
+SUPPORTED_MANIFEST_VERSION = 1
+JOB_PATH_FLAGS = (
+    "--artifact",
+    "--input",
+    "--json-output",
+    "--markdown-output",
+    "--mutation-batch",
+    "--output",
+    "--output-json",
+    "--output-md",
+    "--report",
+    "--state",
+)
+
+
+def _utc_stamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _add_path(paths: list[Path], seen: set[Path], path: Path | None) -> None:
+    if path is None:
+        return
+    normalized = path.resolve(strict=False)
+    if normalized in seen:
+        return
+    seen.add(normalized)
+    paths.append(path)
+
+
+def _job_command_path(job, flag: str) -> Path | None:
+    command = list(job.command)
+    try:
+        index = command.index(flag)
+    except ValueError:
+        return None
+    value_index = index + 1
+    if value_index >= len(command):
+        return None
+    value = str(command[value_index])
+    if not value or value.startswith("--"):
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else job.working_dir / path
+
+
+def configured_backup_paths(config: AutopilotConfig, *, config_path: Path) -> list[Path]:
+    """Return the small files needed to recover/review autopilot state."""
+
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for path in (
+        config_path,
+        config.approval_ledger,
+        config.control_file,
+        config.control_audit_file,
+        config.status_file,
+        config.job_state_file,
+        config.alert_file,
+        config.alert_state_file,
+        config.research_smoke_file,
+        config.strategy_smoke_file,
+        config.research_cycle_file,
+        config.incubation_candidates_file,
+        config.mutation_plan_file,
+        config.mutation_batch_file,
+        config.artifact_hygiene_file,
+        config.backup_report_file,
+        config.operator_report_file,
+        config.operator_report_json_file,
+        config.readiness_report_file,
+        config.readiness_report_json_file,
+    ):
+        _add_path(paths, seen, path)
+    for product in config.products:
+        for path in (
+            product.strategies_path,
+            product.state_file,
+            product.trade_log,
+            product.preflight_report,
+            product.testnet_rehearsal_report,
+        ):
+            _add_path(paths, seen, path)
+    for job in config.jobs:
+        for flag in JOB_PATH_FLAGS:
+            _add_path(paths, seen, _job_command_path(job, flag))
+    return paths
+
+
+def _arcname(path: Path, root: Path) -> str:
+    resolved_path = path.resolve(strict=False)
+    resolved_root = root.resolve(strict=False)
+    try:
+        return resolved_path.relative_to(resolved_root).as_posix()
+    except ValueError:
+        digest = hashlib.sha256(str(resolved_path).encode("utf-8")).hexdigest()[:12]
+        return f"external/{digest}/{resolved_path.name}"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_backup_archive(
+    *,
+    config_path: Path,
+    output: Path | None = None,
+    extra_paths: list[Path] | None = None,
+    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    root: Path = PROJECT_ROOT,
+) -> dict[str, Any]:
+    if max_file_bytes <= 0:
+        raise ValueError("max_file_bytes must be positive")
+    config = load_config(config_path)
+    output = output or (DEFAULT_BACKUP_DIR / f"autopilot_state_{_utc_stamp()}.zip")
+    if output.exists() and output.is_symlink():
+        raise ValueError(f"backup output must not be a symlink: {output}")
+    paths = configured_backup_paths(config, config_path=config_path)
+    seen_paths = {path.resolve(strict=False) for path in paths}
+    for path in extra_paths or []:
+        _add_path(paths, seen_paths, path)
+
+    manifest_entries: list[dict[str, Any]] = []
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        for path in paths:
+            entry: dict[str, Any] = {
+                "path": str(path),
+                "arcname": _arcname(path, root),
+                "exists": path.exists(),
+                "included": False,
+            }
+            if not path.exists():
+                entry["reason"] = "missing"
+            elif path.is_symlink():
+                entry["reason"] = "symlink"
+            elif not path.is_file():
+                entry["reason"] = "not_file"
+            else:
+                size = path.stat().st_size
+                entry["size_bytes"] = size
+                if size > max_file_bytes:
+                    entry["reason"] = "too_large"
+                    entry["max_file_bytes"] = max_file_bytes
+                else:
+                    entry["sha256"] = _sha256_file(path)
+                    archive.write(path, entry["arcname"])
+                    entry["included"] = True
+            manifest_entries.append(entry)
+        manifest = {
+            "version": 1,
+            "generated_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
+            "config": str(config_path),
+            "max_file_bytes": max_file_bytes,
+            "files": manifest_entries,
+            "included_files": sum(1 for item in manifest_entries if item.get("included")),
+            "missing_files": sum(1 for item in manifest_entries if item.get("reason") == "missing"),
+            "skipped_files": sum(1 for item in manifest_entries if item.get("exists") and not item.get("included")),
+        }
+        archive.writestr("MANIFEST.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    report = {
+        "ok": True,
+        "output": str(output),
+        "manifest": manifest,
+        "archive_size_bytes": output.stat().st_size,
+    }
+    report["verification"] = verify_backup_archive(output)
+    return report
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def verify_backup_archive(path: Path) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    report: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "ok": False,
+        "checked_files": 0,
+        "issues": issues,
+    }
+    if not path.exists():
+        issues.append({"code": "missing_archive", "message": "backup archive does not exist"})
+        return report
+    if not path.is_file():
+        issues.append({"code": "not_file", "message": "backup archive path is not a file"})
+        return report
+    try:
+        with zipfile.ZipFile(path) as archive:
+            bad_member = archive.testzip()
+            if bad_member:
+                issues.append({"code": "zip_crc_failed", "member": bad_member})
+            archive_names = archive.namelist()
+            names = set(archive_names)
+            duplicate_archive_members = sorted(
+                name for name in names if archive_names.count(name) > 1
+            )
+            for name in duplicate_archive_members:
+                issues.append({"code": "duplicate_archive_member", "arcname": name})
+            if "MANIFEST.json" not in names:
+                issues.append({"code": "missing_manifest", "message": "MANIFEST.json is missing"})
+                report["ok"] = False
+                return report
+            try:
+                manifest = json.loads(archive.read("MANIFEST.json"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                issues.append({"code": "invalid_manifest", "message": str(exc)})
+                return report
+            files = manifest.get("files")
+            if not isinstance(files, list):
+                issues.append({"code": "invalid_manifest_files", "message": "manifest files must be a list"})
+                return report
+            version = manifest.get("version")
+            if version != SUPPORTED_MANIFEST_VERSION:
+                issues.append(
+                    {
+                        "code": "unsupported_manifest_version",
+                        "version": version,
+                        "supported_version": SUPPORTED_MANIFEST_VERSION,
+                    }
+                )
+            included_entries = [item for item in files if isinstance(item, dict) and item.get("included")]
+            report["manifest"] = {
+                "version": manifest.get("version"),
+                "generated_at": manifest.get("generated_at"),
+                "included_files": manifest.get("included_files"),
+                "missing_files": manifest.get("missing_files"),
+                "skipped_files": manifest.get("skipped_files"),
+            }
+            if manifest.get("included_files") != len(included_entries):
+                issues.append(
+                    {
+                        "code": "included_count_mismatch",
+                        "manifest_included_files": manifest.get("included_files"),
+                        "actual_included_files": len(included_entries),
+                    }
+                )
+            expected_archive_members = {
+                item.get("arcname")
+                for item in included_entries
+                if isinstance(item.get("arcname"), str) and item.get("arcname")
+            }
+            expected_archive_members.add("MANIFEST.json")
+            for name in sorted(names - expected_archive_members):
+                issues.append({"code": "unexpected_member", "arcname": name})
+            seen_arcnames: set[str] = set()
+            for item in included_entries:
+                arcname = item.get("arcname")
+                if not isinstance(arcname, str) or not arcname:
+                    issues.append({"code": "missing_arcname", "path": item.get("path")})
+                    continue
+                try:
+                    _safe_member_path(Path("."), arcname)
+                except ValueError:
+                    issues.append({"code": "unsafe_arcname", "arcname": arcname})
+                    continue
+                if arcname in seen_arcnames:
+                    issues.append({"code": "duplicate_manifest_arcname", "arcname": arcname})
+                    continue
+                seen_arcnames.add(arcname)
+                if arcname not in names:
+                    issues.append({"code": "missing_member", "arcname": arcname})
+                    continue
+                payload = archive.read(arcname)
+                report["checked_files"] += 1
+                expected_sha = item.get("sha256")
+                actual_sha = _sha256_bytes(payload)
+                if expected_sha != actual_sha:
+                    issues.append(
+                        {
+                            "code": "sha256_mismatch",
+                            "arcname": arcname,
+                            "expected": expected_sha,
+                            "actual": actual_sha,
+                        }
+                    )
+                expected_size = item.get("size_bytes")
+                if expected_size is not None and expected_size != len(payload):
+                    issues.append(
+                        {
+                            "code": "size_mismatch",
+                            "arcname": arcname,
+                            "expected": expected_size,
+                            "actual": len(payload),
+                        }
+                    )
+    except zipfile.BadZipFile as exc:
+        issues.append({"code": "bad_zip", "message": str(exc)})
+    report["ok"] = not issues
+    return report
+
+
+def _safe_member_path(restore_dir: Path, arcname: str) -> Path:
+    normalized = normpath(arcname)
+    if normalized in {"", ".", ".."} or normalized.startswith("../") or normalized.startswith("/"):
+        raise ValueError(f"unsafe archive member path: {arcname}")
+    return restore_dir / normalized
+
+
+def _safe_restore_target(restore_dir: Path, arcname: str) -> Path:
+    target = _safe_member_path(restore_dir, arcname)
+    resolved_root = restore_dir.resolve(strict=False)
+    resolved_target = target.resolve(strict=False)
+    try:
+        resolved_target.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"restore target escapes restore dir: {arcname}") from exc
+    return target
+
+
+def restore_backup_archive(path: Path, restore_dir: Path, *, overwrite: bool = False) -> dict[str, Any]:
+    verification = verify_backup_archive(path)
+    if not verification.get("ok"):
+        raise ValueError(f"backup verification failed: {path}")
+    if restore_dir.exists() and restore_dir.is_symlink():
+        raise ValueError(f"restore_dir must not be a symlink: {restore_dir}")
+    restore_dir.mkdir(parents=True, exist_ok=True)
+    restored: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    with zipfile.ZipFile(path) as archive:
+        manifest = json.loads(archive.read("MANIFEST.json"))
+        included_entries = [
+            item for item in manifest.get("files", [])
+            if isinstance(item, dict) and item.get("included")
+        ]
+        planned: list[tuple[dict[str, Any], Path]] = []
+        for item in included_entries:
+            arcname = str(item.get("arcname") or "")
+            target = _safe_restore_target(restore_dir, arcname)
+            if target.is_symlink():
+                raise ValueError(f"restore target is a symlink: {arcname}")
+            planned.append((item, target))
+            if target.exists() and not overwrite:
+                conflicts.append({"arcname": arcname, "target": str(target)})
+        if conflicts:
+            return {
+                "ok": False,
+                "archive": str(path),
+                "restore_dir": str(restore_dir),
+                "verification": verification,
+                "restored_files": 0,
+                "conflicts": conflicts,
+                "reason": "target_exists",
+            }
+        for item, target in planned:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            payload = archive.read(str(item["arcname"]))
+            target.write_bytes(payload)
+            restored.append(
+                {
+                    "arcname": item["arcname"],
+                    "target": str(target),
+                    "size_bytes": len(payload),
+                    "sha256": _sha256_bytes(payload),
+                }
+            )
+    report = {
+        "ok": True,
+        "archive": str(path),
+        "restore_dir": str(restore_dir),
+        "verification": verification,
+        "restored_files": len(restored),
+        "files": restored,
+        "overwrite": overwrite,
+    }
+    write_json_atomic(restore_dir / "RESTORE_REPORT.json", report)
+    return report
+
+
+def prune_backup_archives(backup_dir: Path, *, keep: int, dry_run: bool = False) -> dict[str, Any]:
+    if keep <= 0:
+        raise ValueError("keep must be positive")
+    archives = sorted(
+        (path for path in backup_dir.glob(BACKUP_ARCHIVE_PATTERN) if path.is_file()),
+        key=lambda path: (path.stat().st_mtime, path.name),
+        reverse=True,
+    )
+    deleted = []
+    for path in archives[keep:]:
+        item = {"path": str(path), "size_bytes": path.stat().st_size}
+        deleted.append(item)
+        if not dry_run:
+            path.unlink()
+    return {
+        "path": str(backup_dir),
+        "keep": keep,
+        "archives": len(archives),
+        "deleted_archives": len(deleted),
+        "deleted_bytes": sum(int(item["size_bytes"]) for item in deleted),
+        "deleted": deleted,
+        "dry_run": dry_run,
+        "changed": bool(deleted) and not dry_run,
+    }
+
+
+def backup_output_summary(report: dict[str, Any]) -> dict[str, Any]:
+    manifest = report.get("manifest") or {}
+    return {
+        "ok": bool(report.get("ok")),
+        "output": report.get("output"),
+        "archive_size_bytes": report.get("archive_size_bytes"),
+        "included_files": manifest.get("included_files"),
+        "missing_files": manifest.get("missing_files"),
+        "skipped_files": manifest.get("skipped_files"),
+        "retention": report.get("retention"),
+        "verification": {
+            "ok": (report.get("verification") or {}).get("ok"),
+            "checked_files": (report.get("verification") or {}).get("checked_files"),
+            "issues": len((report.get("verification") or {}).get("issues") or []),
+        }
+        if report.get("verification")
+        else None,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Create a small autopilot recovery backup zip.")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    parser.add_argument("--output", type=Path, help="Output zip path. Defaults to runtime/backups timestamped zip.")
+    parser.add_argument("--report", type=Path, help="Optional JSON report path.")
+    parser.add_argument("--verify", type=Path, help="Verify an existing backup zip instead of creating one.")
+    parser.add_argument("--restore", type=Path, help="Verify and extract an existing backup zip.")
+    parser.add_argument("--restore-dir", type=Path, help="Directory where --restore should extract files.")
+    parser.add_argument("--overwrite", action="store_true", help="Allow --restore to overwrite existing files.")
+    parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
+    parser.add_argument("--max-backups", type=int, help="Keep only the newest N generated backup zip files.")
+    parser.add_argument("--extra", type=Path, action="append", default=[], help="Additional small file to include.")
+    parser.add_argument("--full-output", action="store_true", help="Print the full manifest instead of a compact summary.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.verify:
+        report = verify_backup_archive(args.verify)
+        if args.report:
+            write_json_atomic(args.report, report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        raise SystemExit(0 if report["ok"] else 1)
+    if args.restore:
+        if args.restore_dir is None:
+            raise SystemExit("--restore-dir is required with --restore")
+        try:
+            report = restore_backup_archive(args.restore, args.restore_dir, overwrite=args.overwrite)
+        except Exception as exc:
+            report = {
+                "ok": False,
+                "archive": str(args.restore),
+                "restore_dir": str(args.restore_dir),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        if args.report:
+            write_json_atomic(args.report, report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        raise SystemExit(0 if report["ok"] else 1)
+    report = build_backup_archive(
+        config_path=args.config,
+        output=args.output,
+        extra_paths=list(args.extra),
+        max_file_bytes=args.max_file_bytes,
+    )
+    if args.max_backups is not None:
+        report["retention"] = prune_backup_archives(Path(report["output"]).parent, keep=args.max_backups)
+    if args.report:
+        write_json_atomic(args.report, report)
+    output = report if args.full_output else backup_output_summary(report)
+    print(json.dumps(output, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

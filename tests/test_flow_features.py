@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 
+import build_binance_indicator_dataset as bbid
 from build_binance_indicator_dataset import FLOW_WINDOWS, build_flow_features
 
 
@@ -75,3 +76,27 @@ def test_flow_features_zero_volume_yields_nan_not_inf():
     assert np.isnan(features["avg_trade_size"].iloc[11])
     for series in features.values():
         assert not np.isinf(series.to_numpy(dtype=float)).any()
+
+
+def test_build_indicator_features_required_features_prunes_unneeded_indicators(monkeypatch):
+    df = make_candles(n=30)
+    calls = []
+
+    monkeypatch.setattr(bbid.talib, "get_functions", lambda: ["RSI", "EMA"])
+    monkeypatch.setattr(bbid, "get_variant_candidates", lambda: ["RSI", "EMA"])
+
+    def fake_run_indicator(function_name, inputs, params=None, suffix=None):
+        calls.append((function_name, params, suffix))
+        name = function_name.lower()
+        if suffix:
+            name = f"{name}_{suffix}"
+        return {name: np.arange(len(df), dtype=float)}
+
+    monkeypatch.setattr(bbid, "run_indicator", fake_run_indicator)
+
+    out = bbid.build_indicator_features(df, "5m", required_features={"rsi_14", "volume_z_20"})
+
+    assert calls == [("RSI", {"timeperiod": 14}, "14")]
+    assert "rsi_14" in out.columns
+    assert "volume_z_20" in out.columns
+    assert "ema_200" not in out.columns

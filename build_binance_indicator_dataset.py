@@ -1,5 +1,6 @@
 import gc
 import os
+import re
 import zipfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -12,6 +13,8 @@ import requests
 import talib
 from talib import abstract
 
+from src.candle_validation import validate_1m_candles
+from src.config import candle_data_dir, indicator_data_dir, normalize_market
 
 # =========================
 # CONFIG
@@ -19,7 +22,7 @@ from talib import abstract
 
 # Change these for another pair or market.
 SYMBOL = "BTCUSDT"
-MARKET = "futures"  # "futures" or "spot"
+MARKET = normalize_market(os.environ.get("TRADING_DATA_MARKET", "futures"))  # "futures" or "spot"
 
 # Inclusive monthly Binance download range, formatted as YYYY-MM.
 START_MONTH = "2016-01"
@@ -40,8 +43,27 @@ REBUILD_INDICATORS = True
 SAVE_CSV = False
 
 RAW_DIR = Path("data/raw") / MARKET / SYMBOL / "1m"
-CANDLE_DIR = Path("data/candles") / SYMBOL
-INDICATOR_DIR = CANDLE_DIR / "indicators"
+CANDLE_DIR = candle_data_dir(SYMBOL, MARKET, legacy_fallback=True)
+INDICATOR_DIR = indicator_data_dir(SYMBOL, MARKET, legacy_fallback=True)
+
+
+def configure_dataset(
+    *,
+    symbol: str | None = None,
+    market: str | None = None,
+    legacy_fallback: bool = True,
+) -> None:
+    """Update module-level paths for scripts/tests that select a market at runtime."""
+    global SYMBOL, MARKET, RAW_DIR, CANDLE_DIR, INDICATOR_DIR
+    if symbol is not None:
+        SYMBOL = symbol
+    if market is not None:
+        MARKET = normalize_market(market)
+    else:
+        MARKET = normalize_market(MARKET)
+    RAW_DIR = Path("data/raw") / MARKET / SYMBOL / "1m"
+    CANDLE_DIR = candle_data_dir(SYMBOL, MARKET, legacy_fallback=legacy_fallback)
+    INDICATOR_DIR = indicator_data_dir(SYMBOL, MARKET, legacy_fallback=legacy_fallback)
 
 TIMEFRAME_RULES = {
     "1m": None,
@@ -163,13 +185,17 @@ def read_binance_zip(path: Path) -> pd.DataFrame:
             df = pd.read_csv(file, header=None, names=BINANCE_COLUMNS)
 
     df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
-    df = df.dropna(subset=["open_time"])
+    open_times = df["open_time"].to_numpy(dtype="float64")
+    if df["open_time"].isna().any() or not np.isfinite(open_times).all() or (open_times < 0).any():
+        raise ValueError(f"{path}: open_time must be finite and non-negative")
 
     for column in CANDLE_COLUMNS[1:]:
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
     df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    return df[CANDLE_COLUMNS]
+    out = df[CANDLE_COLUMNS]
+    validate_1m_candles(out, candle_columns=CANDLE_COLUMNS, label=f"{path} raw 1m candles")
+    return out
 
 
 def load_1m_from_zips() -> pd.DataFrame:
@@ -182,9 +208,9 @@ def load_1m_from_zips() -> pd.DataFrame:
         print(f"Reading ZIP {index}/{len(zip_files)}: {path.name}", flush=True)
         frames.append(read_binance_zip(path))
 
-    df = pd.concat(frames, ignore_index=True)
-    df = df.drop_duplicates("timestamp", keep="last")
-    df = df.sort_values("timestamp").set_index("timestamp")
+    df = pd.concat(frames, ignore_index=True).sort_values("timestamp")
+    validate_1m_candles(df, candle_columns=CANDLE_COLUMNS, label=f"{SYMBOL} {MARKET} loaded raw 1m candles")
+    df = df.set_index("timestamp")
     df.index.name = "timestamp"
     return df
 
@@ -201,21 +227,30 @@ def load_existing_1m_candles() -> Optional[pd.DataFrame]:
     if "timestamp" not in df.columns:
         raise ValueError(f"Missing timestamp column in {path}")
 
+    validate_1m_candles(df, candle_columns=CANDLE_COLUMNS, label=f"{path} stored 1m candles")
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df = df.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
     df = df.set_index("timestamp")
     df.index.name = "timestamp"
     return df
 
 
-def build_timeframes(df_1m: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+def build_timeframes(
+    df_1m: pd.DataFrame,
+    timeframes: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> Dict[str, pd.DataFrame]:
     CANDLE_DIR.mkdir(parents=True, exist_ok=True)
 
     datasets = {}
     first_timestamp = df_1m.index.min()
     complete_until = df_1m.index.max() + TIMEFRAME_PERIODS["1m"]
+    selected = set(timeframes) if timeframes else set(TIMEFRAMES)
+    unknown = selected - set(TIMEFRAMES)
+    if unknown:
+        raise ValueError(f"Unknown timeframes {sorted(unknown)}; available: {sorted(TIMEFRAMES)}")
 
     for timeframe in TIMEFRAMES:
+        if timeframe not in selected:
+            continue
         print(f"Building candles for {timeframe}", flush=True)
         if timeframe == "1m":
             df = df_1m.copy()
@@ -341,6 +376,22 @@ def get_variant_candidates() -> List[str]:
 
 
 FLOW_WINDOWS = [5, 20, 50, 100]
+_PERIOD_FEATURE_RE = re.compile(r"^(.+)_(\d+)(?:_(.+))?$")
+
+
+def flow_feature_names() -> set[str]:
+    names = {"taker_buy_ratio", "taker_imbalance", "avg_trade_size"}
+    for window in FLOW_WINDOWS:
+        names.update(
+            {
+                f"cvd_{window}",
+                f"taker_imbalance_ma_{window}",
+                f"volume_z_{window}",
+                f"trades_z_{window}",
+                f"avg_trade_size_z_{window}",
+            }
+        )
+    return names
 
 
 def build_flow_features(df: pd.DataFrame) -> Dict[str, pd.Series]:
@@ -379,13 +430,89 @@ def build_flow_features(df: pd.DataFrame) -> Dict[str, pd.Series]:
     return features
 
 
-def build_indicator_features(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+def _normalised_feature_names(function_name: str, suffix: str | None = None) -> set[str]:
+    function = abstract.Function(function_name)
+    prefix = function_name.lower()
+    if suffix:
+        prefix = f"{prefix}_{suffix}"
+    output_names = list(function.output_names or [])
+    if len(output_names) > 1:
+        return {f"{prefix}_{name}" for name in output_names}
+    return {prefix}
+
+
+def _required_indicator_specs(required_features: set[str]) -> set[tuple[str, int | None]]:
+    all_functions = talib.get_functions()
+    functions_by_lower = {name.lower(): name for name in all_functions}
+    variant_candidates = set(get_variant_candidates())
+    specs: set[tuple[str, int | None]] = set()
+    unresolved = {
+        feature
+        for feature in required_features
+        if feature not in CANDLE_COLUMNS and feature not in flow_feature_names()
+    }
+
+    for feature in list(unresolved):
+        match = _PERIOD_FEATURE_RE.match(feature)
+        if not match:
+            continue
+        base_name = match.group(1)
+        period = int(match.group(2))
+        function_name = functions_by_lower.get(base_name)
+        if function_name in variant_candidates:
+            specs.add((function_name, period))
+            unresolved.remove(feature)
+
+    for feature in list(unresolved):
+        for function_name in all_functions:
+            if feature in _normalised_feature_names(function_name):
+                specs.add((function_name, None))
+                unresolved.remove(feature)
+                break
+    return specs
+
+
+def build_indicator_features(
+    df: pd.DataFrame,
+    timeframe: str,
+    required_features: Iterable[str] | None = None,
+) -> pd.DataFrame:
     inputs = make_talib_inputs(df)
+    features = {}
+    required = None if required_features is None else set(required_features)
+    if required is None or required & flow_feature_names():
+        flow_features = build_flow_features(df)
+        if required is None:
+            features.update(flow_features)
+        else:
+            features.update({name: values for name, values in flow_features.items() if name in required})
+
+    if required is not None:
+        for function_name, period in sorted(
+            _required_indicator_specs(required),
+            key=lambda item: (item[0], -1 if item[1] is None else item[1]),
+        ):
+            try:
+                if period is None:
+                    features.update(run_indicator(function_name, inputs))
+                else:
+                    features.update(
+                        run_indicator(
+                            function_name,
+                            inputs,
+                            params={"timeperiod": period},
+                            suffix=str(period),
+                        )
+                    )
+            except Exception as exc:
+                print(f"[{timeframe}] Skipped required {function_name}: {exc}", flush=True)
+        feature_df = pd.DataFrame(features, index=df.index)
+        final = pd.concat([df, feature_df], axis=1)
+        final = final.replace([np.inf, -np.inf], np.nan)
+        return final.loc[:, ~final.columns.duplicated()]
+
     all_functions = talib.get_functions()
     variant_candidates = get_variant_candidates()
-    features = {}
-    features.update(build_flow_features(df))
-
     for index, function_name in enumerate(all_functions, start=1):
         print(f"[{timeframe}] Default {index}/{len(all_functions)}: {function_name}", flush=True)
         try:

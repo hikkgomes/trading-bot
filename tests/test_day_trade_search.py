@@ -156,9 +156,33 @@ def test_simulate_day_trades_position_sizing():
     )
     trades = simulate_day_trades(data, signal, "long", config)
     assert len(trades) == 1
-    expected_size = 0.003 / 0.005
+    expected_size = 0.25
     assert abs(trades["position_size"].iloc[0] - expected_size) < 1e-9
     assert abs(trades["sized_return"].iloc[0] - trades["net_return"].iloc[0] * expected_size) < 1e-9
+
+
+def test_simulate_day_trades_respects_explicit_position_cap():
+    data = pd.DataFrame({
+        "timestamp": pd.date_range("2024-01-01", periods=20, freq="5min", tz="UTC"),
+        "tf_5m_open": [100] * 20,
+        "tf_5m_high": [100, 101, 101, 101, 101] + [100] * 15,
+        "tf_5m_low": [100] * 20,
+        "tf_5m_close": [100] * 20,
+    })
+    signal = pd.Series([True] + [False] * 19)
+    config = DayTradeConfig(
+        take_profit=0.01,
+        stop_loss=0.005,
+        fee_bps=0,
+        slippage_bps=0,
+        horizon_bars=8,
+        risk_per_trade=0.003,
+        max_position_fraction=0.1,
+    )
+
+    trades = simulate_day_trades(data, signal, "long", config)
+
+    assert trades["position_size"].iloc[0] == pytest.approx(0.1)
 
 
 def test_day_trade_metrics_basic():
@@ -587,5 +611,4 @@ def test_simulate_day_trades_atr_based():
     trade = trades.iloc[0]
     assert trade["exit_reason"] == "stop"
     assert trade["exit"] == 99.0
-    assert trade["position_size"] == pytest.approx(1.0)
-
+    assert trade["position_size"] == pytest.approx(0.25)
