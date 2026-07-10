@@ -12,6 +12,7 @@ from typing import Any
 
 from src.autopilot.io import append_json_line, write_json_atomic
 from src.autopilot.reporting import utc_now
+from src.autopilot.telegram_edge import send_alert_from_environment
 
 VOLATILE_FINGERPRINT_KEYS = {
     "age_seconds",
@@ -175,6 +176,13 @@ def emit_alert(
         except Exception as exc:  # local alerting/cooldown must survive webhook outages
             payload["webhook"] = {"ok": False, "error": str(exc)}
 
+    try:
+        telegram = send_alert_from_environment(payload)
+        if telegram is not None:
+            payload["telegram"] = telegram
+    except Exception as exc:  # local alerting/cooldown must survive Telegram outages
+        payload["telegram"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
     _write_jsonl(alert_file, payload)
 
     state["alerts"][fingerprint] = {
@@ -186,6 +194,8 @@ def emit_alert(
     result = {"sent": True, "fingerprint": fingerprint}
     if "webhook" in payload:
         result["webhook"] = payload["webhook"]
+    if "telegram" in payload:
+        result["telegram"] = payload["telegram"]
     try:
         _save_state(state_file, state)
     except Exception as exc:
@@ -241,7 +251,12 @@ def failure_detail(report: dict[str, Any]) -> dict[str, Any]:
                     "error": job.get("error") or job.get("stderr_tail") or job.get("returncode"),
                 }
             )
-    detail = {"products": products, "jobs": jobs, "data_update": report.get("data_update")}
+    detail = {
+        "products": products,
+        "jobs": jobs,
+        "job_config_errors": report.get("job_config_errors", []),
+        "data_update": report.get("data_update"),
+    }
     if control is not None:
         detail["control"] = control
     return detail

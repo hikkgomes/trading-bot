@@ -487,6 +487,129 @@ def test_healthcheck_warns_for_paper_product_state_errors():
     ]
 
 
+@pytest.mark.parametrize(
+    ("mode", "bucket", "code", "expected_ok"),
+    [
+        ("live", "issues", "live_product_recovery_pending", False),
+        ("paper", "warnings", "paper_product_recovery_pending", True),
+    ],
+)
+def test_healthcheck_surfaces_unresolved_product_recovery_state(
+    mode,
+    bucket,
+    code,
+    expected_ok,
+):
+    states = {
+        "pending_order": {"stage": "entry", "client_id": "tb-en-1"},
+        "pending_entry_recovery": {
+            "status": "recovery_close_failed_position_remains",
+            "recovery_client_id": "tb-rc-1",
+        },
+        "risk_recovery_incident": {
+            "cause": "broker_position_quantity_mismatch",
+            "status": "recovery_close_filled_and_flat",
+        },
+        "flatten_intent": {"client_id": "tb-sf-1"},
+    }
+    health = evaluate_health(
+        operator_report(
+            products=[
+                {
+                    "name": "active_income",
+                    "enabled": True,
+                    "objective": "active_income",
+                    "mode": mode,
+                    "market": "futures",
+                    **states,
+                }
+            ]
+        )
+    )
+
+    assert health["ok"] is expected_ok
+    assert health[bucket] == [
+        {
+            "code": code,
+            "message": (
+                f"one or more {mode} products have unresolved broker intents "
+                "or safety-recovery incidents"
+            ),
+            "detail": {
+                "products": [
+                    {
+                        "product": "active_income",
+                        "objective": "active_income",
+                        "market": "futures",
+                        "mode": mode,
+                        "states": states,
+                    }
+                ]
+            },
+        }
+    ]
+    assert health["warnings" if bucket == "issues" else "issues"] == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "bucket", "code", "expected_ok"),
+    [
+        ("live", "issues", "live_exit_accounting_pending", False),
+        ("paper", "warnings", "paper_exit_accounting_pending", True),
+    ],
+)
+def test_healthcheck_surfaces_unresolved_exit_accounting_intent(
+    mode,
+    bucket,
+    code,
+    expected_ok,
+):
+    intent = {
+        "version": 1,
+        "phase": "ready_to_commit",
+        "exit_event_id": "a" * 64,
+        "strategy_id": "live_r1",
+        "broker_flat_proven": True,
+    }
+    health = evaluate_health(
+        operator_report(
+            products=[
+                {
+                    "name": "active_income",
+                    "enabled": True,
+                    "objective": "active_income",
+                    "mode": mode,
+                    "market": "futures",
+                    "exit_accounting_intent": intent,
+                }
+            ]
+        )
+    )
+
+    assert health["ok"] is expected_ok
+    assert health[bucket] == [
+        {
+            "code": code,
+            "message": (
+                f"one or more {mode} products have an unresolved idempotent "
+                "exit accounting intent"
+            ),
+            "detail": {
+                "products": [
+                    {
+                        "product": "active_income",
+                        "objective": "active_income",
+                        "market": "futures",
+                        "mode": mode,
+                        "intent": intent,
+                    }
+                ]
+            },
+        }
+    ]
+    assert health["warnings" if bucket == "issues" else "issues"] == []
+
+
 def test_healthcheck_fails_for_live_trade_log_issues():
     health = evaluate_health(
         operator_report(
@@ -533,6 +656,81 @@ def test_healthcheck_fails_for_live_trade_log_issues():
             },
         }
     ]
+
+
+def test_healthcheck_fails_for_live_drawdown_circuit_breaker():
+    health = evaluate_health(
+        operator_report(
+            products=[
+                {
+                    "name": "active_income",
+                    "enabled": True,
+                    "objective": "active_income",
+                    "mode": "live",
+                    "market": "futures",
+                    "equity": 900.0,
+                    "peak_equity": 1000.0,
+                    "drawdown_fraction": 0.10,
+                    "drawdown_limit_fraction": 0.10,
+                    "drawdown_halted": True,
+                    "drawdown_halted_at": "2026-07-09T12:00:00+00:00",
+                    "drawdown_halt_reason": "equity_drawdown_limit_reached objective=active_income",
+                }
+            ]
+        )
+    )
+
+    assert health["ok"] is False
+    assert health["issues"] == [
+        {
+            "code": "live_product_drawdown_halted",
+            "message": "one or more live products hit the sticky peak-equity drawdown circuit breaker",
+            "detail": {
+                "products": [
+                    {
+                        "product": "active_income",
+                        "objective": "active_income",
+                        "market": "futures",
+                        "mode": "live",
+                        "equity": 900.0,
+                        "peak_equity": 1000.0,
+                        "drawdown_fraction": 0.10,
+                        "drawdown_limit_fraction": 0.10,
+                        "drawdown_halted_at": "2026-07-09T12:00:00+00:00",
+                        "drawdown_halt_reason": "equity_drawdown_limit_reached objective=active_income",
+                    }
+                ]
+            },
+        }
+    ]
+
+
+def test_healthcheck_warns_for_paper_drawdown_circuit_breaker():
+    health = evaluate_health(
+        operator_report(
+            products=[
+                {
+                    "name": "btc_accumulation",
+                    "enabled": True,
+                    "objective": "btc_accumulation",
+                    "mode": "paper",
+                    "market": "spot",
+                    "equity": 0.95,
+                    "peak_equity": 1.0,
+                    "drawdown_fraction": 0.05,
+                    "drawdown_limit_fraction": 0.05,
+                    "drawdown_halted": True,
+                    "drawdown_halted_at": "2026-07-09T12:00:00+00:00",
+                    "drawdown_halt_reason": "equity_drawdown_limit_reached objective=btc_accumulation",
+                }
+            ]
+        )
+    )
+
+    assert health["ok"] is True
+    assert health["issues"] == []
+    assert health["warnings"][0]["code"] == "paper_product_drawdown_halted"
+    assert health["warnings"][0]["detail"]["products"][0]["product"] == "btc_accumulation"
 
 
 def test_healthcheck_warns_for_paper_trade_log_issues():
@@ -926,6 +1124,7 @@ def test_healthcheck_fails_for_live_open_position_missing_broker_metadata():
                     "broker_requested_qty": None,
                     "broker_fill_ratio": None,
                     "broker_entry_fee": None,
+                    "broker_entry_balance": None,
                     "reasons": [
                         "invalid_broker_symbol",
                         "invalid_broker_side",
@@ -935,7 +1134,14 @@ def test_healthcheck_fails_for_live_open_position_missing_broker_metadata():
                         "invalid_broker_entry_fee",
                         "invalid_broker_requested_qty",
                         "invalid_broker_fill_ratio",
+                        "invalid_broker_entry_balance",
+                        "invalid_broker_stop_order_id",
+                        "invalid_broker_stop_client_id",
+                        "invalid_broker_stop_trigger_price",
                     ],
+                    "broker_stop_order_id": None,
+                    "broker_stop_client_id": None,
+                    "broker_stop_trigger_price": None,
                 }
             ]
         },
@@ -972,6 +1178,10 @@ def test_healthcheck_allows_live_open_position_with_valid_broker_metadata():
                             "broker_entry_fee": 0.0,
                             "broker_requested_qty": 0.5,
                             "broker_fill_ratio": 1.0,
+                            "broker_entry_balance": 10_000.0,
+                            "broker_stop_order_id": "stop-1",
+                            "broker_stop_client_id": "tb-sl-stop-1",
+                            "broker_stop_trigger_price": 102.0,
                         }
                     ],
                 }
@@ -1015,6 +1225,10 @@ def test_healthcheck_fails_for_live_open_position_invalid_broker_entry_fee():
                             "broker_entry_fee": -0.01,
                             "broker_requested_qty": 0.5,
                             "broker_fill_ratio": 1.0,
+                            "broker_entry_balance": 10_000.0,
+                            "broker_stop_order_id": "stop-1",
+                            "broker_stop_client_id": "tb-sl-stop-1",
+                            "broker_stop_trigger_price": 102.0,
                         }
                     ],
                 }
@@ -1059,6 +1273,10 @@ def test_healthcheck_fails_for_live_open_position_partial_broker_fill_metadata()
                             "broker_entry_fee": 0.0,
                             "broker_requested_qty": 0.5,
                             "broker_fill_ratio": 0.5,
+                            "broker_entry_balance": 10_000.0,
+                            "broker_stop_order_id": "stop-1",
+                            "broker_stop_client_id": "tb-sl-stop-1",
+                            "broker_stop_trigger_price": 102.0,
                         }
                     ],
                 }
@@ -1072,6 +1290,55 @@ def test_healthcheck_fails_for_live_open_position_partial_broker_fill_metadata()
     assert broker_issue["detail"]["positions"][0]["reasons"] == [
         "broker_fill_ratio_not_complete",
         "broker_qty_mismatch_requested",
+    ]
+
+
+def test_healthcheck_fails_for_live_futures_position_with_mismatched_native_stop():
+    health = evaluate_health(
+        operator_report(
+            products=[
+                {
+                    "name": "active_income",
+                    "enabled": True,
+                    "objective": "active_income",
+                    "mode": "live",
+                    "market": "futures",
+                    "open_positions": 1,
+                    "open_position_details": [
+                        {
+                            "strategy_id": "live_short",
+                            "direction": "short",
+                            "position_size": 0.1,
+                            "entry_price": 100.0,
+                            "sl_price": 102.0,
+                            "tp_price": 96.0,
+                            "entry_time": "2026-01-01T00:00:00+00:00",
+                            "base_timeframe": "5m",
+                            "horizon_bars": 6,
+                            "stale_after_seconds": 5400.0,
+                            "broker_symbol": "BTCUSDT",
+                            "broker_side": "sell",
+                            "broker_qty": 0.5,
+                            "broker_entry_price": 100.0,
+                            "broker_entry_fee": 0.0,
+                            "broker_requested_qty": 0.5,
+                            "broker_fill_ratio": 1.0,
+                            "broker_entry_balance": 10_000.0,
+                            "broker_stop_order_id": "stop-1",
+                            "broker_stop_client_id": "tb-sl-stop-1",
+                            "broker_stop_trigger_price": 101.0,
+                        }
+                    ],
+                }
+            ]
+        ),
+        now_ts=1767229200.0,
+    )
+
+    assert health["ok"] is False
+    broker_issue = next(item for item in health["issues"] if item["code"] == "live_open_position_broker_invalid")
+    assert broker_issue["detail"]["positions"][0]["reasons"] == [
+        "broker_stop_trigger_mismatch_strategy_stop"
     ]
 
 
@@ -2797,6 +3064,113 @@ def test_healthcheck_warns_when_research_cycle_ignored_mutation_batch_read_error
     ]
 
 
+def test_healthcheck_surfaces_generated_batch_and_experiment_memory_health():
+    health = evaluate_health(
+        operator_report(
+            generated_batch={
+                "ok": True,
+                "schema": "autopilot.generative_strategy_batch/v1",
+                "generated_at": "2026-07-10T00:01:00+00:00",
+                "research_only": True,
+                "executable": False,
+                "paper_trade_allowed": False,
+                "promotion_allowed": False,
+                "live_allowed": False,
+                "requires_full_validation_before_export": True,
+                "hypotheses_count": 3,
+                "summary": {"hypotheses": 3},
+            },
+            experiment_memory={
+                "ok": True,
+                "status": "ready",
+                "path": "runtime/research/experiment_memory.sqlite3",
+                "integrity": {"ok": True},
+                "adaptive_evidence_scope": "development_only",
+                "protected_holdout_results_excluded": True,
+                "feedback": {
+                    "totals": {"strategies": 9, "evaluations": 12},
+                    "outcomes": {"reject": 8, "pre_holdout_pass": 4},
+                },
+            },
+        )
+    )
+
+    assert health["ok"] is True
+    assert health["issues"] == []
+    assert health["warnings"] == []
+    assert health["generative_research"] == {
+        "batch_ok": True,
+        "batch_generated_at": "2026-07-10T00:01:00+00:00",
+        "batch_hypotheses": 3,
+        "unique_behavioral_specs": 9,
+        "recorded_evaluations": 12,
+        "memory_status": "ready",
+        "memory_integrity_ok": True,
+        "adaptive_evidence_scope": "development_only",
+        "protected_holdout_results_excluded": True,
+    }
+
+
+def test_healthcheck_warns_when_generated_research_pipeline_is_unhealthy():
+    health = evaluate_health(
+        operator_report(
+            research_cycle={
+                "ok": False,
+                "generated_at": "2026-07-10T00:02:00+00:00",
+                "generated_batch": {
+                    "status": "ignored",
+                    "path": "runtime/research/generated_hypotheses.json",
+                    "reason": "generated_batch_failed_safety_contract",
+                },
+            },
+            generated_batch={
+                "ok": True,
+                "schema": "autopilot.generative_strategy_batch/v1",
+                "generated_at": "2026-07-10T00:01:00+00:00",
+                "research_only": True,
+                "executable": True,
+                "paper_trade_allowed": False,
+                "promotion_allowed": False,
+                "live_allowed": False,
+                "requires_full_validation_before_export": True,
+                "hypotheses_count": 0,
+                "summary": {"hypotheses": 0, "rejected_attempts": 100},
+            },
+        )
+    )
+
+    assert health["ok"] is True
+    assert health["issues"] == []
+    assert [warning["code"] for warning in health["warnings"]] == [
+        "research_cycle_generated_batch_unhealthy",
+        "generated_batch_unhealthy",
+        "generative_search_empty",
+    ]
+    assert health["warnings"][0]["detail"]["status"] == "ignored"
+    assert health["warnings"][1]["detail"]["unsafe_flags"] == ["executable"]
+
+
+def test_healthcheck_fails_closed_for_bad_experiment_memory_or_feedback_scope():
+    health = evaluate_health(
+        operator_report(
+            experiment_memory={
+                "ok": False,
+                "status": "error",
+                "path": "runtime/research/experiment_memory.sqlite3",
+                "error": "ExperimentMemoryCorruptionError: quick_check failed",
+                "protected_holdout_results_excluded": False,
+            }
+        )
+    )
+
+    assert health["ok"] is False
+    assert [issue["code"] for issue in health["issues"]] == [
+        "experiment_memory_unhealthy",
+        "experiment_memory_feedback_scope_invalid",
+    ]
+    assert health["issues"][0]["detail"]["status"] == "error"
+
+
 def test_healthcheck_does_not_warn_no_exportable_before_research_runs():
     health = evaluate_health(
         operator_report(
@@ -2838,7 +3212,7 @@ def test_healthcheck_warns_when_required_testnet_rehearsal_is_missing():
                 "ok": False,
                 "next_action": {
                     "preflight_command": "make preflight PRODUCT=active_income REQUIRE_TESTNET=1",
-                    "rehearsal_command": "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5",
+                    "rehearsal_command": "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100",
                 },
             },
         )
@@ -2856,7 +3230,7 @@ def test_healthcheck_warns_when_required_testnet_rehearsal_is_missing():
                 "required_by": ["active_income"],
                 "next_action": {
                     "preflight_command": "make preflight PRODUCT=active_income REQUIRE_TESTNET=1",
-                    "rehearsal_command": "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5",
+                    "rehearsal_command": "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100",
                 },
             },
         }

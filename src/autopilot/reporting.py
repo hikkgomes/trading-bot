@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import datetime as dt
 import json
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Any
 
 from src.autopilot.approvals import is_valid_approval_actor, is_valid_revocation_reason
 from src.autopilot.config import DEFAULT_CONFIG_PATH, AutopilotConfig, load_config
+from src.autopilot.experiment_memory import ExperimentMemory
 from src.autopilot.io import write_json_atomic, write_text_atomic
 from src.autopilot.jobs import effective_job_cadence_seconds, job_due
 from src.autopilot.market_data import (
@@ -25,15 +28,23 @@ from src.autopilot.testnet_rehearsal import summarize_testnet_rehearsal_report
 
 LOGGER = logging.getLogger("autopilot.reporting")
 
+_EXPERIMENT_MEMORY_CACHE_KEY: tuple[str, int, int, int] | None = None
+_EXPERIMENT_MEMORY_CACHE_VALUE: dict[str, Any] | None = None
+
 BROKER_EXIT_NUMERIC_FIELDS = (
     "broker_exit_qty",
     "broker_exit_price",
     "broker_exit_fee",
 )
+BROKER_ACCOUNT_RECONCILIATION_FIELDS = (
+    "broker_entry_balance",
+    "broker_exit_balance",
+    "broker_balance_return",
+)
 
 
 def utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+    return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
 
 
 def write_status(path: Path, payload: dict[str, Any]) -> None:
@@ -62,6 +73,89 @@ def _load_json(path: Path) -> dict[str, Any]:
             }
         }
     return payload
+
+
+def _experiment_memory_status(path: Path) -> dict[str, Any]:
+    """Return bounded, development-only research-memory observability.
+
+    ``ExperimentMemory.generator_feedback`` deliberately excludes protected
+    holdout phases.  Keep that API boundary here instead of reading SQLite
+    tables directly, and omit lineage-level records from the operator report.
+    """
+
+    status: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "status": "missing",
+        "ok": None,
+        "adaptive_evidence_scope": "development_only",
+        "protected_holdout_results_excluded": True,
+    }
+    if not path.exists():
+        return status
+    try:
+        initial_stat = path.stat()
+        cache_key = (
+            str(path.resolve()),
+            initial_stat.st_ino,
+            initial_stat.st_mtime_ns,
+            initial_stat.st_size,
+        )
+    except OSError as exc:
+        status.update(status="error", ok=False, error=f"{type(exc).__name__}: {exc}")
+        return status
+    global _EXPERIMENT_MEMORY_CACHE_KEY, _EXPERIMENT_MEMORY_CACHE_VALUE
+    if (
+        cache_key == _EXPERIMENT_MEMORY_CACHE_KEY
+        and _EXPERIMENT_MEMORY_CACHE_VALUE is not None
+    ):
+        return copy.deepcopy(_EXPERIMENT_MEMORY_CACHE_VALUE)
+    try:
+        with ExperimentMemory(path, timeout_seconds=2.0, deep_on_open=False) as memory:
+            integrity = memory.integrity_check(deep=False)
+            feedback = memory.generator_feedback(category_limit=25)
+    except Exception as exc:
+        status.update(
+            status="error",
+            ok=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return status
+
+    # These aggregates contain only non-protected outcomes by contract.  The
+    # potentially large parent-performance list is intentionally not exposed.
+    bounded_feedback = {
+        key: feedback.get(key, {})
+        for key in (
+            "totals",
+            "outcomes",
+            "rejection_reasons",
+            "generation_methods",
+            "families",
+            "primitives",
+        )
+    }
+    status.update(
+        status="ready",
+        ok=True,
+        integrity={**integrity, "startup_deep_validation": True},
+        feedback=bounded_feedback,
+    )
+    try:
+        final_stat = path.stat()
+        _EXPERIMENT_MEMORY_CACHE_KEY = (
+            str(path.resolve()),
+            final_stat.st_ino,
+            final_stat.st_mtime_ns,
+            final_stat.st_size,
+        )
+        _EXPERIMENT_MEMORY_CACHE_VALUE = copy.deepcopy(status)
+    except OSError:
+        # The just-built status remains useful, but a disappearing/replaced DB
+        # must be rechecked rather than cached on the next report cycle.
+        _EXPERIMENT_MEMORY_CACHE_KEY = None
+        _EXPERIMENT_MEMORY_CACHE_VALUE = None
+    return status
 
 
 def _runtime_load_errors(payloads: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -136,14 +230,14 @@ def _parse_timestamp(value: Any) -> float | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        parsed = parsed.replace(tzinfo=dt.UTC)
     return parsed.timestamp()
 
 
 def _status_heartbeat(status: dict[str, Any], config: AutopilotConfig, now_ts: float | None = None) -> dict[str, Any]:
     generated_at = status.get("generated_at")
     generated_ts = _parse_timestamp(generated_at)
-    now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.timezone.utc).timestamp()
+    now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.UTC).timestamp()
     limit_seconds = max(float(config.loop_sleep_seconds) * 3.0, 300.0)
     age_seconds = None
     fresh = None
@@ -179,13 +273,29 @@ def _trade_summary(path: Path) -> dict[str, Any]:
         "last_exit_time": None,
         "invalid_rows": 0,
         "numeric_errors": [],
+        "exit_event_id_errors": [],
     }
     if not path.exists():
         return summary
     invalid_lines: set[int] = set()
+    seen_exit_event_ids: set[str] = set()
     with path.open("r", encoding="utf-8", newline="") as handle:
         for line_number, row in enumerate(csv.DictReader(handle), start=2):
             summary["trades"] += 1
+            exit_event_id = (row.get("exit_event_id") or "").strip()
+            if exit_event_id:
+                if re.fullmatch(r"[0-9a-f]{64}", exit_event_id) is None:
+                    invalid_lines.add(line_number)
+                    summary["exit_event_id_errors"].append(
+                        {"line": line_number, "value": exit_event_id, "reason": "invalid"}
+                    )
+                elif exit_event_id in seen_exit_event_ids:
+                    invalid_lines.add(line_number)
+                    summary["exit_event_id_errors"].append(
+                        {"line": line_number, "value": exit_event_id, "reason": "duplicate"}
+                    )
+                else:
+                    seen_exit_event_ids.add(exit_event_id)
             net_return = _trade_float(row, "net_return", line_number, summary, invalid_lines, required=True)
             sized_return = _trade_float(row, "sized_return", line_number, summary, invalid_lines, required=True)
             broker_fields_present = any((row.get(field) or "") != "" for field in BROKER_EXIT_NUMERIC_FIELDS)
@@ -217,13 +327,52 @@ def _trade_summary(path: Path) -> dict[str, Any]:
                     required=True,
                     non_negative=True,
                 )
+            account_reconciliation_present = any(
+                (row.get(field) or "") != ""
+                for field in BROKER_ACCOUNT_RECONCILIATION_FIELDS
+            )
+            if account_reconciliation_present:
+                _trade_float(
+                    row,
+                    "broker_entry_balance",
+                    line_number,
+                    summary,
+                    invalid_lines,
+                    required=True,
+                    positive=True,
+                )
+                _trade_float(
+                    row,
+                    "broker_exit_balance",
+                    line_number,
+                    summary,
+                    invalid_lines,
+                    required=True,
+                    positive=True,
+                )
+                _trade_float(
+                    row,
+                    "broker_balance_return",
+                    line_number,
+                    summary,
+                    invalid_lines,
+                    required=True,
+                )
             summary["net_return_sum"] += net_return
             summary["sized_return_sum"] += sized_return
             summary["wins"] += int(net_return > 0)
             summary["last_exit_time"] = row.get("exit_time") or summary["last_exit_time"]
     summary["invalid_rows"] = len(invalid_lines)
     if summary["invalid_rows"]:
-        summary["issue"] = f"trade log has {summary['invalid_rows']} row(s) with invalid numeric fields"
+        if summary["exit_event_id_errors"]:
+            summary["issue"] = (
+                f"trade log has {summary['invalid_rows']} row(s) with invalid audit fields, "
+                "including malformed or duplicate exit_event_id values"
+            )
+        else:
+            summary["issue"] = (
+                f"trade log has {summary['invalid_rows']} row(s) with invalid numeric fields"
+            )
     trades = summary["trades"]
     summary["win_rate"] = (summary["wins"] / trades) if trades else None
     return summary
@@ -341,7 +490,7 @@ def _scheduled_job_summary(
 ) -> list[dict[str, Any]]:
     state = job_state if job_state is not None else _load_json(config.job_state_file)
     entries = state.get("jobs", {}) if isinstance(state.get("jobs", {}), dict) else {}
-    now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.timezone.utc).timestamp()
+    now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.UTC).timestamp()
     jobs = []
     for job in config.jobs:
         entry = entries.get(job.name, {}) if isinstance(entries.get(job.name, {}), dict) else {}
@@ -466,7 +615,7 @@ def _command_value(command: list[str], flag: str) -> str | None:
 
 
 def _promotion_review_summaries(config: AutopilotConfig, *, now_ts: float | None = None) -> list[dict[str, Any]]:
-    now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.timezone.utc).timestamp()
+    now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.UTC).timestamp()
     summaries = []
     for job in config.jobs:
         if "promotion" not in job.name:
@@ -718,6 +867,8 @@ def build_operator_report(config: AutopilotConfig, *, now_ts: float | None = Non
     research_smoke = _load_json(config.research_smoke_file)
     strategy_smoke = _load_json(config.strategy_smoke_file)
     research_cycle = _load_json(config.research_cycle_file)
+    generated_batch = _load_json(config.generated_batch_file)
+    experiment_memory = _experiment_memory_status(config.experiment_memory_file)
     incubation_candidates = _load_json(config.incubation_candidates_file)
     mutation_plan = _load_json(config.mutation_plan_file)
     mutation_batch = _load_json(config.mutation_batch_file)
@@ -731,6 +882,7 @@ def build_operator_report(config: AutopilotConfig, *, now_ts: float | None = Non
         "research_smoke": research_smoke,
         "strategy_smoke": strategy_smoke,
         "research_cycle": research_cycle,
+        "generated_batch": generated_batch,
         "incubation_candidates": incubation_candidates,
         "mutation_plan": mutation_plan,
         "mutation_batch": mutation_batch,
@@ -772,6 +924,17 @@ def build_operator_report(config: AutopilotConfig, *, now_ts: float | None = Non
                 "cycle_errors": cycle.get("cycle_errors", []),
                 "state_errors": cycle.get("state_errors", []),
                 "equity": cycle.get("equity"),
+                "peak_equity": cycle.get("peak_equity"),
+                "drawdown_fraction": cycle.get("drawdown_fraction"),
+                "drawdown_limit_fraction": cycle.get("drawdown_limit_fraction"),
+                "drawdown_halted": cycle.get("drawdown_halted"),
+                "drawdown_halted_at": cycle.get("drawdown_halted_at"),
+                "drawdown_halt_reason": cycle.get("drawdown_halt_reason"),
+                "exit_accounting_intent": cycle.get("exit_accounting_intent"),
+                "pending_order": cycle.get("pending_order"),
+                "pending_entry_recovery": cycle.get("pending_entry_recovery"),
+                "risk_recovery_incident": cycle.get("risk_recovery_incident"),
+                "flatten_intent": cycle.get("flatten_intent"),
                 "open_positions": cycle.get("open_positions"),
                 "open_position_details": cycle.get("open_position_details", []),
                 "trade_summary": _trade_summary(product.trade_log),
@@ -810,12 +973,35 @@ def build_operator_report(config: AutopilotConfig, *, now_ts: float | None = Non
             "state_error",
             "summary",
             "market_data",
+            "history_coverage",
             "mutation_batch",
+            "generated_batch",
             "last_market_timestamp",
             "last_mutation_batch_marker",
+            "last_generated_batch_marker",
             "incubation_review",
         ),
         count_keys=("scenarios", "exports"),
+    )
+    generated_batch_view = _compact_artifact_payload(
+        generated_batch,
+        path=config.generated_batch_file,
+        keep_keys=(
+            "ok",
+            "schema",
+            "generated_at",
+            "error",
+            "research_only",
+            "executable",
+            "paper_trade_allowed",
+            "promotion_allowed",
+            "live_allowed",
+            "requires_full_validation_before_export",
+            "source",
+            "budget",
+            "summary",
+        ),
+        count_keys=("hypotheses", "generation_metadata", "rejected"),
     )
     incubation_candidates_view = _compact_artifact_payload(
         incubation_candidates,
@@ -891,6 +1077,8 @@ def build_operator_report(config: AutopilotConfig, *, now_ts: float | None = Non
         "research_smoke": research_smoke,
         "strategy_smoke": strategy_smoke,
         "research_cycle": research_cycle_view,
+        "generated_batch": generated_batch_view,
+        "experiment_memory": experiment_memory,
         "incubation_candidates": incubation_candidates_view,
         "mutation_plan": mutation_plan_view,
         "mutation_batch": mutation_batch_view,
@@ -1338,8 +1526,14 @@ def _open_position_broker_detail(position: dict[str, Any]) -> str:
         "broker_qty",
         "broker_requested_qty",
         "broker_fill_ratio",
+        "broker_entry_quote_balance_before",
+        "broker_entry_quote_balance_after",
         "broker_entry_quote_value",
+        "broker_entry_quote_value_source",
         "broker_exit_sizing",
+        "broker_stop_order_id",
+        "broker_stop_client_id",
+        "broker_stop_trigger_price",
     )
     if not any(position.get(key) is not None for key in keys):
         return ""
@@ -1355,9 +1549,23 @@ def _open_position_broker_detail(position: dict[str, Any]) -> str:
     if position.get("broker_fill_ratio") is not None:
         parts.append(f"fill {_fmt_pct(position.get('broker_fill_ratio'))}")
     if position.get("broker_entry_quote_value") is not None:
-        parts.append(f"quote {position.get('broker_entry_quote_value')}")
+        quote_detail = f"quote {position.get('broker_entry_quote_value')}"
+        quote_source = position.get("broker_entry_quote_value_source")
+        quote_before = position.get("broker_entry_quote_balance_before")
+        quote_after = position.get("broker_entry_quote_balance_after")
+        if quote_source is not None:
+            quote_detail += f" ({quote_source}"
+            if quote_before is not None and quote_after is not None:
+                quote_detail += f", {quote_before}->{quote_after}"
+            quote_detail += ")"
+        parts.append(quote_detail)
     if position.get("broker_exit_sizing") is not None:
         parts.append(str(position.get("broker_exit_sizing")))
+    if position.get("broker_stop_order_id") is not None:
+        stop_detail = f"stop {position.get('broker_stop_order_id')}"
+        if position.get("broker_stop_trigger_price") is not None:
+            stop_detail += f" @ {position.get('broker_stop_trigger_price')}"
+        parts.append(stop_detail)
     return ", ".join(parts)
 
 
@@ -1510,15 +1718,30 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
                 f"{summary.get('scenarios', scenario_count)} real scenarios, "
                 f"keepers {summary.get('keepers', 0)}, "
                 f"watchlist {summary.get('incubation_candidates', 0)}, "
-                f"exports {summary.get('exported', export_count)}, "
+                f"active exports {summary.get('active_exports', summary.get('exported', export_count))}, "
+                f"live staged {summary.get('staged', 0)}, "
                 f"top reason {top_reason}, next {_truncate(str(next_action), 90)}"
             )
+            if int(summary.get("coverage_failures") or 0):
+                failed_names = ", ".join(summary.get("coverage_failed_scenarios") or [])
+                detail += (
+                    f", history blockers {summary.get('coverage_failures')}"
+                    + (f" ({_truncate(failed_names, 100)})" if failed_names else "")
+                )
             mutation_effectiveness = summary.get("mutation_effectiveness")
             if isinstance(mutation_effectiveness, dict):
                 detail += (
                     f", mutations {mutation_effectiveness.get('evaluated_hypotheses', 0)} tested"
                     f"/{mutation_effectiveness.get('keepers', 0)} keepers"
                     f" ({mutation_effectiveness.get('outcome', 'unknown')})"
+                )
+            generative_search = summary.get("generative_search")
+            if isinstance(generative_search, dict):
+                detail += (
+                    f", generated {generative_search.get('evaluated_hypotheses', 0)} tested"
+                    f"/{generative_search.get('keepers', 0)} keepers"
+                    f", trials {generative_search.get('cumulative_trials', 0)}"
+                    f" ({generative_search.get('status', 'unknown')})"
                 )
             coverage_detail = _research_coverage_detail(research_cycle)
             if coverage_detail:
@@ -1528,12 +1751,31 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
             coverage_detail = _research_coverage_detail(research_cycle)
             if coverage_detail:
                 detail += f", coverage {coverage_detail}"
+        history_coverage = research_cycle.get("history_coverage") or {}
+        if (
+            int(history_coverage.get("failure_count") or 0)
+            and not int(summary.get("coverage_failures") or 0)
+        ):
+            failed_names = ", ".join(history_coverage.get("failed_scenarios") or [])
+            detail += (
+                f", history blockers {history_coverage.get('failure_count')}"
+                + (f" ({_truncate(failed_names, 100)})" if failed_names else "")
+            )
         recovery_notes = []
         if research_cycle.get("state_recovered"):
             recovery_notes.append("state recovered")
         cycle_mutation_batch = research_cycle.get("mutation_batch")
         if isinstance(cycle_mutation_batch, dict) and cycle_mutation_batch.get("status") == "read_error":
             recovery_notes.append("mutation batch read_error")
+        cycle_generated_batch = research_cycle.get("generated_batch")
+        if isinstance(cycle_generated_batch, dict) and cycle_generated_batch.get("status") in {
+            "read_error",
+            "invalid",
+            "ignored",
+        }:
+            recovery_notes.append(
+                f"generated batch {cycle_generated_batch.get('status')}"
+            )
         if recovery_notes:
             detail += f", {'; '.join(recovery_notes)}"
         lines.append(
@@ -1542,6 +1784,75 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
         )
     else:
         lines.append("- Research cycle: `unknown` (missing report)")
+    generated_batch = report.get("generated_batch") or {}
+    if generated_batch:
+        summary = generated_batch.get("summary") or {}
+        by_product = summary.get("by_product") or {}
+        by_method = summary.get("by_method") or {}
+        product_detail = ", ".join(
+            f"{product} {count}" for product, count in sorted(by_product.items())
+        )
+        method_detail = ", ".join(
+            f"{method} {count}" for method, count in sorted(by_method.items())
+        )
+        hypotheses = generated_batch.get(
+            "hypotheses_count", summary.get("hypotheses", 0)
+        )
+        safety = (
+            f"research_only `{bool(generated_batch.get('research_only', False))}`, "
+            f"executable `{bool(generated_batch.get('executable', True))}`, "
+            f"paper `{bool(generated_batch.get('paper_trade_allowed', True))}`, "
+            f"live `{bool(generated_batch.get('live_allowed', True))}`"
+        )
+        detail = (
+            f"{hypotheses} bounded hypotheses"
+            f"{', ' + product_detail if product_detail else ''}, "
+            f"new {summary.get('new_hypotheses', 0)}, "
+            f"pending resumed {summary.get('resumed_pending', 0)}, "
+            f"unique behaviors {summary.get('unique_behavioral_specs', 0)}, "
+            f"development trials {summary.get('cumulative_trials', 0)}"
+        )
+        if method_detail:
+            detail += f", methods {method_detail}"
+        detail += f", {safety}, generated `{generated_batch.get('generated_at', 'unknown')}`"
+        if generated_batch.get("error"):
+            detail += f", error {_truncate(str(generated_batch.get('error')), 120)}"
+        lines.append(
+            f"- Generative research batch: `{_fmt_bool(generated_batch.get('ok'))}` "
+            f"({detail})"
+        )
+    else:
+        lines.append("- Generative research batch: `unknown` (missing report)")
+    experiment_memory = report.get("experiment_memory") or {}
+    if experiment_memory:
+        feedback = experiment_memory.get("feedback") or {}
+        totals = feedback.get("totals") or {}
+        outcomes = feedback.get("outcomes") or {}
+        rejection_reasons = feedback.get("rejection_reasons") or {}
+        outcome_detail = ", ".join(
+            f"{name} {count}" for name, count in list(outcomes.items())[:5]
+        ) or "none"
+        reason_detail = ", ".join(
+            f"{name} {count}" for name, count in list(rejection_reasons.items())[:5]
+        ) or "none"
+        if experiment_memory.get("status") == "ready":
+            detail = (
+                f"unique behaviors {totals.get('strategies', 0)}, "
+                f"proposals {totals.get('identities', 0)}, "
+                f"duplicate proposals {totals.get('duplicate_identities', 0)}, "
+                f"recorded evaluations {totals.get('evaluations', 0)}, "
+                f"completed {totals.get('completed', 0)}, claimed {totals.get('claimed', 0)}, "
+                f"development outcomes {outcome_detail}, top rejections {reason_detail}; "
+                "protected holdout outcomes excluded"
+            )
+        elif experiment_memory.get("status") == "missing":
+            detail = f"not created yet at {experiment_memory.get('path', 'unknown')}"
+        else:
+            detail = _truncate(str(experiment_memory.get("error") or "unavailable"), 160)
+        lines.append(
+            f"- Experiment memory: `{_fmt_bool(experiment_memory.get('ok'))}` "
+            f"({detail})"
+        )
     incubation_candidates = report.get("incubation_candidates") or {}
     if incubation_candidates:
         summary = incubation_candidates.get("summary") or {}
@@ -1691,8 +2002,8 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
             "",
             "## Products",
             "",
-            "| Product | Mode | Market | Cycle | Action | Open | Equity | Trades | Win Rate | Sized Return | Issue |",
-            "|---|---|---|---|---|---:|---:|---:|---:|---:|---|",
+            "| Product | Mode | Market | Cycle | Action | Open | Equity | Peak | Drawdown | Trades | Win Rate | Sized Return | Issue |",
+            "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
     for product in report["products"]:
@@ -1711,10 +2022,48 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
             issue = _state_error_issue(product.get("state_errors"))
         if not issue and trades.get("issue"):
             issue = trades["issue"]
+        if product.get("drawdown_halted") is True:
+            halt_issue = (
+                "drawdown halted"
+                f" at {product.get('drawdown_halted_at') or 'unknown time'}: "
+                f"{product.get('drawdown_halt_reason') or 'review required'}"
+            )
+            issue = f"{issue}; {halt_issue}" if issue else halt_issue
+        if product.get("exit_accounting_intent") is not None:
+            intent = product.get("exit_accounting_intent")
+            event_id = intent.get("exit_event_id") if isinstance(intent, dict) else None
+            accounting_issue = f"exit accounting pending ({event_id or 'invalid event id'})"
+            issue = f"{issue}; {accounting_issue}" if issue else accounting_issue
+        for state_key, label, detail_keys in (
+            ("pending_order", "pending order", ("stage", "client_id")),
+            (
+                "pending_entry_recovery",
+                "pending-entry recovery",
+                ("status", "recovery_client_id"),
+            ),
+            (
+                "risk_recovery_incident",
+                "risk recovery incident",
+                ("cause", "status", "recovery_client_id"),
+            ),
+            ("flatten_intent", "flatten intent", ("client_id",)),
+        ):
+            marker = product.get(state_key)
+            if marker is None:
+                continue
+            if isinstance(marker, dict):
+                detail = ", ".join(
+                    str(marker[key]) for key in detail_keys if marker.get(key) is not None
+                )
+            else:
+                detail = "invalid marker"
+            recovery_issue = f"{label} pending" + (f" ({detail})" if detail else "")
+            issue = f"{issue}; {recovery_issue}" if issue else recovery_issue
         issue_text = _truncate(str(issue).replace("|", "\\|"))
         lines.append(
             "| {name} | {mode} | {market} | {cycle} | {action} | {open_positions} | "
-            "{equity} | {trades} | {win_rate} | {sized_return} | {issue} |".format(
+            "{equity} | {peak_equity} | {drawdown} | {trades} | {win_rate} | "
+            "{sized_return} | {issue} |".format(
                 name=product["name"],
                 mode=product["mode"],
                 market=product["market"],
@@ -1723,7 +2072,13 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
                 open_positions=product.get("open_positions")
                 if product.get("open_positions") is not None
                 else "n/a",
-                equity=f"{product['equity']:.4f}" if isinstance(product.get("equity"), (int, float)) else "n/a",
+                equity=f"{product['equity']:.4f}" if isinstance(product.get("equity"), int | float) else "n/a",
+                peak_equity=(
+                    f"{product['peak_equity']:.4f}"
+                    if isinstance(product.get("peak_equity"), int | float)
+                    else "n/a"
+                ),
+                drawdown=_fmt_pct(product.get("drawdown_fraction")),
                 trades=trades["trades"],
                 win_rate=_fmt_pct(trades.get("win_rate")),
                 sized_return=_fmt_pct(trades.get("sized_return_sum", 0.0)),
@@ -1808,6 +2163,8 @@ def _operator_failure_report(config_path: Path, exc: Exception) -> dict[str, Any
         "research_smoke": {},
         "strategy_smoke": {},
         "research_cycle": {},
+        "generated_batch": {},
+        "experiment_memory": {},
         "artifact_hygiene": {},
         "testnet_rehearsal": {},
         "control": {},

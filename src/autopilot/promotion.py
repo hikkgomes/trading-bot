@@ -26,6 +26,7 @@ from src.autopilot.approvals import (
     strategy_fingerprint,
 )
 from src.autopilot.config import DEFAULT_CONFIG_PATH, ProductConfig, load_config
+from src.autopilot.execution_identity import execution_engine_digest
 from src.autopilot.io import write_json_atomic, write_text_atomic
 from src.autopilot.reporting import utc_now
 from src.autopilot.strategy_policy import validate_strategy, validate_strategy_artifact
@@ -42,7 +43,7 @@ class PromotionThresholds:
     min_holdout_return: float = 0.0
     max_paper_drawdown: float = 0.05
     max_paper_consecutive_losses: int = 4
-    min_paper_days: float = 0.0
+    min_paper_days: float = 7.0
 
 
 def _finite_threshold(value: Any) -> float | None:
@@ -84,36 +85,51 @@ def _load_trade_log(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def _paper_stats(trades: pd.DataFrame, strategy_id: str) -> dict[str, Any]:
+def _empty_paper_stats(
+    *,
+    unbound_trade_rows: int = 0,
+    other_fingerprint_rows: int = 0,
+) -> dict[str, Any]:
+    return {
+        "trades": 0,
+        "win_rate": None,
+        "total_sized_return": 0.0,
+        "avg_net_return": None,
+        "last_equity": None,
+        "max_drawdown": None,
+        "max_consecutive_losses": 0,
+        "first_exit_time": None,
+        "last_exit_time": None,
+        "paper_days": 0.0,
+        "invalid_return_rows": 0,
+        "unbound_trade_rows": unbound_trade_rows,
+        "other_fingerprint_rows": other_fingerprint_rows,
+    }
+
+
+def _paper_stats(
+    trades: pd.DataFrame,
+    strategy_id: str,
+    fingerprint: str,
+) -> dict[str, Any]:
     if trades.empty or "strategy_id" not in trades.columns:
-        return {
-            "trades": 0,
-            "win_rate": None,
-            "total_sized_return": 0.0,
-            "avg_net_return": None,
-            "last_equity": None,
-            "max_drawdown": None,
-            "max_consecutive_losses": 0,
-            "first_exit_time": None,
-            "last_exit_time": None,
-            "paper_days": 0.0,
-            "invalid_return_rows": 0,
-        }
-    subset = trades[trades["strategy_id"] == strategy_id].copy()
+        return _empty_paper_stats()
+    id_subset = trades[trades["strategy_id"] == strategy_id].copy()
+    if id_subset.empty:
+        return _empty_paper_stats()
+    if "strategy_fingerprint" not in id_subset.columns:
+        return _empty_paper_stats(unbound_trade_rows=int(len(id_subset)))
+    fingerprints = id_subset["strategy_fingerprint"]
+    bound = fingerprints.map(lambda value: isinstance(value, str) and bool(value.strip()))
+    exact = bound & (fingerprints == fingerprint)
+    unbound_trade_rows = int((~bound).sum())
+    other_fingerprint_rows = int((bound & ~exact).sum())
+    subset = id_subset[exact].copy()
     if subset.empty:
-        return {
-            "trades": 0,
-            "win_rate": None,
-            "total_sized_return": 0.0,
-            "avg_net_return": None,
-            "last_equity": None,
-            "max_drawdown": None,
-            "max_consecutive_losses": 0,
-            "first_exit_time": None,
-            "last_exit_time": None,
-            "paper_days": 0.0,
-            "invalid_return_rows": 0,
-        }
+        return _empty_paper_stats(
+            unbound_trade_rows=unbound_trade_rows,
+            other_fingerprint_rows=other_fingerprint_rows,
+        )
     if "exit_time" in subset.columns:
         subset["_exit_time"] = pd.to_datetime(subset["exit_time"], utc=True, errors="coerce")
         subset = subset.sort_values("_exit_time", na_position="last")
@@ -169,6 +185,8 @@ def _paper_stats(trades: pd.DataFrame, strategy_id: str) -> dict[str, Any]:
         "last_exit_time": last_exit.isoformat() if last_exit is not None else None,
         "paper_days": paper_days,
         "invalid_return_rows": invalid_return_rows,
+        "unbound_trade_rows": unbound_trade_rows,
+        "other_fingerprint_rows": other_fingerprint_rows,
     }
 
 
@@ -187,6 +205,7 @@ def _approval_status(
     *,
     artifact_path: Path,
     artifact_digest_value: str,
+    execution_engine_digest_value: str,
     product: ProductConfig | None,
 ) -> str:
     approvals = ledger_payload.get("approvals", {})
@@ -208,6 +227,8 @@ def _approval_status(
         return "artifact_mismatch"
     if entry.get("artifact_digest") != artifact_digest_value:
         return "artifact_content_mismatch"
+    if entry.get("execution_engine_digest") != execution_engine_digest_value:
+        return "execution_engine_mismatch"
     if product is not None:
         approved_product = entry.get("product")
         if not isinstance(approved_product, dict):
@@ -218,6 +239,9 @@ def _approval_status(
             or approved_product.get("market") != product.market
             or str(approved_product.get("symbol", "")).upper() != product.symbol.upper()
             or str(approved_product.get("base_asset", "")).upper() != product.base_asset.upper()
+            or approved_product.get("starting_equity") != product.starting_equity
+            or approved_product.get("regime_guard") is not product.regime_guard
+            or approved_product.get("regime_mayer_top") != product.regime_mayer_top
         ):
             return "product_mismatch"
     return "approved"
@@ -272,7 +296,10 @@ def _recommendation(
     elif holdout <= thresholds.min_holdout_return:
         reasons.append(f"holdout_total_return {holdout:.6f} <= {thresholds.min_holdout_return:.6f}")
     if paper["trades"] < thresholds.min_paper_trades:
-        reasons.append(f"paper trades {paper['trades']} < {thresholds.min_paper_trades}")
+        reasons.append(
+            "exact-fingerprint paper trades "
+            f"{paper['trades']} < {thresholds.min_paper_trades}"
+        )
     if paper.get("invalid_return_rows", 0) > 0:
         reasons.append(f"paper trade log has {paper['invalid_return_rows']} invalid return row(s)")
     if paper["total_sized_return"] <= thresholds.min_paper_sized_return:
@@ -336,6 +363,7 @@ def build_promotion_review(
         }
     artifact = load_artifact(artifact_path)
     current_artifact_digest = artifact_digest(artifact)
+    current_execution_engine_digest = execution_engine_digest()
     trades = _load_trade_log(trade_log)
     ledger_error = None
     try:
@@ -364,7 +392,7 @@ def build_promotion_review(
     strategies = []
     for index, strategy in enumerate(artifact.get("strategies", [])):
         fingerprint = strategy_fingerprint(strategy)
-        paper = _paper_stats(trades, strategy.get("id", ""))
+        paper = _paper_stats(trades, strategy.get("id", ""), fingerprint)
         status = (
             "ledger_error"
             if ledger_error is not None
@@ -373,6 +401,7 @@ def build_promotion_review(
                 fingerprint,
                 artifact_path=artifact_path,
                 artifact_digest_value=current_artifact_digest,
+                execution_engine_digest_value=current_execution_engine_digest,
                 product=product,
             )
         )
@@ -404,6 +433,8 @@ def build_promotion_review(
                 [
                     "--artifact",
                     str(artifact_path),
+                    "--expected-artifact-digest",
+                    current_artifact_digest,
                     "--strategy-id",
                     str(strategy.get("id")),
                     "--approved-by",
@@ -436,6 +467,8 @@ def build_promotion_review(
     return {
         "generated_at": utc_now(),
         "artifact_path": str(artifact_path),
+        "artifact_digest": current_artifact_digest,
+        "execution_engine_digest": current_execution_engine_digest,
         "trade_log": str(trade_log),
         "ledger_path": str(ledger_path),
         "product": None
@@ -482,6 +515,8 @@ def render_markdown(review: dict[str, Any]) -> str:
         "",
         f"Generated: `{review['generated_at']}`",
         f"Artifact: `{review['artifact_path']}`",
+        f"Artifact digest: `{review.get('artifact_digest') or 'unavailable'}`",
+        f"Execution engine digest: `{review.get('execution_engine_digest') or 'unavailable'}`",
         f"Trade log: `{review['trade_log']}`",
         "",
     ]
@@ -585,7 +620,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-holdout-return", type=float, default=0.0)
     parser.add_argument("--max-paper-drawdown", type=float, default=0.05)
     parser.add_argument("--max-paper-consecutive-losses", type=int, default=4)
-    parser.add_argument("--min-paper-days", type=float, default=0.0)
+    parser.add_argument("--min-paper-days", type=float, default=7.0)
     return parser.parse_args()
 
 

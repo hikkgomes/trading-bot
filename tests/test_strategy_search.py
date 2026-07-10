@@ -1,15 +1,18 @@
 import json
 
 import pandas as pd
+import pytest
 
 from src.discover_patterns import Condition
 from src.strategy_search import (
+    SimArrays,
     StrategyCandidate,
     _generate_pairs_flat,
     _generate_pairs_pool,
     combined_mask,
     regime_breakdown,
     score_candidate,
+    simulate_net_returns,
     simulate_trades,
     timeframe_for_feature,
     trade_metrics,
@@ -71,6 +74,57 @@ def test_simulate_long_trade_uses_next_open_and_take_profit():
     assert len(trades) == 1
     assert trades["exit_reason"].iloc[0] == "take_profit"
     assert round(trades["net_return"].iloc[0], 6) == 0.01
+
+
+def test_usdt_short_uses_linear_futures_return_in_full_and_fast_simulators():
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=4, freq="15min", tz="UTC"),
+            "tf_15m_open": [100.0, 100.0, 90.0, 90.0],
+            "tf_15m_high": [100.0, 100.0, 100.0, 90.0],
+            "tf_15m_low": [100.0, 100.0, 90.0, 90.0],
+            "tf_15m_close": [100.0, 100.0, 90.0, 90.0],
+        }
+    )
+    signal = pd.Series([True, False, False, False])
+
+    trades = simulate_trades(
+        data,
+        signal,
+        direction="short",
+        horizon_bars=1,
+        fee_bps=0,
+        slippage_bps=0,
+        take_profit=0.5,
+        stop_loss=0.5,
+        pnl_unit="usdt",
+    )
+    fast_returns = simulate_net_returns(
+        SimArrays.from_dataframe(data),
+        signal.to_numpy(),
+        direction="short",
+        horizon_bars=1,
+        fee_bps=0,
+        slippage_bps=0,
+        take_profit=0.5,
+        stop_loss=0.5,
+        pnl_unit="usdt",
+    )
+    fast_btc_returns = simulate_net_returns(
+        SimArrays.from_dataframe(data),
+        signal.to_numpy(),
+        direction="short",
+        horizon_bars=1,
+        fee_bps=0,
+        slippage_bps=0,
+        take_profit=0.5,
+        stop_loss=0.5,
+        pnl_unit="btc",
+    )
+
+    assert trades["gross_return"].iloc[0] == pytest.approx(0.10)
+    assert fast_returns[0] == pytest.approx(0.10)
+    assert fast_btc_returns[0] == pytest.approx(1 / 9)
 
 
 def test_trade_metrics_compounds_returns():

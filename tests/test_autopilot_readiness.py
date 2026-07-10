@@ -1,13 +1,18 @@
 import json
 import time
 from collections import namedtuple
+from pathlib import Path
 
 import pytest
 
 import src.autopilot.readiness as readiness
 from src.autopilot.approvals import ApprovalLedger, artifact_digest, strategy_fingerprint
 from src.autopilot.config import AutopilotConfig, JobConfig, ProductConfig
+from src.autopilot.execution_identity import execution_engine_digest
+from src.autopilot.experiment_memory import ExperimentMemory
 from src.autopilot.readiness import build_readiness_report, main, render_readiness_markdown
+from src.autopilot.research_factory import build_generation, load_factory_config
+from src.execution.config import ExchangeConfig
 
 VALID_SERVICE_INSTALLER = """#!/bin/bash
 set -euo pipefail
@@ -16,7 +21,8 @@ validate_unit_value() { :; }
 validate_positive_integer() { :; }
 validate_zero_or_one() { :; }
 "$PYTHON" -m src.autopilot.runtime --config "$CONFIG" --validate
-ExecStartPre=$PYTHON_UNIT -m src.autopilot.readiness --config $CONFIG_UNIT
+"$PYTHON" -m src.autopilot.readiness --config "$CONFIG"
+ExecStart=$PYTHON_UNIT -m src.autopilot.runtime --config $CONFIG_UNIT --skip-jobs
 HEALTHCHECK_TIMER_NAME="${HEALTHCHECK_TIMER_NAME:-trading-bot-autopilot-healthcheck.timer}"
 systemctl --user enable --now "$HEALTHCHECK_TIMER_NAME"
 """
@@ -40,6 +46,33 @@ def product(tmp_path, **overrides):
     }
     payload.update(overrides)
     return ProductConfig(**payload)
+
+
+def write_research_factory_config(tmp_path, monkeypatch):
+    import src.autopilot.research_factory as research_factory
+
+    monkeypatch.setattr(research_factory, "PROJECT_ROOT", tmp_path)
+    payload = json.loads(Path("config/research_factory.json").read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "memory_path": "runtime/research/memory.sqlite3",
+            "generated_batch_path": "runtime/research/batch.json",
+            "openclaw_accepted_dir": "runtime/openclaw/accepted",
+            "openclaw_proposal_state_path": "runtime/research/proposals.json",
+        }
+    )
+    payload["budgets"].update(
+        {
+            "max_candidates_per_cycle": 5,
+            "max_candidates_per_space": 1,
+            "max_generation_attempts": 300,
+            "max_generation_seconds": 5,
+        }
+    )
+    path = tmp_path / "config" / "research_factory.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
 def strategy_artifact(path):
@@ -90,7 +123,112 @@ def strategy_artifact(path):
     return strategy
 
 
-def test_service_installer_status_accepts_readable_valid_bash_script_without_executable_bit(tmp_path):
+def test_research_factory_readiness_validates_goals_horizons_and_path_wiring(
+    tmp_path, monkeypatch
+):
+    factory_path = write_research_factory_config(tmp_path, monkeypatch)
+    cfg = AutopilotConfig(
+        research_factory_config_file=factory_path,
+        generated_batch_file=tmp_path / "runtime" / "research" / "batch.json",
+        experiment_memory_file=tmp_path / "runtime" / "research" / "memory.sqlite3",
+    )
+
+    status, factory = readiness._research_factory_status(cfg)
+
+    assert factory is not None
+    assert status["ok"] is True
+    assert status["active_income_opportunities"] == [
+        "day_trading",
+        "scalping",
+        "swing_trading",
+    ]
+    assert status["btc_accumulation_timeframes"] == ["1h", "4h"]
+    assert all(status["goal_contract"].values())
+    assert all(status["path_contract"].values())
+
+
+def test_research_factory_readiness_rejects_autopilot_memory_path_mismatch(
+    tmp_path, monkeypatch
+):
+    factory_path = write_research_factory_config(tmp_path, monkeypatch)
+    cfg = AutopilotConfig(
+        research_factory_config_file=factory_path,
+        generated_batch_file=tmp_path / "runtime" / "research" / "batch.json",
+        experiment_memory_file=tmp_path / "runtime" / "other-memory.sqlite3",
+    )
+
+    status, factory = readiness._research_factory_status(cfg)
+
+    assert factory is not None
+    assert status["ok"] is False
+    assert status["reason"] == "unsafe_search_contract"
+    assert status["problems"] == ["path_mismatch:memory"]
+
+
+def test_experiment_memory_readiness_handles_clean_first_boot_and_detects_corruption(tmp_path):
+    memory_path = tmp_path / "research" / "memory.sqlite3"
+    backup_path = tmp_path / "research" / "memory.backup.sqlite3"
+
+    missing = readiness._experiment_memory_status(memory_path, backup_path=backup_path)
+    assert missing["ok"] is True
+    assert missing["reason"] == "initializes_on_first_factory_run"
+    assert memory_path.exists() is False
+
+    with ExperimentMemory(memory_path):
+        pass
+    ready = readiness._experiment_memory_status(memory_path, backup_path=backup_path)
+    assert ready["ok"] is True
+    assert ready["integrity"]["deep"] is True
+
+    memory_path.write_bytes(b"not a sqlite database")
+    corrupt = readiness._experiment_memory_status(memory_path, backup_path=backup_path)
+    assert corrupt["ok"] is False
+    assert corrupt["reason"] == "integrity_failed"
+
+
+def test_generated_batch_readiness_accepts_only_canonical_safe_factory_output(
+    tmp_path, monkeypatch
+):
+    factory_path = write_research_factory_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "src.autopilot.research_factory._feature_inventory_for_space", lambda _space: None
+    )
+    factory = load_factory_config(factory_path)
+    payload = build_generation(factory, seed=42, now="2026-07-10T00:00:00+00:00")
+    factory.generated_batch_path.parent.mkdir(parents=True, exist_ok=True)
+    factory.generated_batch_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    ready = readiness._generated_batch_status(factory.generated_batch_path, factory=factory)
+    assert ready["ok"] is True
+    assert ready["hypotheses"] == 5
+    assert ready["unique_behavioral_specs"] == 5
+    assert ready["products"] == ["active_income", "btc_accumulation"]
+
+    payload["live_allowed"] = True
+    factory.generated_batch_path.write_text(json.dumps(payload), encoding="utf-8")
+    unsafe = readiness._generated_batch_status(factory.generated_batch_path, factory=factory)
+    assert unsafe["ok"] is False
+    assert unsafe["level"] == "error"
+    assert unsafe["reason"] == "failed_safety_contract"
+
+
+def test_generated_batch_readiness_warns_without_creating_a_first_boot_batch(
+    tmp_path, monkeypatch
+):
+    factory_path = write_research_factory_config(tmp_path, monkeypatch)
+    factory = load_factory_config(factory_path)
+
+    status = readiness._generated_batch_status(factory.generated_batch_path, factory=factory)
+
+    assert status["ok"] is False
+    assert status["level"] == "warning"
+    assert status["next_action"] == "make research-generate"
+    assert factory.generated_batch_path.exists() is False
+
+
+def test_service_installer_status_accepts_readable_valid_bash_script_without_executable_bit(
+    tmp_path,
+):
     installer = tmp_path / "install_autopilot_service.sh"
     installer.write_text(VALID_SERVICE_INSTALLER, encoding="utf-8")
     installer.chmod(0o644)
@@ -125,7 +263,7 @@ def test_service_installer_status_rejects_script_missing_startup_contract(tmp_pa
     assert status["has_shell_shebang"] is True
     assert status["required_markers"]["strict_shell"] is True
     assert "config_validation" in status["missing_markers"]
-    assert "readiness_prestart" in status["missing_markers"]
+    assert "readiness_install_gate" in status["missing_markers"]
     assert "healthcheck_timer" in status["missing_markers"]
     assert "unit_name_validation" in status["missing_markers"]
     assert "raw_unit_value_validation" in status["missing_markers"]
@@ -233,12 +371,19 @@ def test_offline_rehearsal_status_accepts_complete_workflow(tmp_path):
 
 def passing_preflight_checks(product_config):
     market_type = "spot" if product_config.objective == "btc_accumulation" else "futures"
+    exchange = "binance" if market_type == "spot" else "binanceusdm"
     exchange_detail = {
-        "exchange": "binance" if market_type == "spot" else "binanceusdm",
+        "exchange": exchange,
         "market_type": market_type,
         "testnet": False,
         "require_testnet": False,
         "quote_asset": "USDT",
+        "account_fingerprint": ExchangeConfig(
+            exchange=exchange,
+            market_type=market_type,
+            api_key="key",
+            testnet=False,
+        ).account_fingerprint,
         "max_notional_usd": 100.0,
         "max_fill_slippage_bps": 100.0,
     }
@@ -247,6 +392,7 @@ def passing_preflight_checks(product_config):
         exchange_detail["futures_margin_mode"] = "isolated"
     checks = [
         {"name": "product_config", "ok": True},
+        {"name": "execution_engine_identity", "ok": True},
         {"name": "strategy_artifact_exists", "ok": True},
         {"name": "strategy_fingerprints", "ok": True},
         {"name": "strategy_policy", "ok": True},
@@ -266,6 +412,31 @@ def passing_preflight_checks(product_config):
         },
     ]
     if product_config.objective == "active_income" and product_config.market == "futures":
+        checks.append(
+            {
+                "name": "broker_position_mode_one_way",
+                "ok": True,
+                "detail": {"symbol": product_config.symbol, "one_way": True},
+            }
+        )
+        checks.append(
+            {
+                "name": "broker_native_protective_stops",
+                "ok": True,
+                "detail": {"supported": True},
+            }
+        )
+        checks.append(
+            {
+                "name": "broker_open_orders_empty",
+                "ok": True,
+                "detail": {
+                    "symbol": product_config.symbol,
+                    "regular": {"count": 0, "orders": []},
+                    "conditional": {"count": 0, "orders": []},
+                },
+            }
+        )
         checks.append({"name": "broker_position_flat", "ok": True})
     if product_config.objective == "btc_accumulation" and product_config.market == "spot":
         checks.append({"name": "broker_spot_position_non_negative", "ok": True})
@@ -295,6 +466,12 @@ def mark_preflight_testnet_required(preflight):
                         "testnet": True,
                         "require_testnet": True,
                         "quote_asset": "USDT",
+                        "account_fingerprint": ExchangeConfig(
+                            exchange="binance" if market_type == "spot" else "binanceusdm",
+                            market_type=market_type,
+                            api_key="key",
+                            testnet=True,
+                        ).account_fingerprint,
                         "max_notional_usd": 100.0,
                         "max_fill_slippage_bps": 100.0,
                     }
@@ -321,6 +498,7 @@ def write_preflight(path, product_config, *, generated_ts=None):
                             for strategy in artifact.get("strategies", [])
                         ],
                         "artifact_digest": artifact_digest(artifact),
+                        "execution_engine_digest": execution_engine_digest(),
                         "ok": True,
                         "product": {
                             "name": product_config.name,
@@ -329,6 +507,9 @@ def write_preflight(path, product_config, *, generated_ts=None):
                             "market": product_config.market,
                             "symbol": product_config.symbol,
                             "execution_mode": product_config.execution_mode,
+                            "starting_equity": product_config.starting_equity,
+                            "regime_guard": product_config.regime_guard,
+                            "regime_mayer_top": product_config.regime_mayer_top,
                             "strategies_path": str(product_config.strategies_path),
                         },
                         "checks": passing_preflight_checks(product_config),
@@ -374,8 +555,81 @@ def write_testnet_rehearsal(path, *, generated_ts=None, preflight=None):
         },
         "notional_usd": 5.0,
         "order_qty": 0.05,
-        "entry_fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-        "close_fill": {"symbol": "BTCUSDT", "side": "sell", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1001.0},
+        "entry_fill": {
+            "symbol": "BTCUSDT",
+            "side": "buy",
+            "qty": 0.05,
+            "price": 100.0,
+            "fee": 0.01,
+            "timestamp": 1000.0,
+        },
+        "close_fill": {
+            "symbol": "BTCUSDT",
+            "side": "sell",
+            "qty": 0.05,
+            "price": 100.0,
+            "fee": 0.01,
+            "timestamp": 1001.0,
+        },
+        "native_protective_stop": {
+            "capability_supported": True,
+            "native": True,
+            "reduce_only": True,
+            "trigger_distance_fraction": 0.05,
+            "trigger_reference_price": 100.0,
+            "raw_trigger_price": 95.0,
+            "normalized_trigger_price": 95.0,
+            "open_verified": True,
+            "canceled_verified": True,
+            "placed": {
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "qty": 0.05,
+                "trigger_price": 95.0,
+                "status": "open",
+                "order_id": "stop-1",
+                "client_id": "testnet-stop-1",
+                "filled_qty": 0.0,
+                "average_price": None,
+                "fee": 0.0,
+            },
+            "fetched_open": {
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "qty": 0.05,
+                "trigger_price": 95.0,
+                "status": "open",
+                "order_id": "stop-1",
+                "client_id": "testnet-stop-1",
+                "filled_qty": 0.0,
+                "average_price": None,
+                "fee": 0.0,
+            },
+            "cancel_result": {
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "qty": 0.05,
+                "trigger_price": 95.0,
+                "status": "canceled",
+                "order_id": "stop-1",
+                "client_id": "testnet-stop-1",
+                "filled_qty": 0.0,
+                "average_price": None,
+                "fee": 0.0,
+            },
+            "fetched_terminal": {
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "qty": 0.05,
+                "trigger_price": 95.0,
+                "status": "canceled",
+                "order_id": "stop-1",
+                "client_id": "testnet-stop-1",
+                "filled_qty": 0.0,
+                "average_price": None,
+                "fee": 0.0,
+            },
+        },
         "final_position_qty": 0.0,
     }
     if preflight is not None:
@@ -398,13 +652,27 @@ def test_readiness_allows_paper_product_waiting_for_artifact(tmp_path):
 
     assert report["ok"] is True
     assert report["blocking_count"] == 0
-    check = next(item for item in report["checks"] if item["name"] == "active_income: paper strategy artifact")
+    check = next(
+        item
+        for item in report["checks"]
+        if item["name"] == "active_income: paper strategy artifact"
+    )
     assert check["ok"] is False
     assert check["level"] == "info"
     assert "product will wait" in check["detail"]
     assert "Autopilot Readiness" in markdown
-    assert next(item for item in report["checks"] if item["name"] == "alert log path writable")["ok"] is True
-    assert next(item for item in report["checks"] if item["name"] == "alert cooldown state path writable")["ok"] is True
+    assert (
+        next(item for item in report["checks"] if item["name"] == "alert log path writable")["ok"]
+        is True
+    )
+    assert (
+        next(
+            item
+            for item in report["checks"]
+            if item["name"] == "alert cooldown state path writable"
+        )["ok"]
+        is True
+    )
 
 
 def test_readiness_blocks_missing_core_products_in_production_mode(tmp_path):
@@ -466,7 +734,9 @@ def test_readiness_blocks_missing_core_jobs_in_production_mode(tmp_path):
 def test_readiness_warns_when_offline_workflow_rehearsal_has_not_run(tmp_path, monkeypatch):
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
-    (scripts_dir / "install_autopilot_service.sh").write_text(VALID_SERVICE_INSTALLER, encoding="utf-8")
+    (scripts_dir / "install_autopilot_service.sh").write_text(
+        VALID_SERVICE_INSTALLER, encoding="utf-8"
+    )
     monkeypatch.setattr(readiness, "PROJECT_ROOT", tmp_path)
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",
@@ -592,7 +862,9 @@ def test_readiness_blocks_unwritable_alert_paths(tmp_path, monkeypatch):
     report = build_readiness_report(cfg, env={})
 
     assert report["ok"] is False
-    failed = {item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]}
+    failed = {
+        item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]
+    }
     assert "alert log path writable" in failed
     assert "alert cooldown state path writable" in failed
 
@@ -634,7 +906,9 @@ def test_readiness_blocks_symlink_scheduled_job_state_path(tmp_path):
 
     report = build_readiness_report(cfg, env={})
 
-    check = next(item for item in report["checks"] if item["name"] == "scheduled job state path writable")
+    check = next(
+        item for item in report["checks"] if item["name"] == "scheduled job state path writable"
+    )
     assert report["ok"] is False
     assert check["ok"] is False
     assert check["detail"] == str(job_state)
@@ -652,7 +926,9 @@ def test_readiness_blocks_live_product_without_required_gates(tmp_path):
     report = build_readiness_report(cfg, env={"TRADING_LIVE": "0"}, ccxt_available=True)
 
     assert report["ok"] is False
-    failed = {item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]}
+    failed = {
+        item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]
+    }
     assert "active_income: strategy artifact exists" in failed
     assert "active_income: preflight report exists" in failed
     assert "active_income: TRADING_LIVE=1" in failed
@@ -675,7 +951,9 @@ def test_readiness_warns_for_invalid_paper_artifact_without_blocking(tmp_path):
     report = build_readiness_report(cfg, env={}, ccxt_available=True)
 
     assert report["ok"] is True
-    warning = next(item for item in report["checks"] if item["name"] == "active_income: strategy policy")
+    warning = next(
+        item for item in report["checks"] if item["name"] == "active_income: strategy policy"
+    )
     assert warning["ok"] is False
     assert warning["level"] == "warning"
     assert "holdout_total_return -0.010000 must be positive" in warning["detail"]
@@ -697,7 +975,9 @@ def test_readiness_passes_live_product_with_artifact_approval_preflight_and_env(
     )
     write_preflight(preflight, live_product)
     write_testnet_rehearsal(testnet, preflight=json.loads(preflight.read_text(encoding="utf-8")))
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=live_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=live_product
+    )
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",
         status_file=tmp_path / "status.json",
@@ -709,7 +989,7 @@ def test_readiness_passes_live_product_with_artifact_approval_preflight_and_env(
         cfg,
         env={
             "TRADING_LIVE": "1",
-            "EXCHANGE_TESTNET": "1",
+            "EXCHANGE_TESTNET": "0",
             "EXCHANGE_API_KEY": "key",
             "EXCHANGE_API_SECRET": "secret",
             "MAX_NOTIONAL_USD": "25",
@@ -721,7 +1001,9 @@ def test_readiness_passes_live_product_with_artifact_approval_preflight_and_env(
     )
 
     assert report["ok"] is True
-    failed_errors = [item for item in report["checks"] if item["level"] == "error" and not item["ok"]]
+    failed_errors = [
+        item for item in report["checks"] if item["level"] == "error" and not item["ok"]
+    ]
     assert failed_errors == []
 
 
@@ -741,12 +1023,14 @@ def test_readiness_loads_dotenv_when_env_is_not_explicit(tmp_path, monkeypatch):
     )
     write_preflight(preflight, live_product)
     write_testnet_rehearsal(testnet, preflight=json.loads(preflight.read_text(encoding="utf-8")))
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=live_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=live_product
+    )
     (tmp_path / ".env").write_text(
         "\n".join(
             [
                 "TRADING_LIVE=1",
-                "EXCHANGE_TESTNET=1",
+                "EXCHANGE_TESTNET=0",
                 "EXCHANGE_API_KEY=dotenv-key",
                 "EXCHANGE_API_SECRET=dotenv-secret",
                 "MAX_NOTIONAL_USD=25",
@@ -757,9 +1041,12 @@ def test_readiness_loads_dotenv_when_env_is_not_explicit(tmp_path, monkeypatch):
         ),
         encoding="utf-8",
     )
+    (tmp_path / ".env").chmod(0o600)
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
-    (scripts_dir / "install_autopilot_service.sh").write_text(VALID_SERVICE_INSTALLER, encoding="utf-8")
+    (scripts_dir / "install_autopilot_service.sh").write_text(
+        VALID_SERVICE_INSTALLER, encoding="utf-8"
+    )
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",
         status_file=tmp_path / "status.json",
@@ -782,8 +1069,76 @@ def test_readiness_loads_dotenv_when_env_is_not_explicit(tmp_path, monkeypatch):
     report = build_readiness_report(cfg, ccxt_available=True)
 
     assert report["ok"] is True
-    failed_errors = [item for item in report["checks"] if item["level"] == "error" and not item["ok"]]
+    failed_errors = [
+        item for item in report["checks"] if item["level"] == "error" and not item["ok"]
+    ]
     assert failed_errors == []
+
+
+def test_readiness_dotenv_reader_handles_inline_comments_and_quotes(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "TRADING_LIVE=1 # live flag",
+                'AUTOPILOT_WEBHOOK_URL="https://example.test/hook#alerts" # channel',
+                "TOKEN=abc#123",
+                "SPACED='  quoted value  ' # comment",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    values = readiness._read_dotenv(env_file)
+
+    assert values["TRADING_LIVE"] == "1"
+    assert values["AUTOPILOT_WEBHOOK_URL"] == "https://example.test/hook#alerts"
+    assert values["TOKEN"] == "abc#123"
+    assert values["SPACED"] == "  quoted value  "
+
+
+def test_readiness_dotenv_reader_defers_unreadable_file_to_status_check(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("EXCHANGE_API_KEY=secret\n", encoding="utf-8")
+    original_read_text = Path.read_text
+
+    def deny_env_read(path, *args, **kwargs):
+        if path == env_file:
+            raise PermissionError("permission denied")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deny_env_read)
+
+    assert readiness._read_dotenv(env_file) == {}
+
+
+def test_environment_file_status_requires_current_owner_and_private_mode(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("EXCHANGE_API_KEY=secret\n", encoding="utf-8")
+    env_file.chmod(0o640)
+
+    insecure = readiness._environment_file_status(env_file)
+
+    assert insecure["ok"] is False
+    assert insecure["reason"] == "credential_file_not_owner_private"
+    assert insecure["mode"] == "0640"
+    assert insecure["group_world_permissions"] == 0o40
+
+    env_file.chmod(0o600)
+    secure = readiness._environment_file_status(env_file)
+    assert secure["ok"] is True
+    assert secure["reason"] == "ready"
+
+
+def test_readiness_parses_shipped_dotenv_example():
+    values = readiness._read_dotenv(Path(".env.example"))
+
+    assert readiness._env_bool(values, "TRADING_LIVE", True) is False
+    assert readiness._env_bool(values, "EXCHANGE_TESTNET", False) is True
+    assert readiness._env_float(values, "MAX_NOTIONAL_USD", 0.0) == 250.0
+    assert readiness._env_float(values, "MAX_FILL_SLIPPAGE_BPS", 0.0) == 100.0
+    assert values["FUTURES_MARGIN_MODE"] == "isolated"
+    assert values["MAX_FUTURES_LEVERAGE"] == "1"
 
 
 def test_readiness_ignores_symlink_dotenv_for_live_credentials(tmp_path, monkeypatch):
@@ -802,7 +1157,9 @@ def test_readiness_ignores_symlink_dotenv_for_live_credentials(tmp_path, monkeyp
     )
     write_preflight(preflight, live_product)
     write_testnet_rehearsal(testnet, preflight=json.loads(preflight.read_text(encoding="utf-8")))
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=live_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=live_product
+    )
     target = tmp_path / "external.env"
     target.write_text(
         "\n".join(
@@ -822,7 +1179,9 @@ def test_readiness_ignores_symlink_dotenv_for_live_credentials(tmp_path, monkeyp
     (tmp_path / ".env").symlink_to(target)
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
-    (scripts_dir / "install_autopilot_service.sh").write_text(VALID_SERVICE_INSTALLER, encoding="utf-8")
+    (scripts_dir / "install_autopilot_service.sh").write_text(
+        VALID_SERVICE_INSTALLER, encoding="utf-8"
+    )
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",
         status_file=tmp_path / "status.json",
@@ -844,7 +1203,9 @@ def test_readiness_ignores_symlink_dotenv_for_live_credentials(tmp_path, monkeyp
 
     report = build_readiness_report(cfg, ccxt_available=True)
 
-    failed = {item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]}
+    failed = {
+        item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]
+    }
     assert report["ok"] is False
     assert "environment file not symlink" in failed
     assert "active_income: TRADING_LIVE=1" in failed
@@ -867,7 +1228,9 @@ def test_readiness_blocks_live_product_missing_required_testnet_rehearsal(tmp_pa
         testnet_rehearsal_report=tmp_path / "missing_testnet.json",
     )
     write_preflight(preflight, live_product)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=live_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=live_product
+    )
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",
         status_file=tmp_path / "status.json",
@@ -879,7 +1242,7 @@ def test_readiness_blocks_live_product_missing_required_testnet_rehearsal(tmp_pa
         cfg,
         env={
             "TRADING_LIVE": "1",
-            "EXCHANGE_TESTNET": "1",
+            "EXCHANGE_TESTNET": "0",
             "EXCHANGE_API_KEY": "key",
             "EXCHANGE_API_SECRET": "secret",
             "MAX_NOTIONAL_USD": "25",
@@ -890,7 +1253,9 @@ def test_readiness_blocks_live_product_missing_required_testnet_rehearsal(tmp_pa
         ccxt_available=True,
     )
 
-    failed = {item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]}
+    failed = {
+        item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]
+    }
     assert "active_income: testnet rehearsal report exists" in failed
 
 
@@ -917,10 +1282,16 @@ def test_readiness_blocks_invalid_exchange_boolean_env(tmp_path):
         ccxt_available=True,
     )
 
-    check = next(item for item in report["checks"] if item["name"] == "active_income: exchange environment values")
+    check = next(
+        item
+        for item in report["checks"]
+        if item["name"] == "active_income: exchange environment values"
+    )
     assert report["ok"] is False
     assert check["ok"] is False
-    assert check["detail"] == ["EXCHANGE_TESTNET must be a boolean flag: 1/0, true/false, yes/no, or on/off."]
+    assert check["detail"] == [
+        "EXCHANGE_TESTNET must be a boolean flag: 1/0, true/false, yes/no, or on/off."
+    ]
 
 
 def test_readiness_blocks_blank_exchange_selector(tmp_path):
@@ -946,7 +1317,11 @@ def test_readiness_blocks_blank_exchange_selector(tmp_path):
         ccxt_available=True,
     )
 
-    check = next(item for item in report["checks"] if item["name"] == "active_income: exchange environment values")
+    check = next(
+        item
+        for item in report["checks"]
+        if item["name"] == "active_income: exchange environment values"
+    )
     assert report["ok"] is False
     assert check["ok"] is False
     assert check["detail"] == ["FUTURES_EXCHANGE must be non-empty."]
@@ -975,7 +1350,11 @@ def test_readiness_blocks_blank_live_credentials(tmp_path):
         ccxt_available=True,
     )
 
-    check = next(item for item in report["checks"] if item["name"] == "active_income: exchange API credentials")
+    check = next(
+        item
+        for item in report["checks"]
+        if item["name"] == "active_income: exchange API credentials"
+    )
     assert report["ok"] is False
     assert check["ok"] is False
 
@@ -996,12 +1375,47 @@ def test_readiness_passes_live_product_with_required_testnet_rehearsal(tmp_path)
     )
     write_preflight(preflight, live_product)
     write_testnet_rehearsal(testnet, preflight=json.loads(preflight.read_text(encoding="utf-8")))
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=live_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=live_product
+    )
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",
         status_file=tmp_path / "status.json",
         approval_ledger=ledger,
         products=[live_product],
+    )
+
+    report = build_readiness_report(
+        cfg,
+        env={
+            "TRADING_LIVE": "1",
+            "EXCHANGE_TESTNET": "0",
+            "EXCHANGE_API_KEY": "key",
+            "EXCHANGE_API_SECRET": "secret",
+            "MAX_NOTIONAL_USD": "25",
+            "FUTURES_MARGIN_MODE": "isolated",
+            "MAX_FUTURES_LEVERAGE": "1",
+            "FUTURES_EXCHANGE": "binanceusdm",
+        },
+        ccxt_available=True,
+    )
+
+    assert report["ok"] is True
+    check = next(
+        item
+        for item in report["checks"]
+        if item["name"] == "active_income: testnet rehearsal current"
+    )
+    assert check["ok"] is True
+    assert check["detail"]["notional_usd"] == 5.0
+
+
+def test_readiness_blocks_testnet_routing_for_configured_live_product(tmp_path):
+    cfg = AutopilotConfig(
+        control_file=tmp_path / "control.json",
+        status_file=tmp_path / "status.json",
+        approval_ledger=tmp_path / "approvals.json",
+        products=[product(tmp_path, execution_mode="live")],
     )
 
     report = build_readiness_report(
@@ -1019,10 +1433,13 @@ def test_readiness_passes_live_product_with_required_testnet_rehearsal(tmp_path)
         ccxt_available=True,
     )
 
-    assert report["ok"] is True
-    check = next(item for item in report["checks"] if item["name"] == "active_income: testnet rehearsal current")
-    assert check["ok"] is True
-    assert check["detail"]["notional_usd"] == 5.0
+    check = next(
+        item
+        for item in report["checks"]
+        if item["name"] == "active_income: production exchange routing"
+    )
+    assert check["ok"] is False
+    assert check["level"] == "error"
 
 
 def test_readiness_blocks_stale_live_preflight_report(tmp_path):
@@ -1038,7 +1455,9 @@ def test_readiness_blocks_stale_live_preflight_report(tmp_path):
         preflight_max_age_seconds=60,
     )
     write_preflight(preflight, live_product, generated_ts=time.time() - 120)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=live_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=live_product
+    )
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",
         status_file=tmp_path / "status.json",
@@ -1060,7 +1479,11 @@ def test_readiness_blocks_stale_live_preflight_report(tmp_path):
         ccxt_available=True,
     )
 
-    check = next(item for item in report["checks"] if item["name"] == "active_income: preflight report current")
+    check = next(
+        item
+        for item in report["checks"]
+        if item["name"] == "active_income: preflight report current"
+    )
     assert report["ok"] is False
     assert check["ok"] is False
     assert "preflight report is stale" in check["detail"]
@@ -1078,7 +1501,9 @@ def test_readiness_blocks_malformed_live_preflight_report(tmp_path):
         preflight_report=preflight,
     )
     preflight.write_text("[]", encoding="utf-8")
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=live_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=live_product
+    )
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",
         status_file=tmp_path / "status.json",
@@ -1100,7 +1525,11 @@ def test_readiness_blocks_malformed_live_preflight_report(tmp_path):
         ccxt_available=True,
     )
 
-    check = next(item for item in report["checks"] if item["name"] == "active_income: preflight report current")
+    check = next(
+        item
+        for item in report["checks"]
+        if item["name"] == "active_income: preflight report current"
+    )
     assert report["ok"] is False
     assert check["ok"] is False
     assert "preflight report must be a JSON object" in check["detail"]
@@ -1127,7 +1556,9 @@ def test_readiness_blocks_unsafe_futures_leverage(tmp_path):
         ccxt_available=True,
     )
 
-    failed = {item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]}
+    failed = {
+        item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]
+    }
     assert "active_income: max futures leverage" in failed
 
 
@@ -1152,7 +1583,9 @@ def test_readiness_blocks_active_income_leverage_above_one(tmp_path):
         ccxt_available=True,
     )
 
-    check = next(item for item in report["checks"] if item["name"] == "active_income: max futures leverage")
+    check = next(
+        item for item in report["checks"] if item["name"] == "active_income: max futures leverage"
+    )
     assert check["ok"] is False
     assert check["detail"] == {"value": 2.0, "required": 1}
 
@@ -1179,7 +1612,9 @@ def test_readiness_blocks_non_isolated_futures_margin(tmp_path):
         ccxt_available=True,
     )
 
-    failed = {item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]}
+    failed = {
+        item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]
+    }
     assert "active_income: futures margin mode" in failed
 
 
@@ -1205,7 +1640,9 @@ def test_readiness_blocks_non_binance_active_income_futures_exchange(tmp_path):
         ccxt_available=True,
     )
 
-    failed = {item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]}
+    failed = {
+        item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]
+    }
     assert "active_income: active-income futures exchange" in failed
 
 
@@ -1238,7 +1675,9 @@ def test_readiness_blocks_non_binance_btc_accumulation_spot_exchange(tmp_path):
         ccxt_available=True,
     )
 
-    failed = {item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]}
+    failed = {
+        item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]
+    }
     assert "btc_accumulation: BTC accumulation spot exchange" in failed
 
 
@@ -1271,7 +1710,11 @@ def test_readiness_accepts_binance_btc_accumulation_spot_exchange(tmp_path):
         ccxt_available=True,
     )
 
-    check = next(item for item in report["checks"] if item["name"] == "btc_accumulation: BTC accumulation spot exchange")
+    check = next(
+        item
+        for item in report["checks"]
+        if item["name"] == "btc_accumulation: BTC accumulation spot exchange"
+    )
     assert check["ok"] is True
     assert check["detail"] == "binance"
 
@@ -1299,7 +1742,9 @@ def test_readiness_blocks_non_usdt_quote_asset(tmp_path):
         ccxt_available=True,
     )
 
-    failed = {item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]}
+    failed = {
+        item["name"] for item in report["checks"] if item["level"] == "error" and not item["ok"]
+    }
     assert "active_income: quote asset" in failed
 
 
@@ -1427,8 +1872,12 @@ def test_readiness_warns_when_runtime_filesystem_has_low_free_space(tmp_path, mo
 
     report = build_readiness_report(cfg, env={}, ccxt_available=True)
 
-    check = next(item for item in report["checks"] if item["name"] == "runtime filesystem free space")
-    audit_check = next(item for item in report["checks"] if item["name"] == "control audit path writable")
+    check = next(
+        item for item in report["checks"] if item["name"] == "runtime filesystem free space"
+    )
+    audit_check = next(
+        item for item in report["checks"] if item["name"] == "control audit path writable"
+    )
     assert report["ok"] is True
     assert check["ok"] is False
     assert check["level"] == "warning"
@@ -1460,7 +1909,9 @@ def test_readiness_warns_for_blank_actor_approval_ledger_entries(tmp_path):
     artifact = tmp_path / "active.json"
     ledger = tmp_path / "approvals.json"
     strategy = strategy_artifact(artifact)
-    fingerprint = ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test"
+    )
     payload = json.loads(ledger.read_text(encoding="utf-8"))
     payload["approvals"][fingerprint]["approved_by"] = " "
     ledger.write_text(json.dumps(payload), encoding="utf-8")
@@ -1474,7 +1925,9 @@ def test_readiness_warns_for_blank_actor_approval_ledger_entries(tmp_path):
     report = build_readiness_report(cfg, env={}, ccxt_available=True)
 
     readable = next(item for item in report["checks"] if item["name"] == "approval ledger readable")
-    actor_audit = next(item for item in report["checks"] if item["name"] == "approval ledger actor audit")
+    actor_audit = next(
+        item for item in report["checks"] if item["name"] == "approval ledger actor audit"
+    )
     assert report["ok"] is True
     assert readable["ok"] is True
     assert readable["detail"]["counts"] == {"invalid_actor": 1}
@@ -1488,7 +1941,9 @@ def test_readiness_warns_for_approval_fingerprint_mismatch(tmp_path):
     artifact = tmp_path / "active.json"
     ledger = tmp_path / "approvals.json"
     strategy = strategy_artifact(artifact)
-    fingerprint = ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test"
+    )
     payload = json.loads(ledger.read_text(encoding="utf-8"))
     payload["approvals"][fingerprint]["fingerprint"] = "sha256:wrong"
     ledger.write_text(json.dumps(payload), encoding="utf-8")
@@ -1502,7 +1957,9 @@ def test_readiness_warns_for_approval_fingerprint_mismatch(tmp_path):
     report = build_readiness_report(cfg, env={}, ccxt_available=True)
 
     readable = next(item for item in report["checks"] if item["name"] == "approval ledger readable")
-    fingerprint_audit = next(item for item in report["checks"] if item["name"] == "approval ledger fingerprint audit")
+    fingerprint_audit = next(
+        item for item in report["checks"] if item["name"] == "approval ledger fingerprint audit"
+    )
     assert report["ok"] is True
     assert readable["ok"] is True
     assert readable["detail"]["counts"] == {"fingerprint_mismatch": 1}
@@ -1517,7 +1974,9 @@ def test_readiness_warns_for_missing_approval_entry_fingerprint(tmp_path):
     artifact = tmp_path / "active.json"
     ledger = tmp_path / "approvals.json"
     strategy = strategy_artifact(artifact)
-    fingerprint = ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test"
+    )
     payload = json.loads(ledger.read_text(encoding="utf-8"))
     del payload["approvals"][fingerprint]["fingerprint"]
     ledger.write_text(json.dumps(payload), encoding="utf-8")
@@ -1531,7 +1990,9 @@ def test_readiness_warns_for_missing_approval_entry_fingerprint(tmp_path):
     report = build_readiness_report(cfg, env={}, ccxt_available=True)
 
     readable = next(item for item in report["checks"] if item["name"] == "approval ledger readable")
-    fingerprint_audit = next(item for item in report["checks"] if item["name"] == "approval ledger fingerprint audit")
+    fingerprint_audit = next(
+        item for item in report["checks"] if item["name"] == "approval ledger fingerprint audit"
+    )
     assert report["ok"] is True
     assert readable["ok"] is True
     assert readable["detail"]["counts"] == {"fingerprint_mismatch": 1}
@@ -1545,7 +2006,9 @@ def test_readiness_warns_for_invalid_revocation_audit_entries(tmp_path):
     artifact = tmp_path / "active.json"
     ledger = tmp_path / "approvals.json"
     strategy = strategy_artifact(artifact)
-    fingerprint = ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test"
+    )
     ApprovalLedger(ledger).revoke(fingerprint, revoked_by="test", reason="paper drawdown breached")
     payload = json.loads(ledger.read_text(encoding="utf-8"))
     payload["approvals"][fingerprint]["revoked_by"] = " "
@@ -1561,7 +2024,9 @@ def test_readiness_warns_for_invalid_revocation_audit_entries(tmp_path):
     report = build_readiness_report(cfg, env={}, ccxt_available=True)
 
     readable = next(item for item in report["checks"] if item["name"] == "approval ledger readable")
-    revocation_audit = next(item for item in report["checks"] if item["name"] == "approval ledger revocation audit")
+    revocation_audit = next(
+        item for item in report["checks"] if item["name"] == "approval ledger revocation audit"
+    )
     assert report["ok"] is True
     assert readable["ok"] is True
     assert readable["detail"]["counts"] == {"invalid_revocation_audit": 1}
@@ -1579,7 +2044,9 @@ def test_readiness_allows_revocation_reason_to_mention_automation(tmp_path):
     artifact = tmp_path / "active.json"
     ledger = tmp_path / "approvals.json"
     strategy = strategy_artifact(artifact)
-    fingerprint = ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test"
+    )
     ApprovalLedger(ledger).revoke(fingerprint, revoked_by="test", reason="system outage")
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",
@@ -1660,7 +2127,12 @@ def test_readiness_cli_prints_json_when_json_output_write_fails(monkeypatch, tmp
     monkeypatch.setattr("src.autopilot.readiness.load_config", lambda path: AutopilotConfig())
     monkeypatch.setattr(
         "src.autopilot.readiness.build_readiness_report",
-        lambda config, **_kwargs: {"ok": True, "blocking_count": 0, "warning_count": 0, "checks": []},
+        lambda config, **_kwargs: {
+            "ok": True,
+            "blocking_count": 0,
+            "warning_count": 0,
+            "checks": [],
+        },
     )
 
     def fail_json(path, payload):

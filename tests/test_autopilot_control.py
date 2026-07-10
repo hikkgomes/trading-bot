@@ -3,10 +3,12 @@ import json
 import pytest
 
 from src.autopilot.control import (
+    ControlConflictError,
     is_job_paused,
     is_product_paused,
     load_control,
     should_flatten_product,
+    update_control,
 )
 from src.autopilot.control import (
     main as control_main,
@@ -19,6 +21,45 @@ def test_load_control_missing_file_uses_safe_defaults(tmp_path):
     assert control["paused"] is False
     assert control["pause_jobs"] is False
     assert control["paused_products"] == []
+
+
+def test_stale_runtime_auto_clear_cannot_erase_new_operator_panic(tmp_path):
+    path = tmp_path / "control.json"
+    audit = tmp_path / "control_audit.jsonl"
+    update_control(path, "flatten", name="active_income", reason="initial incident")
+    runtime_snapshot = load_control(path)
+
+    update_control(path, "panic", reason="new operator emergency", audit_path=audit)
+
+    with pytest.raises(ControlConflictError, match="control changed"):
+        update_control(
+            path,
+            "clear-flatten",
+            name="active_income",
+            reason="stale runtime completion",
+            expected_control=runtime_snapshot,
+            enforce_flatten_pause=True,
+        )
+
+    current = load_control(path)
+    assert current["paused"] is True
+    assert current["pause_jobs"] is True
+    assert current["flatten_all"] is True
+    assert current["flatten_products"] == ["active_income"]
+    assert current["reason"] == "new operator emergency"
+
+
+def test_control_update_rejects_symlinked_lock_file(tmp_path):
+    path = tmp_path / "control.json"
+    lock = tmp_path / ".control.json.lock"
+    external = tmp_path / "external.lock"
+    external.write_text("", encoding="utf-8")
+    lock.symlink_to(external)
+
+    with pytest.raises(ValueError, match="lock file must not be a symlink"):
+        update_control(path, "panic", reason="incident")
+
+    assert not path.exists()
 
 
 def test_load_control_normalizes_operator_friendly_values(tmp_path):
@@ -324,6 +365,29 @@ def test_control_cli_panic_pauses_everything_and_requests_flatten_all(tmp_path):
     assert events[0]["after"]["paused"] is True
     assert events[0]["after"]["pause_jobs"] is True
     assert events[0]["after"]["flatten_all"] is True
+
+
+def test_control_cli_flatten_keeps_product_paused_after_request_is_cleared(tmp_path):
+    path = tmp_path / "control.json"
+
+    control_main(["--control", str(path), "flatten", "active_income", "--reason", "risk incident"])
+    control_main(["--control", str(path), "clear-flatten", "active_income"])
+
+    control = load_control(path)
+    assert control["flatten_products"] == []
+    assert control["paused_products"] == ["active_income"]
+    assert is_product_paused(control, "active_income") is True
+
+
+def test_control_cli_flatten_all_keeps_all_products_paused_after_request_is_cleared(tmp_path):
+    path = tmp_path / "control.json"
+
+    control_main(["--control", str(path), "flatten-all", "--reason", "risk incident"])
+    control_main(["--control", str(path), "clear-all-flatten"])
+
+    control = load_control(path)
+    assert control["flatten_all"] is False
+    assert control["paused"] is True
 
 
 def test_control_cli_applies_mutation_when_audit_write_fails(monkeypatch, tmp_path, capsys):

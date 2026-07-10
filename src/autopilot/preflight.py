@@ -12,9 +12,10 @@ import argparse
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from src.autopilot.approvals import (
     ApprovalError,
@@ -28,10 +29,12 @@ from src.autopilot.exchange_policy import (
     ACTIVE_INCOME_MAX_FUTURES_LEVERAGE,
     validate_exchange_policy,
 )
+from src.autopilot.execution_identity import execution_engine_digest
 from src.autopilot.io import write_json_atomic
 from src.autopilot.reporting import utc_now
 from src.autopilot.runtime import build_live_broker, validate_config
 from src.autopilot.strategy_policy import StrategyPolicyError, assert_strategy_artifact_allowed
+from src.execution.broker import OpenOrderIdentity
 from src.execution.config import ExchangeConfig
 
 LOGGER = logging.getLogger("autopilot.preflight")
@@ -48,6 +51,7 @@ def _exchange_env_detail(cfg: ExchangeConfig, *, require_testnet: bool) -> dict[
         "testnet": cfg.testnet,
         "require_testnet": require_testnet,
         "quote_asset": cfg.quote_asset,
+        "account_fingerprint": cfg.account_fingerprint,
         "max_notional_usd": cfg.max_notional_usd,
         "max_fill_slippage_bps": cfg.max_fill_slippage_bps,
     }
@@ -57,7 +61,9 @@ def _exchange_env_detail(cfg: ExchangeConfig, *, require_testnet: bool) -> dict[
     return detail
 
 
-def _check_exchange_env(product: ProductConfig, *, require_testnet: bool = False) -> tuple[list[str], dict[str, Any] | None]:
+def _check_exchange_env(
+    product: ProductConfig, *, require_testnet: bool = False
+) -> tuple[list[str], dict[str, Any] | None]:
     errors: list[str] = []
     try:
         cfg = ExchangeConfig.from_env(market_type=_market_type(product))
@@ -82,10 +88,18 @@ def _check_exchange_env(product: ProductConfig, *, require_testnet: bool = False
         )
     if cfg.market_type == "futures" and cfg.futures_margin_mode != "isolated":
         errors.append("FUTURES_MARGIN_MODE must be 'isolated'.")
-    if require_testnet and not cfg.testnet:
-        errors.append("EXCHANGE_TESTNET must be 1 for this preflight.")
+    if require_testnet:
+        if not cfg.testnet:
+            errors.append("EXCHANGE_TESTNET must be 1 for this testnet preflight.")
+    elif cfg.testnet:
+        errors.append(
+            "EXCHANGE_TESTNET must be 0 for a production preflight; use "
+            "--require-testnet only for the separate sandbox rehearsal."
+        )
     if not cfg.api_key or not cfg.api_secret:
-        errors.append("EXCHANGE_API_KEY and EXCHANGE_API_SECRET are required for balance/position checks.")
+        errors.append(
+            "EXCHANGE_API_KEY and EXCHANGE_API_SECRET are required for balance/position checks."
+        )
     errors.extend(validate_exchange_policy(product, cfg))
     return errors, detail
 
@@ -99,13 +113,20 @@ def _product_status(product: ProductConfig) -> dict[str, Any]:
         "market": product.market,
         "symbol": product.symbol,
         "execution_mode": product.execution_mode,
+        "starting_equity": product.starting_equity,
+        "regime_guard": product.regime_guard,
+        "regime_mayer_top": product.regime_mayer_top,
         "strategies_path": str(product.strategies_path),
         "require_preflight": product.require_preflight,
-        "preflight_report": str(product.preflight_report) if product.preflight_report is not None else None,
+        "preflight_report": str(product.preflight_report)
+        if product.preflight_report is not None
+        else None,
         "preflight_max_age_seconds": product.preflight_max_age_seconds,
         "require_testnet_rehearsal": product.require_testnet_rehearsal,
         "testnet_rehearsal_report": (
-            str(product.testnet_rehearsal_report) if product.testnet_rehearsal_report is not None else None
+            str(product.testnet_rehearsal_report)
+            if product.testnet_rehearsal_report is not None
+            else None
         ),
         "testnet_rehearsal_max_age_seconds": product.testnet_rehearsal_max_age_seconds,
     }
@@ -128,6 +149,58 @@ def _requires_non_negative_spot_position(product: ProductConfig) -> bool:
     return product.objective == "btc_accumulation" and product.market == "spot"
 
 
+def _sanitized_open_order_evidence(
+    orders: Any,
+    *,
+    symbol: str,
+    conditional: bool,
+) -> list[dict[str, Any]]:
+    if not isinstance(orders, list | tuple):
+        raise ValueError("broker open-order inventory must be a list or tuple")
+    evidence: list[dict[str, Any]] = []
+    for index, order in enumerate(orders):
+        if not isinstance(order, OpenOrderIdentity):
+            raise ValueError(f"broker open-order inventory item {index} must be OpenOrderIdentity")
+        if order.symbol != symbol:
+            raise ValueError(
+                f"broker open-order inventory symbol mismatch: {order.symbol!r} != {symbol!r}"
+            )
+        if order.conditional is not conditional:
+            raise ValueError("broker open-order inventory conditional flag mismatch")
+        if order.status not in {"open", "partially_filled"}:
+            raise ValueError(f"broker open-order inventory status is invalid: {order.status!r}")
+        if not order.order_id or not order.client_id:
+            raise ValueError("broker open-order inventory identity is incomplete")
+        evidence.append(
+            {
+                "symbol": order.symbol,
+                "order_id": order.order_id,
+                "client_id": order.client_id,
+                "status": order.status,
+                "conditional": order.conditional,
+            }
+        )
+    return evidence
+
+
+def _open_order_inventory_evidence(broker: Any, symbol: str) -> dict[str, Any]:
+    regular = _sanitized_open_order_evidence(
+        broker.list_open_orders(symbol, conditional=False),
+        symbol=symbol,
+        conditional=False,
+    )
+    conditional = _sanitized_open_order_evidence(
+        broker.list_open_orders(symbol, conditional=True),
+        symbol=symbol,
+        conditional=True,
+    )
+    return {
+        "symbol": symbol,
+        "regular": {"count": len(regular), "orders": regular},
+        "conditional": {"count": len(conditional), "orders": conditional},
+    }
+
+
 def preflight_product(
     product: ProductConfig,
     config: AutopilotConfig,
@@ -147,7 +220,9 @@ def preflight_product(
         "errors": [],
     }
 
-    def check(name: str, ok: bool, detail: dict[str, Any] | None = None, error: str | None = None) -> None:
+    def check(
+        name: str, ok: bool, detail: dict[str, Any] | None = None, error: str | None = None
+    ) -> None:
         entry = {"name": name, "ok": ok}
         if detail is not None:
             entry["detail"] = detail
@@ -160,17 +235,39 @@ def preflight_product(
     cfg_errors = validate_config(AutopilotConfig(products=[live_product]))
     check("product_config", not cfg_errors, error="; ".join(cfg_errors) if cfg_errors else None)
 
+    try:
+        engine_digest = execution_engine_digest()
+    except Exception as exc:
+        check("execution_engine_identity", False, error=str(exc))
+    else:
+        result["execution_engine_digest"] = engine_digest
+        check(
+            "execution_engine_identity",
+            True,
+            {"execution_engine_digest": engine_digest},
+        )
+
     artifact_exists = live_product.strategies_path.exists()
-    check("strategy_artifact_exists", artifact_exists, {"path": str(live_product.strategies_path)} if artifact_exists else None,
-          None if artifact_exists else f"Strategy artifact not found: {live_product.strategies_path}")
+    check(
+        "strategy_artifact_exists",
+        artifact_exists,
+        {"path": str(live_product.strategies_path)} if artifact_exists else None,
+        None if artifact_exists else f"Strategy artifact not found: {live_product.strategies_path}",
+    )
 
     if artifact_exists:
         try:
             fingerprints = _artifact_fingerprints(live_product.strategies_path)
             result["artifact_fingerprints"] = fingerprints
             result["artifact_digest"] = _artifact_digest(live_product.strategies_path)
-            check("strategy_fingerprints", bool(fingerprints), {"fingerprints": fingerprints},
-                  None if fingerprints else f"No strategy fingerprints found: {live_product.strategies_path}")
+            check(
+                "strategy_fingerprints",
+                bool(fingerprints),
+                {"fingerprints": fingerprints},
+                None
+                if fingerprints
+                else f"No strategy fingerprints found: {live_product.strategies_path}",
+            )
         except (ApprovalError, FileNotFoundError, json.JSONDecodeError) as exc:
             check("strategy_fingerprints", False, error=str(exc))
         try:
@@ -180,7 +277,9 @@ def preflight_product(
             check("strategy_policy", False, error=str(exc))
 
     try:
-        assert_artifact_live_approved(live_product.strategies_path, config.approval_ledger, product=live_product)
+        assert_artifact_live_approved(
+            live_product.strategies_path, config.approval_ledger, product=live_product
+        )
         check("approval_gate", True)
     except (ApprovalError, FileNotFoundError) as exc:
         check("approval_gate", False, error=str(exc))
@@ -221,6 +320,86 @@ def preflight_product(
         return result
 
     if connect:
+        if _requires_flat_connect_position(live_product):
+            try:
+                one_way_mode = broker.verify_one_way_position_mode(live_product.symbol)
+            except Exception as exc:
+                check(
+                    "broker_position_mode_one_way",
+                    False,
+                    error=(
+                        f"{live_product.name}: could not verify read-only one-way "
+                        f"futures position mode: {exc}"
+                    ),
+                )
+            else:
+                check(
+                    "broker_position_mode_one_way",
+                    one_way_mode is True,
+                    {
+                        "symbol": live_product.symbol,
+                        "one_way": one_way_mode,
+                    },
+                    None
+                    if one_way_mode is True
+                    else (
+                        f"{live_product.name}: Binance USD-M account is in hedge mode; "
+                        "switch it to one-way mode before live/testnet entry."
+                    ),
+                )
+            try:
+                native_stops_supported = broker.supports_native_protective_stops()
+            except Exception as exc:
+                check(
+                    "broker_native_protective_stops",
+                    False,
+                    error=(
+                        f"{live_product.name}: could not verify exchange-native "
+                        f"protective-stop support: {exc}"
+                    ),
+                )
+            else:
+                check(
+                    "broker_native_protective_stops",
+                    native_stops_supported is True,
+                    {"supported": native_stops_supported},
+                    None
+                    if native_stops_supported is True
+                    else (
+                        f"{live_product.name}: connected active-income futures broker must "
+                        "support exchange-native reduce-only protective stops."
+                    ),
+                )
+            try:
+                open_orders = _open_order_inventory_evidence(
+                    broker,
+                    live_product.symbol,
+                )
+            except Exception as exc:
+                check(
+                    "broker_open_orders_empty",
+                    False,
+                    error=(
+                        f"{live_product.name}: could not prove regular and conditional "
+                        f"open-order inventories are empty: {exc}"
+                    ),
+                )
+            else:
+                regular_count = open_orders["regular"]["count"]
+                conditional_count = open_orders["conditional"]["count"]
+                empty = regular_count == 0 and conditional_count == 0
+                check(
+                    "broker_open_orders_empty",
+                    empty,
+                    open_orders,
+                    None
+                    if empty
+                    else (
+                        f"{live_product.name}: broker has outstanding {live_product.symbol} "
+                        f"orders (regular={regular_count}, conditional={conditional_count}); "
+                        "manual reconciliation is required before live/testnet entry."
+                    ),
+                )
         try:
             price = broker.get_price(live_product.symbol)
             balance = broker.get_balance()
@@ -288,7 +467,9 @@ def run_preflight(
     if product_name:
         products = [product for product in products if product.name == product_name]
     else:
-        products = [product for product in products if product.execution_mode == "live" or assume_live]
+        products = [
+            product for product in products if product.execution_mode == "live" or assume_live
+        ]
     if not products:
         return {
             "ok": False,
@@ -335,17 +516,29 @@ def _append_preflight_error(report: dict[str, Any], name: str, detail: dict[str,
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run live/testnet readiness checks without placing orders.")
+    parser = argparse.ArgumentParser(
+        description="Run live/testnet readiness checks without placing orders."
+    )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--product", help="Product name to check. Defaults to live products.")
-    parser.add_argument("--assume-live", action="store_true", help="Check selected paper products as if promoted live.")
-    parser.add_argument("--connect", action="store_true", help="Fetch ticker, balance, and position. No orders are sent.")
+    parser.add_argument(
+        "--assume-live",
+        action="store_true",
+        help="Check selected paper products as if promoted live.",
+    )
+    parser.add_argument(
+        "--connect",
+        action="store_true",
+        help="Fetch ticker, balance, and position. No orders are sent.",
+    )
     parser.add_argument(
         "--require-testnet",
         action="store_true",
         help="Fail unless EXCHANGE_TESTNET=1. Use before testnet order rehearsals.",
     )
-    parser.add_argument("--output", type=Path, help="Optional path to write the JSON preflight report.")
+    parser.add_argument(
+        "--output", type=Path, help="Optional path to write the JSON preflight report."
+    )
     return parser.parse_args()
 
 

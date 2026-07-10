@@ -7,6 +7,7 @@ import pandas as pd
 from sklearn.cluster import KMeans
 
 from src.config import DEFAULT_SYMBOL, PROCESSED_DATA_DIR, indicator_data_dir
+from src.parquet_io import write_parquet_atomic
 
 
 def _timestamped(data: pd.DataFrame) -> pd.DataFrame:
@@ -91,6 +92,7 @@ def tag_regime_file(
     daily_input_path: Path | None = None,
     daily_price_column: str = "close",
     skip_if_missing: bool = False,
+    compact: bool = False,
 ) -> dict:
     if not input_path.exists():
         if skip_if_missing:
@@ -114,14 +116,17 @@ def tag_regime_file(
             }
         raise FileNotFoundError(daily_input_path)
 
-    data = pd.read_parquet(input_path)
+    compact_columns = ["timestamp", "open", "high", "low", "close", "volume"]
+    data = pd.read_parquet(input_path, columns=compact_columns if compact else None)
     if daily_input_path is not None:
-        daily = pd.read_parquet(daily_input_path)
+        daily = pd.read_parquet(daily_input_path, columns=["timestamp", daily_price_column])
         out = add_regime_column_from_daily(data, daily, daily_price_column=daily_price_column)
     else:
         out = add_regime_column(data, price_column=price_column)
+    if compact:
+        out = out[[*compact_columns, "tf_1d_regime_id"]]
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(output_path, index=False)
+    write_parquet_atomic(out, output_path, index=False)
     regimes = out["tf_1d_regime_id"]
     return {
         "ok": True,
@@ -129,6 +134,7 @@ def tag_regime_file(
         "input": str(input_path),
         "daily_input": str(daily_input_path) if daily_input_path else None,
         "output": str(output_path),
+        "compact": compact,
         "rows": int(len(out)),
         "regime_counts": {str(int(k)): int(v) for k, v in regimes.value_counts().sort_index().items()},
     }
@@ -152,6 +158,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeframe", default="15m")
     parser.add_argument("--daily-timeframe", default="1d")
     parser.add_argument("--skip-if-missing", action="store_true")
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Write only timestamp, OHLCV, and regime id for the lightweight smoke workflow.",
+    )
     parser.add_argument("--report", type=Path, default=None)
     return parser.parse_args()
 
@@ -184,6 +195,7 @@ def main() -> None:
         daily_input_path=_default_daily_input(args),
         daily_price_column=args.daily_price_column,
         skip_if_missing=args.skip_if_missing,
+        compact=args.compact,
     )
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)

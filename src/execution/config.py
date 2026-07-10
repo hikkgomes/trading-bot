@@ -6,12 +6,17 @@ present in the real environment take precedence over the .env file.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from src.config import PROJECT_ROOT
+from src.envfile import parse_env_lines
+
+ACCOUNT_FINGERPRINT_PREFIX = "account-v1:"
 
 
 def load_dotenv(path: Path | None = None) -> None:
@@ -20,12 +25,7 @@ def load_dotenv(path: Path | None = None) -> None:
         raise ValueError(f".env must not be a symlink: {path}")
     if not path.exists():
         return
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        key, val = key.strip(), val.strip().strip('"').strip("'")
+    for key, val in parse_env_lines(path.read_text(encoding="utf-8").splitlines()).items():
         os.environ.setdefault(key, val)
 
 
@@ -44,12 +44,39 @@ class ExchangeConfig:
     futures_margin_mode: str = "isolated"
     quote_asset: str = "USDT"
 
+    @property
+    def account_fingerprint(self) -> str:
+        """Return a non-secret identity for the configured exchange account.
+
+        Binance API keys identify an account credential without exposing the
+        credential itself.  The secret and password are intentionally excluded:
+        rotating either must never leak into reports, while changing the API key,
+        venue, market, or testnet routing invalidates prior preflight evidence.
+        """
+
+        identity = {
+            "api_key": str(self.api_key),
+            "exchange": str(self.exchange).strip().lower(),
+            "market_type": str(self.market_type).strip().lower(),
+            "testnet": bool(self.testnet),
+            "version": 1,
+        }
+        encoded = json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        return f"{ACCOUNT_FINGERPRINT_PREFIX}{hashlib.sha256(encoded).hexdigest()}"
+
     @classmethod
     def from_env(cls, load_file: bool = True, market_type: str | None = None) -> ExchangeConfig:
         if load_file:
             load_dotenv()
 
-        selected_market = (market_type or os.environ.get("EXCHANGE_MARKET_TYPE", "futures")).strip().lower()
+        selected_market = (
+            (market_type or os.environ.get("EXCHANGE_MARKET_TYPE", "futures")).strip().lower()
+        )
         if selected_market not in ("futures", "spot"):
             raise ValueError("EXCHANGE_MARKET_TYPE must be 'futures' or 'spot'.")
         if selected_market == "spot":

@@ -20,7 +20,6 @@ import json
 import logging
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
@@ -61,7 +60,7 @@ def fetch_fear_greed(use_cache: bool = True, timeout: float = 20.0) -> pd.DataFr
     return df
 
 
-def add_fear_greed_column(df: pd.DataFrame, fng: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def add_fear_greed_column(df: pd.DataFrame, fng: pd.DataFrame | None = None) -> pd.DataFrame:
     """Merge a daily ``fear_greed`` column onto ``df`` by calendar date (as-of).
 
     ``df`` must have a DatetimeIndex (any intraday resolution). Each row gets the

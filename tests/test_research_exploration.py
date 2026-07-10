@@ -8,6 +8,7 @@ heavy data is loaded.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import numpy as np
@@ -191,7 +192,7 @@ def test_generate_batch_with_guards_is_stricter_variant():
     guarded = generate_batch(with_guards=True)
     assert len(plain) == len(guarded)                       # same candidates, guarded
     assert all(h.id.endswith("_G") for h in guarded)
-    assert all(len(g.regime) >= len(p.regime) for p, g in zip(plain, guarded))
+    assert all(len(g.regime) >= len(p.regime) for p, g in zip(plain, guarded, strict=False))
 
 
 def test_position_trading_set_guarded_variants_stay_btc_short_side():
@@ -203,7 +204,7 @@ def test_position_trading_set_guarded_variants_stay_btc_short_side():
     assert {h.base_timeframe for h in guarded} == {"1h", "4h"}
     assert all(h.id.startswith("POS_") and h.id.endswith("_G") for h in guarded)
     assert all("position_btc" in h.tags and "regime_avoidance" in h.tags for h in guarded)
-    assert all(len(g.regime) > len(p.regime) for p, g in zip(plain, guarded))
+    assert all(len(g.regime) > len(p.regime) for p, g in zip(plain, guarded, strict=False))
 
 
 # --------------------------------------------------------------------------- #
@@ -609,6 +610,34 @@ def test_uptrend_passes_every_stage_and_is_kept():
     assert res["splits"]["holdout"]["start"] > res["splits"]["train"]["end"]
 
 
+def test_holdout_must_be_durably_claimed_before_evaluation():
+    frame = _ts_frame(_sawtooth(3000, 0.015, 0.005))
+    claims = []
+
+    def deny_second_claim(hypothesis, partial_result):
+        claims.append((hypothesis.id, partial_result["splits"]["holdout"]))
+        return len(claims) == 1
+
+    first = validate_hypothesis(
+        frame,
+        _rising_hypothesis(),
+        _RELAXED,
+        before_holdout=deny_second_claim,
+    )
+    second = validate_hypothesis(
+        frame,
+        _rising_hypothesis(),
+        _RELAXED,
+        before_holdout=deny_second_claim,
+    )
+
+    assert first["verdict"] == "keep"
+    assert second["verdict"] == "inconclusive"
+    assert second["reasons"] == ["holdout_already_consumed"]
+    assert second["holdout"] is None
+    assert len(claims) == 2
+
+
 def test_negative_holdout_gates_admission():
     """Edge in train+val, crash in the untouched holdout -> REJECT (the old
     pipeline's report-only holdout would have shipped this)."""
@@ -675,6 +704,27 @@ def test_validate_batch_preserves_larger_configured_trial_count():
     results = validate_batch(frame, hyps, cfg)
 
     assert results[0]["n_trials"] == 25
+
+
+def test_validate_batch_checkpoints_each_candidate_before_advancing():
+    frame = _ts_frame(_sawtooth(3000, 0.015, 0.005))
+    first = _rising_hypothesis()
+    second = dataclasses.replace(first, id="SECOND_CANDIDATE")
+    checkpointed = []
+
+    def stop_after_first(hypothesis, result):
+        checkpointed.append((hypothesis.id, result["verdict"]))
+        raise RuntimeError("simulated checkpoint boundary stop")
+
+    with pytest.raises(RuntimeError, match="checkpoint boundary"):
+        validate_batch(
+            frame,
+            [first, second],
+            _RELAXED,
+            after_candidate=stop_after_first,
+        )
+
+    assert checkpointed == [(first.id, "keep")]
 
 
 def test_validation_config_rejects_bad_fractions():

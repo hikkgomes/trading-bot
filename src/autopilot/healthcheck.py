@@ -61,7 +61,7 @@ def _parse_timestamp(value: Any) -> float | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        parsed = parsed.replace(tzinfo=dt.UTC)
     return parsed.timestamp()
 
 
@@ -323,6 +323,84 @@ def _product_state_error_details(operator_report: dict[str, Any], *, mode: str) 
     return state_error_details
 
 
+def _product_drawdown_halt_details(operator_report: dict[str, Any], *, mode: str) -> list[dict[str, Any]]:
+    halted_products = []
+    for product in _dict_list(operator_report, "products"):
+        if product.get("enabled") is False or product.get("mode") != mode:
+            continue
+        if product.get("drawdown_halted") is not True:
+            continue
+        halted_products.append(
+            {
+                "product": product.get("name"),
+                "objective": product.get("objective"),
+                "market": product.get("market"),
+                "mode": product.get("mode"),
+                "equity": product.get("equity"),
+                "peak_equity": product.get("peak_equity"),
+                "drawdown_fraction": product.get("drawdown_fraction"),
+                "drawdown_limit_fraction": product.get("drawdown_limit_fraction"),
+                "drawdown_halted_at": product.get("drawdown_halted_at"),
+                "drawdown_halt_reason": product.get("drawdown_halt_reason"),
+            }
+        )
+    return halted_products
+
+
+def _product_exit_accounting_intent_details(
+    operator_report: dict[str, Any], *, mode: str
+) -> list[dict[str, Any]]:
+    pending_products = []
+    for product in _dict_list(operator_report, "products"):
+        if product.get("enabled") is False or product.get("mode") != mode:
+            continue
+        intent = product.get("exit_accounting_intent")
+        if intent is None:
+            continue
+        pending_products.append(
+            {
+                "product": product.get("name"),
+                "objective": product.get("objective"),
+                "market": product.get("market"),
+                "mode": product.get("mode"),
+                "intent": intent,
+            }
+        )
+    return pending_products
+
+
+def _product_recovery_state_details(
+    operator_report: dict[str, Any], *, mode: str
+) -> list[dict[str, Any]]:
+    pending_products = []
+    state_keys = (
+        "pending_order",
+        "pending_entry_recovery",
+        "risk_recovery_incident",
+        "flatten_intent",
+    )
+    for product in _dict_list(operator_report, "products"):
+        if product.get("enabled") is False or product.get("mode") != mode:
+            continue
+        states = {
+            key: product[key]
+            for key in state_keys
+            if product.get(key) is not None
+        }
+        if not states:
+            continue
+        pending_products.append(
+            {
+                "product": product.get("name"),
+                "objective": product.get("objective"),
+                "market": product.get("market"),
+                "mode": product.get("mode"),
+                "states": states,
+            }
+        )
+    return pending_products
+
+
 def _product_trade_log_issue_details(operator_report: dict[str, Any], *, mode: str) -> list[dict[str, Any]]:
     trade_log_issues = []
     for product in _dict_list(operator_report, "products"):
@@ -347,6 +425,19 @@ def _product_trade_log_issue_details(operator_report: dict[str, Any], *, mode: s
                 "numeric_errors": trade_summary.get("numeric_errors", [])[:10]
                 if isinstance(trade_summary.get("numeric_errors"), list)
                 else [],
+                **(
+                    {
+                        "exit_event_id_errors": trade_summary.get(
+                            "exit_event_id_errors", []
+                        )[:10]
+                        if isinstance(
+                            trade_summary.get("exit_event_id_errors"), list
+                        )
+                        else []
+                    }
+                    if "exit_event_id_errors" in trade_summary
+                    else {}
+                ),
             }
         )
     return trade_log_issues
@@ -698,6 +789,25 @@ def _live_open_position_broker_issues(operator_report: dict[str, Any]) -> list[d
                 and abs(broker_qty - requested_qty) > max(requested_qty * 1e-6, 1e-9)
             ):
                 reasons.append("broker_qty_mismatch_requested")
+            if product.get("market") == "futures":
+                if _positive_float(position.get("broker_entry_balance")) is None:
+                    reasons.append("invalid_broker_entry_balance")
+                stop_order_id = position.get("broker_stop_order_id")
+                if not isinstance(stop_order_id, str) or not stop_order_id.strip():
+                    reasons.append("invalid_broker_stop_order_id")
+                stop_client_id = position.get("broker_stop_client_id")
+                if not isinstance(stop_client_id, str) or not stop_client_id.strip():
+                    reasons.append("invalid_broker_stop_client_id")
+                stop_trigger = _positive_float(position.get("broker_stop_trigger_price"))
+                if stop_trigger is None:
+                    reasons.append("invalid_broker_stop_trigger_price")
+                else:
+                    strategy_stop = _positive_float(position.get("sl_price"))
+                    if strategy_stop is not None and abs(stop_trigger - strategy_stop) > max(
+                        strategy_stop * 1e-9,
+                        1e-12,
+                    ):
+                        reasons.append("broker_stop_trigger_mismatch_strategy_stop")
             if product.get("objective") == "btc_accumulation" and product.get("market") == "spot":
                 exit_sizing = position.get("broker_exit_sizing")
                 if direction == "short" and exit_sizing != "quote_reinvest":
@@ -718,6 +828,10 @@ def _live_open_position_broker_issues(operator_report: dict[str, Any]) -> list[d
                         "broker_requested_qty": position.get("broker_requested_qty"),
                         "broker_fill_ratio": position.get("broker_fill_ratio"),
                         "broker_entry_fee": position.get("broker_entry_fee"),
+                        "broker_entry_balance": position.get("broker_entry_balance"),
+                        "broker_stop_order_id": position.get("broker_stop_order_id"),
+                        "broker_stop_client_id": position.get("broker_stop_client_id"),
+                        "broker_stop_trigger_price": position.get("broker_stop_trigger_price"),
                         "reasons": reasons,
                     }
                 )
@@ -834,7 +948,7 @@ def evaluate_health(
 
     issues: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
-    now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.timezone.utc).timestamp()
+    now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.UTC).timestamp()
     malformed_sections = [
         detail
         for key in ("products", "jobs", "scheduled_jobs")
@@ -952,6 +1066,64 @@ def evaluate_health(
                 "paper_product_state_invalid",
                 "one or more paper products reported invalid local state",
                 detail={"products": paper_state_errors},
+            )
+        )
+    live_recovery_states = _product_recovery_state_details(operator_report, mode="live")
+    if live_recovery_states:
+        issues.append(
+            _issue(
+                "live_product_recovery_pending",
+                "one or more live products have unresolved broker intents or safety-recovery incidents",
+                detail={"products": live_recovery_states},
+            )
+        )
+    paper_recovery_states = _product_recovery_state_details(operator_report, mode="paper")
+    if paper_recovery_states:
+        warnings.append(
+            _issue(
+                "paper_product_recovery_pending",
+                "one or more paper products have unresolved broker intents or safety-recovery incidents",
+                detail={"products": paper_recovery_states},
+            )
+        )
+    live_drawdown_halts = _product_drawdown_halt_details(operator_report, mode="live")
+    if live_drawdown_halts:
+        issues.append(
+            _issue(
+                "live_product_drawdown_halted",
+                "one or more live products hit the sticky peak-equity drawdown circuit breaker",
+                detail={"products": live_drawdown_halts},
+            )
+        )
+    paper_drawdown_halts = _product_drawdown_halt_details(operator_report, mode="paper")
+    if paper_drawdown_halts:
+        warnings.append(
+            _issue(
+                "paper_product_drawdown_halted",
+                "one or more paper products hit the sticky peak-equity drawdown circuit breaker",
+                detail={"products": paper_drawdown_halts},
+            )
+        )
+    live_exit_accounting = _product_exit_accounting_intent_details(
+        operator_report, mode="live"
+    )
+    if live_exit_accounting:
+        issues.append(
+            _issue(
+                "live_exit_accounting_pending",
+                "one or more live products have an unresolved idempotent exit accounting intent",
+                detail={"products": live_exit_accounting},
+            )
+        )
+    paper_exit_accounting = _product_exit_accounting_intent_details(
+        operator_report, mode="paper"
+    )
+    if paper_exit_accounting:
+        warnings.append(
+            _issue(
+                "paper_exit_accounting_pending",
+                "one or more paper products have an unresolved idempotent exit accounting intent",
+                detail={"products": paper_exit_accounting},
             )
         )
     live_trade_log_issues = _product_trade_log_issue_details(operator_report, mode="live")
@@ -1310,6 +1482,187 @@ def evaluate_health(
                 },
             )
         )
+    cycle_generated_batch = research_cycle.get("generated_batch")
+    if isinstance(cycle_generated_batch, dict) and cycle_generated_batch.get("status") in {
+        "read_error",
+        "invalid",
+        "ignored",
+    }:
+        warnings.append(
+            _issue(
+                "research_cycle_generated_batch_unhealthy",
+                "research cycle could not safely consume the generated strategy batch",
+                detail={
+                    "generated_at": research_cycle.get("generated_at"),
+                    "status": cycle_generated_batch.get("status"),
+                    "path": cycle_generated_batch.get("path"),
+                    "reason": cycle_generated_batch.get("reason"),
+                    "error": cycle_generated_batch.get("error"),
+                },
+            )
+        )
+    elif research_cycle.get("error") == "generated_batch_not_ready":
+        warnings.append(
+            _issue(
+                "research_cycle_generated_batch_missing",
+                "generated-only research is waiting for a valid generated strategy batch",
+                detail={
+                    "generated_at": research_cycle.get("generated_at"),
+                    "status": (
+                        cycle_generated_batch.get("status")
+                        if isinstance(cycle_generated_batch, dict)
+                        else None
+                    ),
+                    "path": (
+                        cycle_generated_batch.get("path")
+                        if isinstance(cycle_generated_batch, dict)
+                        else None
+                    ),
+                },
+            )
+        )
+
+    generated_batch = (
+        operator_report.get("generated_batch")
+        if isinstance(operator_report.get("generated_batch"), dict)
+        else {}
+    )
+    if generated_batch and not generated_batch.get("_load_error"):
+        unsafe_flags = [
+            name
+            for name, expected in (
+                ("schema", "autopilot.generative_strategy_batch/v1"),
+                ("research_only", True),
+                ("executable", False),
+                ("paper_trade_allowed", False),
+                ("promotion_allowed", False),
+                ("live_allowed", False),
+                ("requires_full_validation_before_export", True),
+            )
+            if generated_batch.get(name) != expected
+        ]
+        if generated_batch.get("ok") is False or unsafe_flags:
+            warnings.append(
+                _issue(
+                    "generated_batch_unhealthy",
+                    "latest generated strategy batch failed or violates its research-only contract",
+                    detail={
+                        "generated_at": generated_batch.get("generated_at"),
+                        "artifact": generated_batch.get("artifact"),
+                        "error": generated_batch.get("error"),
+                        "unsafe_flags": unsafe_flags,
+                    },
+                )
+            )
+        generated_summary = (
+            generated_batch.get("summary")
+            if isinstance(generated_batch.get("summary"), dict)
+            else {}
+        )
+        generated_count = generated_batch.get("hypotheses_count")
+        if generated_count is None:
+            generated_count = generated_summary.get("hypotheses")
+        if generated_batch.get("ok") is True and int(generated_count or 0) == 0:
+            warnings.append(
+                _issue(
+                    "generative_search_empty",
+                    "strategy factory completed without emitting any research hypotheses",
+                    detail={
+                        "generated_at": generated_batch.get("generated_at"),
+                        "rejected_attempts": generated_summary.get("rejected_attempts"),
+                        "unique_behavioral_specs": generated_summary.get(
+                            "unique_behavioral_specs"
+                        ),
+                    },
+                )
+            )
+
+    experiment_memory = (
+        operator_report.get("experiment_memory")
+        if isinstance(operator_report.get("experiment_memory"), dict)
+        else {}
+    )
+    if experiment_memory:
+        integrity = (
+            experiment_memory.get("integrity")
+            if isinstance(experiment_memory.get("integrity"), dict)
+            else {}
+        )
+        if (
+            experiment_memory.get("status") == "error"
+            or experiment_memory.get("ok") is False
+            or integrity.get("ok") is False
+        ):
+            issues.append(
+                _issue(
+                    "experiment_memory_unhealthy",
+                    "strategy experiment memory failed integrity validation",
+                    detail={
+                        "path": experiment_memory.get("path"),
+                        "status": experiment_memory.get("status"),
+                        "error": experiment_memory.get("error"),
+                        "integrity": integrity,
+                    },
+                )
+            )
+        if experiment_memory.get("protected_holdout_results_excluded") is not True:
+            issues.append(
+                _issue(
+                    "experiment_memory_feedback_scope_invalid",
+                    "experiment-memory reporting does not confirm protected holdout exclusion",
+                    detail={
+                        "path": experiment_memory.get("path"),
+                        "adaptive_evidence_scope": experiment_memory.get(
+                            "adaptive_evidence_scope"
+                        ),
+                    },
+                )
+            )
+        enabled_factory_jobs = [
+            job
+            for job in _dict_list(operator_report, "scheduled_jobs")
+            if job.get("enabled") and job.get("name") == "research_factory"
+        ]
+        factory_has_run = any(job.get("last_started_at") for job in enabled_factory_jobs)
+        if experiment_memory.get("status") == "missing" and factory_has_run:
+            warnings.append(
+                _issue(
+                    "experiment_memory_missing",
+                    "strategy factory has run but durable experiment memory is missing",
+                    detail={
+                        "path": experiment_memory.get("path"),
+                        "factory_jobs": [job.get("name") for job in enabled_factory_jobs],
+                    },
+                )
+            )
+    history_coverage = (
+        research_cycle.get("history_coverage")
+        if isinstance(research_cycle.get("history_coverage"), dict)
+        else {}
+    )
+    coverage_failures = int(
+        research_summary.get("coverage_failures")
+        or history_coverage.get("failure_count")
+        or 0
+    )
+    coverage_failed_scenarios = (
+        research_summary.get("coverage_failed_scenarios")
+        or history_coverage.get("failed_scenarios")
+        or []
+    )
+    if coverage_failures > 0:
+        warnings.append(
+            _issue(
+                "research_history_coverage_insufficient",
+                "one or more curated research scenarios lack their required history depth",
+                detail={
+                    "generated_at": research_cycle.get("generated_at"),
+                    "coverage_failures": coverage_failures,
+                    "scenarios": coverage_failed_scenarios,
+                    "next_actions": research_summary.get("next_actions") or [],
+                },
+            )
+        )
     if (
         waiting_paper_products
         and research_cycle.get("ok") is True
@@ -1417,6 +1770,40 @@ def evaluate_health(
             if item_key in alert
         }
         warnings.append(_issue(code, message, detail=detail))
+    memory_feedback = (
+        experiment_memory.get("feedback")
+        if isinstance(experiment_memory.get("feedback"), dict)
+        else {}
+    )
+    memory_totals = (
+        memory_feedback.get("totals")
+        if isinstance(memory_feedback.get("totals"), dict)
+        else {}
+    )
+    generated_summary = (
+        generated_batch.get("summary")
+        if isinstance(generated_batch.get("summary"), dict)
+        else {}
+    )
+    generative_research = {
+        "batch_ok": generated_batch.get("ok"),
+        "batch_generated_at": generated_batch.get("generated_at"),
+        "batch_hypotheses": generated_batch.get(
+            "hypotheses_count", generated_summary.get("hypotheses")
+        ),
+        "unique_behavioral_specs": memory_totals.get("strategies"),
+        "recorded_evaluations": memory_totals.get("evaluations"),
+        "memory_status": experiment_memory.get("status"),
+        "memory_integrity_ok": (
+            (experiment_memory.get("integrity") or {}).get("ok")
+            if isinstance(experiment_memory.get("integrity"), dict)
+            else None
+        ),
+        "adaptive_evidence_scope": experiment_memory.get("adaptive_evidence_scope"),
+        "protected_holdout_results_excluded": experiment_memory.get(
+            "protected_holdout_results_excluded"
+        ),
+    }
     return {
         "ok": not issues,
         "issues": issues,
@@ -1424,6 +1811,7 @@ def evaluate_health(
         "status_generated_at": operator_report.get("status_generated_at"),
         "operator_report_generated_at": operator_report.get("generated_at"),
         "readiness_ok": None if readiness_report is None else readiness_report.get("ok"),
+        "generative_research": generative_research,
     }
 
 

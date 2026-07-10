@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -65,6 +66,7 @@ REJECTION_REASONS = (
     "failed_validation",
     "unstable_across_windows",
     "parameter_fragile",
+    "holdout_already_consumed",
     "insufficient_holdout_trades",
     "failed_holdout",
 )
@@ -278,7 +280,8 @@ def sensitivity_check(frame: pd.DataFrame, hyp: Hypothesis,
 # --------------------------------------------------------------------------- #
 def validate_hypothesis(frame: pd.DataFrame, hyp: Hypothesis,
                         cfg: ValidationConfig | None = None,
-                        eval_cfg: EvalConfig | None = None) -> dict:
+                        eval_cfg: EvalConfig | None = None,
+                        before_holdout: Callable[[Hypothesis, dict], bool | None] | None = None) -> dict:
     """Run the full staged pipeline. The holdout is only ever *touched* after
     every earlier stage passes, and a negative holdout rejects — it gates."""
     cfg = cfg or ValidationConfig()
@@ -340,7 +343,12 @@ def validate_hypothesis(frame: pd.DataFrame, hyp: Hypothesis,
     if not sens["passed"]:
         return finish("reject", "parameter_fragile")
 
-    # 5. HOLDOUT — untouched until now, and it GATES.
+    # 5. HOLDOUT — untouched until now, and it GATES.  Autonomous callers use
+    # this hook to durably claim the canonical behavior+snapshot before a read.
+    # Returning False means an earlier attempt (including a killed process)
+    # already consumed this holdout; fail closed rather than looking again.
+    if before_holdout is not None and before_holdout(hyp, result) is False:
+        return finish("inconclusive", "holdout_already_consumed")
     holdout = evaluate_hypothesis(segs["holdout"], hyp, eval_cfg)
     result["holdout"] = holdout
     if holdout["trades"] < cfg.min_trades_holdout:
@@ -356,7 +364,9 @@ def validate_hypothesis(frame: pd.DataFrame, hyp: Hypothesis,
 def validate_batch(frame: pd.DataFrame, hyps: list[Hypothesis],
                    cfg: ValidationConfig | None = None,
                    eval_cfg: EvalConfig | None = None,
-                   log_path: Path | None = None) -> list[dict]:
+                   log_path: Path | None = None,
+                   before_holdout: Callable[[Hypothesis, dict], bool | None] | None = None,
+                   after_candidate: Callable[[Hypothesis, dict], None] | None = None) -> list[dict]:
     """Validate a batch with DSR deflated by at least the batch size.
 
     Callers that rotate a slice of a larger candidate universe can set
@@ -369,8 +379,19 @@ def validate_batch(frame: pd.DataFrame, hyps: list[Hypothesis],
     eval_cfg = eval_cfg or EvalConfig()
     results = []
     for hyp in hyps:
-        res = validate_hypothesis(frame, hyp, cfg, eval_cfg)
+        res = validate_hypothesis(
+            frame,
+            hyp,
+            cfg,
+            eval_cfg,
+            before_holdout=before_holdout,
+        )
         results.append(res)
+        # Autonomous callers use this as the per-candidate durable checkpoint.
+        # Invoke it before the advisory JSONL log so a timeout cannot erase the
+        # completed work of earlier candidates in a long sequential batch.
+        if after_candidate is not None:
+            after_candidate(hyp, res)
         if log_path is not None:
             headline = {"dsr_deflated": res["dsr_deflated"], "n_trials": cfg.n_trials,
                         "reasons": res["reasons"]}

@@ -12,8 +12,6 @@
   "job_state_file": "runtime/job_state.json",
   "lock_file": "runtime/autopilot.lock",
   "incubation_candidates_file": "runtime/incubation_candidates.json",
-  "mutation_batch_file": "runtime/mutation_hypotheses.json",
-  "mutation_plan_file": "runtime/mutation_plan.json",
   "min_runtime_free_bytes": 536870912,
   "max_jobs_per_cycle": 1,
   "max_consecutive_job_deferrals": 3,
@@ -23,6 +21,10 @@
   "readiness_report_file": "runtime/readiness_report.md",
   "readiness_report_json_file": "runtime/readiness_report.json",
   "research_cycle_file": "runtime/research_cycle.json",
+  "research_factory_config_file": "config/research_factory.json",
+  "generated_batch_file": "runtime/research/generated_hypotheses.json",
+  "experiment_memory_file": "runtime/research/experiment_memory.sqlite3",
+  "experiment_memory_backup_file": "runtime/research/experiment_memory.backup.sqlite3",
   "research_smoke_file": "runtime/research_smoke.json",
   "strategy_smoke_file": "runtime/strategy_framework_smoke.json",
   "run_data_update": false,
@@ -33,11 +35,11 @@
       "name": "market_data_update_futures",
       "enabled": true,
       "command": [
-        ".venv/bin/python", "-m", "src.update_candles",
+        ".venv/bin/python", "-m", "src.autopilot.history_bootstrap",
+        "--config", "config/research_factory.json",
         "--market", "futures",
-        "--bootstrap-days", "90",
-        "--skip-if-missing",
-        "--timeframes", "5m", "15m", "30m", "1h", "4h", "1d"
+        "--exclude-timeframes", "1m",
+        "--report", "runtime/history_bootstrap_futures.json"
       ],
       "cadence_seconds": 21600,
       "timeout_seconds": 1800
@@ -52,6 +54,7 @@
         "--daily-timeframe", "1d",
         "--output", "runtime/regime/futures_15m_regime.parquet",
         "--report", "runtime/regime_tag_futures_15m.json",
+        "--compact",
         "--skip-if-missing"
       ],
       "cadence_seconds": 21600,
@@ -61,11 +64,11 @@
       "name": "market_data_update_futures_1m",
       "enabled": true,
       "command": [
-        ".venv/bin/python", "-m", "src.update_candles",
+        ".venv/bin/python", "-m", "src.autopilot.history_bootstrap",
+        "--config", "config/research_factory.json",
         "--market", "futures",
-        "--bootstrap-days", "90",
-        "--skip-if-missing",
-        "--timeframes", "1m"
+        "--timeframes", "1m",
+        "--report", "runtime/history_bootstrap_futures_1m.json"
       ],
       "cadence_seconds": 86400,
       "timeout_seconds": 1800
@@ -74,11 +77,10 @@
       "name": "market_data_update_spot",
       "enabled": true,
       "command": [
-        ".venv/bin/python", "-m", "src.update_candles",
+        ".venv/bin/python", "-m", "src.autopilot.history_bootstrap",
+        "--config", "config/research_factory.json",
         "--market", "spot",
-        "--bootstrap-days", "365",
-        "--skip-if-missing",
-        "--timeframes", "1h", "4h", "1d", "1w"
+        "--report", "runtime/history_bootstrap_spot.json"
       ],
       "cadence_seconds": 21600,
       "timeout_seconds": 1800
@@ -101,40 +103,41 @@
       "timeout_seconds": 300
     },
     {
+      "name": "research_factory",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.research_factory",
+        "--config", "config/research_factory.json",
+        "--output", "runtime/research/generated_hypotheses.json"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 120
+    },
+    {
       "name": "research_cycle",
       "enabled": true,
       "command": [
         ".venv/bin/python", "-m", "src.autopilot.research_cycle",
         "--output", "runtime/research_cycle.json",
         "--state", "runtime/research_cycle_state.json",
-        "--include-mutations",
-        "--mutation-batch", "runtime/mutation_hypotheses.json"
+        "--include-generated",
+        "--generated-only",
+        "--generated-batch", "runtime/research/generated_hypotheses.json",
+        "--research-factory-config", "config/research_factory.json"
       ],
       "cadence_seconds": 86400,
-      "timeout_seconds": 900
+      "timeout_seconds": 1800
     },
     {
-      "name": "mutation_plan",
+      "name": "candidate_paper_cycle",
       "enabled": true,
       "command": [
-        ".venv/bin/python", "-m", "src.autopilot.mutation_plan",
-        "--input", "runtime/research_cycle.json",
-        "--output", "runtime/mutation_plan.json",
-        "--markdown-output", "runtime/mutation_plan.md"
+        ".venv/bin/python", "-m", "src.autopilot.candidate_paper",
+        "--config", "config/autopilot.json",
+        "--output", "runtime/candidate_paper_status.json"
       ],
-      "cadence_seconds": 86400,
-      "timeout_seconds": 120
-    },
-    {
-      "name": "mutation_batch",
-      "enabled": true,
-      "command": [
-        ".venv/bin/python", "-m", "src.autopilot.mutation_batch",
-        "--input", "runtime/mutation_plan.json",
-        "--output", "runtime/mutation_hypotheses.json"
-      ],
-      "cadence_seconds": 86400,
-      "timeout_seconds": 120
+      "cadence_seconds": 300,
+      "timeout_seconds": 240
     },
     {
       "name": "synthetic_strategy_sweep",
@@ -204,7 +207,10 @@
         ".venv/bin/python", "-m", "src.autopilot.maintenance",
         "--config", "config/autopilot.json",
         "--max-alert-lines", "1000",
-        "--max-experiment-lines", "5000"
+        "--max-alert-fingerprints", "1000",
+        "--max-experiment-lines", "5000",
+        "--max-control-audit-lines", "5000",
+        "--max-quarantine-bytes", "268435456"
       ],
       "cadence_seconds": 86400,
       "timeout_seconds": 60
@@ -216,7 +222,7 @@
         ".venv/bin/python", "-m", "src.autopilot.backup",
         "--config", "config/autopilot.json",
         "--report", "runtime/backup_report.json",
-        "--max-file-bytes", "10485760",
+        "--max-file-bytes", "52428800",
         "--max-backups", "30"
       ],
       "cadence_seconds": 86400,

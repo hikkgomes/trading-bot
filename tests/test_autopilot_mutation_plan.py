@@ -192,3 +192,39 @@ def test_mutation_plan_suppresses_recent_failed_mutation_sources():
             "verdict": "reject",
         }
     ]
+
+
+def test_mutation_plan_retires_failed_holdout_without_generating_feedback():
+    payload = research_cycle_payload()
+    payload["scenarios"][0]["incubation_candidates"].append(
+        {
+            "id": "HOLDOUT_FAILURE",
+            "family": "volatility_breakout",
+            "direction": "long",
+            "reasons": ["failed_holdout"],
+            "verdict": "reject",
+            "stage_reached": "holdout",
+            "score": 99.0,
+        }
+    )
+
+    plan = build_mutation_plan(payload, top_per_scenario=3, max_total=10)
+
+    assert "HOLDOUT_FAILURE" not in {
+        proposal["source_candidate_id"] for proposal in plan["proposals"]
+    }
+    assert plan["summary"]["retired_candidates"] == 1
+    assert plan["summary"]["retired_by_product"] == {"active_income": 1}
+    assert plan["summary"]["retired_by_reason"] == {"failed_holdout": 1}
+    assert plan["retired_candidates"] == [
+        {
+            "source_scenario": "active_income_5m_guarded",
+            "product": "active_income",
+            "source_candidate_id": "HOLDOUT_FAILURE",
+            "reason": "failed_holdout",
+            "source_verdict": "reject",
+            "stage_reached": "holdout",
+            "score": 99.0,
+            "disposition": "retired_from_autonomous_mutation",
+        }
+    ]

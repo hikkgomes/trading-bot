@@ -1,7 +1,9 @@
+import hashlib
 import json
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,24 +14,41 @@ from src.autopilot.approvals import (
     strategy_fingerprint,
 )
 from src.autopilot.config import AutopilotConfig, JobConfig, ProductConfig, load_config
+from src.autopilot.execution_identity import execution_engine_digest
 from src.autopilot.runtime import (
     REQUIRED_CORE_JOB_FLAG_VALUES,
     REQUIRED_CORE_JOB_MODULES,
     REQUIRED_CORE_JOB_PRESENCE_FLAGS,
     REQUIRED_CORE_JOBS,
+    _assert_current_environment_matches_preflight,
+    _bot_status_snapshot,
     _effective_sleep_seconds,
+    _local_state_requires_management,
     acquire_runtime_lock,
     assert_live_environment,
     assert_recent_preflight,
     assert_recent_testnet_rehearsal,
     build_live_broker,
     flatten_product_once,
+    main,
     run_once,
     run_product_once,
     validate_config,
     write_cycle_reports,
 )
-from src.execution.broker import Fill, OrderSide, Position
+from src.execution.broker import (
+    Fill,
+    OrderSide,
+    OrderType,
+    Position,
+    ProtectiveOrder,
+    ProtectiveOrderStatus,
+)
+from src.execution.config import ExchangeConfig
+from src.run_bot import PaperTradingBot
+
+TEST_ACCOUNT_FINGERPRINT = f"account-v1:{'a' * 64}"
+OTHER_ACCOUNT_FINGERPRINT = f"account-v1:{'b' * 64}"
 
 
 def product(tmp_path, **overrides):
@@ -74,7 +93,7 @@ def product_config_payload(tmp_path, **overrides):
 
 def set_live_env(monkeypatch):
     monkeypatch.setenv("TRADING_LIVE", "1")
-    monkeypatch.setenv("EXCHANGE_TESTNET", "1")
+    monkeypatch.setenv("EXCHANGE_TESTNET", "0")
     monkeypatch.setenv("FUTURES_EXCHANGE", "binanceusdm")
     monkeypatch.setenv("EXCHANGE_API_KEY", "key")
     monkeypatch.setenv("EXCHANGE_API_SECRET", "secret")
@@ -89,9 +108,9 @@ CORE_AUTOPILOT_JOBS = {
     "market_data_update_spot",
     "regime_tag_futures_15m",
     "research_synthetic_smoke",
+    "research_factory",
     "research_cycle",
-    "mutation_plan",
-    "mutation_batch",
+    "candidate_paper_cycle",
     "strategy_framework_smoke",
     "active_income_promotion_review",
     "btc_accumulation_promotion_review",
@@ -125,6 +144,15 @@ def test_checked_in_autopilot_configs_validate_and_cover_core_jobs():
         assert cfg.max_jobs_per_cycle == 1
         assert cfg.max_consecutive_job_deferrals == 3
         assert CORE_AUTOPILOT_JOBS <= job_names
+
+
+def test_validate_config_rejects_legacy_inline_data_update():
+    errors = validate_config(AutopilotConfig(run_data_update=True))
+
+    assert errors == [
+        "run_data_update=true is unsupported because inline downloads can block trading "
+        "supervision; use the isolated market_data_update_* jobs"
+    ]
 
 
 def test_load_config_rejects_symlink_without_trusting_target(tmp_path):
@@ -247,7 +275,10 @@ def test_load_config_rejects_malformed_jobs_and_products(tmp_path, payload, mess
     ("job_payload", "message"),
     [
         ({"name": "bad", "command": [], "cadence_seconds": 60}, "job bad: command cannot be empty"),
-        ({"name": "bad", "command": ["python"], "cadence_seconds": 0}, "job bad: cadence_seconds must be positive"),
+        (
+            {"name": "bad", "command": ["python"], "cadence_seconds": 0},
+            "job bad: cadence_seconds must be positive",
+        ),
         (
             {"name": "bad", "command": ["python"], "cadence_seconds": 60, "timeout_seconds": 0},
             "job bad: timeout_seconds must be positive",
@@ -288,6 +319,62 @@ def test_load_config_rejects_malformed_job_values(tmp_path, job_payload, message
 
     with pytest.raises(ValueError, match=message):
         load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "jobs_payload",
+    [
+        {"not": "a list"},
+        ["not an object"],
+        [{"name": "broken", "command": [], "cadence_seconds": 0}],
+    ],
+)
+def test_load_config_supervision_only_isolates_malformed_jobs(tmp_path, jobs_payload):
+    config_path = tmp_path / "autopilot.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "jobs": jobs_payload,
+                "max_jobs_per_cycle": "also job-only garbage",
+                "run_data_update": "also job-only garbage",
+                "products": [product_config_payload(tmp_path)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    configured = load_config(config_path, strict_jobs=False)
+
+    assert configured.jobs == []
+    assert configured.job_config_errors
+    assert configured.max_jobs_per_cycle == 1
+    assert configured.run_data_update is False
+    assert [item.name for item in configured.products] == ["active_income"]
+
+
+def test_load_config_supervision_only_retains_valid_jobs_beside_malformed_job(tmp_path):
+    config_path = tmp_path / "autopilot.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "name": "valid-status-context",
+                        "command": [sys.executable, "-c", "print('ok')"],
+                        "cadence_seconds": 60,
+                    },
+                    {"name": "broken", "command": [], "cadence_seconds": 0},
+                ],
+                "products": [product_config_payload(tmp_path)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    configured = load_config(config_path, strict_jobs=False)
+
+    assert [job.name for job in configured.jobs] == ["valid-status-context"]
+    assert configured.job_config_errors == ["jobs[1]: job broken: command cannot be empty"]
 
 
 @pytest.mark.parametrize(
@@ -333,7 +420,11 @@ def test_load_config_rejects_missing_required_product_fields(tmp_path, field, me
         ("state_file", "", "product active_income: state_file must be non-empty"),
         ("trade_log", True, "product active_income: trade_log must be a string"),
         ("preflight_report", {}, "product active_income: preflight_report must be a string"),
-        ("testnet_rehearsal_report", " ", "product active_income: testnet_rehearsal_report must be non-empty"),
+        (
+            "testnet_rehearsal_report",
+            " ",
+            "product active_income: testnet_rehearsal_report must be non-empty",
+        ),
     ],
 )
 def test_load_config_rejects_malformed_product_path_values(tmp_path, field, value, message):
@@ -350,17 +441,27 @@ def test_load_config_rejects_unknown_product_keys(tmp_path):
     product_payload = product_config_payload(tmp_path, require_prefligth=True)
     config_path.write_text(json.dumps({"products": [product_payload]}), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="product active_income has unknown field: require_prefligth"):
+    with pytest.raises(
+        ValueError, match="product active_income has unknown field: require_prefligth"
+    ):
         load_config(config_path)
 
 
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("starting_equity", "1000", "product active_income: starting_equity must be a finite JSON number"),
+        (
+            "starting_equity",
+            "1000",
+            "product active_income: starting_equity must be a finite JSON number",
+        ),
         ("starting_equity", float("nan"), "invalid JSON constant: NaN"),
         ("starting_equity", 0, "product active_income: starting_equity must be positive"),
-        ("regime_mayer_top", True, "product active_income: regime_mayer_top must be a finite JSON number"),
+        (
+            "regime_mayer_top",
+            True,
+            "product active_income: regime_mayer_top must be a finite JSON number",
+        ),
         (
             "preflight_max_age_seconds",
             3600.5,
@@ -473,7 +574,10 @@ def test_load_config_rejects_non_boolean_product_flags(tmp_path, field, value):
         ({"run_data_update": 0}, "run_data_update must be a JSON boolean"),
         ({"loop_sleep_seconds": "60"}, "loop_sleep_seconds must be a JSON integer"),
         ({"max_jobs_per_cycle": True}, "max_jobs_per_cycle must be a JSON integer"),
-        ({"max_consecutive_job_deferrals": "3"}, "max_consecutive_job_deferrals must be a JSON integer"),
+        (
+            {"max_consecutive_job_deferrals": "3"},
+            "max_consecutive_job_deferrals must be a JSON integer",
+        ),
         ({"alert_cooldown_seconds": False}, "alert_cooldown_seconds must be a JSON integer"),
         ({"min_runtime_free_bytes": 536870912.0}, "min_runtime_free_bytes must be a JSON integer"),
         ({"control_file": ""}, "control_file must be non-empty"),
@@ -534,12 +638,19 @@ def test_load_config_accepts_json_boolean_false_values(tmp_path):
 
 def exchange_environment_detail(product_config, *, testnet=False, require_testnet=False):
     market_type = "spot" if product_config.objective == "btc_accumulation" else "futures"
+    exchange = "binance" if market_type == "spot" else "binanceusdm"
     detail = {
-        "exchange": "binance" if market_type == "spot" else "binanceusdm",
+        "exchange": exchange,
         "market_type": market_type,
         "testnet": testnet,
         "require_testnet": require_testnet,
         "quote_asset": "USDT",
+        "account_fingerprint": ExchangeConfig(
+            exchange=exchange,
+            market_type=market_type,
+            api_key="key",
+            testnet=testnet,
+        ).account_fingerprint,
         "max_notional_usd": 100.0,
         "max_fill_slippage_bps": 100.0,
     }
@@ -607,8 +718,81 @@ def write_testnet_rehearsal(
         },
         "notional_usd": 5.0,
         "order_qty": 0.05,
-        "entry_fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-        "close_fill": {"symbol": "BTCUSDT", "side": "sell", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1001.0},
+        "entry_fill": {
+            "symbol": "BTCUSDT",
+            "side": "buy",
+            "qty": 0.05,
+            "price": 100.0,
+            "fee": 0.01,
+            "timestamp": 1000.0,
+        },
+        "close_fill": {
+            "symbol": "BTCUSDT",
+            "side": "sell",
+            "qty": 0.05,
+            "price": 100.0,
+            "fee": 0.01,
+            "timestamp": 1001.0,
+        },
+        "native_protective_stop": {
+            "capability_supported": True,
+            "native": True,
+            "reduce_only": True,
+            "trigger_distance_fraction": 0.05,
+            "trigger_reference_price": 100.0,
+            "raw_trigger_price": 95.0,
+            "normalized_trigger_price": 95.0,
+            "open_verified": True,
+            "canceled_verified": True,
+            "placed": {
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "qty": 0.05,
+                "trigger_price": 95.0,
+                "status": "open",
+                "order_id": "stop-1",
+                "client_id": "testnet-stop-1",
+                "filled_qty": 0.0,
+                "average_price": None,
+                "fee": 0.0,
+            },
+            "fetched_open": {
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "qty": 0.05,
+                "trigger_price": 95.0,
+                "status": "open",
+                "order_id": "stop-1",
+                "client_id": "testnet-stop-1",
+                "filled_qty": 0.0,
+                "average_price": None,
+                "fee": 0.0,
+            },
+            "cancel_result": {
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "qty": 0.05,
+                "trigger_price": 95.0,
+                "status": "canceled",
+                "order_id": "stop-1",
+                "client_id": "testnet-stop-1",
+                "filled_qty": 0.0,
+                "average_price": None,
+                "fee": 0.0,
+            },
+            "fetched_terminal": {
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "qty": 0.05,
+                "trigger_price": 95.0,
+                "status": "canceled",
+                "order_id": "stop-1",
+                "client_id": "testnet-stop-1",
+                "filled_qty": 0.0,
+                "average_price": None,
+                "fee": 0.0,
+            },
+        },
         "final_position_qty": 0.0,
     }
     if preflight is not None:
@@ -643,7 +827,9 @@ def test_validate_config_rejects_active_income_on_spot(tmp_path):
 def test_validate_config_requires_core_products_in_production_mode(tmp_path):
     cfg = AutopilotConfig(products=[product(tmp_path)])
 
-    assert validate_config(cfg, require_core_products=True) == ["missing required product: btc_accumulation"]
+    assert validate_config(cfg, require_core_products=True) == [
+        "missing required product: btc_accumulation"
+    ]
 
 
 def test_validate_config_requires_core_products_enabled_in_production_mode(tmp_path):
@@ -665,7 +851,9 @@ def test_validate_config_requires_core_products_enabled_in_production_mode(tmp_p
         ]
     )
 
-    assert validate_config(cfg, require_core_products=True) == ["btc_accumulation: required product must be enabled"]
+    assert validate_config(cfg, require_core_products=True) == [
+        "btc_accumulation: required product must be enabled"
+    ]
 
 
 def test_validate_config_requires_core_jobs_in_production_mode():
@@ -685,7 +873,9 @@ def test_validate_config_requires_core_jobs_enabled_in_production_mode(tmp_path)
         ]
     )
 
-    assert validate_config(cfg, require_core_jobs=True) == ["research_cycle: required job must be enabled"]
+    assert validate_config(cfg, require_core_jobs=True) == [
+        "research_cycle: required job must be enabled"
+    ]
 
 
 def test_validate_config_requires_core_jobs_to_run_expected_modules_in_production_mode(tmp_path):
@@ -711,7 +901,15 @@ def test_validate_config_requires_core_jobs_to_run_expected_modules_in_productio
 
 
 def test_validate_config_requires_core_jobs_to_keep_expected_arguments_in_production_mode(tmp_path):
-    bad_command = [sys.executable, "-m", "src.update_candles", "--market", "spot", "--timeframes", "1h"]
+    bad_command = [
+        sys.executable,
+        "-m",
+        "src.autopilot.history_bootstrap",
+        "--market",
+        "spot",
+        "--timeframes",
+        "1h",
+    ]
     cfg = AutopilotConfig(
         jobs=[
             core_job(
@@ -724,9 +922,11 @@ def test_validate_config_requires_core_jobs_to_keep_expected_arguments_in_produc
     )
 
     assert validate_config(cfg, require_core_jobs=True) == [
-        "market_data_update_futures: required job must include --skip-if-missing",
-        "market_data_update_futures: required job --market must include futures (got spot)",
-        "market_data_update_futures: required job --timeframes must include 5m 15m 30m 1h 4h 1d (got 1h)",
+        "market_data_update_futures: required job must not include --timeframes",
+        "market_data_update_futures: required job must include --config config/research_factory.json",
+        "market_data_update_futures: required job --market must equal futures (got spot)",
+        "market_data_update_futures: required job must include --exclude-timeframes 1m",
+        "market_data_update_futures: required job must include --report runtime/history_bootstrap_futures.json",
     ]
 
 
@@ -734,15 +934,11 @@ def test_validate_config_accepts_core_job_required_arguments_as_inline_flags(tmp
     inline_command = [
         sys.executable,
         "-m",
-        "src.update_candles",
+        "src.autopilot.history_bootstrap",
+        "--config=config/research_factory.json",
         "--market=futures",
-        "--timeframes=5m",
-        "--timeframes=15m",
-        "--timeframes=30m",
-        "--timeframes=1h",
-        "--timeframes=4h",
-        "--timeframes=1d",
-        "--skip-if-missing",
+        "--exclude-timeframes=1m",
+        "--report=runtime/history_bootstrap_futures.json",
     ]
     cfg = AutopilotConfig(
         jobs=[
@@ -758,19 +954,14 @@ def test_validate_config_accepts_core_job_required_arguments_as_inline_flags(tmp
     assert validate_config(cfg, require_core_jobs=True) == []
 
 
-def test_validate_config_rejects_inline_value_for_core_presence_only_argument(tmp_path):
+def test_validate_config_rejects_missing_history_report_path(tmp_path):
     inline_command = [
         sys.executable,
         "-m",
-        "src.update_candles",
+        "src.autopilot.history_bootstrap",
+        "--config=config/research_factory.json",
         "--market=futures",
-        "--timeframes=5m",
-        "--timeframes=15m",
-        "--timeframes=30m",
-        "--timeframes=1h",
-        "--timeframes=4h",
-        "--timeframes=1d",
-        "--skip-if-missing=true",
+        "--exclude-timeframes=1m",
     ]
     cfg = AutopilotConfig(
         jobs=[
@@ -784,7 +975,46 @@ def test_validate_config_rejects_inline_value_for_core_presence_only_argument(tm
     )
 
     assert validate_config(cfg, require_core_jobs=True) == [
-        "market_data_update_futures: required job must include --skip-if-missing"
+        "market_data_update_futures: required job must include --report runtime/history_bootstrap_futures.json"
+    ]
+
+
+def test_validate_config_rejects_duplicate_or_extra_history_partition_flags(tmp_path):
+    command = [
+        sys.executable,
+        "-m",
+        "src.autopilot.history_bootstrap",
+        "--config",
+        "config/research_factory.json",
+        "--config",
+        "config/other.json",
+        "--market",
+        "futures",
+        "--exclude-timeframes",
+        "1m",
+        "--exclude-timeframes",
+        "5m",
+        "--timeframes",
+        "5m",
+        "--report",
+        "runtime/history_bootstrap_futures.json",
+    ]
+    cfg = AutopilotConfig(
+        jobs=[
+            core_job(
+                tmp_path,
+                name,
+                command=command if name == "market_data_update_futures" else None,
+            )
+            for name in REQUIRED_CORE_JOBS
+        ]
+    )
+
+    assert validate_config(cfg, require_core_jobs=True) == [
+        "market_data_update_futures: required job must not include --timeframes",
+        "market_data_update_futures: required job --config must equal "
+        "config/research_factory.json (got config/research_factory.json config/other.json)",
+        "market_data_update_futures: required job --exclude-timeframes must equal 1m (got 1m 5m)",
     ]
 
 
@@ -801,7 +1031,11 @@ def test_validate_config_rejects_active_income_wrong_symbol(tmp_path, symbol):
 
     errors = validate_config(cfg)
 
-    assert any("active income" in error and ("symbol must be BTC/USDT" in error or "settlement must be USDT" in error) for error in errors)
+    assert any(
+        "active income" in error
+        and ("symbol must be BTC/USDT" in error or "settlement must be USDT" in error)
+        for error in errors
+    )
 
 
 @pytest.mark.parametrize("symbol", ["ETHUSDT", "BTCUSDC", "BTC/USDT:USDT"])
@@ -821,7 +1055,11 @@ def test_validate_config_rejects_btc_accumulation_wrong_symbol(tmp_path, symbol)
 
     errors = validate_config(cfg)
 
-    assert any("BTC accumulation" in error and ("symbol must be BTC/USDT" in error or "must not include" in error) for error in errors)
+    assert any(
+        "BTC accumulation" in error
+        and ("symbol must be BTC/USDT" in error or "must not include" in error)
+        for error in errors
+    )
 
 
 def test_validate_config_rejects_unknown_objective_and_market(tmp_path):
@@ -878,7 +1116,9 @@ def test_validate_config_rejects_missing_job_working_dir(tmp_path):
         ],
     )
 
-    assert validate_config(cfg) == [f"job bad_workdir: working_dir does not exist: {tmp_path / 'missing'}"]
+    assert validate_config(cfg) == [
+        f"job bad_workdir: working_dir does not exist: {tmp_path / 'missing'}"
+    ]
 
 
 def test_validate_config_rejects_missing_job_executable(tmp_path):
@@ -954,6 +1194,111 @@ def test_validate_config_rejects_missing_python_job_module(tmp_path):
     ]
 
 
+def test_validate_config_can_probe_transitive_job_dependencies(monkeypatch, tmp_path):
+    module_name = "autopilot_broken_dependency_job"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import dependency_that_is_intentionally_missing_for_test\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    cfg = AutopilotConfig(
+        products=[],
+        jobs=[
+            JobConfig(
+                name="broken_dependency",
+                enabled=True,
+                command=[sys.executable, "-m", module_name],
+                cadence_seconds=60,
+                working_dir=tmp_path,
+            )
+        ],
+    )
+
+    errors = validate_config(cfg, verify_job_imports=True)
+
+    assert len(errors) == 1
+    assert "job broken_dependency" in errors[0]
+    assert "dependency import failed" in errors[0]
+    assert "dependency_that_is_intentionally_missing_for_test" in errors[0]
+
+
+@pytest.mark.parametrize(("skip_jobs", "verify_job_imports"), [(True, False), (False, True)])
+def test_main_only_probes_job_imports_when_scheduled_jobs_are_enabled(
+    monkeypatch,
+    tmp_path,
+    skip_jobs,
+    verify_job_imports,
+):
+    configured = AutopilotConfig(products=[])
+    seen = {}
+    monkeypatch.setattr("src.autopilot.runtime.configure_logging", lambda: None)
+    monkeypatch.setattr(
+        "src.autopilot.runtime.parse_args",
+        lambda: SimpleNamespace(
+            config=tmp_path / "autopilot.json",
+            once=True,
+            validate=False,
+            skip_jobs=skip_jobs,
+            sleep=None,
+        ),
+    )
+
+    def load(path, *, strict_jobs=True):
+        seen["strict_jobs"] = strict_jobs
+        return configured
+
+    monkeypatch.setattr("src.autopilot.runtime.load_config", load)
+
+    def validate(config, **kwargs):
+        seen.update(kwargs)
+        return ["stop after validation probe"]
+
+    monkeypatch.setattr("src.autopilot.runtime.validate_config", validate)
+
+    with pytest.raises(SystemExit, match="stop after validation probe"):
+        main()
+
+    assert seen == {
+        "strict_jobs": not skip_jobs,
+        "require_core_products": True,
+        "require_core_jobs": not skip_jobs,
+        "verify_job_imports": verify_job_imports,
+        "validate_jobs": not skip_jobs,
+    }
+
+
+def test_main_once_exits_nonzero_when_cycle_report_fails(monkeypatch, tmp_path):
+    configured = AutopilotConfig(
+        lock_file=tmp_path / "autopilot.lock",
+        status_file=tmp_path / "status.json",
+    )
+    monkeypatch.setattr("src.autopilot.runtime.configure_logging", lambda: None)
+    monkeypatch.setattr(
+        "src.autopilot.runtime.parse_args",
+        lambda: SimpleNamespace(
+            config=tmp_path / "autopilot.json",
+            once=True,
+            validate=False,
+            skip_jobs=True,
+            sleep=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "src.autopilot.runtime.load_config",
+        lambda path, strict_jobs: configured,
+    )
+    monkeypatch.setattr("src.autopilot.runtime.validate_config", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "src.autopilot.runtime.run_once",
+        lambda config, run_jobs: {"ok": False},
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 1
+
+
 def test_validate_config_rejects_missing_python_module_argument(tmp_path):
     cfg = AutopilotConfig(
         products=[],
@@ -968,7 +1313,9 @@ def test_validate_config_rejects_missing_python_module_argument(tmp_path):
         ],
     )
 
-    assert validate_config(cfg) == ["job missing_module_arg: python -m command is missing a module name"]
+    assert validate_config(cfg) == [
+        "job missing_module_arg: python -m command is missing a module name"
+    ]
 
 
 def test_validate_config_rejects_duplicate_job_names(tmp_path):
@@ -1003,14 +1350,26 @@ def test_validate_config_rejects_duplicate_job_output_paths(tmp_path):
             JobConfig(
                 name="research_cycle",
                 enabled=True,
-                command=[sys.executable, "-m", "src.autopilot.research_cycle", "--output", str(shared)],
+                command=[
+                    sys.executable,
+                    "-m",
+                    "src.autopilot.research_cycle",
+                    "--output",
+                    str(shared),
+                ],
                 cadence_seconds=86400,
                 working_dir=tmp_path,
             ),
             JobConfig(
                 name="mutation_plan",
                 enabled=True,
-                command=[sys.executable, "-m", "src.autopilot.mutation_plan", "--output", str(shared)],
+                command=[
+                    sys.executable,
+                    "-m",
+                    "src.autopilot.mutation_plan",
+                    "--output",
+                    str(shared),
+                ],
                 cadence_seconds=86400,
                 working_dir=tmp_path,
             ),
@@ -1030,7 +1389,13 @@ def test_validate_config_allows_job_input_to_read_another_job_output(tmp_path):
             JobConfig(
                 name="research_cycle",
                 enabled=True,
-                command=[sys.executable, "-m", "src.autopilot.research_cycle", "--output", str(research_output)],
+                command=[
+                    sys.executable,
+                    "-m",
+                    "src.autopilot.research_cycle",
+                    "--output",
+                    str(research_output),
+                ],
                 cadence_seconds=86400,
                 working_dir=tmp_path,
             ),
@@ -1086,7 +1451,9 @@ def test_validate_config_rejects_inline_job_output_flag_without_path(tmp_path):
         ],
     )
 
-    assert validate_config(cfg) == ["job bad_inline_output: output flag --output must include a path"]
+    assert validate_config(cfg) == [
+        "job bad_inline_output: output flag --output must include a path"
+    ]
 
 
 def test_validate_config_rejects_duplicate_global_runtime_paths(tmp_path):
@@ -1112,7 +1479,9 @@ def test_validate_config_rejects_product_cross_field_runtime_path_collision(tmp_
         ],
     )
 
-    assert validate_config(cfg) == [f"active_income trade_log path duplicates active_income state_file: {shared}"]
+    assert validate_config(cfg) == [
+        f"active_income trade_log path duplicates active_income state_file: {shared}"
+    ]
 
 
 def test_validate_config_rejects_job_output_to_protected_runtime_file(tmp_path):
@@ -1124,7 +1493,13 @@ def test_validate_config_rejects_job_output_to_protected_runtime_file(tmp_path):
             JobConfig(
                 name="bad_status_writer",
                 enabled=True,
-                command=[sys.executable, "-m", "src.autopilot.research_smoke", "--output", str(status_file)],
+                command=[
+                    sys.executable,
+                    "-m",
+                    "src.autopilot.research_smoke",
+                    "--output",
+                    str(status_file),
+                ],
                 cadence_seconds=86400,
                 working_dir=tmp_path,
             ),
@@ -1146,7 +1521,12 @@ def test_validate_config_rejects_inline_job_output_to_protected_runtime_file(tmp
             JobConfig(
                 name="bad_inline_status_writer",
                 enabled=True,
-                command=[sys.executable, "-m", "src.autopilot.research_smoke", f"--output={status_file}"],
+                command=[
+                    sys.executable,
+                    "-m",
+                    "src.autopilot.research_smoke",
+                    f"--output={status_file}",
+                ],
                 cadence_seconds=86400,
                 working_dir=tmp_path,
             ),
@@ -1167,7 +1547,13 @@ def test_validate_config_rejects_job_output_to_product_state_file(tmp_path):
             JobConfig(
                 name="bad_state_writer",
                 enabled=True,
-                command=[sys.executable, "-m", "src.autopilot.research_smoke", "--output", str(state_file)],
+                command=[
+                    sys.executable,
+                    "-m",
+                    "src.autopilot.research_smoke",
+                    "--output",
+                    str(state_file),
+                ],
                 cadence_seconds=86400,
                 working_dir=tmp_path,
             ),
@@ -1199,10 +1585,22 @@ def test_validate_config_rejects_shared_product_runtime_paths(tmp_path):
 
     errors = validate_config(cfg)
 
-    assert "copy_income: strategies_path duplicates active_income: " + str(tmp_path / "missing.json") in errors
-    assert "copy_income: state_file duplicates active_income: " + str(tmp_path / "state.json") in errors
-    assert "copy_income: trade_log duplicates active_income: " + str(tmp_path / "trades.csv") in errors
-    assert "copy_income: preflight_report duplicates active_income: " + str(tmp_path / "preflight.json") in errors
+    assert (
+        "copy_income: strategies_path duplicates active_income: " + str(tmp_path / "missing.json")
+        in errors
+    )
+    assert (
+        "copy_income: state_file duplicates active_income: " + str(tmp_path / "state.json")
+        in errors
+    )
+    assert (
+        "copy_income: trade_log duplicates active_income: " + str(tmp_path / "trades.csv") in errors
+    )
+    assert (
+        "copy_income: preflight_report duplicates active_income: "
+        + str(tmp_path / "preflight.json")
+        in errors
+    )
     assert (
         "copy_income: testnet_rehearsal_report duplicates active_income: "
         + str(tmp_path / "testnet.json")
@@ -1260,7 +1658,9 @@ def test_validate_config_rejects_bad_preflight_max_age(tmp_path):
 def test_validate_config_rejects_bad_testnet_rehearsal_max_age(tmp_path):
     cfg = AutopilotConfig(products=[product(tmp_path, testnet_rehearsal_max_age_seconds=0)])
 
-    assert validate_config(cfg) == ["active_income: testnet_rehearsal_max_age_seconds must be positive"]
+    assert validate_config(cfg) == [
+        "active_income: testnet_rehearsal_max_age_seconds must be positive"
+    ]
 
 
 def test_validate_config_rejects_testnet_rehearsal_gate_for_btc_accumulation(tmp_path):
@@ -1317,7 +1717,9 @@ def test_validate_config_rejects_live_product_without_preflight_report_path(tmp_
         ]
     )
 
-    assert validate_config(cfg) == ["active_income: live execution requires a preflight_report path"]
+    assert validate_config(cfg) == [
+        "active_income: live execution requires a preflight_report path"
+    ]
 
 
 def test_validate_config_rejects_testnet_rehearsal_gate_without_report_path(tmp_path):
@@ -1385,6 +1787,141 @@ def test_run_once_waits_for_missing_paper_artifact(tmp_path):
     assert status["products"][0]["reason"] == "waiting_for_strategy_artifact"
     assert "Strategy artifact not found" in status["products"][0]["detail"]
     assert "alert" not in status
+
+
+def test_run_once_supervises_products_before_scheduled_jobs(monkeypatch, tmp_path):
+    calls = []
+    configured_product = product(tmp_path)
+    configured_job = JobConfig(
+        name="slow-research",
+        enabled=True,
+        command=[sys.executable, "-c", "print('ok')"],
+        cadence_seconds=60,
+        timeout_seconds=1800,
+        working_dir=tmp_path,
+    )
+    cfg = AutopilotConfig(
+        control_file=tmp_path / "control.json",
+        status_file=tmp_path / "status.json",
+        approval_ledger=tmp_path / "approvals.json",
+        alert_file=tmp_path / "alerts.jsonl",
+        alert_state_file=tmp_path / "alert_state.json",
+        job_state_file=tmp_path / "job_state.json",
+        products=[configured_product],
+        jobs=[configured_job],
+    )
+
+    def supervise(product_config, *, approval_ledger):
+        calls.append(("product", product_config.name))
+        return {"product": {"name": product_config.name}, "ok": True}
+
+    def run_jobs(jobs, state_file, **kwargs):
+        calls.append(("job", jobs[0].name))
+        return [{"name": jobs[0].name, "ok": True}]
+
+    monkeypatch.setattr("src.autopilot.runtime.run_product_once", supervise)
+    monkeypatch.setattr("src.autopilot.runtime.run_due_jobs", run_jobs)
+
+    report = run_once(cfg)
+
+    assert report["ok"] is True
+    assert calls == [("product", configured_product.name), ("job", configured_job.name)]
+
+
+def test_run_once_supervision_only_never_enters_scheduled_job_runner(monkeypatch, tmp_path):
+    cfg = AutopilotConfig(
+        control_file=tmp_path / "control.json",
+        status_file=tmp_path / "status.json",
+        job_state_file=tmp_path / "job_state.json",
+        products=[],
+        jobs=[
+            JobConfig(
+                name="slow-research",
+                enabled=True,
+                command=[sys.executable, "-c", "print('should not run')"],
+                cadence_seconds=60,
+                timeout_seconds=1800,
+                working_dir=tmp_path,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "src.autopilot.runtime.run_due_jobs",
+        lambda *args, **kwargs: pytest.fail("supervision-only cycle must not run jobs"),
+    )
+
+    report = run_once(cfg, run_jobs=False)
+
+    assert report["ok"] is True
+    assert report["jobs"] == []
+    assert not cfg.job_state_file.exists()
+
+
+def test_run_once_supervision_only_is_not_blocked_by_invalid_job_definition(
+    monkeypatch,
+    tmp_path,
+):
+    configured_product = product(tmp_path)
+    cfg = AutopilotConfig(
+        control_file=tmp_path / "control.json",
+        status_file=tmp_path / "status.json",
+        job_state_file=tmp_path / "job_state.json",
+        products=[configured_product],
+        jobs=[
+            JobConfig(
+                name="broken-optional-research",
+                enabled=True,
+                command=["sh", "-c", "exit 9"],
+                cadence_seconds=-1,
+                timeout_seconds=-1,
+                working_dir=tmp_path,
+            )
+        ],
+    )
+    seen = []
+
+    def supervise(product_config, *, approval_ledger):
+        seen.append(product_config.name)
+        return {"product": {"name": product_config.name}, "ok": True}
+
+    monkeypatch.setattr("src.autopilot.runtime.run_product_once", supervise)
+    monkeypatch.setattr(
+        "src.autopilot.runtime.run_due_jobs",
+        lambda *args, **kwargs: pytest.fail("supervision-only cycle must not run invalid jobs"),
+    )
+
+    report = run_once(cfg, run_jobs=False)
+
+    assert report["ok"] is True
+    assert report["jobs"] == []
+    assert seen == [configured_product.name]
+    assert not cfg.job_state_file.exists()
+
+
+def test_run_once_supervision_continues_but_fails_heartbeat_for_job_parse_errors(
+    monkeypatch,
+    tmp_path,
+):
+    configured_product = product(tmp_path)
+    cfg = AutopilotConfig(
+        control_file=tmp_path / "control.json",
+        status_file=tmp_path / "status.json",
+        products=[configured_product],
+        job_config_errors=["jobs[3]: malformed optional research job"],
+    )
+    seen = []
+
+    def supervise(product_config, *, approval_ledger):
+        seen.append(product_config.name)
+        return {"product": {"name": product_config.name}, "ok": True}
+
+    monkeypatch.setattr("src.autopilot.runtime.run_product_once", supervise)
+
+    report = run_once(cfg, run_jobs=False)
+
+    assert seen == [configured_product.name]
+    assert report["ok"] is False
+    assert report["job_config_errors"] == ["jobs[3]: malformed optional research job"]
 
 
 def test_run_once_surfaces_symlink_job_state_without_touching_target(tmp_path):
@@ -1468,9 +2005,15 @@ def test_write_cycle_reports_records_partial_output_failure(monkeypatch, tmp_pat
     )
 
     monkeypatch.setattr("src.autopilot.runtime.build_operator_report", lambda config: {"ok": True})
-    monkeypatch.setattr("src.autopilot.runtime.render_operator_markdown", lambda report: "# Operator\n")
-    monkeypatch.setattr("src.autopilot.readiness.build_readiness_report", lambda config: {"ok": True, "checks": []})
-    monkeypatch.setattr("src.autopilot.readiness.render_readiness_markdown", lambda report: "# Readiness\n")
+    monkeypatch.setattr(
+        "src.autopilot.runtime.render_operator_markdown", lambda report: "# Operator\n"
+    )
+    monkeypatch.setattr(
+        "src.autopilot.readiness.build_readiness_report", lambda config: {"ok": True, "checks": []}
+    )
+    monkeypatch.setattr(
+        "src.autopilot.readiness.render_readiness_markdown", lambda report: "# Readiness\n"
+    )
 
     def write_json(path, payload):
         if path == cfg.operator_report_json_file:
@@ -1495,10 +2038,15 @@ def test_write_cycle_reports_records_partial_output_failure(monkeypatch, tmp_pat
         }
     ]
     assert cfg.operator_report_file.read_text(encoding="utf-8") == "# Operator\n"
-    assert json.loads(cfg.readiness_report_json_file.read_text(encoding="utf-8")) == {"ok": True, "checks": []}
+    assert json.loads(cfg.readiness_report_json_file.read_text(encoding="utf-8")) == {
+        "ok": True,
+        "checks": [],
+    }
 
 
-def test_run_once_does_not_alert_from_stale_readiness_json_after_refresh_failure(monkeypatch, tmp_path):
+def test_run_once_does_not_alert_from_stale_readiness_json_after_refresh_failure(
+    monkeypatch, tmp_path
+):
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",
         status_file=tmp_path / "status.json",
@@ -1536,7 +2084,9 @@ def test_run_once_does_not_alert_from_stale_readiness_json_after_refresh_failure
                     "written": False,
                 }
             },
-            "errors": [{"stage": "readiness_report_json_write_failed", "error": "OSError: disk full"}],
+            "errors": [
+                {"stage": "readiness_report_json_write_failed", "error": "OSError: disk full"}
+            ],
         }
 
     monkeypatch.setattr("src.autopilot.runtime.write_cycle_reports", write_reports)
@@ -2106,6 +2656,113 @@ def test_run_product_once_surfaces_bot_cycle_errors(monkeypatch, tmp_path):
     ]
 
 
+def test_bot_status_snapshot_compacts_durable_recovery_and_accounting_state():
+    bot = SimpleNamespace(
+        state={
+            "equity": 997.5,
+            "open_positions": {},
+            "inactive_strategies": [],
+            "pending_order": {
+                "version": 1,
+                "strategy_id": "live_r1",
+                "stage": "entry",
+                "symbol": "BTCUSDT",
+                "side": "buy",
+                "qty": 0.1,
+                "order_type": "market",
+                "reduce_only": False,
+                "client_id": "tb-en-1",
+                "created_ts": 123.0,
+                "intent_ref": "excluded verbose intent",
+            },
+            "pending_entry_recovery": {
+                "version": 1,
+                "strategy_id": "live_r1",
+                "symbol": "BTCUSDT",
+                "status": "recovery_close_failed_position_remains",
+                "recovery_client_id": "tb-rc-1",
+                "attempt_count": 2,
+                "last_error": "excluded arbitrary broker response",
+            },
+            "risk_recovery_incident": {
+                "version": 1,
+                "strategy_id": "live_r1",
+                "symbol": "BTCUSDT",
+                "cause": "broker_position_quantity_mismatch",
+                "status": "recovery_close_filled_and_flat",
+                "recovery_client_id": "tb-rc-2",
+                "attempt_count": 1,
+                "fill": {"fee": 0.1},
+            },
+            "flatten_intent": {
+                "version": 1,
+                "strategy_id": "spot_r1",
+                "symbol": "BTCUSDT",
+                "side": "buy",
+                "order_type": "market",
+                "client_id": "tb-sf-1",
+                "qty": 0.01,
+                "quote_budget": 1.0,
+                "created_ts": 124.0,
+                "position_before": {"symbol": "BTCUSDT", "qty": 0.0},
+            },
+            "exit_accounting_intent": {
+                "version": 1,
+                "phase": "ready_to_commit",
+                "exit_event_id": "a" * 64,
+                "strategy_id": "live_r1",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "broker_flat_proven": True,
+                "trade_data": {"excluded": True},
+            },
+        },
+        strategies=[],
+    )
+
+    snapshot = _bot_status_snapshot(bot)
+
+    assert snapshot["pending_order"]["client_id"] == "tb-en-1"
+    assert "intent_ref" not in snapshot["pending_order"]
+    assert snapshot["pending_entry_recovery"] == {
+        "version": 1,
+        "strategy_id": "live_r1",
+        "symbol": "BTCUSDT",
+        "status": "recovery_close_failed_position_remains",
+        "recovery_client_id": "tb-rc-1",
+        "attempt_count": 2,
+    }
+    assert "fill" not in snapshot["risk_recovery_incident"]
+    assert "position_before" not in snapshot["flatten_intent"]
+    assert snapshot["exit_accounting_intent"] == {
+        "version": 1,
+        "phase": "ready_to_commit",
+        "exit_event_id": "a" * 64,
+        "strategy_id": "live_r1",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "broker_flat_proven": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "state_key",
+    [
+        "pending_order",
+        "pending_entry_recovery",
+        "risk_recovery_incident",
+        "flatten_intent",
+        "exit_accounting_intent",
+    ],
+)
+def test_durable_recovery_state_requires_management_cycle(tmp_path, state_key):
+    configured_product = product(tmp_path)
+    configured_product.state_file.write_text(
+        json.dumps({"open_positions": {}, state_key: {"version": 1}}),
+        encoding="utf-8",
+    )
+
+    assert _local_state_requires_management(configured_product) is True
+
+
 def test_run_product_once_reports_structured_bot_cycle_exception(monkeypatch, tmp_path):
     artifact = tmp_path / "active.json"
     strategy_artifact(artifact)
@@ -2115,25 +2772,29 @@ def test_run_product_once_reports_structured_bot_cycle_exception(monkeypatch, tm
         def __init__(self, **kwargs):
             self.state = {
                 "equity": 997.5,
-                    "open_positions": {
-                        "live_r1": {
-                            "direction": "long",
-                            "entry_time": "2026-01-01T00:00:00+00:00",
-                            "position_size": 0.1,
-                            "entry_price": 100.0,
-                            "sl_price": 98.0,
-                            "tp_price": 104.0,
-                            "sl_pct": 0.02,
-                            "tp_pct": 0.04,
-                            "broker_symbol": "BTCUSDT",
-                            "broker_qty": 0.1,
-                            "broker_side": "buy",
-                            "broker_entry_price": 100.0,
-                            "broker_entry_fee": 0.01,
-                            "broker_requested_qty": 0.1,
-                            "broker_fill_ratio": 1.0,
-                        }
-                    },
+                "open_positions": {
+                    "live_r1": {
+                        "direction": "long",
+                        "entry_time": "2026-01-01T00:00:00+00:00",
+                        "position_size": 0.1,
+                        "entry_price": 100.0,
+                        "sl_price": 98.0,
+                        "tp_price": 104.0,
+                        "sl_pct": 0.02,
+                        "tp_pct": 0.04,
+                        "broker_symbol": "BTCUSDT",
+                        "broker_qty": 0.1,
+                        "broker_side": "buy",
+                        "broker_entry_price": 100.0,
+                        "broker_entry_fee": 0.01,
+                        "broker_entry_balance": 997.5,
+                        "broker_requested_qty": 0.1,
+                        "broker_fill_ratio": 1.0,
+                        "broker_stop_order_id": "stop-123",
+                        "broker_stop_client_id": "tb-sl-stop-123",
+                        "broker_stop_trigger_price": 98.0,
+                    }
+                },
                 "inactive_strategies": ["stale_r2"],
             }
             self.strategies = [{"id": "live_r1", "base_timeframe": "5m", "horizon_bars": 6}]
@@ -2169,8 +2830,12 @@ def test_run_product_once_reports_structured_bot_cycle_exception(monkeypatch, tm
             "broker_side": "buy",
             "broker_entry_price": 100.0,
             "broker_entry_fee": 0.01,
+            "broker_entry_balance": 997.5,
             "broker_requested_qty": 0.1,
             "broker_fill_ratio": 1.0,
+            "broker_stop_order_id": "stop-123",
+            "broker_stop_client_id": "tb-sl-stop-123",
+            "broker_stop_trigger_price": 98.0,
         }
     ]
     assert status["inactive_strategies"] == ["stale_r2"]
@@ -2313,6 +2978,38 @@ def test_run_once_respects_pause_control(tmp_path):
     assert report["products"][0]["reason"] == "paused"
 
 
+def test_run_once_paused_product_still_manages_existing_exposure(monkeypatch, tmp_path):
+    (tmp_path / "control.json").write_text(json.dumps({"paused": True}), encoding="utf-8")
+    configured_product = product(tmp_path)
+    configured_product.state_file.write_text(
+        json.dumps({"open_positions": {"strategy": {"direction": "long"}}}),
+        encoding="utf-8",
+    )
+    cfg = AutopilotConfig(
+        control_file=tmp_path / "control.json",
+        status_file=tmp_path / "status.json",
+        approval_ledger=tmp_path / "approvals.json",
+        products=[configured_product],
+    )
+    seen = {}
+
+    def manage(product_config, *, approval_ledger, allow_entries=True):
+        seen.update(product=product_config.name, allow_entries=allow_entries)
+        return {
+            "product": {"name": product_config.name},
+            "ok": True,
+            "entries_allowed": allow_entries,
+        }
+
+    monkeypatch.setattr("src.autopilot.runtime.run_product_once", manage)
+
+    report = run_once(cfg)
+
+    assert seen == {"product": "active_income", "allow_entries": False}
+    assert report["products"][0]["paused"] is True
+    assert report["products"][0]["entries_allowed"] is False
+
+
 def test_run_once_malformed_control_fails_closed_and_writes_status(tmp_path):
     (tmp_path / "control.json").write_text("{", encoding="utf-8")
     cfg = AutopilotConfig(
@@ -2446,11 +3143,211 @@ def test_run_once_pauses_selected_job_without_pausing_products(tmp_path):
     assert not (tmp_path / "job_state.json").exists()
 
 
+def test_flatten_live_futures_rejects_testnet_before_broker_or_state_change(
+    monkeypatch,
+    tmp_path,
+):
+    set_live_env(monkeypatch)
+    monkeypatch.setenv("EXCHANGE_TESTNET", "1")
+    state_file = tmp_path / "state.json"
+    original = {
+        "open_positions": {
+            "s1": {
+                "direction": "long",
+                "broker_symbol": "BTCUSDT",
+                "broker_qty": 0.5,
+            }
+        },
+        "pending_order": {"client_id": "tb-ex-1"},
+        "equity": 1000.0,
+    }
+    state_file.write_text(json.dumps(original), encoding="utf-8")
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        state_file=state_file,
+    )
+    broker_calls = []
+    monkeypatch.setattr(
+        "src.autopilot.runtime.build_live_broker",
+        lambda configured_product: broker_calls.append(configured_product),
+    )
+
+    with pytest.raises(RuntimeError, match="EXCHANGE_TESTNET must be 0"):
+        flatten_product_once(live_product)
+
+    assert broker_calls == []
+    assert json.loads(state_file.read_text(encoding="utf-8")) == original
+
+
+def test_flatten_live_spot_rejects_testnet_before_broker_or_state_change(
+    monkeypatch,
+    tmp_path,
+):
+    set_live_env(monkeypatch)
+    monkeypatch.setenv("EXCHANGE_TESTNET", "1")
+    state_file = tmp_path / "state.json"
+    original = {
+        "equity": 1.0,
+        "open_positions": {
+            "btc_step_aside": {
+                "direction": "short",
+                "broker_symbol": "BTCUSDT",
+                "broker_qty": 0.5,
+                "broker_side": "sell",
+                "broker_entry_price": 100.0,
+                "broker_entry_fee": 0.05,
+                "broker_entry_quote_value": 50.0,
+                "broker_requested_qty": 0.5,
+                "broker_fill_ratio": 1.0,
+                "broker_exit_sizing": "quote_reinvest",
+                "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+            }
+        },
+    }
+    state_file.write_text(json.dumps(original), encoding="utf-8")
+    live_product = product(
+        tmp_path,
+        name="btc_accumulation",
+        objective="btc_accumulation",
+        base_asset="BTC",
+        market="spot",
+        execution_mode="live",
+        state_file=state_file,
+    )
+    broker_calls = []
+    monkeypatch.setattr(
+        "src.autopilot.runtime.build_live_broker",
+        lambda configured_product: broker_calls.append(configured_product),
+    )
+
+    with pytest.raises(RuntimeError, match="EXCHANGE_TESTNET must be 0"):
+        flatten_product_once(live_product)
+
+    assert broker_calls == []
+    assert json.loads(state_file.read_text(encoding="utf-8")) == original
+
+
+def test_flatten_live_futures_rejects_wrong_account_before_any_broker_read(
+    monkeypatch,
+    tmp_path,
+):
+    set_live_env(monkeypatch)
+    state_file = tmp_path / "state.json"
+    original = {
+        "open_positions": {
+            "s1": {
+                "direction": "long",
+                "broker_symbol": "BTCUSDT",
+                "broker_qty": 0.5,
+                "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+            }
+        },
+        "equity": 1000.0,
+    }
+    state_file.write_text(json.dumps(original), encoding="utf-8")
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        state_file=state_file,
+    )
+
+    class WrongAccountBroker:
+        name = "wrong-account"
+        account_fingerprint = OTHER_ACCOUNT_FINGERPRINT
+
+        def get_position(self, symbol):
+            raise AssertionError("account mismatch must block before broker position read")
+
+        def close_position(self, symbol):
+            raise AssertionError("account mismatch must block before broker close")
+
+    monkeypatch.setattr(
+        "src.autopilot.runtime.build_live_broker",
+        lambda configured_product: WrongAccountBroker(),
+    )
+
+    with pytest.raises(RuntimeError, match="different broker account"):
+        flatten_product_once(live_product)
+
+    assert json.loads(state_file.read_text(encoding="utf-8")) == original
+
+
+def test_flatten_live_spot_rejects_wrong_account_before_any_broker_read(
+    monkeypatch,
+    tmp_path,
+):
+    set_live_env(monkeypatch)
+    state_file = tmp_path / "state.json"
+    original = {
+        "open_positions": {
+            "btc_step_aside": {
+                "direction": "short",
+                "broker_symbol": "BTCUSDT",
+                "broker_qty": 0.5,
+                "broker_side": "sell",
+                "broker_entry_price": 100.0,
+                "broker_entry_quote_value": 50.0,
+                "broker_exit_sizing": "quote_reinvest",
+                "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+            }
+        },
+        "equity": 1.0,
+    }
+    state_file.write_text(json.dumps(original), encoding="utf-8")
+    live_product = product(
+        tmp_path,
+        name="btc_accumulation",
+        objective="btc_accumulation",
+        base_asset="BTC",
+        market="spot",
+        execution_mode="live",
+        state_file=state_file,
+    )
+
+    class WrongAccountBroker:
+        name = "wrong-account"
+        account_fingerprint = OTHER_ACCOUNT_FINGERPRINT
+
+        def get_position(self, symbol):
+            raise AssertionError("account mismatch must block before broker balance read")
+
+    monkeypatch.setattr(
+        "src.autopilot.runtime.build_live_broker",
+        lambda configured_product: WrongAccountBroker(),
+    )
+
+    status = flatten_product_once(live_product)
+
+    assert status["ok"] is False
+    assert status["reason"] == "broker_account_mismatch"
+    assert json.loads(state_file.read_text(encoding="utf-8")) == original
+
+
 def test_flatten_live_futures_product_closes_broker_and_clears_state(monkeypatch, tmp_path):
     set_live_env(monkeypatch)
     state_file = tmp_path / "state.json"
     state_file.write_text(
-        json.dumps({"open_positions": {"s1": {"broker_qty": 0.5}}, "equity": 1000.0}),
+        json.dumps(
+            {
+                "open_positions": {
+                    "s1": {
+                        "direction": "long",
+                        "broker_symbol": "BTCUSDT",
+                        "broker_qty": 0.5,
+                        "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+                        "broker_stop_order_id": "stop-1",
+                        "broker_stop_client_id": "tb-sl-stop-1",
+                        "broker_stop_trigger_price": 95.0,
+                    }
+                },
+                "pending_order": {
+                    "client_id": "tb-ex-recovery",
+                    "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+                },
+                "equity": 1000.0,
+            }
+        ),
         encoding="utf-8",
     )
     live_product = product(
@@ -2462,10 +3359,33 @@ def test_flatten_live_futures_product_closes_broker_and_clears_state(monkeypatch
 
     class FakeBroker:
         name = "fake-live"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
 
         def __init__(self):
             self.position = Position(symbol="BTCUSDT", qty=0.5, avg_price=100.0)
             self.closed = False
+            self.stop_status = ProtectiveOrderStatus.OPEN
+
+        def supports_native_protective_stops(self):
+            return True
+
+        def _stop(self):
+            return ProtectiveOrder(
+                symbol="BTCUSDT",
+                side=OrderSide.SELL,
+                qty=0.5,
+                trigger_price=95.0,
+                status=self.stop_status,
+                order_id="stop-1",
+                client_id="tb-sl-stop-1",
+            )
+
+        def get_protective_stop(self, **kwargs):
+            return self._stop()
+
+        def cancel_protective_stop(self, **kwargs):
+            self.stop_status = ProtectiveOrderStatus.CANCELED
+            return self._stop()
 
         def get_position(self, symbol):
             return self.position
@@ -2486,18 +3406,155 @@ def test_flatten_live_futures_product_closes_broker_and_clears_state(monkeypatch
     assert status["position_before"]["qty"] == 0.5
     assert status["position_after"]["qty"] == 0.0
     assert broker.closed is True
+    assert status["native_stop_cleanup"] == [
+        {
+            "strategy_id": "s1",
+            "order_id": "stop-1",
+            "client_id": "tb-sl-stop-1",
+            "status": "canceled",
+        }
+    ]
     state = json.loads(state_file.read_text(encoding="utf-8"))
     assert state["open_positions"] == {}
+    assert "pending_order" not in state
     assert state["last_flatten"]["reason"] == "autopilot_control"
     assert state["last_flatten"]["recovered_state"] is False
+    assert state["last_flatten"]["cleared_pending_order"] is True
+    assert state["last_flatten"]["pending_client_id"] == "tb-ex-recovery"
     assert status["local_state"]["recovered"] is False
+
+
+def test_flatten_live_futures_keeps_state_when_native_stop_remains_open(monkeypatch, tmp_path):
+    set_live_env(monkeypatch)
+    state_file = tmp_path / "state.json"
+    original = {
+        "open_positions": {
+            "s1": {
+                "direction": "long",
+                "broker_symbol": "BTCUSDT",
+                "broker_qty": 0.5,
+                "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+                "broker_stop_order_id": "stop-1",
+                "broker_stop_client_id": "tb-sl-stop-1",
+                "broker_stop_trigger_price": 95.0,
+            }
+        }
+    }
+    state_file.write_text(json.dumps(original), encoding="utf-8")
+    live_product = product(tmp_path, execution_mode="live", state_file=state_file)
+
+    class StuckStopBroker:
+        name = "stuck-stop"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
+
+        def get_position(self, symbol):
+            return Position(symbol=symbol)
+
+        def supports_native_protective_stops(self):
+            return True
+
+        def _stop(self):
+            return ProtectiveOrder(
+                symbol="BTCUSDT",
+                side=OrderSide.SELL,
+                qty=0.5,
+                trigger_price=95.0,
+                status=ProtectiveOrderStatus.OPEN,
+                order_id="stop-1",
+                client_id="tb-sl-stop-1",
+            )
+
+        def get_protective_stop(self, **kwargs):
+            return self._stop()
+
+        def cancel_protective_stop(self, **kwargs):
+            return self._stop()
+
+    monkeypatch.setattr(
+        "src.autopilot.runtime.build_live_broker", lambda product: StuckStopBroker()
+    )
+
+    status = flatten_product_once(live_product)
+
+    assert status["ok"] is False
+    assert status["reason"] == "native_stop_cleanup_unverified"
+    assert "remains open" in status["native_stop_cleanup_error"]
+    assert json.loads(state_file.read_text(encoding="utf-8")) == original
+
+
+def test_flatten_live_futures_adopts_triggered_stop_before_clearing_state(monkeypatch, tmp_path):
+    set_live_env(monkeypatch)
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "open_positions": {
+                    "s1": {
+                        "direction": "long",
+                        "broker_symbol": "BTCUSDT",
+                        "broker_qty": 0.5,
+                        "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+                        "broker_stop_order_id": "stop-1",
+                        "broker_stop_client_id": "tb-sl-stop-1",
+                        "broker_stop_trigger_price": 95.0,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    live_product = product(tmp_path, execution_mode="live", state_file=state_file)
+
+    class TriggeredStopBroker:
+        name = "triggered-stop"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
+
+        def get_position(self, symbol):
+            return Position(symbol=symbol)
+
+        def supports_native_protective_stops(self):
+            return True
+
+        def get_protective_stop(self, **kwargs):
+            return ProtectiveOrder(
+                symbol="BTCUSDT",
+                side=OrderSide.SELL,
+                qty=0.5,
+                trigger_price=95.0,
+                status=ProtectiveOrderStatus.TRIGGERED,
+                order_id="stop-1",
+                client_id="tb-sl-stop-1",
+                filled_qty=0.5,
+                average_price=94.5,
+            )
+
+        def cancel_protective_stop(self, **kwargs):
+            pytest.fail("an already-triggered stop must not be canceled")
+
+    monkeypatch.setattr(
+        "src.autopilot.runtime.build_live_broker", lambda product: TriggeredStopBroker()
+    )
+
+    status = flatten_product_once(live_product)
+
+    assert status["ok"] is True
+    assert status["native_stop_cleanup"][0]["status"] == "triggered"
+    assert json.loads(state_file.read_text(encoding="utf-8"))["open_positions"] == {}
 
 
 def test_flatten_live_futures_closes_broker_but_refuses_symlink_local_state(monkeypatch, tmp_path):
     set_live_env(monkeypatch)
     state_file = tmp_path / "state.json"
     target = tmp_path / "external_state.json"
-    original = {"open_positions": {"s1": {"broker_qty": 0.5}}, "equity": 1000.0}
+    original = {
+        "open_positions": {
+            "s1": {
+                "broker_qty": 0.5,
+                "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+            }
+        },
+        "equity": 1000.0,
+    }
     target.write_text(json.dumps(original), encoding="utf-8")
     state_file.symlink_to(target)
     live_product = product(
@@ -2509,6 +3566,7 @@ def test_flatten_live_futures_closes_broker_but_refuses_symlink_local_state(monk
 
     class FakeBroker:
         name = "fake-live"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
 
         def __init__(self):
             self.position = Position(symbol="BTCUSDT", qty=0.5, avg_price=100.0)
@@ -2525,20 +3583,17 @@ def test_flatten_live_futures_closes_broker_but_refuses_symlink_local_state(monk
     broker = FakeBroker()
     monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: broker)
 
-    status = flatten_product_once(live_product)
+    with pytest.raises(RuntimeError, match="cannot verify account identity"):
+        flatten_product_once(live_product)
 
-    assert status["ok"] is False
-    assert status["flattened"] is True
-    assert status["reason"] == "unsafe_local_state"
-    assert status["local_state"]["unsafe"] is True
-    assert status["local_state"]["cleared"] is False
-    assert "state file must not be a symlink" in status["local_state"]["error"]
-    assert broker.closed is True
+    assert broker.closed is False
     assert state_file.is_symlink()
     assert json.loads(target.read_text(encoding="utf-8")) == original
 
 
-def test_flatten_live_futures_product_recovers_corrupt_local_state(monkeypatch, tmp_path):
+def test_flatten_live_futures_product_keeps_corrupt_state_when_stop_identity_is_unknown(
+    monkeypatch, tmp_path
+):
     set_live_env(monkeypatch)
     state_file = tmp_path / "state.json"
     state_file.write_text("{", encoding="utf-8")
@@ -2551,6 +3606,7 @@ def test_flatten_live_futures_product_recovers_corrupt_local_state(monkeypatch, 
 
     class FakeBroker:
         name = "fake-live"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
 
         def __init__(self):
             self.position = Position(symbol="BTCUSDT", qty=0.5, avg_price=100.0)
@@ -2564,15 +3620,10 @@ def test_flatten_live_futures_product_recovers_corrupt_local_state(monkeypatch, 
 
     monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: FakeBroker())
 
-    status = flatten_product_once(live_product)
+    with pytest.raises(RuntimeError, match="cannot verify account identity"):
+        flatten_product_once(live_product)
 
-    assert status["ok"] is True
-    assert status["local_state"]["recovered"] is True
-    assert "JSONDecodeError" in status["local_state"]["error"]
-    state = json.loads(state_file.read_text(encoding="utf-8"))
-    assert state["open_positions"] == {}
-    assert state["last_flatten"]["recovered_state"] is True
-    assert "JSONDecodeError" in state["last_flatten"]["state_error"]
+    assert state_file.read_text(encoding="utf-8") == "{"
 
 
 def test_flatten_btc_spot_step_aside_refuses_symlink_local_state_before_broker(tmp_path):
@@ -2616,7 +3667,17 @@ def test_flatten_live_futures_reports_close_failure_with_position_context(monkey
     set_live_env(monkeypatch)
     state_file = tmp_path / "state.json"
     state_file.write_text(
-        json.dumps({"open_positions": {"s1": {"broker_qty": 0.5}}, "equity": 1000.0}),
+        json.dumps(
+            {
+                "open_positions": {
+                    "s1": {
+                        "broker_qty": 0.5,
+                        "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+                    }
+                },
+                "equity": 1000.0,
+            }
+        ),
         encoding="utf-8",
     )
     live_product = product(
@@ -2628,6 +3689,7 @@ def test_flatten_live_futures_reports_close_failure_with_position_context(monkey
 
     class CloseFailsBroker:
         name = "fake-live"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
 
         def get_position(self, symbol):
             return Position(symbol=symbol, qty=0.5, avg_price=100.0)
@@ -2635,7 +3697,9 @@ def test_flatten_live_futures_reports_close_failure_with_position_context(monkey
         def close_position(self, symbol):
             raise RuntimeError("exchange timeout")
 
-    monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: CloseFailsBroker())
+    monkeypatch.setattr(
+        "src.autopilot.runtime.build_live_broker", lambda product: CloseFailsBroker()
+    )
 
     status = flatten_product_once(live_product)
 
@@ -2652,7 +3716,17 @@ def test_flatten_live_futures_reports_remaining_position_after_close(monkeypatch
     set_live_env(monkeypatch)
     state_file = tmp_path / "state.json"
     state_file.write_text(
-        json.dumps({"open_positions": {"s1": {"broker_qty": 0.5}}, "equity": 1000.0}),
+        json.dumps(
+            {
+                "open_positions": {
+                    "s1": {
+                        "broker_qty": 0.5,
+                        "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+                    }
+                },
+                "equity": 1000.0,
+            }
+        ),
         encoding="utf-8",
     )
     live_product = product(
@@ -2664,6 +3738,7 @@ def test_flatten_live_futures_reports_remaining_position_after_close(monkeypatch
 
     class StillOpenBroker:
         name = "fake-live"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
 
         def get_position(self, symbol):
             return Position(symbol=symbol, qty=0.25, avg_price=100.0)
@@ -2671,7 +3746,9 @@ def test_flatten_live_futures_reports_remaining_position_after_close(monkeypatch
         def close_position(self, symbol):
             return Fill(symbol=symbol, side=OrderSide.SELL, qty=0.25, price=101.0, fee=0.1)
 
-    monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: StillOpenBroker())
+    monkeypatch.setattr(
+        "src.autopilot.runtime.build_live_broker", lambda product: StillOpenBroker()
+    )
 
     status = flatten_product_once(live_product)
 
@@ -2682,10 +3759,20 @@ def test_flatten_live_futures_reports_remaining_position_after_close(monkeypatch
     assert "last_flatten" not in json.loads(state_file.read_text(encoding="utf-8"))
 
 
-def test_flatten_live_futures_rejects_invalid_close_fill_before_clearing_state(monkeypatch, tmp_path):
+def test_flatten_live_futures_rejects_invalid_close_fill_before_clearing_state(
+    monkeypatch, tmp_path
+):
     set_live_env(monkeypatch)
     state_file = tmp_path / "state.json"
-    original_state = {"open_positions": {"s1": {"broker_qty": 0.5}}, "equity": 1000.0}
+    original_state = {
+        "open_positions": {
+            "s1": {
+                "broker_qty": 0.5,
+                "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+            }
+        },
+        "equity": 1000.0,
+    }
     state_file.write_text(json.dumps(original_state), encoding="utf-8")
     live_product = product(
         tmp_path,
@@ -2696,6 +3783,7 @@ def test_flatten_live_futures_rejects_invalid_close_fill_before_clearing_state(m
 
     class WrongSideBroker:
         name = "fake-live"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
 
         def __init__(self):
             self.position = Position(symbol="BTCUSDT", qty=0.5, avg_price=100.0)
@@ -2707,7 +3795,9 @@ def test_flatten_live_futures_rejects_invalid_close_fill_before_clearing_state(m
             self.position = Position(symbol=symbol, qty=0.0, avg_price=0.0)
             return Fill(symbol=symbol, side=OrderSide.BUY, qty=0.5, price=101.0, fee=0.1)
 
-    monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: WrongSideBroker())
+    monkeypatch.setattr(
+        "src.autopilot.runtime.build_live_broker", lambda product: WrongSideBroker()
+    )
 
     status = flatten_product_once(live_product)
 
@@ -2717,7 +3807,9 @@ def test_flatten_live_futures_rejects_invalid_close_fill_before_clearing_state(m
     assert json.loads(state_file.read_text(encoding="utf-8")) == original_state
 
 
-def test_flatten_live_futures_already_flat_recovers_corrupt_local_state(monkeypatch, tmp_path):
+def test_flatten_live_futures_already_flat_keeps_corrupt_state_for_stop_reconciliation(
+    monkeypatch, tmp_path
+):
     set_live_env(monkeypatch)
     state_file = tmp_path / "state.json"
     state_file.write_text("{", encoding="utf-8")
@@ -2730,21 +3822,17 @@ def test_flatten_live_futures_already_flat_recovers_corrupt_local_state(monkeypa
 
     class FlatBroker:
         name = "flat-live"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
 
         def get_position(self, symbol):
             return Position(symbol=symbol, qty=0.0, avg_price=0.0)
 
     monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: FlatBroker())
 
-    status = flatten_product_once(live_product)
+    with pytest.raises(RuntimeError, match="cannot verify account identity"):
+        flatten_product_once(live_product)
 
-    assert status["ok"] is True
-    assert status["flattened"] is False
-    assert status["reason"] == "already_flat"
-    assert status["local_state"]["recovered"] is True
-    state = json.loads(state_file.read_text(encoding="utf-8"))
-    assert state["open_positions"] == {}
-    assert state["last_flatten"]["recovered_state"] is True
+    assert state_file.read_text(encoding="utf-8") == "{"
 
 
 def test_run_once_flatten_takes_precedence_over_pause(monkeypatch, tmp_path):
@@ -2758,6 +3846,7 @@ def test_run_once_flatten_takes_precedence_over_pause(monkeypatch, tmp_path):
         approval_ledger=tmp_path / "approvals.json",
         products=[product(tmp_path, execution_mode="live", require_testnet_rehearsal=True)],
     )
+
     def flatten_success(product_config):
         status = {"product": {"name": product_config.name}, "ok": True, "action": "flatten"}
         if product_config.name == "btc_accumulation":
@@ -2775,12 +3864,55 @@ def test_run_once_flatten_takes_precedence_over_pause(monkeypatch, tmp_path):
     assert report["control_clear"][0]["name"] == "active_income"
     assert report["control_clear"][0]["ok"] is True
     audit_events = [
-        json.loads(line)
-        for line in cfg.control_audit_file.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in cfg.control_audit_file.read_text(encoding="utf-8").splitlines()
     ]
     assert audit_events[-1]["actor"] == "autopilot"
     assert audit_events[-1]["command"] == "clear-flatten"
     assert audit_events[-1]["name"] == "active_income"
+
+
+def test_run_once_successful_manual_flatten_request_atomically_leaves_product_paused(
+    monkeypatch,
+    tmp_path,
+):
+    control_path = tmp_path / "control.json"
+    control_path.write_text(
+        json.dumps({"flatten_products": ["active_income"]}),
+        encoding="utf-8",
+    )
+    cfg = AutopilotConfig(
+        control_file=control_path,
+        control_audit_file=tmp_path / "control_audit.jsonl",
+        status_file=tmp_path / "status.json",
+        approval_ledger=tmp_path / "approvals.json",
+        products=[product(tmp_path, execution_mode="live", require_testnet_rehearsal=True)],
+    )
+    monkeypatch.setattr(
+        "src.autopilot.runtime.flatten_product_once",
+        lambda product_config: {
+            "product": {"name": product_config.name},
+            "ok": True,
+            "action": "flatten",
+        },
+    )
+
+    report = run_once(cfg)
+
+    assert report["ok"] is True
+    control = json.loads(control_path.read_text(encoding="utf-8"))
+    assert control["paused"] is False
+    assert control["paused_products"] == ["active_income"]
+    assert control["flatten_products"] == []
+    assert report["control_clear"][0]["paused_products"] == ["active_income"]
+    audit_events = [
+        json.loads(line) for line in cfg.control_audit_file.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(audit_events) == 1
+    assert audit_events[0]["command"] == "clear-flatten"
+    assert audit_events[0]["before"]["paused_products"] == []
+    assert audit_events[0]["before"]["flatten_products"] == ["active_income"]
+    assert audit_events[0]["after"]["paused_products"] == ["active_income"]
+    assert audit_events[0]["after"]["flatten_products"] == []
 
 
 def test_run_once_panic_control_pauses_jobs_and_runs_flatten_all(monkeypatch, tmp_path):
@@ -2814,6 +3946,7 @@ def test_run_once_panic_control_pauses_jobs_and_runs_flatten_all(monkeypatch, tm
             )
         ],
     )
+
     def flatten_success(product_config):
         status = {"product": {"name": product_config.name}, "ok": True, "action": "flatten"}
         if product_config.name == "btc_accumulation":
@@ -2826,7 +3959,9 @@ def test_run_once_panic_control_pauses_jobs_and_runs_flatten_all(monkeypatch, tm
 
     assert report["ok"] is True
     assert report["jobs"] == []
-    assert report["products"] == [{"product": {"name": "active_income"}, "ok": True, "action": "flatten"}]
+    assert report["products"] == [
+        {"product": {"name": "active_income"}, "ok": True, "action": "flatten"}
+    ]
     assert not cfg.job_state_file.exists()
     control = json.loads(control_path.read_text(encoding="utf-8"))
     assert control["paused"] is True
@@ -2835,9 +3970,7 @@ def test_run_once_panic_control_pauses_jobs_and_runs_flatten_all(monkeypatch, tm
     assert control["reason"] == "auto-cleared after successful runtime flatten"
     assert report["control_clear"][0]["ok"] is True
     assert report["control_clear"][0]["name"] is None
-    assert report["control_clear"][0]["targets"] == [
-        {"product_name": "active_income", "ok": True}
-    ]
+    assert report["control_clear"][0]["targets"] == [{"product_name": "active_income", "ok": True}]
 
 
 def test_run_once_keeps_failed_flatten_request_for_retry(monkeypatch, tmp_path):
@@ -2868,6 +4001,8 @@ def test_run_once_keeps_failed_flatten_request_for_retry(monkeypatch, tmp_path):
     assert "control_clear" not in report
     control = json.loads((tmp_path / "control.json").read_text(encoding="utf-8"))
     assert control["flatten_products"] == ["active_income"]
+    assert control.get("paused", False) is False
+    assert control.get("paused_products", []) == []
     assert not cfg.control_audit_file.exists()
 
 
@@ -2900,6 +4035,7 @@ def test_run_once_clears_flatten_all_only_after_all_targets_succeed(monkeypatch,
         approval_ledger=tmp_path / "approvals.json",
         products=[active, btc],
     )
+
     def flatten_success(product_config):
         status = {"product": {"name": product_config.name}, "ok": True, "action": "flatten"}
         if product_config.name == "btc_accumulation":
@@ -2913,8 +4049,10 @@ def test_run_once_clears_flatten_all_only_after_all_targets_succeed(monkeypatch,
     assert report["ok"] is True
     assert len(report["products"]) == 2
     control = json.loads(control_path.read_text(encoding="utf-8"))
+    assert control["paused"] is True
     assert control["flatten_all"] is False
     assert control["flatten_products"] == []
+    assert report["control_clear"][0]["paused"] is True
     assert report["control_clear"][0]["name"] is None
     assert report["control_clear"][0]["targets"] == [
         {"product_name": "active_income", "ok": True},
@@ -2926,11 +4064,15 @@ def test_run_once_clears_flatten_all_only_after_all_targets_succeed(monkeypatch,
         },
     ]
     audit_events = [
-        json.loads(line)
-        for line in cfg.control_audit_file.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in cfg.control_audit_file.read_text(encoding="utf-8").splitlines()
     ]
+    assert len(audit_events) == 1
     assert audit_events[-1]["command"] == "clear-flatten"
     assert audit_events[-1]["name"] is None
+    assert audit_events[-1]["before"]["paused"] is False
+    assert audit_events[-1]["before"]["flatten_all"] is True
+    assert audit_events[-1]["after"]["paused"] is True
+    assert audit_events[-1]["after"]["flatten_all"] is False
 
 
 def test_run_once_preserves_flatten_all_when_any_target_fails(monkeypatch, tmp_path):
@@ -3038,6 +4180,7 @@ def test_flatten_live_spot_step_aside_reinvests_quote_and_clears_state(monkeypat
                         "broker_requested_qty": 0.5,
                         "broker_fill_ratio": 1.0,
                         "broker_exit_sizing": "quote_reinvest",
+                        "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
                     }
                 },
             }
@@ -3057,10 +4200,13 @@ def test_flatten_live_spot_step_aside_reinvests_quote_and_clears_state(monkeypat
 
     class FakeSpotBroker:
         name = "fake-spot"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
 
         def __init__(self):
             self.position = Position(symbol="BTCUSDT", qty=0.8, avg_price=0.0)
             self.orders = []
+            self.normalizations = []
+            self.persisted_intents = []
 
         def get_position(self, symbol):
             return self.position
@@ -3068,10 +4214,26 @@ def test_flatten_live_spot_step_aside_reinvests_quote_and_clears_state(monkeypat
         def get_price(self, symbol):
             return 125.0
 
+        def normalize_order_qty(self, symbol, qty, *, price=None, reduce_only=False):
+            self.normalizations.append((symbol, qty, price, reduce_only))
+            return qty - 0.001
+
         def place_order(self, order):
+            durable_state = json.loads(state_file.read_text(encoding="utf-8"))
+            self.persisted_intents.append(durable_state["flatten_intent"])
             self.orders.append(order)
-            self.position = Position(symbol=order.symbol, qty=self.position.qty + order.qty, avg_price=125.0)
-            return Fill(symbol=order.symbol, side=order.side, qty=order.qty, price=125.0, fee=0.02)
+            self.position = Position(
+                symbol=order.symbol,
+                qty=self.position.qty + order.qty,
+                avg_price=125.0,
+            )
+            return Fill(
+                symbol=order.symbol,
+                side=order.side,
+                qty=order.qty,
+                price=125.0,
+                fee=0.02,
+            )
 
     broker = FakeSpotBroker()
     monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: broker)
@@ -3083,17 +4245,357 @@ def test_flatten_live_spot_step_aside_reinvests_quote_and_clears_state(monkeypat
     assert status["broker"] == "fake-spot"
     assert status["flattened"] is True
     assert status["spot_step_aside"]["quote_value"] == pytest.approx(50.0)
-    assert status["spot_step_aside"]["requested_qty"] == pytest.approx(0.4)
+    assert status["spot_step_aside"]["raw_requested_qty"] == pytest.approx(0.4)
+    assert status["spot_step_aside"]["requested_qty"] == pytest.approx(0.399)
     assert status["fill"]["side"] == "buy"
-    assert status["fill"]["qty"] == pytest.approx(0.4)
+    assert status["fill"]["qty"] == pytest.approx(0.399)
     assert status["position_before"]["qty"] == pytest.approx(0.8)
-    assert status["position_after"]["qty"] == pytest.approx(1.2)
+    assert status["position_after"]["qty"] == pytest.approx(1.199)
     assert len(broker.orders) == 1
+    assert broker.normalizations == [("BTCUSDT", pytest.approx(0.4), 125.0, False)]
     assert broker.orders[0].side == OrderSide.BUY
-    assert broker.orders[0].qty == pytest.approx(0.4)
+    assert broker.orders[0].qty == pytest.approx(0.399)
+    assert len(broker.persisted_intents) == 1
+    intent = broker.persisted_intents[0]
+    assert set(intent) == {
+        "version",
+        "strategy_id",
+        "symbol",
+        "side",
+        "order_type",
+        "client_id",
+        "broker_account_fingerprint",
+        "qty",
+        "quote_budget",
+        "position_before",
+        "created_ts",
+    }
+    assert intent["qty"] == pytest.approx(0.399)
+    assert intent["quote_budget"] == pytest.approx(50.0)
+    assert intent["broker_account_fingerprint"] == TEST_ACCOUNT_FINGERPRINT
+    assert intent["position_before"] == {
+        "symbol": "BTCUSDT",
+        "qty": 0.8,
+        "avg_price": 0.0,
+    }
+    assert intent["created_ts"] > 0
+    assert intent["client_id"] == broker.orders[0].client_id
+    assert intent["client_id"].startswith("tb-sf-")
+    assert len(intent["client_id"]) <= 36
+    assert set(intent["client_id"]) <= set(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/-"
+    )
+    assert status["balance_evidence"]["proven"] is True
+    assert status["balance_evidence"]["actual_increase"] == pytest.approx(0.399)
     state = json.loads(state_file.read_text(encoding="utf-8"))
     assert state["open_positions"] == {}
+    assert "flatten_intent" not in state
     assert state["last_flatten"]["reason"] == "autopilot_control"
+    assert state["last_flatten"]["flatten_client_id"] == intent["client_id"]
+    assert state["last_flatten"]["auto_finalized"] is False
+    assert state["last_flatten"]["balance_evidence"]["proven"] is True
+
+
+def test_flatten_live_spot_ambiguous_submission_retains_intent_and_never_duplicates(
+    monkeypatch,
+    tmp_path,
+):
+    set_live_env(monkeypatch)
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "equity": 1.0,
+                "open_positions": {
+                    "btc_step_aside": {
+                        "direction": "short",
+                        "broker_symbol": "BTCUSDT",
+                        "broker_qty": 0.5,
+                        "broker_side": "sell",
+                        "broker_entry_price": 100.0,
+                        "broker_entry_quote_value": 50.0,
+                        "broker_exit_sizing": "quote_reinvest",
+                        "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    live_product = product(
+        tmp_path,
+        name="btc_accumulation",
+        objective="btc_accumulation",
+        base_asset="BTC",
+        market="spot",
+        execution_mode="live",
+        state_file=state_file,
+        symbol="BTCUSDT",
+    )
+
+    class AmbiguousSpotBroker:
+        name = "ambiguous-spot"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
+
+        def __init__(self):
+            self.position = Position(symbol="BTCUSDT", qty=0.8, avg_price=0.0)
+            self.orders = []
+            self.price_reads = 0
+            self.normalizations = 0
+
+        def get_position(self, symbol):
+            return self.position
+
+        def get_price(self, symbol):
+            self.price_reads += 1
+            return 125.0
+
+        def normalize_order_qty(self, symbol, qty, *, price=None, reduce_only=False):
+            self.normalizations += 1
+            return qty - 0.001
+
+        def place_order(self, order):
+            self.orders.append(order)
+            raise RuntimeError("submission timed out")
+
+    broker = AmbiguousSpotBroker()
+    monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: broker)
+
+    first = flatten_product_once(live_product)
+    intent_state = json.loads(state_file.read_text(encoding="utf-8"))
+    durable_intent = intent_state["flatten_intent"]
+    second = flatten_product_once(live_product)
+
+    assert first["ok"] is False
+    assert first["reason"] == "unresolved_flatten_intent"
+    assert first["flatten_intent"] == durable_intent
+    assert second["ok"] is False
+    assert second["reason"] == "unresolved_flatten_intent"
+    assert "refusing duplicate buyback" in second["error"]
+    assert second["balance_evidence"]["proven"] is False
+    assert len(broker.orders) == 1
+    assert broker.price_reads == 1
+    assert broker.normalizations == 1
+    assert json.loads(state_file.read_text(encoding="utf-8")) == intent_state
+
+
+def test_flatten_live_spot_restart_auto_finalizes_when_balance_proves_fill(
+    monkeypatch,
+    tmp_path,
+):
+    set_live_env(monkeypatch)
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "equity": 1.0,
+                "open_positions": {
+                    "btc_step_aside": {
+                        "direction": "short",
+                        "broker_symbol": "BTCUSDT",
+                        "broker_qty": 0.5,
+                        "broker_side": "sell",
+                        "broker_entry_price": 100.0,
+                        "broker_entry_quote_value": 50.0,
+                        "broker_exit_sizing": "quote_reinvest",
+                        "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    live_product = product(
+        tmp_path,
+        name="btc_accumulation",
+        objective="btc_accumulation",
+        base_asset="BTC",
+        market="spot",
+        execution_mode="live",
+        state_file=state_file,
+        symbol="BTCUSDT",
+    )
+
+    class FilledThenTimedOutSpotBroker:
+        name = "filled-then-timeout-spot"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
+
+        def __init__(self):
+            self.position = Position(symbol="BTCUSDT", qty=0.8, avg_price=0.0)
+            self.orders = []
+            self.price_reads = 0
+
+        def get_position(self, symbol):
+            return self.position
+
+        def get_price(self, symbol):
+            self.price_reads += 1
+            return 125.0
+
+        def normalize_order_qty(self, symbol, qty, *, price=None, reduce_only=False):
+            return qty - 0.001
+
+        def place_order(self, order):
+            self.orders.append(order)
+            self.position = Position(
+                symbol=order.symbol,
+                qty=self.position.qty + order.qty,
+                avg_price=125.0,
+            )
+            raise RuntimeError("response timed out after exchange fill")
+
+    broker = FilledThenTimedOutSpotBroker()
+    monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: broker)
+
+    first = flatten_product_once(live_product)
+    durable_intent = json.loads(state_file.read_text(encoding="utf-8"))["flatten_intent"]
+    second = flatten_product_once(live_product)
+
+    assert first["ok"] is False
+    assert first["reason"] == "unresolved_flatten_intent"
+    assert second["ok"] is True
+    assert second["flattened"] is True
+    assert second["auto_finalized"] is True
+    assert second["reason"] == "flatten_intent_auto_finalized"
+    assert second["balance_evidence"]["proven"] is True
+    assert second["balance_evidence"]["actual_increase"] == pytest.approx(durable_intent["qty"])
+    assert len(broker.orders) == 1
+    assert broker.price_reads == 1
+    final_state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert final_state["open_positions"] == {}
+    assert "flatten_intent" not in final_state
+    assert final_state["last_flatten"]["auto_finalized"] is True
+    assert final_state["last_flatten"]["flatten_client_id"] == durable_intent["client_id"]
+
+
+def test_flatten_live_spot_malformed_intent_fails_closed_without_broker(
+    monkeypatch,
+    tmp_path,
+):
+    state_file = tmp_path / "state.json"
+    original_state = {
+        "equity": 1.0,
+        "open_positions": {
+            "btc_step_aside": {
+                "direction": "short",
+                "broker_symbol": "BTCUSDT",
+                "broker_qty": 0.5,
+                "broker_side": "sell",
+                "broker_entry_price": 100.0,
+                "broker_entry_quote_value": 50.0,
+                "broker_exit_sizing": "quote_reinvest",
+                "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+            }
+        },
+        "flatten_intent": {"version": 1},
+    }
+    state_file.write_text(json.dumps(original_state), encoding="utf-8")
+    live_product = product(
+        tmp_path,
+        name="btc_accumulation",
+        objective="btc_accumulation",
+        base_asset="BTC",
+        market="spot",
+        execution_mode="live",
+        state_file=state_file,
+        symbol="BTCUSDT",
+    )
+    monkeypatch.setattr(
+        "src.autopilot.runtime.build_live_broker",
+        lambda product: pytest.fail("malformed intent must fail before broker construction"),
+    )
+
+    status = flatten_product_once(live_product)
+
+    assert status["ok"] is False
+    assert status["reason"] == "unresolved_flatten_intent"
+    assert "missing required key(s)" in status["error"]
+    assert status["flatten_intent"] == {"version": 1}
+    assert json.loads(state_file.read_text(encoding="utf-8")) == original_state
+
+
+def test_flatten_live_spot_post_fill_balance_mismatch_retains_intent(
+    monkeypatch,
+    tmp_path,
+):
+    set_live_env(monkeypatch)
+    state_file = tmp_path / "state.json"
+    original_state = {
+        "equity": 1.0,
+        "open_positions": {
+            "unsafe strategy id / " * 8: {
+                "direction": "short",
+                "broker_symbol": "BTCUSDT",
+                "broker_qty": 0.5,
+                "broker_side": "sell",
+                "broker_entry_price": 100.0,
+                "broker_entry_quote_value": 50.0,
+                "broker_exit_sizing": "quote_reinvest",
+                "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+            }
+        },
+    }
+    state_file.write_text(json.dumps(original_state), encoding="utf-8")
+    live_product = product(
+        tmp_path,
+        name="btc_accumulation",
+        objective="btc_accumulation",
+        base_asset="BTC",
+        market="spot",
+        execution_mode="live",
+        state_file=state_file,
+        symbol="BTCUSDT",
+    )
+
+    class WrongBalanceSpotBroker:
+        name = "wrong-balance-spot"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
+
+        def __init__(self):
+            self.position = Position(symbol="BTCUSDT", qty=0.8, avg_price=0.0)
+            self.order = None
+
+        def get_position(self, symbol):
+            return self.position
+
+        def get_price(self, symbol):
+            return 125.0
+
+        def normalize_order_qty(self, symbol, qty, *, price=None, reduce_only=False):
+            return qty - 0.001
+
+        def place_order(self, order):
+            self.order = order
+            self.position = Position(
+                symbol=order.symbol,
+                qty=self.position.qty + (order.qty / 2),
+                avg_price=125.0,
+            )
+            return Fill(
+                symbol=order.symbol,
+                side=order.side,
+                qty=order.qty,
+                price=125.0,
+                fee=0.02,
+            )
+
+    broker = WrongBalanceSpotBroker()
+    monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: broker)
+
+    status = flatten_product_once(live_product)
+
+    assert status["ok"] is False
+    assert status["reason"] == "unresolved_flatten_intent"
+    assert status["balance_evidence"]["proven"] is False
+    assert status["balance_evidence"]["actual_increase"] == pytest.approx(0.399 / 2)
+    assert broker.order is not None
+    assert len(broker.order.client_id) <= 36
+    assert set(broker.order.client_id) <= set(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/-"
+    )
+    retained_state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert retained_state["open_positions"] == original_state["open_positions"]
+    assert retained_state["flatten_intent"]["client_id"] == broker.order.client_id
 
 
 def test_flatten_live_spot_step_aside_rejects_missing_quote_budget(monkeypatch, tmp_path):
@@ -3109,6 +4611,7 @@ def test_flatten_live_spot_step_aside_rejects_missing_quote_budget(monkeypatch, 
                 "broker_side": "sell",
                 "broker_entry_price": 100.0,
                 "broker_exit_sizing": "quote_reinvest",
+                "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
             }
         },
     }
@@ -3125,7 +4628,9 @@ def test_flatten_live_spot_step_aside_rejects_missing_quote_budget(monkeypatch, 
     )
     monkeypatch.setattr(
         "src.autopilot.runtime.build_live_broker",
-        lambda product: pytest.fail("broker should not be built when spot flatten state is invalid"),
+        lambda product: pytest.fail(
+            "broker should not be built when spot flatten state is invalid"
+        ),
     )
 
     status = flatten_product_once(live_product)
@@ -3261,6 +4766,7 @@ def btc_strategy_artifact(path):
 def passing_preflight_checks(product_config):
     checks = [
         {"name": "product_config", "ok": True},
+        {"name": "execution_engine_identity", "ok": True},
         {"name": "strategy_artifact_exists", "ok": True},
         {"name": "strategy_fingerprints", "ok": True},
         {"name": "strategy_policy", "ok": True},
@@ -3284,6 +4790,31 @@ def passing_preflight_checks(product_config):
         },
     ]
     if product_config.objective == "active_income" and product_config.market == "futures":
+        checks.append(
+            {
+                "name": "broker_position_mode_one_way",
+                "ok": True,
+                "detail": {"symbol": product_config.symbol, "one_way": True},
+            }
+        )
+        checks.append(
+            {
+                "name": "broker_native_protective_stops",
+                "ok": True,
+                "detail": {"supported": True},
+            }
+        )
+        checks.append(
+            {
+                "name": "broker_open_orders_empty",
+                "ok": True,
+                "detail": {
+                    "symbol": product_config.symbol,
+                    "regular": {"count": 0, "orders": []},
+                    "conditional": {"count": 0, "orders": []},
+                },
+            }
+        )
         checks.append({"name": "broker_position_flat", "ok": True})
     if product_config.objective == "btc_accumulation" and product_config.market == "spot":
         checks.append({"name": "broker_spot_position_non_negative", "ok": True})
@@ -3317,7 +4848,10 @@ def write_preflight(
         "products": [
             {
                 "artifact_fingerprints": artifact_fingerprints,
-                "artifact_digest": artifact_digest(artifact_payload) if isinstance(artifact_payload, dict) else None,
+                "artifact_digest": artifact_digest(artifact_payload)
+                if isinstance(artifact_payload, dict)
+                else None,
+                "execution_engine_digest": execution_engine_digest(),
                 "ok": ok,
                 "product": {
                     "name": product_config.name,
@@ -3326,6 +4860,9 @@ def write_preflight(
                     "market": product_config.market,
                     "symbol": product_config.symbol,
                     "execution_mode": product_config.execution_mode,
+                    "starting_equity": product_config.starting_equity,
+                    "regime_guard": product_config.regime_guard,
+                    "regime_mayer_top": product_config.regime_mayer_top,
                     "strategies_path": str(strategies_path or product_config.strategies_path),
                 },
                 "checks": passing_preflight_checks(product_config) if checks is None else checks,
@@ -3357,6 +4894,57 @@ def test_recent_preflight_gate_accepts_matching_report(tmp_path):
     assert len(gate["artifact_fingerprints"]) == 1
     assert gate["exchange_environment"]["market_type"] == "futures"
     assert gate["exchange_environment"]["max_futures_leverage"] == 1
+    assert gate["position_mode"] == {"symbol": "BTCUSDT", "one_way": True}
+    assert gate["open_order_inventory"] == {
+        "symbol": "BTCUSDT",
+        "regular": {"count": 0, "orders": []},
+        "conditional": {"count": 0, "orders": []},
+    }
+
+
+def test_recent_preflight_gate_rejects_invalid_account_fingerprint(tmp_path):
+    artifact = tmp_path / "active.json"
+    strategy_artifact(artifact)
+    preflight_path = tmp_path / "preflight.json"
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        strategies_path=artifact,
+        preflight_report=preflight_path,
+    )
+    report = write_preflight(preflight_path, live_product)
+    for check in report["products"][0]["checks"]:
+        if check["name"] == "exchange_environment":
+            check["detail"]["account_fingerprint"] = "key-is-not-safe-evidence"
+    preflight_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="account fingerprint evidence is invalid"):
+        assert_recent_preflight(live_product)
+
+
+def test_recent_preflight_gate_requires_one_way_position_mode_evidence(tmp_path):
+    artifact = tmp_path / "active.json"
+    strategy_artifact(artifact)
+    preflight_path = tmp_path / "preflight.json"
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        strategies_path=artifact,
+        preflight_report=preflight_path,
+    )
+    report = write_preflight(preflight_path, live_product)
+    report["products"][0]["checks"] = [
+        check
+        for check in report["products"][0]["checks"]
+        if check["name"] != "broker_position_mode_one_way"
+    ]
+    preflight_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(
+        RuntimeError,
+        match="missing required check broker_position_mode_one_way",
+    ):
+        assert_recent_preflight(live_product)
 
 
 def test_recent_preflight_gate_rejects_symlink_report(tmp_path):
@@ -3447,7 +5035,9 @@ def test_recent_preflight_gate_rejects_missing_connectivity_evidence(tmp_path):
         ("position_is_flat", "yes", "position_is_flat evidence is invalid"),
     ],
 )
-def test_recent_preflight_gate_rejects_invalid_connectivity_evidence(tmp_path, field, value, message):
+def test_recent_preflight_gate_rejects_invalid_connectivity_evidence(
+    tmp_path, field, value, message
+):
     artifact = tmp_path / "active.json"
     strategy_artifact(artifact)
     preflight_path = tmp_path / "preflight.json"
@@ -3541,7 +5131,9 @@ def test_recent_preflight_gate_rejects_missing_required_check(tmp_path):
     )
     report = write_preflight(preflight_path, live_product)
     report["products"][0]["checks"] = [
-        check for check in report["products"][0]["checks"] if check["name"] != "exchange_read_connectivity"
+        check
+        for check in report["products"][0]["checks"]
+        if check["name"] != "exchange_read_connectivity"
     ]
     preflight_path.write_text(json.dumps(report), encoding="utf-8")
 
@@ -3567,6 +5159,26 @@ def test_recent_preflight_gate_rejects_failed_required_check(tmp_path):
     preflight_path.write_text(json.dumps(report), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="required check broker_constructed failed"):
+        assert_recent_preflight(live_product)
+
+
+def test_recent_preflight_gate_requires_empty_open_order_evidence(tmp_path):
+    artifact = tmp_path / "active.json"
+    strategy_artifact(artifact)
+    preflight_path = tmp_path / "preflight.json"
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        strategies_path=artifact,
+        preflight_report=preflight_path,
+    )
+    report = write_preflight(preflight_path, live_product)
+    for check in report["products"][0]["checks"]:
+        if check["name"] == "broker_open_orders_empty":
+            check["detail"]["regular"]["count"] = 1
+    preflight_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="regular open-order count is not zero"):
         assert_recent_preflight(live_product)
 
 
@@ -3747,7 +5359,9 @@ def test_recent_preflight_gate_rejects_artifact_digest_mismatch(tmp_path):
     report["products"][0]["artifact_digest"] = "sha256:not-current"
     preflight_path.write_text(json.dumps(report), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="preflight artifact digest does not match current artifact"):
+    with pytest.raises(
+        RuntimeError, match="preflight artifact digest does not match current artifact"
+    ):
         assert_recent_preflight(live_product)
 
 
@@ -3777,7 +5391,9 @@ def test_recent_preflight_gate_rejects_changed_artifact_content(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(RuntimeError, match="preflight artifact digest does not match current artifact"):
+    with pytest.raises(
+        RuntimeError, match="preflight artifact digest does not match current artifact"
+    ):
         assert_recent_preflight(live_product)
 
 
@@ -3803,6 +5419,137 @@ def test_recent_testnet_rehearsal_gate_accepts_matching_report(tmp_path):
     assert gate["notional_usd"] == 5.0
     assert gate["final_position_flat"] is True
     assert len(gate["artifact_fingerprints"]) == 1
+    assert gate["preflight_position_mode"] == {
+        "symbol": "BTCUSDT",
+        "one_way": True,
+    }
+
+
+def test_recent_testnet_rehearsal_gate_rejects_missing_native_stop_evidence(tmp_path):
+    artifact = tmp_path / "active.json"
+    strategy_artifact(artifact)
+    report_path = tmp_path / "testnet.json"
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        strategies_path=artifact,
+        require_testnet_rehearsal=True,
+        testnet_rehearsal_report=report_path,
+    )
+    preflight = write_preflight(tmp_path / "preflight.json", live_product)
+    write_testnet_rehearsal(report_path, preflight=preflight)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload.pop("native_protective_stop")
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="missing_native_protective_stop"):
+        assert_recent_testnet_rehearsal(live_product)
+
+
+def test_recent_testnet_rehearsal_gate_rejects_invalid_native_stop_evidence(tmp_path):
+    artifact = tmp_path / "active.json"
+    strategy_artifact(artifact)
+    report_path = tmp_path / "testnet.json"
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        strategies_path=artifact,
+        require_testnet_rehearsal=True,
+        testnet_rehearsal_report=report_path,
+    )
+    preflight = write_preflight(tmp_path / "preflight.json", live_product)
+    write_testnet_rehearsal(report_path, preflight=preflight)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["native_protective_stop"]["fetched_terminal"]["status"] = "open"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        RuntimeError,
+        match="native_stop_fetched_terminal_status_not_terminal",
+    ):
+        assert_recent_testnet_rehearsal(live_product)
+
+
+def test_recent_testnet_rehearsal_gate_rejects_missing_embedded_stop_capability(tmp_path):
+    artifact = tmp_path / "active.json"
+    strategy_artifact(artifact)
+    report_path = tmp_path / "testnet.json"
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        strategies_path=artifact,
+        require_testnet_rehearsal=True,
+        testnet_rehearsal_report=report_path,
+    )
+    preflight = write_preflight(tmp_path / "preflight.json", live_product)
+    preflight["products"][0]["checks"] = [
+        check
+        for check in preflight["products"][0]["checks"]
+        if check["name"] != "broker_native_protective_stops"
+    ]
+    write_testnet_rehearsal(report_path, preflight=preflight)
+
+    with pytest.raises(
+        RuntimeError,
+        match="embedded_preflight_missing_native_stop_capability",
+    ):
+        assert_recent_testnet_rehearsal(live_product)
+
+
+def test_recent_testnet_rehearsal_gate_rejects_missing_one_way_mode_evidence(
+    tmp_path,
+):
+    artifact = tmp_path / "active.json"
+    strategy_artifact(artifact)
+    report_path = tmp_path / "testnet.json"
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        strategies_path=artifact,
+        require_testnet_rehearsal=True,
+        testnet_rehearsal_report=report_path,
+    )
+    preflight = write_preflight(tmp_path / "preflight.json", live_product)
+    preflight["products"][0]["checks"] = [
+        check
+        for check in preflight["products"][0]["checks"]
+        if check["name"] != "broker_position_mode_one_way"
+    ]
+    write_testnet_rehearsal(report_path, preflight=preflight)
+
+    with pytest.raises(
+        RuntimeError,
+        match="embedded_preflight_missing_one_way_position_mode",
+    ):
+        assert_recent_testnet_rehearsal(live_product)
+
+
+def test_recent_testnet_rehearsal_gate_rejects_missing_embedded_open_order_inventory(
+    tmp_path,
+):
+    artifact = tmp_path / "active.json"
+    strategy_artifact(artifact)
+    report_path = tmp_path / "testnet.json"
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        strategies_path=artifact,
+        require_testnet_rehearsal=True,
+        testnet_rehearsal_report=report_path,
+    )
+    preflight = write_preflight(tmp_path / "preflight.json", live_product)
+    preflight["products"][0]["checks"] = [
+        check
+        for check in preflight["products"][0]["checks"]
+        if check["name"] != "broker_open_orders_empty"
+    ]
+    write_testnet_rehearsal(report_path, preflight=preflight)
+
+    with pytest.raises(
+        RuntimeError,
+        match="embedded_preflight_missing_open_order_inventory",
+    ):
+        assert_recent_testnet_rehearsal(live_product)
 
 
 def test_recent_testnet_rehearsal_gate_rejects_symlink_report(tmp_path):
@@ -3883,7 +5630,7 @@ def test_recent_testnet_rehearsal_gate_rejects_missing_report(tmp_path):
     with pytest.raises(RuntimeError, match="testnet rehearsal report not found") as exc:
         assert_recent_testnet_rehearsal(live_product)
     assert "make preflight PRODUCT=active_income REQUIRE_TESTNET=1" in str(exc.value)
-    assert "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5" in str(exc.value)
+    assert "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100" in str(exc.value)
     assert "make testnet-status" in str(exc.value)
 
 
@@ -3939,7 +5686,7 @@ def test_recent_testnet_rehearsal_gate_rejects_future_report_timestamp(tmp_path)
 
     with pytest.raises(RuntimeError, match="future_generated_ts") as exc:
         assert_recent_testnet_rehearsal(live_product)
-    assert "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5" in str(exc.value)
+    assert "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100" in str(exc.value)
 
 
 def test_recent_testnet_rehearsal_gate_rejects_non_testnet_report(tmp_path):
@@ -4001,7 +5748,7 @@ def test_recent_testnet_rehearsal_gate_rejects_report_product_mismatch(tmp_path)
 
     with pytest.raises(RuntimeError, match="product_symbol_mismatch") as exc:
         assert_recent_testnet_rehearsal(live_product)
-    assert "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5" in str(exc.value)
+    assert "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100" in str(exc.value)
 
 
 def test_recent_testnet_rehearsal_gate_rejects_missing_risk_controls(tmp_path):
@@ -4023,7 +5770,7 @@ def test_recent_testnet_rehearsal_gate_rejects_missing_risk_controls(tmp_path):
 
     with pytest.raises(RuntimeError, match="missing_risk_controls") as exc:
         assert_recent_testnet_rehearsal(live_product)
-    assert "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5" in str(exc.value)
+    assert "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100" in str(exc.value)
 
 
 def test_recent_testnet_rehearsal_gate_rejects_unsafe_risk_controls(tmp_path):
@@ -4163,7 +5910,9 @@ def test_recent_testnet_rehearsal_gate_rejects_missing_embedded_required_preflig
     )
     preflight = write_preflight(tmp_path / "preflight.json", live_product)
     preflight["products"][0]["checks"] = [
-        check for check in preflight["products"][0]["checks"] if check["name"] != "broker_position_flat"
+        check
+        for check in preflight["products"][0]["checks"]
+        if check["name"] != "broker_position_flat"
     ]
     write_testnet_rehearsal(report_path, preflight=preflight)
 
@@ -4243,7 +5992,9 @@ def test_recent_testnet_rehearsal_gate_rejects_non_list_embedded_fingerprints(tm
     preflight["products"][0]["artifact_fingerprints"] = "not-a-list"
     write_testnet_rehearsal(report_path, preflight=preflight)
 
-    with pytest.raises(RuntimeError, match="testnet rehearsal preflight has no artifact_fingerprints"):
+    with pytest.raises(
+        RuntimeError, match="testnet rehearsal preflight has no artifact_fingerprints"
+    ):
         assert_recent_testnet_rehearsal(live_product)
 
 
@@ -4332,6 +6083,231 @@ def test_live_product_requires_strategy_approval(tmp_path):
         run_product_once(live_product, approval_ledger=tmp_path / "approvals.json")
 
 
+def test_live_existing_position_management_skips_entry_only_gates(monkeypatch, tmp_path):
+    set_live_env(monkeypatch)
+    artifact = tmp_path / "active.json"
+    strategy_artifact(artifact)
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"open_positions": {"active_1": {"direction": "long"}}}),
+        encoding="utf-8",
+    )
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        strategies_path=artifact,
+        state_file=state_file,
+        preflight_report=tmp_path / "missing-preflight.json",
+        require_testnet_rehearsal=True,
+        testnet_rehearsal_report=tmp_path / "missing-rehearsal.json",
+    )
+    seen = {}
+
+    class FakeBroker:
+        name = "risk-reduction-broker"
+
+    class FakeBot:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+            self.state = {
+                "equity": 1000.0,
+                "open_positions": {"active_1": {"direction": "long"}},
+                "inactive_strategies": [],
+            }
+            self.cycle_errors = []
+
+        def run_cycle(self):
+            seen["ran"] = True
+
+    monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: FakeBroker())
+    monkeypatch.setattr("src.autopilot.runtime.PaperTradingBot", FakeBot)
+
+    status = run_product_once(live_product, approval_ledger=tmp_path / "missing-ledger.json")
+
+    assert status["ok"] is True
+    assert status["entries_allowed"] is False
+    assert status["approval_gate"] == "management_only"
+    assert status["preflight_gate"]["skipped"] is True
+    assert status["testnet_rehearsal_gate"]["skipped"] is True
+    assert seen["allow_entries"] is False
+    assert seen["ran"] is True
+
+
+def test_live_management_recovers_frozen_strategy_when_artifact_is_missing(monkeypatch, tmp_path):
+    set_live_env(monkeypatch)
+    artifact = tmp_path / "active.json"
+    strategy = strategy_artifact(artifact)
+    artifact.unlink()
+    canonical = json.dumps(
+        strategy,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "open_positions": {
+                    strategy["id"]: {
+                        "direction": strategy["direction"],
+                        "strategy_snapshot": strategy,
+                        "strategy_fingerprint": hashlib.sha256(
+                            canonical.encode("utf-8")
+                        ).hexdigest(),
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        strategies_path=artifact,
+        state_file=state_file,
+    )
+    seen = {}
+
+    class FakeBroker:
+        name = "management-recovery"
+
+    class FakeBot:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+            self.state = {
+                "equity": 1000.0,
+                "open_positions": {strategy["id"]: {"direction": "long"}},
+                "inactive_strategies": [],
+            }
+            self.cycle_errors = []
+
+        def run_cycle(self):
+            seen["ran"] = True
+
+    monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: FakeBroker())
+    monkeypatch.setattr("src.autopilot.runtime.PaperTradingBot", FakeBot)
+
+    status = run_product_once(live_product, approval_ledger=tmp_path / "missing-ledger.json")
+
+    assert status["ok"] is True
+    assert status["entries_allowed"] is False
+    assert status["strategy_policy"]["artifact_source"] == "frozen_open_position_state"
+    assert seen["allow_entries"] is False
+    assert seen["artifact_payload"]["source"] == "frozen_open_position_state"
+    assert seen["artifact_payload"]["strategies"] == [strategy]
+    assert seen["ran"] is True
+
+
+def test_live_pending_entry_recovery_ignores_missing_artifact_approval_and_stale_gates(
+    monkeypatch,
+    tmp_path,
+):
+    set_live_env(monkeypatch)
+    state_file = tmp_path / "state.json"
+    intent_ref = "2026-07-09T12:00:00+00:00"
+    pending_qty = 10.0
+    pending_client_id = PaperTradingBot._deterministic_client_order_id(
+        strategy_id="missing_strategy",
+        stage="entry",
+        intent_ref=intent_ref,
+        symbol="BTCUSDT",
+        side=OrderSide.BUY,
+        qty=pending_qty,
+        order_type=OrderType.MARKET,
+        reduce_only=False,
+    )
+    state_file.write_text(
+        json.dumps(
+            {
+                "equity": 1000.0,
+                "open_positions": {},
+                "inactive_strategies": [],
+                "pending_order": {
+                    "version": 1,
+                    "strategy_id": "missing_strategy",
+                    "stage": "entry",
+                    "intent_ref": intent_ref,
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "qty": pending_qty,
+                    "order_type": "market",
+                    "reduce_only": False,
+                    "client_id": pending_client_id,
+                    "broker_account_fingerprint": TEST_ACCOUNT_FINGERPRINT,
+                    "created_ts": 1.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        strategies_path=tmp_path / "deleted-artifact.json",
+        state_file=state_file,
+        preflight_report=tmp_path / "stale-missing-preflight.json",
+        require_testnet_rehearsal=True,
+        testnet_rehearsal_report=tmp_path / "stale-missing-rehearsal.json",
+    )
+
+    class RecoveryBroker:
+        name = "pending-entry-recovery"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
+        config = SimpleNamespace(live=True, market_type="futures")
+
+        def __init__(self):
+            self.position = Position("BTCUSDT", qty=pending_qty, avg_price=100.0)
+            self.orders = []
+
+        def get_position(self, symbol):
+            return self.position
+
+        def get_price(self, symbol):
+            return 100.0
+
+        def get_balance(self):
+            return 1000.0
+
+        def place_order(self, order):
+            self.orders.append(order)
+            assert order.reduce_only is True
+            assert order.side == OrderSide.SELL
+            assert order.qty == pytest.approx(pending_qty)
+            self.position = Position("BTCUSDT")
+            return Fill("BTCUSDT", OrderSide.SELL, pending_qty, 100.0, 0.0)
+
+    broker = RecoveryBroker()
+    monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: broker)
+    monkeypatch.setattr(
+        "src.autopilot.runtime.assert_recent_preflight",
+        lambda *args, **kwargs: pytest.fail("entry-only preflight must be skipped for recovery"),
+    )
+    monkeypatch.setattr(
+        "src.autopilot.runtime.assert_recent_testnet_rehearsal",
+        lambda *args, **kwargs: pytest.fail("entry-only rehearsal must be skipped for recovery"),
+    )
+
+    status = run_product_once(
+        live_product,
+        approval_ledger=tmp_path / "missing-approval-ledger.json",
+    )
+
+    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    assert status["ok"] is False
+    assert status["entries_allowed"] is False
+    assert status["approval_gate"] == "management_only"
+    assert status["preflight_gate"]["skipped"] is True
+    assert status["testnet_rehearsal_gate"]["skipped"] is True
+    assert status["strategy_policy"]["artifact_source"] == "durable_order_recovery_state"
+    assert broker.position.is_flat
+    assert len(broker.orders) == 1
+    assert broker.orders[0].client_id.startswith("tb-rc-")
+    assert persisted["pending_order"]["client_id"] == pending_client_id
+    assert persisted["pending_entry_recovery"]["status"] == "recovery_close_filled_and_flat"
+
+
 def test_live_product_requires_live_environment_before_broker(monkeypatch, tmp_path):
     for name in ("TRADING_LIVE", "EXCHANGE_API_KEY", "EXCHANGE_API_SECRET", "MAX_NOTIONAL_USD"):
         monkeypatch.delenv(name, raising=False)
@@ -4343,9 +6319,14 @@ def test_live_product_requires_live_environment_before_broker(monkeypatch, tmp_p
         execution_mode="live",
         strategies_path=artifact,
         preflight_report=tmp_path / "preflight.json",
+        require_testnet_rehearsal=True,
+        testnet_rehearsal_report=tmp_path / "testnet.json",
     )
-    write_preflight(live_product.preflight_report, live_product)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=live_product)
+    preflight = write_preflight(live_product.preflight_report, live_product)
+    write_testnet_rehearsal(live_product.testnet_rehearsal_report, preflight=preflight)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=live_product
+    )
     monkeypatch.setattr(
         "src.autopilot.runtime.build_live_broker",
         lambda product: pytest.fail("broker should not be built without live env"),
@@ -4369,15 +6350,19 @@ def test_live_active_income_requires_testnet_rehearsal_before_broker(monkeypatch
         strategies_path=artifact,
     )
     write_preflight(live_product.preflight_report, live_product)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=live_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=live_product
+    )
     monkeypatch.setattr(
         "src.autopilot.runtime.build_live_broker",
-        lambda product: pytest.fail("broker should not be built without testnet rehearsal evidence"),
+        lambda product: pytest.fail(
+            "broker should not be built without testnet rehearsal evidence"
+        ),
     )
 
     with pytest.raises(RuntimeError, match="testnet rehearsal report not found") as exc:
         run_product_once(live_product, approval_ledger=ledger)
-    assert "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5" in str(exc.value)
+    assert "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100" in str(exc.value)
     assert "make testnet-status" in str(exc.value)
 
 
@@ -4390,13 +6375,38 @@ def test_assert_live_environment_reports_safe_details(monkeypatch, tmp_path):
         "ok": True,
         "exchange": "binanceusdm",
         "market_type": "futures",
-        "testnet": True,
+        "testnet": False,
+        "account_fingerprint": ExchangeConfig(
+            exchange="binanceusdm",
+            market_type="futures",
+            api_key="key",
+            testnet=False,
+        ).account_fingerprint,
         "max_notional_usd": 100.0,
         "max_fill_slippage_bps": 100.0,
         "max_futures_leverage": 1,
         "futures_margin_mode": "isolated",
         "quote_asset": "USDT",
     }
+
+
+def test_runtime_requires_fresh_preflight_after_api_key_change(tmp_path):
+    live_product = product(tmp_path, execution_mode="live")
+    recorded = exchange_environment_detail(live_product, testnet=False)
+    current = dict(recorded)
+    current["account_fingerprint"] = ExchangeConfig(
+        exchange="binanceusdm",
+        market_type="futures",
+        api_key="replacement-key",
+        testnet=False,
+    ).account_fingerprint
+
+    with pytest.raises(RuntimeError, match="account_fingerprint"):
+        _assert_current_environment_matches_preflight(
+            live_product,
+            current=current,
+            recorded=recorded,
+        )
 
 
 def test_assert_live_environment_reports_spot_btc_accumulation_details(monkeypatch, tmp_path):
@@ -4417,7 +6427,13 @@ def test_assert_live_environment_reports_spot_btc_accumulation_details(monkeypat
         "ok": True,
         "exchange": "binance",
         "market_type": "spot",
-        "testnet": True,
+        "testnet": False,
+        "account_fingerprint": ExchangeConfig(
+            exchange="binance",
+            market_type="spot",
+            api_key="key",
+            testnet=False,
+        ).account_fingerprint,
         "max_notional_usd": 100.0,
         "max_fill_slippage_bps": 100.0,
         "quote_asset": "USDT",
@@ -4514,10 +6530,14 @@ def test_approved_live_active_income_uses_broker(monkeypatch, tmp_path):
     )
     preflight = write_preflight(live_product.preflight_report, live_product)
     write_testnet_rehearsal(live_product.testnet_rehearsal_report, preflight=preflight)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=live_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=live_product
+    )
+    approved_snapshot = json.loads(artifact.read_text(encoding="utf-8"))
 
     class FakeBroker:
         name = "fake-live"
+        account_fingerprint = TEST_ACCOUNT_FINGERPRINT
 
     seen = {}
 
@@ -4529,7 +6549,13 @@ def test_approved_live_active_income_uses_broker(monkeypatch, tmp_path):
         def run_cycle(self):
             seen["ran"] = True
 
-    monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: FakeBroker())
+    def replace_artifact_after_gates(product):
+        changed = json.loads(json.dumps(approved_snapshot))
+        changed["strategies"][0]["take_profit"] = 0.99
+        artifact.write_text(json.dumps(changed), encoding="utf-8")
+        return FakeBroker()
+
+    monkeypatch.setattr("src.autopilot.runtime.build_live_broker", replace_artifact_after_gates)
     monkeypatch.setattr("src.autopilot.runtime.PaperTradingBot", FakeBot)
 
     status = run_product_once(live_product, approval_ledger=ledger)
@@ -4542,7 +6568,102 @@ def test_approved_live_active_income_uses_broker(monkeypatch, tmp_path):
     assert seen["market"] == "futures"
     assert seen["objective"] == "active_income"
     assert seen["base_asset"] == "USDT"
+    assert seen["artifact_payload"] == approved_snapshot
+    assert seen["artifact_payload"]["strategies"][0]["take_profit"] != 0.99
+    assert callable(seen["pre_entry_gate"])
     assert seen["ran"] is True
+
+
+@pytest.mark.parametrize("late_change", ["panic", "revoke"])
+def test_live_pre_entry_gate_blocks_late_panic_or_approval_revocation(
+    monkeypatch,
+    tmp_path,
+    late_change,
+):
+    set_live_env(monkeypatch)
+    artifact = tmp_path / "active.json"
+    strategy = strategy_artifact(artifact)
+    ledger_path = tmp_path / "approvals.json"
+    control_path = tmp_path / "control.json"
+    live_product = product(
+        tmp_path,
+        execution_mode="live",
+        strategies_path=artifact,
+        state_file=tmp_path / "state.json",
+        preflight_report=tmp_path / "preflight.json",
+        require_testnet_rehearsal=True,
+        testnet_rehearsal_report=tmp_path / "testnet.json",
+    )
+    preflight = write_preflight(live_product.preflight_report, live_product)
+    write_testnet_rehearsal(live_product.testnet_rehearsal_report, preflight=preflight)
+    ledger = ApprovalLedger(ledger_path)
+    fingerprint = ledger.approve(
+        strategy,
+        artifact_path=artifact,
+        approved_by="human-reviewer",
+        product=live_product,
+    )
+    config = AutopilotConfig(
+        control_file=control_path,
+        approval_ledger=ledger_path,
+        products=[live_product],
+    )
+
+    class FakeBroker:
+        name = "late-gate-broker"
+
+        def __init__(self):
+            self.orders = []
+
+        def place_order(self, order):
+            self.orders.append(order)
+            raise AssertionError("late pre-entry gate allowed broker submission")
+
+    broker = FakeBroker()
+
+    class FakeBot:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.state = {"equity": 1000.0, "open_positions": {}, "inactive_strategies": []}
+            self.cycle_errors = []
+
+        def run_cycle(self):
+            if late_change == "panic":
+                control_path.write_text(
+                    json.dumps(
+                        {
+                            "paused": True,
+                            "pause_jobs": True,
+                            "flatten_all": True,
+                            "reason": "operator panic during feature fetch",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                ledger.revoke(
+                    fingerprint,
+                    revoked_by="human-reviewer",
+                    reason="operator revoked during feature fetch",
+                )
+            self.kwargs["pre_entry_gate"]()
+            self.kwargs["broker"].place_order(object())
+
+    monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: broker)
+    monkeypatch.setattr("src.autopilot.runtime.PaperTradingBot", FakeBot)
+
+    status = run_product_once(
+        live_product,
+        approval_ledger=ledger_path,
+        config=config,
+    )
+
+    assert status["ok"] is False
+    assert broker.orders == []
+    if late_change == "panic":
+        assert "flatten is requested" in status["error"]
+    else:
+        assert "revoked/not approved" in status["error"]
 
 
 def test_approved_live_btc_accumulation_uses_spot_broker(monkeypatch, tmp_path):
@@ -4561,7 +6682,9 @@ def test_approved_live_btc_accumulation_uses_spot_broker(monkeypatch, tmp_path):
         strategies_path=artifact,
     )
     write_preflight(live_product.preflight_report, live_product)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=live_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=live_product
+    )
 
     class FakeBroker:
         name = "fake-spot"
@@ -4679,7 +6802,9 @@ def test_btc_accumulation_live_rejects_non_spot_market(tmp_path):
         require_preflight=False,
         strategies_path=artifact,
     )
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=live_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=live_product
+    )
 
     with pytest.raises(RuntimeError, match="spot"):
         run_product_once(live_product, approval_ledger=ledger)

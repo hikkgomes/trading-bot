@@ -12,6 +12,7 @@ import requests
 # Import configuration and building functions from build_binance_indicator_dataset
 import build_binance_indicator_dataset as bbid
 from src.candle_validation import validate_1m_candles
+from src.parquet_io import write_parquet_atomic
 
 LOGGER = logging.getLogger("update_candles")
 DEFAULT_FETCH_ERROR_GRACE_SECONDS = 24 * 60 * 60
@@ -63,7 +64,7 @@ def fetch_recent_candles(
         raise ValueError(f"{symbol} {market} fetched 1m candles: Binance response must be a list")
     expected_width = len(bbid.BINANCE_COLUMNS)
     for index, row in enumerate(data):
-        if not isinstance(row, (list, tuple)) or len(row) != expected_width:
+        if not isinstance(row, list | tuple) or len(row) != expected_width:
             raise ValueError(
                 f"{symbol} {market} fetched 1m candles: malformed Binance row {index}"
             )
@@ -184,7 +185,7 @@ def bootstrap_1m_candles(days: int) -> pd.DataFrame:
         label=f"{bbid.SYMBOL} {bbid.MARKET} bootstrapped 1m candles",
     )
     candle_path.parent.mkdir(parents=True, exist_ok=True)
-    df_bootstrap.to_parquet(candle_path)
+    write_parquet_atomic(df_bootstrap, candle_path)
     df_bootstrap.attrs["fetched_rows"] = int(sum(len(frame) for frame in new_frames))
     df_bootstrap.attrs["bootstrap_days"] = days
     if fetch_error:
@@ -280,7 +281,7 @@ def update_1m_candles() -> pd.DataFrame:
 
         # Save back to 1m Parquet
         candle_path.parent.mkdir(parents=True, exist_ok=True)
-        df_updated.to_parquet(candle_path)
+        write_parquet_atomic(df_updated, candle_path)
         df_updated.attrs["fetched_rows"] = int(len(df_new_all))
         if fetch_error:
             df_updated.attrs["fetch_error"] = fetch_error

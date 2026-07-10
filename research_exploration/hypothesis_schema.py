@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, field
 TF_ORDER = ("1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 TF_RANK = {tf: i for i, tf in enumerate(TF_ORDER)}
 
-DIRECTIONS = ("long", "short", "both")
+DIRECTIONS = ("long", "short")
 
 # Predicate operators understood by the evaluator. Kept explicit (no eval) so the
 # grammar is auditable and safe to round-trip through JSON.
@@ -76,6 +76,36 @@ class Predicate:
             raise ValueError(f"Unknown timeframe {self.timeframe!r}")
         if self.op not in OPS:
             raise ValueError(f"Unknown op {self.op!r}. Allowed: {sorted(OPS)}")
+        if not isinstance(self.feature, str) or not self.feature.strip():
+            raise ValueError("predicate feature must be a non-empty string")
+        if self.shift_b < 0:
+            raise ValueError("predicate shift_b must be non-negative")
+        if self.lookback is not None and self.lookback <= 0:
+            raise ValueError("predicate lookback must be positive")
+        if self.window is not None and self.window <= 1:
+            raise ValueError("predicate rolling window must be greater than one")
+        if self.quantile is not None and not 0 < self.quantile < 1:
+            raise ValueError("predicate quantile must be in (0, 1)")
+        if self.op in {"gt", "ge", "lt", "le", "pct_above", "pct_below"} and self.reference is None:
+            raise ValueError(f"predicate op {self.op!r} requires reference")
+        if self.op in {
+            "gt_feature",
+            "lt_feature",
+            "cross_above",
+            "cross_below",
+            "pct_above",
+            "pct_below",
+        } and not self.feature_b:
+            raise ValueError(f"predicate op {self.op!r} requires feature_b")
+        if self.op in {"rising", "falling", "slope_up", "slope_down"} and self.lookback is None:
+            raise ValueError(f"predicate op {self.op!r} requires lookback")
+        if self.op in {"q_ge", "q_le"} and (self.window is None or self.quantile is None):
+            raise ValueError(f"predicate op {self.op!r} requires window and quantile")
+        if self.op == "between":
+            if self.low is None or self.high is None:
+                raise ValueError("predicate op 'between' requires low and high")
+            if self.low > self.high:
+                raise ValueError("predicate between low cannot exceed high")
 
     def column(self) -> str:
         return f"tf_{self.timeframe}_{self.feature}"
@@ -146,6 +176,18 @@ class ExitRule:
     trail: bool = False
     note: str = ""
 
+    def __post_init__(self) -> None:
+        if not 0 < self.take_profit < 1:
+            raise ValueError("take_profit must be in (0, 1)")
+        if not 0 < self.stop_loss < 1:
+            raise ValueError("stop_loss must be in (0, 1)")
+        if self.horizon_bars <= 0:
+            raise ValueError("horizon_bars must be positive")
+        if self.atr_take_profit is not None and self.atr_take_profit <= 0:
+            raise ValueError("atr_take_profit must be positive")
+        if self.atr_stop_loss is not None and self.atr_stop_loss <= 0:
+            raise ValueError("atr_stop_loss must be positive")
+
     def to_dict(self) -> dict:
         return {k: v for k, v in asdict(self).items() if v is not None and v != "" and v is not False}
 
@@ -167,6 +209,28 @@ class RiskRule:
     min_atr_pct: float | None = None  # skip entries when ATR% below this (too quiet)
     max_atr_pct: float | None = None  # skip entries when ATR% above this (too wild)
     note: str = ""
+
+    def __post_init__(self) -> None:
+        if not 0 < self.risk_per_trade <= 1:
+            raise ValueError("risk_per_trade must be in (0, 1]")
+        if not 0 < self.max_position_fraction <= 1:
+            raise ValueError("max_position_fraction must be in (0, 1]")
+        if self.max_trades_per_day is not None and self.max_trades_per_day <= 0:
+            raise ValueError("max_trades_per_day must be positive")
+        if self.max_daily_loss_r is not None and self.max_daily_loss_r <= 0:
+            raise ValueError("max_daily_loss_r must be positive")
+        if self.cooldown_bars < 0:
+            raise ValueError("cooldown_bars must be non-negative")
+        if self.min_atr_pct is not None and self.min_atr_pct <= 0:
+            raise ValueError("min_atr_pct must be positive")
+        if self.max_atr_pct is not None and self.max_atr_pct <= 0:
+            raise ValueError("max_atr_pct must be positive")
+        if (
+            self.min_atr_pct is not None
+            and self.max_atr_pct is not None
+            and self.min_atr_pct >= self.max_atr_pct
+        ):
+            raise ValueError("min_atr_pct must be less than max_atr_pct")
 
     def to_dict(self) -> dict:
         return {k: v for k, v in asdict(self).items() if v is not None and v != "" and v != 0}
@@ -202,6 +266,14 @@ class Hypothesis:
     def __post_init__(self) -> None:
         if self.direction not in DIRECTIONS:
             raise ValueError(f"direction must be one of {DIRECTIONS}")
+        for label, timeframe in (
+            ("base_timeframe", self.base_timeframe),
+            ("regime_timeframe", self.regime_timeframe),
+            ("setup_timeframe", self.setup_timeframe),
+            ("trigger_timeframe", self.trigger_timeframe),
+        ):
+            if timeframe not in TF_RANK:
+                raise ValueError(f"{label} has unknown timeframe {timeframe!r}")
         # Causality sanity: regime should be >= setup >= trigger in coarseness.
         if not (TF_RANK[self.regime_timeframe] >= TF_RANK[self.setup_timeframe] >= TF_RANK[self.trigger_timeframe]):
             raise ValueError(

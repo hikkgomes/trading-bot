@@ -9,14 +9,16 @@ preflight report using a fake read-only broker.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from src.autopilot.approvals import ApprovalLedger
+from src.autopilot.approvals import ApprovalLedger, strategy_fingerprint
 from src.autopilot.config import AutopilotConfig, ProductConfig
+from src.autopilot.experiment_memory import ExperimentMemory
 from src.autopilot.io import write_json_atomic, write_text_atomic
 from src.autopilot.preflight import run_preflight
 from src.autopilot.promotion import (
@@ -24,6 +26,8 @@ from src.autopilot.promotion import (
     build_promotion_review,
     write_review,
 )
+from src.autopilot.research_factory import build_generation, load_factory_config
+from src.autopilot.research_smoke import run_research_smoke
 from src.config import PROJECT_ROOT
 from src.execution.broker import Position
 
@@ -181,6 +185,7 @@ def write_synthetic_inputs(
         [
             {
                 "strategy_id": strategy["id"],
+                "strategy_fingerprint": strategy_fingerprint(strategy),
                 "exit_time": str(pd.Timestamp("2026-01-01", tz="UTC") + pd.Timedelta(days=i)),
                 "net_return": 0.012 if i % 3 else -0.004,
                 "sized_return": 0.001,
@@ -203,6 +208,15 @@ def write_synthetic_inputs(
 class FakeReadOnlyBroker:
     name = "fake-read-only"
 
+    def verify_one_way_position_mode(self, symbol: str) -> bool:
+        return True
+
+    def supports_native_protective_stops(self) -> bool:
+        return True
+
+    def list_open_orders(self, symbol: str, *, conditional: bool) -> tuple:
+        return ()
+
     def get_price(self, symbol: str) -> float:
         return 100.0
 
@@ -214,12 +228,95 @@ class FakeReadOnlyBroker:
 
 
 def run_rehearsal(work_dir: Path = DEFAULT_REHEARSAL_DIR) -> dict[str, Any]:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    research_memory_path = work_dir / "experiment_memory.sqlite3"
+    research_batch_path = work_dir / "generated_hypotheses.json"
+    research_proposal_state_path = work_dir / "openclaw_proposal_state.json"
+    for path in (research_memory_path, research_batch_path, research_proposal_state_path):
+        if path.is_symlink():
+            raise ValueError(f"rehearsal artifact must not be a symlink: {path}")
+        if path.exists():
+            path.unlink()
+
+    factory_template = load_factory_config()
+    rehearsal_factory = dataclasses.replace(
+        factory_template,
+        memory_path=research_memory_path,
+        generated_batch_path=research_batch_path,
+        openclaw_accepted_dir=work_dir / "openclaw" / "accepted",
+        proposal_state_path=research_proposal_state_path,
+    )
+    first_generation = build_generation(
+        rehearsal_factory,
+        seed=101,
+        now="2026-01-01T00:00:00+00:00",
+    )
+    first_hashes = {
+        str(item["strategy_hash"]) for item in first_generation["generation_metadata"]
+    }
+    with ExperimentMemory(research_memory_path) as memory:
+        for item in first_generation["generation_metadata"]:
+            memory.record_outcome(
+                str(item["strategy_hash"]),
+                dataset={"snapshot_id": "offline-rehearsal-development-v1"},
+                window={"start": "2024-01-01", "end": "2025-01-01"},
+                protocol={
+                    "name": "offline_rehearsal",
+                    "version": 1,
+                    "research_engine_digest": first_generation["source"][
+                        "research_engine_digest"
+                    ],
+                },
+                phase="development",
+                outcome="reject",
+                rejection_reasons=("synthetic_rehearsal_rejection",),
+                details={"synthetic_only": True, "holdout_feedback_allowed": False},
+            )
+    second_generation = build_generation(
+        rehearsal_factory,
+        seed=202,
+        now="2026-01-02T00:00:00+00:00",
+    )
+    write_json_atomic(research_batch_path, second_generation)
+    second_hashes = {
+        str(item["strategy_hash"]) for item in second_generation["generation_metadata"]
+    }
+    research_smoke = run_research_smoke(synthetic_rows=700)
+    research_rehearsal = {
+        "ok": bool(first_generation.get("ok"))
+        and bool(second_generation.get("ok"))
+        and bool(research_smoke.get("ok"))
+        and bool(first_hashes)
+        and first_hashes.isdisjoint(second_hashes),
+        "synthetic_only": True,
+        "first_generation": len(first_hashes),
+        "second_generation": len(second_hashes),
+        "new_behavioral_specs_after_feedback": len(second_hashes - first_hashes),
+        "products": sorted(
+            {
+                str(item.get("product"))
+                for item in second_generation.get("generation_metadata", [])
+            }
+        ),
+        "opportunity_types": sorted(
+            {
+                str(item.get("opportunity_type"))
+                for item in second_generation.get("generation_metadata", [])
+            }
+        ),
+        "experiment_memory": str(research_memory_path),
+        "generated_batch": str(research_batch_path),
+        "smoke": research_smoke,
+    }
+
     product_names = ("active_income", "btc_accumulation")
     ledger_path = work_dir / "approvals_rehearsal.json"
     if ledger_path.exists():
         ledger_path.unlink()
 
-    thresholds = PromotionThresholds(min_paper_trades=20, min_paper_sized_return=0.0, min_holdout_return=0.0)
+    thresholds = PromotionThresholds(
+        min_paper_trades=20, min_paper_sized_return=0.0, min_holdout_return=0.0
+    )
     products: list[ProductConfig] = []
     product_reports: dict[str, Any] = {}
     ledger = ApprovalLedger(ledger_path)
@@ -280,12 +377,16 @@ def run_rehearsal(work_dir: Path = DEFAULT_REHEARSAL_DIR) -> dict[str, Any]:
             and item["after_recommendation"] == "already_approved"
             for item in product_reports.values()
         )
-        and preflight["ok"],
+        and preflight["ok"]
+        and research_rehearsal["ok"],
         "work_dir": str(work_dir),
         "products": product_reports,
         "preflight_report": str(preflight_path),
-        "preflight_products": [item.get("product", {}).get("name") for item in preflight.get("products", [])],
+        "preflight_products": [
+            item.get("product", {}).get("name") for item in preflight.get("products", [])
+        ],
         "preflight_ok": preflight["ok"],
+        "research_rehearsal": research_rehearsal,
         # Backwards-compatible summary fields for older smoke checks.
         "artifact": active_report["artifact"],
         "trade_log": active_report["trade_log"],
@@ -300,7 +401,9 @@ def run_rehearsal(work_dir: Path = DEFAULT_REHEARSAL_DIR) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run an offline end-to-end autopilot workflow rehearsal.")
+    parser = argparse.ArgumentParser(
+        description="Run an offline end-to-end autopilot workflow rehearsal."
+    )
     parser.add_argument("--work-dir", type=Path, default=DEFAULT_REHEARSAL_DIR)
     return parser.parse_args()
 

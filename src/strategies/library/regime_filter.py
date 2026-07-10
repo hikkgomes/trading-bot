@@ -21,7 +21,7 @@ def _parse_regime_ids(value) -> set[int]:
         return {int(value)}
     if isinstance(value, float) and value.is_integer():
         return {int(value)}
-    if isinstance(value, (list, tuple, set)):
+    if isinstance(value, list | tuple | set):
         return {int(item) for item in value}
     text = str(value).strip()
     if not text:

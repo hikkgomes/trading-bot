@@ -1,9 +1,9 @@
 import pandas as pd
 
+import src.meta_labeling as meta_labeling
 from src.discover_patterns import Condition
 from src.meta_labeling import _label_column
 from src.strategy_search import StrategyCandidate, _conditions_payload
-import src.meta_labeling as meta_labeling
 
 
 def test_label_column_matches_trade_label_schema():

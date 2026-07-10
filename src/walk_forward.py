@@ -1,5 +1,5 @@
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -17,10 +17,10 @@ class WalkForwardConfig:
     embargo_bars: int = 0
 
 
-def generate_windows(n_rows: int, config: WalkForwardConfig) -> List[Tuple[slice, slice]]:
+def generate_windows(n_rows: int, config: WalkForwardConfig) -> list[tuple[slice, slice]]:
     if min(config.train_bars, config.test_bars, config.step_bars) <= 0:
         raise ValueError("train_bars, test_bars and step_bars must be > 0")
-    windows: List[Tuple[slice, slice]] = []
+    windows: list[tuple[slice, slice]] = []
     test_start = config.train_bars + config.embargo_bars
     while True:
         test_end = test_start + config.test_bars
@@ -44,7 +44,7 @@ def generate_purged_kfold_windows(
     k: int,
     horizon: int,
     embargo: int,
-) -> List[Tuple[np.ndarray, np.ndarray]]:
+) -> list[tuple[np.ndarray, np.ndarray]]:
     if min(n_rows, k) <= 0:
         raise ValueError("n_rows and k must be > 0")
     if k > n_rows:
@@ -52,7 +52,7 @@ def generate_purged_kfold_windows(
     horizon = max(0, int(horizon))
     embargo = max(0, int(embargo))
     folds = np.array_split(np.arange(n_rows), int(k))
-    windows: List[Tuple[np.ndarray, np.ndarray]] = []
+    windows: list[tuple[np.ndarray, np.ndarray]] = []
     for fold in folds:
         test_start = int(fold[0])
         test_end = int(fold[-1]) + 1
@@ -118,7 +118,7 @@ def refit_conditions(
     base_prefix: str,
 ):
     _ = base_prefix
-    updated: List[Condition] = []
+    updated: list[Condition] = []
     for c in candidate.conditions:
         threshold = _compute_threshold(train_window, c)
         updated.append(
@@ -158,7 +158,7 @@ def candidate_feature_columns(candidates) -> set:
     return needed
 
 
-def condition_cache_key(condition: Condition) -> Tuple:
+def condition_cache_key(condition: Condition) -> tuple:
     refittable = condition.threshold_source in (
         "quantile", "delta_quantile", "slope_quantile", "ratio_quantile",
     )
@@ -196,12 +196,12 @@ class WindowConditionCache:
     large candidate population across walk-forward windows.
     """
 
-    def __init__(self, data: pd.DataFrame, windows: Sequence[Tuple[slice, slice]]):
+    def __init__(self, data: pd.DataFrame, windows: Sequence[tuple[slice, slice]]):
         self.windows = list(windows)
         self.train_frames = [data.iloc[train_slice] for train_slice, _ in self.windows]
         self.test_frames = [data.iloc[test_slice] for _, test_slice in self.windows]
-        self.threshold_cache: Dict[Tuple, float] = {}
-        self.mask_cache: Dict[Tuple, np.ndarray] = {}
+        self.threshold_cache: dict[tuple, float] = {}
+        self.mask_cache: dict[tuple, np.ndarray] = {}
 
     def condition_test_mask(self, window_index: int, condition: Condition) -> np.ndarray:
         key = (window_index, condition_cache_key(condition))
@@ -225,9 +225,9 @@ class WindowConditionCache:
 
 
 def aggregate_walk_forward_results(
-    window_results: Sequence[Dict[str, float]],
+    window_results: Sequence[dict[str, float]],
     pass_rate_threshold: float = 0.8,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     if not window_results:
         return {"windows": 0, "pass_rate": 0.0, "passes_walk_forward": False}
     returns = np.array([r.get("test_total_return", 0.0) for r in window_results], dtype=float)
@@ -260,9 +260,9 @@ def walk_forward_score_candidate(
     trade_config,
     wf_config: WalkForwardConfig,
     base_prefix: str,
-    score_fn: Callable[[pd.DataFrame, pd.DataFrame, object, object, str], Dict[str, float]],
-) -> Tuple[List[Dict[str, float]], Dict[str, float]]:
-    window_results: List[Dict[str, float]] = []
+    score_fn: Callable[[pd.DataFrame, pd.DataFrame, object, object, str], dict[str, float]],
+) -> tuple[list[dict[str, float]], dict[str, float]]:
+    window_results: list[dict[str, float]] = []
     windows = generate_windows(len(data), wf_config)
     for train_slice, test_slice in windows:
         train = data.iloc[train_slice].copy()

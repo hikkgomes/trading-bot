@@ -3,15 +3,15 @@ import itertools
 import json
 import logging
 from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
 
 from src.build_dataset import TARGET_COLUMNS
-from src.config import PROJECT_ROOT, PROCESSED_DATA_DIR
+from src.config import PROCESSED_DATA_DIR, PROJECT_ROOT
 from src.discover_patterns import (
     DEFAULT_ENABLED_KINDS,
     Condition,
@@ -28,6 +28,7 @@ from src.metrics import (
     probability_backtest_overfitting,
     sharpe_ratio,
 )
+from src.trade_utils import gross_return_for_pnl_unit, gross_return_numba
 from src.walk_forward import (
     WalkForwardConfig,
     WindowConditionCache,
@@ -39,7 +40,6 @@ from src.walk_forward import (
     with_threshold,
 )
 
-
 LOGGER = logging.getLogger(__name__)
 DEFAULT_INPUT_PATH = PROCESSED_DATA_DIR / "train_15m_indicators.parquet"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "strategy_search"
@@ -50,14 +50,14 @@ TIMEFRAME_PREFIXES = ("tf_15m_", "tf_30m_", "tf_1h_", "tf_4h_", "tf_1d_", "tf_1w
 class StrategyCandidate:
     direction: str
     horizon_bars: int
-    conditions: Tuple[Condition, ...]
+    conditions: tuple[Condition, ...]
 
     @property
     def rule(self) -> str:
         return " AND ".join(condition.description for condition in self.conditions)
 
     @property
-    def timeframes(self) -> Tuple[str, ...]:
+    def timeframes(self) -> tuple[str, ...]:
         values = []
         for condition in self.conditions:
             values.append(timeframe_for_feature(condition.feature))
@@ -135,10 +135,7 @@ def _simulate_net_returns_python(
                     xi = k
                     xp = entry * (1.0 - take_profit)
                     break
-        if pnl_btc:
-            gr = entry / xp - 1.0 if not is_long else 0.0
-        else:
-            gr = xp / entry - 1.0 if is_long else entry / xp - 1.0
+        gr = gross_return_numba(entry, xp, is_long, pnl_btc)
         net_returns[count] = gr - total_cost
         count += 1
         next_allowed = xi + 1
@@ -166,19 +163,22 @@ def simulate_net_returns(
     stop_loss: float,
     pnl_unit: str = "usdt",
 ) -> np.ndarray:
+    normalized_pnl_unit = str(pnl_unit).lower()
+    if normalized_pnl_unit not in {"usdt", "btc"}:
+        raise ValueError(f"Unsupported pnl_unit {pnl_unit!r}; expected 'usdt' or 'btc'")
     total_cost = 2 * ((fee_bps + slippage_bps) / 10_000)
     fn = _simulate_net_returns_numba if _HAS_NUMBA else _simulate_net_returns_python
     return fn(
         arrays.open_, arrays.high, arrays.low, arrays.close,
         signal, direction == "long", horizon_bars,
-        take_profit, stop_loss, total_cost, pnl_unit == "btc",
+        take_profit, stop_loss, total_cost, normalized_pnl_unit == "btc",
     )
 
 
 BASE_COLUMNS = ("timestamp", "tf_15m_open", "tf_15m_high", "tf_15m_low", "tf_15m_close")
 
 
-def load_dataset(path: Path, horizons: Sequence[int], columns: Optional[Sequence[str]] = None) -> pd.DataFrame:
+def load_dataset(path: Path, horizons: Sequence[int], columns: Sequence[str] | None = None) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing dataset: {path}")
     read_columns = None
@@ -198,7 +198,7 @@ def load_dataset(path: Path, horizons: Sequence[int], columns: Optional[Sequence
     )
 
 
-def numeric_feature_columns(data: pd.DataFrame) -> List[str]:
+def numeric_feature_columns(data: pd.DataFrame) -> list[str]:
     excluded = {
         "timestamp",
         "tf_15m_open",
@@ -214,7 +214,7 @@ def numeric_feature_columns(data: pd.DataFrame) -> List[str]:
     ]
 
 
-def _finite_quantiles(series: pd.Series, quantiles: Sequence[float]) -> Dict[float, float]:
+def _finite_quantiles(series: pd.Series, quantiles: Sequence[float]) -> dict[float, float]:
     clean = series.replace([np.inf, -np.inf], np.nan).dropna()
     if clean.empty:
         return {}
@@ -222,7 +222,7 @@ def _finite_quantiles(series: pd.Series, quantiles: Sequence[float]) -> Dict[flo
     return {float(key): float(value) for key, value in values.items() if pd.notna(value)}
 
 
-def build_feature_conditions(train: pd.DataFrame, feature: str) -> List[Condition]:
+def build_feature_conditions(train: pd.DataFrame, feature: str) -> list[Condition]:
     conditions = []
     for quantile, threshold in _finite_quantiles(train[feature], [0.1, 0.2, 0.8, 0.9]).items():
         kind = "value_le" if quantile < 0.5 else "value_ge"
@@ -262,7 +262,7 @@ def rank_features_by_direction(
     direction: str,
     max_features: int,
     sample_rows: int = 50_000,
-) -> List[str]:
+) -> list[str]:
     feature_list = list(features)
     target = train[f"future_return_{horizon}_bars"]
     if direction == "short":
@@ -365,10 +365,12 @@ def simulate_trades(
                         exit_reason = "take_profit"
                         break
 
-        if pnl_unit == "btc":
-            gross_return = entry / exit_price - 1 if direction == "short" else 0.0
-        else:
-            gross_return = exit_price / entry - 1 if direction == "long" else entry / exit_price - 1
+        gross_return = gross_return_for_pnl_unit(
+            entry,
+            exit_price,
+            is_long=direction == "long",
+            pnl_unit=pnl_unit,
+        )
         net_return = gross_return - total_cost
         trades.append(
             {
@@ -389,7 +391,7 @@ def simulate_trades(
     return pd.DataFrame(trades)
 
 
-def returns_metrics(returns: np.ndarray) -> Dict[str, float]:
+def returns_metrics(returns: np.ndarray) -> dict[str, float]:
     returns = np.asarray(returns, dtype=float)
     if returns.size == 0:
         return {
@@ -423,7 +425,7 @@ def returns_metrics(returns: np.ndarray) -> Dict[str, float]:
     }
 
 
-def trade_metrics(trades: pd.DataFrame) -> Dict[str, float]:
+def trade_metrics(trades: pd.DataFrame) -> dict[str, float]:
     if trades.empty:
         return returns_metrics(np.array([], dtype=float))
     return returns_metrics(trades["net_return"].astype(float).to_numpy())
@@ -439,7 +441,7 @@ def score_candidate(
     stop_loss: float,
     pnl_unit: str = "usdt",
     use_triple_barrier_labels: bool = False,
-) -> Dict[str, object]:
+) -> dict[str, object]:
     train_mask = combined_mask(train, candidate.conditions)
     test_mask = combined_mask(test, candidate.conditions)
     train_trades = simulate_trades(
@@ -490,7 +492,7 @@ def score_candidate_with_config(
     candidate: StrategyCandidate,
     trade_config: TradeConfig,
     base_prefix: str = "tf_15m_",
-) -> Dict[str, object]:
+) -> dict[str, object]:
     _ = base_prefix
     return score_candidate(
         train,
@@ -507,13 +509,13 @@ def score_candidate_with_config(
 
 def _rank_features(
     train: pd.DataFrame,
-    all_features: List[str],
+    all_features: list[str],
     horizon: int,
     direction: str,
     max_features: int,
     ranking_method: str,
     rank_sample_rows: int,
-) -> List[str]:
+) -> list[str]:
     if ranking_method == "spearman":
         return rank_features_by_direction(
             train, all_features, horizon, direction,
@@ -534,10 +536,10 @@ def _rank_features(
 
 def _build_conditions_for_features(
     train: pd.DataFrame,
-    ranked_features: List[str],
-    enabled_kinds: Set[str],
-    cross_feature_pairs: Optional[Sequence[Tuple[str, str]]],
-) -> List[Condition]:
+    ranked_features: list[str],
+    enabled_kinds: set[str],
+    cross_feature_pairs: Sequence[tuple[str, str]] | None,
+) -> list[Condition]:
     if enabled_kinds == {"value", "delta"}:
         return [
             condition
@@ -552,12 +554,12 @@ def _build_conditions_for_features(
 
 def _score_and_select_conditions(
     train: pd.DataFrame,
-    conditions: List[Condition],
+    conditions: list[Condition],
     horizon: int,
     direction: str,
     top_conditions: int,
     min_support: int = 500,
-) -> List[int]:
+) -> list[int]:
     target = train[f"future_return_{horizon}_bars"]
     if direction == "short":
         target = -target
@@ -573,10 +575,10 @@ def _score_and_select_conditions(
 
 
 def _generate_pairs_flat(
-    conditions: List[Condition],
-    selected_indices: List[int],
+    conditions: list[Condition],
+    selected_indices: list[int],
     max_pairs: int,
-) -> List[Tuple[int, int]]:
+) -> list[tuple[int, int]]:
     pairs = []
     for left_pos, left_index in enumerate(selected_indices):
         for right_index in selected_indices[left_pos + 1:]:
@@ -589,11 +591,11 @@ def _generate_pairs_flat(
 
 
 def _generate_pairs_pool(
-    conditions: List[Condition],
-    selected_indices: List[int],
+    conditions: list[Condition],
+    selected_indices: list[int],
     max_pairs: int,
-) -> List[Tuple[int, int]]:
-    pools: Dict[str, List[int]] = defaultdict(list)
+) -> list[tuple[int, int]]:
+    pools: dict[str, list[int]] = defaultdict(list)
     for idx in selected_indices:
         tf = timeframe_for_feature(conditions[idx].feature)
         pools[tf].append(idx)
@@ -608,7 +610,7 @@ def _generate_pairs_pool(
         return _generate_pairs_flat(conditions, selected_indices, max_pairs)
 
     pairs_per_combo = max(1, max_pairs // len(tf_combos))
-    pairs: List[Tuple[int, int]] = []
+    pairs: list[tuple[int, int]] = []
     for tf_a, tf_b in tf_combos:
         combo_count = 0
         for left_index in pools[tf_a]:
@@ -628,12 +630,12 @@ def _generate_pairs_pool(
 
 def _generate_pairs_shap(
     train: pd.DataFrame,
-    conditions: List[Condition],
-    selected_indices: List[int],
-    all_features: List[str],
+    conditions: list[Condition],
+    selected_indices: list[int],
+    all_features: list[str],
     horizon: int,
     max_pairs: int,
-) -> List[Tuple[int, int]]:
+) -> list[tuple[int, int]]:
     from src.feature_ranking import suggest_feature_pairs
 
     target_column = f"future_return_{horizon}_bars"
@@ -642,7 +644,7 @@ def _generate_pairs_shap(
     )
     shap_feature_set = {(a, b) for a, b in shap_pairs} | {(b, a) for a, b in shap_pairs}
 
-    pairs: List[Tuple[int, int]] = []
+    pairs: list[tuple[int, int]] = []
     for left_pos, left_index in enumerate(selected_indices):
         for right_index in selected_indices[left_pos + 1:]:
             left_f = conditions[left_index].feature
@@ -670,12 +672,12 @@ def make_candidates(
     condition_depths: Sequence[int],
     ranking_method: str = "spearman",
     cross_tf_mode: str = "none",
-    enabled_kinds: Set[str] = DEFAULT_ENABLED_KINDS,
+    enabled_kinds: set[str] = DEFAULT_ENABLED_KINDS,
     shap_screen: bool = False,
     shap_target: str = "sign",
-) -> List[StrategyCandidate]:
+) -> list[StrategyCandidate]:
     all_features = numeric_feature_columns(train)
-    candidates: List[StrategyCandidate] = []
+    candidates: list[StrategyCandidate] = []
     for horizon in horizons:
         for direction in directions:
             LOGGER.info(
@@ -788,7 +790,7 @@ def make_candidates(
                         if triple_count >= max_triples:
                             break
     seen = set()
-    deduped: List[StrategyCandidate] = []
+    deduped: list[StrategyCandidate] = []
     for candidate in candidates:
         signature = (
             candidate.direction,
@@ -853,7 +855,7 @@ def _attach_statistical_metrics(strategies: pd.DataFrame, walk_forward: bool = F
             n_obs=max(1, int(n) if np.isfinite(n) else 1),
             sr_std_trials=sr_std_trials,
         )
-        for s, sk, ku, n in zip(sr, skew, kurt, n_obs)
+        for s, sk, ku, n in zip(sr, skew, kurt, n_obs, strict=False)
     ]
     return out
 
@@ -866,10 +868,10 @@ def regime_breakdown(
     take_profit: float,
     stop_loss: float,
     pnl_unit: str = "usdt",
-) -> Dict[str, Dict[str, float]]:
+) -> dict[str, dict[str, float]]:
     if "tf_1d_regime_id" not in data.columns:
         return {}
-    breakdown: Dict[str, Dict[str, float]] = {}
+    breakdown: dict[str, dict[str, float]] = {}
     for regime_id, regime_data in data.groupby("tf_1d_regime_id"):
         trades = simulate_trades(
             regime_data,
@@ -908,7 +910,7 @@ def cluster_ranked_strategies(
     if out.empty or "conditions_json" not in out.columns:
         out["cluster_id"] = pd.Series(dtype=int)
         return out
-    masks: Dict[str, np.ndarray] = {}
+    masks: dict[str, np.ndarray] = {}
     for idx, row in out.iterrows():
         conditions = tuple(Condition(**payload) for payload in json.loads(row["conditions_json"]))
         masks[str(idx)] = combined_mask(data, conditions).to_numpy()
@@ -988,7 +990,7 @@ def summarize_filter_rejections(
     min_test_trades: int,
     require_multitimeframe: bool,
     walk_forward: bool = False,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     if walk_forward:
         if scored.empty:
             return {
@@ -1047,12 +1049,12 @@ _with_threshold = with_threshold
 class WalkForwardEngine(WindowConditionCache):
     """WindowConditionCache plus per-window simulation arrays for the 15m search."""
 
-    def __init__(self, data: pd.DataFrame, windows: Sequence[Tuple[slice, slice]], base_prefix: str = "tf_15m_"):
+    def __init__(self, data: pd.DataFrame, windows: Sequence[tuple[slice, slice]], base_prefix: str = "tf_15m_"):
         super().__init__(data, windows)
         self.test_arrays = [SimArrays.from_dataframe(frame, base_prefix) for frame in self.test_frames]
 
 
-def _base_row(candidate: StrategyCandidate, take_profit: float, stop_loss: float) -> Dict[str, object]:
+def _base_row(candidate: StrategyCandidate, take_profit: float, stop_loss: float) -> dict[str, object]:
     return {
         "direction": candidate.direction,
         "horizon_bars": candidate.horizon_bars,
@@ -1078,14 +1080,14 @@ _ZEROED_SPLIT_COLUMNS = {
 def _score_candidate_walk_forward(
     engine: WalkForwardEngine,
     candidate: StrategyCandidate,
-    scenarios: Sequence[Tuple[float, float]],
+    scenarios: Sequence[tuple[float, float]],
     fee_bps: float,
     slippage_bps: float,
     pnl_unit: str,
     wf_pass_rate: float,
-) -> List[Dict[str, object]]:
+) -> list[dict[str, object]]:
     n_windows = len(engine.windows)
-    per_scenario_stats: List[List[Dict[str, float]]] = [[] for _ in scenarios]
+    per_scenario_stats: list[list[dict[str, float]]] = [[] for _ in scenarios]
     for window_index in range(n_windows):
         mask = engine.candidate_test_mask(window_index, candidate)
         arrays = engine.test_arrays[window_index]
@@ -1134,9 +1136,9 @@ def _score_candidate_single_split(
     train_arrays: SimArrays,
     test_arrays: SimArrays,
     candidate: StrategyCandidate,
-    scenarios: Sequence[Tuple[float, float]],
+    scenarios: Sequence[tuple[float, float]],
     trade_config_template: TradeConfig,
-) -> List[Dict[str, object]]:
+) -> list[dict[str, object]]:
     rows = []
     if trade_config_template.use_triple_barrier_labels:
         for take_profit, stop_loss in scenarios:
@@ -1177,7 +1179,7 @@ def _score_candidate_single_split(
     return rows
 
 
-def _config_hash(config: Dict[str, object]) -> str:
+def _config_hash(config: dict[str, object]) -> str:
     import hashlib
 
     runtime_only = ("git_sha", "search_timestamp", "n_jobs", "checkpoint_every", "resume")
@@ -1195,7 +1197,7 @@ def _load_checkpoint(
     meta_path: Path,
     config_hash: str,
     n_scenarios: int,
-) -> Tuple[List[Dict[str, object]], Set[int]]:
+) -> tuple[list[dict[str, object]], set[int]]:
     if not checkpoint_path.exists() or not meta_path.exists():
         return [], set()
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -1214,10 +1216,10 @@ def _load_checkpoint(
     return frame.to_dict("records"), complete
 
 
-_WORKER: Dict[str, object] = {}
+_WORKER: dict[str, object] = {}
 
 
-def _worker_init(payload: Dict[str, object]) -> None:
+def _worker_init(payload: dict[str, object]) -> None:
     data = load_dataset(
         Path(payload["input_path"]), payload["horizons"], columns=payload.get("columns"),
     )
@@ -1236,11 +1238,11 @@ def _worker_init(payload: Dict[str, object]) -> None:
         _WORKER["test_arrays"] = SimArrays.from_dataframe(test)
 
 
-def _score_chunk(indices: Sequence[int]) -> List[Dict[str, object]]:
-    candidates: List[StrategyCandidate] = _WORKER["candidates"]
-    scenarios: List[Tuple[float, float]] = _WORKER["scenarios"]
+def _score_chunk(indices: Sequence[int]) -> list[dict[str, object]]:
+    candidates: list[StrategyCandidate] = _WORKER["candidates"]
+    scenarios: list[tuple[float, float]] = _WORKER["scenarios"]
     trade_config = TradeConfig(**_WORKER["trade_config"])
-    rows: List[Dict[str, object]] = []
+    rows: list[dict[str, object]] = []
     for index in indices:
         candidate = candidates[index]
         if _WORKER["walk_forward"]:
@@ -1274,7 +1276,7 @@ def _score_chunk(indices: Sequence[int]) -> List[Dict[str, object]]:
     return rows
 
 
-def _flush_rows(rows: List[Dict[str, object]], checkpoint_path: Path) -> None:
+def _flush_rows(rows: list[dict[str, object]], checkpoint_path: Path) -> None:
     if not rows:
         return
     frame = pd.DataFrame(rows)
@@ -1331,7 +1333,7 @@ def write_report(
     strategies: pd.DataFrame,
     yearly: pd.DataFrame,
     diagnostics: pd.DataFrame,
-    rejection_summary: Dict[str, int],
+    rejection_summary: dict[str, int],
     path: Path,
     mode: str = "usdt",
     pnl_unit: str = "usdt",
@@ -1522,7 +1524,7 @@ def run(
     require_multitimeframe: bool = False,
     ranking_method: str = "spearman",
     cross_tf_mode: str = "none",
-    enabled_kinds: Set[str] = DEFAULT_ENABLED_KINDS,
+    enabled_kinds: set[str] = DEFAULT_ENABLED_KINDS,
     mode: str = "usdt",
     pnl_unit: str = "usdt",
     shap_screen: bool = False,
@@ -1536,7 +1538,7 @@ def run(
     wf_step_bars: int = 17_520,
     wf_min_windows: int = 3,
     wf_pass_rate: float = 0.6,
-    embargo_bars: Optional[int] = None,
+    embargo_bars: int | None = None,
     purged_kfold_splits: int = 5,
     use_triple_barrier_labels: bool = False,
     dsr_threshold: float = 0.0,
@@ -1557,8 +1559,8 @@ def run(
 
     holdout = data.iloc[0:0]
     core = data
-    windows: List[Tuple[slice, slice]] = []
-    wf_config: Optional[WalkForwardConfig] = None
+    windows: list[tuple[slice, slice]] = []
+    wf_config: WalkForwardConfig | None = None
     train = test = None
     if wf_engine_mode:
         core_rows = len(data) - int(len(data) * holdout_fraction) if holdout_fraction > 0 else len(data)
@@ -1618,7 +1620,7 @@ def run(
     # The full table is thousands of columns; loading it once per worker
     # process exhausts RAM, so workers get a pruned column list and, in
     # walk-forward mode, the parent drops the unused columns too.
-    extra_columns: Set[str] = set()
+    extra_columns: set[str] = set()
     if use_triple_barrier_labels:
         extra_columns |= {c for c in data.columns if c.startswith(("label_", "bars_to_exit_"))}
     if regime_conditional and "tf_1d_regime_id" in data.columns:
@@ -1680,8 +1682,8 @@ def run(
     checkpoint_path = output_dir / "checkpoint.csv"
     meta_path = output_dir / "checkpoint_meta.json"
     config_hash = _config_hash(config)
-    rows: List[Dict[str, object]] = []
-    done: Set[int] = set()
+    rows: list[dict[str, object]] = []
+    done: set[int] = set()
     if resume:
         rows, done = _load_checkpoint(checkpoint_path, meta_path, config_hash, len(scenarios))
     elif checkpoint_path.exists():
@@ -1712,7 +1714,7 @@ def run(
 
     if purged_kfold:
         scored = 0
-        buffer: List[Dict[str, object]] = []
+        buffer: list[dict[str, object]] = []
         for index in pending:
             candidate = candidates[index]
             conditions_json = _conditions_payload(candidate)

@@ -2,7 +2,7 @@
 name = "trading-bot"
 version = "0.1.0"
 description = "Multi-timeframe BTCUSDT strategy research + paper/live execution system"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 
 # This repo is run as scripts (`python -m src.<module>`) rather than installed,
 # so there is intentionally no build-system / packaging section.
@@ -17,7 +17,7 @@ filterwarnings = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py311"
 extend-exclude = [".venv", "data", "outputs"]
 
 [tool.ruff.lint]

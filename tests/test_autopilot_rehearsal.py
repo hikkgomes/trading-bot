@@ -13,6 +13,20 @@ def test_run_rehearsal_writes_end_to_end_artifacts(tmp_path):
     assert report["preflight_ok"] is True
     assert set(report["products"]) == {"active_income", "btc_accumulation"}
     assert set(report["preflight_products"]) == {"active_income", "btc_accumulation"}
+    research = report["research_rehearsal"]
+    assert research["ok"] is True
+    assert research["synthetic_only"] is True
+    assert research["first_generation"] > 0
+    assert research["new_behavioral_specs_after_feedback"] == research["second_generation"]
+    assert set(research["products"]) == {"active_income", "btc_accumulation"}
+    assert set(research["opportunity_types"]) >= {
+        "scalping",
+        "day_trading",
+        "swing_trading",
+        "btc_accumulation",
+    }
+    assert Path(research["experiment_memory"]).exists()
+    assert Path(research["generated_batch"]).exists()
 
     for key in (
         "artifact",
@@ -29,6 +43,20 @@ def test_run_rehearsal_writes_end_to_end_artifacts(tmp_path):
     checks = {item["name"]: item for item in preflight["products"][0]["checks"]}
     assert checks["approval_gate"]["ok"] is True
     assert checks["exchange_read_connectivity"]["detail"]["price"] == 100.0
+    assert checks["broker_native_protective_stops"] == {
+        "name": "broker_native_protective_stops",
+        "ok": True,
+        "detail": {"supported": True},
+    }
+    assert checks["broker_open_orders_empty"] == {
+        "name": "broker_open_orders_empty",
+        "ok": True,
+        "detail": {
+            "symbol": "BTCUSDT",
+            "regular": {"count": 0, "orders": []},
+            "conditional": {"count": 0, "orders": []},
+        },
+    }
     for product_name, product_report in report["products"].items():
         assert product_report["before_recommendation"] == "needs_approval"
         assert product_report["after_recommendation"] == "already_approved"

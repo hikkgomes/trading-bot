@@ -8,15 +8,19 @@ Linux box configured well enough to run the 24/7 supervisor?"
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import logging
 import os
 import shutil
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from research_exploration.hypothesis_schema import Hypothesis
+from research_exploration.strategy_grammar import validate_hypothesis_against_space
 from src.autopilot.approvals import (
     ApprovalError,
     ApprovalLedger,
@@ -31,6 +35,11 @@ from src.autopilot.exchange_policy import (
     ACTIVE_INCOME_MAX_FUTURES_LEVERAGE,
     BTC_ACCUMULATION_SPOT_EXCHANGES,
 )
+from src.autopilot.experiment_memory import (
+    ExperimentMemory,
+    ExperimentMemoryError,
+    canonical_strategy_hash,
+)
 from src.autopilot.io import write_json_atomic, write_text_atomic
 from src.autopilot.market_data import (
     build_indicator_feature_statuses,
@@ -38,6 +47,17 @@ from src.autopilot.market_data import (
     required_indicator_features_by_market,
 )
 from src.autopilot.regime_data import build_regime_data_statuses
+from src.autopilot.research_factory import (
+    BATCH_SCHEMA as GENERATED_BATCH_SCHEMA,
+)
+from src.autopilot.research_factory import (
+    SAFETY as GENERATED_BATCH_SAFETY,
+)
+from src.autopilot.research_factory import (
+    ResearchFactoryConfig,
+    load_factory_config,
+    strategy_behavior_spec,
+)
 from src.autopilot.runtime import (
     assert_recent_preflight,
     assert_recent_testnet_rehearsal,
@@ -45,8 +65,12 @@ from src.autopilot.runtime import (
 )
 from src.autopilot.strategy_policy import StrategyPolicyError, assert_strategy_artifact_allowed
 from src.config import PROJECT_ROOT
+from src.envfile import parse_env_lines
 
 LOGGER = logging.getLogger("autopilot.readiness")
+MAX_READINESS_BATCH_BYTES = 8 * 1024 * 1024
+_MEMORY_READINESS_CACHE_KEY: tuple[str, int, int, int] | None = None
+_MEMORY_READINESS_CACHE_VALUE: dict[str, Any] | None = None
 
 
 def _check(name: str, ok: bool, *, level: str = "error", detail: Any = None) -> dict[str, Any]:
@@ -121,13 +145,21 @@ def _service_installer_status(path: Path) -> dict[str, Any]:
     status["has_shell_shebang"] = first_line in {"#!/bin/bash", "#!/usr/bin/env bash", "#!/bin/sh"}
     required_markers = {
         "strict_shell": "set -euo pipefail" in content,
-        "config_validation": "src.autopilot.runtime --config" in content and "--validate" in content,
-        "readiness_prestart": "src.autopilot.readiness --config" in content and "ExecStartPre=" in content,
-        "healthcheck_timer": "HEALTHCHECK_TIMER_NAME" in content and "systemctl --user enable --now" in content,
+        "config_validation": "src.autopilot.runtime --config" in content
+        and "--validate" in content,
+        "readiness_install_gate": (
+            '"$PYTHON" -m src.autopilot.readiness --config "$CONFIG"' in content
+        ),
+        "healthcheck_timer": "HEALTHCHECK_TIMER_NAME" in content
+        and "systemctl --user enable --now" in content,
         "unit_name_validation": "validate_unit_name" in content,
         "raw_unit_value_validation": all(
             marker in content
-            for marker in ("validate_unit_value", "validate_positive_integer", "validate_zero_or_one")
+            for marker in (
+                "validate_unit_value",
+                "validate_positive_integer",
+                "validate_zero_or_one",
+            )
         ),
     }
     status["required_markers"] = required_markers
@@ -186,6 +218,278 @@ def _strategy_smoke_configured(config: AutopilotConfig) -> bool:
     )
 
 
+def _same_path(left: Path, right: Path) -> bool:
+    return left.resolve(strict=False) == right.resolve(strict=False)
+
+
+def _research_factory_status(
+    config: AutopilotConfig,
+) -> tuple[dict[str, Any], ResearchFactoryConfig | None]:
+    """Validate the autonomous search contract and its autopilot path wiring."""
+
+    path = config.research_factory_config_file
+    status: dict[str, Any] = {"path": str(path), "exists": path.exists(), "ok": False}
+    try:
+        factory = load_factory_config(path)
+    except Exception as exc:
+        status.update(reason="invalid_config", error=f"{type(exc).__name__}: {exc}")
+        return status, None
+
+    active_spaces = [space for space in factory.search_spaces if space.product == "active_income"]
+    btc_spaces = [space for space in factory.search_spaces if space.product == "btc_accumulation"]
+    active_opportunities = {space.opportunity_type for space in active_spaces}
+    required_active = {"scalping", "day_trading", "swing_trading"}
+    path_contract = {
+        "memory": _same_path(factory.memory_path, config.experiment_memory_file),
+        "generated_batch": _same_path(factory.generated_batch_path, config.generated_batch_file),
+    }
+    goal_contract = {
+        "active_income_horizons": required_active.issubset(active_opportunities),
+        "active_income_futures_usdt": bool(active_spaces)
+        and all(space.market == "futures" and space.pnl_unit == "usdt" for space in active_spaces),
+        "btc_accumulation_spot_btc": bool(btc_spaces)
+        and all(space.market == "spot" and space.pnl_unit == "btc" for space in btc_spaces),
+        "btc_accumulation_dodge_only": bool(btc_spaces)
+        and all(set(space.directions) == {"short"} for space in btc_spaces),
+        "btc_accumulation_multiple_horizons": len({space.base_timeframe for space in btc_spaces})
+        >= 2,
+    }
+    problems = [
+        *(f"path_mismatch:{name}" for name, ok in path_contract.items() if not ok),
+        *(f"goal_contract:{name}" for name, ok in goal_contract.items() if not ok),
+    ]
+    status.update(
+        ok=not problems,
+        reason="ready" if not problems else "unsafe_search_contract",
+        search_spaces=len(factory.search_spaces),
+        products=sorted({space.product for space in factory.search_spaces}),
+        active_income_opportunities=sorted(active_opportunities),
+        btc_accumulation_timeframes=sorted({space.base_timeframe for space in btc_spaces}),
+        path_contract=path_contract,
+        goal_contract=goal_contract,
+        budgets={
+            "max_candidates_per_cycle": factory.budgets.max_candidates_per_cycle,
+            "max_candidates_per_space": factory.budgets.max_candidates_per_space,
+            "max_generation_attempts": factory.budgets.max_generation_attempts,
+            "max_generation_seconds": factory.budgets.max_generation_seconds,
+            "max_memory_bytes": factory.budgets.max_memory_bytes,
+        },
+        problems=problems,
+    )
+    return status, factory
+
+
+def _experiment_memory_status(
+    path: Path,
+    *,
+    backup_path: Path,
+) -> dict[str, Any]:
+    """Check an existing memory deeply, or prove a fresh memory can be created."""
+
+    status: dict[str, Any] = {
+        "path": str(path),
+        "backup_path": str(backup_path),
+        "exists": path.exists(),
+        "ok": False,
+    }
+    if _same_path(path, backup_path):
+        status.update(reason="backup_path_matches_live_memory")
+        return status
+    if path.is_symlink() or backup_path.is_symlink():
+        status.update(reason="symlink_not_allowed")
+        return status
+    if backup_path.exists() and not backup_path.is_file():
+        status.update(reason="backup_path_not_file")
+        return status
+    backup_writable = _path_writable(backup_path)
+    status["backup_path_writable"] = backup_writable
+    if not backup_writable:
+        status.update(reason="backup_path_not_writable")
+        return status
+    if not path.exists():
+        writable = _path_writable(path)
+        status.update(
+            ok=writable,
+            reason="initializes_on_first_factory_run" if writable else "memory_path_not_writable",
+            path_writable=writable,
+            integrity=None,
+        )
+        return status
+    if not path.is_file():
+        status.update(reason="memory_path_not_file")
+        return status
+    try:
+        initial_stat = path.stat()
+        cache_key = (
+            str(path.resolve()),
+            initial_stat.st_ino,
+            initial_stat.st_mtime_ns,
+            initial_stat.st_size,
+        )
+    except OSError as exc:
+        status.update(reason="memory_stat_failed", error=f"{type(exc).__name__}: {exc}")
+        return status
+    global _MEMORY_READINESS_CACHE_KEY, _MEMORY_READINESS_CACHE_VALUE
+    if (
+        cache_key == _MEMORY_READINESS_CACHE_KEY
+        and _MEMORY_READINESS_CACHE_VALUE is not None
+    ):
+        cached = copy.deepcopy(_MEMORY_READINESS_CACHE_VALUE)
+        cached["backup_path_writable"] = backup_writable
+        return cached
+    try:
+        with ExperimentMemory(path, deep_on_open=False) as memory:
+            integrity = memory.integrity_check(deep=True)
+    except (ExperimentMemoryError, OSError, ValueError) as exc:
+        status.update(reason="integrity_failed", error=f"{type(exc).__name__}: {exc}")
+        return status
+    status.update(ok=True, reason="ready", path_writable=_path_writable(path), integrity=integrity)
+    try:
+        final_stat = path.stat()
+        _MEMORY_READINESS_CACHE_KEY = (
+            str(path.resolve()),
+            final_stat.st_ino,
+            final_stat.st_mtime_ns,
+            final_stat.st_size,
+        )
+        _MEMORY_READINESS_CACHE_VALUE = copy.deepcopy(status)
+    except OSError:
+        _MEMORY_READINESS_CACHE_KEY = None
+        _MEMORY_READINESS_CACHE_VALUE = None
+    return status
+
+
+def _generated_batch_status(
+    path: Path,
+    *,
+    factory: ResearchFactoryConfig | None,
+) -> dict[str, Any]:
+    """Fail closed on an unsafe batch while allowing a clean first boot."""
+
+    status: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "ok": False,
+        "level": "error",
+    }
+    if not path.exists():
+        status.update(
+            reason="missing; generated by the first research_factory job",
+            level="warning",
+            next_action="make research-generate",
+        )
+        return status
+    if path.is_symlink() or not path.is_file():
+        status.update(reason="batch_must_be_regular_file")
+        return status
+    if path.stat().st_size > MAX_READINESS_BATCH_BYTES:
+        status.update(reason="batch_too_large", size_bytes=path.stat().st_size)
+        return status
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        status.update(reason="read_error", error=f"{type(exc).__name__}: {exc}")
+        return status
+    if not isinstance(payload, dict):
+        status.update(reason="payload_not_object")
+        return status
+    safety = {key: payload.get(key) for key in GENERATED_BATCH_SAFETY}
+    if (
+        payload.get("ok") is not True
+        or payload.get("schema") != GENERATED_BATCH_SCHEMA
+        or safety != GENERATED_BATCH_SAFETY
+    ):
+        status.update(
+            reason="failed_safety_contract",
+            schema=payload.get("schema"),
+            safety=safety,
+        )
+        return status
+    if factory is None:
+        status.update(reason="factory_config_unavailable")
+        return status
+    hypotheses = payload.get("hypotheses")
+    metadata_items = payload.get("generation_metadata")
+    if not isinstance(hypotheses, list) or not isinstance(metadata_items, list):
+        status.update(reason="hypotheses_or_metadata_not_list")
+        return status
+    if len(hypotheses) != len(metadata_items):
+        status.update(reason="hypothesis_metadata_count_mismatch")
+        return status
+    if len(hypotheses) > factory.budgets.max_candidates_per_cycle:
+        status.update(reason="candidate_budget_exceeded", hypotheses=len(hypotheses))
+        return status
+
+    spaces = {space.name: space for space in factory.search_spaces}
+    metadata_by_id: dict[str, dict[str, Any]] = {}
+    for item in metadata_items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            status.update(reason="invalid_generation_metadata")
+            return status
+        strategy_id = item["id"]
+        if strategy_id in metadata_by_id:
+            status.update(reason="duplicate_metadata_id", strategy_id=strategy_id)
+            return status
+        metadata_by_id[strategy_id] = item
+
+    hashes: set[str] = set()
+    products: set[str] = set()
+    try:
+        for raw_hypothesis in hypotheses:
+            if not isinstance(raw_hypothesis, dict):
+                raise ValueError("hypothesis must be an object")
+            hypothesis = Hypothesis.from_dict(raw_hypothesis)
+            metadata = metadata_by_id.pop(hypothesis.id)
+            space = spaces[str(metadata["search_space"])]
+            expected_context = {
+                "product": space.product,
+                "market": space.market,
+                "pnl_unit": space.pnl_unit,
+                "opportunity_type": space.opportunity_type,
+                "base_timeframe": space.base_timeframe,
+            }
+            mismatches = [
+                key for key, expected in expected_context.items() if metadata.get(key) != expected
+            ]
+            if mismatches:
+                raise ValueError(f"metadata mismatch: {', '.join(mismatches)}")
+            problems = validate_hypothesis_against_space(hypothesis, space)
+            if problems:
+                raise ValueError(f"grammar contract failed: {', '.join(problems)}")
+            expected_hash = canonical_strategy_hash(strategy_behavior_spec(hypothesis, space))
+            if metadata.get("strategy_hash") != expected_hash:
+                raise ValueError("strategy behavior hash mismatch")
+            if expected_hash in hashes:
+                raise ValueError("duplicate strategy behavior")
+            hashes.add(expected_hash)
+            products.add(space.product)
+        if metadata_by_id:
+            raise ValueError("orphan generation metadata")
+    except (KeyError, TypeError, ValueError) as exc:
+        status.update(reason="invalid_strategy_batch", error=f"{type(exc).__name__}: {exc}")
+        return status
+
+    if not hypotheses:
+        status.update(
+            reason="empty_safe_batch",
+            level="warning",
+            hypotheses=0,
+            generated_at=payload.get("generated_at"),
+            next_action="make research-generate",
+        )
+        return status
+    status.update(
+        ok=True,
+        level="info",
+        reason="ready",
+        hypotheses=len(hypotheses),
+        unique_behavioral_specs=len(hashes),
+        products=sorted(products),
+        generated_at=payload.get("generated_at"),
+    )
+    return status
+
+
 def _offline_rehearsal_status(path: Path) -> dict[str, Any]:
     status: dict[str, Any] = {
         "path": str(path),
@@ -199,7 +503,9 @@ def _offline_rehearsal_status(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
-        status.update(reason="read_error", error=f"{type(exc).__name__}: {exc}", next_action="make rehearse")
+        status.update(
+            reason="read_error", error=f"{type(exc).__name__}: {exc}", next_action="make rehearse"
+        )
         return status
     if not isinstance(payload, dict):
         status.update(
@@ -405,19 +711,50 @@ def _env_exchange(
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
     if path.is_symlink() or not path.exists():
-        return values
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        if not key:
-            continue
-        values[key] = value.strip().strip('"').strip("'")
-    return values
+        return {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        # The dedicated owner/private-mode readiness check below reports the
+        # actionable failure. Do not let an unreadable credential file prevent
+        # the rest of the fail-closed report from being produced.
+        return {}
+    return parse_env_lines(lines)
+
+
+def _environment_file_status(path: Path) -> dict[str, Any]:
+    status: dict[str, Any] = {"path": str(path), "exists": path.exists(), "ok": False}
+    if path.is_symlink():
+        status["reason"] = "symlink_not_allowed"
+        return status
+    if not path.exists():
+        status.update(ok=True, reason="missing_optional_paper_environment")
+        return status
+    try:
+        metadata = path.stat()
+    except OSError as exc:
+        status.update(reason="stat_failed", error=f"{type(exc).__name__}: {exc}")
+        return status
+    mode = stat.S_IMODE(metadata.st_mode)
+    owner_uid = os.getuid()
+    status.update(
+        mode=f"{mode:04o}",
+        owner_uid=metadata.st_uid,
+        expected_owner_uid=owner_uid,
+        regular_file=stat.S_ISREG(metadata.st_mode),
+        owner_matches=metadata.st_uid == owner_uid,
+        group_world_permissions=mode & 0o077,
+        readable=os.access(path, os.R_OK),
+    )
+    status["ok"] = bool(
+        status["regular_file"]
+        and status["owner_matches"]
+        and status["group_world_permissions"] == 0
+        and status["readable"]
+    )
+    status["reason"] = "ready" if status["ok"] else "credential_file_not_owner_private"
+    return status
 
 
 def _readiness_env() -> dict[str, str]:
@@ -488,7 +825,9 @@ def _product_readiness(
 
     if artifact_exists:
         try:
-            assert_artifact_live_approved(product.strategies_path, config.approval_ledger, product=product)
+            assert_artifact_live_approved(
+                product.strategies_path, config.approval_ledger, product=product
+            )
             checks.append(_check(f"{product.name}: live approval", True))
         except (ApprovalError, FileNotFoundError, json.JSONDecodeError) as exc:
             checks.append(_check(f"{product.name}: live approval", False, detail=str(exc)))
@@ -499,31 +838,45 @@ def _product_readiness(
             _check(
                 f"{product.name}: preflight report exists",
                 preflight_exists,
-                detail=str(product.preflight_report) if product.preflight_report else "not configured",
+                detail=str(product.preflight_report)
+                if product.preflight_report
+                else "not configured",
             )
         )
         if preflight_exists:
             try:
                 detail = assert_recent_preflight(product)
-                checks.append(_check(f"{product.name}: preflight report current", True, detail=detail))
+                checks.append(
+                    _check(f"{product.name}: preflight report current", True, detail=detail)
+                )
             except (RuntimeError, OSError, json.JSONDecodeError, ValueError) as exc:
-                checks.append(_check(f"{product.name}: preflight report current", False, detail=str(exc)))
+                checks.append(
+                    _check(f"{product.name}: preflight report current", False, detail=str(exc))
+                )
 
     if product.require_testnet_rehearsal:
-        rehearsal_exists = bool(product.testnet_rehearsal_report and product.testnet_rehearsal_report.exists())
+        rehearsal_exists = bool(
+            product.testnet_rehearsal_report and product.testnet_rehearsal_report.exists()
+        )
         checks.append(
             _check(
                 f"{product.name}: testnet rehearsal report exists",
                 rehearsal_exists,
-                detail=str(product.testnet_rehearsal_report) if product.testnet_rehearsal_report else "not configured",
+                detail=str(product.testnet_rehearsal_report)
+                if product.testnet_rehearsal_report
+                else "not configured",
             )
         )
         if rehearsal_exists:
             try:
                 detail = assert_recent_testnet_rehearsal(product)
-                checks.append(_check(f"{product.name}: testnet rehearsal current", True, detail=detail))
+                checks.append(
+                    _check(f"{product.name}: testnet rehearsal current", True, detail=detail)
+                )
             except (RuntimeError, OSError, json.JSONDecodeError, ValueError) as exc:
-                checks.append(_check(f"{product.name}: testnet rehearsal current", False, detail=str(exc)))
+                checks.append(
+                    _check(f"{product.name}: testnet rehearsal current", False, detail=str(exc))
+                )
 
     market_type = _market_type(product)
     env_errors: list[str] = []
@@ -552,7 +905,9 @@ def _product_readiness(
     max_futures_leverage = _env_float(env, "MAX_FUTURES_LEVERAGE", 1.0)
     futures_margin_mode = env.get("FUTURES_MARGIN_MODE", "isolated").strip().lower()
     if env_errors:
-        checks.append(_check(f"{product.name}: exchange environment values", False, detail=env_errors))
+        checks.append(
+            _check(f"{product.name}: exchange environment values", False, detail=env_errors)
+        )
     checks.extend(
         [
             _check(
@@ -562,7 +917,10 @@ def _product_readiness(
             ),
             _check(
                 f"{product.name}: exchange API credentials",
-                bool(_env_optional_str(env, "EXCHANGE_API_KEY") and _env_optional_str(env, "EXCHANGE_API_SECRET")),
+                bool(
+                    _env_optional_str(env, "EXCHANGE_API_KEY")
+                    and _env_optional_str(env, "EXCHANGE_API_SECRET")
+                ),
                 detail="EXCHANGE_API_KEY and EXCHANGE_API_SECRET",
             ),
             _check(
@@ -612,17 +970,20 @@ def _product_readiness(
         checks.append(
             _check(
                 f"{product.name}: BTC accumulation spot exchange",
-                product.objective != "btc_accumulation" or exchange.strip().lower() in BTC_ACCUMULATION_SPOT_EXCHANGES,
+                product.objective != "btc_accumulation"
+                or exchange.strip().lower() in BTC_ACCUMULATION_SPOT_EXCHANGES,
                 detail=exchange or "using execution default",
             )
         )
     checks.append(_check(f"{product.name}: quote asset", quote_asset == "USDT", detail=quote_asset))
     checks.append(
         _check(
-            f"{product.name}: exchange testnet",
-            testnet_enabled,
-            level="warning",
-            detail="recommended for first live rehearsals",
+            f"{product.name}: production exchange routing",
+            not testnet_enabled,
+            detail=(
+                "EXCHANGE_TESTNET=0 is required for a configured live product; "
+                "run the separate testnet rehearsal while the product remains paper/paused"
+            ),
         )
     )
     return checks
@@ -645,15 +1006,88 @@ def build_readiness_report(
         require_core_jobs=require_core_jobs,
     )
     checks.append(_check("autopilot config valid", not config_errors, detail=config_errors or None))
-    checks.append(_check("runtime directory writable", _path_writable(config.status_file), detail=str(config.status_file.parent)))
-    checks.append(_check("runtime lock path writable", _path_writable(config.lock_file), detail=str(config.lock_file)))
-    checks.append(_check("control path writable", _path_writable(config.control_file), detail=str(config.control_file)))
+    research_factory, loaded_factory = _research_factory_status(config)
+    checks.append(
+        _check(
+            "autonomous research factory config",
+            bool(research_factory["ok"]),
+            detail=research_factory,
+        )
+    )
+    experiment_memory = _experiment_memory_status(
+        config.experiment_memory_file,
+        backup_path=config.experiment_memory_backup_file,
+    )
+    checks.append(
+        _check(
+            "experiment memory integrity and recovery path",
+            bool(experiment_memory["ok"]),
+            detail=experiment_memory,
+        )
+    )
+    generated_batch = _generated_batch_status(
+        config.generated_batch_file,
+        factory=loaded_factory,
+    )
+    checks.append(
+        _check(
+            "generated research batch safety",
+            bool(generated_batch["ok"]),
+            level=str(generated_batch["level"]),
+            detail=generated_batch,
+        )
+    )
+    checks.append(
+        _check(
+            "runtime directory writable",
+            _path_writable(config.status_file),
+            detail=str(config.status_file.parent),
+        )
+    )
+    checks.append(
+        _check(
+            "runtime lock path writable",
+            _path_writable(config.lock_file),
+            detail=str(config.lock_file),
+        )
+    )
+    checks.append(
+        _check(
+            "control path writable",
+            _path_writable(config.control_file),
+            detail=str(config.control_file),
+        )
+    )
     control_file = _control_file_status(config.control_file, config)
     checks.append(_check("control file valid", bool(control_file["ok"]), detail=control_file))
-    checks.append(_check("control audit path writable", _path_writable(config.control_audit_file), detail=str(config.control_audit_file)))
-    checks.append(_check("approval ledger path writable", _path_writable(config.approval_ledger), detail=str(config.approval_ledger)))
-    checks.append(_check("scheduled job state path writable", _path_writable(config.job_state_file), detail=str(config.job_state_file)))
-    checks.append(_check("alert log path writable", _path_writable(config.alert_file), detail=str(config.alert_file)))
+    checks.append(
+        _check(
+            "control audit path writable",
+            _path_writable(config.control_audit_file),
+            detail=str(config.control_audit_file),
+        )
+    )
+    checks.append(
+        _check(
+            "approval ledger path writable",
+            _path_writable(config.approval_ledger),
+            detail=str(config.approval_ledger),
+        )
+    )
+    checks.append(
+        _check(
+            "scheduled job state path writable",
+            _path_writable(config.job_state_file),
+            detail=str(config.job_state_file),
+        )
+    )
+    checks.append(
+        _check(
+            "alert log path writable",
+            _path_writable(config.alert_file),
+            detail=str(config.alert_file),
+        )
+    )
     checks.append(
         _check(
             "alert cooldown state path writable",
@@ -662,7 +1096,9 @@ def build_readiness_report(
         )
     )
     approval_ledger = _approval_ledger_status(config.approval_ledger)
-    checks.append(_check("approval ledger readable", bool(approval_ledger["ok"]), detail=approval_ledger))
+    checks.append(
+        _check("approval ledger readable", bool(approval_ledger["ok"]), detail=approval_ledger)
+    )
     if approval_ledger.get("ok") and approval_ledger.get("invalid_actor_count"):
         checks.append(
             _check(
@@ -711,19 +1147,31 @@ def build_readiness_report(
     checks.append(
         _check(
             "operator report path writable",
-            _path_writable(config.operator_report_file) and _path_writable(config.operator_report_json_file),
-            detail={"markdown": str(config.operator_report_file), "json": str(config.operator_report_json_file)},
+            _path_writable(config.operator_report_file)
+            and _path_writable(config.operator_report_json_file),
+            detail={
+                "markdown": str(config.operator_report_file),
+                "json": str(config.operator_report_json_file),
+            },
         )
     )
     checks.append(
         _check(
             "readiness report path writable",
-            _path_writable(config.readiness_report_file) and _path_writable(config.readiness_report_json_file),
-            detail={"markdown": str(config.readiness_report_file), "json": str(config.readiness_report_json_file)},
+            _path_writable(config.readiness_report_file)
+            and _path_writable(config.readiness_report_json_file),
+            detail={
+                "markdown": str(config.readiness_report_file),
+                "json": str(config.readiness_report_json_file),
+            },
         )
     )
-    service_installer = _service_installer_status(PROJECT_ROOT / "scripts" / "install_autopilot_service.sh")
-    checks.append(_check("service installer usable", bool(service_installer["ok"]), detail=service_installer))
+    service_installer = _service_installer_status(
+        PROJECT_ROOT / "scripts" / "install_autopilot_service.sh"
+    )
+    checks.append(
+        _check("service installer usable", bool(service_installer["ok"]), detail=service_installer)
+    )
     markets = sorted({product.market for product in config.products}) or ["futures"]
     market_data = build_market_data_statuses(markets)
     checks.append(
@@ -736,7 +1184,9 @@ def build_readiness_report(
     )
     indicator_features = build_indicator_feature_statuses(
         markets,
-        required_features_by_market=required_indicator_features_by_market(markets, jobs=config.jobs),
+        required_features_by_market=required_indicator_features_by_market(
+            markets, jobs=config.jobs
+        ),
     )
     checks.append(
         _check(
@@ -766,7 +1216,9 @@ def build_readiness_report(
                 detail=strategy_smoke,
             )
         )
-    offline_rehearsal = _offline_rehearsal_status(PROJECT_ROOT / "runtime" / "rehearsal" / "rehearsal_summary.json")
+    offline_rehearsal = _offline_rehearsal_status(
+        PROJECT_ROOT / "runtime" / "rehearsal" / "rehearsal_summary.json"
+    )
     checks.append(
         _check(
             "offline workflow rehearsal",
@@ -784,10 +1236,22 @@ def build_readiness_report(
             detail=".env is optional for paper mode, required for live credentials",
         )
     )
-    checks.append(_check("environment file not symlink", not env_file.is_symlink(), detail=str(env_file)))
+    checks.append(
+        _check("environment file not symlink", not env_file.is_symlink(), detail=str(env_file))
+    )
+    environment_file = _environment_file_status(env_file)
+    checks.append(
+        _check(
+            "environment file owner-private",
+            bool(environment_file["ok"]),
+            detail=environment_file,
+        )
+    )
 
     any_live = any(product.execution_mode == "live" for product in config.products)
-    ccxt_ok = importlib.util.find_spec("ccxt") is not None if ccxt_available is None else ccxt_available
+    ccxt_ok = (
+        importlib.util.find_spec("ccxt") is not None if ccxt_available is None else ccxt_available
+    )
     checks.append(
         _check(
             "ccxt installed for live mode",

@@ -33,11 +33,11 @@ def run(
     train, test = split_train_test(data, train_fraction)
     rows = []
     for _, row in rules.iterrows():
-        def objective(trial: optuna.Trial) -> float:
+        def objective(trial: optuna.Trial, candidate_row: pd.Series = row) -> float:
             tp = trial.suggest_float("take_profit", 0.001, 0.03, log=True)
             sl = trial.suggest_float("stop_loss", 0.001, 0.03, log=True)
             horizon = trial.suggest_int("horizon_bars", 2, 64)
-            candidate = _candidate_from_row(row, horizon)
+            candidate = _candidate_from_row(candidate_row, horizon)
             config = TradeConfig(
                 fee_bps=fee_bps,
                 slippage_bps=slippage_bps,

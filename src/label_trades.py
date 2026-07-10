@@ -1,6 +1,6 @@
 import argparse
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -46,7 +46,7 @@ def compute_tp_sl_labels(
 
 def build_trade_labels(
     data: pd.DataFrame,
-    tp_sl_pairs: Sequence[Tuple[float, float]],
+    tp_sl_pairs: Sequence[tuple[float, float]],
     horizons: Sequence[int],
     directions: Sequence[str],
     base_prefix: str,
@@ -83,7 +83,7 @@ def run(
     input_path: Path,
     output_path: Path,
     base_timeframe: str = "5m",
-    tp_sl_pairs: Sequence[Tuple[float, float]] = ((0.003, 0.002), (0.005, 0.003), (0.008, 0.004), (0.012, 0.006)),
+    tp_sl_pairs: Sequence[tuple[float, float]] = ((0.003, 0.002), (0.005, 0.003), (0.008, 0.004), (0.012, 0.006)),
     horizons: Sequence[int] = (4, 8, 16),
     directions: Sequence[str] = ("long", "short"),
 ) -> Path:

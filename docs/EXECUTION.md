@@ -9,7 +9,7 @@ safety switches.
 | Broker | Use | Notes |
 |---|---|---|
 | `PaperBroker` | development, tests, paper autopilot cycles | Simulated market fills with fees + slippage; injectable price source; tracks signed positions, realised/unrealised PnL and equity. Dependency-free. |
-| `CcxtBroker` | live / testnet | Wraps [ccxt](https://github.com/ccxt/ccxt) for spot or futures. Requires `pip install ccxt`. |
+| `CcxtBroker` | live / testnet | Wraps the pinned `ccxt==4.5.64` from `requirements-bot.txt`; Binance native conditional-stop routing is version-sensitive. |
 
 ```python
 from src.execution import PaperBroker, Order, OrderSide
@@ -54,13 +54,20 @@ credentials. A real order is sent **only when all** of these hold:
   submission so BTC accumulation cannot overspend available USDT
 * futures margin mode is `isolated`, and the broker successfully sets it before
   opening futures orders
-* futures leverage is configured with `MAX_FUTURES_LEVERAGE` in the conservative
-  range 1-3, and the broker successfully sets it before opening futures orders
+* the environment parser accepts futures leverage in the conservative range
+  1–3, but `active_income` policy requires `MAX_FUTURES_LEVERAGE=1`; the broker
+  must successfully set it before an entry
+* Binance USD-M must report one-way position mode (`positionSide=BOTH`); hedge
+  mode is refused
+* immediately before a non-reduce futures `create_order`, the broker re-fetches
+  the signed position and requires it to be flat; concurrent external exposure
+  cannot be stacked or offset
 
 Otherwise `place_order` raises, so a misconfigured run cannot trade real size.
-Set `EXCHANGE_TESTNET=1` to route everything to the exchange sandbox first.
+Set `EXCHANGE_TESTNET=1` only for the exchange sandbox rehearsal. Production
+runtime and production preflight require `EXCHANGE_TESTNET=0`.
 `src.autopilot.preflight` is read-only; the explicit active-income testnet order
-rehearsal is `make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5`. It requires the
+rehearsal is `make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100`. It requires the
 same approval/preflight/env gates, refuses non-testnet venues, starts only from a
 flat futures position, places one tiny BTCUSDT futures market entry, and closes
 it immediately through the broker close path.
@@ -71,7 +78,7 @@ SPOT_EXCHANGE=binance
 EXCHANGE_MARKET_TYPE=futures
 EXCHANGE_TESTNET=1
 TRADING_LIVE=0          # flip to 1 only when you mean it
-MAX_NOTIONAL_USD=100
+MAX_NOTIONAL_USD=250
 MAX_FILL_SLIPPAGE_BPS=100
 QUOTE_ASSET=USDT
 FUTURES_MARGIN_MODE=isolated
@@ -121,16 +128,81 @@ continuing. Broker entry fills above the requested order quantity are also
 rejected. Entry fills with a mismatched symbol/side or invalid quantity/price are
 rejected before local state opens. Futures exits send reduce-only market orders
 for the strategy's stored fill quantity.
+
+Feature construction can take long enough for an operator action or approval to
+change. Therefore the autopilot live-entry path reloads and rechecks control
+(panic/pause/flatten), approval, saved preflight, and current environment after
+signal evaluation and immediately before the durable entry intent. A stale
+earlier gate can never authorize the eventual order.
 Spot BTC step-aside exits reinvest the quote
 proceeds from the sell, so a successful sell-lower/buy-lower round trip can
 increase BTC holdings instead of leaving gains idle in USDT. Each cycle
 reconciles local open state against the broker position before managing exits.
+For a live spot sell, the bot does not infer that buyback budget from the
+fill's numeric fee because the fill does not identify whether commission was
+paid in USDT, BTC, or BNB. It reads free USDT immediately before and after the
+sell, requires that positive delta to remain within 1% of the filled quote
+notional (and never above it beyond numeric tolerance), and persists the two
+balances, their observed delta, and the source marker. The later buyback uses
+that observed delta exactly. A missing, non-positive, unexpectedly small, or
+inflated delta leaves the durable entry intent unresolved and blocks trading
+for reconciliation. Use a dedicated spot account/subaccount: transfers or
+manual trades during this window deliberately trip this protection.
+Every live position and recovery/flatten intent also persists the broker's
+non-secret account fingerprint. Normal management, recovery, and emergency
+flatten compare it with the currently configured broker before placing an order;
+an API-key/venue/routing change cannot accidentally close a different account.
+If credentials must rotate while exposure exists, keep the product paused and
+reconcile/restore the intended account binding before management resumes.
 If persisted broker state is missing required broker metadata, contains a
 non-positive or non-numeric `broker_qty`, a `broker_qty` that does not match
 `broker_requested_qty`, a negative or non-numeric `broker_entry_fee`, or a fill
 ratio other than `1`, startup fails before broker reconciliation or exit order
 placement. When a broker is attached, paper-style open-position records with no
 broker metadata at all are rejected for the same reason.
+For every live futures entry, the market-order intent is persisted first. After
+an accepted full fill, the bot places a native reduce-only stop-market order,
+fetches it back, and persists its order ID, client ID, trigger, quantity, and
+status with the position before clearing the entry intent. A process/network
+failure therefore leaves durable restart evidence; it never turns an
+unprotected fill into an ordinary open local position.
+Live futures reconciliation requires the broker's signed quantity to equal the
+persisted signed quantity within fill tolerance. Extra same-direction contracts,
+opposite exposure, or a partial external close means the exchange-native stop no
+longer covers the actual account. The bot then persists a deterministic
+reduce-only recovery intent, closes the full current broker quantity, proves the
+account flat, cancels any still-open tracked stop, and latches
+`risk_recovery_incident`. A tracked native stop that is unexpectedly canceled,
+expired, rejected, or only partially fills while residual exposure remains uses
+the same full-actual-quantity recovery close. The
+incident remains blocking after a successful close; reconcile its fill,
+accounting, stop state, and cause before removing it during reviewed maintenance.
+Runtime status and the operator report expose the native-stop fields plus
+`pending_order`, `pending_entry_recovery`, `risk_recovery_incident`,
+`flatten_intent`, and `exit_accounting_intent`; healthcheck treats any of these
+durable states on a live product as blocking.
+When the stop lookup is malformed or only a partial fill can be inferred, the
+residual recovery fill is not booked as though it closed the original position.
+The bot proves the residual exposure flat but retains local position/accounting
+state and the sticky incident so the stop and recovery fills can be reconciled
+together before a trade row is committed.
+
+Every live pending order, open position, and recovery marker stores a non-secret
+`broker_account_fingerprint` bound to exchange, market, testnet flag, and API-key
+identity (never the secret). Startup, reconciliation, ordinary exits, and
+emergency flatten compare it with the current broker before any account read or
+order. Credential rotation to another account, missing legacy identity, or
+mixed recovery identities fail closed without touching that account.
+
+Live futures entry intents also survive an ambiguous order response. If the
+entry was accepted but no protected local position was committed, the bot checks
+the actual broker position immediately and again on restart, persists
+`pending_entry_recovery`, and submits one deterministic reduce-only close for the
+exact actual quantity. A broker-flat readback never clears the original
+`pending_order`; it only proves risk reduction, then blocks for operator review.
+Missing, stale, changed, or revoked strategy/approval/preflight evidence cannot
+block this management-only close, and can never authorize another entry. Spot
+orders and pending exits are excluded from this automatic pending-entry path.
 If a broker exit reports a mismatched, invalid, partial, or overfilled fill, the
 bot raises before deleting local open-position state or writing a trade row,
 leaving the position visible for operator reconciliation.
@@ -140,6 +212,43 @@ positive quantity/price and non-negative fee, and healthcheck fails live product
 with corrupted trade-log audit fields. Every trade-log row must also contain
 finite `net_return` and `sized_return` values; missing or malformed returns are
 reported instead of being treated as zero.
+For live futures, each newly opened position also persists the flat quote-balance
+baseline read immediately before entry. After an ordinary or native-stop exit
+has been proved flat, the bot reads the balance again and compares the observed
+account return with fill-price/commission accounting. It books the worse result
+into local equity, `daily_pnl`, the consecutive-loss cooldown, and the trade log.
+This downside-only reconciliation captures funding and broker-booked debits,
+while a deposit or other positive credit cannot improve the modeled result.
+Trade rows expose `broker_entry_balance`, `broker_exit_balance`,
+`broker_balance_return`, `accounting_adjustment_fraction`, and
+`accounting_return_source`; operator reporting rejects malformed balance
+evidence. Missing or invalid baseline/readback data fails before local close
+accounting is finalized. Across multiple closes in one day, the tracker keeps
+the worse of additive and compounded cumulative returns, so a gain followed by
+an equal percentage loss cannot be misreported as flat and consecutive losses
+do not receive a favorable compounding offset. The daily window resets on the
+UTC calendar date, independent of the server's local timezone.
+
+The broker-flat exit and its local accounting commit are crash-consistent. The
+bot first writes `exit_accounting_intent` with a deterministic exit event ID,
+integrity digests, the exact trade row, and pre/post state. It then atomically
+inserts or verifies that keyed CSV row and commits the target state. A restart
+revalidates broker flat and resumes these steps without placing another exit;
+the event ID prevents duplicate trade rows. Until commit completes, runtime
+status/operator reporting show the intent and healthcheck blocks a live product.
+Do not delete the WAL or hand-edit a replacement trade row.
+
+Use a dedicated futures account or subaccount and do not deposit, withdraw, or
+manually trade in it while the bot has exposure. A positive transfer can mask a
+simultaneous funding debit even though it cannot turn a modeled trading loss into
+a gain. Live fill records carry a numeric fee but not a fee currency, so this
+accounting assumes futures commissions are charged in the USDT settlement asset.
+Do not enable payment from an alternative fee asset; if the account does use one,
+its balance and USDT value require separate monitoring and the modeled fee floor
+is only an estimate. The daily stop is realized at the proved-flat exit boundary;
+it does not continuously mark unrealized PnL or intraday funding while a position
+remains open. The one-position limit, approved stop distance, and exchange-native
+stop bound that interim exposure.
 Runtime state enforces the exported risk block: per-trade risk,
 `max_position_fraction`, daily stop, per-strategy `max_trades_per_day`,
 consecutive-loss cooldown, and drift deactivation. `max_position_fraction`
@@ -158,8 +267,7 @@ exception is an explicit paper-only bootstrap artifact generated with
 checks reject it. Promotion/live policy requires `paper_trade_allowed`,
 `live_allowed`, and `promotion_eligible` to be explicitly `true`; missing
 eligibility flags fail closed. New exports stamp `market` and `symbol` at both
-the artifact and strategy level. If an
-artifact or strategy declares either field,
+the artifact and strategy level. If an artifact or strategy declares either field,
 it must match the bot's configured `--market` and `--symbol`; legacy artifacts
 without declared fields are still accepted for compatibility. These basic
 executable-artifact checks also run when `src.run_bot` is invoked directly, so
@@ -179,23 +287,75 @@ record must have a known strategy id, valid timestamp, direction, positive
 prices/percentages, bounded position size, and sane broker metadata. Corrupt
 state fails the cycle before sizing or order logic can run.
 
+### Persistent peak-equity circuit breaker
+
+Daily limits reset on UTC boundaries, so they cannot by themselves prevent a
+strategy from losing a small amount repeatedly across many days. Every product
+therefore also maintains an account-level, peak-to-current equity circuit
+breaker in its atomic bot state:
+
+- active-income futures halt new entries at a 10% drawdown from peak local USDT
+  equity;
+- BTC accumulation halts new entries at a 5% drawdown from peak local BTC
+  equity;
+- direct runs that omit `--objective` receive the safer 5% limit.
+
+The BTC envelope is tighter because that product's purpose is conservative base
+asset preservation. The active-income envelope is wider than its 3% default
+daily stop so ordinary daily protection fires first, while the 10% ceiling
+still bounds cumulative damage across UTC resets. `peak_equity` only moves
+upward. At or beyond the fixed limit the bot atomically latches
+`drawdown_halted`, `drawdown_halted_at`, and `drawdown_halt_reason`, continues to
+manage and close existing exposure, and refuses every new entry. A new UTC day,
+later profit, restart, artifact change, or strategy approval does not clear the
+halt. Operator reports show current/peak equity and drawdown, and healthcheck
+treats a live halt as blocking (paper halt as a warning).
+
+Old valid state is migrated without losing safety fields: its initial peak is
+the greater of current local equity and configured starting equity, and an
+already-breached envelope latches immediately. Do not lower `peak_equity` to
+make the percentage look smaller.
+
+Recovery is deliberately a reviewed maintenance action, not an automatic or
+daily reset. Keep the product paused; reconcile exchange balances, funding,
+fills, the local trade ledger, pending-order state, and the cause of loss; make
+sure all exposure is either deliberately managed or flat; back up the state;
+then review the proposed recovery with the owner. Only after current local
+equity is genuinely inside the unchanged peak/limit envelope may the stopped
+service's state be atomically changed to `drawdown_halted: false` with
+`drawdown_halted_at` and `drawdown_halt_reason` set to `null`. If the reconciled
+drawdown is still at the limit, startup immediately relatches. There is no
+one-command auto-clear path.
+
 The autopilot wires approved `active_income` live products to a futures ccxt
 broker and approved `btc_accumulation` live products to a spot ccxt broker.
 For spot BTC accumulation, logical sell/step-aside orders are sized from the
 existing base-asset balance rather than quote balance, so the product cannot
 sell more BTC than the account holds. The ccxt spot adapter repeats that check
 immediately before order submission. The runtime records BTC before/after the sell
-and the quote budget available for buyback. BTC accumulation never routes through
+and the observed free-USDT delta available for buyback. BTC accumulation never routes through
 the futures broker, so it cannot use leverage.
 
 Emergency control is file-based. Adding a live futures product to
 `flatten_products` in `runtime/control.json` asks the runtime to close the broker
 position with a reduce-only market order and clear local open-position state
-after the broker reports flat. If the state file is corrupt at that point, the
-runtime writes a minimal recovered state with a `last_flatten` audit marker.
-Spot BTC accumulation is skipped by this command.
+only after the broker reports flat and every tracked native stop is proved
+terminal. A BTC-accumulation flatten buys back exactly one fully tracked spot
+step-aside position; it never sells the base BTC stack. Its normalized buyback
+is protected by a durable `flatten_intent`, so an ambiguous restart cannot send
+the same buy twice. Invalid or insufficient state fails closed.
 
-Before a live/testnet run, use the preflight. It does not place orders:
+An emergency runtime flatten is an operator recovery path, not a normal bot exit.
+The runtime atomically clears a successful flatten request while leaving the
+affected product (or all products for `flatten_all`) paused. For futures,
+it does not currently append a trade row or apply the realized fill/funding delta
+to `daily_pnl`, equity, or the consecutive-loss cooldown. Keep that pause in
+place after the broker is flat; reconcile the
+exchange balance, fill fees, funding history, local state, and trade ledger before
+explicitly resuming. Resuming immediately can understate that day's loss limit.
+
+Preflight never places orders. Sandbox and production evidence are distinct.
+For a testnet rehearsal use:
 
 ```bash
 python -m src.autopilot.preflight \
@@ -207,19 +367,27 @@ python -m src.autopilot.preflight \
   --output runtime/active_income_preflight_report.json
 ```
 
-The check validates strategy approval, env safety switches, broker construction,
-and read-only ticker/balance/position access. By default, live runtime also
-checks that the saved report is successful, has a finite timestamp that is not
-stale or far in the future, and is tied to the exact strategy artifact and
-strategy fingerprints about to trade. It also requires the saved report to include
-successful check entries for config, strategy artifact, policy, approval,
-exchange environment, broker construction, read-only connectivity, and the
-product-specific position check. The live runtime also enforces
+For the saved production gate, switch to production credentials and
+`EXCHANGE_TESTNET=0`, then run `make preflight PRODUCT=active_income` (or
+`PRODUCT=btc_accumulation`). Production preflight refuses testnet routing.
+
+The check validates approval, artifact/product identity, the execution-engine
+digest (Python, pinned installed versions, and source), environment, broker
+construction, and read-only ticker/balance/position access. Futures also proves
+one-way position mode, native-stop capability, empty regular/conditional order
+inventories, and a flat position. Live runtime requires a fresh saved report
+bound to the exact artifact digest/fingerprints, engine, and a non-secret account
+fingerprint derived from API key plus venue/market/testnet routing. Current
+exchange, market, account, testnet flag, quote asset, notional/slippage caps,
+leverage, and margin mode must exactly match the production report; any change
+requires a new connected preflight. Product starting equity/regime settings and
+execution-capable code/dependency changes also invalidate prior evidence.
+
+The live runtime independently enforces
 `TRADING_LIVE=1`, exchange credentials, a positive
 `MAX_NOTIONAL_USD`, a positive `MAX_FILL_SLIPPAGE_BPS`,
 `FUTURES_MARGIN_MODE=isolated`, and `MAX_FUTURES_LEVERAGE=1` for the
-active-income futures product before broker construction, so disabling preflight
-does not skip the basic safety checks. If the preflight command itself cannot
+active-income futures product before broker construction. If preflight cannot
 build or write the report, it exits nonzero with structured JSON describing the
 failed gate.
 
@@ -237,7 +405,7 @@ To exercise the actual Binance USDT-M testnet order path after approval and a
 green connected preflight:
 
 ```bash
-make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5
+make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100
 make testnet-status
 ```
 
@@ -246,12 +414,16 @@ against mainnet; the command requires `EXCHANGE_TESTNET=1` and exits otherwise.
 `make testnet-status` reads the saved report without placing orders, and
 `make report` surfaces the latest rehearsal as missing, failed, stale, or ok.
 A usable report must have a finite timestamp, positive notional, positive order
-quantity, product-symbol-matched buy entry fill, product-symbol-matched sell
-close fill, entry/close quantities matching the order quantity, testnet routing,
-and a flat final position. The default active-income product config requires
+quantity, matched entry/close fills, a verified native stop
+place/read/cancel/terminal lifecycle, testnet routing, empty preflight order
+inventories, and a flat final position. The default active-income product config requires
 that report to be recent and
 successful before live execution can construct a broker. CLI failures, including
 config-load and output-write failures, are emitted as structured JSON. If the
 entry fills but close/readback fails, the command attempts one best-effort cleanup
 close and records the recovery result, while still treating the rehearsal as
 failed until it can be rerun cleanly.
+
+After a passing rehearsal, run the fresh `EXCHANGE_TESTNET=0` production
+preflight described above. A testnet report never substitutes for production
+account/environment evidence.

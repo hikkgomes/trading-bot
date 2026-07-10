@@ -8,13 +8,21 @@ def test_research_smoke_runs_both_products_on_synthetic_data():
 
     assert report["ok"] is True
     assert report["synthetic_only"] is True
-    assert {scenario["name"] for scenario in report["scenarios"]} == {
+    assert report["generator"] == "typed_compositional_grammar"
+    assert set(report["products"]) == {
         "active_income",
+        "btc_accumulation",
+    }
+    assert set(report["opportunity_types"]) >= {
+        "scalping",
+        "day_trading",
+        "swing_trading",
         "btc_accumulation",
     }
     assert {scenario["pnl_unit"] for scenario in report["scenarios"]} == {"usdt", "btc"}
     assert all(scenario["hypotheses"] > 0 for scenario in report["scenarios"])
     assert all(scenario["verdicts"] for scenario in report["scenarios"])
+    assert all("recursive_mutation" in scenario["generation_methods"] for scenario in report["scenarios"])
 
 
 def test_research_smoke_rejects_tiny_synthetic_frame():

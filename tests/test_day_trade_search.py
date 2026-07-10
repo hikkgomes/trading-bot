@@ -7,19 +7,18 @@ import pytest
 
 import src.day_trade_search as dts
 import src.feature_screener as fs
-from src.discover_patterns import Condition
 from src.day_trade_search import (
     DayTradeConfig,
     StrategyCandidate,
+    _generate_pairs_pool,
     combined_mask,
     day_trade_metrics,
-    load_dataset,
     numeric_feature_columns,
     score_candidate,
     simulate_day_trades,
     timeframe_for_feature,
-    _generate_pairs_pool,
 )
+from src.discover_patterns import Condition
 
 
 def _make_5m_data(n=100):
@@ -89,6 +88,29 @@ def test_simulate_day_trades_stop_loss():
     assert len(trades) == 1
     assert trades["exit_reason"].iloc[0] == "stop"
     assert round(trades["net_return"].iloc[0], 6) == -0.01
+
+
+def test_simulate_day_trades_short_uses_linear_usdt_futures_return():
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=4, freq="5min", tz="UTC"),
+            "tf_5m_open": [100.0, 100.0, 90.0, 90.0],
+            "tf_5m_high": [100.0, 100.0, 100.0, 90.0],
+            "tf_5m_low": [100.0, 100.0, 90.0, 90.0],
+            "tf_5m_close": [100.0, 100.0, 90.0, 90.0],
+        }
+    )
+    config = DayTradeConfig(
+        take_profit=0.5,
+        stop_loss=0.5,
+        fee_bps=0,
+        slippage_bps=0,
+        horizon_bars=1,
+    )
+
+    trades = simulate_day_trades(data, pd.Series([True, False, False, False]), "short", config)
+
+    assert trades["gross_return"].iloc[0] == pytest.approx(0.10)
 
 
 def test_simulate_day_trades_daily_stop():
@@ -557,16 +579,16 @@ def test_feature_screen_cache_separates_fold_label_and_scenario(monkeypatch):
     monkeypatch.setattr(fs, "screen_features", fake_screen)
     cache = dts.FeatureScreenCache.create()
     features = ["tf_5m_a", "tf_5m_b"]
-    common = dict(
-        direction="long",
-        horizon_bars=8,
-        take_profit=0.005,
-        stop_loss=0.003,
-        feature_columns=features,
-        max_features=1,
-        cache=cache,
-        method="importance",
-    )
+    common = {
+        "direction": "long",
+        "horizon_bars": 8,
+        "take_profit": 0.005,
+        "stop_loss": 0.003,
+        "feature_columns": features,
+        "max_features": 1,
+        "cache": cache,
+        "method": "importance",
+    }
     dts.get_screened_features_cached(base.iloc[:n], "label_long_tp50_sl30_h8", **common)
     dts.get_screened_features_cached(base.iloc[1:], "label_long_tp50_sl30_h8", **common)
     dts.get_screened_features_cached(base.iloc[:n], "label_short_tp50_sl30_h8", **common)

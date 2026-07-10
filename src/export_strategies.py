@@ -11,7 +11,6 @@ import json
 import math
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 
@@ -177,13 +176,13 @@ def _git_sha() -> str:
         return "unknown"
 
 
-def _row_metric(row: pd.Series, name: str) -> Optional[float]:
+def _row_metric(row: pd.Series, name: str) -> float | None:
     if name not in row or pd.isna(row[name]):
         return None
     return float(row[name])
 
 
-def _baseline_win_rate(row: pd.Series) -> Optional[float]:
+def _baseline_win_rate(row: pd.Series) -> float | None:
     # Prefer the untouched holdout; fall back to in-sample. A zero/missing
     # baseline disables the bot's drift kill-switch, so never export 0.0.
     for column in ("holdout_win_rate", "train_win_rate", "test_win_rate"):
@@ -203,8 +202,8 @@ def _ranked_path(search_dir: Path, prefer_clustered: bool = True) -> Path:
 def build_payload(
     search_dir: Path,
     top_k: int = 3,
-    min_dsr: Optional[float] = None,
-    min_holdout_return: Optional[float] = 0.0,
+    min_dsr: float | None = None,
+    min_holdout_return: float | None = 0.0,
     prefer_clustered: bool = True,
 ) -> dict:
     try:
@@ -320,7 +319,7 @@ def build_payload(
         )
     return {
         "version": SCHEMA_VERSION,
-        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "generated_at": datetime.datetime.now(datetime.UTC).isoformat(),
         "export_git_sha": _git_sha(),
         "source_dir": str(search_dir),
         "search_git_sha": config.get("git_sha", "unknown"),
@@ -340,8 +339,8 @@ def run(
     search_dir: Path,
     output_path: Path = DEFAULT_OUTPUT_PATH,
     top_k: int = 3,
-    min_dsr: Optional[float] = None,
-    min_holdout_return: Optional[float] = 0.0,
+    min_dsr: float | None = None,
+    min_holdout_return: float | None = 0.0,
     prefer_clustered: bool = True,
 ) -> Path:
     payload = build_payload(

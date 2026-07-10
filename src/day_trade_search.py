@@ -7,16 +7,15 @@ import logging
 import re
 import subprocess
 from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
 
 from src.build_dataset import TARGET_COLUMNS
 from src.config import (
-    DAY_TRADE_HIGHER_TFS,
     INDICATOR_DATA_DIR,
     PROCESSED_DATA_DIR,
     PROJECT_ROOT,
@@ -38,7 +37,13 @@ from src.metrics import (
     probability_backtest_overfitting,
     sharpe_ratio,
 )
-from src.trade_utils import scan_tp_sl, scan_tp_sl_numba
+from src.strategy_search import _config_hash, _flush_rows, _load_checkpoint
+from src.trade_utils import (
+    gross_return_numba,
+    linear_usdt_futures_return,
+    scan_tp_sl,
+    scan_tp_sl_numba,
+)
 from src.walk_forward import (
     WalkForwardConfig,
     WindowConditionCache,
@@ -47,8 +52,6 @@ from src.walk_forward import (
     generate_windows,
     with_threshold,
 )
-from src.strategy_search import _config_hash, _flush_rows, _load_checkpoint
-
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "day_trade_search"
@@ -73,14 +76,14 @@ class DayTradeConfig:
 class StrategyCandidate:
     direction: str
     horizon_bars: int
-    conditions: Tuple[Condition, ...]
+    conditions: tuple[Condition, ...]
 
     @property
     def rule(self) -> str:
         return " AND ".join(c.description for c in self.conditions)
 
     @property
-    def timeframes(self) -> Tuple[str, ...]:
+    def timeframes(self) -> tuple[str, ...]:
         values = set()
         for c in self.conditions:
             values.add(timeframe_for_feature(c.feature))
@@ -104,7 +107,7 @@ def get_git_sha() -> str:
 
 @dataclass
 class FeatureScreenCache:
-    values: Dict[Tuple[object, ...], Set[str]]
+    values: dict[tuple[object, ...], set[str]]
     hits: int = 0
     misses: int = 0
 
@@ -132,7 +135,7 @@ def cache_key_for_screening(
     feature_columns: Sequence[str],
     max_features: int,
     method: str,
-) -> Tuple[object, ...]:
+) -> tuple[object, ...]:
     if train.empty:
         start = None
         stop = None
@@ -164,7 +167,7 @@ def get_screened_features_cached(
     max_features: int,
     cache: FeatureScreenCache,
     method: str = "shap",
-) -> Set[str]:
+) -> set[str]:
     key = cache_key_for_screening(
         train, label_column, direction, horizon_bars,
         take_profit, stop_loss, feature_columns,
@@ -206,7 +209,7 @@ def load_dataset(
     horizons: Sequence[int],
     base_prefix: str = "tf_5m_",
     base_timeframe: str = "5m",
-    columns: Optional[Sequence[str]] = None,
+    columns: Sequence[str] | None = None,
 ) -> pd.DataFrame:
     _ensure_dataset(path, base_timeframe)
     if not path.exists():
@@ -239,7 +242,7 @@ def load_dataset(
 def numeric_feature_columns(
     data: pd.DataFrame,
     base_prefix: str = "tf_5m_",
-) -> List[str]:
+) -> list[str]:
     excluded = {
         "timestamp",
         f"{base_prefix}open",
@@ -357,10 +360,7 @@ try:
             else:
                 xp = close[xi]
 
-            if is_long:
-                gr = xp / entry - 1.0
-            else:
-                gr = entry / xp - 1.0
+            gr = gross_return_numba(entry, xp, is_long, False)
             nr = gr - total_cost
 
             if use_atr_tp_sl:
@@ -431,7 +431,7 @@ def _simulate_day_trades_python(
     direction: str,
     config: DayTradeConfig,
     base_prefix: str = "tf_5m_",
-    precomputed: Optional[PrecomputedArrays] = None,
+    precomputed: PrecomputedArrays | None = None,
 ) -> pd.DataFrame:
     if precomputed is not None:
         open_ = precomputed.open_
@@ -525,10 +525,10 @@ def _simulate_day_trades_python(
             exit_price = close[exit_index]
             exit_reason = "time"
 
-        gross_return = (
-            exit_price / entry - 1
-            if direction == "long"
-            else entry / exit_price - 1
+        gross_return = linear_usdt_futures_return(
+            entry,
+            exit_price,
+            is_long=direction == "long",
         )
         net_return = gross_return - total_cost
         sized_return = net_return * trade_position_size
@@ -576,7 +576,7 @@ def _simulate_day_trades_numba(
     direction: str,
     config: DayTradeConfig,
     base_prefix: str = "tf_5m_",
-    precomputed: Optional[PrecomputedArrays] = None,
+    precomputed: PrecomputedArrays | None = None,
 ) -> pd.DataFrame:
     if precomputed is not None:
         open_ = precomputed.open_
@@ -660,14 +660,14 @@ def simulate_day_trades(
     direction: str,
     config: DayTradeConfig,
     base_prefix: str = "tf_5m_",
-    precomputed: Optional[PrecomputedArrays] = None,
+    precomputed: PrecomputedArrays | None = None,
 ) -> pd.DataFrame:
     if _HAS_NUMBA:
         return _simulate_day_trades_numba(data, signal_mask, direction, config, base_prefix, precomputed)
     return _simulate_day_trades_python(data, signal_mask, direction, config, base_prefix, precomputed)
 
 
-def day_trade_metrics(trades: pd.DataFrame) -> Dict[str, float]:
+def day_trade_metrics(trades: pd.DataFrame) -> dict[str, float]:
     if trades.empty:
         return {
             "trades": 0,
@@ -725,11 +725,11 @@ def score_candidate(
     candidate: StrategyCandidate,
     config: DayTradeConfig,
     base_prefix: str = "tf_5m_",
-    train_mask: Optional[pd.Series] = None,
-    test_mask: Optional[pd.Series] = None,
-    train_arrays: Optional[PrecomputedArrays] = None,
-    test_arrays: Optional[PrecomputedArrays] = None,
-) -> Dict[str, object]:
+    train_mask: pd.Series | None = None,
+    test_mask: pd.Series | None = None,
+    train_arrays: PrecomputedArrays | None = None,
+    test_arrays: PrecomputedArrays | None = None,
+) -> dict[str, object]:
     if train_mask is None:
         train_mask = combined_mask(train, candidate.conditions)
     if test_mask is None:
@@ -760,7 +760,7 @@ def score_candidate(
 
 def _attach_statistical_metrics(
     strategies: pd.DataFrame,
-    return_rows: Optional[Sequence[Dict[str, object]]] = None,
+    return_rows: Sequence[dict[str, object]] | None = None,
     walk_forward: bool = False,
 ) -> pd.DataFrame:
     if strategies.empty:
@@ -783,7 +783,7 @@ def _attach_statistical_metrics(
                 n_obs=max(1, int(n) if np.isfinite(n) else 1),
                 sr_std_trials=sr_std_trials,
             )
-            for s, sk, ku, n in zip(sr, skew, kurt, n_obs)
+            for s, sk, ku, n in zip(sr, skew, kurt, n_obs, strict=False)
         ]
         return out
     out = strategies.copy()
@@ -797,7 +797,7 @@ def _attach_statistical_metrics(
     dsr_values = []
     ci_low = []
     ci_high = []
-    for row, train_sr in zip(return_rows, train_srs):
+    for row, train_sr in zip(return_rows, train_srs, strict=False):
         train_returns = np.asarray(row.get("train_returns", []), dtype=float)
         test_returns = np.asarray(row.get("test_returns", []), dtype=float)
         dsr_values.append(
@@ -824,10 +824,10 @@ def regime_breakdown(
     candidate: StrategyCandidate,
     config: DayTradeConfig,
     base_prefix: str = "tf_5m_",
-) -> Dict[str, Dict[str, float]]:
+) -> dict[str, dict[str, float]]:
     if "tf_1d_regime_id" not in data.columns:
         return {}
-    breakdown: Dict[str, Dict[str, float]] = {}
+    breakdown: dict[str, dict[str, float]] = {}
     for regime_id, regime_data in data.groupby("tf_1d_regime_id"):
         trades = simulate_day_trades(
             regime_data,
@@ -882,7 +882,7 @@ def rank_features_by_direction(
     direction: str,
     max_features: int,
     sample_rows: int = 50_000,
-) -> List[str]:
+) -> list[str]:
     feature_list = list(features)
     target = train[f"future_return_{horizon}_bars"]
     if direction == "short":
@@ -901,13 +901,13 @@ def rank_features_by_direction(
 
 def _rank_features(
     train: pd.DataFrame,
-    all_features: List[str],
+    all_features: list[str],
     horizon: int,
     direction: str,
     max_features: int,
     ranking_method: str,
     rank_sample_rows: int,
-) -> List[str]:
+) -> list[str]:
     if ranking_method == "spearman":
         return rank_features_by_direction(
             train, all_features, horizon, direction,
@@ -925,7 +925,7 @@ def _rank_features(
     )
 
 
-def build_feature_conditions(train: pd.DataFrame, feature: str) -> List[Condition]:
+def build_feature_conditions(train: pd.DataFrame, feature: str) -> list[Condition]:
     conditions = []
     clean = train[feature].replace([np.inf, -np.inf], np.nan).dropna()
     if clean.empty:
@@ -970,10 +970,10 @@ def build_feature_conditions(train: pd.DataFrame, feature: str) -> List[Conditio
 
 def _build_conditions_for_features(
     train: pd.DataFrame,
-    ranked_features: List[str],
-    enabled_kinds: Set[str],
-    cross_feature_pairs: Optional[Sequence[Tuple[str, str]]],
-) -> List[Condition]:
+    ranked_features: list[str],
+    enabled_kinds: set[str],
+    cross_feature_pairs: Sequence[tuple[str, str]] | None,
+) -> list[Condition]:
     if enabled_kinds == {"value", "delta"}:
         return [
             c for feature in ranked_features
@@ -987,12 +987,12 @@ def _build_conditions_for_features(
 
 def _score_and_select_conditions(
     train: pd.DataFrame,
-    conditions: List[Condition],
+    conditions: list[Condition],
     horizon: int,
     direction: str,
     top_conditions: int,
     min_support: int = 500,
-) -> List[int]:
+) -> list[int]:
     target = train[f"future_return_{horizon}_bars"]
     if direction == "short":
         target = -target
@@ -1008,10 +1008,10 @@ def _score_and_select_conditions(
 
 
 def _generate_pairs_flat(
-    conditions: List[Condition],
-    selected_indices: List[int],
+    conditions: list[Condition],
+    selected_indices: list[int],
     max_pairs: int,
-) -> List[Tuple[int, int]]:
+) -> list[tuple[int, int]]:
     pairs = []
     for left_pos, left_idx in enumerate(selected_indices):
         for right_idx in selected_indices[left_pos + 1:]:
@@ -1024,11 +1024,11 @@ def _generate_pairs_flat(
 
 
 def _generate_pairs_pool(
-    conditions: List[Condition],
-    selected_indices: List[int],
+    conditions: list[Condition],
+    selected_indices: list[int],
     max_pairs: int,
-) -> List[Tuple[int, int]]:
-    pools: Dict[str, List[int]] = defaultdict(list)
+) -> list[tuple[int, int]]:
+    pools: dict[str, list[int]] = defaultdict(list)
     for idx in selected_indices:
         tf = timeframe_for_feature(conditions[idx].feature)
         pools[tf].append(idx)
@@ -1041,7 +1041,7 @@ def _generate_pairs_pool(
     if not tf_combos:
         return _generate_pairs_flat(conditions, selected_indices, max_pairs)
     pairs_per_combo = max(1, max_pairs // len(tf_combos))
-    pairs: List[Tuple[int, int]] = []
+    pairs: list[tuple[int, int]] = []
     for tf_a, tf_b in tf_combos:
         count = 0
         for left_idx in pools[tf_a]:
@@ -1071,10 +1071,10 @@ def make_candidates(
     condition_depths: Sequence[int],
     ranking_method: str = "blended",
     cross_tf_mode: str = "pool",
-    enabled_kinds: Set[str] = DEFAULT_ENABLED_KINDS,
+    enabled_kinds: set[str] = DEFAULT_ENABLED_KINDS,
     base_prefix: str = "tf_5m_",
-    feature_pattern: Optional[str] = None,
-) -> List[StrategyCandidate]:
+    feature_pattern: str | None = None,
+) -> list[StrategyCandidate]:
     all_features = numeric_feature_columns(train, base_prefix)
     if feature_pattern:
         compiled = re.compile(feature_pattern)
@@ -1082,7 +1082,7 @@ def make_candidates(
         if not all_features:
             raise ValueError(f"feature_pattern {feature_pattern!r} matches no feature columns")
         LOGGER.info("Feature pattern %r restricts the universe to %s columns", feature_pattern, len(all_features))
-    candidates: List[StrategyCandidate] = []
+    candidates: list[StrategyCandidate] = []
     for horizon in horizons:
         for direction in directions:
             LOGGER.info(
@@ -1156,7 +1156,7 @@ def make_candidates(
                         if triple_count >= max_triples:
                             break
     seen_signatures = set()
-    deduped: List[StrategyCandidate] = []
+    deduped: list[StrategyCandidate] = []
     for candidate in candidates:
         signature = (
             candidate.direction,
@@ -1228,7 +1228,7 @@ def summarize_filter_rejections(
     min_test_trades: int,
     require_multitimeframe: bool,
     walk_forward: bool = False,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     if walk_forward:
         if scored.empty:
             return {
@@ -1321,7 +1321,7 @@ def _conditions_payload_day(candidate: StrategyCandidate) -> str:
 def _score_candidate_walk_forward_day(
     engine: DayTradeWindowEngine,
     candidate: StrategyCandidate,
-    scenarios: Sequence[Tuple[float, float]],
+    scenarios: Sequence[tuple[float, float]],
     fee_bps: float,
     slippage_bps: float,
     risk_per_trade: float,
@@ -1332,10 +1332,10 @@ def _score_candidate_walk_forward_day(
     use_atr_tp_sl: bool,
     wf_pass_rate: float,
     feature_screening: str = "none",
-    screen_cache: Optional[FeatureScreenCache] = None,
+    screen_cache: FeatureScreenCache | None = None,
     max_features: int = 60,
-) -> List[Dict[str, object]]:
-    per_scenario_stats: List[List[Dict[str, float]]] = [[] for _ in scenarios]
+) -> list[dict[str, object]]:
+    per_scenario_stats: list[list[dict[str, float]]] = [[] for _ in scenarios]
     for window_index in range(len(engine.windows)):
         mask = engine.candidate_test_mask(window_index, candidate)
         test_frame = engine.test_frames[window_index]
@@ -1387,14 +1387,14 @@ def _score_candidate_walk_forward_day(
                     "screened_out": False,
                 }
             )
-    rows: List[Dict[str, object]] = []
+    rows: list[dict[str, object]] = []
     for scenario_index, (take_profit, stop_loss) in enumerate(scenarios):
         stats = per_scenario_stats[scenario_index]
         summary = aggregate_walk_forward_results(stats, wf_pass_rate)
         window_returns = np.array([s["test_avg_net_return"] for s in stats], dtype=float)
         returns_series = pd.Series(window_returns)
         ci_low, ci_high = bootstrap_sharpe_ci(window_returns, n_boot=200)
-        row: Dict[str, object] = {
+        row: dict[str, object] = {
             "direction": candidate.direction,
             "horizon_bars": candidate.horizon_bars,
             "take_profit": take_profit,
@@ -1477,10 +1477,10 @@ def _evaluate_holdout_day(
     return out
 
 
-_DT_WORKER: Dict[str, object] = {}
+_DT_WORKER: dict[str, object] = {}
 
 
-def _dt_worker_init(payload: Dict[str, object]) -> None:
+def _dt_worker_init(payload: dict[str, object]) -> None:
     base_prefix = f"tf_{payload['base_timeframe']}_"
     data = load_dataset(
         Path(payload["input_path"]), payload["horizons"], base_prefix, payload["base_timeframe"],
@@ -1494,10 +1494,10 @@ def _dt_worker_init(payload: Dict[str, object]) -> None:
     _DT_WORKER["screen_cache"] = FeatureScreenCache.create()
 
 
-def _dt_score_chunk(indices: Sequence[int]) -> List[Dict[str, object]]:
-    candidates: List[StrategyCandidate] = _DT_WORKER["candidates"]
-    scenarios: List[Tuple[float, float]] = _DT_WORKER["scenarios"]
-    rows: List[Dict[str, object]] = []
+def _dt_score_chunk(indices: Sequence[int]) -> list[dict[str, object]]:
+    candidates: list[StrategyCandidate] = _DT_WORKER["candidates"]
+    scenarios: list[tuple[float, float]] = _DT_WORKER["scenarios"]
+    rows: list[dict[str, object]] = []
     for index in indices:
         candidate = candidates[index]
         candidate_rows = _score_candidate_walk_forward_day(
@@ -1527,7 +1527,7 @@ def write_report(
     strategies: pd.DataFrame,
     yearly: pd.DataFrame,
     diagnostics: pd.DataFrame,
-    rejection_summary: Dict[str, int],
+    rejection_summary: dict[str, int],
     path: Path,
     base_timeframe: str = "5m",
     walk_forward: bool = False,
@@ -1638,19 +1638,19 @@ def run(
     require_multitimeframe: bool = True,
     ranking_method: str = "blended",
     cross_tf_mode: str = "pool",
-    enabled_kinds: Set[str] = DEFAULT_ENABLED_KINDS,
+    enabled_kinds: set[str] = DEFAULT_ENABLED_KINDS,
     risk_per_trade: float = 0.003,
     max_position_fraction: float = 0.25,
     daily_stop_loss: float = -0.02,
     max_consecutive_losses: int = 3,
     cooldown_bars: int = 24,
     walk_forward: bool = False,
-    wf_train_bars: Optional[int] = None,
-    wf_test_bars: Optional[int] = None,
-    wf_step_bars: Optional[int] = None,
+    wf_train_bars: int | None = None,
+    wf_test_bars: int | None = None,
+    wf_step_bars: int | None = None,
     wf_pass_rate: float = 0.8,
     wf_min_windows: int = 6,
-    wf_embargo_bars: Optional[int] = None,
+    wf_embargo_bars: int | None = None,
     feature_screening: str = "none",
     dsr_threshold: float = 0.0,
     regime_conditional: bool = False,
@@ -1661,7 +1661,7 @@ def run(
     n_jobs: int = 1,
     checkpoint_every: int = 25,
     resume: bool = False,
-    feature_pattern: Optional[str] = None,
+    feature_pattern: str | None = None,
 ) -> pd.DataFrame:
     base_prefix = f"tf_{base_timeframe}_"
     data = load_dataset(input_path, horizons, base_prefix, base_timeframe)
@@ -1670,12 +1670,12 @@ def run(
         regime_conditional = False
     directions = ("long", "short")
     scenarios = list(itertools.product(take_profits, stop_losses))
-    rows: List[Dict[str, object]] = []
-    return_rows: List[Dict[str, object]] = []
+    rows: list[dict[str, object]] = []
+    return_rows: list[dict[str, object]] = []
     screen_cache = FeatureScreenCache.create()
     holdout = data.iloc[0:0]
     core = data
-    windows: List[Tuple[slice, slice]] = []
+    windows: list[tuple[slice, slice]] = []
     checkpoint_path = output_dir / "checkpoint.csv"
     meta_path = output_dir / "checkpoint_meta.json"
     if not walk_forward:
@@ -1841,7 +1841,7 @@ def run(
         }
         config_hash = _config_hash(hash_config)
         output_dir.mkdir(parents=True, exist_ok=True)
-        done: Set[int] = set()
+        done: set[int] = set()
         if resume:
             rows, done = _load_checkpoint(checkpoint_path, meta_path, config_hash, len(scenarios))
         elif checkpoint_path.exists():
@@ -2009,7 +2009,7 @@ def run(
     output_dir.mkdir(parents=True, exist_ok=True)
     config_dict = {
         "git_sha": get_git_sha(),
-        "search_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "search_timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         "input_path": str(input_path),
         "base_timeframe": base_timeframe,
         "horizons": list(horizons),

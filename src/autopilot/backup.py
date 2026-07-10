@@ -6,17 +6,21 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
+import stat
 import zipfile
 from pathlib import Path
 from posixpath import normpath
 from typing import Any
 
+from src.autopilot.candidate_activation import candidate_path_for_product
 from src.autopilot.config import DEFAULT_CONFIG_PATH, AutopilotConfig, load_config
+from src.autopilot.experiment_memory import ExperimentMemory
 from src.autopilot.io import write_json_atomic
 from src.config import PROJECT_ROOT
 
 DEFAULT_BACKUP_DIR = PROJECT_ROOT / "runtime" / "backups"
-DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKUP_ARCHIVE_PATTERN = "autopilot_state_*.zip"
 SUPPORTED_MANIFEST_VERSION = 1
 JOB_PATH_FLAGS = (
@@ -34,7 +38,7 @@ JOB_PATH_FLAGS = (
 
 
 def _utc_stamp() -> str:
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
 def _add_path(paths: list[Path], seen: set[Path], path: Path | None) -> None:
@@ -80,6 +84,9 @@ def configured_backup_paths(config: AutopilotConfig, *, config_path: Path) -> li
         config.research_smoke_file,
         config.strategy_smoke_file,
         config.research_cycle_file,
+        config.research_factory_config_file,
+        config.generated_batch_file,
+        config.experiment_memory_backup_file,
         config.incubation_candidates_file,
         config.mutation_plan_file,
         config.mutation_batch_file,
@@ -92,14 +99,23 @@ def configured_backup_paths(config: AutopilotConfig, *, config_path: Path) -> li
     ):
         _add_path(paths, seen, path)
     for product in config.products:
+        candidate_path = candidate_path_for_product(product.name)
         for path in (
             product.strategies_path,
+            candidate_path,
+            candidate_path.parent / f"{product.name}_paper_trades.csv",
+            candidate_path.parent / f"{product.name}_promotion_review.json",
+            candidate_path.parent / f"{product.name}_promotion_review.md",
             product.state_file,
             product.trade_log,
             product.preflight_report,
             product.testnet_rehearsal_report,
         ):
             _add_path(paths, seen, path)
+        for state_path in sorted(
+            candidate_path.parent.glob(f"{product.name}_paper_state_*.json")
+        ):
+            _add_path(paths, seen, state_path)
     for job in config.jobs:
         for flag in JOB_PATH_FLAGS:
             _add_path(paths, seen, _job_command_path(job, flag))
@@ -124,6 +140,99 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _open_private_archive(path: Path):
+    """Open a zip destination without exposing it through the caller's umask."""
+
+    flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"backup output must be a regular file: {path}")
+        os.fchmod(descriptor, 0o600)
+        return os.fdopen(descriptor, "w+b")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _ensure_private_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError(f"restore directory must not be a symlink: {path}")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not path.is_dir():
+        raise ValueError(f"restore directory must be a directory: {path}")
+    path.chmod(0o700)
+
+
+def _write_private_file(path: Path, payload: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"restore target must be a regular file: {path}")
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError(f"short restore write: {path}")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _snapshot_experiment_memory(config: AutopilotConfig) -> dict[str, Any]:
+    """Create and deeply validate a stable SQLite recovery image.
+
+    The live database is never added to the zip directly. SQLite's online
+    backup API captures one transactionally consistent image even while the
+    research worker is active.
+    """
+
+    source = config.experiment_memory_file
+    destination = config.experiment_memory_backup_file
+    status: dict[str, Any] = {
+        "source": str(source),
+        "destination": str(destination),
+        "source_exists": source.exists(),
+        "existing_snapshot": destination.exists(),
+        "refreshed": False,
+    }
+    if source.is_symlink() or destination.is_symlink():
+        raise ValueError("experiment memory and its backup must not be symlinks")
+    if source.resolve(strict=False) == destination.resolve(strict=False):
+        raise ValueError("experiment memory backup path must differ from the live database")
+    if not source.exists():
+        if destination.exists():
+            with ExperimentMemory(destination, deep_on_open=False) as snapshot:
+                status["snapshot_integrity"] = snapshot.integrity_check(deep=True)
+            status.update(
+                reason="live_memory_missing_existing_snapshot_retained",
+                size_bytes=destination.stat().st_size,
+                sha256=_sha256_file(destination),
+            )
+        else:
+            status["reason"] = "live_memory_not_initialized"
+        return status
+    with ExperimentMemory(source, deep_on_open=False) as memory:
+        status["source_integrity"] = memory.integrity_check(deep=True)
+        memory.backup_to(destination)
+    with ExperimentMemory(destination, deep_on_open=False) as snapshot:
+        status["snapshot_integrity"] = snapshot.integrity_check(deep=True)
+    status.update(
+        refreshed=True,
+        existing_snapshot=True,
+        size_bytes=destination.stat().st_size,
+        sha256=_sha256_file(destination),
+    )
+    return status
+
+
 def build_backup_archive(
     *,
     config_path: Path,
@@ -135,8 +244,9 @@ def build_backup_archive(
     if max_file_bytes <= 0:
         raise ValueError("max_file_bytes must be positive")
     config = load_config(config_path)
+    memory_snapshot = _snapshot_experiment_memory(config)
     output = output or (DEFAULT_BACKUP_DIR / f"autopilot_state_{_utc_stamp()}.zip")
-    if output.exists() and output.is_symlink():
+    if output.is_symlink():
         raise ValueError(f"backup output must not be a symlink: {output}")
     paths = configured_backup_paths(config, config_path=config_path)
     seen_paths = {path.resolve(strict=False) for path in paths}
@@ -145,49 +255,73 @@ def build_backup_archive(
 
     manifest_entries: list[dict[str, Any]] = []
     output.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-        for path in paths:
-            entry: dict[str, Any] = {
-                "path": str(path),
-                "arcname": _arcname(path, root),
-                "exists": path.exists(),
-                "included": False,
-            }
-            if not path.exists():
-                entry["reason"] = "missing"
-            elif path.is_symlink():
-                entry["reason"] = "symlink"
-            elif not path.is_file():
-                entry["reason"] = "not_file"
-            else:
-                size = path.stat().st_size
-                entry["size_bytes"] = size
-                if size > max_file_bytes:
-                    entry["reason"] = "too_large"
-                    entry["max_file_bytes"] = max_file_bytes
+    with _open_private_archive(output) as archive_handle:
+        with zipfile.ZipFile(
+            archive_handle,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=6,
+        ) as archive:
+            for path in paths:
+                entry: dict[str, Any] = {
+                    "path": str(path),
+                    "arcname": _arcname(path, root),
+                    "exists": path.exists(),
+                    "included": False,
+                }
+                if path.resolve(strict=False) == config.experiment_memory_backup_file.resolve(
+                    strict=False
+                ):
+                    entry["role"] = "experiment_memory_snapshot"
+                if not path.exists():
+                    entry["reason"] = "missing"
+                elif path.is_symlink():
+                    entry["reason"] = "symlink"
+                elif not path.is_file():
+                    entry["reason"] = "not_file"
                 else:
-                    entry["sha256"] = _sha256_file(path)
-                    archive.write(path, entry["arcname"])
-                    entry["included"] = True
-            manifest_entries.append(entry)
-        manifest = {
-            "version": 1,
-            "generated_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat(),
-            "config": str(config_path),
-            "max_file_bytes": max_file_bytes,
-            "files": manifest_entries,
-            "included_files": sum(1 for item in manifest_entries if item.get("included")),
-            "missing_files": sum(1 for item in manifest_entries if item.get("reason") == "missing"),
-            "skipped_files": sum(1 for item in manifest_entries if item.get("exists") and not item.get("included")),
-        }
-        archive.writestr("MANIFEST.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+                    size = path.stat().st_size
+                    entry["size_bytes"] = size
+                    if size > max_file_bytes:
+                        entry["reason"] = "too_large"
+                        entry["max_file_bytes"] = max_file_bytes
+                    else:
+                        entry["sha256"] = _sha256_file(path)
+                        archive.write(path, entry["arcname"])
+                        entry["included"] = True
+                manifest_entries.append(entry)
+            manifest = {
+                "version": 1,
+                "generated_at": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
+                "config": str(config_path),
+                "max_file_bytes": max_file_bytes,
+                "experiment_memory_snapshot": memory_snapshot,
+                "files": manifest_entries,
+                "included_files": sum(
+                    1 for item in manifest_entries if item.get("included")
+                ),
+                "missing_files": sum(
+                    1 for item in manifest_entries if item.get("reason") == "missing"
+                ),
+                "skipped_files": sum(
+                    1
+                    for item in manifest_entries
+                    if item.get("exists") and not item.get("included")
+                ),
+            }
+            archive.writestr(
+                "MANIFEST.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+            )
+        archive_handle.flush()
+        os.fsync(archive_handle.fileno())
     report = {
-        "ok": True,
+        "ok": False,
         "output": str(output),
         "manifest": manifest,
         "archive_size_bytes": output.stat().st_size,
     }
     report["verification"] = verify_backup_archive(output)
+    report["ok"] = report["verification"].get("ok") is True
     return report
 
 
@@ -245,6 +379,44 @@ def verify_backup_archive(path: Path) -> dict[str, Any]:
                     }
                 )
             included_entries = [item for item in files if isinstance(item, dict) and item.get("included")]
+            memory_snapshot = manifest.get("experiment_memory_snapshot")
+            if isinstance(memory_snapshot, dict):
+                report["experiment_memory_snapshot"] = memory_snapshot
+                snapshot_entries = [
+                    item
+                    for item in files
+                    if isinstance(item, dict)
+                    and item.get("role") == "experiment_memory_snapshot"
+                ]
+                if len(snapshot_entries) > 1:
+                    issues.append(
+                        {
+                            "code": "duplicate_memory_snapshot_entries",
+                            "count": len(snapshot_entries),
+                        }
+                    )
+                if memory_snapshot.get("source_exists") is True:
+                    if memory_snapshot.get("refreshed") is not True:
+                        issues.append({"code": "memory_snapshot_not_refreshed"})
+                if (
+                    memory_snapshot.get("source_exists") is True
+                    or memory_snapshot.get("existing_snapshot") is True
+                ):
+                    integrity = memory_snapshot.get("snapshot_integrity")
+                    if not isinstance(integrity, dict) or integrity.get("ok") is not True:
+                        issues.append({"code": "memory_snapshot_integrity_missing"})
+                    included_snapshots = [
+                        item for item in snapshot_entries if item.get("included") is True
+                    ]
+                    if len(included_snapshots) != 1:
+                        issues.append(
+                            {
+                                "code": "required_memory_snapshot_missing",
+                                "included": len(included_snapshots),
+                            }
+                        )
+                    elif included_snapshots[0].get("sha256") != memory_snapshot.get("sha256"):
+                        issues.append({"code": "memory_snapshot_manifest_hash_mismatch"})
             report["manifest"] = {
                 "version": manifest.get("version"),
                 "generated_at": manifest.get("generated_at"),
@@ -339,7 +511,7 @@ def restore_backup_archive(path: Path, restore_dir: Path, *, overwrite: bool = F
         raise ValueError(f"backup verification failed: {path}")
     if restore_dir.exists() and restore_dir.is_symlink():
         raise ValueError(f"restore_dir must not be a symlink: {restore_dir}")
-    restore_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_directory(restore_dir)
     restored: list[dict[str, Any]] = []
     conflicts: list[dict[str, Any]] = []
     with zipfile.ZipFile(path) as archive:
@@ -368,9 +540,9 @@ def restore_backup_archive(path: Path, restore_dir: Path, *, overwrite: bool = F
                 "reason": "target_exists",
             }
         for item, target in planned:
-            target.parent.mkdir(parents=True, exist_ok=True)
+            _ensure_private_directory(target.parent)
             payload = archive.read(str(item["arcname"]))
-            target.write_bytes(payload)
+            _write_private_file(target, payload)
             restored.append(
                 {
                     "arcname": item["arcname"],
@@ -389,6 +561,7 @@ def restore_backup_archive(path: Path, restore_dir: Path, *, overwrite: bool = F
         "overwrite": overwrite,
     }
     write_json_atomic(restore_dir / "RESTORE_REPORT.json", report)
+    (restore_dir / "RESTORE_REPORT.json").chmod(0o600)
     return report
 
 
@@ -427,6 +600,7 @@ def backup_output_summary(report: dict[str, Any]) -> dict[str, Any]:
         "included_files": manifest.get("included_files"),
         "missing_files": manifest.get("missing_files"),
         "skipped_files": manifest.get("skipped_files"),
+        "experiment_memory_snapshot": manifest.get("experiment_memory_snapshot"),
         "retention": report.get("retention"),
         "verification": {
             "ok": (report.get("verification") or {}).get("ok"),
@@ -484,12 +658,13 @@ def main() -> None:
         extra_paths=list(args.extra),
         max_file_bytes=args.max_file_bytes,
     )
-    if args.max_backups is not None:
+    if args.max_backups is not None and report["ok"]:
         report["retention"] = prune_backup_archives(Path(report["output"]).parent, keep=args.max_backups)
     if args.report:
         write_json_atomic(args.report, report)
     output = report if args.full_output else backup_output_summary(report)
     print(json.dumps(output, indent=2, sort_keys=True))
+    raise SystemExit(0 if report["ok"] else 1)
 
 
 if __name__ == "__main__":

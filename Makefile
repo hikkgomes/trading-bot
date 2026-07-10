@@ -13,7 +13,7 @@ RESTORE_DIR ?= runtime/restore_rehearsal
 
 .PHONY: help
 help:  ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
 
 # ---------------------------------------------------------------------------
@@ -115,8 +115,12 @@ service-dry-run:  ## Rehearse user-systemd unit generation without touching live
 		DRY_RUN=1 bash scripts/install_autopilot_service.sh
 
 .PHONY: autopilot-once
-autopilot-once:  ## Run one 24/7 autopilot orchestration cycle
-	$(PY) -m src.autopilot.runtime --config config/autopilot.json --once
+autopilot-once:  ## Run one trading-supervision cycle without scheduled jobs
+	$(PY) -m src.autopilot.runtime --config config/autopilot.json --once --skip-jobs
+
+.PHONY: jobs-once
+jobs-once:  ## Run one separately locked scheduled-job cycle
+	$(PY) -m src.autopilot.job_worker --config config/autopilot.json --once
 
 .PHONY: approvals
 approvals:  ## List strategy live-trading approvals
@@ -139,7 +143,7 @@ testnet-rehearsal:  ## Place+close a tiny active-income futures testnet order. R
 		echo "Refusing: this target can place testnet orders."; \
 		echo "Re-run with CONFIRM=1 after approval, preflight, and sandbox env are ready."; exit 1; fi
 	$(PY) -m src.autopilot.testnet_rehearsal --config config/autopilot.json \
-		--product active_income --notional-usd $(or $(NOTIONAL_USD),5) \
+		--product active_income --notional-usd $(or $(NOTIONAL_USD),100) \
 		--output runtime/testnet_rehearsal_report.json --confirm
 
 .PHONY: testnet-status
@@ -157,6 +161,22 @@ report:  ## Build compact operator report
 	$(PY) -m src.autopilot.reporting --config config/autopilot.json \
 		--output runtime/operator_report.md --json-output runtime/operator_report.json
 
+.PHONY: telegram-status
+telegram-status:  ## Print the same sanitized read-only status exposed through Telegram
+	$(PY) -m src.autopilot.telegram_edge --config config/autopilot.json --status
+
+.PHONY: telegram-send-status
+telegram-send-status:  ## Send one sanitized status message using runtime/telegram.env
+	$(PY) -m src.autopilot.telegram_edge --config config/autopilot.json --send-status
+
+.PHONY: openclaw-context
+openclaw-context:  ## Export credential- and final-holdout-free research context for OpenClaw
+	$(PY) -m src.autopilot.openclaw_bridge export
+
+.PHONY: openclaw-ingest
+openclaw-ingest:  ## Validate/archive inert OpenClaw proposals from the research inbox
+	$(PY) -m src.autopilot.openclaw_bridge ingest
+
 .PHONY: healthcheck
 healthcheck:  ## Machine-readable watchdog check; exits nonzero on stale/failed autopilot state
 	$(PY) -m src.autopilot.healthcheck --config config/autopilot.json \
@@ -165,15 +185,19 @@ healthcheck:  ## Machine-readable watchdog check; exits nonzero on stale/failed 
 .PHONY: backup
 backup:  ## Create a small recovery backup zip of autopilot runtime state
 	$(PY) -m src.autopilot.backup --config config/autopilot.json \
-		--report runtime/backup_report.json --max-file-bytes 10485760 \
+		--report runtime/backup_report.json --max-file-bytes 52428800 \
 		--max-backups 30
 
 .PHONY: backup-verify
 backup-verify:  ## Verify a backup zip. Usage: make backup-verify [BACKUP=runtime/backups/...zip]
+	@if [ -z "$(BACKUP)" ]; then \
+		echo "No backup zip found. Run 'make backup' first or pass BACKUP=runtime/backups/...zip."; exit 1; fi
 	$(PY) -m src.autopilot.backup --verify $(BACKUP)
 
 .PHONY: backup-restore
 backup-restore:  ## Extract a verified backup into RESTORE_DIR without overwriting existing files
+	@if [ -z "$(BACKUP)" ]; then \
+		echo "No backup zip found. Run 'make backup' first or pass BACKUP=runtime/backups/...zip."; exit 1; fi
 	$(PY) -m src.autopilot.backup --restore $(BACKUP) --restore-dir $(RESTORE_DIR)
 
 .PHONY: maintenance
@@ -198,23 +222,46 @@ data-update: data-update-futures data-update-spot  ## Incrementally update all s
 regime-tag-futures:  ## Build a futures 15m regime-tagged research parquet
 	$(PY) -m src.regime --market futures --timeframe 15m --daily-timeframe 1d \
 		--output runtime/regime/futures_15m_regime.parquet \
-		--report runtime/regime_tag_futures_15m.json --skip-if-missing
+		--report runtime/regime_tag_futures_15m.json --compact --skip-if-missing
 
 .PHONY: data-update-futures
 data-update-futures:  ## Incrementally update seeded futures candles/features
-	$(PY) -m src.update_candles --market futures --bootstrap-days 90 --skip-if-missing --timeframes 5m 15m 30m 1h 4h 1d
+	$(PY) -m src.autopilot.history_bootstrap --config config/research_factory.json \
+		--market futures --exclude-timeframes 1m --report runtime/history_bootstrap_futures.json
 
 .PHONY: data-update-1m-flow
 data-update-1m-flow:  ## Rebuild 1m indicators for scalping flow features
-	$(PY) -m src.update_candles --market futures --bootstrap-days 90 --skip-if-missing --timeframes 1m
+	$(PY) -m src.autopilot.history_bootstrap --config config/research_factory.json --market futures \
+		--timeframes 1m --report runtime/history_bootstrap_futures_1m.json
 
 .PHONY: data-update-spot
 data-update-spot:  ## Incrementally update seeded spot candles/features for BTC accumulation
-	$(PY) -m src.update_candles --market spot --bootstrap-days 365 --skip-if-missing --timeframes 1h 4h 1d 1w
+	$(PY) -m src.autopilot.history_bootstrap --config config/research_factory.json \
+		--market spot --report runtime/history_bootstrap_spot.json
 
 .PHONY: research-smoke
 research-smoke:  ## Run cheap synthetic research wiring checks for both products
 	$(PY) -m src.autopilot.research_smoke --output runtime/research_smoke.json
+
+.PHONY: research-factory-validate
+research-factory-validate:  ## Validate autonomous grammar, budgets, and experiment memory
+	$(PY) -m src.autopilot.research_factory --config config/research_factory.json --validate
+
+.PHONY: research-generate
+research-generate:  ## Generate the next bounded, deduplicated research population
+	$(PY) -m src.autopilot.research_factory --config config/research_factory.json \
+		--output runtime/research/generated_hypotheses.json
+
+.PHONY: research-history-plan
+research-history-plan:  ## Show exact native-timeframe history required by autonomous research
+	$(PY) -m src.autopilot.history_bootstrap --config config/research_factory.json \
+		--plan $(if $(MARKET),--market $(MARKET),)
+
+.PHONY: research-history-bootstrap
+research-history-bootstrap:  ## Bootstrap/update resumable lightweight native-timeframe research history
+	$(PY) -m src.autopilot.history_bootstrap --config config/research_factory.json \
+		$(if $(MARKET),--market $(MARKET),) \
+		--report runtime/history_bootstrap$(if $(MARKET),_$(MARKET),).json
 
 .PHONY: strategy-smoke
 strategy-smoke:  ## Run lightweight strategy-framework sweeps on synthetic + regime data
@@ -223,12 +270,34 @@ strategy-smoke:  ## Run lightweight strategy-framework sweeps on synthetic + reg
 		--regime-input runtime/regime/futures_15m_regime.parquet
 
 .PHONY: research-cycle
-research-cycle:  ## Run bounded real-data validation + gated strategy export
+research-cycle:  ## Validate the autonomous population and gate paper handoff
 	$(PY) -m src.autopilot.research_cycle \
+		--config config/autopilot.json \
 		--output runtime/research_cycle.json \
 		--state runtime/research_cycle_state.json \
-		--include-mutations \
-		--mutation-batch runtime/mutation_hypotheses.json
+		--include-generated --generated-only \
+		--generated-batch runtime/research/generated_hypotheses.json \
+		--research-factory-config config/research_factory.json
+
+.PHONY: research-once
+research-once: research-generate research-cycle  ## Generate and validate one bounded population
+
+.PHONY: activate-candidate
+activate-candidate:  ## Activate reviewed live candidate. Usage: make activate-candidate PRODUCT=active_income CANDIDATE_DIGEST=sha256:... CONFIRM=1
+	@if [ -z "$(PRODUCT)" ]; then \
+		echo "Refusing: pass PRODUCT=<configured-live-product>."; exit 1; fi
+	@if [ -z "$(CANDIDATE_DIGEST)" ]; then \
+		echo "Refusing: pass CANDIDATE_DIGEST=sha256:<reviewed-candidate-digest>."; exit 1; fi
+	@if [ "$(CONFIRM)" != "1" ]; then \
+		echo "Refusing: candidate activation requires CONFIRM=1."; exit 1; fi
+	$(PY) -m src.autopilot.candidate_activation \
+		--config config/autopilot.json --product "$(PRODUCT)" \
+		--expected-candidate-digest "$(CANDIDATE_DIGEST)" --confirm $(if $(OPERATOR),--operator "$(OPERATOR)")
+
+.PHONY: candidate-paper-once
+candidate-paper-once:  ## Run one isolated paper cycle for each staged live candidate
+	$(PY) -m src.autopilot.candidate_paper --config config/autopilot.json \
+		--output runtime/candidate_paper_status.json
 
 .PHONY: rehearse
 rehearse:  ## Run offline end-to-end autopilot workflow rehearsal

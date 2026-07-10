@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import zipfile
 
 import pytest
@@ -12,7 +14,9 @@ from src.autopilot.backup import (
     restore_backup_archive,
     verify_backup_archive,
 )
+from src.autopilot.candidate_activation import candidate_path_for_product
 from src.autopilot.config import AutopilotConfig, JobConfig, ProductConfig
+from src.autopilot.experiment_memory import ExperimentMemory
 
 
 def product(tmp_path):
@@ -47,6 +51,12 @@ def write_config(tmp_path):
                 "research_smoke_file": str(tmp_path / "research_smoke.json"),
                 "strategy_smoke_file": str(tmp_path / "strategy_smoke.json"),
                 "research_cycle_file": str(tmp_path / "research_cycle.json"),
+                "research_factory_config_file": str(tmp_path / "research_factory.json"),
+                "generated_batch_file": str(tmp_path / "generated_batch.json"),
+                "experiment_memory_file": str(tmp_path / "experiment_memory.sqlite3"),
+                "experiment_memory_backup_file": str(
+                    tmp_path / "experiment_memory.backup.sqlite3"
+                ),
                 "incubation_candidates_file": str(tmp_path / "incubation_candidates.json"),
                 "mutation_plan_file": str(tmp_path / "mutation_plan.json"),
                 "mutation_batch_file": str(tmp_path / "mutation_batch.json"),
@@ -94,8 +104,15 @@ def test_configured_backup_paths_include_core_and_product_state(tmp_path):
     assert tmp_path / "autopilot.json" in paths
     assert tmp_path / "approvals.json" in paths
     assert tmp_path / "control.json" in paths
+    # Candidate activations append to the configured control audit and live
+    # research candidates are deterministic per product.
+    assert config.control_audit_file in paths
+    assert candidate_path_for_product("active_income") in paths
     assert tmp_path / "backup_report.json" in paths
     assert tmp_path / "incubation_candidates.json" in paths
+    assert config.research_factory_config_file in paths
+    assert config.generated_batch_file in paths
+    assert config.experiment_memory_backup_file in paths
     assert tmp_path / "active_strategies_flow.json" in paths
     assert tmp_path / "active_income_state.json" in paths
     assert tmp_path / "active_income_trades.csv" in paths
@@ -179,6 +196,137 @@ def test_build_backup_archive_writes_manifest_and_existing_files(tmp_path):
     included = {item["arcname"] for item in manifest["files"] if item["included"]}
     assert "active_income_trades.csv" in included
     assert all(item.get("sha256") for item in manifest["files"] if item["included"])
+
+
+def test_backup_archive_is_owner_private_even_with_permissive_umask(tmp_path):
+    config_path = write_config(tmp_path)
+    output = tmp_path / "backup.zip"
+    previous = os.umask(0)
+    try:
+        report = build_backup_archive(config_path=config_path, output=output, root=tmp_path)
+    finally:
+        os.umask(previous)
+
+    assert report["ok"] is True
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
+def test_build_backup_archive_uses_a_deeply_validated_sqlite_memory_snapshot(tmp_path):
+    config_path = write_config(tmp_path)
+    memory_path = tmp_path / "experiment_memory.sqlite3"
+    snapshot_path = tmp_path / "experiment_memory.backup.sqlite3"
+    with ExperimentMemory(memory_path) as memory:
+        memory.register_strategy(
+            {
+                "id": "research-1",
+                "direction": "long",
+                "regime": [
+                    {
+                        "timeframe": "1h",
+                        "feature": "ema_20",
+                        "op": "gt_feature",
+                        "feature_b": "ema_50",
+                    }
+                ],
+            },
+            strategy_id="research-1",
+            generation_method="grammar_sample",
+            metadata={"product": "active_income", "opportunity_type": "swing_trading"},
+        )
+
+    report = build_backup_archive(
+        config_path=config_path,
+        output=tmp_path / "backup.zip",
+        root=tmp_path,
+    )
+
+    snapshot = report["manifest"]["experiment_memory_snapshot"]
+    assert report["ok"] is True
+    assert snapshot["refreshed"] is True
+    assert snapshot["source_integrity"]["ok"] is True
+    assert snapshot["snapshot_integrity"]["ok"] is True
+    entry = next(
+        item
+        for item in report["manifest"]["files"]
+        if item.get("role") == "experiment_memory_snapshot"
+    )
+    assert entry["included"] is True
+    assert entry["sha256"] == snapshot["sha256"]
+    assert snapshot_path.stat().st_mode & 0o777 == 0o600
+
+    restored_snapshot = tmp_path / "restored-memory.sqlite3"
+    with zipfile.ZipFile(report["output"]) as archive:
+        restored_snapshot.write_bytes(archive.read(entry["arcname"]))
+    with ExperimentMemory(restored_snapshot) as restored:
+        assert restored.integrity_check(deep=True)["ok"] is True
+        assert restored.generator_feedback()["totals"]["strategies"] == 1
+
+
+def test_build_backup_archive_fails_if_current_memory_snapshot_is_omitted_by_size_limit(
+    tmp_path,
+):
+    config_path = write_config(tmp_path)
+    with ExperimentMemory(tmp_path / "experiment_memory.sqlite3"):
+        pass
+
+    report = build_backup_archive(
+        config_path=config_path,
+        output=tmp_path / "backup.zip",
+        max_file_bytes=100,
+        root=tmp_path,
+    )
+
+    assert report["ok"] is False
+    assert any(
+        item["code"] == "required_memory_snapshot_missing"
+        for item in report["verification"]["issues"]
+    )
+
+
+def test_build_backup_archive_rejects_live_memory_as_its_own_backup_destination(tmp_path):
+    config_path = write_config(tmp_path)
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["experiment_memory_backup_file"] = payload["experiment_memory_file"]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="backup path must differ"):
+        build_backup_archive(
+            config_path=config_path,
+            output=tmp_path / "backup.zip",
+            root=tmp_path,
+        )
+
+
+def test_build_backup_archive_rejects_broken_memory_symlink(tmp_path):
+    config_path = write_config(tmp_path)
+    (tmp_path / "experiment_memory.sqlite3").symlink_to(tmp_path / "missing.sqlite3")
+
+    with pytest.raises(ValueError, match="must not be symlinks"):
+        build_backup_archive(
+            config_path=config_path,
+            output=tmp_path / "backup.zip",
+            root=tmp_path,
+        )
+
+
+def test_build_backup_archive_propagates_failed_verification(monkeypatch, tmp_path):
+    config_path = write_config(tmp_path)
+    output = tmp_path / "backup.zip"
+    monkeypatch.setattr(
+        "src.autopilot.backup.verify_backup_archive",
+        lambda path: {
+            "path": str(path),
+            "exists": True,
+            "ok": False,
+            "checked_files": 0,
+            "issues": [{"code": "injected_verification_failure"}],
+        },
+    )
+
+    report = build_backup_archive(config_path=config_path, output=output, root=tmp_path)
+
+    assert report["ok"] is False
+    assert report["verification"]["ok"] is False
 
 
 def test_build_backup_archive_includes_existing_job_state_paths(tmp_path):
@@ -318,6 +466,7 @@ def test_backup_output_summary_omits_full_manifest():
         "included_files": 3,
         "missing_files": 2,
         "skipped_files": 1,
+        "experiment_memory_snapshot": None,
         "retention": {"deleted_archives": 1},
         "verification": {"ok": True, "checked_files": 3, "issues": 0},
     }
@@ -581,6 +730,29 @@ def test_restore_backup_archive_extracts_verified_files(tmp_path):
     assert (restore_dir / "RESTORE_REPORT.json").exists()
 
 
+def test_restore_forces_private_directory_and_file_modes_with_permissive_umask(tmp_path):
+    config_path = write_config(tmp_path)
+    (tmp_path / "approvals.json").write_text(
+        '{"version": 1, "approvals": {}}\n', encoding="utf-8"
+    )
+    archive_path = tmp_path / "backup.zip"
+    build_backup_archive(config_path=config_path, output=archive_path, root=tmp_path)
+    restore_dir = tmp_path / "restore"
+    restore_dir.mkdir(mode=0o777)
+    restore_dir.chmod(0o777)
+
+    previous = os.umask(0)
+    try:
+        report = restore_backup_archive(archive_path, restore_dir)
+    finally:
+        os.umask(previous)
+
+    assert report["ok"] is True
+    assert stat.S_IMODE(restore_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((restore_dir / "approvals.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((restore_dir / "RESTORE_REPORT.json").stat().st_mode) == 0o600
+
+
 def test_restore_backup_archive_refuses_to_overwrite_existing_files(tmp_path):
     config_path = write_config(tmp_path)
     (tmp_path / "approvals.json").write_text('{"version": 1, "approvals": {}}\n', encoding="utf-8")
@@ -606,11 +778,13 @@ def test_restore_backup_archive_can_overwrite_when_requested(tmp_path):
     restore_dir = tmp_path / "restore"
     restore_dir.mkdir()
     (restore_dir / "approvals.json").write_text("existing\n", encoding="utf-8")
+    (restore_dir / "approvals.json").chmod(0o644)
 
     report = restore_backup_archive(archive_path, restore_dir, overwrite=True)
 
     assert report["ok"] is True
     assert (restore_dir / "approvals.json").read_text(encoding="utf-8") == '{"version": 1, "approvals": {}}\n'
+    assert stat.S_IMODE((restore_dir / "approvals.json").stat().st_mode) == 0o600
 
 
 def test_restore_backup_archive_rejects_symlink_escape_when_overwriting(tmp_path):

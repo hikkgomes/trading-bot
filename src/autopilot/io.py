@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,14 @@ def write_text_atomic(path: Path, content: str, *, encoding: str = "utf-8") -> N
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)
+        # ``fsync`` on the temporary file protects its contents; syncing the
+        # containing directory makes the rename itself durable across a host
+        # crash.  This matters for order intents and accounting WAL records.
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if tmp_path is not None and tmp_path.exists():
             tmp_path.unlink()
@@ -41,8 +50,24 @@ def append_json_line(path: Path, payload: dict[str, Any]) -> None:
     if path.is_symlink():
         raise ValueError(f"jsonl path must not be a symlink: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, sort_keys=True))
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    existed = path.exists()
+    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"jsonl path must be a regular file: {path}")
+        record = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+        written = os.write(descriptor, record)
+        if written != len(record):
+            raise OSError(f"short JSONL append to {path}: wrote {written} of {len(record)} bytes")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    if not existed:
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)

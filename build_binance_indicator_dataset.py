@@ -15,6 +15,7 @@ from talib import abstract
 
 from src.candle_validation import validate_1m_candles
 from src.config import candle_data_dir, indicator_data_dir, normalize_market
+from src.parquet_io import atomic_output_path, write_parquet_atomic
 
 # =========================
 # CONFIG
@@ -282,7 +283,7 @@ def build_timeframes(
         df.index.name = "timestamp"
 
         output_path = CANDLE_DIR / f"{SYMBOL}_{timeframe}.parquet"
-        df.to_parquet(output_path)
+        write_parquet_atomic(df, output_path)
         datasets[timeframe] = df
         print(
             f"Saved candles: {output_path} | rows={len(df):,}, cols={len(df.columns):,}",
@@ -567,13 +568,11 @@ def build_full_indicator_file(timeframe: str, df: pd.DataFrame) -> None:
     if output_path.exists() and not REBUILD_INDICATORS:
         print(f"Output already exists, skipping: {output_path}", flush=True)
         return
-    if output_path.exists():
-        output_path.unlink()
 
     print(f"Building indicators for {timeframe}", flush=True)
     indicators = build_indicator_features(df, timeframe)
     indicators = reduce_numeric_dtypes(indicators)
-    indicators.to_parquet(output_path)
+    write_parquet_atomic(indicators, output_path)
     print(
         f"Saved indicators: {output_path} | rows={len(indicators):,}, cols={len(indicators.columns):,}",
         flush=True,
@@ -588,8 +587,6 @@ def build_chunked_indicator_file(timeframe: str, df: pd.DataFrame) -> None:
     if output_path.exists() and not REBUILD_INDICATORS:
         print(f"Output already exists, skipping: {output_path}", flush=True)
         return
-    if output_path.exists():
-        output_path.unlink()
 
     if "timestamp" not in df.columns:
         df = df.reset_index()
@@ -599,43 +596,46 @@ def build_chunked_indicator_file(timeframe: str, df: pd.DataFrame) -> None:
         if column != "timestamp":
             df[column] = pd.to_numeric(df[column], errors="coerce").astype("float64")
 
-    writer = None
-    try:
-        total_rows = len(df)
-        for start in range(0, total_rows, CHUNK_SIZE):
-            end = min(start + CHUNK_SIZE, total_rows)
-            warmup_start = max(0, start - WARMUP_ROWS)
-            print(
-                f"[{timeframe}] Chunk rows {start:,} to {end:,} "
-                f"(warmup from {warmup_start:,})",
-                flush=True,
-            )
+    total_rows = len(df)
+    if total_rows == 0:
+        raise ValueError(f"Cannot build empty {timeframe} indicator artifact")
+    with atomic_output_path(output_path) as temporary_path:
+        writer = None
+        try:
+            for start in range(0, total_rows, CHUNK_SIZE):
+                end = min(start + CHUNK_SIZE, total_rows)
+                warmup_start = max(0, start - WARMUP_ROWS)
+                print(
+                    f"[{timeframe}] Chunk rows {start:,} to {end:,} "
+                    f"(warmup from {warmup_start:,})",
+                    flush=True,
+                )
 
-            chunk = df.iloc[warmup_start:end].copy()
-            out_chunk = build_indicator_features(chunk, timeframe)
-            rows_to_drop = start - warmup_start
-            if rows_to_drop > 0:
-                out_chunk = out_chunk.iloc[rows_to_drop:].copy()
+                chunk = df.iloc[warmup_start:end].copy()
+                out_chunk = build_indicator_features(chunk, timeframe)
+                rows_to_drop = start - warmup_start
+                if rows_to_drop > 0:
+                    out_chunk = out_chunk.iloc[rows_to_drop:].copy()
 
-            out_chunk = reduce_numeric_dtypes(out_chunk)
-            table = pa.Table.from_pandas(out_chunk, preserve_index=False)
+                out_chunk = reduce_numeric_dtypes(out_chunk)
+                table = pa.Table.from_pandas(out_chunk, preserve_index=False)
 
-            if writer is None:
-                writer = pq.ParquetWriter(output_path, table.schema, compression="zstd")
-            writer.write_table(table)
+                if writer is None:
+                    writer = pq.ParquetWriter(temporary_path, table.schema, compression="zstd")
+                writer.write_table(table)
 
-            print(
-                f"[{timeframe}] Wrote chunk rows={len(out_chunk):,}, cols={len(out_chunk.columns):,}",
-                flush=True,
-            )
+                print(
+                    f"[{timeframe}] Wrote chunk rows={len(out_chunk):,}, cols={len(out_chunk.columns):,}",
+                    flush=True,
+                )
 
-            del chunk
-            del out_chunk
-            del table
-            gc.collect()
-    finally:
-        if writer is not None:
-            writer.close()
+                del chunk
+                del out_chunk
+                del table
+                gc.collect()
+        finally:
+            if writer is not None:
+                writer.close()
 
     print(f"Saved chunked indicators: {output_path}", flush=True)
 

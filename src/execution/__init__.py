@@ -13,10 +13,13 @@ The ccxt-backed live/testnet adapter is imported lazily (it needs the optional
 from src.execution.broker import (
     Broker,
     Fill,
+    OpenOrderIdentity,
     Order,
     OrderSide,
     OrderType,
     Position,
+    ProtectiveOrder,
+    ProtectiveOrderStatus,
 )
 from src.execution.config import ExchangeConfig
 from src.execution.paper import PaperBroker, binance_mark_price
@@ -27,7 +30,10 @@ __all__ = [
     "OrderSide",
     "OrderType",
     "Fill",
+    "OpenOrderIdentity",
     "Position",
+    "ProtectiveOrder",
+    "ProtectiveOrderStatus",
     "PaperBroker",
     "binance_mark_price",
     "ExchangeConfig",

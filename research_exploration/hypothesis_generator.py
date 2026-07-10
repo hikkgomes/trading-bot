@@ -27,6 +27,14 @@ POSITION_TF_COMBOS = [("1w", "1d", "4h"), ("1d", "4h", "1h"), ("1d", "4h", "4h")
 POSITION_EXIT_SCALE = 3.0     # day-trade exits are far too tight for multi-day swings
 POSITION_HORIZON_SCALE = 2.0
 
+# Active-income swing trading is a separate research horizon, not a label for
+# the intraday 15m candidates.  A 1h execution base keeps the data and compute
+# footprint modest while the 48--96 bar time stops span two to four days.
+SWING_TF_COMBOS = [("1d", "4h", "1h")]
+SWING_EXIT_SCALE = 2.0
+SWING_HORIZON_SCALE = 4.0
+SWING_MIN_HORIZON_BARS = 48
+
 
 def generate_batch(per_family_combos: int | None = None,
                    directions=("long", "short"),
@@ -92,6 +100,65 @@ def position_trading_set(with_guards: bool = False,
             if with_guards:
                 hyp = apply_no_trade_guards(hyp)
             out.append(hyp)
+    return out
+
+
+def swing_trading_set(
+    with_guards: bool = False,
+    exit_scale: float = SWING_EXIT_SCALE,
+    horizon_scale: float = SWING_HORIZON_SCALE,
+    min_horizon_bars: int = SWING_MIN_HORIZON_BARS,
+) -> list[Hypothesis]:
+    """Active-income candidates with genuine multi-day 1h holding horizons.
+
+    The entry families remain deliberately curated, but are rebuilt on a
+    daily/4h/1h stack.  Exits are widened from their intraday templates and the
+    time stop is never shorter than two days.  Risk is reduced because these
+    positions can remain open across several sessions.
+    """
+    if min_horizon_bars < SWING_MIN_HORIZON_BARS:
+        raise ValueError(
+            f"min_horizon_bars must be at least {SWING_MIN_HORIZON_BARS} for multi-day swing research"
+        )
+    if exit_scale <= 0 or horizon_scale <= 0:
+        raise ValueError("exit_scale and horizon_scale must be positive")
+
+    out: list[Hypothesis] = []
+    for key, family in FAMILIES.items():
+        for idx, combo in enumerate(SWING_TF_COMBOS, start=1):
+            for direction in ("long", "short"):
+                if direction not in family.directions:
+                    continue
+                hyp = build_family(key, direction, combo, idx)
+                exit_rule = dataclasses.replace(
+                    hyp.exit,
+                    take_profit=round(hyp.exit.take_profit * exit_scale, 6),
+                    stop_loss=round(hyp.exit.stop_loss * exit_scale, 6),
+                    horizon_bars=max(
+                        int(min_horizon_bars),
+                        round(hyp.exit.horizon_bars * horizon_scale),
+                    ),
+                )
+                risk_rule = dataclasses.replace(
+                    hyp.risk,
+                    risk_per_trade=min(hyp.risk.risk_per_trade, 0.005),
+                    max_position_fraction=min(hyp.risk.max_position_fraction, 0.15),
+                    max_trades_per_day=1,
+                    max_daily_loss_r=2.0,
+                    cooldown_bars=max(hyp.risk.cooldown_bars, 6),
+                )
+                hyp = dataclasses.replace(
+                    hyp,
+                    id=f"SWING_{hyp.id}",
+                    exit=exit_rule,
+                    risk=risk_rule,
+                    expected_holding="up to 2-4 days (multi-day active-income swing)",
+                    expected_frequency="a few setups per week; positions may span sessions",
+                    tags=[*hyp.tags, "swing", "multi_day", "active_income"],
+                )
+                if with_guards:
+                    hyp = apply_no_trade_guards(hyp)
+                out.append(hyp)
     return out
 
 

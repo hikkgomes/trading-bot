@@ -87,7 +87,7 @@ def dca_buy_plan(
     raw = [1.0 + i if lower_heavy else 1.0 for i in range(levels)]  # heavier toward lower prices
     weights = _normalize(raw)
     legs: list[PlanLeg] = []
-    for price, w in zip(prices, weights):
+    for price, w in zip(prices, weights, strict=True):
         quote = quote_budget * w
         legs.append(PlanLeg(OrderSide.BUY, price, quote / price, w, note="dca"))
     return legs
@@ -112,7 +112,7 @@ def scaled_exit_plan(
     if abs(sum(clean_fractions) - 1.0) > 1e-6:
         raise ValueError("fractions must sum to 1.0.")
     legs: list[PlanLeg] = []
-    for frac, off in zip(clean_fractions, clean_offsets):
+    for frac, off in zip(clean_fractions, clean_offsets, strict=True):
         price = range_high * (1.0 + off)
         legs.append(PlanLeg(OrderSide.SELL, price, qty * frac, frac, note="scaled_exit"))
     return legs
@@ -138,7 +138,7 @@ def stink_bid_plan(
         raise ValueError("weights and depths must be the same length.")
     w = _normalize(weights if weights is not None else [1.0] * len(depths))
     legs: list[PlanLeg] = []
-    for depth, weight in zip(clean_depths, w):
+    for depth, weight in zip(clean_depths, w, strict=True):
         if not 0.0 < depth < 1.0:
             raise ValueError("each depth must be in (0, 1).")
         price = ref_price * (1.0 - depth)

@@ -15,6 +15,7 @@ DEFAULT_INPUT = Path("runtime/research_cycle.json")
 DEFAULT_OUTPUT = Path("runtime/mutation_plan.json")
 DEFAULT_MARKDOWN = Path("runtime/mutation_plan.md")
 SKIPPED_CANDIDATE_SETS = {"mutation"}
+RETIRED_REASONS = {"failed_holdout"}
 
 
 FAMILY_ACTIONS = {
@@ -93,10 +94,6 @@ REASON_ACTIONS = {
         "widen exit robustness or simplify the entry condition",
         "prefer mutations with fewer sensitive numeric thresholds",
     ],
-    "failed_holdout": [
-        "quarantine this exact idea until a new market regime is observed",
-        "only revisit through a materially different regime filter",
-    ],
 }
 
 DEFAULT_ACTIONS = [
@@ -115,6 +112,24 @@ def _load_json(path: Path) -> dict[str, Any]:
 def _primary_reason(candidate: dict[str, Any]) -> str:
     reasons = candidate.get("reasons") or []
     return str(reasons[0]) if reasons else "unknown"
+
+
+def _retired_reason(candidate: dict[str, Any]) -> str | None:
+    reasons = {str(reason) for reason in candidate.get("reasons") or []}
+    return next((reason for reason in RETIRED_REASONS if reason in reasons), None)
+
+
+def _retired_candidate(scenario: dict[str, Any], candidate: dict[str, Any], reason: str) -> dict[str, Any]:
+    return {
+        "source_scenario": scenario.get("name"),
+        "product": scenario.get("product"),
+        "source_candidate_id": candidate.get("id"),
+        "reason": reason,
+        "source_verdict": candidate.get("verdict"),
+        "stage_reached": candidate.get("stage_reached"),
+        "score": candidate.get("score"),
+        "disposition": "retired_from_autonomous_mutation",
+    }
 
 
 def _actions_for(candidate: dict[str, Any]) -> list[str]:
@@ -206,6 +221,7 @@ def build_mutation_plan(
     skipped_scenarios: list[dict[str, Any]] = []
     suppressed_sources = _recent_failed_mutation_sources(research_cycle)
     suppressed_repeated_sources: list[dict[str, Any]] = []
+    retired_candidates: list[dict[str, Any]] = []
     for scenario in research_cycle.get("scenarios") or []:
         if not isinstance(scenario, dict):
             continue
@@ -220,11 +236,15 @@ def build_mutation_plan(
                 }
             )
             continue
-        candidates = [
-            candidate
-            for candidate in scenario.get("incubation_candidates") or []
-            if isinstance(candidate, dict)
-        ]
+        candidates = []
+        for candidate in scenario.get("incubation_candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            retired_reason = _retired_reason(candidate)
+            if retired_reason is not None:
+                retired_candidates.append(_retired_candidate(scenario, candidate, retired_reason))
+                continue
+            candidates.append(candidate)
         candidates = sorted(
             candidates,
             key=lambda candidate: float(candidate.get("score") or 0.0),
@@ -250,6 +270,8 @@ def build_mutation_plan(
     by_reason = Counter(str(item.get("reason") or "unknown") for item in proposals)
     suppressed_by_product = Counter(str(item.get("product") or "unknown") for item in suppressed_repeated_sources)
     suppressed_by_reason = Counter(str(item.get("reason") or "unknown") for item in suppressed_repeated_sources)
+    retired_by_product = Counter(str(item.get("product") or "unknown") for item in retired_candidates)
+    retired_by_reason = Counter(str(item.get("reason") or "unknown") for item in retired_candidates)
     return {
         "ok": True,
         "generated_at": utc_now(),
@@ -266,10 +288,14 @@ def build_mutation_plan(
             "suppressed_repeated_sources": len(suppressed_repeated_sources),
             "suppressed_by_product": dict(sorted(suppressed_by_product.items())),
             "suppressed_by_reason": dict(suppressed_by_reason.most_common()),
+            "retired_candidates": len(retired_candidates),
+            "retired_by_product": dict(sorted(retired_by_product.items())),
+            "retired_by_reason": dict(retired_by_reason.most_common()),
             "executable": False,
         },
         "skipped_scenarios": skipped_scenarios,
         "suppressed_repeated_sources": suppressed_repeated_sources[:MAX_SUPPRESSED_SOURCES_REPORT],
+        "retired_candidates": retired_candidates,
         "proposals": proposals,
     }
 
@@ -283,6 +309,7 @@ def render_markdown(plan: dict[str, Any]) -> str:
         f"- Proposals: `{summary.get('proposals', 0)}`",
         f"- Skipped scenarios: `{summary.get('skipped_scenarios', 0)}`",
         f"- Suppressed repeat sources: `{summary.get('suppressed_repeated_sources', 0)}`",
+        f"- Retired holdout failures: `{summary.get('retired_candidates', 0)}`",
         "- Executable: `False`",
         "- Scope: research-only; every proposal requires full validation before export.",
         "",

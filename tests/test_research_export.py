@@ -413,4 +413,4 @@ def test_position_trading_set_guarded_variant():
     guarded = position_trading_set(with_guards=True)
     assert len(guarded) == len(plain)
     assert all(h.id.endswith("_G") for h in guarded)
-    assert all(len(g.regime) > len(p.regime) for g, p in zip(guarded, plain))
+    assert all(len(g.regime) > len(p.regime) for g, p in zip(guarded, plain, strict=False))

@@ -540,6 +540,25 @@ def assert_strategy_artifact_allowed(
     if require_live_eligible is None:
         require_live_eligible = product.execution_mode == "live"
     artifact = load_strategy_artifact(path, require_live_eligible=require_live_eligible)
+    return assert_loaded_strategy_artifact_allowed(
+        product,
+        artifact,
+        artifact_path=path,
+        require_live_eligible=require_live_eligible,
+    )
+
+
+def assert_loaded_strategy_artifact_allowed(
+    product: ProductConfig,
+    artifact: dict[str, Any],
+    *,
+    artifact_path: Path | None = None,
+    require_live_eligible: bool | None = None,
+) -> dict[str, Any]:
+    """Apply product policy to an artifact payload that was loaded once."""
+    path = artifact_path or product.strategies_path
+    if require_live_eligible is None:
+        require_live_eligible = product.execution_mode == "live"
     errors = validate_strategy_artifact(product, artifact, require_live_eligible=require_live_eligible)
     if errors:
         raise StrategyPolicyError(

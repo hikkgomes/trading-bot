@@ -1,7 +1,7 @@
 import argparse
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import List, Optional, Sequence
 
 import lightgbm as lgb
 import numpy as np
@@ -49,7 +49,7 @@ def walk_forward_model_signals(
     max_features: int = 80,
 ) -> pd.DataFrame:
     windows = generate_windows(len(data), wf_config)
-    parts: List[pd.DataFrame] = []
+    parts: list[pd.DataFrame] = []
     for train_slice, test_slice in windows:
         train = data.iloc[train_slice].copy()
         test = data.iloc[test_slice].copy()
@@ -96,7 +96,7 @@ def run(
     sl: float,
     fee_bps: float = 5.0,
     slippage_bps: float = 2.0,
-    embargo_bars: Optional[int] = None,
+    embargo_bars: int | None = None,
     report: bool = False,
 ) -> Path:
     data = pd.read_parquet(input_path).sort_values("timestamp").reset_index(drop=True)

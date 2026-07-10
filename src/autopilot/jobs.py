@@ -51,7 +51,7 @@ STRUCTURED_REPORT_SAMPLE_KEYS = ("errors",)
 
 
 def utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+    return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
 
 
 def load_job_state(path: Path) -> dict[str, Any]:
@@ -188,9 +188,12 @@ def _missing_bootstrap_seed_due(job: JobConfig, entry: dict[str, Any]) -> bool:
     if entry.get("last_ok") is False:
         return False
     command = list(job.command)
-    if "src.update_candles" not in command:
-        return False
-    if not _positive_int(_command_value(command, "--bootstrap-days")):
+    legacy_bootstrap = (
+        "src.update_candles" in command
+        and _positive_int(_command_value(command, "--bootstrap-days"))
+    )
+    native_history_bootstrap = "src.autopilot.history_bootstrap" in command
+    if not legacy_bootstrap and not native_history_bootstrap:
         return False
     market = _command_value(command, "--market")
     if market not in {"spot", "futures"}:
@@ -296,6 +299,54 @@ def _mutation_batch_awaiting_research_due(job: JobConfig, job_state: dict[str, A
     return mutation_started <= research_started
 
 
+def _generated_batch_marker(payload: dict[str, Any]) -> dict[str, Any] | None:
+    generated_at = payload.get("generated_at")
+    if not generated_at:
+        return None
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    return {
+        "status": "loaded",
+        "generated_at": generated_at,
+        "hypotheses": summary.get("hypotheses", len(payload.get("hypotheses") or [])),
+        "scenarios": len(summary.get("by_space") or {}),
+        "cumulative_trials": summary.get("cumulative_trials", 0),
+    }
+
+
+def _state_generated_batch_marker_current(state_value: Any, marker: dict[str, Any]) -> bool:
+    if isinstance(state_value, str):
+        try:
+            state_marker = json.loads(state_value)
+        except json.JSONDecodeError:
+            return False
+    elif isinstance(state_value, dict):
+        state_marker = state_value
+    else:
+        return False
+    return all(
+        state_marker.get(key) == marker.get(key)
+        for key in ("status", "generated_at", "hypotheses", "scenarios", "cumulative_trials")
+    )
+
+
+def _generated_batch_awaiting_research_due(job: JobConfig) -> bool:
+    command = list(job.command)
+    if "src.autopilot.research_cycle" not in command or "--include-generated" not in command:
+        return False
+    state_path = _command_path_value(job, "--state")
+    generated_batch_path = _command_path_value(job, "--generated-batch")
+    if state_path is None or generated_batch_path is None:
+        return False
+    marker = _generated_batch_marker(_load_json_object(generated_batch_path))
+    if marker is None:
+        return False
+    state = _load_json_object(state_path)
+    return not _state_generated_batch_marker_current(
+        state.get("last_generated_batch_marker"),
+        marker,
+    )
+
+
 def _blocked_export_products(payload: dict[str, Any]) -> set[str]:
     exports = payload.get("exports")
     if not isinstance(exports, list):
@@ -353,6 +404,8 @@ def job_due(job: JobConfig, job_state: dict[str, Any], now: float | None = None)
     if _stale_research_handoff_due(job):
         return True
     if _mutation_batch_awaiting_research_due(job, job_state):
+        return True
+    if _generated_batch_awaiting_research_due(job):
         return True
     if _open_position_blocked_export_due(job):
         return True

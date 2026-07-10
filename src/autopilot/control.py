@@ -8,9 +8,12 @@ or replacing it with the examples documented in README.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
+import stat
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +39,43 @@ DEFAULT_CONTROL = {
 LOGGER = logging.getLogger("autopilot.control")
 TRUE_STRINGS = {"1", "true", "yes", "on"}
 FALSE_STRINGS = {"0", "false", "no", "off"}
+
+
+class ControlConflictError(RuntimeError):
+    """Raised when an automatic mutation is based on a stale control snapshot."""
+
+
+@contextmanager
+def control_update_lock(path: Path):
+    """Serialize control read-modify-write transactions across processes.
+
+    The lock is deliberately a sibling file, rather than the atomically replaced
+    control inode.  Locking the control file itself would stop protecting later
+    readers after ``os.replace`` installs a new inode.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    if lock_path.is_symlink():
+        raise ValueError(f"control lock file must not be a symlink: {lock_path}")
+    flags = os.O_CREAT | os.O_RDWR
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise RuntimeError(f"cannot open control lock {lock_path}: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"control lock must be a regular file: {lock_path}")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _fail_closed(path: Path, error: str) -> dict[str, Any]:
@@ -240,7 +280,12 @@ def _audit_event(
     )
 
 
-def update_control(
+def _control_snapshot(control: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_control(control)
+    return {key: normalized[key] for key in DEFAULT_CONTROL}
+
+
+def _update_control_locked(
     path: Path,
     command: str,
     *,
@@ -248,8 +293,21 @@ def update_control(
     reason: str | None = None,
     audit_path: Path | None = None,
     actor: str | None = None,
+    enforce_flatten_pause: bool = False,
+    expected_control: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     control, recovered_control_error = _load_editable_control(path)
+    if expected_control is not None:
+        if recovered_control_error is not None:
+            raise ControlConflictError(
+                "control changed or became invalid after the runtime snapshot; "
+                f"refusing stale {command!r} mutation: {recovered_control_error}"
+            )
+        if _control_snapshot(control) != _control_snapshot(expected_control):
+            raise ControlConflictError(
+                "control changed after the runtime snapshot; "
+                f"refusing stale {command!r} mutation"
+            )
     before = dict(control)
     if recovered_control_error is not None:
         before["recovered_control_error"] = recovered_control_error
@@ -296,12 +354,22 @@ def update_control(
     elif command == "flatten":
         if not name:
             raise ValueError("flatten requires a product name")
+        # Flattening is an emergency/risk-reduction action. Keep the product
+        # paused after the one-shot request is auto-cleared so it cannot open a
+        # fresh position before the operator reconciles fills and accounting.
+        _append_unique(control, "paused_products", name)
         _append_unique(control, "flatten_products", name)
         _set_reason(control, reason)
     elif command == "flatten-all":
+        control["paused"] = True
         control["flatten_all"] = True
         _set_reason(control, reason)
     elif command == "clear-flatten":
+        if enforce_flatten_pause:
+            if name:
+                _append_unique(control, "paused_products", name)
+            else:
+                control["paused"] = True
         if name:
             _remove_value(control, "flatten_products", name)
         else:
@@ -328,6 +396,37 @@ def update_control(
         LOGGER.exception("Failed to append control audit event")
         payload["audit_error"] = f"{type(exc).__name__}: {exc}"
     return payload
+
+
+def update_control(
+    path: Path,
+    command: str,
+    *,
+    name: str | None = None,
+    reason: str | None = None,
+    audit_path: Path | None = None,
+    actor: str | None = None,
+    enforce_flatten_pause: bool = False,
+    expected_control: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Atomically mutate operator control without losing concurrent intent.
+
+    Interactive commands always apply to the latest state under the lock.
+    Runtime auto-clears additionally pass the snapshot they acted on; a newer
+    operator command then wins and the stale auto-clear fails closed.
+    """
+
+    with control_update_lock(path):
+        return _update_control_locked(
+            path,
+            command,
+            name=name,
+            reason=reason,
+            audit_path=audit_path,
+            actor=actor,
+            enforce_flatten_pause=enforce_flatten_pause,
+            expected_control=expected_control,
+        )
 
 
 def is_product_paused(control: dict[str, Any], product_name: str) -> bool:

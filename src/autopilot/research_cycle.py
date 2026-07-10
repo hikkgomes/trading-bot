@@ -1,25 +1,29 @@
-"""Bounded real-data research cycle for the autopilot.
+"""Bounded real-data evaluation coordinator for autonomous research.
 
-The cycle is intentionally conservative:
+The scheduled path consumes behaviorally unique candidates from the persistent
+strategy factory, checks real-history and feature contracts, records
+development evidence, and durably claims a lineage's protected holdout before
+it can be read.  Qualified outputs may enter isolated paper incubation, but no
+candidate can become an active live strategy through this module.
 
-* validate a small, fixed candidate set for each product;
-* append full staged-validation records to the experiment log;
-* export only strategies that already passed the existing positive-holdout gate;
-* treat "no exportable strategies" as a successful research result, not a
-  runtime failure.
+Legacy curated and mutation-batch loaders remain available for old reports and
+tests; production configuration uses ``--generated-only``.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import math
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import pyarrow.parquet as pq
 
 from research_exploration.evaluate import EvalConfig, _needed_columns, build_aligned_frame
@@ -29,17 +33,47 @@ from research_exploration.hypothesis_generator import (
     first_smoke_set,
     generate_batch,
     position_trading_set,
+    swing_trading_set,
 )
 from research_exploration.hypothesis_schema import Hypothesis
-from research_exploration.validation import ValidationConfig, validate_batch
+from research_exploration.strategy_grammar import validate_hypothesis_against_space
+from research_exploration.validation import ValidationConfig, split_frame, validate_batch
+from src.autopilot.approvals import artifact_digest, load_artifact
+from src.autopilot.candidate_activation import (
+    DEFAULT_CANDIDATE_DIR,
+    candidate_path_for_product,
+    product_identity,
+)
+from src.autopilot.config import DEFAULT_CONFIG_PATH, ProductConfig, load_config
+from src.autopilot.execution_identity import execution_engine_digest
+from src.autopilot.experiment_memory import (
+    EvaluationConflictError,
+    ExperimentMemory,
+    canonical_strategy_hash,
+)
 from src.autopilot.io import write_json_atomic
 from src.autopilot.market_data import build_market_data_statuses
 from src.autopilot.reporting import utc_now
+from src.autopilot.research_factory import (
+    BATCH_SCHEMA as GENERATED_BATCH_SCHEMA,
+)
+from src.autopilot.research_factory import (
+    DEFAULT_CONFIG as DEFAULT_RESEARCH_FACTORY_CONFIG,
+)
+from src.autopilot.research_factory import (
+    load_factory_config,
+    strategy_behavior_spec,
+)
+from src.autopilot.research_history_contract import generated_history_contract
+from src.autopilot.strategy_policy import assert_loaded_strategy_artifact_allowed
 from src.config import indicator_data_dir
 
 DEFAULT_OUTPUT = Path("runtime/research_cycle.json")
 DEFAULT_STATE = Path("runtime/research_cycle_state.json")
 DEFAULT_MUTATION_BATCH = Path("runtime/mutation_hypotheses.json")
+DEFAULT_GENERATED_BATCH = Path("runtime/research/generated_hypotheses.json")
+_FILE_DIGEST_CACHE: dict[tuple[str, int, int, int], str] = {}
+_MAX_FILE_DIGEST_CACHE_ITEMS = 64
 DEFAULT_INCUBATION_OUTPUT = Path("runtime/incubation_candidates.json")
 DEFAULT_PRODUCT_STATE_FILES = {
     "active_income": Path("runtime/active_income_state.json"),
@@ -61,20 +95,31 @@ class ResearchScenario:
     with_guards: bool = False
     candidate_set: str = "smoke"
     max_hypotheses: int | None = None
+    coverage_earliest: str | None = None
+    coverage_max_start_delay_days: float | None = None
+    coverage_max_latest_age_hours: float | None = None
+    coverage_min_span_days: float | None = None
+    coverage_min_rows: int | None = None
 
 
 DEFAULT_SCENARIOS = (
     ResearchScenario(
-        name="active_income_15m",
+        name="active_income_1h_swing",
         product="active_income",
-        base_tf="15m",
+        base_tf="1h",
         pnl_unit="usdt",
         market="futures",
         position=False,
         start="2022-01-01",
         opportunity_type="swing_trading",
-        candidate_set="full",
+        with_guards=True,
+        candidate_set="swing",
         max_hypotheses=8,
+        coverage_earliest="2022-01-01",
+        coverage_max_start_delay_days=2,
+        coverage_max_latest_age_hours=24,
+        coverage_min_span_days=900,
+        coverage_min_rows=20_000,
     ),
     ResearchScenario(
         name="active_income_5m_guarded",
@@ -88,6 +133,11 @@ DEFAULT_SCENARIOS = (
         with_guards=True,
         candidate_set="full",
         max_hypotheses=8,
+        coverage_earliest="2023-01-01",
+        coverage_max_start_delay_days=1,
+        coverage_max_latest_age_hours=24,
+        coverage_min_span_days=730,
+        coverage_min_rows=200_000,
     ),
     ResearchScenario(
         name="active_income_1m_guarded",
@@ -101,6 +151,11 @@ DEFAULT_SCENARIOS = (
         with_guards=True,
         candidate_set="full",
         max_hypotheses=8,
+        coverage_earliest="2026-01-01",
+        coverage_max_start_delay_days=1,
+        coverage_max_latest_age_hours=24,
+        coverage_min_span_days=90,
+        coverage_min_rows=100_000,
     ),
     ResearchScenario(
         name="btc_accumulation_4h",
@@ -112,6 +167,11 @@ DEFAULT_SCENARIOS = (
         start="2020-06-01",
         opportunity_type="btc_accumulation",
         candidate_set="position",
+        coverage_earliest="2020-06-01",
+        coverage_max_start_delay_days=2,
+        coverage_max_latest_age_hours=24,
+        coverage_min_span_days=1_000,
+        coverage_min_rows=8_000,
     ),
     ResearchScenario(
         name="btc_accumulation_4h_guarded",
@@ -124,6 +184,11 @@ DEFAULT_SCENARIOS = (
         opportunity_type="btc_accumulation",
         with_guards=True,
         candidate_set="position",
+        coverage_earliest="2020-06-01",
+        coverage_max_start_delay_days=2,
+        coverage_max_latest_age_hours=24,
+        coverage_min_span_days=1_000,
+        coverage_min_rows=8_000,
     ),
     ResearchScenario(
         name="btc_accumulation_1h",
@@ -135,6 +200,11 @@ DEFAULT_SCENARIOS = (
         start="2020-06-01",
         opportunity_type="btc_accumulation",
         candidate_set="position",
+        coverage_earliest="2020-06-01",
+        coverage_max_start_delay_days=2,
+        coverage_max_latest_age_hours=24,
+        coverage_min_span_days=1_000,
+        coverage_min_rows=30_000,
     ),
     ResearchScenario(
         name="btc_accumulation_1h_guarded",
@@ -147,6 +217,11 @@ DEFAULT_SCENARIOS = (
         opportunity_type="btc_accumulation",
         with_guards=True,
         candidate_set="position",
+        coverage_earliest="2020-06-01",
+        coverage_max_start_delay_days=2,
+        coverage_max_latest_age_hours=24,
+        coverage_min_span_days=1_000,
+        coverage_min_rows=30_000,
     ),
 )
 
@@ -154,14 +229,12 @@ DEFAULT_EXPORTS = {
     "active_income": {
         "pnl_unit": "usdt",
         "market": "futures",
-        "out": Path("outputs/active_strategies_flow.json"),
         "top_k": 3,
         "min_dsr": 0.60,
     },
     "btc_accumulation": {
         "pnl_unit": "btc",
         "market": "spot",
-        "out": Path("outputs/active_strategies_position.json"),
         "top_k": 3,
     },
 }
@@ -209,9 +282,29 @@ def _market_data_skip_marker(market_data_by_market: dict[str, dict[str, Any]]) -
     return json.dumps(marker, sort_keys=True)
 
 
+def _history_coverage_skip_marker(
+    statuses: dict[str, dict[str, Any]],
+) -> str | None:
+    if not statuses:
+        return None
+    marker = {
+        name: {
+            "ok": status.get("ok"),
+            "actual": status.get("actual"),
+            "failed_checks": status.get("failed_checks"),
+            "path": status.get("path"),
+            "read_error": status.get("read_error"),
+        }
+        for name, status in sorted(statuses.items())
+    }
+    return json.dumps(marker, sort_keys=True)
+
+
 def _hypotheses_for(scenario: ResearchScenario):
     if scenario.candidate_set == "position" or scenario.position:
         hypotheses = position_trading_set(with_guards=scenario.with_guards)
+    elif scenario.candidate_set == "swing":
+        hypotheses = swing_trading_set(with_guards=scenario.with_guards)
     elif scenario.candidate_set == "full":
         hypotheses = generate_batch(with_guards=scenario.with_guards)
     elif scenario.candidate_set == "smoke":
@@ -221,6 +314,36 @@ def _hypotheses_for(scenario: ResearchScenario):
     return [hyp for hyp in hypotheses if hyp.base_timeframe == scenario.base_tf]
 
 
+def _consumed_holdout_ids(
+    state: dict[str, Any],
+    scenario_name: str,
+) -> set[str]:
+    registry = state.get("consumed_holdout_ids")
+    if not isinstance(registry, dict):
+        return set()
+    values = registry.get(scenario_name)
+    if not isinstance(values, list):
+        return set()
+    return {str(value) for value in values if isinstance(value, str) and value.strip()}
+
+
+def _consumed_holdout_registry(state: dict[str, Any]) -> dict[str, set[str]]:
+    registry = state.get("consumed_holdout_ids")
+    if not isinstance(registry, dict):
+        return {}
+    return {
+        str(name): {str(value) for value in values if isinstance(value, str) and value.strip()}
+        for name, values in registry.items()
+        if isinstance(name, str) and name and isinstance(values, list)
+    }
+
+
+def _serialized_holdout_registry(
+    registry: dict[str, set[str]],
+) -> dict[str, list[str]]:
+    return {name: sorted(ids) for name, ids in sorted(registry.items()) if ids}
+
+
 def _select_from_hypotheses(
     scenario: ResearchScenario,
     hypotheses: list[Hypothesis],
@@ -228,19 +351,47 @@ def _select_from_hypotheses(
 ) -> tuple[list[Hypothesis], dict[str, Any]]:
     total = len(hypotheses)
     if total == 0:
-        return [], {"available": 0, "selected": 0, "offset": 0, "next_offset": 0}
-    limit = total if scenario.max_hypotheses is None else min(int(scenario.max_hypotheses), total)
+        return [], {
+            "available": 0,
+            "eligible": 0,
+            "consumed_holdout": 0,
+            "selected": 0,
+            "offset": 0,
+            "next_offset": 0,
+            "exhausted": False,
+        }
+    consumed = _consumed_holdout_ids(state, scenario.name)
+    relevant_consumed = {hyp.id for hyp in hypotheses if hyp.id in consumed}
+    eligible = total - len(relevant_consumed)
+    limit = (
+        eligible
+        if scenario.max_hypotheses is None
+        else min(
+            int(scenario.max_hypotheses),
+            eligible,
+        )
+    )
     offsets = state.get("scenario_offsets", {})
     offset = int(offsets.get(scenario.name, 0) or 0) % total if isinstance(offsets, dict) else 0
-    indices = [(offset + idx) % total for idx in range(limit)]
+    indices: list[int] = []
+    scanned = 0
+    while scanned < total and len(indices) < limit:
+        index = (offset + scanned) % total
+        scanned += 1
+        if hypotheses[index].id in relevant_consumed:
+            continue
+        indices.append(index)
     selected = [hypotheses[idx] for idx in indices]
-    next_offset = (offset + limit) % total
+    next_offset = (offset + scanned) % total
     return selected, {
         "available": total,
+        "eligible": eligible,
+        "consumed_holdout": len(relevant_consumed),
         "selected": len(selected),
         "offset": offset,
         "next_offset": next_offset,
-        "wrapped": next_offset <= offset and limit < total,
+        "wrapped": offset + scanned > total,
+        "exhausted": eligible == 0,
         "candidate_set": scenario.candidate_set,
         "max_hypotheses": scenario.max_hypotheses,
         "ids": [hyp.id for hyp in selected],
@@ -269,7 +420,12 @@ def _load_mutation_scenarios(
     path: Path,
     *,
     max_hypotheses_per_scenario: int = MAX_MUTATION_HYPOTHESES_PER_SCENARIO,
-) -> tuple[tuple[ResearchScenario, ...], dict[str, list[Hypothesis]], dict[str, dict[str, dict[str, Any]]], dict[str, Any]]:
+) -> tuple[
+    tuple[ResearchScenario, ...],
+    dict[str, list[Hypothesis]],
+    dict[str, dict[str, dict[str, Any]]],
+    dict[str, Any],
+]:
     if not path.exists():
         return (), {}, {}, {"status": "missing", "path": str(path), "scenarios": 0, "hypotheses": 0}
     try:
@@ -288,7 +444,17 @@ def _load_mutation_scenarios(
             },
         )
     if not isinstance(payload, dict):
-        return (), {}, {}, {"status": "invalid", "path": str(path), "reason": "payload_not_object", "scenarios": 0}
+        return (
+            (),
+            {},
+            {},
+            {
+                "status": "invalid",
+                "path": str(path),
+                "reason": "payload_not_object",
+                "scenarios": 0,
+            },
+        )
     if not payload.get("ok") or not payload.get("research_only") or payload.get("executable"):
         return (
             (),
@@ -322,13 +488,26 @@ def _load_mutation_scenarios(
                 skipped_errors.append(f"{type(exc).__name__}: {exc}")
             continue
         metadata = metadata_by_id.get(hyp.id, {})
-        product = str(metadata.get("product") or ("btc_accumulation" if hyp.direction == "short" else "active_income"))
-        market = str(metadata.get("market") or ("spot" if product == "btc_accumulation" else "futures"))
-        validation_scope = metadata.get("validation_scope") if isinstance(metadata.get("validation_scope"), dict) else {}
-        pnl_unit = str(validation_scope.get("pnl_unit") or ("btc" if product == "btc_accumulation" else "usdt"))
+        product = str(
+            metadata.get("product")
+            or ("btc_accumulation" if hyp.direction == "short" else "active_income")
+        )
+        market = str(
+            metadata.get("market") or ("spot" if product == "btc_accumulation" else "futures")
+        )
+        validation_scope = (
+            metadata.get("validation_scope")
+            if isinstance(metadata.get("validation_scope"), dict)
+            else {}
+        )
+        pnl_unit = str(
+            validation_scope.get("pnl_unit") or ("btc" if product == "btc_accumulation" else "usdt")
+        )
         position = product == "btc_accumulation" or pnl_unit == "btc"
         opportunity = str(metadata.get("opportunity_type") or "mutation_research")
-        grouped.setdefault((product, market, pnl_unit, hyp.base_timeframe, opportunity, position), []).append(hyp)
+        grouped.setdefault(
+            (product, market, pnl_unit, hyp.base_timeframe, opportunity, position), []
+        ).append(hyp)
 
     scenarios: list[ResearchScenario] = []
     hypotheses_by_scenario: dict[str, list[Hypothesis]] = {}
@@ -349,12 +528,12 @@ def _load_mutation_scenarios(
                 max_hypotheses=max_hypotheses_per_scenario,
             )
         )
-        hypotheses = sorted(grouped[(product, market, pnl_unit, base_tf, opportunity, position)], key=lambda h: h.id)
+        hypotheses = sorted(
+            grouped[(product, market, pnl_unit, base_tf, opportunity, position)], key=lambda h: h.id
+        )
         hypotheses_by_scenario[name] = hypotheses
         metadata_by_scenario[name] = {
-            hyp.id: metadata_by_id[hyp.id]
-            for hyp in hypotheses
-            if hyp.id in metadata_by_id
+            hyp.id: metadata_by_id[hyp.id] for hyp in hypotheses if hyp.id in metadata_by_id
         }
     summary = {
         "status": "loaded",
@@ -376,6 +555,168 @@ def _load_mutation_scenarios(
     )
 
 
+def _load_generated_scenarios(
+    path: Path,
+    *,
+    factory_config_path: Path = DEFAULT_RESEARCH_FACTORY_CONFIG,
+) -> tuple[
+    tuple[ResearchScenario, ...],
+    dict[str, list[Hypothesis]],
+    dict[str, dict[str, dict[str, Any]]],
+    dict[str, Any],
+]:
+    if not path.exists():
+        return (
+            (),
+            {},
+            {},
+            {
+                "status": "missing",
+                "path": str(path),
+                "scenarios": 0,
+                "hypotheses": 0,
+            },
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return (
+            (),
+            {},
+            {},
+            {
+                "status": "read_error",
+                "path": str(path),
+                "error": f"{type(exc).__name__}: {exc}",
+                "scenarios": 0,
+                "hypotheses": 0,
+            },
+        )
+    if not isinstance(payload, dict):
+        return (
+            (),
+            {},
+            {},
+            {
+                "status": "invalid",
+                "path": str(path),
+                "reason": "payload_not_object",
+                "scenarios": 0,
+                "hypotheses": 0,
+            },
+        )
+    safety_ok = (
+        payload.get("ok") is True
+        and payload.get("schema") == GENERATED_BATCH_SCHEMA
+        and payload.get("research_only") is True
+        and payload.get("executable") is False
+        and payload.get("paper_trade_allowed") is False
+        and payload.get("promotion_allowed") is False
+        and payload.get("live_allowed") is False
+    )
+    if not safety_ok:
+        return (
+            (),
+            {},
+            {},
+            {
+                "status": "ignored",
+                "path": str(path),
+                "reason": "generated_batch_failed_safety_contract",
+                "scenarios": 0,
+                "hypotheses": 0,
+            },
+        )
+    factory_config = load_factory_config(factory_config_path)
+    spaces = {space.name: space for space in factory_config.search_spaces}
+    metadata_by_id = {
+        str(item.get("id")): item
+        for item in payload.get("generation_metadata") or []
+        if isinstance(item, dict) and item.get("id")
+    }
+    grouped: dict[str, list[Hypothesis]] = {}
+    grouped_metadata: dict[str, dict[str, dict[str, Any]]] = {}
+    skipped_errors: list[str] = []
+    for item in payload.get("hypotheses") or []:
+        if not isinstance(item, dict):
+            if len(skipped_errors) < 10:
+                skipped_errors.append("hypothesis_not_object")
+            continue
+        try:
+            hypothesis = Hypothesis.from_dict(item)
+            metadata = metadata_by_id[hypothesis.id]
+            space_name = str(metadata["search_space"])
+            space = spaces[space_name]
+            expected_context = {
+                "product": space.product,
+                "market": space.market,
+                "pnl_unit": space.pnl_unit,
+                "opportunity_type": space.opportunity_type,
+                "base_timeframe": space.base_timeframe,
+            }
+            mismatches = [
+                key for key, expected in expected_context.items() if metadata.get(key) != expected
+            ]
+            if mismatches:
+                raise ValueError(f"metadata mismatch: {', '.join(mismatches)}")
+            problems = validate_hypothesis_against_space(hypothesis, space)
+            if problems:
+                raise ValueError(f"grammar contract failed: {', '.join(problems)}")
+            expected_hash = canonical_strategy_hash(strategy_behavior_spec(hypothesis, space))
+            if metadata.get("strategy_hash") != expected_hash:
+                raise ValueError("strategy_hash does not match canonical behavior")
+        except Exception as exc:
+            if len(skipped_errors) < 10:
+                skipped_errors.append(f"{type(exc).__name__}: {exc}")
+            continue
+        grouped.setdefault(space_name, []).append(hypothesis)
+        grouped_metadata.setdefault(space_name, {})[hypothesis.id] = metadata
+
+    scenarios: list[ResearchScenario] = []
+    hypotheses_by_scenario: dict[str, list[Hypothesis]] = {}
+    metadata_by_scenario: dict[str, dict[str, dict[str, Any]]] = {}
+    cumulative_trials = _int_count((payload.get("summary") or {}).get("cumulative_trials"))
+    for space_name, hypotheses in sorted(grouped.items()):
+        space = spaces[space_name]
+        contract = generated_history_contract(space)
+        name = f"generated_{space.name}"
+        scenarios.append(
+            ResearchScenario(
+                name=name,
+                product=space.product,
+                base_tf=space.base_timeframe,
+                pnl_unit=space.pnl_unit,
+                market=space.market,
+                position=space.product == "btc_accumulation",
+                opportunity_type=space.opportunity_type,
+                candidate_set="generated",
+                max_hypotheses=len(hypotheses),
+                **contract,
+            )
+        )
+        hypotheses_by_scenario[name] = sorted(hypotheses, key=lambda item: item.id)
+        metadata_by_scenario[name] = {
+            hypothesis.id: {
+                **grouped_metadata[space_name][hypothesis.id],
+                "cumulative_trials": cumulative_trials,
+            }
+            for hypothesis in hypotheses
+        }
+    summary = {
+        "status": "loaded",
+        "path": str(path),
+        "generated_at": payload.get("generated_at"),
+        "scenarios": len(scenarios),
+        "hypotheses": sum(len(items) for items in hypotheses_by_scenario.values()),
+        "skipped": len(skipped_errors),
+        "skipped_errors": skipped_errors,
+        "cumulative_trials": cumulative_trials,
+        "research_only": True,
+        "executable": False,
+    }
+    return tuple(scenarios), hypotheses_by_scenario, metadata_by_scenario, summary
+
+
 def _validation_config(scenario: ResearchScenario, *, n_trials: int = 1) -> ValidationConfig:
     if scenario.position:
         cfg = ValidationConfig(min_trades_train=15, min_trades_val=5, min_trades_holdout=3)
@@ -393,24 +734,15 @@ def _trial_count_for_selection(
     counts = [selected_hypotheses, supported_hypotheses]
     if isinstance(selection, dict):
         counts.extend(
-            _int_count(selection.get(key))
-            for key in ("available", "selected")
+            _int_count(selection.get(key)) for key in ("available", "selected", "cumulative_trials")
         )
     return max(1, *counts)
 
 
 def _summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     verdicts = Counter(str(result.get("verdict", "unknown")) for result in results)
-    reasons = Counter(
-        reason
-        for result in results
-        for reason in result.get("reasons", [])
-    )
-    keepers = [
-        result
-        for result in results
-        if result.get("verdict") == "keep"
-    ]
+    reasons = Counter(reason for result in results for reason in result.get("reasons", []))
+    keepers = [result for result in results if result.get("verdict") == "keep"]
     return {
         "hypotheses": len(results),
         "keepers": len(keepers),
@@ -424,6 +756,7 @@ def _segment_summary(result: dict[str, Any], name: str) -> dict[str, Any] | None
     segment = result.get(name)
     if not isinstance(segment, dict):
         return None
+
     def finite_or_none(value: Any) -> float | None:
         try:
             number = float(value)
@@ -537,9 +870,7 @@ def _incubation_candidates_from_results(
                     else {}
                 ),
                 **(
-                    {"holdout": holdout}
-                    if (holdout := _segment_summary(result, "holdout"))
-                    else {}
+                    {"holdout": holdout} if (holdout := _segment_summary(result, "holdout")) else {}
                 ),
                 **(
                     {"oos_pass_rate": result["oos"]["pass_rate"]}
@@ -575,8 +906,24 @@ def _cycle_next_actions(summary: dict[str, Any]) -> list[str]:
     actions: list[str] = []
     top_reasons = summary.get("top_reasons") or {}
     mutation_effectiveness = summary.get("mutation_effectiveness") or {}
+    if summary.get("staged"):
+        staged_candidates = summary.get("staged_candidates") or []
+        staged_detail = staged_candidates[0] if staged_candidates else {}
+        digest = staged_detail.get("artifact_digest") or "<missing-digest>"
+        product = staged_detail.get("product") or "<unknown-product>"
+        actions.append(
+            f"review staged live candidate {product} digest {digest} and activate it "
+            "explicitly while paused; approval and fresh live evidence are still required"
+        )
     if summary.get("scenario_errors"):
         actions.append("repair failing research scenarios before trusting exports")
+    if summary.get("coverage_failures"):
+        failed_names = ", ".join(summary.get("coverage_failed_scenarios") or [])
+        actions.append(
+            "bootstrap the required direct timeframe history"
+            + (f" for {failed_names}" if failed_names else "")
+            + " before rerunning research"
+        )
     if summary.get("unsupported_hypotheses"):
         actions.append("repair indicator coverage for unsupported hypotheses")
     if (
@@ -588,7 +935,11 @@ def _cycle_next_actions(summary: dict[str, Any]) -> list[str]:
         actions.append(f"mutation batch found no keepers; top mutation reason {mutation_reason}")
     if summary.get("hypotheses") and not summary.get("keepers"):
         if top_reasons.get("no_train_edge"):
-            actions.append("continue rotating curated candidates; no positive train edge found yet")
+            actions.append(
+                "let the generator explore new structures; no positive train edge found yet"
+                if summary.get("generative_search")
+                else "continue rotating curated candidates; no positive train edge found yet"
+            )
         elif top_reasons.get("failed_validation"):
             actions.append("keep validation gate tight; candidates are losing validation")
         elif top_reasons.get("failed_holdout"):
@@ -598,13 +949,24 @@ def _cycle_next_actions(summary: dict[str, Any]) -> list[str]:
             or top_reasons.get("insufficient_validation_trades")
             or top_reasons.get("insufficient_holdout_trades")
         ):
-            actions.append("favor higher-frequency or longer-window candidates to improve sample size")
+            actions.append(
+                "favor higher-frequency or longer-window candidates to improve sample size"
+            )
         else:
             actions.append("continue bounded search; no exportable keeper found yet")
     if summary.get("keepers") and not summary.get("exported"):
-        export_reasons = summary.get("export_reasons") if isinstance(summary.get("export_reasons"), dict) else {}
+        export_reasons = (
+            summary.get("export_reasons") if isinstance(summary.get("export_reasons"), dict) else {}
+        )
         if export_reasons.get("open_positions_block_export"):
-            actions.append("wait for open positions to close before replacing the active paper artifact")
+            if summary.get("staging_open_position_blocks"):
+                actions.append(
+                    "wait for open positions to close before refreshing the staged live candidate"
+                )
+            if summary.get("active_open_position_blocks"):
+                actions.append(
+                    "wait for open positions to close before replacing the active paper artifact"
+                )
         else:
             actions.append("inspect kept candidates blocked during export policy checks")
     if not actions and summary.get("exported"):
@@ -689,11 +1051,57 @@ def _mutation_effectiveness_summary(
     }
 
 
+def _generated_effectiveness_summary(
+    scenario_reports: list[dict[str, Any]],
+    generated_batch_summary: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    generated = [
+        scenario for scenario in scenario_reports if scenario.get("candidate_set") == "generated"
+    ]
+    if generated_batch_summary is None and not generated:
+        return None
+    verdicts: Counter[str] = Counter()
+    reasons: Counter[str] = Counter()
+    by_product: Counter[str] = Counter()
+    evaluated = 0
+    keepers = 0
+    holdout_exposures = 0
+    already_evaluated = 0
+    for scenario in generated:
+        by_product[str(scenario.get("product") or "unknown")] += 1
+        evaluated += _int_count(scenario.get("hypotheses"))
+        keepers += _int_count(scenario.get("keepers"))
+        holdout_exposures += len(scenario.get("holdout_exposed_ids") or [])
+        already_evaluated += len(scenario.get("already_evaluated_ids") or [])
+        for verdict, count in (scenario.get("verdicts") or {}).items():
+            verdicts[str(verdict)] += _int_count(count)
+        for reason, count in (scenario.get("top_reasons") or {}).items():
+            reasons[str(reason)] += _int_count(count)
+    batch = generated_batch_summary or {}
+    return {
+        "status": batch.get("status") or ("evaluated" if generated else "not_loaded"),
+        "generated_at": batch.get("generated_at"),
+        "batch_hypotheses": batch.get("hypotheses"),
+        "cumulative_trials": _int_count(batch.get("cumulative_trials")),
+        "evaluated_scenarios": len(generated),
+        "evaluated_hypotheses": evaluated,
+        "already_evaluated": already_evaluated,
+        "keepers": keepers,
+        "holdout_exposures": holdout_exposures,
+        "by_product": dict(sorted(by_product.items())),
+        "verdicts": dict(sorted(verdicts.items())),
+        "top_development_reasons": {
+            reason: count for reason, count in reasons.most_common(8) if "holdout" not in reason
+        },
+    }
+
+
 def _summarize_cycle(
     scenario_reports: list[dict[str, Any]],
     export_reports: list[dict[str, Any]],
     *,
     mutation_batch_summary: dict[str, Any] | None = None,
+    generated_batch_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     verdicts: Counter[str] = Counter()
     top_reasons: Counter[str] = Counter()
@@ -706,11 +1114,14 @@ def _summarize_cycle(
     incubation_candidates = 0
     unsupported = 0
     scenario_errors = 0
+    coverage_failed_scenarios: list[str] = []
 
     for scenario in scenario_reports:
         if not scenario.get("ok"):
             scenario_errors += 1
             top_reasons["scenario_error"] += 1
+        if scenario.get("reason") == "insufficient_history_coverage":
+            coverage_failed_scenarios.append(str(scenario.get("name") or "unknown"))
         product = str(scenario.get("product", "unknown"))
         opportunity = str(scenario.get("opportunity_type", "unknown"))
         opportunities[opportunity] += 1
@@ -729,13 +1140,41 @@ def _summarize_cycle(
             top_reasons[str(reason)] += _int_count(count)
 
     exported = sum(1 for item in export_reports if item.get("exported"))
+    staged = sum(1 for item in export_reports if item.get("staged"))
+    active_exports = sum(
+        1 for item in export_reports if item.get("exported") and item.get("destination") == "active"
+    )
     export_failures = sum(1 for item in export_reports if not item.get("ok"))
-    no_exportable = sum(1 for item in export_reports if item.get("reason") == "no_exportable_strategies")
+    no_exportable = sum(
+        1 for item in export_reports if item.get("reason") == "no_exportable_strategies"
+    )
     export_reasons = Counter(
         str(item.get("reason"))
         for item in export_reports
         if not item.get("exported") and item.get("reason")
     )
+    staging_open_position_blocks = sum(
+        1
+        for item in export_reports
+        if item.get("reason") == "open_positions_block_export"
+        and item.get("destination") == "staging"
+    )
+    active_open_position_blocks = sum(
+        1
+        for item in export_reports
+        if item.get("reason") == "open_positions_block_export"
+        and item.get("destination") == "active"
+    )
+    staged_candidates = [
+        {
+            "product": item.get("product"),
+            "artifact": item.get("artifact"),
+            "artifact_digest": item.get("artifact_digest"),
+            "active_artifact": item.get("active_artifact"),
+        }
+        for item in export_reports
+        if item.get("staged")
+    ]
     summary = {
         "scenarios": len(scenario_reports),
         "opportunity_types": dict(sorted(opportunities.items())),
@@ -744,6 +1183,8 @@ def _summarize_cycle(
             for product, counts in sorted(opportunities_by_product.items())
         },
         "scenario_errors": scenario_errors,
+        "coverage_failures": len(coverage_failed_scenarios),
+        "coverage_failed_scenarios": coverage_failed_scenarios,
         "hypotheses": hypotheses,
         "selected_hypotheses": selected,
         "available_hypotheses": available,
@@ -754,9 +1195,14 @@ def _summarize_cycle(
         "top_reasons": dict(top_reasons.most_common(8)),
         "exports": len(export_reports),
         "exported": exported,
+        "staged": staged,
+        "staged_candidates": staged_candidates,
+        "active_exports": active_exports,
         "export_failures": export_failures,
         "no_exportable": no_exportable,
         "export_reasons": dict(export_reasons.most_common()),
+        "staging_open_position_blocks": staging_open_position_blocks,
+        "active_open_position_blocks": active_open_position_blocks,
     }
     mutation_effectiveness = _mutation_effectiveness_summary(
         scenario_reports,
@@ -764,6 +1210,12 @@ def _summarize_cycle(
     )
     if mutation_effectiveness is not None:
         summary["mutation_effectiveness"] = mutation_effectiveness
+    generated_effectiveness = _generated_effectiveness_summary(
+        scenario_reports,
+        generated_batch_summary,
+    )
+    if generated_effectiveness is not None:
+        summary["generative_search"] = generated_effectiveness
     summary["next_actions"] = _cycle_next_actions(summary)
     return summary
 
@@ -817,10 +1269,7 @@ def build_incubation_review(
         "reason": "non_keeper_research_attention_queue",
         "summary": {
             "candidates": total,
-            "by_product": {
-                product: len(items)
-                for product, items in selected_by_product.items()
-            },
+            "by_product": {product: len(items) for product, items in selected_by_product.items()},
         },
         "products": selected_by_product,
     }
@@ -862,6 +1311,465 @@ def _partition_supported_hypotheses(
     return supported, unsupported
 
 
+def _retire_unsupported_generated_hypotheses(
+    unsupported: list[dict[str, Any]],
+    *,
+    hypothesis_metadata: dict[str, dict[str, Any]] | None,
+    experiment_memory: ExperimentMemory | None,
+) -> list[str]:
+    """Retire generated work that cannot compile against the real feature inventory.
+
+    Generated candidates are registered before evaluation so a killed process can
+    resume them.  Without this terminal transition, a permanently unsupported
+    candidate would remain ``pending`` forever and eventually apply backpressure
+    to every future factory cycle.  Legacy hypotheses have no strategy hash and
+    are deliberately left untouched.
+    """
+
+    if experiment_memory is None or not hypothesis_metadata:
+        return []
+    retired: list[str] = []
+    for item in unsupported:
+        hypothesis_id = str(item.get("id") or "")
+        metadata = hypothesis_metadata.get(hypothesis_id) or {}
+        behavior_hash = metadata.get("strategy_hash")
+        if not isinstance(behavior_hash, str):
+            continue
+        missing = item.get("missing_columns")
+        detail = json.dumps(missing, sort_keys=True, separators=(",", ":"))
+        experiment_memory.retire_strategy(
+            behavior_hash,
+            reason=f"unsupported_feature_contract:{detail}"[:512],
+        )
+        retired.append(hypothesis_id)
+    return sorted(retired)
+
+
+def _scenario_coverage_requirements(
+    scenario: ResearchScenario,
+    *,
+    now: str | pd.Timestamp | None = None,
+) -> dict[str, Any] | None:
+    """Return the explicit real-history contract for a scenario.
+
+    Ad-hoc/mutation scenarios can omit the contract.  Every curated default
+    scenario sets it explicitly so a recent, shallow seed can never be mistaken
+    for the multi-year sample used by the validation gates.
+    """
+    configured = (
+        scenario.coverage_earliest,
+        scenario.coverage_max_start_delay_days,
+        scenario.coverage_max_latest_age_hours,
+        scenario.coverage_min_span_days,
+        scenario.coverage_min_rows,
+    )
+    if all(value is None for value in configured):
+        return None
+    if any(value is None for value in configured):
+        raise ValueError(f"{scenario.name}: incomplete history coverage contract")
+    if float(scenario.coverage_max_start_delay_days or 0) < 0:
+        raise ValueError(f"{scenario.name}: coverage_max_start_delay_days must be non-negative")
+    if float(scenario.coverage_max_latest_age_hours or 0) <= 0:
+        raise ValueError(f"{scenario.name}: coverage_max_latest_age_hours must be positive")
+    if float(scenario.coverage_min_span_days or 0) <= 0:
+        raise ValueError(f"{scenario.name}: coverage_min_span_days must be positive")
+    if int(scenario.coverage_min_rows or 0) <= 0:
+        raise ValueError(f"{scenario.name}: coverage_min_rows must be positive")
+
+    earliest = pd.Timestamp(str(scenario.coverage_earliest))
+    earliest = (
+        earliest.tz_localize("UTC") if earliest.tzinfo is None else earliest.tz_convert("UTC")
+    )
+    reference = pd.Timestamp(now if now is not None else utc_now())
+    reference = (
+        reference.tz_localize("UTC") if reference.tzinfo is None else reference.tz_convert("UTC")
+    )
+    if scenario.end:
+        end = pd.Timestamp(scenario.end)
+        reference = end.tz_localize("UTC") if end.tzinfo is None else end.tz_convert("UTC")
+    latest = reference - pd.Timedelta(hours=float(scenario.coverage_max_latest_age_hours))
+    return {
+        "earliest_at_or_before": (
+            earliest + pd.Timedelta(days=float(scenario.coverage_max_start_delay_days))
+        ).isoformat(),
+        "latest_at_or_after": latest.isoformat(),
+        "minimum_span_days": float(scenario.coverage_min_span_days),
+        "minimum_rows": int(scenario.coverage_min_rows),
+    }
+
+
+def _scenario_coverage_status(
+    frame: pd.DataFrame,
+    scenario: ResearchScenario,
+    *,
+    now: str | pd.Timestamp | None = None,
+    research_factory_config_path: Path = DEFAULT_RESEARCH_FACTORY_CONFIG,
+) -> dict[str, Any] | None:
+    requirements = _scenario_coverage_requirements(scenario, now=now)
+    if requirements is None:
+        return None
+
+    if "timestamp" in frame.columns:
+        values = frame["timestamp"]
+    elif isinstance(frame.index, pd.DatetimeIndex):
+        values = pd.Series(frame.index, index=frame.index)
+    else:
+        values = pd.Series(dtype="datetime64[ns, UTC]")
+    timestamps = pd.to_datetime(values, utc=True, errors="coerce").dropna()
+    earliest = timestamps.min() if not timestamps.empty else None
+    latest = timestamps.max() if not timestamps.empty else None
+    span_days = (
+        float((latest - earliest).total_seconds() / 86_400)
+        if earliest is not None and latest is not None
+        else 0.0
+    )
+    rows = int(len(frame))
+    checks = {
+        "earliest": bool(
+            earliest is not None and earliest <= pd.Timestamp(requirements["earliest_at_or_before"])
+        ),
+        "latest": bool(
+            latest is not None and latest >= pd.Timestamp(requirements["latest_at_or_after"])
+        ),
+        "span": span_days >= float(requirements["minimum_span_days"]),
+        "rows": rows >= int(requirements["minimum_rows"]),
+    }
+    failed_checks = [name for name, ok in checks.items() if not ok]
+    return {
+        "ok": not failed_checks,
+        "requirements": requirements,
+        "actual": {
+            "earliest": earliest.isoformat() if earliest is not None else None,
+            "latest": latest.isoformat() if latest is not None else None,
+            "span_days": round(span_days, 6),
+            "rows": rows,
+        },
+        "checks": checks,
+        "failed_checks": failed_checks,
+        "remediation": {
+            "action": "bootstrap_research_history",
+            "command": [
+                ".venv/bin/python",
+                "-m",
+                "src.autopilot.history_bootstrap",
+                "--config",
+                str(research_factory_config_path),
+                "--market",
+                scenario.market,
+                "--report",
+                f"runtime/history_bootstrap_{scenario.market}.json",
+            ],
+            "note": (
+                "Fetch the direct Binance timeframe history, then rerun the research cycle. "
+                "Do not weaken the coverage contract to admit a shallow sample."
+            ),
+        },
+    }
+
+
+def _scenario_indicator_coverage_status(
+    scenario: ResearchScenario,
+    *,
+    indicator_dir: Path,
+    now: str | pd.Timestamp | None = None,
+    research_factory_config_path: Path = DEFAULT_RESEARCH_FACTORY_CONFIG,
+) -> dict[str, Any] | None:
+    """Check base-timeframe depth even when every candidate lacks a feature."""
+    if _scenario_coverage_requirements(scenario, now=now) is None:
+        return None
+    path = indicator_dir / f"BTCUSDT_{scenario.base_tf}_all_indicators.parquet"
+    try:
+        filters: list[tuple[str, str, pd.Timestamp]] = [
+            ("timestamp", ">=", _utc_timestamp_for_coverage(scenario.start)),
+        ]
+        if scenario.end:
+            filters.append(("timestamp", "<=", _utc_timestamp_for_coverage(scenario.end)))
+        frame = pd.read_parquet(path, columns=["timestamp"], filters=filters)
+        if "timestamp" not in frame.columns:
+            frame = frame.reset_index()
+    except Exception as exc:
+        frame = pd.DataFrame(columns=["timestamp"])
+        read_error = f"{type(exc).__name__}: {exc}"
+    else:
+        read_error = None
+    status = _scenario_coverage_status(
+        frame,
+        scenario,
+        now=now,
+        research_factory_config_path=research_factory_config_path,
+    )
+    assert status is not None
+    status["path"] = str(path)
+    if read_error:
+        status["read_error"] = read_error
+    return status
+
+
+def _utc_timestamp_for_coverage(value: str | pd.Timestamp) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    return timestamp.tz_localize("UTC") if timestamp.tzinfo is None else timestamp.tz_convert("UTC")
+
+
+def _coverage_failure_report(
+    scenario: ResearchScenario,
+    coverage: dict[str, Any],
+    *,
+    selection: dict[str, Any] | None,
+    unsupported_hypotheses: list[dict[str, Any]],
+    research_factory_config_path: Path = DEFAULT_RESEARCH_FACTORY_CONFIG,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "skipped": True,
+        "reason": "insufficient_history_coverage",
+        "name": scenario.name,
+        "product": scenario.product,
+        "base_tf": scenario.base_tf,
+        "pnl_unit": scenario.pnl_unit,
+        "market": scenario.market,
+        "position": scenario.position,
+        "opportunity_type": scenario.opportunity_type,
+        "with_guards": scenario.with_guards,
+        "candidate_set": scenario.candidate_set,
+        "start": scenario.start,
+        "end": scenario.end,
+        "rows": int((coverage.get("actual") or {}).get("rows") or 0),
+        "hypotheses": 0,
+        "keepers": 0,
+        "keeper_ids": [],
+        "selection": selection,
+        "unsupported_hypotheses": unsupported_hypotheses,
+        "holdout_exposed_ids": [],
+        "verdicts": {},
+        "top_reasons": {"insufficient_history_coverage": 1},
+        "coverage": coverage,
+        "remediation": coverage.get("remediation")
+        or {
+            "action": "bootstrap_research_history",
+            "command": [
+                ".venv/bin/python",
+                "-m",
+                "src.autopilot.history_bootstrap",
+                "--config",
+                str(research_factory_config_path),
+            ],
+        },
+    }
+
+
+def _peer_coverage_gate_report(
+    scenario: ResearchScenario,
+    *,
+    failed_scenarios: list[str],
+    coverage: dict[str, Any] | None,
+    research_factory_config_path: Path = DEFAULT_RESEARCH_FACTORY_CONFIG,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "skipped": True,
+        "reason": "history_coverage_gate_blocked",
+        "name": scenario.name,
+        "product": scenario.product,
+        "base_tf": scenario.base_tf,
+        "pnl_unit": scenario.pnl_unit,
+        "market": scenario.market,
+        "position": scenario.position,
+        "opportunity_type": scenario.opportunity_type,
+        "with_guards": scenario.with_guards,
+        "candidate_set": scenario.candidate_set,
+        "start": scenario.start,
+        "end": scenario.end,
+        "rows": 0,
+        "hypotheses": 0,
+        "keepers": 0,
+        "keeper_ids": [],
+        "selection": None,
+        "unsupported_hypotheses": [],
+        "holdout_exposed_ids": [],
+        "verdicts": {},
+        "top_reasons": {"history_coverage_gate_blocked": 1},
+        "blocked_by_scenarios": failed_scenarios,
+        **({"coverage": coverage} if coverage is not None else {}),
+        "remediation": {
+            "action": "bootstrap_research_history",
+            "command": [
+                ".venv/bin/python",
+                "-m",
+                "src.autopilot.history_bootstrap",
+                "--config",
+                str(research_factory_config_path),
+                "--report",
+                "runtime/history_bootstrap.json",
+            ],
+        },
+    }
+
+
+def _frame_window(frame: pd.DataFrame) -> dict[str, Any]:
+    if "timestamp" in frame.columns:
+        timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce").dropna()
+    elif isinstance(frame.index, pd.DatetimeIndex):
+        timestamps = pd.Series(pd.to_datetime(frame.index, utc=True)).dropna()
+    else:
+        timestamps = pd.Series(dtype="datetime64[ns, UTC]")
+    return {
+        "start": timestamps.min().isoformat() if not timestamps.empty else None,
+        "end": timestamps.max().isoformat() if not timestamps.empty else None,
+        "rows": int(len(frame)),
+    }
+
+
+def _content_digest(path: Path) -> str:
+    """Hash immutable dataset content once per process/stat version."""
+
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"dataset input must be a non-symlink regular file: {path}")
+    stat_result = path.stat()
+    key = (
+        str(path.resolve()),
+        int(stat_result.st_ino),
+        int(stat_result.st_size),
+        int(stat_result.st_mtime_ns),
+    )
+    cached = _FILE_DIGEST_CACHE.get(key)
+    if cached is not None:
+        return cached
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    result = "sha256:" + digest.hexdigest()
+    if len(_FILE_DIGEST_CACHE) >= _MAX_FILE_DIGEST_CACHE_ITEMS:
+        _FILE_DIGEST_CACHE.clear()
+    _FILE_DIGEST_CACHE[key] = result
+    return result
+
+
+def _dataset_snapshot(
+    scenario: ResearchScenario,
+    hypotheses: list[Hypothesis],
+    *,
+    frame: pd.DataFrame,
+    indicator_dir: Path,
+) -> dict[str, Any]:
+    timeframes = sorted(
+        {hypothesis.base_timeframe for hypothesis in hypotheses}
+        | {
+            predicate.timeframe
+            for hypothesis in hypotheses
+            for predicate in hypothesis.all_predicates()
+        }
+    )
+    files: list[dict[str, Any]] = []
+    for timeframe in timeframes:
+        path = indicator_dir / f"BTCUSDT_{timeframe}_all_indicators.parquet"
+        stat_result = path.stat()
+        parquet = pq.ParquetFile(path)
+        files.append(
+            {
+                "timeframe": timeframe,
+                "path": str(path),
+                "file": path.name,
+                "size_bytes": int(stat_result.st_size),
+                "content_digest": _content_digest(path),
+                "rows": int(parquet.metadata.num_rows),
+                "row_groups": int(parquet.metadata.num_row_groups),
+                "schema": hashlib.sha256(str(parquet.schema_arrow).encode()).hexdigest(),
+            }
+        )
+    manifest: dict[str, Any] = {
+        "symbol": "BTCUSDT",
+        "market": scenario.market,
+        "base_timeframe": scenario.base_tf,
+        "scenario_window": {"start": scenario.start, "end": scenario.end},
+        "loaded_window": _frame_window(frame),
+        "files": files,
+    }
+    identity_manifest = {
+        **manifest,
+        "files": [{key: value for key, value in item.items() if key != "path"} for item in files],
+    }
+    encoded = json.dumps(identity_manifest, sort_keys=True, separators=(",", ":"))
+    return {
+        **manifest,
+        "snapshot_id": "sha256:" + hashlib.sha256(encoded.encode()).hexdigest(),
+    }
+
+
+def _development_window(frame: pd.DataFrame, config: ValidationConfig) -> dict[str, Any]:
+    segments = split_frame(frame, config)
+    return {
+        "train": _frame_window(segments["train"]),
+        "validation": _frame_window(segments["validation"]),
+        "pre_holdout_rows": int(len(segments["train"]) + len(segments["validation"])),
+    }
+
+
+def _development_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "stage_reached": _candidate_stage(result),
+        "dsr_deflated": result.get("dsr_deflated"),
+    }
+    for stage in ("train", "validation"):
+        if summary := _segment_summary(result, stage):
+            metrics[stage] = summary
+    if isinstance(result.get("oos"), dict):
+        metrics["oos_pass_rate"] = result["oos"].get("pass_rate")
+    if isinstance(result.get("sensitivity"), dict):
+        metrics["sensitivity_pass_fraction"] = result["sensitivity"].get("pass_fraction")
+    return metrics
+
+
+def _memory_protocol(
+    scenario: ResearchScenario,
+    validation_config: ValidationConfig,
+    eval_config: EvalConfig,
+) -> dict[str, Any]:
+    return {
+        "schema": "autopilot.staged_validation/v2",
+        "research_engine_digest": execution_engine_digest(),
+        "scenario": scenario.name,
+        "product": scenario.product,
+        "market": scenario.market,
+        "pnl_unit": scenario.pnl_unit,
+        "base_timeframe": scenario.base_tf,
+        "validation": dataclasses.asdict(validation_config),
+        "evaluation": dataclasses.asdict(eval_config),
+    }
+
+
+def _register_legacy_memory_strategy(
+    memory: ExperimentMemory,
+    hypothesis: Hypothesis,
+    scenario: ResearchScenario,
+) -> str:
+    spec = {
+        **hypothesis.to_dict(),
+        "_product": scenario.product,
+        "_market": scenario.market,
+        "_pnl_unit": scenario.pnl_unit,
+        "_opportunity_type": scenario.opportunity_type,
+        "_search_space": scenario.name,
+    }
+    behavior_hash = canonical_strategy_hash(spec)
+    memory.register_strategy(
+        spec,
+        strategy_id=hypothesis.id,
+        generation_method="legacy_seed",
+        metadata={
+            "family": hypothesis.family,
+            "product": scenario.product,
+            "market": scenario.market,
+            "pnl_unit": scenario.pnl_unit,
+            "opportunity_type": scenario.opportunity_type,
+            "search_space": scenario.name,
+            "base_timeframe": scenario.base_tf,
+            "lineage_depth": 0,
+        },
+    )
+    return behavior_hash
+
+
 def run_validation_scenario(
     scenario: ResearchScenario,
     *,
@@ -869,14 +1777,36 @@ def run_validation_scenario(
     selection: dict[str, Any] | None = None,
     hypothesis_metadata: dict[str, dict[str, Any]] | None = None,
     log_path: Path = DEFAULT_LOG,
+    coverage_now: str | pd.Timestamp | None = None,
+    experiment_memory: ExperimentMemory | None = None,
+    research_factory_config_path: Path = DEFAULT_RESEARCH_FACTORY_CONFIG,
 ) -> dict[str, Any]:
     hypotheses = _hypotheses_for(scenario) if hypotheses is None else hypotheses
     if not hypotheses:
         raise ValueError(f"{scenario.name}: no hypotheses for base timeframe {scenario.base_tf}")
     selected_indicator_dir = indicator_data_dir("BTCUSDT", scenario.market, legacy_fallback=True)
+    coverage = _scenario_indicator_coverage_status(
+        scenario,
+        indicator_dir=selected_indicator_dir,
+        now=coverage_now,
+        research_factory_config_path=research_factory_config_path,
+    )
+    if coverage is not None and not coverage["ok"]:
+        return _coverage_failure_report(
+            scenario,
+            coverage,
+            selection=selection,
+            unsupported_hypotheses=[],
+            research_factory_config_path=research_factory_config_path,
+        )
     supported_hypotheses, unsupported_hypotheses = _partition_supported_hypotheses(
         hypotheses,
         indicator_dir=selected_indicator_dir,
+    )
+    retired_unsupported_ids = _retire_unsupported_generated_hypotheses(
+        unsupported_hypotheses,
+        hypothesis_metadata=hypothesis_metadata,
+        experiment_memory=experiment_memory,
     )
     if not supported_hypotheses:
         return {
@@ -899,6 +1829,8 @@ def run_validation_scenario(
             "keepers": 0,
             "selection": selection,
             "unsupported_hypotheses": unsupported_hypotheses,
+            "retired_unsupported_ids": retired_unsupported_ids,
+            "holdout_exposed_ids": [],
             "verdicts": {},
             "top_reasons": {"unsupported_features": len(unsupported_hypotheses)},
         }
@@ -909,6 +1841,20 @@ def run_validation_scenario(
         end=scenario.end,
         indicator_dir=selected_indicator_dir,
     )
+    coverage = _scenario_coverage_status(
+        frame,
+        scenario,
+        now=coverage_now,
+        research_factory_config_path=research_factory_config_path,
+    )
+    if coverage is not None and not coverage["ok"]:
+        return _coverage_failure_report(
+            scenario,
+            coverage,
+            selection=selection,
+            unsupported_hypotheses=unsupported_hypotheses,
+            research_factory_config_path=research_factory_config_path,
+        )
     eval_cfg = EvalConfig(pnl_unit=scenario.pnl_unit, market=scenario.market)
     validation_cfg = _validation_config(
         scenario,
@@ -918,16 +1864,172 @@ def run_validation_scenario(
             supported_hypotheses=len(supported_hypotheses),
         ),
     )
+    memory_hashes: dict[str, str] = {}
+    dataset_snapshot: dict[str, Any] | None = None
+    development_window: dict[str, Any] | None = None
+    protocol: dict[str, Any] | None = None
+    already_evaluated: list[str] = []
+    if experiment_memory is not None:
+        dataset_snapshot = _dataset_snapshot(
+            scenario,
+            supported_hypotheses,
+            frame=frame,
+            indicator_dir=selected_indicator_dir,
+        )
+        development_window = _development_window(frame, validation_cfg)
+        protocol = _memory_protocol(scenario, validation_cfg, eval_cfg)
+        hypothesis_metadata = hypothesis_metadata or {}
+        pending_hypotheses: list[Hypothesis] = []
+        for hypothesis in supported_hypotheses:
+            metadata = hypothesis_metadata.get(hypothesis.id, {})
+            behavior_hash = metadata.get("strategy_hash")
+            if behavior_hash is None:
+                behavior_hash = _register_legacy_memory_strategy(
+                    experiment_memory,
+                    hypothesis,
+                    scenario,
+                )
+            else:
+                behavior_hash = str(behavior_hash)
+                registered = experiment_memory.get_strategy(behavior_hash)
+                submitted = registered.get("submitted_spec") or {}
+                if canonical_strategy_hash(submitted) != behavior_hash:
+                    raise ValueError(f"{hypothesis.id}: experiment-memory identity mismatch")
+            memory_hashes[hypothesis.id] = behavior_hash
+            if experiment_memory.is_tested(
+                behavior_hash,
+                dataset=dataset_snapshot,
+                window=development_window,
+                protocol=protocol,
+                phase="development",
+            ):
+                already_evaluated.append(hypothesis.id)
+            else:
+                pending_hypotheses.append(hypothesis)
+        supported_hypotheses = pending_hypotheses
+        if not supported_hypotheses:
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "already_evaluated_on_snapshot",
+                "name": scenario.name,
+                "product": scenario.product,
+                "base_tf": scenario.base_tf,
+                "pnl_unit": scenario.pnl_unit,
+                "market": scenario.market,
+                "position": scenario.position,
+                "opportunity_type": scenario.opportunity_type,
+                "with_guards": scenario.with_guards,
+                "candidate_set": scenario.candidate_set,
+                "start": scenario.start,
+                "end": scenario.end,
+                "rows": int(len(frame)),
+                "hypotheses": 0,
+                "keepers": 0,
+                "keeper_ids": [],
+                "selection": selection,
+                "unsupported_hypotheses": unsupported_hypotheses,
+                "retired_unsupported_ids": retired_unsupported_ids,
+                "holdout_exposed_ids": [],
+                "already_evaluated_ids": already_evaluated,
+                "verdicts": {},
+                "top_reasons": {"already_evaluated_on_snapshot": len(already_evaluated)},
+                "dataset_snapshot_id": dataset_snapshot["snapshot_id"],
+            }
+
+    holdout_claims: dict[str, str] = {}
+
+    def before_holdout(hypothesis: Hypothesis, partial_result: dict[str, Any]) -> bool:
+        if experiment_memory is None:
+            return True
+        assert (
+            dataset_snapshot is not None and development_window is not None and protocol is not None
+        )
+        behavior_hash = memory_hashes[hypothesis.id]
+        experiment_memory.record_outcome(
+            behavior_hash,
+            dataset=dataset_snapshot,
+            window=development_window,
+            protocol=protocol,
+            phase="development",
+            outcome="pre_holdout_pass",
+            metrics=_development_metrics(partial_result),
+            details={"stage_reached": "sensitivity", "holdout_feedback_allowed": False},
+        )
+        snapshot_id = str(dataset_snapshot["snapshot_id"])
+        if experiment_memory.holdout_claimed(behavior_hash, snapshot_id=snapshot_id):
+            return False
+        try:
+            claim = experiment_memory.claim_holdout(
+                behavior_hash,
+                snapshot_id=snapshot_id,
+                dataset=dataset_snapshot,
+                window=partial_result["splits"]["holdout"],
+                protocol=protocol,
+            )
+        except EvaluationConflictError:
+            return False
+        if not claim.created:
+            return False
+        holdout_claims[hypothesis.id] = claim.evaluation_key
+        return True
+
+    def checkpoint_candidate(hypothesis: Hypothesis, result: dict[str, Any]) -> None:
+        """Persist each candidate before the sequential batch advances."""
+
+        if experiment_memory is None:
+            return
+        assert (
+            dataset_snapshot is not None and development_window is not None and protocol is not None
+        )
+        behavior_hash = memory_hashes[hypothesis.id]
+        if result.get("holdout") is not None:
+            evaluation_key = holdout_claims.get(hypothesis.id)
+            if evaluation_key is None:
+                raise RuntimeError(f"{hypothesis.id}: holdout was read without a durable claim")
+            experiment_memory.complete_evaluation(
+                evaluation_key,
+                outcome=str(result["verdict"]),
+                rejection_reasons=tuple(str(item) for item in result.get("reasons") or []),
+                metrics={"holdout": _segment_summary(result, "holdout") or {}},
+                details={"protected_feedback": True},
+            )
+        elif "holdout_already_consumed" not in set(result.get("reasons") or []):
+            experiment_memory.record_outcome(
+                behavior_hash,
+                dataset=dataset_snapshot,
+                window=development_window,
+                protocol=protocol,
+                phase="development",
+                outcome=str(result["verdict"]),
+                rejection_reasons=tuple(str(item) for item in result.get("reasons") or []),
+                metrics=_development_metrics(result),
+                details={"holdout_feedback_allowed": False},
+            )
+
+    validate_kwargs: dict[str, Any] = {
+        "eval_cfg": eval_cfg,
+        "log_path": log_path,
+    }
+    if experiment_memory is not None:
+        validate_kwargs["before_holdout"] = before_holdout
+        validate_kwargs["after_candidate"] = checkpoint_candidate
     results = validate_batch(
         frame,
         supported_hypotheses,
         validation_cfg,
-        eval_cfg=eval_cfg,
-        log_path=log_path,
+        **validate_kwargs,
     )
     incubation_candidates = _incubation_candidates_from_results(
         results,
         hypothesis_metadata=hypothesis_metadata,
+    )
+    holdout_exposed_ids = sorted(
+        {
+            str(result.get("hypothesis_id"))
+            for result in results
+            if result.get("hypothesis_id") and result.get("holdout") is not None
+        }
     )
     return {
         "ok": True,
@@ -943,9 +2045,19 @@ def run_validation_scenario(
         "start": scenario.start,
         "end": scenario.end,
         "rows": int(len(frame)),
+        "coverage": coverage,
         "unsupported_hypotheses": unsupported_hypotheses,
+        "retired_unsupported_ids": retired_unsupported_ids,
+        "already_evaluated_ids": already_evaluated,
+        "holdout_exposed_ids": holdout_exposed_ids,
+        **(
+            {"dataset_snapshot_id": dataset_snapshot["snapshot_id"]}
+            if dataset_snapshot is not None
+            else {}
+        ),
         "trial_count": validation_cfg.n_trials,
-        "selection": selection or {
+        "selection": selection
+        or {
             "available": len(supported_hypotheses),
             "selected": len(supported_hypotheses),
             "offset": 0,
@@ -1023,6 +2135,131 @@ def export_product(
     }
 
 
+def stage_live_product_candidate(
+    product: ProductConfig,
+    *,
+    pnl_unit: str,
+    market: str,
+    out: Path,
+    top_k: int,
+    ids: list[str] | None = None,
+    min_dsr: float | None = None,
+    log_path: Path = DEFAULT_LOG,
+) -> dict[str, Any]:
+    """Export, policy-check, and atomically stage a candidate for a live product."""
+    if out.resolve(strict=False) == product.strategies_path.resolve(strict=False):
+        raise ValueError(
+            f"{product.name}: candidate staging path must be distinct from the active artifact"
+        )
+    open_position_ids = _open_position_ids_for_export(
+        product.name,
+        state_file=product.state_file,
+    )
+    if open_position_ids:
+        return {
+            "ok": True,
+            "product": product.name,
+            "pnl_unit": pnl_unit,
+            "market": market,
+            "exported": False,
+            "staged": False,
+            "destination": "staging",
+            "activation_required": True,
+            "reason": "open_positions_block_export",
+            "detail": "staged candidate is left unchanged while positions are open",
+            "artifact": str(out),
+            "active_artifact": str(product.strategies_path),
+            "ids": ids or [],
+            "open_positions": open_position_ids,
+            "min_dsr": min_dsr,
+        }
+
+    if out.is_symlink():
+        raise ValueError(f"{product.name}: candidate staging path must not be a symlink: {out}")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.parent.is_symlink():
+        raise ValueError(
+            f"{product.name}: candidate staging directory must not be a symlink: {out.parent}"
+        )
+
+    scratch_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=out.parent,
+            prefix=f".{out.name}.",
+            suffix=".research.tmp",
+            delete=False,
+        ) as handle:
+            scratch_path = Path(handle.name)
+        try:
+            path = export_strategies(
+                log_path=log_path,
+                output_path=scratch_path,
+                top_k=top_k,
+                pnl_unit=pnl_unit,
+                market=market,
+                ids=ids,
+                min_dsr=min_dsr,
+            )
+        except ValueError as exc:
+            if "No exportable strategies" not in str(exc):
+                raise
+            return {
+                "ok": True,
+                "product": product.name,
+                "pnl_unit": pnl_unit,
+                "market": market,
+                "exported": False,
+                "staged": False,
+                "destination": "staging",
+                "activation_required": True,
+                "reason": "no_exportable_strategies",
+                "detail": str(exc),
+                "artifact": str(out),
+                "active_artifact": str(product.strategies_path),
+                "ids": ids or [],
+                "min_dsr": min_dsr,
+            }
+        payload = load_artifact(path)
+        payload["product"] = product_identity(product)
+        payload["candidate_staging"] = {
+            "staged_at": utc_now(),
+            "activation_required": True,
+            "approval_granted": False,
+            "active_artifact": str(product.strategies_path),
+        }
+        assert_loaded_strategy_artifact_allowed(
+            product,
+            payload,
+            artifact_path=out,
+            require_live_eligible=True,
+        )
+        write_json_atomic(out, payload)
+    finally:
+        if scratch_path is not None and scratch_path.exists():
+            scratch_path.unlink()
+
+    return {
+        "ok": True,
+        "product": product.name,
+        "pnl_unit": pnl_unit,
+        "market": market,
+        "exported": True,
+        "staged": True,
+        "destination": "staging",
+        "activation_required": True,
+        "approval_granted": False,
+        "artifact_digest": artifact_digest(payload),
+        "artifact": str(out),
+        "active_artifact": str(product.strategies_path),
+        "strategies": len(payload.get("strategies", [])),
+        "ids": ids or [],
+        "min_dsr": min_dsr,
+    }
+
+
 def _open_position_ids_for_export(product: str, *, state_file: Path | None = None) -> list[str]:
     path = state_file if state_file is not None else DEFAULT_PRODUCT_STATE_FILES.get(product)
     if path is None or not path.exists():
@@ -1056,6 +2293,8 @@ def _current_keeper_ids(
 
 def run_research_cycle(
     *,
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    candidate_dir: Path = DEFAULT_CANDIDATE_DIR,
     state_path: Path = DEFAULT_STATE,
     output_path: Path | None = None,
     incubation_output_path: Path | None = None,
@@ -1064,7 +2303,13 @@ def run_research_cycle(
     force: bool = False,
     include_mutations: bool = False,
     mutation_batch_path: Path = DEFAULT_MUTATION_BATCH,
+    include_generated: bool = False,
+    generated_only: bool = False,
+    generated_batch_path: Path = DEFAULT_GENERATED_BATCH,
+    research_factory_config_path: Path = DEFAULT_RESEARCH_FACTORY_CONFIG,
 ) -> dict[str, Any]:
+    config = load_config(config_path)
+    configured_products = {product.name: product for product in config.products}
     mutation_scenarios: tuple[ResearchScenario, ...] = ()
     mutation_hypotheses: dict[str, list[Hypothesis]] = {}
     mutation_metadata: dict[str, dict[str, dict[str, Any]]] = {}
@@ -1076,32 +2321,73 @@ def run_research_cycle(
             mutation_metadata,
             mutation_batch_summary,
         ) = _load_mutation_scenarios(mutation_batch_path)
-    scenarios = (*scenarios, *mutation_scenarios)
+    generated_scenarios: tuple[ResearchScenario, ...] = ()
+    generated_hypotheses: dict[str, list[Hypothesis]] = {}
+    generated_metadata: dict[str, dict[str, dict[str, Any]]] = {}
+    generated_batch_summary: dict[str, Any] | None = None
+    if include_generated:
+        (
+            generated_scenarios,
+            generated_hypotheses,
+            generated_metadata,
+            generated_batch_summary,
+        ) = _load_generated_scenarios(
+            generated_batch_path,
+            factory_config_path=research_factory_config_path,
+        )
+    base_scenarios = () if generated_only else scenarios
+    scenarios = (*base_scenarios, *generated_scenarios, *mutation_scenarios)
     scenario_markets = sorted({scenario.market for scenario in scenarios}) or ["futures"]
     market_data_by_market = build_market_data_statuses(scenario_markets)
-    ready_markets = {
-        market
-        for market, status in market_data_by_market.items()
-        if status.get("ok")
-    }
+    ready_markets = {market for market, status in market_data_by_market.items() if status.get("ok")}
     marker = {
         market: status.get("last_timestamp")
         for market, status in market_data_by_market.items()
         if status.get("ok")
     }
     market_marker = _market_data_skip_marker(market_data_by_market)
+    generated_at = utc_now()
+    history_coverage: dict[str, dict[str, Any]] = {}
+    for scenario in scenarios:
+        if _scenario_coverage_requirements(scenario, now=generated_at) is None:
+            continue
+        history_coverage[scenario.name] = (
+            _scenario_indicator_coverage_status(
+                scenario,
+                indicator_dir=indicator_data_dir("BTCUSDT", scenario.market, legacy_fallback=True),
+                now=generated_at,
+                research_factory_config_path=research_factory_config_path,
+            )
+            or {}
+        )
+    history_failed_scenarios = [
+        name for name, status in history_coverage.items() if not status.get("ok")
+    ]
+    history_coverage_marker = _history_coverage_skip_marker(history_coverage)
     report: dict[str, Any] = {
         "ok": False,
-        "generated_at": utc_now(),
+        "generated_at": generated_at,
         "market_data": {
             "ok": all(status.get("ok") for status in market_data_by_market.values()),
             "markets": market_data_by_market,
         },
         "mutation_batch": mutation_batch_summary,
+        "generated_batch": generated_batch_summary,
+        "history_coverage": {
+            "ok": all(status.get("ok") for status in history_coverage.values()),
+            "failure_count": len(history_failed_scenarios),
+            "failed_scenarios": history_failed_scenarios,
+            "scenarios": history_coverage,
+        },
         "scenarios": [],
         "exports": [],
         "skipped": False,
     }
+    if generated_only and not generated_scenarios:
+        report.update(error="generated_batch_not_ready")
+        if output_path:
+            write_json_atomic(output_path, report)
+        return report
     if not ready_markets:
         report.update(error="market_data_not_ready")
         if output_path:
@@ -1120,8 +2406,22 @@ def run_research_cycle(
             },
             sort_keys=True,
         )
+    generated_marker = None
+    if generated_batch_summary is not None:
+        generated_marker = json.dumps(
+            {
+                "status": generated_batch_summary.get("status"),
+                "generated_at": generated_batch_summary.get("generated_at"),
+                "hypotheses": generated_batch_summary.get("hypotheses", 0),
+                "scenarios": generated_batch_summary.get("scenarios", 0),
+                "cumulative_trials": generated_batch_summary.get("cumulative_trials", 0),
+            },
+            sort_keys=True,
+        )
     state = _load_state(state_path)
     state_recovered = bool(state.get("_state_recovered"))
+    consumed_holdout_registry = _consumed_holdout_registry(state)
+    initial_consumed_holdout_registry = _serialized_holdout_registry(consumed_holdout_registry)
     if state_recovered:
         report["state_recovered"] = True
         report["state_error"] = state.get("_state_error")
@@ -1129,6 +2429,11 @@ def run_research_cycle(
         not force
         and state.get("last_market_marker") == market_marker
         and state.get("last_mutation_batch_marker") == mutation_marker
+        and state.get("last_generated_batch_marker") == generated_marker
+        and (
+            history_coverage_marker is None
+            or state.get("last_history_coverage_marker") == history_coverage_marker
+        )
     ):
         report.update(
             ok=True,
@@ -1137,6 +2442,8 @@ def run_research_cycle(
             last_market_timestamp=last_timestamp,
             last_market_marker=market_marker,
             last_mutation_batch_marker=mutation_marker,
+            last_generated_batch_marker=generated_marker,
+            last_history_coverage_marker=history_coverage_marker,
         )
         if output_path:
             write_json_atomic(output_path, report)
@@ -1144,12 +2451,51 @@ def run_research_cycle(
 
     scenario_reports: list[dict[str, Any]] = []
     next_offsets: dict[str, int] = {}
+    experiment_memory = (
+        ExperimentMemory(load_factory_config(research_factory_config_path).memory_path)
+        if include_generated
+        else None
+    )
     for scenario in scenarios:
         try:
+            if history_failed_scenarios:
+                coverage = history_coverage.get(scenario.name)
+                if coverage is not None and not coverage.get("ok"):
+                    scenario_reports.append(
+                        _coverage_failure_report(
+                            scenario,
+                            coverage,
+                            selection=None,
+                            unsupported_hypotheses=[],
+                            research_factory_config_path=research_factory_config_path,
+                        )
+                    )
+                else:
+                    scenario_reports.append(
+                        _peer_coverage_gate_report(
+                            scenario,
+                            failed_scenarios=history_failed_scenarios,
+                            coverage=coverage,
+                            research_factory_config_path=research_factory_config_path,
+                        )
+                    )
+                continue
             if scenario.market not in ready_markets:
+                coverage = history_coverage.get(scenario.name)
+                if coverage is not None and not coverage.get("ok"):
+                    scenario_reports.append(
+                        _coverage_failure_report(
+                            scenario,
+                            coverage,
+                            selection=None,
+                            unsupported_hypotheses=[],
+                            research_factory_config_path=research_factory_config_path,
+                        )
+                    )
+                    continue
                 scenario_reports.append(
                     {
-                        "ok": True,
+                        "ok": coverage is None,
                         "skipped": True,
                         "reason": "market_data_not_ready",
                         "name": scenario.name,
@@ -1170,10 +2516,28 @@ def run_research_cycle(
                         "unsupported_hypotheses": [],
                         "verdicts": {},
                         "top_reasons": {"market_data_not_ready": 1},
+                        **({"coverage": coverage} if coverage is not None else {}),
                     }
                 )
                 continue
-            if scenario.name in mutation_hypotheses:
+            if scenario.name in generated_hypotheses:
+                hypotheses, selection = _select_from_hypotheses(
+                    scenario,
+                    generated_hypotheses[scenario.name],
+                    state,
+                )
+                cumulative_trials = max(
+                    (
+                        _int_count(item.get("cumulative_trials"))
+                        for item in generated_metadata.get(scenario.name, {}).values()
+                    ),
+                    default=0,
+                )
+                selection["cumulative_trials"] = max(
+                    cumulative_trials,
+                    _int_count(selection.get("available")),
+                )
+            elif scenario.name in mutation_hypotheses:
                 hypotheses, selection = _select_from_hypotheses(
                     scenario,
                     mutation_hypotheses[scenario.name],
@@ -1181,14 +2545,64 @@ def run_research_cycle(
                 )
             else:
                 hypotheses, selection = _select_hypotheses(scenario, state)
+            if not hypotheses and selection.get("exhausted") is True:
+                scenario_reports.append(
+                    {
+                        "ok": True,
+                        "skipped": True,
+                        "reason": "holdout_registry_exhausted",
+                        "name": scenario.name,
+                        "product": scenario.product,
+                        "base_tf": scenario.base_tf,
+                        "pnl_unit": scenario.pnl_unit,
+                        "market": scenario.market,
+                        "position": scenario.position,
+                        "opportunity_type": scenario.opportunity_type,
+                        "with_guards": scenario.with_guards,
+                        "candidate_set": scenario.candidate_set,
+                        "start": scenario.start,
+                        "end": scenario.end,
+                        "rows": 0,
+                        "hypotheses": 0,
+                        "keepers": 0,
+                        "keeper_ids": [],
+                        "holdout_exposed_ids": [],
+                        "selection": selection,
+                        "unsupported_hypotheses": [],
+                        "verdicts": {},
+                        "top_reasons": {"holdout_registry_exhausted": 1},
+                    }
+                )
+                next_offsets[scenario.name] = int(selection.get("next_offset", 0))
+                continue
             validation_kwargs: dict[str, Any] = {
                 "hypotheses": hypotheses,
                 "selection": selection,
                 "log_path": log_path,
             }
+            if (
+                Path(research_factory_config_path).resolve()
+                != Path(DEFAULT_RESEARCH_FACTORY_CONFIG).resolve()
+            ):
+                validation_kwargs["research_factory_config_path"] = research_factory_config_path
             if mutation_metadata.get(scenario.name):
                 validation_kwargs["hypothesis_metadata"] = mutation_metadata[scenario.name]
-            scenario_reports.append(run_validation_scenario(scenario, **validation_kwargs))
+            if generated_metadata.get(scenario.name):
+                validation_kwargs["hypothesis_metadata"] = generated_metadata[scenario.name]
+            if experiment_memory is not None:
+                validation_kwargs["experiment_memory"] = experiment_memory
+            scenario_report = run_validation_scenario(scenario, **validation_kwargs)
+            scenario_reports.append(scenario_report)
+            exposed_ids = {
+                str(hypothesis_id)
+                for hypothesis_id in scenario_report.get("holdout_exposed_ids") or []
+                if hypothesis_id
+            }
+            if exposed_ids:
+                consumed_holdout_registry.setdefault(scenario.name, set()).update(exposed_ids)
+                state["consumed_holdout_ids"] = _serialized_holdout_registry(
+                    consumed_holdout_registry
+                )
             next_offsets[scenario.name] = int(selection.get("next_offset", 0))
         except Exception as exc:
             scenario_reports.append(
@@ -1199,12 +2613,46 @@ def run_research_cycle(
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
+    if experiment_memory is not None:
+        experiment_memory.close()
     report["scenarios"] = scenario_reports
 
     export_reports: list[dict[str, Any]] = []
     if all(bool(item.get("ok")) for item in scenario_reports):
         for product, export_cfg in DEFAULT_EXPORTS.items():
+            product_config = configured_products.get(product)
+            if product_config is None:
+                export_reports.append(
+                    {
+                        "ok": False,
+                        "product": product,
+                        "exported": False,
+                        "reason": "product_not_configured",
+                        "detail": f"{product}: no matching product in {config_path}",
+                    }
+                )
+                continue
+            if product_config.execution_mode not in {"paper", "live"}:
+                export_reports.append(
+                    {
+                        "ok": False,
+                        "product": product,
+                        "exported": False,
+                        "reason": "unsupported_execution_mode",
+                        "detail": (
+                            f"{product}: execution_mode must be paper or live, got "
+                            f"{product_config.execution_mode!r}"
+                        ),
+                    }
+                )
+                continue
             product_market = str(export_cfg["market"])
+            is_live = product_config.execution_mode == "live"
+            target_path = (
+                candidate_path_for_product(product, candidate_dir=candidate_dir)
+                if is_live
+                else product_config.strategies_path
+            )
             keeper_ids = _current_keeper_ids(
                 scenario_reports,
                 product=product,
@@ -1212,9 +2660,7 @@ def run_research_cycle(
             )
             if not keeper_ids:
                 min_dsr = (
-                    float(export_cfg["min_dsr"])
-                    if export_cfg.get("min_dsr") is not None
-                    else None
+                    float(export_cfg["min_dsr"]) if export_cfg.get("min_dsr") is not None else None
                 )
                 export_reports.append(
                     {
@@ -1224,19 +2670,23 @@ def run_research_cycle(
                         "market": product_market,
                         "exported": False,
                         "reason": "no_current_cycle_keepers",
-                        "artifact": str(export_cfg["out"]),
+                        "artifact": str(target_path),
+                        "active_artifact": str(product_config.strategies_path),
+                        "destination": "staging" if is_live else "active",
+                        "staged": False,
+                        "activation_required": is_live,
                         "ids": [],
                         "min_dsr": min_dsr,
                     }
                 )
                 continue
             try:
-                export_reports.append(
-                    export_product(
-                        product,
+                if is_live:
+                    export_report = stage_live_product_candidate(
+                        product_config,
                         pnl_unit=str(export_cfg["pnl_unit"]),
                         market=product_market,
-                        out=Path(export_cfg["out"]),
+                        out=target_path,
                         top_k=int(export_cfg["top_k"]),
                         ids=keeper_ids,
                         min_dsr=(
@@ -1246,12 +2696,39 @@ def run_research_cycle(
                         ),
                         log_path=log_path,
                     )
-                )
+                else:
+                    export_report = export_product(
+                        product,
+                        pnl_unit=str(export_cfg["pnl_unit"]),
+                        market=product_market,
+                        out=target_path,
+                        top_k=int(export_cfg["top_k"]),
+                        ids=keeper_ids,
+                        min_dsr=(
+                            float(export_cfg["min_dsr"])
+                            if export_cfg.get("min_dsr") is not None
+                            else None
+                        ),
+                        log_path=log_path,
+                        state_file=product_config.state_file,
+                    )
+                    export_report.update(
+                        active_artifact=str(product_config.strategies_path),
+                        destination="active",
+                        staged=False,
+                        activation_required=False,
+                    )
+                export_reports.append(export_report)
             except Exception as exc:
                 export_reports.append(
                     {
                         "ok": False,
                         "product": product,
+                        "exported": False,
+                        "artifact": str(target_path),
+                        "active_artifact": str(product_config.strategies_path),
+                        "destination": "staging" if is_live else "active",
+                        "activation_required": is_live,
                         "error": f"{type(exc).__name__}: {exc}",
                     }
                 )
@@ -1277,11 +2754,15 @@ def run_research_cycle(
         scenario_reports,
         export_reports,
         mutation_batch_summary=mutation_batch_summary,
+        generated_batch_summary=generated_batch_summary,
     )
     report["ok"] = all(bool(item.get("ok")) for item in scenario_reports + export_reports)
     report["last_market_timestamp"] = last_timestamp
     report["last_market_marker"] = market_marker
     report["last_mutation_batch_marker"] = mutation_marker
+    report["last_generated_batch_marker"] = generated_marker
+    report["last_history_coverage_marker"] = history_coverage_marker
+    serialized_holdout_registry = _serialized_holdout_registry(consumed_holdout_registry)
 
     if report["ok"]:
         write_json_atomic(
@@ -1291,10 +2772,32 @@ def run_research_cycle(
                 "last_market_timestamp": last_timestamp,
                 "last_market_marker": market_marker,
                 "last_mutation_batch_marker": mutation_marker,
+                "last_generated_batch_marker": generated_marker,
+                "last_history_coverage_marker": history_coverage_marker,
                 "last_run_at": report["generated_at"],
                 "scenario_offsets": next_offsets,
+                "consumed_holdout_ids": serialized_holdout_registry,
             },
         )
+    elif serialized_holdout_registry != initial_consumed_holdout_registry:
+        partial_state = {
+            key: state[key]
+            for key in (
+                "last_market_timestamp",
+                "last_market_marker",
+                "last_mutation_batch_marker",
+                "last_generated_batch_marker",
+                "last_history_coverage_marker",
+                "last_run_at",
+                "scenario_offsets",
+            )
+            if key in state
+        }
+        partial_state.update(
+            version=1,
+            consumed_holdout_ids=serialized_holdout_registry,
+        )
+        write_json_atomic(state_path, partial_state)
     if output_path:
         write_json_atomic(output_path, report)
     return report
@@ -1302,16 +2805,35 @@ def run_research_cycle(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run bounded real-data research and gated export.")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
-    parser.add_argument("--force", action="store_true", help="Run even if market data timestamp is unchanged.")
+    parser.add_argument(
+        "--force", action="store_true", help="Run even if market data timestamp is unchanged."
+    )
     parser.add_argument(
         "--include-mutations",
         action="store_true",
         help="Validate research-only mutation hypotheses from --mutation-batch.",
     )
     parser.add_argument("--mutation-batch", type=Path, default=DEFAULT_MUTATION_BATCH)
+    parser.add_argument(
+        "--include-generated",
+        action="store_true",
+        help="Validate the safe autonomous batch from --generated-batch.",
+    )
+    parser.add_argument(
+        "--generated-only",
+        action="store_true",
+        help="Disable the finite legacy scenarios and evaluate generated candidates only.",
+    )
+    parser.add_argument("--generated-batch", type=Path, default=DEFAULT_GENERATED_BATCH)
+    parser.add_argument(
+        "--research-factory-config",
+        type=Path,
+        default=DEFAULT_RESEARCH_FACTORY_CONFIG,
+    )
     parser.add_argument(
         "--incubation-output",
         type=Path,
@@ -1324,12 +2846,17 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     report = run_research_cycle(
+        config_path=args.config,
         state_path=args.state,
         output_path=args.output,
         log_path=args.log,
         force=args.force,
         include_mutations=args.include_mutations,
         mutation_batch_path=args.mutation_batch,
+        include_generated=args.include_generated,
+        generated_only=args.generated_only,
+        generated_batch_path=args.generated_batch,
+        research_factory_config_path=args.research_factory_config,
         incubation_output_path=args.incubation_output,
     )
     print(json.dumps(report, indent=2, sort_keys=True))

@@ -133,7 +133,7 @@ def test_build_all_conditions_include_threshold_metadata():
     a = refit_conditions(train.iloc[:120].copy(), candidate, "tf_15m_")
     b = refit_conditions(train.iloc[40:160].copy(), candidate, "tf_15m_")
     any_changed = False
-    for ca, cb in zip(a.conditions, b.conditions):
+    for ca, cb in zip(a.conditions, b.conditions, strict=False):
         if ca.threshold_source in {"quantile", "delta_quantile", "slope_quantile", "ratio_quantile"}:
             any_changed = any_changed or (ca.threshold != cb.threshold)
         if ca.threshold_source == "fixed":

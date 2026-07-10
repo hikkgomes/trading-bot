@@ -424,6 +424,7 @@ def test_failure_detail_summarizes_failed_products_and_jobs():
             {"ok": False, "name": "sweep", "returncode": 2, "stderr_tail": "bad"},
             {"ok": True, "name": "smoke"},
         ],
+        "job_config_errors": ["jobs[3]: malformed optional research job"],
         "data_update": {"ok": True},
     }
 
@@ -467,6 +468,7 @@ def test_failure_detail_summarizes_failed_products_and_jobs():
             },
         ],
         "jobs": [{"name": "sweep", "error": "bad"}],
+        "job_config_errors": ["jobs[3]: malformed optional research job"],
         "data_update": {"ok": True},
     }
 
@@ -475,6 +477,7 @@ def test_failure_detail_ignores_malformed_sections():
     assert failure_detail({"products": {"bad": "shape"}, "jobs": None, "data_update": {"ok": False}}) == {
         "products": [],
         "jobs": [],
+        "job_config_errors": [],
         "data_update": {"ok": False},
     }
     assert failure_detail(
@@ -498,6 +501,7 @@ def test_failure_detail_ignores_malformed_sections():
             }
         ],
         "jobs": [{"name": "sweep", "error": 2}],
+        "job_config_errors": [],
         "data_update": None,
     }
 
@@ -1063,7 +1067,7 @@ def test_testnet_rehearsal_warning_detail_summarizes_required_missing_rehearsal(
                 "ok": False,
                 "product": "active_income",
                 "next_action": {
-                    "rehearsal_command": "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5",
+                    "rehearsal_command": "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100",
                 },
             }
         }
@@ -1076,7 +1080,7 @@ def test_testnet_rehearsal_warning_detail_summarizes_required_missing_rehearsal(
                 "required_by": ["active_income"],
                 "product": "active_income",
                 "next_action": {
-                    "rehearsal_command": "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5",
+                    "rehearsal_command": "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100",
                 },
             }
         ]

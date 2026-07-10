@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -9,7 +10,13 @@ from src.autopilot.testnet_rehearsal import (
     run_testnet_rehearsal,
     summarize_testnet_rehearsal_report,
 )
-from src.execution.broker import Fill, OrderSide, Position
+from src.execution.broker import (
+    Fill,
+    OrderSide,
+    Position,
+    ProtectiveOrder,
+    ProtectiveOrderStatus,
+)
 
 
 def product(tmp_path, **overrides):
@@ -91,7 +98,9 @@ def approved_config(tmp_path):
     strategy = strategy_artifact(artifact)
     ledger = tmp_path / "approvals.json"
     active_product = product(tmp_path, strategies_path=artifact)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=active_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=active_product
+    )
     return AutopilotConfig(approval_ledger=ledger, products=[active_product])
 
 
@@ -101,7 +110,7 @@ def set_testnet_env(monkeypatch):
     monkeypatch.setenv("FUTURES_EXCHANGE", "binanceusdm")
     monkeypatch.setenv("EXCHANGE_API_KEY", "key")
     monkeypatch.setenv("EXCHANGE_API_SECRET", "secret")
-    monkeypatch.setenv("MAX_NOTIONAL_USD", "10")
+    monkeypatch.setenv("MAX_NOTIONAL_USD", "200")
     monkeypatch.setenv("MAX_FILL_SLIPPAGE_BPS", "100")
     monkeypatch.setenv("MAX_FUTURES_LEVERAGE", "1")
     monkeypatch.setenv("FUTURES_MARGIN_MODE", "isolated")
@@ -111,8 +120,13 @@ class FakeTestnetBroker:
     name = "fake-testnet"
 
     def __init__(self, *, initial_qty=0.0):
-        self.position = Position(symbol="BTCUSDT", qty=initial_qty, avg_price=100.0 if initial_qty else 0.0)
+        self.position = Position(
+            symbol="BTCUSDT", qty=initial_qty, avg_price=100.0 if initial_qty else 0.0
+        )
         self.orders = []
+        self.normalization_calls = []
+        self.protective_calls = []
+        self.protective_order = None
 
     def get_price(self, symbol):
         return 100.0
@@ -123,19 +137,39 @@ class FakeTestnetBroker:
     def get_position(self, symbol):
         return Position(symbol=symbol, qty=self.position.qty, avg_price=self.position.avg_price)
 
+    def supports_native_protective_stops(self):
+        return True
+
+    def verify_one_way_position_mode(self, symbol):
+        return True
+
+    def list_open_orders(self, symbol, *, conditional):
+        return ()
+
+    def normalize_order_qty(self, symbol, qty, *, price=None, reduce_only=False):
+        self.normalization_calls.append(("qty", symbol, qty, price, reduce_only))
+        return qty
+
+    def normalize_order_price(self, symbol, price):
+        self.normalization_calls.append(("price", symbol, price))
+        return price
+
     def place_order(self, order):
         self.orders.append(order)
         signed = order.qty if order.side == OrderSide.BUY else -order.qty
         if order.reduce_only:
             self.position = Position(symbol=order.symbol)
         else:
-            self.position = Position(symbol=order.symbol, qty=self.position.qty + signed, avg_price=100.0)
+            self.position = Position(
+                symbol=order.symbol, qty=self.position.qty + signed, avg_price=100.0
+            )
         return Fill(symbol=order.symbol, side=order.side, qty=order.qty, price=100.0, fee=0.01)
 
     def close_position(self, symbol):
         if self.position.is_flat:
             return None
         side = OrderSide.SELL if self.position.qty > 0 else OrderSide.BUY
+
         class RehearsalOrder:
             def __init__(self, symbol, side, qty):
                 self.symbol = symbol
@@ -144,6 +178,39 @@ class FakeTestnetBroker:
                 self.reduce_only = True
 
         return self.place_order(RehearsalOrder(symbol, side, abs(self.position.qty)))
+
+    def place_protective_stop(self, *, symbol, side, qty, trigger_price, client_id):
+        self.protective_calls.append("place")
+        self.protective_order = ProtectiveOrder(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            trigger_price=trigger_price,
+            status=ProtectiveOrderStatus.OPEN,
+            order_id="stop-1",
+            client_id=client_id,
+        )
+        return self.protective_order
+
+    def get_protective_stop(self, *, symbol, order_id, client_id):
+        self.protective_calls.append("get")
+        assert self.protective_order is not None
+        assert symbol == self.protective_order.symbol
+        assert order_id == self.protective_order.order_id
+        assert client_id == self.protective_order.client_id
+        return self.protective_order
+
+    def cancel_protective_stop(self, *, symbol, order_id, client_id):
+        self.protective_calls.append("cancel")
+        assert self.protective_order is not None
+        assert symbol == self.protective_order.symbol
+        assert order_id == self.protective_order.order_id
+        assert client_id == self.protective_order.client_id
+        self.protective_order = replace(
+            self.protective_order,
+            status=ProtectiveOrderStatus.CANCELED,
+        )
+        return self.protective_order
 
 
 class CloseFailsOnceBroker(FakeTestnetBroker):
@@ -165,6 +232,43 @@ class WrongCloseFillSideBroker(FakeTestnetBroker):
         qty = abs(self.position.qty)
         self.position = Position(symbol=symbol, qty=0.0, avg_price=0.0)
         return Fill(symbol=symbol, side=OrderSide.BUY, qty=qty, price=100.0, fee=0.01)
+
+
+class NoNativeStopBroker(FakeTestnetBroker):
+    def supports_native_protective_stops(self):
+        return False
+
+
+class TerminalExpiredStopBroker(FakeTestnetBroker):
+    def get_protective_stop(self, *, symbol, order_id, client_id):
+        order = super().get_protective_stop(
+            symbol=symbol,
+            order_id=order_id,
+            client_id=client_id,
+        )
+        if order.status == ProtectiveOrderStatus.CANCELED:
+            self.protective_order = replace(
+                order,
+                status=ProtectiveOrderStatus.EXPIRED,
+            )
+        return self.protective_order
+
+
+class StopCancelRemainsOpenBroker(FakeTestnetBroker):
+    def cancel_protective_stop(self, *, symbol, order_id, client_id):
+        self.protective_calls.append("cancel")
+        assert self.protective_order is not None
+        return self.protective_order
+
+
+class PrecisionNormalizingBroker(FakeTestnetBroker):
+    def normalize_order_qty(self, symbol, qty, *, price=None, reduce_only=False):
+        self.normalization_calls.append(("qty", symbol, qty, price, reduce_only))
+        return 0.04
+
+    def normalize_order_price(self, symbol, price):
+        self.normalization_calls.append(("price", symbol, price))
+        return 94.5
 
 
 def test_testnet_rehearsal_requires_explicit_confirmation(monkeypatch, tmp_path):
@@ -189,7 +293,9 @@ def test_testnet_rehearsal_refuses_non_testnet_env(monkeypatch, tmp_path):
     monkeypatch.setenv("EXCHANGE_TESTNET", "0")
     cfg = approved_config(tmp_path)
 
-    report = run_testnet_rehearsal(cfg, confirm=True, broker_builder=lambda product: FakeTestnetBroker())
+    report = run_testnet_rehearsal(
+        cfg, confirm=True, broker_builder=lambda product: FakeTestnetBroker()
+    )
 
     assert report["ok"] is False
     assert "EXCHANGE_TESTNET must be 1" in report["error"]
@@ -199,7 +305,10 @@ def test_testnet_rehearsal_requires_approval_before_broker_use(monkeypatch, tmp_
     set_testnet_env(monkeypatch)
     artifact = tmp_path / "active.json"
     strategy_artifact(artifact)
-    cfg = AutopilotConfig(approval_ledger=tmp_path / "approvals.json", products=[product(tmp_path, strategies_path=artifact)])
+    cfg = AutopilotConfig(
+        approval_ledger=tmp_path / "approvals.json",
+        products=[product(tmp_path, strategies_path=artifact)],
+    )
 
     def fail_broker(_product):
         raise AssertionError("broker should not be built when approval is missing")
@@ -229,6 +338,28 @@ def test_testnet_rehearsal_requires_flat_starting_position(monkeypatch, tmp_path
     assert checks["broker_position_flat"]["detail"]["position_qty"] == pytest.approx(0.1)
 
 
+def test_testnet_rehearsal_rejects_broker_without_native_protective_stops(
+    monkeypatch,
+    tmp_path,
+):
+    set_testnet_env(monkeypatch)
+    cfg = approved_config(tmp_path)
+    broker = NoNativeStopBroker()
+
+    report = run_testnet_rehearsal(
+        cfg,
+        confirm=True,
+        broker_builder=lambda product: broker,
+    )
+
+    assert report["ok"] is False
+    assert report["error"] == "preflight_failed"
+    checks = {item["name"]: item for item in report["preflight"]["products"][0]["checks"]}
+    assert checks["broker_native_protective_stops"]["ok"] is False
+    assert broker.orders == []
+    assert broker.protective_calls == []
+
+
 def test_testnet_rehearsal_places_tiny_entry_and_reduce_only_close(monkeypatch, tmp_path):
     set_testnet_env(monkeypatch)
     cfg = approved_config(tmp_path)
@@ -254,7 +385,9 @@ def test_testnet_rehearsal_places_tiny_entry_and_reduce_only_close(monkeypatch, 
     assert product_payload["preflight_report"] == str(active_product.preflight_report)
     assert product_payload["preflight_max_age_seconds"] == active_product.preflight_max_age_seconds
     assert product_payload["require_testnet_rehearsal"] is True
-    assert product_payload["testnet_rehearsal_report"] == str(active_product.testnet_rehearsal_report)
+    assert product_payload["testnet_rehearsal_report"] == str(
+        active_product.testnet_rehearsal_report
+    )
     assert (
         product_payload["testnet_rehearsal_max_age_seconds"]
         == active_product.testnet_rehearsal_max_age_seconds
@@ -262,17 +395,168 @@ def test_testnet_rehearsal_places_tiny_entry_and_reduce_only_close(monkeypatch, 
     assert report["risk_controls"] == {
         "max_futures_leverage": 1,
         "futures_margin_mode": "isolated",
-        "max_notional_usd": 10.0,
+        "max_notional_usd": 200.0,
         "max_fill_slippage_bps": 100.0,
+    }
+    preflight_checks = {item["name"]: item for item in report["preflight"]["products"][0]["checks"]}
+    assert preflight_checks["broker_position_mode_one_way"] == {
+        "name": "broker_position_mode_one_way",
+        "ok": True,
+        "detail": {"symbol": "BTCUSDT", "one_way": True},
     }
     assert report["order_qty"] == pytest.approx(0.05)
     assert report["entry_fill"]["side"] == "buy"
     assert report["close_fill"]["side"] == "sell"
+    stop_evidence = report["native_protective_stop"]
+    assert stop_evidence["capability_supported"] is True
+    assert stop_evidence["native"] is True
+    assert stop_evidence["reduce_only"] is True
+    assert stop_evidence["open_verified"] is True
+    assert stop_evidence["canceled_verified"] is True
+    assert stop_evidence["placed"]["status"] == "open"
+    assert stop_evidence["fetched_open"]["status"] == "open"
+    assert stop_evidence["cancel_result"]["status"] == "canceled"
+    assert stop_evidence["fetched_terminal"]["status"] == "canceled"
+    assert stop_evidence["placed"]["side"] == "sell"
+    assert stop_evidence["placed"]["qty"] == pytest.approx(0.05)
+    assert stop_evidence["placed"]["trigger_price"] == pytest.approx(95.0)
     assert report["final_position_qty"] == pytest.approx(0.0)
     assert len(broker.orders) == 2
     assert broker.orders[0].reduce_only is False
     assert broker.orders[1].reduce_only is True
+    assert broker.normalization_calls == [
+        ("price", "BTCUSDT", 95.0),
+        ("qty", "BTCUSDT", 0.05, 100.0, False),
+    ]
+    assert broker.protective_calls == ["place", "get", "cancel", "get"]
     assert json.loads(output.read_text(encoding="utf-8"))["ok"] is True
+
+    status = summarize_testnet_rehearsal_report(
+        output,
+        now_ts=report["generated_ts"],
+        expected_product=active_product,
+    )
+    assert status["ok"] is True
+    assert status["status"] == "ok"
+    assert status["native_protective_stop"]["canceled_verified"] is True
+
+
+def test_testnet_rehearsal_summary_rejects_missing_or_invalid_native_stop_evidence(
+    monkeypatch,
+    tmp_path,
+):
+    set_testnet_env(monkeypatch)
+    cfg = approved_config(tmp_path)
+    output = tmp_path / "testnet.json"
+    report = run_testnet_rehearsal(
+        cfg,
+        confirm=True,
+        output_path=output,
+        broker_builder=lambda product: FakeTestnetBroker(),
+    )
+    active_product = cfg.products[0]
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    stop_evidence = payload.pop("native_protective_stop")
+    output.write_text(json.dumps(payload), encoding="utf-8")
+    missing = summarize_testnet_rehearsal_report(
+        output,
+        now_ts=report["generated_ts"],
+        expected_product=active_product,
+    )
+
+    assert missing["ok"] is False
+    assert missing["status"] == "failed"
+    assert missing["invalid_reasons"] == ["missing_native_protective_stop"]
+
+    stop_evidence["fetched_terminal"]["status"] = "open"
+    payload["native_protective_stop"] = stop_evidence
+    output.write_text(json.dumps(payload), encoding="utf-8")
+    invalid = summarize_testnet_rehearsal_report(
+        output,
+        now_ts=report["generated_ts"],
+        expected_product=active_product,
+    )
+
+    assert invalid["ok"] is False
+    assert invalid["status"] == "failed"
+    assert invalid["invalid_reasons"] == ["native_stop_fetched_terminal_status_not_terminal"]
+
+
+def test_testnet_rehearsal_accepts_terminal_non_open_stop_fetch(monkeypatch, tmp_path):
+    set_testnet_env(monkeypatch)
+    cfg = approved_config(tmp_path)
+    output = tmp_path / "testnet.json"
+    report = run_testnet_rehearsal(
+        cfg,
+        confirm=True,
+        output_path=output,
+        broker_builder=lambda product: TerminalExpiredStopBroker(),
+    )
+
+    assert report["ok"] is True
+    assert report["native_protective_stop"]["cancel_result"]["status"] == "canceled"
+    assert report["native_protective_stop"]["fetched_terminal"]["status"] == "expired"
+    status = summarize_testnet_rehearsal_report(
+        output,
+        now_ts=report["generated_ts"],
+        expected_product=cfg.products[0],
+    )
+    assert status["ok"] is True
+
+
+def test_testnet_rehearsal_submits_and_evidences_normalized_order_values(
+    monkeypatch,
+    tmp_path,
+):
+    set_testnet_env(monkeypatch)
+    cfg = approved_config(tmp_path)
+    broker = PrecisionNormalizingBroker()
+    output = tmp_path / "normalized-testnet.json"
+
+    report = run_testnet_rehearsal(
+        cfg,
+        confirm=True,
+        notional_usd=5.0,
+        output_path=output,
+        broker_builder=lambda product: broker,
+    )
+
+    assert report["ok"] is True
+    assert report["raw_order_qty"] == pytest.approx(0.05)
+    assert report["order_qty"] == pytest.approx(0.04)
+    assert broker.orders[0].qty == pytest.approx(0.04)
+    evidence = report["native_protective_stop"]
+    assert evidence["trigger_reference_price"] == pytest.approx(100.0)
+    assert evidence["raw_trigger_price"] == pytest.approx(95.0)
+    assert evidence["normalized_trigger_price"] == pytest.approx(94.5)
+    assert evidence["placed"]["qty"] == pytest.approx(0.04)
+    assert evidence["placed"]["trigger_price"] == pytest.approx(94.5)
+    status = summarize_testnet_rehearsal_report(
+        output,
+        now_ts=report["generated_ts"],
+        expected_product=cfg.products[0],
+    )
+    assert status["ok"] is True
+
+
+def test_testnet_rehearsal_rejects_unverified_stop_cancellation(monkeypatch, tmp_path):
+    set_testnet_env(monkeypatch)
+    cfg = approved_config(tmp_path)
+    broker = StopCancelRemainsOpenBroker()
+
+    report = run_testnet_rehearsal(
+        cfg,
+        confirm=True,
+        broker_builder=lambda product: broker,
+    )
+
+    assert report["ok"] is False
+    assert "cancel-result protective-stop status mismatch" in report["error"]
+    assert report["native_protective_stop"]["cancel_result"]["status"] == "open"
+    assert report["native_protective_stop"]["canceled_verified"] is False
+    assert report["recovery"]["final_position_flat"] is True
+    assert "protective_stop_cancel" in report["recovery"]["errors"]
 
 
 def test_testnet_rehearsal_attempts_recovery_close_after_entry_close_failure(monkeypatch, tmp_path):
@@ -339,10 +623,14 @@ def test_testnet_rehearsal_cli_writes_output(monkeypatch, tmp_path):
             str(output),
         ],
     )
-    monkeypatch.setattr("src.autopilot.testnet_rehearsal.load_config", lambda path: AutopilotConfig())
+    monkeypatch.setattr(
+        "src.autopilot.testnet_rehearsal.load_config", lambda path: AutopilotConfig()
+    )
     monkeypatch.setattr(
         "src.autopilot.testnet_rehearsal.run_testnet_rehearsal",
-        lambda *args, **kwargs: (output.write_text(json.dumps(report), encoding="utf-8"), report)[1],
+        lambda *args, **kwargs: (output.write_text(json.dumps(report), encoding="utf-8"), report)[
+            1
+        ],
     )
 
     with pytest.raises(SystemExit) as exc:
@@ -381,7 +669,9 @@ def test_testnet_rehearsal_cli_status_summarizes_without_confirm(monkeypatch, tm
     def fail_rehearsal(*args, **kwargs):
         raise AssertionError("status mode must not run the order rehearsal")
 
-    monkeypatch.setattr("src.autopilot.testnet_rehearsal.summarize_testnet_rehearsal_report", fake_summary)
+    monkeypatch.setattr(
+        "src.autopilot.testnet_rehearsal.summarize_testnet_rehearsal_report", fake_summary
+    )
     monkeypatch.setattr("src.autopilot.testnet_rehearsal.run_testnet_rehearsal", fail_rehearsal)
 
     with pytest.raises(SystemExit) as exc:
@@ -418,7 +708,9 @@ def test_testnet_rehearsal_marks_output_write_failure(monkeypatch, tmp_path):
     ]
 
 
-def test_testnet_rehearsal_cli_writes_failure_report_when_config_load_fails(monkeypatch, tmp_path, capsys):
+def test_testnet_rehearsal_cli_writes_failure_report_when_config_load_fails(
+    monkeypatch, tmp_path, capsys
+):
     output = tmp_path / "reports" / "testnet.json"
     config_path = tmp_path / "bad_config.json"
     monkeypatch.setattr(
@@ -456,8 +748,14 @@ def test_testnet_rehearsal_summary_reports_missing_and_stale(tmp_path):
     assert missing["exists"] is False
     assert missing["status"] == "missing"
     assert missing["ok"] is False
-    assert missing["next_action"]["preflight_command"] == "make preflight PRODUCT=active_income REQUIRE_TESTNET=1"
-    assert missing["next_action"]["rehearsal_command"] == "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5"
+    assert (
+        missing["next_action"]["preflight_command"]
+        == "make preflight PRODUCT=active_income REQUIRE_TESTNET=1"
+    )
+    assert (
+        missing["next_action"]["rehearsal_command"]
+        == "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100"
+    )
     assert missing["next_action"]["status_command"] == "make testnet-status"
     assert "EXCHANGE_TESTNET=1" in missing["next_action"]["required_env"]
 
@@ -473,8 +771,22 @@ def test_testnet_rehearsal_summary_reports_missing_and_stale(tmp_path):
                 "testnet": True,
                 "notional_usd": 5.0,
                 "order_qty": 0.05,
-                "entry_fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-                "close_fill": {"symbol": "BTCUSDT", "side": "sell", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1001.0},
+                "entry_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1000.0,
+                },
+                "close_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "sell",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1001.0,
+                },
                 "final_position_qty": 0.0,
             }
         ),
@@ -540,22 +852,41 @@ def test_testnet_rehearsal_summary_rejects_unmatched_expected_product(tmp_path):
                 },
                 "notional_usd": 5.0,
                 "order_qty": 0.05,
-                "entry_fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-                "close_fill": {"symbol": "BTCUSDT", "side": "sell", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1001.0},
+                "entry_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1000.0,
+                },
+                "close_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "sell",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1001.0,
+                },
                 "final_position_qty": 0.0,
             }
         ),
         encoding="utf-8",
     )
 
-    status = summarize_testnet_rehearsal_report(report_path, now_ts=1001.0, expected_product=product(tmp_path))
+    status = summarize_testnet_rehearsal_report(
+        report_path, now_ts=1001.0, expected_product=product(tmp_path)
+    )
 
     assert status["ok"] is False
     assert status["status"] == "failed"
     assert status["invalid_reasons"] == ["product_symbol_mismatch"]
     assert status["report_product"]["symbol"] == "ETHUSDT"
     assert status["expected_product"]["symbol"] == "BTCUSDT"
-    assert status["next_action"]["rehearsal_command"] == "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5"
+    assert (
+        status["next_action"]["rehearsal_command"]
+        == "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100"
+    )
     assert status["next_action"]["status_command"] == "make testnet-status"
 
 
@@ -605,7 +936,9 @@ def test_testnet_rehearsal_summary_rejects_unmatched_fill_symbols(tmp_path):
         encoding="utf-8",
     )
 
-    status = summarize_testnet_rehearsal_report(report_path, now_ts=1001.0, expected_product=product(tmp_path))
+    status = summarize_testnet_rehearsal_report(
+        report_path, now_ts=1001.0, expected_product=product(tmp_path)
+    )
 
     assert status["ok"] is False
     assert status["status"] == "failed"
@@ -662,7 +995,9 @@ def test_testnet_rehearsal_summary_rejects_fill_qty_not_matching_order_qty(tmp_p
         encoding="utf-8",
     )
 
-    status = summarize_testnet_rehearsal_report(report_path, now_ts=1001.0, expected_product=product(tmp_path))
+    status = summarize_testnet_rehearsal_report(
+        report_path, now_ts=1001.0, expected_product=product(tmp_path)
+    )
 
     assert status["ok"] is False
     assert status["status"] == "failed"
@@ -691,15 +1026,31 @@ def test_testnet_rehearsal_summary_rejects_missing_risk_controls_for_expected_pr
                 "testnet": True,
                 "notional_usd": 5.0,
                 "order_qty": 0.05,
-                "entry_fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-                "close_fill": {"symbol": "BTCUSDT", "side": "sell", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1001.0},
+                "entry_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1000.0,
+                },
+                "close_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "sell",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1001.0,
+                },
                 "final_position_qty": 0.0,
             }
         ),
         encoding="utf-8",
     )
 
-    status = summarize_testnet_rehearsal_report(report_path, now_ts=1001.0, expected_product=product(tmp_path))
+    status = summarize_testnet_rehearsal_report(
+        report_path, now_ts=1001.0, expected_product=product(tmp_path)
+    )
 
     assert status["ok"] is False
     assert status["status"] == "failed"
@@ -731,15 +1082,31 @@ def test_testnet_rehearsal_summary_rejects_unsafe_risk_controls(tmp_path):
                 },
                 "notional_usd": 5.0,
                 "order_qty": 0.05,
-                "entry_fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-                "close_fill": {"symbol": "BTCUSDT", "side": "sell", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1001.0},
+                "entry_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1000.0,
+                },
+                "close_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "sell",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1001.0,
+                },
                 "final_position_qty": 0.0,
             }
         ),
         encoding="utf-8",
     )
 
-    status = summarize_testnet_rehearsal_report(report_path, now_ts=1001.0, expected_product=product(tmp_path))
+    status = summarize_testnet_rehearsal_report(
+        report_path, now_ts=1001.0, expected_product=product(tmp_path)
+    )
 
     assert status["ok"] is False
     assert status["status"] == "failed"
@@ -776,15 +1143,31 @@ def test_testnet_rehearsal_summary_rejects_active_income_leverage_above_one(tmp_
                 },
                 "notional_usd": 5.0,
                 "order_qty": 0.05,
-                "entry_fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-                "close_fill": {"symbol": "BTCUSDT", "side": "sell", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1001.0},
+                "entry_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1000.0,
+                },
+                "close_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "sell",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1001.0,
+                },
                 "final_position_qty": 0.0,
             }
         ),
         encoding="utf-8",
     )
 
-    status = summarize_testnet_rehearsal_report(report_path, now_ts=1001.0, expected_product=product(tmp_path))
+    status = summarize_testnet_rehearsal_report(
+        report_path, now_ts=1001.0, expected_product=product(tmp_path)
+    )
 
     assert status["ok"] is False
     assert status["status"] == "failed"
@@ -819,8 +1202,22 @@ def test_testnet_rehearsal_summary_rejects_embedded_preflight_missing_artifact_d
                 },
                 "notional_usd": 5.0,
                 "order_qty": 0.05,
-                "entry_fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-                "close_fill": {"symbol": "BTCUSDT", "side": "sell", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1001.0},
+                "entry_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1000.0,
+                },
+                "close_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "sell",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1001.0,
+                },
                 "final_position_qty": 0.0,
                 "preflight": {
                     "ok": True,
@@ -844,7 +1241,9 @@ def test_testnet_rehearsal_summary_rejects_embedded_preflight_missing_artifact_d
         encoding="utf-8",
     )
 
-    status = summarize_testnet_rehearsal_report(report_path, now_ts=1001.0, expected_product=active_product)
+    status = summarize_testnet_rehearsal_report(
+        report_path, now_ts=1001.0, expected_product=active_product
+    )
 
     assert status["ok"] is False
     assert status["status"] == "failed"
@@ -879,8 +1278,22 @@ def test_testnet_rehearsal_summary_rejects_embedded_preflight_artifact_digest_mi
                 },
                 "notional_usd": 5.0,
                 "order_qty": 0.05,
-                "entry_fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-                "close_fill": {"symbol": "BTCUSDT", "side": "sell", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1001.0},
+                "entry_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1000.0,
+                },
+                "close_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "sell",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1001.0,
+                },
                 "final_position_qty": 0.0,
                 "preflight": {
                     "ok": True,
@@ -905,7 +1318,9 @@ def test_testnet_rehearsal_summary_rejects_embedded_preflight_artifact_digest_mi
         encoding="utf-8",
     )
 
-    status = summarize_testnet_rehearsal_report(report_path, now_ts=1001.0, expected_product=active_product)
+    status = summarize_testnet_rehearsal_report(
+        report_path, now_ts=1001.0, expected_product=active_product
+    )
 
     assert status["ok"] is False
     assert status["status"] == "failed"
@@ -925,8 +1340,22 @@ def test_testnet_rehearsal_summary_rejects_future_timestamp(tmp_path):
                 "testnet": True,
                 "notional_usd": 5.0,
                 "order_qty": 0.05,
-                "entry_fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-                "close_fill": {"symbol": "BTCUSDT", "side": "sell", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1001.0},
+                "entry_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1000.0,
+                },
+                "close_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "sell",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1001.0,
+                },
                 "final_position_qty": 0.0,
             }
         ),
@@ -941,7 +1370,10 @@ def test_testnet_rehearsal_summary_rejects_future_timestamp(tmp_path):
     assert status["age_seconds"] == pytest.approx(-401.0)
     assert status["clock_skew_seconds"] == 300
     assert status["invalid_reasons"] == ["future_generated_ts"]
-    assert status["next_action"]["rehearsal_command"] == "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5"
+    assert (
+        status["next_action"]["rehearsal_command"]
+        == "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100"
+    )
     assert status["next_action"]["status_command"] == "make testnet-status"
 
 
@@ -955,7 +1387,10 @@ def test_testnet_rehearsal_summary_reports_non_object_json(tmp_path):
     assert status["ok"] is False
     assert status["status"] == "read_error"
     assert status["error"] == "TypeError: expected JSON object, got list"
-    assert status["next_action"]["rehearsal_command"] == "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5"
+    assert (
+        status["next_action"]["rehearsal_command"]
+        == "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100"
+    )
     assert status["next_action"]["status_command"] == "make testnet-status"
 
 
@@ -972,8 +1407,22 @@ def test_testnet_rehearsal_summary_fails_unsafe_ok_reports(tmp_path):
                 "testnet": False,
                 "notional_usd": 5.0,
                 "order_qty": 0.05,
-                "entry_fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-                "close_fill": {"symbol": "BTCUSDT", "side": "sell", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1001.0},
+                "entry_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1000.0,
+                },
+                "close_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "sell",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1001.0,
+                },
                 "final_position_qty": 0.01,
             }
         ),
@@ -986,7 +1435,10 @@ def test_testnet_rehearsal_summary_fails_unsafe_ok_reports(tmp_path):
     assert status["status"] == "failed"
     assert status["invalid_reasons"] == ["not_testnet", "final_position_not_flat"]
     assert status["final_position_flat"] is False
-    assert status["next_action"]["preflight_command"] == "make preflight PRODUCT=active_income REQUIRE_TESTNET=1"
+    assert (
+        status["next_action"]["preflight_command"]
+        == "make preflight PRODUCT=active_income REQUIRE_TESTNET=1"
+    )
     assert status["next_action"]["status_command"] == "make testnet-status"
 
 
@@ -1044,8 +1496,20 @@ def test_testnet_rehearsal_summary_fails_invalid_fill_evidence(tmp_path):
                 "testnet": True,
                 "notional_usd": 5.0,
                 "order_qty": 0.05,
-                "entry_fill": {"side": "buy", "qty": "nan", "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-                "close_fill": {"side": "sell", "qty": 0.05, "price": 0.0, "fee": -0.01, "timestamp": None},
+                "entry_fill": {
+                    "side": "buy",
+                    "qty": "nan",
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1000.0,
+                },
+                "close_fill": {
+                    "side": "sell",
+                    "qty": 0.05,
+                    "price": 0.0,
+                    "fee": -0.01,
+                    "timestamp": None,
+                },
                 "final_position_qty": 0.0,
             }
         ),
@@ -1062,4 +1526,7 @@ def test_testnet_rehearsal_summary_fails_invalid_fill_evidence(tmp_path):
         "close_fill_invalid_fee",
         "close_fill_invalid_timestamp",
     ]
-    assert status["next_action"]["rehearsal_command"] == "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=5"
+    assert (
+        status["next_action"]["rehearsal_command"]
+        == "make testnet-rehearsal CONFIRM=1 NOTIONAL_USD=100"
+    )

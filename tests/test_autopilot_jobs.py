@@ -167,6 +167,37 @@ def test_missing_seed_makes_bootstrap_market_data_job_due(tmp_path, monkeypatch)
     assert job_due(cfg, state, now=120.0)
 
 
+def test_missing_seed_makes_native_history_job_due(tmp_path, monkeypatch):
+    seed_path = tmp_path / "missing" / "BTCUSDT_1m.parquet"
+    monkeypatch.setattr("src.autopilot.jobs.default_1m_candle_path", lambda market: seed_path)
+    cfg = job(
+        tmp_path,
+        name="market_data_update_spot",
+        command=[
+            sys.executable,
+            "-m",
+            "src.autopilot.history_bootstrap",
+            "--market",
+            "spot",
+            "--timeframes",
+            "1m",
+            "1h",
+        ],
+        cadence_seconds=6 * 60 * 60,
+    )
+    state = {
+        "version": 1,
+        "jobs": {
+            "market_data_update_spot": {
+                "last_started_ts": 100.0,
+                "last_ok": True,
+            }
+        },
+    }
+
+    assert job_due(cfg, state, now=120.0)
+
+
 def test_missing_seed_does_not_bypass_failed_job_retry(tmp_path, monkeypatch):
     seed_path = tmp_path / "missing" / "BTCUSDT_1m.parquet"
     monkeypatch.setattr("src.autopilot.jobs.default_1m_candle_path", lambda market: seed_path)
@@ -478,6 +509,68 @@ def test_research_cycle_mutation_batch_due_requires_include_mutations(tmp_path):
         cadence_seconds=86400,
     )
     state = {"version": 1, "jobs": {"research_cycle": {"last_started_ts": 100.0, "last_ok": True}}}
+
+    assert not job_due(cfg, state, now=120.0)
+
+
+def test_research_cycle_due_exactly_once_for_new_generated_population(tmp_path):
+    research_state = tmp_path / "research_cycle_state.json"
+    generated_batch = tmp_path / "generated_hypotheses.json"
+    generated_batch.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "generated_at": "2026-07-10T00:00:00+00:00",
+                "summary": {
+                    "hypotheses": 12,
+                    "by_space": {"active_day": 6, "btc_position": 6},
+                    "cumulative_trials": 240,
+                },
+                "hypotheses": [{}] * 12,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = job(
+        tmp_path,
+        name="research_cycle",
+        command=[
+            sys.executable,
+            "-m",
+            "src.autopilot.research_cycle",
+            "--state",
+            str(research_state),
+            "--include-generated",
+            "--generated-only",
+            "--generated-batch",
+            str(generated_batch),
+        ],
+        cadence_seconds=86400,
+    )
+    state = {
+        "version": 1,
+        "jobs": {"research_cycle": {"last_started_ts": 100.0, "last_ok": True}},
+    }
+
+    assert job_due(cfg, state, now=120.0)
+
+    research_state.write_text(
+        json.dumps(
+            {
+                "last_generated_batch_marker": json.dumps(
+                    {
+                        "status": "loaded",
+                        "generated_at": "2026-07-10T00:00:00+00:00",
+                        "hypotheses": 12,
+                        "scenarios": 2,
+                        "cumulative_trials": 240,
+                    },
+                    sort_keys=True,
+                )
+            }
+        ),
+        encoding="utf-8",
+    )
 
     assert not job_due(cfg, state, now=120.0)
 

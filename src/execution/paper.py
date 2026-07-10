@@ -10,7 +10,7 @@ trip (here applied per fill).
 from __future__ import annotations
 
 import math
-from typing import Callable
+from collections.abc import Callable
 
 from src.execution.broker import Broker, Fill, Order, OrderSide, OrderType, Position
 

@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 import src.strategy_search as ss
+from src.discover_patterns import Condition
 from src.strategy_search import (
     SimArrays,
     StrategyCandidate,
@@ -13,7 +14,6 @@ from src.strategy_search import (
     simulate_net_returns,
     simulate_trades,
 )
-from src.discover_patterns import Condition
 
 
 def make_ohlc(n=400, seed=7):

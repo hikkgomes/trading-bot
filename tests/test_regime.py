@@ -95,3 +95,47 @@ def test_tag_regime_file_writes_reportable_output_from_daily(tmp_path):
     assert output_path.exists()
     tagged = pd.read_parquet(output_path)
     assert "tf_1d_regime_id" in tagged.columns
+
+
+def test_tag_regime_file_compact_output_drops_heavy_indicator_columns(tmp_path):
+    timestamps = pd.date_range("2024-01-01", periods=96 * 10, freq="15min", tz="UTC")
+    intraday_path = tmp_path / "intraday.parquet"
+    daily_path = tmp_path / "daily.parquet"
+    output_path = tmp_path / "compact.parquet"
+    close = pd.Series(range(100, 100 + len(timestamps)), dtype=float)
+    pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": close,
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+            "volume": 10.0,
+            "unused_heavy_indicator": 123.0,
+        }
+    ).to_parquet(intraday_path, index=False)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=10, freq="D", tz="UTC"),
+            "close": range(100, 110),
+            "unused_daily_indicator": 456.0,
+        }
+    ).to_parquet(daily_path, index=False)
+
+    report = tag_regime_file(
+        intraday_path,
+        output_path,
+        daily_input_path=daily_path,
+        compact=True,
+    )
+
+    assert report["compact"] is True
+    assert pd.read_parquet(output_path).columns.tolist() == [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "tf_1d_regime_id",
+    ]

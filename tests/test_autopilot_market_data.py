@@ -49,44 +49,30 @@ def test_market_data_status_reports_missing_seed_dataset(tmp_path):
     assert report["remediation"]["command"] == [
         ".venv/bin/python",
         "-m",
-        "src.update_candles",
+        "src.autopilot.history_bootstrap",
+        "--config",
+        "config/research_factory.json",
         "--market",
         "spot",
-        "--bootstrap-days",
-        "365",
-        "--timeframes",
-        "1h",
-        "4h",
-        "1d",
-        "1w",
+        "--report",
+        "runtime/history_bootstrap_spot.json",
     ]
 
 
-def test_bootstrap_command_for_market_uses_bounded_defaults():
+def test_bootstrap_command_for_market_uses_authoritative_factory_config():
     futures_command = bootstrap_command_for_market("futures")
-    assert futures_command[futures_command.index("--bootstrap-days") + 1] == "90"
-    assert futures_command[futures_command.index("--timeframes") + 1:] == [
-        "1m",
-        "5m",
-        "15m",
-        "30m",
-        "1h",
-        "4h",
-        "1d",
-    ]
+    assert "--timeframes" not in futures_command
+    assert futures_command[futures_command.index("--config") + 1] == "config/research_factory.json"
     assert bootstrap_command_for_market("spot") == [
         ".venv/bin/python",
         "-m",
-        "src.update_candles",
+        "src.autopilot.history_bootstrap",
+        "--config",
+        "config/research_factory.json",
         "--market",
         "spot",
-        "--bootstrap-days",
-        "365",
-        "--timeframes",
-        "1h",
-        "4h",
-        "1d",
-        "1w",
+        "--report",
+        "runtime/history_bootstrap_spot.json",
     ]
 
 
@@ -97,7 +83,7 @@ def test_market_data_status_reports_fresh_dataset(tmp_path):
 
     report = build_market_data_status(
         path,
-        now=dt.datetime(2026, 1, 1, 0, 3, tzinfo=dt.timezone.utc),
+        now=dt.datetime(2026, 1, 1, 0, 3, tzinfo=dt.UTC),
         max_age_seconds=300,
     )
 
@@ -114,7 +100,7 @@ def test_market_data_status_reports_stale_dataset(tmp_path):
 
     report = build_market_data_status(
         path,
-        now=dt.datetime(2026, 1, 2, tzinfo=dt.timezone.utc),
+        now=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
         max_age_seconds=3600,
     )
 
@@ -130,7 +116,7 @@ def test_market_data_status_reports_future_dataset_timestamp(tmp_path):
 
     report = build_market_data_status(
         path,
-        now=dt.datetime(2026, 1, 1, 0, 0, tzinfo=dt.timezone.utc),
+        now=dt.datetime(2026, 1, 1, 0, 0, tzinfo=dt.UTC),
         max_age_seconds=300,
     )
 
@@ -160,9 +146,9 @@ def test_market_data_status_rejects_non_positive_age_limit(tmp_path):
 def test_indicator_feature_status_reports_ready_timeframes(tmp_path):
     indicator_dir = tmp_path / "indicators"
     indicator_dir.mkdir()
-    pd.DataFrame({"timestamp": [pd.Timestamp("2026-01-01T00:00:00Z")], "volume_z_20": [1.2]}).to_parquet(
-        indicator_dir / "BTCUSDT_1m_all_indicators.parquet"
-    )
+    pd.DataFrame(
+        {"timestamp": [pd.Timestamp("2026-01-01T00:00:00Z")], "volume_z_20": [1.2]}
+    ).to_parquet(indicator_dir / "BTCUSDT_1m_all_indicators.parquet")
 
     report = build_indicator_feature_status({"1m": ["volume_z_20"]}, indicator_dir=indicator_dir)
 
@@ -205,9 +191,35 @@ def test_required_indicator_features_follow_enabled_market_data_jobs():
     requirements = required_indicator_features_by_market(
         {"futures", "spot"},
         jobs=[
-            Job(["python", "-m", "src.update_candles", "--market", "spot", "--timeframes", "1h", "4h", "1d"]),
-            Job(["python", "-m", "src.update_candles", "--market", "futures", "--timeframes", "1m", "5m"]),
-            Job(["python", "-m", "src.update_candles", "--market", "spot", "--timeframes", "1m"], enabled=False),
+            Job(
+                [
+                    "python",
+                    "-m",
+                    "src.update_candles",
+                    "--market",
+                    "spot",
+                    "--timeframes",
+                    "1h",
+                    "4h",
+                    "1d",
+                ]
+            ),
+            Job(
+                [
+                    "python",
+                    "-m",
+                    "src.update_candles",
+                    "--market",
+                    "futures",
+                    "--timeframes",
+                    "1m",
+                    "5m",
+                ]
+            ),
+            Job(
+                ["python", "-m", "src.update_candles", "--market", "spot", "--timeframes", "1m"],
+                enabled=False,
+            ),
         ],
     )
 
@@ -232,7 +244,16 @@ def test_required_indicator_features_follow_inline_market_data_job_flags():
         {"futures", "spot"},
         jobs=[
             Job(["python", "-m", "src.update_candles", "--market=spot", "--timeframes=1h"]),
-            Job(["python", "-m", "src.update_candles", "--market=futures", "--timeframes=1m", "--timeframes=5m"]),
+            Job(
+                [
+                    "python",
+                    "-m",
+                    "src.update_candles",
+                    "--market=futures",
+                    "--timeframes=1m",
+                    "--timeframes=5m",
+                ]
+            ),
         ],
     )
 

@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -8,13 +9,41 @@ def systemd_unit_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
 
 
+def write_executable(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o700)
+
+
+def real_install_env(tmp_path: Path, fake_bin: Path) -> dict[str, str]:
+    fake_python = fake_bin / "python"
+    write_executable(fake_python, "#!/bin/sh\nexit 0\n")
+    write_executable(fake_bin / "id", "#!/bin/sh\necho autopilot-test\n")
+    config = tmp_path / "autopilot.json"
+    config.write_text("{}\n", encoding="utf-8")
+    return {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "HOME": str(tmp_path),
+        "USER": "autopilot-test",
+        "UNIT_DIR": str(tmp_path / "units"),
+        "REPO": str(tmp_path / "repo"),
+        "PYTHON": str(fake_python),
+        "CONFIG": str(config),
+        "DRY_RUN": "0",
+    }
+
+
 def test_systemd_installer_validates_config_before_starting_service():
     script = Path("scripts/install_autopilot_service.sh").read_text(encoding="utf-8")
 
     assert '"$PYTHON" -m src.autopilot.runtime --config "$CONFIG" --validate' in script
     assert '"$PYTHON" -m src.autopilot.readiness --config "$CONFIG"' in script
-    assert "ExecStartPre=$PYTHON_UNIT -m src.autopilot.runtime --config $CONFIG_UNIT --validate" in script
-    assert "ExecStartPre=$PYTHON_UNIT -m src.autopilot.readiness --config $CONFIG_UNIT" in script
+    assert (
+        "ExecStartPre=$PYTHON_UNIT -m src.autopilot.runtime --config $CONFIG_UNIT "
+        "--validate --skip-jobs"
+    ) in script
+    assert "ExecStartPre=$PYTHON_UNIT -m src.autopilot.readiness --config $CONFIG_UNIT" not in script
     assert script.index('"$PYTHON" -m src.autopilot.runtime --config "$CONFIG" --validate') < script.index(
         '"$PYTHON" -m src.autopilot.readiness --config "$CONFIG"'
     )
@@ -28,6 +57,7 @@ def test_systemd_installer_validates_unit_names_before_deriving_paths():
 
     assert "validate_unit_name()" in script
     assert 'validate_unit_name "$SERVICE_NAME" ".service" "SERVICE_NAME"' in script
+    assert 'validate_unit_name "$JOB_SERVICE_NAME" ".service" "JOB_SERVICE_NAME"' in script
     assert (
         'validate_unit_name "$HEALTHCHECK_SERVICE_NAME" ".service" "HEALTHCHECK_SERVICE_NAME"'
         in script
@@ -56,24 +86,147 @@ def test_systemd_installer_validates_raw_unit_values_before_deriving_paths():
     )
 
 
-def test_systemd_unit_runs_readiness_before_service_start():
+def test_systemd_installer_verifies_linger_before_enabling_units():
     script = Path("scripts/install_autopilot_service.sh").read_text(encoding="utf-8")
 
+    assert "ensure_user_linger()" in script
+    assert 'loginctl show-user "$target_user" --property=Linger' in script
+    assert 'TARGET_USER="$(id -un)"' in script
+    assert 'ensure_user_linger "$TARGET_USER"' in script
+    assert script.index('ensure_user_linger "$TARGET_USER"') < script.index(
+        'systemctl --user enable --now "$SERVICE_NAME"'
+    )
+    dry_run_exit = script.index('if [ "$DRY_RUN" = "1" ]')
+    assert dry_run_exit < script.index('ensure_user_linger "$TARGET_USER"')
+    assert 'loginctl enable-linger "$USER" >/dev/null 2>&1 || true' not in script
+
+
+def test_real_installer_fails_actionably_when_linger_cannot_be_enabled(tmp_path):
+    fake_bin = tmp_path / "bin"
+    write_executable(
+        fake_bin / "loginctl",
+        """#!/bin/sh
+if [ "$1" = "show-user" ]; then
+  echo "Linger=no"
+  exit 0
+fi
+if [ "$1" = "enable-linger" ]; then
+  exit 1
+fi
+exit 2
+""",
+    )
+    write_executable(fake_bin / "systemctl", "#!/bin/sh\necho systemctl-invoked >&2\nexit 99\n")
+
+    result = subprocess.run(
+        ["bash", "scripts/install_autopilot_service.sh"],
+        cwd=Path.cwd(),
+        env=real_install_env(tmp_path, fake_bin),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 1
+    assert "Could not enable user lingering for autopilot-test" in result.stderr
+    assert "sudo loginctl enable-linger autopilot-test" in result.stderr
+    assert "systemctl-invoked" not in result.stderr
+
+
+def test_real_installer_enables_and_verifies_linger_before_systemd(tmp_path):
+    fake_bin = tmp_path / "bin"
+    linger_state = tmp_path / "linger-enabled"
+    systemctl_log = tmp_path / "systemctl.log"
+    write_executable(
+        fake_bin / "loginctl",
+        f"""#!/bin/sh
+if [ "$1" = "show-user" ]; then
+  if [ -f "{linger_state}" ]; then echo "Linger=yes"; else echo "Linger=no"; fi
+  exit 0
+fi
+if [ "$1" = "enable-linger" ]; then
+  : > "{linger_state}"
+  exit 0
+fi
+exit 2
+""",
+    )
+    write_executable(
+        fake_bin / "systemctl",
+        f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{systemctl_log}"\nexit 0\n',
+    )
+
+    result = subprocess.run(
+        ["bash", "scripts/install_autopilot_service.sh"],
+        cwd=Path.cwd(),
+        env=real_install_env(tmp_path, fake_bin),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert linger_state.exists()
+    calls = systemctl_log.read_text(encoding="utf-8").splitlines()
+    assert "--user daemon-reload" in calls
+    assert "--user enable --now trading-bot-autopilot.service" in calls
+    assert "--user enable --now trading-bot-autopilot-jobs.service" in calls
+    assert "--user enable --now trading-bot-autopilot-healthcheck.timer" in calls
+
+
+def test_server_requirements_cover_enabled_autopilot_job_dependencies():
+    requirement_lines = [
+        line.strip()
+        for line in Path("requirements-bot.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    requirements = {
+        re.split(r"[<>=!~;\[]", line, maxsplit=1)[0].strip().lower()
+        for line in requirement_lines
+    }
+
+    assert {"numpy", "pandas", "pyarrow", "requests", "scipy", "scikit-learn", "ta-lib", "ccxt"} <= requirements
+    assert {
+        "aiodns",
+        "aiohttp",
+        "certifi",
+        "cffi",
+        "charset-normalizer",
+        "coincurve",
+        "cryptography",
+        "idna",
+        "joblib",
+        "pycares",
+        "python-dateutil",
+        "threadpoolctl",
+        "typing_extensions",
+        "urllib3",
+        "yarl",
+    } <= requirements
+    assert all("==" in line.split(";", 1)[0] for line in requirement_lines)
+
+
+def test_systemd_installer_gates_initial_enablement_but_restart_preserves_management():
+    script = Path("scripts/install_autopilot_service.sh").read_text(encoding="utf-8")
+
+    assert '"$PYTHON" -m src.autopilot.readiness --config "$CONFIG"' in script
     assert (
-        "ExecStartPre=$PYTHON_UNIT -m src.autopilot.readiness --config $CONFIG_UNIT "
-        "--output $READINESS_REPORT_UNIT "
-        "--json-output $READINESS_JSON_UNIT"
+        "ExecStartPre=$PYTHON_UNIT -m src.autopilot.runtime --config $CONFIG_UNIT "
+        "--validate --skip-jobs"
     ) in script
-    assert script.index(
-        "ExecStartPre=$PYTHON_UNIT -m src.autopilot.runtime --config $CONFIG_UNIT --validate"
-    ) < script.index(
-        "ExecStartPre=$PYTHON_UNIT -m src.autopilot.readiness --config $CONFIG_UNIT"
-    )
-    assert script.index(
-        "ExecStartPre=$PYTHON_UNIT -m src.autopilot.readiness --config $CONFIG_UNIT"
-    ) < script.index(
-        "ExecStart=$PYTHON_UNIT -m src.autopilot.runtime --config $CONFIG_UNIT"
-    )
+    assert "ExecStartPre=$PYTHON_UNIT -m src.autopilot.readiness --config $CONFIG_UNIT" not in script
+    assert "ExecStart=$PYTHON_UNIT -m src.autopilot.runtime --config $CONFIG_UNIT --skip-jobs" in script
+
+
+def test_systemd_separates_trading_supervision_from_scheduled_jobs():
+    script = Path("scripts/install_autopilot_service.sh").read_text(encoding="utf-8")
+
+    assert 'JOB_SERVICE_NAME="${JOB_SERVICE_NAME:-trading-bot-autopilot-jobs.service}"' in script
+    assert "ExecStart=$PYTHON_UNIT -m src.autopilot.runtime --config $CONFIG_UNIT --skip-jobs" in script
+    assert "ExecStart=$PYTHON_UNIT -m src.autopilot.job_worker --config $CONFIG_UNIT" in script
+    assert 'systemctl --user enable --now "$JOB_SERVICE_NAME"' in script
 
 
 def test_systemd_unit_loads_env_and_has_restart_bounds():
@@ -204,6 +357,7 @@ def test_installer_dry_run_generates_units_without_systemctl(tmp_path):
         "CONFIG": str(config_file),
         "DRY_RUN": "1",
         "SERVICE_NAME": "test-autopilot.service",
+        "JOB_SERVICE_NAME": "test-autopilot-jobs.service",
         "HEALTHCHECK_SERVICE_NAME": "test-autopilot-healthcheck.service",
         "HEALTHCHECK_TIMER_NAME": "test-autopilot-healthcheck.timer",
         "AUTOPILOT_THREADS": "1",
@@ -226,23 +380,25 @@ def test_installer_dry_run_generates_units_without_systemctl(tmp_path):
     assert "Dry run complete. Wrote unit files:" in result.stdout
     unit_dir = tmp_path / "dry-run-units"
     service = (unit_dir / "test-autopilot.service").read_text(encoding="utf-8")
+    job_service = (unit_dir / "test-autopilot-jobs.service").read_text(encoding="utf-8")
     health_service = (unit_dir / "test-autopilot-healthcheck.service").read_text(encoding="utf-8")
     timer = (unit_dir / "test-autopilot-healthcheck.timer").read_text(encoding="utf-8")
     repo_unit = systemd_unit_quote(str(service_repo))
     python_unit = systemd_unit_quote(str(python_link))
     config_unit = systemd_unit_quote(str(config_file))
     env_file_unit = systemd_unit_quote("-" + str(service_repo / ".env"))
-    readiness_report_unit = systemd_unit_quote(str(service_repo / "runtime" / "readiness_report.md"))
-    readiness_json_unit = systemd_unit_quote(str(service_repo / "runtime" / "readiness_report.json"))
     healthcheck_json_unit = systemd_unit_quote(str(service_repo / "runtime" / "healthcheck.json"))
     assert f"WorkingDirectory={repo_unit}" in service
     assert f"EnvironmentFile={env_file_unit}" in service
-    assert f"ExecStartPre={python_unit} -m src.autopilot.runtime --config {config_unit} --validate" in service
     assert (
-        f"ExecStartPre={python_unit} -m src.autopilot.readiness --config {config_unit} "
-        f"--output {readiness_report_unit} --json-output {readiness_json_unit}"
+        f"ExecStartPre={python_unit} -m src.autopilot.runtime --config {config_unit} "
+        "--validate --skip-jobs"
     ) in service
-    assert f"ExecStart={python_unit} -m src.autopilot.runtime --config {config_unit}" in service
+    assert "src.autopilot.readiness" not in service
+    assert f"ExecStart={python_unit} -m src.autopilot.runtime --config {config_unit} --skip-jobs" in service
+    assert f"WorkingDirectory={repo_unit}" in job_service
+    assert f"EnvironmentFile={env_file_unit}" in job_service
+    assert f"ExecStart={python_unit} -m src.autopilot.job_worker --config {config_unit}" in job_service
     assert f"WorkingDirectory={repo_unit}" in health_service
     assert f"EnvironmentFile={env_file_unit}" in health_service
     assert f"ExecStart={python_unit} -m src.autopilot.healthcheck --config {config_unit} --output {healthcheck_json_unit}" in health_service
@@ -252,12 +408,16 @@ def test_installer_dry_run_generates_units_without_systemctl(tmp_path):
     assert "MemoryMax=512M" in service
     assert "CPUQuota=50%" in service
     assert "TasksMax=64" in service
+    assert "MemoryMax=512M" in job_service
+    assert "CPUQuota=50%" in job_service
+    assert "TasksMax=64" in job_service
     assert "MemoryMax=512M" in health_service
     assert "CPUQuota=50%" in health_service
     assert "TasksMax=64" in health_service
     assert "Unit=test-autopilot-healthcheck.service" in timer
     assert "OnUnitActiveSec=5min" in timer
     assert (unit_dir / "test-autopilot.service").stat().st_mode & 0o777 == 0o600
+    assert (unit_dir / "test-autopilot-jobs.service").stat().st_mode & 0o777 == 0o600
     assert (unit_dir / "test-autopilot-healthcheck.service").stat().st_mode & 0o777 == 0o600
     assert (unit_dir / "test-autopilot-healthcheck.timer").stat().st_mode & 0o777 == 0o600
 

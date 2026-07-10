@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Sequence, Tuple
+from collections.abc import Sequence
 
 import lightgbm as lgb
 import numpy as np
@@ -39,7 +39,7 @@ def screen_features(
     feature_columns: Sequence[str],
     max_features: int,
     method: str = "shap",
-) -> List[str]:
+) -> list[str]:
     model = _fit_classifier(train_data, feature_columns, label_column)
     features = list(feature_columns)
     if method == "shap":
@@ -64,13 +64,13 @@ def screen_features(
 
 def screen_features_per_scenario(
     train_data: pd.DataFrame,
-    tp_sl_pairs: Sequence[Tuple[float, float]],
+    tp_sl_pairs: Sequence[tuple[float, float]],
     horizons: Sequence[int],
     directions: Sequence[str],
     feature_columns: Sequence[str],
     max_features: int,
-) -> Dict[str, List[str]]:
-    result: Dict[str, List[str]] = {}
+) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
     for direction in directions:
         for horizon in horizons:
             for tp, sl in tp_sl_pairs:

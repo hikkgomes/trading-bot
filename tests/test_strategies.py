@@ -104,6 +104,51 @@ def test_btc_pnl_unit_only_shorts_realise():
     assert all(abs(t["gross_return"]) < 1e-12 for t in trades)
 
 
+def test_canonical_backtester_uses_product_specific_short_return_math():
+    open_ = np.array([100.0, 100.0, 90.0])
+    high = np.array([100.0, 100.0, 100.0])
+    low = np.array([100.0, 100.0, 90.0])
+    close = np.array([100.0, 100.0, 90.0])
+    direction = np.array([-1, 0, 0])
+    index = pd.RangeIndex(3)
+
+    usdt_trade = _simulate(
+        open_,
+        high,
+        low,
+        close,
+        direction,
+        index,
+        BacktestConfig(
+            fee_bps=0,
+            slippage_bps=0,
+            take_profit=0.5,
+            stop_loss=0.5,
+            horizon_bars=1,
+            pnl_unit="usdt",
+        ),
+    )[0]
+    btc_trade = _simulate(
+        open_,
+        high,
+        low,
+        close,
+        direction,
+        index,
+        BacktestConfig(
+            fee_bps=0,
+            slippage_bps=0,
+            take_profit=0.5,
+            stop_loss=0.5,
+            horizon_bars=1,
+            pnl_unit="btc",
+        ),
+    )[0]
+
+    assert usdt_trade["gross_return"] == pytest.approx(0.10)
+    assert btc_trade["gross_return"] == pytest.approx(1 / 9)
+
+
 # --------------------------------------------------------------------------- indicators
 def test_new_indicators_bounds_and_shape():
     from src.strategies import indicators as ind

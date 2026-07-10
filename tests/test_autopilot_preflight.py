@@ -6,7 +6,8 @@ import pytest
 from src.autopilot.approvals import ApprovalLedger, artifact_digest
 from src.autopilot.config import AutopilotConfig, ProductConfig
 from src.autopilot.preflight import main, run_preflight
-from src.execution.broker import Position
+from src.execution.broker import OpenOrderIdentity, Position
+from src.execution.config import ExchangeConfig
 
 
 def product(tmp_path, **overrides):
@@ -114,6 +115,7 @@ def btc_strategy_artifact(path):
 
 def set_live_env(monkeypatch):
     monkeypatch.setenv("TRADING_LIVE", "1")
+    monkeypatch.setenv("EXCHANGE_TESTNET", "0")
     monkeypatch.setenv("FUTURES_EXCHANGE", "binanceusdm")
     monkeypatch.setenv("EXCHANGE_API_KEY", "key")
     monkeypatch.setenv("EXCHANGE_API_SECRET", "secret")
@@ -135,7 +137,18 @@ class FakeBroker:
         return 1000.0
 
     def get_position(self, symbol):
-        return Position(symbol=symbol, qty=self.position_qty, avg_price=90.0 if self.position_qty else 0.0)
+        return Position(
+            symbol=symbol, qty=self.position_qty, avg_price=90.0 if self.position_qty else 0.0
+        )
+
+    def supports_native_protective_stops(self):
+        return True
+
+    def verify_one_way_position_mode(self, symbol):
+        return True
+
+    def list_open_orders(self, symbol, *, conditional):
+        return ()
 
 
 def test_preflight_no_products_selected(tmp_path):
@@ -224,7 +237,9 @@ def test_preflight_passes_with_approval_and_env(monkeypatch, tmp_path):
     strategy = strategy_artifact(artifact)
     ledger = tmp_path / "approvals.json"
     active_product = product(tmp_path)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=active_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=active_product
+    )
     cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
     monkeypatch.setattr("src.autopilot.preflight.build_live_broker", lambda product: FakeBroker())
 
@@ -240,7 +255,9 @@ def test_preflight_passes_with_approval_and_env(monkeypatch, tmp_path):
     assert product_payload["preflight_report"] == str(active_product.preflight_report)
     assert product_payload["preflight_max_age_seconds"] == active_product.preflight_max_age_seconds
     assert product_payload["require_testnet_rehearsal"] is True
-    assert product_payload["testnet_rehearsal_report"] == str(active_product.testnet_rehearsal_report)
+    assert product_payload["testnet_rehearsal_report"] == str(
+        active_product.testnet_rehearsal_report
+    )
     assert (
         product_payload["testnet_rehearsal_max_age_seconds"]
         == active_product.testnet_rehearsal_max_age_seconds
@@ -249,9 +266,15 @@ def test_preflight_passes_with_approval_and_env(monkeypatch, tmp_path):
     assert checks["exchange_environment"]["detail"] == {
         "exchange": "binanceusdm",
         "market_type": "futures",
-        "testnet": True,
+        "testnet": False,
         "require_testnet": False,
         "quote_asset": "USDT",
+        "account_fingerprint": ExchangeConfig(
+            exchange="binanceusdm",
+            market_type="futures",
+            api_key="key",
+            testnet=False,
+        ).account_fingerprint,
         "max_notional_usd": 100.0,
         "max_fill_slippage_bps": 100.0,
         "max_futures_leverage": 1,
@@ -272,7 +295,9 @@ def test_preflight_rejects_unsafe_futures_leverage(monkeypatch, tmp_path):
     strategy = strategy_artifact(artifact)
     ledger = tmp_path / "approvals.json"
     active_product = product(tmp_path)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=active_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=active_product
+    )
     cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
 
     def fail_broker(_product):
@@ -296,7 +321,9 @@ def test_preflight_rejects_active_income_leverage_above_one(monkeypatch, tmp_pat
     strategy = strategy_artifact(artifact)
     ledger = tmp_path / "approvals.json"
     active_product = product(tmp_path)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=active_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=active_product
+    )
     cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
 
     def fail_broker(_product):
@@ -309,7 +336,10 @@ def test_preflight_rejects_active_income_leverage_above_one(monkeypatch, tmp_pat
     checks = {item["name"]: item for item in report["products"][0]["checks"]}
     assert report["ok"] is False
     assert checks["exchange_environment"]["ok"] is False
-    assert "active income futures must use MAX_FUTURES_LEVERAGE=1" in checks["exchange_environment"]["error"]
+    assert (
+        "active income futures must use MAX_FUTURES_LEVERAGE=1"
+        in checks["exchange_environment"]["error"]
+    )
     assert checks["broker_constructed"]["detail"]["skipped"] is True
 
 
@@ -320,7 +350,9 @@ def test_preflight_rejects_non_positive_fill_slippage(monkeypatch, tmp_path):
     strategy = strategy_artifact(artifact)
     ledger = tmp_path / "approvals.json"
     active_product = product(tmp_path)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=active_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=active_product
+    )
     cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
 
     def fail_broker(_product):
@@ -344,7 +376,9 @@ def test_preflight_rejects_malformed_exchange_env_without_building_broker(monkey
     strategy = strategy_artifact(artifact)
     ledger = tmp_path / "approvals.json"
     active_product = product(tmp_path)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=active_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=active_product
+    )
     cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
 
     def fail_broker(_product):
@@ -369,7 +403,9 @@ def test_preflight_require_testnet_rejects_mainnet_env(monkeypatch, tmp_path):
     strategy = strategy_artifact(artifact)
     ledger = tmp_path / "approvals.json"
     active_product = product(tmp_path)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=active_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=active_product
+    )
     cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
 
     def fail_broker(_product):
@@ -377,7 +413,9 @@ def test_preflight_require_testnet_rejects_mainnet_env(monkeypatch, tmp_path):
 
     monkeypatch.setattr("src.autopilot.preflight.build_live_broker", fail_broker)
 
-    report = run_preflight(cfg, product_name="active_income", assume_live=True, require_testnet=True)
+    report = run_preflight(
+        cfg, product_name="active_income", assume_live=True, require_testnet=True
+    )
 
     checks = {item["name"]: item for item in report["products"][0]["checks"]}
     assert report["ok"] is False
@@ -388,6 +426,43 @@ def test_preflight_require_testnet_rejects_mainnet_env(monkeypatch, tmp_path):
     assert checks["broker_constructed"]["detail"]["skipped"] is True
 
 
+def test_production_preflight_rejects_testnet_environment(monkeypatch, tmp_path):
+    set_live_env(monkeypatch)
+    monkeypatch.setenv("EXCHANGE_TESTNET", "1")
+    artifact = tmp_path / "active.json"
+    strategy = strategy_artifact(artifact)
+    ledger = tmp_path / "approvals.json"
+    active_product = product(tmp_path)
+    ApprovalLedger(ledger).approve(
+        strategy,
+        artifact_path=artifact,
+        approved_by="test",
+        product=active_product,
+    )
+    cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
+
+    def fail_broker(_product):
+        raise AssertionError("broker should not be built for a sandbox production preflight")
+
+    report = run_preflight(
+        cfg,
+        product_name="active_income",
+        assume_live=True,
+        connect=True,
+        broker_builder=fail_broker,
+    )
+
+    checks = {item["name"]: item for item in report["products"][0]["checks"]}
+    assert report["ok"] is False
+    assert checks["exchange_environment"]["ok"] is False
+    assert checks["exchange_environment"]["detail"]["testnet"] is True
+    assert (
+        "EXCHANGE_TESTNET must be 0 for a production preflight"
+        in checks["exchange_environment"]["error"]
+    )
+    assert checks["broker_constructed"]["detail"]["skipped"] is True
+
+
 def test_preflight_rejects_non_isolated_futures_margin(monkeypatch, tmp_path):
     set_live_env(monkeypatch)
     monkeypatch.setenv("FUTURES_MARGIN_MODE", "cross")
@@ -395,7 +470,9 @@ def test_preflight_rejects_non_isolated_futures_margin(monkeypatch, tmp_path):
     strategy = strategy_artifact(artifact)
     ledger = tmp_path / "approvals.json"
     active_product = product(tmp_path)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=active_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=active_product
+    )
     cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
 
     def fail_broker(_product):
@@ -419,7 +496,9 @@ def test_preflight_rejects_non_binance_active_income_futures(monkeypatch, tmp_pa
     strategy = strategy_artifact(artifact)
     ledger = tmp_path / "approvals.json"
     active_product = product(tmp_path)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=active_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=active_product
+    )
     cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
 
     def fail_broker(_product):
@@ -436,14 +515,18 @@ def test_preflight_rejects_non_binance_active_income_futures(monkeypatch, tmp_pa
     assert checks["broker_constructed"]["detail"]["skipped"] is True
 
 
-def test_preflight_broker_policy_rejects_non_binance_even_with_custom_env_checker(monkeypatch, tmp_path):
+def test_preflight_broker_policy_rejects_non_binance_even_with_custom_env_checker(
+    monkeypatch, tmp_path
+):
     set_live_env(monkeypatch)
     monkeypatch.setenv("FUTURES_EXCHANGE", "okx")
     artifact = tmp_path / "active.json"
     strategy = strategy_artifact(artifact)
     ledger = tmp_path / "approvals.json"
     active_product = product(tmp_path)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=active_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=active_product
+    )
     cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
 
     class FailBroker:
@@ -471,9 +554,13 @@ def test_preflight_connect_reads_exchange(monkeypatch, tmp_path):
     strategy = strategy_artifact(artifact)
     ledger = tmp_path / "approvals.json"
     active_product = product(tmp_path)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=active_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=active_product
+    )
     cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
-    monkeypatch.setattr("src.autopilot.preflight.build_live_broker", lambda product: FakeBroker(position_qty=0.0))
+    monkeypatch.setattr(
+        "src.autopilot.preflight.build_live_broker", lambda product: FakeBroker(position_qty=0.0)
+    )
 
     report = run_preflight(cfg, product_name="active_income", assume_live=True, connect=True)
 
@@ -482,7 +569,188 @@ def test_preflight_connect_reads_exchange(monkeypatch, tmp_path):
     assert checks["exchange_read_connectivity"]["detail"]["price"] == 100.0
     assert checks["exchange_read_connectivity"]["detail"]["position_qty"] == 0.0
     assert checks["exchange_read_connectivity"]["detail"]["position_is_flat"] is True
+    assert checks["broker_native_protective_stops"] == {
+        "name": "broker_native_protective_stops",
+        "ok": True,
+        "detail": {"supported": True},
+    }
+    assert checks["broker_position_mode_one_way"] == {
+        "name": "broker_position_mode_one_way",
+        "ok": True,
+        "detail": {"symbol": "BTCUSDT", "one_way": True},
+    }
+    assert checks["broker_open_orders_empty"] == {
+        "name": "broker_open_orders_empty",
+        "ok": True,
+        "detail": {
+            "symbol": "BTCUSDT",
+            "regular": {"count": 0, "orders": []},
+            "conditional": {"count": 0, "orders": []},
+        },
+    }
     assert checks["broker_position_flat"]["ok"] is True
+
+
+def test_preflight_connect_rejects_hedge_position_mode(monkeypatch, tmp_path):
+    set_live_env(monkeypatch)
+    artifact = tmp_path / "active.json"
+    strategy = strategy_artifact(artifact)
+    ledger = tmp_path / "approvals.json"
+    active_product = product(tmp_path)
+    ApprovalLedger(ledger).approve(
+        strategy,
+        artifact_path=artifact,
+        approved_by="test",
+        product=active_product,
+    )
+    cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
+    broker = FakeBroker()
+    broker.verify_one_way_position_mode = lambda symbol: False
+
+    report = run_preflight(
+        cfg,
+        product_name="active_income",
+        assume_live=True,
+        connect=True,
+        broker_builder=lambda product: broker,
+    )
+
+    checks = {item["name"]: item for item in report["products"][0]["checks"]}
+    assert report["ok"] is False
+    assert checks["broker_position_mode_one_way"]["ok"] is False
+    assert checks["broker_position_mode_one_way"]["detail"] == {
+        "symbol": "BTCUSDT",
+        "one_way": False,
+    }
+    assert "hedge mode" in checks["broker_position_mode_one_way"]["error"]
+
+
+@pytest.mark.parametrize("conditional", [False, True])
+def test_preflight_connect_rejects_orphaned_open_orders(
+    monkeypatch,
+    tmp_path,
+    conditional,
+):
+    set_live_env(monkeypatch)
+    artifact = tmp_path / "active.json"
+    strategy = strategy_artifact(artifact)
+    ledger = tmp_path / "approvals.json"
+    active_product = product(tmp_path)
+    ApprovalLedger(ledger).approve(
+        strategy,
+        artifact_path=artifact,
+        approved_by="test",
+        product=active_product,
+    )
+    cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
+    broker = FakeBroker()
+    orphan_kind = conditional
+
+    def inventory(symbol, *, conditional):
+        if conditional != orphan_kind:
+            return ()
+        return (
+            OpenOrderIdentity(
+                symbol=symbol,
+                order_id="12345",
+                client_id="manual-order-1",
+                status="open",
+                conditional=conditional,
+            ),
+        )
+
+    broker.list_open_orders = inventory
+    report = run_preflight(
+        cfg,
+        product_name="active_income",
+        assume_live=True,
+        connect=True,
+        broker_builder=lambda product: broker,
+    )
+
+    checks = {item["name"]: item for item in report["products"][0]["checks"]}
+    detail = checks["broker_open_orders_empty"]["detail"]
+    assert report["ok"] is False
+    assert checks["broker_open_orders_empty"]["ok"] is False
+    assert detail["conditional" if conditional else "regular"]["count"] == 1
+    assert detail["conditional" if conditional else "regular"]["orders"][0] == {
+        "symbol": "BTCUSDT",
+        "order_id": "12345",
+        "client_id": "manual-order-1",
+        "status": "open",
+        "conditional": conditional,
+    }
+    assert "manual reconciliation" in checks["broker_open_orders_empty"]["error"]
+
+
+def test_preflight_connect_fails_closed_when_open_order_query_is_unavailable(
+    monkeypatch,
+    tmp_path,
+):
+    set_live_env(monkeypatch)
+    artifact = tmp_path / "active.json"
+    strategy = strategy_artifact(artifact)
+    ledger = tmp_path / "approvals.json"
+    active_product = product(tmp_path)
+    ApprovalLedger(ledger).approve(
+        strategy,
+        artifact_path=artifact,
+        approved_by="test",
+        product=active_product,
+    )
+    cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
+    broker = FakeBroker()
+
+    def unavailable(symbol, *, conditional):
+        raise RuntimeError("inventory endpoint unavailable")
+
+    broker.list_open_orders = unavailable
+    report = run_preflight(
+        cfg,
+        product_name="active_income",
+        assume_live=True,
+        connect=True,
+        broker_builder=lambda product: broker,
+    )
+
+    checks = {item["name"]: item for item in report["products"][0]["checks"]}
+    assert report["ok"] is False
+    assert checks["broker_open_orders_empty"]["ok"] is False
+    assert "inventory endpoint unavailable" in checks["broker_open_orders_empty"]["error"]
+
+
+def test_preflight_connect_rejects_active_income_broker_without_native_stops(
+    monkeypatch,
+    tmp_path,
+):
+    set_live_env(monkeypatch)
+    artifact = tmp_path / "active.json"
+    strategy = strategy_artifact(artifact)
+    ledger = tmp_path / "approvals.json"
+    active_product = product(tmp_path)
+    ApprovalLedger(ledger).approve(
+        strategy,
+        artifact_path=artifact,
+        approved_by="test",
+        product=active_product,
+    )
+    cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
+    broker = FakeBroker()
+    broker.supports_native_protective_stops = lambda: False
+
+    report = run_preflight(
+        cfg,
+        product_name="active_income",
+        assume_live=True,
+        connect=True,
+        broker_builder=lambda product: broker,
+    )
+
+    checks = {item["name"]: item for item in report["products"][0]["checks"]}
+    assert report["ok"] is False
+    assert checks["broker_native_protective_stops"]["ok"] is False
+    assert checks["broker_native_protective_stops"]["detail"] == {"supported": False}
+    assert "exchange-native reduce-only" in checks["broker_native_protective_stops"]["error"]
 
 
 def test_preflight_connect_rejects_non_flat_active_income_position(monkeypatch, tmp_path):
@@ -491,9 +759,13 @@ def test_preflight_connect_rejects_non_flat_active_income_position(monkeypatch, 
     strategy = strategy_artifact(artifact)
     ledger = tmp_path / "approvals.json"
     active_product = product(tmp_path)
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=active_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=active_product
+    )
     cfg = AutopilotConfig(approval_ledger=ledger, products=[active_product])
-    monkeypatch.setattr("src.autopilot.preflight.build_live_broker", lambda product: FakeBroker(position_qty=0.5))
+    monkeypatch.setattr(
+        "src.autopilot.preflight.build_live_broker", lambda product: FakeBroker(position_qty=0.5)
+    )
 
     report = run_preflight(cfg, product_name="active_income", assume_live=True, connect=True)
 
@@ -519,9 +791,13 @@ def test_preflight_connect_allows_existing_btc_accumulation_spot_position(monkey
         market="spot",
         strategies_path=artifact,
     )
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=btc_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=btc_product
+    )
     cfg = AutopilotConfig(approval_ledger=ledger, products=[btc_product])
-    monkeypatch.setattr("src.autopilot.preflight.build_live_broker", lambda product: FakeBroker(position_qty=0.5))
+    monkeypatch.setattr(
+        "src.autopilot.preflight.build_live_broker", lambda product: FakeBroker(position_qty=0.5)
+    )
 
     report = run_preflight(cfg, product_name="btc_accumulation", assume_live=True, connect=True)
 
@@ -547,9 +823,13 @@ def test_preflight_connect_rejects_negative_btc_accumulation_spot_position(monke
         market="spot",
         strategies_path=artifact,
     )
-    ApprovalLedger(ledger).approve(strategy, artifact_path=artifact, approved_by="test", product=btc_product)
+    ApprovalLedger(ledger).approve(
+        strategy, artifact_path=artifact, approved_by="test", product=btc_product
+    )
     cfg = AutopilotConfig(approval_ledger=ledger, products=[btc_product])
-    monkeypatch.setattr("src.autopilot.preflight.build_live_broker", lambda product: FakeBroker(position_qty=-0.01))
+    monkeypatch.setattr(
+        "src.autopilot.preflight.build_live_broker", lambda product: FakeBroker(position_qty=-0.01)
+    )
 
     report = run_preflight(cfg, product_name="btc_accumulation", assume_live=True, connect=True)
 
@@ -557,7 +837,9 @@ def test_preflight_connect_rejects_negative_btc_accumulation_spot_position(monke
     assert report["ok"] is False
     assert checks["exchange_read_connectivity"]["ok"] is True
     assert checks["broker_spot_position_non_negative"]["ok"] is False
-    assert checks["broker_spot_position_non_negative"]["detail"]["position_qty"] == pytest.approx(-0.01)
+    assert checks["broker_spot_position_non_negative"]["detail"]["position_qty"] == pytest.approx(
+        -0.01
+    )
     assert "must be non-negative" in checks["broker_spot_position_non_negative"]["error"]
 
 
@@ -649,7 +931,9 @@ def test_preflight_cli_prints_json_when_output_write_fails(monkeypatch, tmp_path
     )
     report = {"ok": True, "generated_ts": 1.0, "products": []}
     monkeypatch.setattr("src.autopilot.preflight.load_config", lambda path: AutopilotConfig())
-    monkeypatch.setattr("src.autopilot.preflight.run_preflight", lambda *args, **kwargs: report.copy())
+    monkeypatch.setattr(
+        "src.autopilot.preflight.run_preflight", lambda *args, **kwargs: report.copy()
+    )
 
     def fail_write(path, payload):
         raise OSError("disk full")

@@ -66,11 +66,23 @@ def write_artifact(path, strategies):
     )
 
 
-def write_trades(path, strategy_id="s1", n=3, sized_return=0.01, start="2026-01-01"):
+def write_trades(
+    path,
+    strategy_id="s1",
+    n=3,
+    sized_return=0.01,
+    start="2026-01-01",
+    day_step=4,
+    strategy_payload=None,
+):
+    fingerprint = strategy_fingerprint(strategy_payload or strategy(strategy_id))
     rows = [
         {
             "strategy_id": strategy_id,
-            "exit_time": str(pd.Timestamp(start, tz="UTC") + pd.Timedelta(days=i)),
+            "strategy_fingerprint": fingerprint,
+            "exit_time": str(
+                pd.Timestamp(start, tz="UTC") + pd.Timedelta(days=i * day_step)
+            ),
             "net_return": 0.02 if i % 2 == 0 else -0.01,
             "sized_return": sized_return,
             "equity_after": 1000 + i,
@@ -137,7 +149,38 @@ def test_promotion_review_not_ready_without_paper_trades(tmp_path):
     item = review["strategies"][0]
     assert item["recommendation"] == "not_ready"
     assert item["paper"]["trades"] == 0
-    assert "paper trades 0 < 1" in item["reasons"]
+    assert "exact-fingerprint paper trades 0 < 1" in item["reasons"]
+    assert item["approval_command"] is None
+
+
+def test_promotion_review_never_inherits_trades_from_changed_same_id_strategy(tmp_path):
+    artifact = tmp_path / "active.json"
+    trade_log = tmp_path / "trades.csv"
+    old_strategy = strategy()
+    old_strategy["take_profit"] = 0.01
+    changed_strategy = strategy()
+    changed_strategy["take_profit"] = 0.03
+    write_artifact(artifact, [changed_strategy])
+    write_trades(
+        trade_log,
+        n=25,
+        sized_return=0.01,
+        strategy_payload=old_strategy,
+    )
+
+    review = build_promotion_review(
+        artifact_path=artifact,
+        trade_log=trade_log,
+        ledger_path=tmp_path / "approvals.json",
+        thresholds=PromotionThresholds(min_paper_trades=20),
+        product=product(tmp_path, strategies_path=artifact, trade_log=trade_log),
+    )
+
+    item = review["strategies"][0]
+    assert item["paper"]["trades"] == 0
+    assert item["paper"]["other_fingerprint_rows"] == 25
+    assert item["recommendation"] == "not_ready"
+    assert "exact-fingerprint paper trades 0 < 20" in item["reasons"]
     assert item["approval_command"] is None
 
 
@@ -182,7 +225,7 @@ def test_promotion_review_needs_approval_when_thresholds_pass(tmp_path):
     assert item["paper"]["total_sized_return"] == 0.03
     assert item["paper"]["max_drawdown"] == 0.0
     assert item["paper"]["max_consecutive_losses"] == 1
-    assert item["paper"]["paper_days"] == 2.0
+    assert item["paper"]["paper_days"] == 8.0
     assert any("product context is required" in reason for reason in item["reasons"])
     assert item["approval_command"] is None
 
@@ -195,6 +238,7 @@ def test_promotion_review_blocks_invalid_paper_return_rows(tmp_path):
         [
             {
                 "strategy_id": "s1",
+                "strategy_fingerprint": strategy_fingerprint(strategy()),
                 "exit_time": "2026-01-01T00:00:00Z",
                 "net_return": 0.02,
                 "sized_return": 0.01,
@@ -202,6 +246,7 @@ def test_promotion_review_blocks_invalid_paper_return_rows(tmp_path):
             },
             {
                 "strategy_id": "s1",
+                "strategy_fingerprint": strategy_fingerprint(strategy()),
                 "exit_time": "2026-01-02T00:00:00Z",
                 "net_return": "bad",
                 "sized_return": 0.01,
@@ -209,6 +254,7 @@ def test_promotion_review_blocks_invalid_paper_return_rows(tmp_path):
             },
             {
                 "strategy_id": "s1",
+                "strategy_fingerprint": strategy_fingerprint(strategy()),
                 "exit_time": "2026-01-03T00:00:00Z",
                 "net_return": 0.01,
                 "equity_after": 1030.0,
@@ -427,6 +473,7 @@ def test_promotion_review_blocks_large_paper_drawdown(tmp_path):
         [
             {
                 "strategy_id": "s1",
+                "strategy_fingerprint": strategy_fingerprint(strategy()),
                 "exit_time": "2026-01-01T00:00:00Z",
                 "net_return": 0.03,
                 "sized_return": 0.03,
@@ -434,6 +481,7 @@ def test_promotion_review_blocks_large_paper_drawdown(tmp_path):
             },
             {
                 "strategy_id": "s1",
+                "strategy_fingerprint": strategy_fingerprint(strategy()),
                 "exit_time": "2026-01-02T00:00:00Z",
                 "net_return": -0.02,
                 "sized_return": -0.02,
@@ -441,6 +489,7 @@ def test_promotion_review_blocks_large_paper_drawdown(tmp_path):
             },
             {
                 "strategy_id": "s1",
+                "strategy_fingerprint": strategy_fingerprint(strategy()),
                 "exit_time": "2026-01-03T00:00:00Z",
                 "net_return": 0.01,
                 "sized_return": 0.01,
@@ -471,6 +520,7 @@ def test_promotion_review_blocks_excessive_loss_streak(tmp_path):
         [
             {
                 "strategy_id": "s1",
+                "strategy_fingerprint": strategy_fingerprint(strategy()),
                 "exit_time": f"2026-01-0{i + 1}T00:00:00Z",
                 "net_return": -0.001,
                 "sized_return": 0.001,
@@ -501,7 +551,7 @@ def test_promotion_review_blocks_short_paper_duration_when_required(tmp_path):
     artifact = tmp_path / "active.json"
     trade_log = tmp_path / "trades.csv"
     write_artifact(artifact, [strategy()])
-    write_trades(trade_log, n=3, sized_return=0.01)
+    write_trades(trade_log, n=3, sized_return=0.01, day_step=1)
 
     review = build_promotion_review(
         artifact_path=artifact,
@@ -573,6 +623,8 @@ def test_promotion_review_shell_quotes_approval_command_paths_and_placeholder(tm
         "active_income",
         "--artifact",
         str(artifact),
+        "--expected-artifact-digest",
+        review["artifact_digest"],
         "--strategy-id",
         "s1",
         "--approved-by",
@@ -587,7 +639,7 @@ def test_promotion_review_marks_approval_product_mismatch_for_different_symbol(t
     strat = strategy()
     strat["symbol"] = "ETHUSDT"
     write_artifact(artifact, [strat])
-    write_trades(trade_log, n=3, sized_return=0.01)
+    write_trades(trade_log, n=3, sized_return=0.01, strategy_payload=strat)
     ledger = tmp_path / "approvals.json"
     approved_product = product(tmp_path, strategies_path=artifact, symbol="BTCUSDT")
     reviewed_product = product(tmp_path, strategies_path=artifact, symbol="ETHUSDT")

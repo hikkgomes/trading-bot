@@ -87,7 +87,7 @@ def _param_combos(grid: dict[str, list]) -> list[dict]:
     if not grid:
         return [{}]
     keys = list(grid)
-    return [dict(zip(keys, combo)) for combo in itertools.product(*(grid[k] for k in keys))]
+    return [dict(zip(keys, combo, strict=False)) for combo in itertools.product(*(grid[k] for k in keys))]
 
 
 def _deflated_sharpe(returns: np.ndarray, *, n_trials: int) -> float:

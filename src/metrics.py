@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable, Mapping, Sequence
 from itertools import combinations
-from typing import Dict, Iterable, List, Mapping, Sequence
 
 import numpy as np
 from scipy.stats import norm
@@ -124,7 +124,7 @@ def probability_backtest_overfitting(
 def cluster_strategies_by_overlap(
     masks_dict: Mapping[str, Iterable[bool]],
     jaccard_threshold: float = 0.8,
-) -> Dict[int, List[str]]:
+) -> dict[int, list[str]]:
     names = list(masks_dict.keys())
     masks = {name: np.asarray(list(masks_dict[name]), dtype=bool) for name in names}
     parent = {name: name for name in names}
@@ -148,7 +148,7 @@ def cluster_strategies_by_overlap(
             if score >= jaccard_threshold:
                 union(left, right)
 
-    clusters: Dict[str, List[str]] = defaultdict(list)
+    clusters: dict[str, list[str]] = defaultdict(list)
     for name in names:
         clusters[find(name)].append(name)
     return {idx: sorted(values) for idx, values in enumerate(clusters.values())}

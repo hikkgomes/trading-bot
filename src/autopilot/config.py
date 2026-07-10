@@ -31,6 +31,12 @@ DEFAULT_ALERT_STATE_FILE = PROJECT_ROOT / "runtime" / "alert_state.json"
 DEFAULT_RESEARCH_SMOKE_FILE = PROJECT_ROOT / "runtime" / "research_smoke.json"
 DEFAULT_STRATEGY_SMOKE_FILE = PROJECT_ROOT / "runtime" / "strategy_framework_smoke.json"
 DEFAULT_RESEARCH_CYCLE_FILE = PROJECT_ROOT / "runtime" / "research_cycle.json"
+DEFAULT_RESEARCH_FACTORY_CONFIG_FILE = PROJECT_ROOT / "config" / "research_factory.json"
+DEFAULT_GENERATED_BATCH_FILE = PROJECT_ROOT / "runtime" / "research" / "generated_hypotheses.json"
+DEFAULT_EXPERIMENT_MEMORY_FILE = PROJECT_ROOT / "runtime" / "research" / "experiment_memory.sqlite3"
+DEFAULT_EXPERIMENT_MEMORY_BACKUP_FILE = (
+    PROJECT_ROOT / "runtime" / "research" / "experiment_memory.backup.sqlite3"
+)
 DEFAULT_INCUBATION_CANDIDATES_FILE = PROJECT_ROOT / "runtime" / "incubation_candidates.json"
 DEFAULT_MUTATION_PLAN_FILE = PROJECT_ROOT / "runtime" / "mutation_plan.json"
 DEFAULT_MUTATION_BATCH_FILE = PROJECT_ROOT / "runtime" / "mutation_hypotheses.json"
@@ -81,6 +87,9 @@ AUTOPILOT_CONFIG_KEYS = {
     "backup_report_file",
     "control_audit_file",
     "control_file",
+    "experiment_memory_backup_file",
+    "experiment_memory_file",
+    "generated_batch_file",
     "incubation_candidates_file",
     "job_state_file",
     "jobs",
@@ -97,6 +106,7 @@ AUTOPILOT_CONFIG_KEYS = {
     "readiness_report_file",
     "readiness_report_json_file",
     "research_cycle_file",
+    "research_factory_config_file",
     "research_smoke_file",
     "run_data_update",
     "status_file",
@@ -242,6 +252,10 @@ class AutopilotConfig:
     research_smoke_file: Path = DEFAULT_RESEARCH_SMOKE_FILE
     strategy_smoke_file: Path = DEFAULT_STRATEGY_SMOKE_FILE
     research_cycle_file: Path = DEFAULT_RESEARCH_CYCLE_FILE
+    research_factory_config_file: Path = DEFAULT_RESEARCH_FACTORY_CONFIG_FILE
+    generated_batch_file: Path = DEFAULT_GENERATED_BATCH_FILE
+    experiment_memory_file: Path = DEFAULT_EXPERIMENT_MEMORY_FILE
+    experiment_memory_backup_file: Path = DEFAULT_EXPERIMENT_MEMORY_BACKUP_FILE
     incubation_candidates_file: Path = DEFAULT_INCUBATION_CANDIDATES_FILE
     mutation_plan_file: Path = DEFAULT_MUTATION_PLAN_FILE
     mutation_batch_file: Path = DEFAULT_MUTATION_BATCH_FILE
@@ -261,24 +275,57 @@ class AutopilotConfig:
     max_consecutive_job_deferrals: int = 3
     run_data_update: bool = False
     jobs: list[JobConfig] = field(default_factory=list)
+    job_config_errors: list[str] = field(default_factory=list)
     products: list[ProductConfig] = field(default_factory=list)
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> AutopilotConfig:
+    def from_dict(
+        cls,
+        payload: dict[str, Any],
+        *,
+        strict_jobs: bool = True,
+    ) -> AutopilotConfig:
         _reject_unknown_keys(payload, allowed=AUTOPILOT_CONFIG_KEYS, label="autopilot config")
-        jobs_payload = payload.get("jobs", [])
-        if not isinstance(jobs_payload, list):
-            raise ValueError("autopilot config jobs must be a list")
-        for index, job in enumerate(jobs_payload):
-            if not isinstance(job, dict):
-                raise ValueError(f"autopilot config jobs[{index}] must be a JSON object")
+        raw_jobs = payload.get("jobs", [])
+        jobs: list[JobConfig] = []
+        job_config_errors: list[str] = []
+        if strict_jobs:
+            if not isinstance(raw_jobs, list):
+                raise ValueError("autopilot config jobs must be a list")
+            for index, job in enumerate(raw_jobs):
+                if not isinstance(job, dict):
+                    raise ValueError(f"autopilot config jobs[{index}] must be a JSON object")
+            _reject_duplicate_names(raw_jobs, label="job")
+            jobs = [JobConfig.from_dict(job) for job in raw_jobs]
+        elif isinstance(raw_jobs, list):
+            # Supervision never executes jobs, but retaining every independently
+            # valid definition keeps normal status/report output complete. Bad
+            # entries and duplicates remain fatal in the dedicated job worker.
+            seen_job_names: set[str] = set()
+            for index, raw_job in enumerate(raw_jobs):
+                if not isinstance(raw_job, dict):
+                    job_config_errors.append(
+                        f"autopilot config jobs[{index}] must be a JSON object"
+                    )
+                    continue
+                try:
+                    job = JobConfig.from_dict(raw_job)
+                except (TypeError, ValueError) as exc:
+                    job_config_errors.append(f"jobs[{index}]: {exc}")
+                    continue
+                if job.name in seen_job_names:
+                    job_config_errors.append(f"duplicate job name: {job.name}")
+                    continue
+                seen_job_names.add(job.name)
+                jobs.append(job)
+        else:
+            job_config_errors.append("autopilot config jobs must be a list")
         products_payload = payload.get("products", [])
         if not isinstance(products_payload, list):
             raise ValueError("autopilot config products must be a list")
         for index, product in enumerate(products_payload):
             if not isinstance(product, dict):
                 raise ValueError(f"autopilot config products[{index}] must be a JSON object")
-        _reject_duplicate_names(jobs_payload, label="job")
         _reject_duplicate_names(products_payload, label="product")
         alert_cooldown_seconds = _non_negative_int(
             payload.get("alert_cooldown_seconds", 900),
@@ -289,11 +336,40 @@ class AutopilotConfig:
             "min_runtime_free_bytes",
         )
         loop_sleep_seconds = _positive_int(payload.get("loop_sleep_seconds", 60), "loop_sleep_seconds")
-        max_jobs_per_cycle = _positive_int(payload.get("max_jobs_per_cycle", 1), "max_jobs_per_cycle")
-        max_consecutive_job_deferrals = _positive_int(
-            payload.get("max_consecutive_job_deferrals", 3),
-            "max_consecutive_job_deferrals",
-        )
+        try:
+            max_jobs_per_cycle = _positive_int(
+                payload.get("max_jobs_per_cycle", 1),
+                "max_jobs_per_cycle",
+            )
+        except ValueError:
+            if strict_jobs:
+                raise
+            job_config_errors.append("max_jobs_per_cycle must be a positive JSON integer")
+            max_jobs_per_cycle = 1
+        try:
+            max_consecutive_job_deferrals = _positive_int(
+                payload.get("max_consecutive_job_deferrals", 3),
+                "max_consecutive_job_deferrals",
+            )
+        except ValueError:
+            if strict_jobs:
+                raise
+            job_config_errors.append(
+                "max_consecutive_job_deferrals must be a positive JSON integer"
+            )
+            max_consecutive_job_deferrals = 3
+        try:
+            run_data_update = _json_bool(
+                payload,
+                "run_data_update",
+                default=False,
+                field="run_data_update",
+            )
+        except ValueError:
+            if strict_jobs:
+                raise
+            job_config_errors.append("run_data_update must be a JSON boolean")
+            run_data_update = False
         return cls(
             control_file=_optional_project_path(payload, "control_file", default=DEFAULT_CONTROL_FILE, field="control_file"),
             control_audit_file=_optional_project_path(
@@ -340,6 +416,30 @@ class AutopilotConfig:
                 "research_cycle_file",
                 default=DEFAULT_RESEARCH_CYCLE_FILE,
                 field="research_cycle_file",
+            ),
+            research_factory_config_file=_optional_project_path(
+                payload,
+                "research_factory_config_file",
+                default=DEFAULT_RESEARCH_FACTORY_CONFIG_FILE,
+                field="research_factory_config_file",
+            ),
+            generated_batch_file=_optional_project_path(
+                payload,
+                "generated_batch_file",
+                default=DEFAULT_GENERATED_BATCH_FILE,
+                field="generated_batch_file",
+            ),
+            experiment_memory_file=_optional_project_path(
+                payload,
+                "experiment_memory_file",
+                default=DEFAULT_EXPERIMENT_MEMORY_FILE,
+                field="experiment_memory_file",
+            ),
+            experiment_memory_backup_file=_optional_project_path(
+                payload,
+                "experiment_memory_backup_file",
+                default=DEFAULT_EXPERIMENT_MEMORY_BACKUP_FILE,
+                field="experiment_memory_backup_file",
             ),
             incubation_candidates_file=_optional_project_path(
                 payload,
@@ -413,8 +513,9 @@ class AutopilotConfig:
             loop_sleep_seconds=loop_sleep_seconds,
             max_jobs_per_cycle=max_jobs_per_cycle,
             max_consecutive_job_deferrals=max_consecutive_job_deferrals,
-            run_data_update=_json_bool(payload, "run_data_update", default=False, field="run_data_update"),
-            jobs=[JobConfig.from_dict(job) for job in jobs_payload],
+            run_data_update=run_data_update,
+            jobs=jobs,
+            job_config_errors=job_config_errors,
             products=[ProductConfig.from_dict(product) for product in products_payload],
         )
 
@@ -528,7 +629,17 @@ def _reject_non_standard_json_constant(value: str) -> None:
     raise NonStandardConfigConstantError(f"invalid JSON constant: {value}")
 
 
-def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AutopilotConfig:
+def load_config(
+    path: Path = DEFAULT_CONFIG_PATH,
+    *,
+    strict_jobs: bool = True,
+) -> AutopilotConfig:
+    """Load strict product/runtime config, optionally isolating scheduled jobs.
+
+    The trading supervisor passes ``strict_jobs=False``. A malformed optional
+    research command must stop the separate job worker and healthcheck, but it
+    must not prevent management of existing exchange exposure.
+    """
     if path.is_symlink():
         raise ValueError(f"autopilot config must not be a symlink: {path}")
     if not path.exists():
@@ -547,4 +658,4 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> AutopilotConfig:
         raise ValueError(f"autopilot config must be strict JSON: {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"autopilot config must be a JSON object: {path}")
-    return AutopilotConfig.from_dict(payload)
+    return AutopilotConfig.from_dict(payload, strict_jobs=strict_jobs)

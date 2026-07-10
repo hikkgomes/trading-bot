@@ -20,21 +20,17 @@ DEFAULT_REQUIRED_INDICATOR_FEATURES = {
     "15m": ["volume_z_20"],
 }
 INDICATOR_CANARY_FEATURES = ["volume_z_20"]
-DEFAULT_BOOTSTRAP_DAYS = {
-    "futures": 90,
-    "spot": 365,
-}
-DEFAULT_BOOTSTRAP_TIMEFRAMES = {
-    "futures": ["1m", "5m", "15m", "30m", "1h", "4h", "1d"],
-    "spot": ["1h", "4h", "1d", "1w"],
-}
+DEFAULT_RESEARCH_FACTORY_CONFIG = "config/research_factory.json"
 
 
 def default_1m_candle_path(*, market: str | None = None, symbol: str | None = None) -> Path:
     selected_symbol = symbol or bbid.SYMBOL
     if market is None:
         return bbid.CANDLE_DIR / f"{selected_symbol}_1m.parquet"
-    return candle_data_dir(selected_symbol, market, legacy_fallback=True) / f"{selected_symbol}_1m.parquet"
+    return (
+        candle_data_dir(selected_symbol, market, legacy_fallback=True)
+        / f"{selected_symbol}_1m.parquet"
+    )
 
 
 def default_indicator_dir(*, market: str | None = None, symbol: str | None = None) -> Path:
@@ -47,27 +43,26 @@ def default_indicator_dir(*, market: str | None = None, symbol: str | None = Non
 def bootstrap_command_for_market(
     market: str,
     *,
-    days: int | None = None,
     timeframes: Sequence[str] | None = None,
+    config_path: str = DEFAULT_RESEARCH_FACTORY_CONFIG,
 ) -> list[str]:
-    bootstrap_days = days if days is not None else DEFAULT_BOOTSTRAP_DAYS.get(market, 90)
     command = [
         ".venv/bin/python",
         "-m",
-        "src.update_candles",
+        "src.autopilot.history_bootstrap",
+        "--config",
+        config_path,
         "--market",
         market,
-        "--bootstrap-days",
-        str(bootstrap_days),
     ]
-    selected_timeframes = list(timeframes or DEFAULT_BOOTSTRAP_TIMEFRAMES.get(market, ()))
-    if selected_timeframes:
-        command.extend(["--timeframes", *selected_timeframes])
+    if timeframes:
+        command.extend(["--timeframes", *timeframes])
+    command.extend(["--report", f"runtime/history_bootstrap_{market}.json"])
     return command
 
 
 def utc_now() -> dt.datetime:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    return dt.datetime.now(dt.UTC).replace(microsecond=0)
 
 
 def _utc_timestamp(value: Any) -> pd.Timestamp:
@@ -136,7 +131,7 @@ def build_market_data_status(
 
     selected_market = market or bbid.MARKET
     path = default_1m_candle_path(market=market) if path is None else path
-    now = utc_now() if now is None else now.astimezone(dt.timezone.utc)
+    now = utc_now() if now is None else now.astimezone(dt.UTC)
     status: dict[str, Any] = {
         "ok": False,
         "path": str(path),
@@ -150,7 +145,7 @@ def build_market_data_status(
         status["remediation"] = {
             "action": "bootstrap_market_data",
             "command": bootstrap_command_for_market(selected_market),
-            "note": "Run once on the server with network access to create the 1m seed and derived indicators.",
+            "note": "Run once on the server with network access to create resumable native-timeframe history and pruned indicators.",
         }
         return status
 
@@ -219,7 +214,7 @@ def _command_value(command: Sequence[str], flag: str) -> str | None:
     prefix = f"{flag}="
     for part in command:
         if part.startswith(prefix):
-            value = part[len(prefix):]
+            value = part[len(prefix) :]
             return value or None
     try:
         index = command.index(flag)
@@ -236,7 +231,9 @@ def _command_value(command: Sequence[str], flag: str) -> str | None:
 
 def _command_values(command: Sequence[str], flag: str) -> list[str]:
     prefix = f"{flag}="
-    inline_values = [part[len(prefix):] for part in command if part.startswith(prefix) and part[len(prefix):]]
+    inline_values = [
+        part[len(prefix) :] for part in command if part.startswith(prefix) and part[len(prefix) :]
+    ]
     if inline_values:
         return inline_values
     try:
@@ -244,7 +241,7 @@ def _command_values(command: Sequence[str], flag: str) -> list[str]:
     except ValueError:
         return []
     values: list[str] = []
-    for value in command[index + 1:]:
+    for value in command[index + 1 :]:
         if value.startswith("--"):
             break
         values.append(value)
