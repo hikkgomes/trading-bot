@@ -210,6 +210,69 @@ def test_protected_epoch_may_end_before_full_source_freshness_threshold(monkeypa
     )
 
 
+def test_small_unprotected_epoch_defers_until_minimum_sample_capacity(monkeypatch):
+    scenario = coverage_scenario(end="2026-01-06")
+    hypothesis = next(hyp for hyp in generate_batch() if hyp.base_timeframe == "5m")
+    full_frame = pd.DataFrame(
+        {"timestamp": pd.date_range("2026-01-01", periods=6, freq="1D", tz="UTC")}
+    )
+
+    class CapacityOnlyMemory:
+        def protected_intervals(self, **_kwargs):
+            return (
+                {
+                    "interval_key": "sealed",
+                    "market": "futures",
+                    "symbol": "BTCUSDT",
+                    "start": str(full_frame["timestamp"].iloc[0]),
+                    "end": str(full_frame["timestamp"].iloc[-2]),
+                },
+            )
+
+        def __getattr__(self, name):
+            raise AssertionError(
+                f"experiment memory must not be used after capacity deferral: {name}"
+            )
+
+    monkeypatch.setattr(
+        rc,
+        "_scenario_indicator_coverage_status",
+        lambda *args, **kwargs: {"ok": True},
+    )
+    monkeypatch.setattr(rc, "_missing_columns_for_hypothesis", lambda *args, **kwargs: {})
+    monkeypatch.setattr(rc, "build_aligned_frame", lambda *args, **kwargs: full_frame.copy())
+    monkeypatch.setattr(rc, "_hypothesis_feature_timeframes", lambda _hypotheses: ("5m",))
+
+    report = rc.run_validation_scenario(
+        scenario,
+        hypotheses=[hypothesis],
+        selection={"offset": 4, "next_offset": 5, "selected": 1},
+        coverage_now="2026-01-06T00:00:00Z",
+        experiment_memory=CapacityOnlyMemory(),
+        log_path=None,
+    )
+
+    assert report["ok"] is True
+    assert report["skipped"] is True
+    assert report["deferred"] is True
+    assert report["reason"] == "unprotected_epoch_unavailable"
+    assert report["selection"]["offset"] == 4
+    assert report["hypotheses"] == 0
+    assert report["holdout_exposed_ids"] == []
+    assert report["unprotected_epoch_capacity"] == {
+        "ok": False,
+        "requirements": {"minimum_span_days": 4.0, "minimum_rows": 5},
+        "actual": {
+            "earliest": "2026-01-06T00:00:00+00:00",
+            "latest": "2026-01-06T00:00:00+00:00",
+            "span_days": 0.0,
+            "rows": 1,
+        },
+        "checks": {"span": False, "rows": False},
+        "failed_checks": ["span", "rows"],
+    }
+
+
 def test_stale_full_aligned_source_fails_before_protected_epoch_selection(monkeypatch):
     scenario = coverage_scenario()
     hypothesis = next(hyp for hyp in generate_batch() if hyp.base_timeframe == "5m")

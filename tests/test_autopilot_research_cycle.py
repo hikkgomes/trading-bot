@@ -328,6 +328,123 @@ def test_research_cycle_reruns_when_market_readiness_changes(tmp_path, monkeypat
     ] == rc._market_data_skip_marker(current_statuses)
 
 
+def test_research_cycle_defers_unprotected_epoch_without_advancing_selection(
+    tmp_path,
+    monkeypatch,
+):
+    state_path = tmp_path / "state.json"
+    output_path = tmp_path / "research_cycle.json"
+    scenario = rc.ResearchScenario(
+        name="active_income_15m",
+        product="active_income",
+        base_tf="15m",
+        pnl_unit="usdt",
+        market="futures",
+        position=False,
+        start="2022-01-01",
+    )
+    state_path.write_text(
+        json.dumps({"version": 1, "scenario_offsets": {scenario.name: 1}}),
+        encoding="utf-8",
+    )
+    market_timestamp = {"value": "2026-07-08T11:22:00+00:00"}
+    monkeypatch.setattr(
+        rc,
+        "build_market_data_statuses",
+        lambda markets: _market_statuses(market_timestamp["value"]),
+    )
+    validation_offsets = []
+
+    def defer_validation(selected, *, selection, **_kwargs):
+        validation_offsets.append(selection["offset"])
+        return rc._unprotected_epoch_deferral_report(
+            selected,
+            selection=selection,
+            unsupported_hypotheses=[],
+            retired_unsupported_ids=[],
+            detail="no unprotected chronological research epoch remains",
+        )
+
+    monkeypatch.setattr(rc, "run_validation_scenario", defer_validation)
+
+    report = rc.run_research_cycle(
+        state_path=state_path,
+        output_path=output_path,
+        scenarios=(scenario,),
+        force=True,
+    )
+
+    deferred = report["scenarios"][0]
+    assert report["ok"] is True
+    assert deferred["ok"] is True
+    assert deferred["skipped"] is True
+    assert deferred["deferred"] is True
+    assert deferred["reason"] == "unprotected_epoch_unavailable"
+    assert deferred["selection"]["offset"] == 1
+    assert report["summary"]["scenario_errors"] == 0
+    assert report["summary"]["unprotected_epoch_deferrals"] == 1
+    assert report["summary"]["unprotected_epoch_deferred_scenarios"] == [scenario.name]
+    assert report["summary"]["next_actions"][0] == (
+        "wait for additional market history to create an unprotected research epoch "
+        f"for {scenario.name}"
+    )
+    persisted_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted_state["scenario_offsets"][scenario.name] == 1
+
+    unchanged = rc.run_research_cycle(
+        state_path=state_path,
+        output_path=output_path,
+        scenarios=(scenario,),
+    )
+    assert unchanged["ok"] is True
+    assert unchanged["skipped"] is True
+    assert unchanged["reason"] == "market_data_unchanged"
+    assert validation_offsets == [1]
+
+    market_timestamp["value"] = "2026-07-08T11:23:00+00:00"
+    retried = rc.run_research_cycle(
+        state_path=state_path,
+        output_path=output_path,
+        scenarios=(scenario,),
+    )
+    assert retried["scenarios"][0]["deferred"] is True
+    assert validation_offsets == [1, 1]
+
+
+def test_research_cycle_keeps_other_evaluation_conflicts_failing(tmp_path, monkeypatch):
+    scenario = rc.ResearchScenario(
+        name="active_income_15m",
+        product="active_income",
+        base_tf="15m",
+        pnl_unit="usdt",
+        market="futures",
+        position=False,
+        start="2022-01-01",
+    )
+    monkeypatch.setattr(rc, "build_market_data_statuses", lambda markets: _market_statuses())
+    monkeypatch.setattr(
+        rc,
+        "run_validation_scenario",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            rc.EvaluationConflictError("immutable evidence changed")
+        ),
+    )
+
+    report = rc.run_research_cycle(
+        state_path=tmp_path / "state.json",
+        output_path=tmp_path / "research_cycle.json",
+        scenarios=(scenario,),
+        force=True,
+    )
+
+    assert report["ok"] is False
+    assert report["summary"]["scenario_errors"] == 1
+    assert report["exports"] == []
+    assert report["scenarios"][0]["error"] == (
+        "EvaluationConflictError: immutable evidence changed"
+    )
+
+
 def test_research_cycle_recovers_corrupt_state_and_runs(tmp_path, monkeypatch):
     state_path = tmp_path / "state.json"
     output_path = tmp_path / "research_cycle.json"
@@ -1876,6 +1993,143 @@ def test_research_epoch_selection_prefers_newest_run_when_sizes_tie():
     selected, _ = rc._select_unprotected_epoch(frame, protected)
 
     assert selected["value"].tolist() == list(range(11, 21))
+
+
+def test_research_epoch_selection_prefers_capacity_qualified_run_over_denser_run():
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T12:00:00Z",
+                    "2026-01-02T00:00:00Z",
+                    "2026-01-03T00:00:00Z",
+                    "2026-01-04T00:00:00Z",
+                    "2026-01-05T00:00:00Z",
+                    "2026-01-06T00:00:00Z",
+                    "2026-01-07T00:00:00Z",
+                    "2026-01-08T00:00:00Z",
+                    "2026-01-10T00:00:00Z",
+                ],
+                utc=True,
+            ),
+            "value": range(10),
+        }
+    )
+    protected = (
+        {
+            "interval_key": "sealed",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "start": "2026-01-05T00:00:00Z",
+            "end": "2026-01-05T00:00:00Z",
+        },
+    )
+
+    selected, detail = rc._select_unprotected_epoch(
+        frame,
+        protected,
+        capacity_requirements={"minimum_rows": 4, "minimum_span_days": 4.0},
+    )
+
+    assert selected["value"].tolist() == [6, 7, 8, 9]
+    assert detail["capacity_selection"] == {
+        "requirements": {"minimum_rows": 4, "minimum_span_days": 4.0},
+        "available_runs": 2,
+        "qualified_runs": 1,
+    }
+
+
+def test_research_epoch_selection_raises_specific_error_when_every_row_is_protected():
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range(
+                "2026-01-01T00:00:00Z",
+                periods=12,
+                freq="5min",
+            )
+        }
+    )
+    protected = (
+        {
+            "interval_key": "sealed",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "start": str(frame["timestamp"].iloc[0]),
+            "end": str(frame["timestamp"].iloc[-1]),
+        },
+    )
+
+    with pytest.raises(
+        rc.UnprotectedResearchEpochUnavailableError,
+        match="no unprotected chronological research epoch remains",
+    ):
+        rc._select_unprotected_epoch(frame, protected)
+    assert issubclass(rc.UnprotectedResearchEpochUnavailableError, rc.EvaluationConflictError)
+
+
+def test_validation_scenario_defers_when_protected_epochs_cover_all_rows(monkeypatch):
+    import pandas as pd
+
+    scenario = rc.ResearchScenario(
+        name="protected_epoch_deferred",
+        product="active_income",
+        base_tf="5m",
+        pnl_unit="usdt",
+        market="futures",
+        position=False,
+        start="2026-01-01",
+    )
+    hypothesis = next(hyp for hyp in generate_batch() if hyp.base_timeframe == "5m")
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range(
+                "2026-01-01T00:00:00Z",
+                periods=24,
+                freq="5min",
+            )
+        }
+    )
+
+    class FullyProtectedMemory:
+        def protected_intervals(self, **_kwargs):
+            return (
+                {
+                    "interval_key": "sealed",
+                    "market": "futures",
+                    "symbol": "BTCUSDT",
+                    "start": str(frame["timestamp"].iloc[0]),
+                    "end": str(frame["timestamp"].iloc[-1]),
+                },
+            )
+
+    monkeypatch.setattr(rc, "_scenario_indicator_coverage_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        rc,
+        "_partition_supported_hypotheses",
+        lambda hypotheses, **_kwargs: (hypotheses, []),
+    )
+    monkeypatch.setattr(rc, "build_aligned_frame", lambda *args, **kwargs: frame.copy())
+
+    report = rc.run_validation_scenario(
+        scenario,
+        hypotheses=[hypothesis],
+        selection={"offset": 2, "next_offset": 3, "selected": 1},
+        experiment_memory=FullyProtectedMemory(),
+        log_path=None,
+    )
+
+    assert report["ok"] is True
+    assert report["skipped"] is True
+    assert report["deferred"] is True
+    assert report["reason"] == "unprotected_epoch_unavailable"
+    assert report["selection"]["offset"] == 2
+    assert report["holdout_exposed_ids"] == []
+    assert report["remediation"]["action"] == "wait_for_unprotected_history"
 
 
 def test_research_epoch_selection_embargoes_cross_timeframe_feature_dependencies():

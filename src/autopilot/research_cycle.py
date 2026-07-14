@@ -91,6 +91,10 @@ DEFAULT_PRODUCT_STATE_FILES = {
 FEATURE_DEPENDENCY_MAX_NATIVE_BARS = 240
 
 
+class UnprotectedResearchEpochUnavailableError(EvaluationConflictError):
+    """No adaptive research rows remain outside permanently protected evidence."""
+
+
 def _protected_epoch_scenario_order(scenario: ResearchScenario) -> tuple[Any, ...]:
     """Give short-history/fast scenarios first choice of the newest epoch."""
 
@@ -951,6 +955,12 @@ def _cycle_next_actions(summary: dict[str, Any]) -> list[str]:
             + (f" for {failed_names}" if failed_names else "")
             + " before rerunning research"
         )
+    if summary.get("unprotected_epoch_deferrals"):
+        deferred_names = ", ".join(summary.get("unprotected_epoch_deferred_scenarios") or [])
+        actions.append(
+            "wait for additional market history to create an unprotected research epoch"
+            + (f" for {deferred_names}" if deferred_names else "")
+        )
     if summary.get("unsupported_hypotheses"):
         actions.append("repair indicator coverage for unsupported hypotheses")
     if (
@@ -1142,6 +1152,7 @@ def _summarize_cycle(
     unsupported = 0
     scenario_errors = 0
     coverage_failed_scenarios: list[str] = []
+    unprotected_epoch_deferred_scenarios: list[str] = []
 
     for scenario in scenario_reports:
         if not scenario.get("ok"):
@@ -1149,6 +1160,8 @@ def _summarize_cycle(
             top_reasons["scenario_error"] += 1
         if scenario.get("reason") == "insufficient_history_coverage":
             coverage_failed_scenarios.append(str(scenario.get("name") or "unknown"))
+        if scenario.get("reason") == "unprotected_epoch_unavailable":
+            unprotected_epoch_deferred_scenarios.append(str(scenario.get("name") or "unknown"))
         product = str(scenario.get("product", "unknown"))
         opportunity = str(scenario.get("opportunity_type", "unknown"))
         opportunities[opportunity] += 1
@@ -1212,6 +1225,8 @@ def _summarize_cycle(
         "scenario_errors": scenario_errors,
         "coverage_failures": len(coverage_failed_scenarios),
         "coverage_failed_scenarios": coverage_failed_scenarios,
+        "unprotected_epoch_deferrals": len(unprotected_epoch_deferred_scenarios),
+        "unprotected_epoch_deferred_scenarios": unprotected_epoch_deferred_scenarios,
         "hypotheses": hypotheses,
         "selected_hypotheses": selected,
         "available_hypotheses": available,
@@ -1494,6 +1509,52 @@ def _scenario_coverage_status(
     }
 
 
+def _unprotected_epoch_capacity_requirements(
+    source_coverage: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(source_coverage, dict):
+        return None
+    source_requirements = source_coverage.get("requirements")
+    if not isinstance(source_requirements, dict):
+        return None
+    return {
+        "minimum_span_days": float(source_requirements["minimum_span_days"]),
+        "minimum_rows": int(source_requirements["minimum_rows"]),
+    }
+
+
+def _unprotected_epoch_capacity_status(
+    frame: pd.DataFrame,
+    source_coverage: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Check sample capacity without reapplying full-source recency bounds."""
+
+    requirements = _unprotected_epoch_capacity_requirements(source_coverage)
+    if requirements is None:
+        return None
+    timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="raise")
+    earliest = timestamps.min()
+    latest = timestamps.max()
+    span_days = float((latest - earliest).total_seconds() / 86_400)
+    actual = {
+        "earliest": earliest.isoformat(),
+        "latest": latest.isoformat(),
+        "span_days": round(span_days, 6),
+        "rows": int(len(frame)),
+    }
+    checks = {
+        "span": span_days >= requirements["minimum_span_days"],
+        "rows": len(frame) >= requirements["minimum_rows"],
+    }
+    return {
+        "ok": all(checks.values()),
+        "requirements": requirements,
+        "actual": actual,
+        "checks": checks,
+        "failed_checks": [name for name, ok in checks.items() if not ok],
+    }
+
+
 def _scenario_indicator_coverage_status(
     scenario: ResearchScenario,
     *,
@@ -1581,6 +1642,63 @@ def _coverage_failure_report(
                 "--config",
                 str(research_factory_config_path),
             ],
+        },
+    }
+
+
+def _unprotected_epoch_deferral_report(
+    scenario: ResearchScenario,
+    *,
+    selection: dict[str, Any] | None,
+    unsupported_hypotheses: list[dict[str, Any]],
+    retired_unsupported_ids: list[str],
+    detail: str,
+    protected_epoch_selection: dict[str, Any] | None = None,
+    unprotected_epoch_capacity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "skipped": True,
+        "deferred": True,
+        "reason": "unprotected_epoch_unavailable",
+        "name": scenario.name,
+        "product": scenario.product,
+        "base_tf": scenario.base_tf,
+        "pnl_unit": scenario.pnl_unit,
+        "market": scenario.market,
+        "position": scenario.position,
+        "opportunity_type": scenario.opportunity_type,
+        "with_guards": scenario.with_guards,
+        "candidate_set": scenario.candidate_set,
+        "start": scenario.start,
+        "end": scenario.end,
+        "rows": 0,
+        "hypotheses": 0,
+        "keepers": 0,
+        "keeper_ids": [],
+        "selection": selection,
+        "unsupported_hypotheses": unsupported_hypotheses,
+        "retired_unsupported_ids": retired_unsupported_ids,
+        "holdout_exposed_ids": [],
+        "verdicts": {},
+        "top_reasons": {"unprotected_epoch_unavailable": 1},
+        "detail": detail,
+        **(
+            {"protected_epoch_selection": protected_epoch_selection}
+            if protected_epoch_selection is not None
+            else {}
+        ),
+        **(
+            {"unprotected_epoch_capacity": unprotected_epoch_capacity}
+            if unprotected_epoch_capacity is not None
+            else {}
+        ),
+        "remediation": {
+            "action": "wait_for_unprotected_history",
+            "note": (
+                "Protected evidence was not reused. Retry the same selection automatically "
+                "after additional market history arrives."
+            ),
         },
     }
 
@@ -1738,6 +1856,7 @@ def _select_unprotected_epoch(
     protected_intervals: tuple[dict[str, str], ...],
     *,
     feature_timeframes: tuple[str, ...] = (),
+    capacity_requirements: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any] | None]:
     """Choose the largest contiguous row run that has never been protected.
 
@@ -1803,11 +1922,24 @@ def _select_unprotected_epoch(
     if run_start is not None:
         runs.append((run_start, len(frame)))
     if not runs:
-        raise EvaluationConflictError(
+        raise UnprotectedResearchEpochUnavailableError(
             "no unprotected chronological research epoch remains for this market and symbol"
         )
+    eligible_runs = runs
+    if capacity_requirements is not None:
+        minimum_rows = int(capacity_requirements["minimum_rows"])
+        minimum_span_days = float(capacity_requirements["minimum_span_days"])
+        qualified_runs = [
+            run
+            for run in runs
+            if run[1] - run[0] >= minimum_rows
+            and (timestamps.iloc[run[1] - 1] - timestamps.iloc[run[0]]).total_seconds() / 86_400
+            >= minimum_span_days
+        ]
+        if qualified_runs:
+            eligible_runs = qualified_runs
     start_position, end_position = max(
-        runs,
+        eligible_runs,
         key=lambda run: (
             run[1] - run[0],
             timestamps.iloc[run[1] - 1],
@@ -1823,6 +1955,12 @@ def _select_unprotected_epoch(
         "end": str(pd.Timestamp(selected["timestamp"].iloc[-1])),
         "protected_intervals_considered": len(relevant),
     }
+    if capacity_requirements is not None:
+        detail["capacity_selection"] = {
+            "requirements": capacity_requirements,
+            "available_runs": len(runs),
+            "qualified_runs": len(qualified_runs),
+        }
     if normalized_timeframes:
         detail.update(
             protected_rows_excluded=int(protected_blocked.sum()),
@@ -2017,14 +2155,40 @@ def run_validation_scenario(
         )
     epoch_selection = None
     if experiment_memory is not None:
-        frame, epoch_selection = _select_unprotected_epoch(
-            frame,
-            experiment_memory.protected_intervals(
-                market=scenario.market,
-                symbol="BTCUSDT",
-            ),
-            feature_timeframes=_hypothesis_feature_timeframes(supported_hypotheses),
-        )
+        epoch_capacity_requirements = _unprotected_epoch_capacity_requirements(coverage)
+        try:
+            frame, epoch_selection = _select_unprotected_epoch(
+                frame,
+                experiment_memory.protected_intervals(
+                    market=scenario.market,
+                    symbol="BTCUSDT",
+                ),
+                feature_timeframes=_hypothesis_feature_timeframes(supported_hypotheses),
+                capacity_requirements=epoch_capacity_requirements,
+            )
+        except UnprotectedResearchEpochUnavailableError as exc:
+            return _unprotected_epoch_deferral_report(
+                scenario,
+                selection=selection,
+                unsupported_hypotheses=unsupported_hypotheses,
+                retired_unsupported_ids=retired_unsupported_ids,
+                detail=str(exc),
+            )
+        epoch_capacity = _unprotected_epoch_capacity_status(frame, coverage)
+        if epoch_selection is not None and epoch_capacity is not None and not epoch_capacity["ok"]:
+            failed_checks = ", ".join(epoch_capacity["failed_checks"])
+            return _unprotected_epoch_deferral_report(
+                scenario,
+                selection=selection,
+                unsupported_hypotheses=unsupported_hypotheses,
+                retired_unsupported_ids=retired_unsupported_ids,
+                detail=(
+                    "the available unprotected research epoch does not satisfy minimum "
+                    f"sample capacity ({failed_checks})"
+                ),
+                protected_epoch_selection=epoch_selection,
+                unprotected_epoch_capacity=epoch_capacity,
+            )
     eval_cfg = EvalConfig(pnl_unit=scenario.pnl_unit, market=scenario.market)
     validation_cfg = _validation_config(
         scenario,
@@ -2903,7 +3067,8 @@ def run_research_cycle(
                 state["consumed_holdout_ids"] = _serialized_holdout_registry(
                     consumed_holdout_registry
                 )
-            next_offsets[scenario.name] = int(selection.get("next_offset", 0))
+            offset_key = "offset" if scenario_report.get("deferred") else "next_offset"
+            next_offsets[scenario.name] = int(selection.get(offset_key, 0))
         except Exception as exc:
             scenario_reports.append(
                 {
