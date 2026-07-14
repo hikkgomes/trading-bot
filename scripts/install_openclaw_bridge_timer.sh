@@ -12,6 +12,7 @@ UNIT_DIR="${UNIT_DIR:-$HOME/.config/systemd/user}"
 DRY_RUN="${DRY_RUN:-0}"
 OPENCLAW_GROUP="${OPENCLAW_GROUP:-}"
 OPENCLAW_USER="${OPENCLAW_USER:-}"
+TARGET_UNIT_DIR="$UNIT_DIR"
 
 for value in "$SERVICE_NAME" "$TIMER_NAME" "$INTERVAL"; do
   if [[ -z "$value" || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
@@ -55,10 +56,58 @@ fi
 
 systemd_quote() {
   local value="$1"
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    echo "Systemd unit values must not contain control characters" >&2
+    exit 1
+  fi
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
   value="${value//%/%%}"
   printf '"%s"' "$value"
+}
+
+systemd_scalar() {
+  local value="$1"
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    echo "Systemd scalar values must not contain control characters" >&2
+    exit 1
+  fi
+  value="${value//%/%%}"
+  printf '%s' "$value"
+}
+
+verify_unit_files() {
+  if ! command -v systemd-analyze >/dev/null 2>&1; then
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "Dry run: systemd-analyze is unavailable; skipped unit-file verification."
+      return 0
+    fi
+    echo "systemd-analyze is required to verify generated unit files before installation." >&2
+    exit 1
+  fi
+  systemd-analyze --user verify "$@"
+}
+
+prepare_unit_staging() {
+  if [ -L "$TARGET_UNIT_DIR" ] || [ ! -d "$TARGET_UNIT_DIR" ]; then
+    echo "Systemd unit directory must be a real directory: $TARGET_UNIT_DIR" >&2
+    exit 1
+  fi
+  STAGING_UNIT_DIR="$(mktemp -d "$TARGET_UNIT_DIR/.trading-bot-units.XXXXXX")"
+  trap 'if [[ -n "${STAGING_UNIT_DIR:-}" && -d "$STAGING_UNIT_DIR" ]]; then rm -rf -- "$STAGING_UNIT_DIR"; fi' EXIT
+  UNIT_DIR="$STAGING_UNIT_DIR"
+}
+
+publish_unit_files() {
+  local file destination
+  for file in "$@"; do
+    chmod 600 "$file"
+    destination="$TARGET_UNIT_DIR/${file##*/}"
+    mv -f -- "$file" "$destination"
+  done
+  rmdir "$STAGING_UNIT_DIR"
+  STAGING_UNIT_DIR=""
+  UNIT_DIR="$TARGET_UNIT_DIR"
 }
 
 group_list_contains() {
@@ -146,7 +195,7 @@ grant_minimal_parent_traversal() {
   done
 }
 
-mkdir -p "$UNIT_DIR"
+mkdir -p "$TARGET_UNIT_DIR"
 if [[ "$DRY_RUN" != "1" ]]; then
   mkdir -p \
     "$REPO/runtime/openclaw" \
@@ -250,6 +299,7 @@ if [[ -n "$OPENCLAW_GROUP" ]]; then
 fi
 
 REPO_UNIT="$(systemd_quote "$REPO")"
+REPO_WORKING_DIRECTORY="$(systemd_scalar "$REPO")"
 PYTHON_UNIT="$(systemd_quote "$PYTHON")"
 OPENCLAW_UNIT="$(systemd_quote "$REPO/runtime/openclaw")"
 INBOX_UNIT="$(systemd_quote "$REPO/runtime/research_inbox/openclaw")"
@@ -258,6 +308,7 @@ APPROVALS_UNIT="$(systemd_quote "$REPO/runtime/approvals.json")"
 CONTROL_UNIT="$(systemd_quote "$REPO/runtime/operator-control/control.json")"
 OUTPUTS_UNIT="$(systemd_quote "$REPO/outputs")"
 DATA_UNIT="$(systemd_quote "$REPO/data")"
+prepare_unit_staging
 SERVICE_FILE="$UNIT_DIR/$SERVICE_NAME"
 TIMER_FILE="$UNIT_DIR/$TIMER_NAME"
 
@@ -268,7 +319,7 @@ After=trading-bot-autopilot-jobs.service
 
 [Service]
 Type=oneshot
-WorkingDirectory=$REPO_UNIT
+WorkingDirectory=$REPO_WORKING_DIRECTORY
 Environment=PYTHONUNBUFFERED=1
 Environment=OPENCLAW_SHARED_GROUP=$SHARED_GROUP_FLAG
 ExecStart=$PYTHON_UNIT -m src.autopilot.openclaw_bridge export
@@ -318,6 +369,12 @@ Unit=$SERVICE_NAME
 [Install]
 WantedBy=timers.target
 UNIT
+
+verify_unit_files "$SERVICE_FILE" "$TIMER_FILE"
+
+publish_unit_files "$SERVICE_FILE" "$TIMER_FILE"
+SERVICE_FILE="$UNIT_DIR/$SERVICE_NAME"
+TIMER_FILE="$UNIT_DIR/$TIMER_NAME"
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "Dry run complete: wrote $SERVICE_FILE and $TIMER_FILE"

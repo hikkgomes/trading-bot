@@ -9,6 +9,10 @@ def systemd_unit_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
 
 
+def systemd_unit_scalar(value: str) -> str:
+    return value.replace("%", "%%")
+
+
 def write_executable(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -19,6 +23,7 @@ def real_install_env(tmp_path: Path, fake_bin: Path) -> dict[str, str]:
     fake_python = fake_bin / "python"
     write_executable(fake_python, "#!/bin/sh\nexit 0\n")
     write_executable(fake_bin / "id", "#!/bin/sh\necho autopilot-test\n")
+    write_executable(fake_bin / "systemd-analyze", "#!/bin/sh\nexit 0\n")
     config = tmp_path / "autopilot.json"
     config.write_text("{}\n", encoding="utf-8")
     return {
@@ -103,9 +108,52 @@ def test_systemd_installer_verifies_linger_before_enabling_units():
     assert script.index('ensure_user_linger "$TARGET_USER"') < script.index(
         'systemctl --user enable --now "$SERVICE_NAME"'
     )
-    dry_run_exit = script.index('if [ "$DRY_RUN" = "1" ]')
+    verify_call = script.index("verify_unit_files \\\n")
+    dry_run_exit = script.index('if [ "$DRY_RUN" = "1" ]', verify_call)
     assert dry_run_exit < script.index('ensure_user_linger "$TARGET_USER"')
     assert 'loginctl enable-linger "$USER" >/dev/null 2>&1 || true' not in script
+
+
+def test_systemd_installer_verifies_generated_units_before_enabling_them():
+    script = Path("scripts/install_autopilot_service.sh").read_text(encoding="utf-8")
+
+    assert 'systemd-analyze --user verify "$@"' in script
+    verify_call = script.index("verify_unit_files \\\n")
+    assert verify_call < script.index('if [ "$DRY_RUN" = "1" ]', verify_call)
+    assert verify_call < script.index('systemctl --user enable --now "$SERVICE_NAME"')
+    assert "prepare_unit_staging()" in script
+    assert "publish_unit_files()" in script
+    assert verify_call < script.index("publish_unit_files \\\n", verify_call)
+
+
+def test_real_installer_stops_before_systemctl_when_unit_verification_fails(tmp_path):
+    fake_bin = tmp_path / "bin"
+    unit_dir = tmp_path / "units"
+    unit_dir.mkdir()
+    existing_unit = unit_dir / "trading-bot-autopilot.service"
+    existing_unit.write_text("previously-verified-unit\n", encoding="utf-8")
+    write_executable(fake_bin / "systemctl", "#!/bin/sh\necho systemctl-invoked >&2\nexit 99\n")
+
+    environment = real_install_env(tmp_path, fake_bin)
+    write_executable(
+        fake_bin / "systemd-analyze",
+        "#!/bin/sh\necho unit-verification-failed >&2\nexit 1\n",
+    )
+    result = subprocess.run(
+        ["bash", "scripts/install_autopilot_service.sh"],
+        cwd=Path.cwd(),
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 1
+    assert "unit-verification-failed" in result.stderr
+    assert "systemctl-invoked" not in result.stderr
+    assert existing_unit.read_text(encoding="utf-8") == "previously-verified-unit\n"
+    assert not list(unit_dir.glob(".trading-bot-units.*"))
 
 
 def test_real_installer_fails_actionably_when_linger_cannot_be_enabled(tmp_path):
@@ -258,7 +306,7 @@ def test_scheduled_job_unit_cannot_inherit_live_credentials_or_read_approvals():
     job_end = script.index('cat > "$HEALTHCHECK_SERVICE_FILE" <<UNIT', job_start)
     job_block = script[job_start:job_end]
 
-    assert "EnvironmentFile=$ENV_FILE_UNIT" not in job_block
+    assert "EnvironmentFile=$ENV_FILE_SCALAR" not in job_block
     assert (
         "UnsetEnvironment=EXCHANGE_API_KEY EXCHANGE_API_SECRET EXCHANGE_API_PASSWORD "
         "TRADING_LIVE EXCHANGE_TESTNET" in job_block
@@ -312,7 +360,7 @@ def test_backup_has_a_dedicated_credential_free_timer_with_read_only_approvals()
 def test_systemd_unit_loads_env_and_has_restart_bounds():
     script = Path("scripts/install_autopilot_service.sh").read_text(encoding="utf-8")
 
-    assert "EnvironmentFile=$ENV_FILE_UNIT" in script
+    assert "EnvironmentFile=$ENV_FILE_SCALAR" in script
     assert "Restart=always" in script
     assert "RestartSec=10" in script
     assert "StartLimitIntervalSec=300" in script
@@ -404,8 +452,8 @@ def test_healthcheck_systemd_unit_uses_only_private_operations_credentials():
     healthcheck_end = script.index('cat > "$HEALTHCHECK_TIMER_FILE" <<UNIT', healthcheck_start)
     healthcheck_block = script[healthcheck_start:healthcheck_end]
     assert "Type=oneshot" in healthcheck_block
-    assert "WorkingDirectory=$REPO_UNIT" in healthcheck_block
-    assert "EnvironmentFile=$ENV_FILE_UNIT" not in healthcheck_block
+    assert "WorkingDirectory=$REPO_WORKING_DIRECTORY" in healthcheck_block
+    assert "EnvironmentFile=$ENV_FILE_SCALAR" not in healthcheck_block
     assert "EnvironmentFile=" not in healthcheck_block
     assert "Environment=$ALERT_ENV_ASSIGNMENT_UNIT" in healthcheck_block
     assert (
@@ -495,9 +543,11 @@ def test_installer_dry_run_generates_units_without_systemctl(tmp_path):
     health_service = (unit_dir / "test-autopilot-healthcheck.service").read_text(encoding="utf-8")
     timer = (unit_dir / "test-autopilot-healthcheck.timer").read_text(encoding="utf-8")
     repo_unit = systemd_unit_quote(str(service_repo))
+    repo_working_directory = systemd_unit_scalar(str(service_repo))
     python_unit = systemd_unit_quote(str(python_link))
     config_unit = systemd_unit_quote(str(config_file))
     env_file_unit = systemd_unit_quote("-" + str(service_repo / ".env"))
+    env_file_scalar = systemd_unit_scalar("-" + str(service_repo / ".env"))
     alert_env_unit = systemd_unit_quote("-" + str(service_repo / "runtime" / "alerts.env"))
     alert_env_path_unit = systemd_unit_quote(str(service_repo / "runtime" / "alerts.env"))
     alert_env_assignment_unit = systemd_unit_quote(
@@ -514,8 +564,8 @@ def test_installer_dry_run_generates_units_without_systemctl(tmp_path):
     )
     candidate_lock_unit = systemd_unit_quote(str(service_repo / "runtime" / "candidate_paper.lock"))
     backup_report_unit = systemd_unit_quote(str(service_repo / "runtime" / "backup_report.json"))
-    assert f"WorkingDirectory={repo_unit}" in service
-    assert f"EnvironmentFile={env_file_unit}" in service
+    assert f"WorkingDirectory={repo_working_directory}" in service
+    assert f"EnvironmentFile={env_file_scalar}" in service
     assert f"Environment={alert_env_assignment_unit}" in service
     assert f"EnvironmentFile={alert_env_unit}" not in service
     assert (
@@ -530,8 +580,8 @@ def test_installer_dry_run_generates_units_without_systemctl(tmp_path):
         f"ExecStart={python_unit} -m src.autopilot.runtime --config {config_unit} --skip-jobs"
         in service
     )
-    assert f"WorkingDirectory={repo_unit}" in job_service
-    assert f"EnvironmentFile={env_file_unit}" not in job_service
+    assert f"WorkingDirectory={repo_working_directory}" in job_service
+    assert f"EnvironmentFile={env_file_scalar}" not in job_service
     assert (
         "UnsetEnvironment=EXCHANGE_API_KEY EXCHANGE_API_SECRET EXCHANGE_API_PASSWORD "
         "TRADING_LIVE EXCHANGE_TESTNET" in job_service
@@ -583,8 +633,8 @@ def test_installer_dry_run_generates_units_without_systemctl(tmp_path):
     assert f"InaccessiblePaths={approvals_unit}" not in backup_service
     assert "OnUnitActiveSec=24h" in backup_timer
     assert "Unit=test-autopilot-backup.service" in backup_timer
-    assert f"WorkingDirectory={repo_unit}" in health_service
-    assert f"EnvironmentFile={env_file_unit}" not in health_service
+    assert f"WorkingDirectory={repo_working_directory}" in health_service
+    assert f"EnvironmentFile={env_file_scalar}" not in health_service
     assert "EnvironmentFile=" not in health_service
     assert f"Environment={alert_env_assignment_unit}" in health_service
     assert (

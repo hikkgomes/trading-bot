@@ -40,6 +40,8 @@ DEFAULT_CHECKPOINT_PAGES = 20
 DEFAULT_REQUEST_DELAY_SECONDS = 0.2
 DEFAULT_MAX_REQUEST_PAGES = 5_000
 KLINE_LIMIT = 1_000
+MAX_EXCHANGE_GAP_DURATION = pd.Timedelta(hours=12)
+MAX_EXCHANGE_MISSING_FRACTION = 0.001
 TIMEFRAME_DELTAS = {
     "1m": pd.Timedelta(minutes=1),
     "5m": pd.Timedelta(minutes=5),
@@ -60,6 +62,20 @@ class HistoryRequirement:
     required_features: frozenset[str]
     scenario_names: tuple[str, ...]
     build_indicators: bool = True
+
+
+@dataclass(frozen=True)
+class ExchangeGapPolicy:
+    max_gap_duration: pd.Timedelta
+    max_missing_fraction: float
+
+
+EXCHANGE_GAP_POLICIES = {
+    (SYMBOL, "spot", "1h"): ExchangeGapPolicy(
+        max_gap_duration=MAX_EXCHANGE_GAP_DURATION,
+        max_missing_fraction=MAX_EXCHANGE_MISSING_FRACTION,
+    )
+}
 
 
 def _utc_timestamp(value: Any) -> pd.Timestamp:
@@ -250,6 +266,77 @@ def validate_candle_frame(
     return out[bbid.CANDLE_COLUMNS].set_index("timestamp")
 
 
+def audit_exchange_gaps(
+    frame: pd.DataFrame,
+    timeframe: str,
+    *,
+    label: str,
+    max_gap_duration: pd.Timedelta = MAX_EXCHANGE_GAP_DURATION,
+    max_missing_fraction: float | None = MAX_EXCHANGE_MISSING_FRACTION,
+) -> list[dict[str, Any]]:
+    """Describe bounded exchange-side outages without inventing tradable bars.
+
+    Binance can omit klines while spot trading is suspended for maintenance.
+    Keeping those intervals absent prevents a backtest from entering or exiting
+    on synthetic prices. Large or pervasive gaps still fail closed as likely
+    corruption, and every accepted range remains visible in the manifest.
+    """
+
+    if timeframe not in TIMEFRAME_DELTAS:
+        raise ValueError(f"{label}: unsupported timeframe {timeframe!r}")
+    if frame.empty or len(frame.index) < 2:
+        return []
+    if not isinstance(frame.index, pd.DatetimeIndex):
+        raise ValueError(f"{label}: expected a DatetimeIndex for gap auditing")
+
+    period = TIMEFRAME_DELTAS[timeframe]
+    gaps: list[dict[str, Any]] = []
+    missing_total = 0
+    previous = _utc_timestamp(frame.index[0])
+    for raw_current in frame.index[1:]:
+        current = _utc_timestamp(raw_current)
+        delta = current - previous
+        if delta == period:
+            previous = current
+            continue
+        if delta <= period or delta % period != pd.Timedelta(0):
+            raise ValueError(f"{label}: timestamps do not follow the {timeframe} cadence")
+        missing_bars = int(delta / period) - 1
+        missing_duration = missing_bars * period
+        if missing_duration > max_gap_duration:
+            raise ValueError(
+                f"{label}: exchange gap of {missing_bars} {timeframe} bars exceeds "
+                f"the {max_gap_duration} safety limit"
+            )
+        missing_total += missing_bars
+        gaps.append(
+            {
+                "start": (previous + period).isoformat(),
+                "end": (current - period).isoformat(),
+                "missing_bars": missing_bars,
+                "missing_duration_seconds": int(missing_duration.total_seconds()),
+            }
+        )
+        previous = current
+
+    expected_rows = len(frame) + missing_total
+    missing_fraction = missing_total / expected_rows
+    if max_missing_fraction is not None and missing_fraction > max_missing_fraction:
+        raise ValueError(
+            f"{label}: missing-candle fraction {missing_fraction:.6f} exceeds "
+            f"the {max_missing_fraction:.6f} safety limit"
+        )
+    return gaps
+
+
+def _exchange_gap_policy(
+    symbol: str,
+    market: str,
+    timeframe: str,
+) -> ExchangeGapPolicy | None:
+    return EXCHANGE_GAP_POLICIES.get((symbol, market, timeframe))
+
+
 def _endpoint(market: str) -> str:
     if market == "futures":
         return "https://fapi.binance.com/fapi/v1/klines"
@@ -299,26 +386,57 @@ def fetch_kline_page(
     raw["timestamp"] = pd.to_datetime(raw["open_time"], unit="ms", utc=True, errors="coerce")
     for column in bbid.CANDLE_COLUMNS[1:]:
         raw[column] = pd.to_numeric(raw[column], errors="coerce")
-    return validate_candle_frame(
+    gap_policy = _exchange_gap_policy(symbol, market, timeframe)
+    page = validate_candle_frame(
         raw[bbid.CANDLE_COLUMNS],
         timeframe,
         label=f"Binance {market} {timeframe} page",
+        require_contiguous=gap_policy is None,
     )
+    if gap_policy is not None:
+        audit_exchange_gaps(
+            page,
+            timeframe,
+            label=f"Binance {market} {timeframe} page",
+            max_gap_duration=gap_policy.max_gap_duration,
+            max_missing_fraction=None,
+        )
+    return page
 
 
-def _load_candles(path: Path, timeframe: str, *, checkpoint: bool = False) -> pd.DataFrame:
+def _load_candles(
+    path: Path,
+    timeframe: str,
+    *,
+    symbol: str,
+    market: str,
+    checkpoint: bool = False,
+) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(
             columns=bbid.CANDLE_COLUMNS[1:], index=pd.DatetimeIndex([], name="timestamp", tz="UTC")
         )
     if path.is_symlink():
         raise ValueError(f"refusing symlinked candle input: {path}")
-    return validate_candle_frame(
+    gap_policy = _exchange_gap_policy(symbol, market, timeframe)
+    frame = validate_candle_frame(
         pd.read_parquet(path),
         timeframe,
         label=str(path),
-        require_contiguous=not checkpoint,
+        require_contiguous=not checkpoint and gap_policy is None,
     )
+    # A checkpoint can contain several disjoint repair ranges. Its schema,
+    # ordering and alignment are validated above; cadence is assessed only
+    # after it is merged with the published dataset.
+    if not checkpoint and gap_policy is not None:
+        audit_exchange_gaps(
+            frame,
+            timeframe,
+            label=str(path),
+            max_gap_duration=gap_policy.max_gap_duration,
+            max_missing_fraction=gap_policy.max_missing_fraction,
+        )
+    return frame
 
 
 def _merge_frames(*frames: pd.DataFrame) -> pd.DataFrame:
@@ -404,7 +522,8 @@ def _download_ranges(
     request_delay_seconds: float,
     max_request_pages: int,
     fetch_page: Callable[..., pd.DataFrame],
-) -> pd.DataFrame:
+    request_pages_used: int = 0,
+) -> tuple[pd.DataFrame, int]:
     if checkpoint_pages <= 0:
         raise ValueError("checkpoint_pages must be positive")
     if request_delay_seconds < 0:
@@ -415,10 +534,16 @@ def _download_ranges(
         or not 0 < max_request_pages <= 100_000
     ):
         raise ValueError("max_request_pages must be an integer in [1, 100000]")
+    if (
+        not isinstance(request_pages_used, int)
+        or isinstance(request_pages_used, bool)
+        or not 0 <= request_pages_used <= max_request_pages
+    ):
+        raise ValueError("request_pages_used must be an integer within the page budget")
     period_ms = int(TIMEFRAME_DELTAS[requirement.timeframe].total_seconds() * 1_000)
     downloaded = checkpoint
     pages_since_checkpoint = 0
-    request_pages = 0
+    request_pages = request_pages_used
     try:
         for range_start, range_end in ranges:
             cursor_ms = int(range_start.value // 1_000_000)
@@ -462,7 +587,7 @@ def _download_ranges(
         raise
     if not downloaded.empty:
         write_parquet_atomic(downloaded, checkpoint_path)
-    return downloaded
+    return downloaded, request_pages
 
 
 def sync_requirement(
@@ -482,8 +607,19 @@ def sync_requirement(
     candle_path = candle_dir / f"{symbol}_{requirement.timeframe}.parquet"
     checkpoint_path = candle_dir / f".{symbol}_{requirement.timeframe}.history_checkpoint.parquet"
     manifest_path = candle_dir / f".{symbol}_{requirement.timeframe}.history.json"
-    existing = _load_candles(candle_path, requirement.timeframe)
-    checkpoint = _load_candles(checkpoint_path, requirement.timeframe, checkpoint=True)
+    existing = _load_candles(
+        candle_path,
+        requirement.timeframe,
+        symbol=symbol,
+        market=requirement.market,
+    )
+    checkpoint = _load_candles(
+        checkpoint_path,
+        requirement.timeframe,
+        symbol=symbol,
+        market=requirement.market,
+        checkpoint=True,
+    )
     available = _merge_frames(existing, checkpoint)
     prefix_complete = _manifest_prefix_complete(
         manifest_path,
@@ -497,7 +633,7 @@ def sync_requirement(
         timeframe=requirement.timeframe,
         prefix_complete=prefix_complete,
     )
-    downloaded = (
+    downloaded, request_pages_used = (
         _download_ranges(
             requirement,
             ranges,
@@ -510,15 +646,79 @@ def sync_requirement(
             fetch_page=fetch_page,
         )
         if ranges
-        else checkpoint
+        else (checkpoint, 0)
     )
     merged = _merge_frames(existing, downloaded)
     merged = merged.loc[(merged.index >= requirement.start) & (merged.index <= last_closed)]
+    gap_policy = _exchange_gap_policy(symbol, requirement.market, requirement.timeframe)
     merged = validate_candle_frame(
         merged,
         requirement.timeframe,
         label=f"{symbol} {requirement.market} {requirement.timeframe} merged history",
+        require_contiguous=gap_policy is None,
     )
+    targeted_gap_ranges: set[tuple[pd.Timestamp, pd.Timestamp]] = set()
+    if gap_policy is not None:
+        provisional_gaps = audit_exchange_gaps(
+            merged,
+            requirement.timeframe,
+            label=f"{symbol} {requirement.market} {requirement.timeframe} merged history",
+            max_gap_duration=gap_policy.max_gap_duration,
+            max_missing_fraction=None,
+        )
+        provisional_ranges = [
+            (_utc_timestamp(item["start"]), _utc_timestamp(item["end"]))
+            for item in provisional_gaps
+        ]
+        requested_ranges = {(_utc_timestamp(left), _utc_timestamp(right)) for left, right in ranges}
+        targeted_gap_ranges.update(
+            gap_range for gap_range in provisional_ranges if gap_range in requested_ranges
+        )
+        repair_ranges = [
+            gap_range for gap_range in provisional_ranges if gap_range not in requested_ranges
+        ]
+        if repair_ranges:
+            downloaded, request_pages_used = _download_ranges(
+                requirement,
+                repair_ranges,
+                symbol=symbol,
+                checkpoint_path=checkpoint_path,
+                checkpoint=downloaded,
+                checkpoint_pages=checkpoint_pages,
+                request_delay_seconds=request_delay_seconds,
+                max_request_pages=max_request_pages,
+                fetch_page=fetch_page,
+                request_pages_used=request_pages_used,
+            )
+            targeted_gap_ranges.update(repair_ranges)
+            merged = _merge_frames(existing, downloaded)
+            merged = merged.loc[(merged.index >= requirement.start) & (merged.index <= last_closed)]
+            merged = validate_candle_frame(
+                merged,
+                requirement.timeframe,
+                label=f"{symbol} {requirement.market} {requirement.timeframe} merged history",
+                require_contiguous=False,
+            )
+        exchange_gaps = audit_exchange_gaps(
+            merged,
+            requirement.timeframe,
+            label=f"{symbol} {requirement.market} {requirement.timeframe} merged history",
+            max_gap_duration=gap_policy.max_gap_duration,
+            max_missing_fraction=gap_policy.max_missing_fraction,
+        )
+        for item in exchange_gaps:
+            gap_start = _utc_timestamp(item["start"])
+            gap_end = _utc_timestamp(item["end"])
+            if not any(
+                checked_start <= gap_start and checked_end >= gap_end
+                for checked_start, checked_end in targeted_gap_ranges
+            ):
+                raise RuntimeError(
+                    f"{symbol} {requirement.market} {requirement.timeframe}: "
+                    "refusing to publish an exchange gap without a targeted recheck"
+                )
+    else:
+        exchange_gaps = []
     if merged.index.max() < last_closed:
         raise RuntimeError(
             f"{symbol} {requirement.market} {requirement.timeframe}: incomplete Binance history; "
@@ -546,10 +746,21 @@ def sync_requirement(
         write_parquet_atomic(indicators, indicator_path)
         indicator_columns = int(len(indicators.columns))
 
+    exchange_gap_policy = (
+        {
+            "scope": f"{symbol}:{requirement.market}:{requirement.timeframe}",
+            "max_gap_duration_seconds": int(gap_policy.max_gap_duration.total_seconds()),
+            "max_missing_fraction": gap_policy.max_missing_fraction,
+            "requires_targeted_recheck": True,
+        }
+        if gap_policy is not None
+        else None
+    )
+    exchange_gap_rechecked_at = reference.isoformat() if exchange_gaps else None
     write_json_atomic(
         manifest_path,
         {
-            "version": 1,
+            "version": 2,
             "symbol": symbol,
             "market": requirement.market,
             "timeframe": requirement.timeframe,
@@ -558,6 +769,11 @@ def sync_requirement(
             "first_timestamp": merged.index.min().isoformat(),
             "last_timestamp": merged.index.max().isoformat(),
             "rows": int(len(merged)),
+            "exchange_gap_count": len(exchange_gaps),
+            "exchange_missing_bars": sum(item["missing_bars"] for item in exchange_gaps),
+            "exchange_gaps": exchange_gaps,
+            "exchange_gap_policy": exchange_gap_policy,
+            "exchange_gap_rechecked_at": exchange_gap_rechecked_at,
             "updated_at": reference.isoformat(),
         },
     )
@@ -571,6 +787,11 @@ def sync_requirement(
         "first_timestamp": merged.index.min().isoformat(),
         "last_timestamp": merged.index.max().isoformat(),
         "rows": int(len(merged)),
+        "exchange_gap_count": len(exchange_gaps),
+        "exchange_missing_bars": sum(item["missing_bars"] for item in exchange_gaps),
+        "exchange_gaps": exchange_gaps,
+        "exchange_gap_policy": exchange_gap_policy,
+        "exchange_gap_rechecked_at": exchange_gap_rechecked_at,
         "required_features": sorted(requirement.required_features),
         "indicator_columns": indicator_columns,
         "scenarios": list(requirement.scenario_names),

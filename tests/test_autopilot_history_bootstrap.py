@@ -258,11 +258,266 @@ def test_fetch_kline_page_uses_market_endpoint_and_validates_payload():
         )
 
 
+def test_fetch_kline_page_accepts_only_bounded_exchange_side_gaps():
+    first = int(pd.Timestamp("2020-06-28T00:00:00Z").value // 1_000_000)
+    bounded_payload = [
+        kline_row(first),
+        kline_row(first + 60 * 60_000),
+        kline_row(first + 5 * 60 * 60_000),
+    ]
+
+    frame = hb.fetch_kline_page(
+        symbol="BTCUSDT",
+        market="spot",
+        timeframe="1h",
+        start_ms=first,
+        end_ms=first + 5 * 60 * 60_000,
+        request_get=lambda *args, **kwargs: FakeResponse(bounded_payload),
+    )
+
+    gaps = hb.audit_exchange_gaps(
+        frame,
+        "1h",
+        label="test",
+        max_missing_fraction=None,
+    )
+    assert gaps == [
+        {
+            "start": "2020-06-28T02:00:00+00:00",
+            "end": "2020-06-28T04:00:00+00:00",
+            "missing_bars": 3,
+            "missing_duration_seconds": 10_800,
+        }
+    ]
+
+    oversized_payload = [
+        kline_row(first),
+        kline_row(first + 14 * 60 * 60_000),
+    ]
+    with pytest.raises(ValueError, match="exchange gap .* exceeds"):
+        hb.fetch_kline_page(
+            symbol="BTCUSDT",
+            market="spot",
+            timeframe="1h",
+            start_ms=first,
+            end_ms=first + 14 * 60 * 60_000,
+            request_get=lambda *args, **kwargs: FakeResponse(oversized_payload),
+        )
+
+    with pytest.raises(ValueError, match="contiguous 1h intervals"):
+        hb.fetch_kline_page(
+            symbol="BTCUSDT",
+            market="futures",
+            timeframe="1h",
+            start_ms=first,
+            end_ms=first + 5 * 60 * 60_000,
+            request_get=lambda *args, **kwargs: FakeResponse(bounded_payload),
+        )
+
+
 def test_validate_candle_frame_rejects_cadence_gap():
     frame = candle_frame("2026-01-01", 3).iloc[[0, 2]]
 
     with pytest.raises(ValueError, match="contiguous 1m intervals"):
         hb.validate_candle_frame(frame, "1m", label="test")
+
+
+def test_sync_requirement_records_and_rechecks_bounded_exchange_gaps(tmp_path, monkeypatch):
+    patch_data_paths(monkeypatch, tmp_path)
+    start = pd.Timestamp("2026-01-01T00:00:00Z")
+    complete = candle_frame(start, 4_001, "1h")
+    exchange_history = complete.drop(complete.index[[2, 3, 4]])
+    calls = []
+
+    def fetch_page(**kwargs):
+        calls.append(kwargs)
+        left = pd.to_datetime(kwargs["start_ms"], unit="ms", utc=True)
+        right = pd.to_datetime(kwargs["end_ms"], unit="ms", utc=True)
+        return exchange_history.loc[
+            (exchange_history.index >= left) & (exchange_history.index <= right)
+        ].head(kwargs["limit"])
+
+    requirement = hb.HistoryRequirement(
+        market="spot",
+        timeframe="1h",
+        start=start,
+        required_features=frozenset(),
+        scenario_names=("maintenance-gap",),
+        build_indicators=False,
+    )
+    result = hb.sync_requirement(
+        requirement,
+        now=(start + pd.Timedelta(hours=4_001)).isoformat(),
+        request_delay_seconds=0,
+        fetch_page=fetch_page,
+    )
+
+    assert result["rows"] == 3_998
+    assert result["exchange_gap_count"] == 1
+    assert result["exchange_missing_bars"] == 3
+    candle_path = tmp_path / "spot" / "BTCUSDT" / "BTCUSDT_1h.parquet"
+    saved = pd.read_parquet(candle_path)
+    assert list(saved.index) == list(exchange_history.index)
+    manifest_path = candle_path.parent / ".BTCUSDT_1h.history.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["version"] == 2
+    assert manifest["exchange_gaps"] == result["exchange_gaps"]
+    assert manifest["exchange_gap_policy"] == {
+        "scope": "BTCUSDT:spot:1h",
+        "max_gap_duration_seconds": 43_200,
+        "max_missing_fraction": 0.001,
+        "requires_targeted_recheck": True,
+    }
+    assert manifest["exchange_gap_rechecked_at"] is not None
+
+    requested = [
+        (
+            pd.to_datetime(call["start_ms"], unit="ms", utc=True),
+            pd.to_datetime(call["end_ms"], unit="ms", utc=True),
+        )
+        for call in calls
+    ]
+    assert (complete.index[2], complete.index[4]) in requested
+
+    calls.clear()
+    hb.sync_requirement(
+        requirement,
+        now=(start + pd.Timedelta(hours=4_001)).isoformat(),
+        request_delay_seconds=0,
+        fetch_page=fetch_page,
+    )
+    requested = [
+        (
+            pd.to_datetime(call["start_ms"], unit="ms", utc=True),
+            pd.to_datetime(call["end_ms"], unit="ms", utc=True),
+        )
+        for call in calls
+    ]
+    assert (complete.index[2], complete.index[4]) in requested
+
+
+def test_targeted_recheck_repairs_a_newly_observed_gap_before_publish(tmp_path, monkeypatch):
+    patch_data_paths(monkeypatch, tmp_path)
+    start = pd.Timestamp("2026-01-01T00:00:00Z")
+    complete = candle_frame(start, 4_001, "1h")
+    initially_gapped = complete.drop(complete.index[[2, 3, 4]])
+    exact_gap = (complete.index[2], complete.index[4])
+    calls = []
+
+    def fetch_page(**kwargs):
+        left = pd.to_datetime(kwargs["start_ms"], unit="ms", utc=True)
+        right = pd.to_datetime(kwargs["end_ms"], unit="ms", utc=True)
+        calls.append((left, right))
+        source = complete if (left, right) == exact_gap else initially_gapped
+        return source.loc[(source.index >= left) & (source.index <= right)].head(kwargs["limit"])
+
+    result = hb.sync_requirement(
+        hb.HistoryRequirement(
+            market="spot",
+            timeframe="1h",
+            start=start,
+            required_features=frozenset(),
+            scenario_names=("repair",),
+            build_indicators=False,
+        ),
+        now=(start + pd.Timedelta(hours=4_001)).isoformat(),
+        request_delay_seconds=0,
+        fetch_page=fetch_page,
+    )
+
+    assert exact_gap in calls
+    assert result["rows"] == 4_001
+    assert result["exchange_gap_count"] == 0
+    assert result["exchange_gap_rechecked_at"] is None
+
+
+def test_targeted_gap_recheck_shares_the_dataset_page_budget(tmp_path, monkeypatch):
+    patch_data_paths(monkeypatch, tmp_path)
+    start = pd.Timestamp("2026-01-01T00:00:00Z")
+    complete = candle_frame(start, 4_001, "1h")
+    exchange_history = complete.drop(complete.index[[2, 3, 4]])
+    calls = []
+
+    def fetch_page(**kwargs):
+        left = pd.to_datetime(kwargs["start_ms"], unit="ms", utc=True)
+        right = pd.to_datetime(kwargs["end_ms"], unit="ms", utc=True)
+        calls.append((left, right))
+        return exchange_history.loc[
+            (exchange_history.index >= left) & (exchange_history.index <= right)
+        ].head(kwargs["limit"])
+
+    with pytest.raises(RuntimeError, match="API page budget exhausted at 4"):
+        hb.sync_requirement(
+            hb.HistoryRequirement(
+                market="spot",
+                timeframe="1h",
+                start=start,
+                required_features=frozenset(),
+                scenario_names=("budgeted-recheck",),
+                build_indicators=False,
+            ),
+            now=(start + pd.Timedelta(hours=4_001)).isoformat(),
+            request_delay_seconds=0,
+            max_request_pages=4,
+            fetch_page=fetch_page,
+        )
+
+    assert len(calls) == 4
+    assert (complete.index[2], complete.index[4]) not in calls
+
+
+def test_checkpoint_may_contain_disjoint_repair_ranges(tmp_path):
+    path = tmp_path / ".BTCUSDT_1h.history_checkpoint.parquet"
+    first = candle_frame("2026-01-01T00:00:00Z", 2, "1h")
+    second = candle_frame("2026-01-03T00:00:00Z", 2, "1h")
+    pd.concat([first, second]).sort_index().to_parquet(path)
+
+    loaded = hb._load_candles(
+        path,
+        "1h",
+        symbol="BTCUSDT",
+        market="spot",
+        checkpoint=True,
+    )
+
+    assert len(loaded) == 4
+
+
+def test_exchange_gap_policy_rejects_too_many_small_gaps():
+    frame = candle_frame("2026-01-01T00:00:00Z", 4_001, "1h")
+    frame = frame.drop(frame.index[[100, 200, 300, 400, 500]])
+
+    with pytest.raises(ValueError, match="missing-candle fraction"):
+        hb.audit_exchange_gaps(frame, "1h", label="test")
+
+
+def test_local_published_gap_must_be_rechecked_before_it_is_accepted(tmp_path, monkeypatch):
+    patch_data_paths(monkeypatch, tmp_path)
+    start = pd.Timestamp("2026-01-01T00:00:00Z")
+    candle_path = tmp_path / "spot" / "BTCUSDT" / "BTCUSDT_1h.parquet"
+    candle_path.parent.mkdir(parents=True)
+    candle_frame(start, 4_001, "1h").drop(pd.Timestamp("2026-01-05T04:00:00Z")).to_parquet(
+        candle_path
+    )
+
+    with pytest.raises(RuntimeError, match="offline targeted recheck"):
+        hb.sync_requirement(
+            hb.HistoryRequirement(
+                market="spot",
+                timeframe="1h",
+                start=start,
+                required_features=frozenset(),
+                scenario_names=("local-gap",),
+                build_indicators=False,
+            ),
+            now=(start + pd.Timedelta(hours=4_001)).isoformat(),
+            request_delay_seconds=0,
+            fetch_page=lambda **kwargs: (_ for _ in ()).throw(
+                RuntimeError("offline targeted recheck")
+            ),
+        )
+
+    assert not (candle_path.parent / ".BTCUSDT_1h.history.json").exists()
 
 
 def test_sync_requirement_atomically_writes_candles_and_pruned_indicators(

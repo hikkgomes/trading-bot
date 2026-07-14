@@ -21,6 +21,7 @@ REPORT_TIMER_NAME="${REPORT_TIMER_NAME:-trading-bot-telegram-report.timer}"
 REPORT_INTERVAL="${REPORT_INTERVAL:-24h}"
 UNIT_DIR="${UNIT_DIR:-$HOME/.config/systemd/user}"
 DRY_RUN="${DRY_RUN:-0}"
+TARGET_UNIT_DIR="$UNIT_DIR"
 
 for value in "$SERVICE_NAME" "$REPORT_SERVICE_NAME" "$REPORT_TIMER_NAME" "$REPORT_INTERVAL"; do
   if [[ -z "$value" || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
@@ -62,7 +63,7 @@ if [ -L "$TELEGRAM_ENV" ]; then
   exit 1
 fi
 chmod 600 "$TELEGRAM_ENV"
-mkdir -p "$UNIT_DIR" "$CONTROL_STATE_DIR" "$TELEGRAM_STATE_DIR"
+mkdir -p "$TARGET_UNIT_DIR" "$CONTROL_STATE_DIR" "$TELEGRAM_STATE_DIR"
 for directory in "$CONTROL_STATE_DIR" "$TELEGRAM_STATE_DIR"; do
   if [ -L "$directory" ] || [ ! -d "$directory" ]; then
     echo "Telegram writable state directory must be a non-symlink directory: $directory" >&2
@@ -132,7 +133,52 @@ systemd_quote() {
   printf '"%s"' "$value"
 }
 
+systemd_scalar() {
+  local value="$1"
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    echo "Systemd scalar values must not contain control characters" >&2
+    exit 1
+  fi
+  value="${value//%/%%}"
+  printf '%s' "$value"
+}
+
+verify_unit_files() {
+  if ! command -v systemd-analyze >/dev/null 2>&1; then
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "Dry run: systemd-analyze is unavailable; skipped unit-file verification."
+      return 0
+    fi
+    echo "systemd-analyze is required to verify generated unit files before installation." >&2
+    exit 1
+  fi
+  systemd-analyze --user verify "$@"
+}
+
+prepare_unit_staging() {
+  if [ -L "$TARGET_UNIT_DIR" ] || [ ! -d "$TARGET_UNIT_DIR" ]; then
+    echo "Systemd unit directory must be a real directory: $TARGET_UNIT_DIR" >&2
+    exit 1
+  fi
+  STAGING_UNIT_DIR="$(mktemp -d "$TARGET_UNIT_DIR/.trading-bot-units.XXXXXX")"
+  trap 'if [[ -n "${STAGING_UNIT_DIR:-}" && -d "$STAGING_UNIT_DIR" ]]; then rm -rf -- "$STAGING_UNIT_DIR"; fi' EXIT
+  UNIT_DIR="$STAGING_UNIT_DIR"
+}
+
+publish_unit_files() {
+  local file destination
+  for file in "$@"; do
+    chmod 600 "$file"
+    destination="$TARGET_UNIT_DIR/${file##*/}"
+    mv -f -- "$file" "$destination"
+  done
+  rmdir "$STAGING_UNIT_DIR"
+  STAGING_UNIT_DIR=""
+  UNIT_DIR="$TARGET_UNIT_DIR"
+}
+
 REPO_UNIT="$(systemd_quote "$REPO")"
+REPO_WORKING_DIRECTORY="$(systemd_scalar "$REPO")"
 PYTHON_UNIT="$(systemd_quote "$PYTHON")"
 CONFIG_UNIT="$(systemd_quote "$CONFIG")"
 TELEGRAM_ENV_UNIT="$(systemd_quote "$TELEGRAM_ENV")"
@@ -145,6 +191,7 @@ TRADING_ENV_UNIT="$(systemd_quote "$REPO/.env")"
 APPROVALS_UNIT="$(systemd_quote "$REPO/runtime/approvals.json")"
 OUTPUTS_UNIT="$(systemd_quote "$REPO/outputs")"
 DATA_UNIT="$(systemd_quote "$REPO/data")"
+prepare_unit_staging
 UNIT_FILE="$UNIT_DIR/$SERVICE_NAME"
 REPORT_SERVICE_FILE="$UNIT_DIR/$REPORT_SERVICE_NAME"
 REPORT_TIMER_FILE="$UNIT_DIR/$REPORT_TIMER_NAME"
@@ -161,7 +208,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=$REPO_UNIT
+WorkingDirectory=$REPO_WORKING_DIRECTORY
 Environment=PYTHONUNBUFFERED=1
 ExecStartPre=$PYTHON_UNIT -m src.autopilot.telegram_edge --settings-file $TELEGRAM_ENV_UNIT --validate-settings
 ExecStartPre=$PYTHON_UNIT -m src.autopilot.telegram_edge --config $CONFIG_UNIT --poll-state $POLL_STATE_FILE_UNIT --expected-control-file $CONTROL_FILE_UNIT --expected-control-audit $CONTROL_AUDIT_FILE_UNIT --validate-service-paths
@@ -214,7 +261,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=$REPO_UNIT
+WorkingDirectory=$REPO_WORKING_DIRECTORY
 Environment=PYTHONUNBUFFERED=1
 ExecStartPre=$PYTHON_UNIT -m src.autopilot.telegram_edge --settings-file $TELEGRAM_ENV_UNIT --validate-settings
 ExecStart=$PYTHON_UNIT -m src.autopilot.telegram_edge --config $CONFIG_UNIT --settings-file $TELEGRAM_ENV_UNIT --send-status
@@ -262,6 +309,13 @@ Unit=$REPORT_SERVICE_NAME
 [Install]
 WantedBy=timers.target
 UNIT
+
+verify_unit_files "$UNIT_FILE" "$REPORT_SERVICE_FILE" "$REPORT_TIMER_FILE"
+
+publish_unit_files "$UNIT_FILE" "$REPORT_SERVICE_FILE" "$REPORT_TIMER_FILE"
+UNIT_FILE="$UNIT_DIR/$SERVICE_NAME"
+REPORT_SERVICE_FILE="$UNIT_DIR/$REPORT_SERVICE_NAME"
+REPORT_TIMER_FILE="$UNIT_DIR/$REPORT_TIMER_NAME"
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "Dry run complete: wrote $UNIT_FILE, $REPORT_SERVICE_FILE, and $REPORT_TIMER_FILE"

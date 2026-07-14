@@ -115,6 +115,51 @@ systemd_quote() {
   printf '"%s"' "$value"
 }
 
+systemd_scalar() {
+  local value="$1"
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    echo "Systemd scalar values cannot contain newline or carriage return characters" >&2
+    exit 1
+  fi
+  value="${value//%/%%}"
+  printf '%s' "$value"
+}
+
+verify_unit_files() {
+  if ! command -v systemd-analyze >/dev/null 2>&1; then
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "Dry run: systemd-analyze is unavailable; skipped unit-file verification."
+      return 0
+    fi
+    echo "systemd-analyze is required to verify generated unit files before installation." >&2
+    exit 1
+  fi
+  systemd-analyze --user verify "$@"
+}
+
+prepare_unit_staging() {
+  mkdir -p "$TARGET_UNIT_DIR"
+  if [ -L "$TARGET_UNIT_DIR" ] || [ ! -d "$TARGET_UNIT_DIR" ]; then
+    echo "Systemd unit directory must be a real directory: $TARGET_UNIT_DIR" >&2
+    exit 1
+  fi
+  STAGING_UNIT_DIR="$(mktemp -d "$TARGET_UNIT_DIR/.trading-bot-units.XXXXXX")"
+  trap 'if [[ -n "${STAGING_UNIT_DIR:-}" && -d "$STAGING_UNIT_DIR" ]]; then rm -rf -- "$STAGING_UNIT_DIR"; fi' EXIT
+  UNIT_DIR="$STAGING_UNIT_DIR"
+}
+
+publish_unit_files() {
+  local file destination
+  for file in "$@"; do
+    chmod 600 "$file"
+    destination="$TARGET_UNIT_DIR/${file##*/}"
+    mv -f -- "$file" "$destination"
+  done
+  rmdir "$STAGING_UNIT_DIR"
+  STAGING_UNIT_DIR=""
+  UNIT_DIR="$TARGET_UNIT_DIR"
+}
+
 configured_project_path() {
   local key="$1"
   local default_value="$2"
@@ -145,14 +190,7 @@ validate_unit_value "$BACKUP_INTERVAL" "BACKUP_INTERVAL"
 validate_positive_integer "$BACKUP_TIMEOUT" "BACKUP_TIMEOUT"
 validate_zero_or_one "$DRY_RUN" "DRY_RUN"
 
-UNIT_FILE="$UNIT_DIR/$SERVICE_NAME"
-JOB_SERVICE_FILE="$UNIT_DIR/$JOB_SERVICE_NAME"
-CANDIDATE_PAPER_SERVICE_FILE="$UNIT_DIR/$CANDIDATE_PAPER_SERVICE_NAME"
-CANDIDATE_PAPER_TIMER_FILE="$UNIT_DIR/$CANDIDATE_PAPER_TIMER_NAME"
-BACKUP_SERVICE_FILE="$UNIT_DIR/$BACKUP_SERVICE_NAME"
-BACKUP_TIMER_FILE="$UNIT_DIR/$BACKUP_TIMER_NAME"
-HEALTHCHECK_SERVICE_FILE="$UNIT_DIR/$HEALTHCHECK_SERVICE_NAME"
-HEALTHCHECK_TIMER_FILE="$UNIT_DIR/$HEALTHCHECK_TIMER_NAME"
+TARGET_UNIT_DIR="$UNIT_DIR"
 
 if [ ! -x "$PYTHON" ]; then
   echo "Missing Python executable: $PYTHON" >&2
@@ -163,12 +201,22 @@ if [ ! -f "$CONFIG" ]; then
   exit 1
 fi
 
-mkdir -p "$UNIT_DIR" "$REPO/runtime" "$REPO/data" "$REPO/outputs"
+mkdir -p "$REPO/runtime" "$REPO/data" "$REPO/outputs"
+prepare_unit_staging
+UNIT_FILE="$UNIT_DIR/$SERVICE_NAME"
+JOB_SERVICE_FILE="$UNIT_DIR/$JOB_SERVICE_NAME"
+CANDIDATE_PAPER_SERVICE_FILE="$UNIT_DIR/$CANDIDATE_PAPER_SERVICE_NAME"
+CANDIDATE_PAPER_TIMER_FILE="$UNIT_DIR/$CANDIDATE_PAPER_TIMER_NAME"
+BACKUP_SERVICE_FILE="$UNIT_DIR/$BACKUP_SERVICE_NAME"
+BACKUP_TIMER_FILE="$UNIT_DIR/$BACKUP_TIMER_NAME"
+HEALTHCHECK_SERVICE_FILE="$UNIT_DIR/$HEALTHCHECK_SERVICE_NAME"
+HEALTHCHECK_TIMER_FILE="$UNIT_DIR/$HEALTHCHECK_TIMER_NAME"
 
 REPO_UNIT="$(systemd_quote "$REPO")"
+REPO_WORKING_DIRECTORY="$(systemd_scalar "$REPO")"
 PYTHON_UNIT="$(systemd_quote "$PYTHON")"
 CONFIG_UNIT="$(systemd_quote "$CONFIG")"
-ENV_FILE_UNIT="$(systemd_quote "-$REPO/.env")"
+ENV_FILE_SCALAR="$(systemd_scalar "-$REPO/.env")"
 ALERT_ENV_FILE_UNIT="$(systemd_quote "-$ALERT_ENV_FILE")"
 ALERT_ENV_PATH_UNIT="$(systemd_quote "$ALERT_ENV_FILE")"
 ALERT_ENV_ASSIGNMENT_UNIT="$(systemd_quote "AUTOPILOT_ALERT_SETTINGS_FILE=$ALERT_ENV_FILE")"
@@ -206,8 +254,8 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=$REPO_UNIT
-EnvironmentFile=$ENV_FILE_UNIT
+WorkingDirectory=$REPO_WORKING_DIRECTORY
+EnvironmentFile=$ENV_FILE_SCALAR
 Environment=$ALERT_ENV_ASSIGNMENT_UNIT
 Environment=PYTHONUNBUFFERED=1
 Environment=OMP_NUM_THREADS=$AUTOPILOT_THREADS
@@ -260,7 +308,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=$REPO_UNIT
+WorkingDirectory=$REPO_WORKING_DIRECTORY
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=OMP_NUM_THREADS=$AUTOPILOT_THREADS
@@ -319,7 +367,7 @@ After=$SERVICE_NAME
 
 [Service]
 Type=oneshot
-WorkingDirectory=$REPO_UNIT
+WorkingDirectory=$REPO_WORKING_DIRECTORY
 Environment=$ALERT_ENV_ASSIGNMENT_UNIT
 Environment=PYTHONUNBUFFERED=1
 Environment=OMP_NUM_THREADS=$AUTOPILOT_THREADS
@@ -384,7 +432,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=$REPO_UNIT
+WorkingDirectory=$REPO_WORKING_DIRECTORY
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=OMP_NUM_THREADS=$AUTOPILOT_THREADS
@@ -450,7 +498,7 @@ After=$SERVICE_NAME
 
 [Service]
 Type=oneshot
-WorkingDirectory=$REPO_UNIT
+WorkingDirectory=$REPO_WORKING_DIRECTORY
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 UnsetEnvironment=EXCHANGE_API_KEY EXCHANGE_API_SECRET EXCHANGE_API_PASSWORD TRADING_LIVE EXCHANGE_TESTNET AUTOPILOT_WEBHOOK_URL AUTOPILOT_TELEGRAM_BOT_TOKEN AUTOPILOT_TELEGRAM_CHAT_ID AUTOPILOT_TELEGRAM_PAUSE_COMMANDS AUTOPILOT_TELEGRAM_ALLOWED_USER_IDS AUTOPILOT_TELEGRAM_SETTINGS_FILE AUTOPILOT_ALERT_SETTINGS_FILE
@@ -501,6 +549,34 @@ Unit=$BACKUP_SERVICE_NAME
 [Install]
 WantedBy=timers.target
 UNIT
+
+verify_unit_files \
+  "$UNIT_FILE" \
+  "$JOB_SERVICE_FILE" \
+  "$CANDIDATE_PAPER_SERVICE_FILE" \
+  "$CANDIDATE_PAPER_TIMER_FILE" \
+  "$BACKUP_SERVICE_FILE" \
+  "$BACKUP_TIMER_FILE" \
+  "$HEALTHCHECK_SERVICE_FILE" \
+  "$HEALTHCHECK_TIMER_FILE"
+
+publish_unit_files \
+  "$UNIT_FILE" \
+  "$JOB_SERVICE_FILE" \
+  "$CANDIDATE_PAPER_SERVICE_FILE" \
+  "$CANDIDATE_PAPER_TIMER_FILE" \
+  "$BACKUP_SERVICE_FILE" \
+  "$BACKUP_TIMER_FILE" \
+  "$HEALTHCHECK_SERVICE_FILE" \
+  "$HEALTHCHECK_TIMER_FILE"
+UNIT_FILE="$UNIT_DIR/$SERVICE_NAME"
+JOB_SERVICE_FILE="$UNIT_DIR/$JOB_SERVICE_NAME"
+CANDIDATE_PAPER_SERVICE_FILE="$UNIT_DIR/$CANDIDATE_PAPER_SERVICE_NAME"
+CANDIDATE_PAPER_TIMER_FILE="$UNIT_DIR/$CANDIDATE_PAPER_TIMER_NAME"
+BACKUP_SERVICE_FILE="$UNIT_DIR/$BACKUP_SERVICE_NAME"
+BACKUP_TIMER_FILE="$UNIT_DIR/$BACKUP_TIMER_NAME"
+HEALTHCHECK_SERVICE_FILE="$UNIT_DIR/$HEALTHCHECK_SERVICE_NAME"
+HEALTHCHECK_TIMER_FILE="$UNIT_DIR/$HEALTHCHECK_TIMER_NAME"
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "Dry run complete. Wrote unit files:"

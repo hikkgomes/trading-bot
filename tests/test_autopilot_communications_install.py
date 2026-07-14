@@ -32,6 +32,16 @@ def test_telegram_service_uses_telegram_only_environment_and_pause_edge():
     assert "ReadWritePaths=$RUNTIME_UNIT" not in script
     assert "NoNewPrivileges=true" in script
     assert "MemoryMax=192M" in script
+    assert "WorkingDirectory=$REPO_WORKING_DIRECTORY" in script
+    assert 'systemd-analyze --user verify "$@"' in script
+    verify_call = script.index(
+        'verify_unit_files "$UNIT_FILE" "$REPORT_SERVICE_FILE" "$REPORT_TIMER_FILE"'
+    )
+    assert verify_call < script.index('if [ "$DRY_RUN" = "1" ]', verify_call)
+    assert verify_call < script.index('systemctl --user enable --now "$SERVICE_NAME"')
+    assert "prepare_unit_staging()" in script
+    assert "publish_unit_files()" in script
+    assert verify_call < script.index("publish_unit_files", verify_call)
 
 
 def test_openclaw_timer_never_launches_openclaw_or_loads_trading_environment():
@@ -46,6 +56,14 @@ def test_openclaw_timer_never_launches_openclaw_or_loads_trading_environment():
     assert "InaccessiblePaths=$TRADING_ENV_UNIT" in script
     assert "InaccessiblePaths=-$APPROVALS_UNIT" in script
     assert "InaccessiblePaths=-$CONTROL_UNIT" in script
+    assert "WorkingDirectory=$REPO_WORKING_DIRECTORY" in script
+    assert 'systemd-analyze --user verify "$@"' in script
+    verify_call = script.index('verify_unit_files "$SERVICE_FILE" "$TIMER_FILE"')
+    assert verify_call < script.index('if [ "$DRY_RUN" = "1" ]', verify_call)
+    assert verify_call < script.index('systemctl --user enable --now "$TIMER_NAME"')
+    assert "prepare_unit_staging()" in script
+    assert "publish_unit_files()" in script
+    assert verify_call < script.index("publish_unit_files", verify_call)
 
 
 def test_openclaw_shared_user_mode_uses_narrow_named_user_acls():
@@ -141,6 +159,7 @@ exec {real_id} "$@"
     )
     (fake_bin / "getent").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     (fake_bin / "systemctl").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fake_bin / "systemd-analyze").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     for path in fake_bin.iterdir():
         path.chmod(0o700)
 
@@ -216,6 +235,10 @@ def test_communications_installers_generate_hardened_units_in_dry_run(tmp_path):
     report_unit = (tmp_path / "units" / "trading-bot-telegram-report.service").read_text()
     report_timer = (tmp_path / "units" / "trading-bot-telegram-report.timer").read_text()
     bridge_unit = (tmp_path / "units" / "trading-bot-openclaw-bridge.service").read_text()
+    working_directory = str(repo).replace("%", "%%")
+    assert f"WorkingDirectory={working_directory}" in telegram_unit
+    assert f"WorkingDirectory={working_directory}" in report_unit
+    assert f"WorkingDirectory={working_directory}" in bridge_unit
     assert "ProtectSystem=strict" in telegram_unit
     assert str(repo / ".env") in telegram_unit
     assert "EnvironmentFile=" not in telegram_unit
@@ -329,6 +352,9 @@ def test_telegram_installer_copies_legacy_state_into_dedicated_directories(tmp_p
     systemctl = fake_bin / "systemctl"
     systemctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     systemctl.chmod(0o700)
+    systemd_analyze = fake_bin / "systemd-analyze"
+    systemd_analyze.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    systemd_analyze.chmod(0o700)
 
     result = subprocess.run(
         ["bash", str(source_repo / "scripts" / "install_communications_service.sh")],
