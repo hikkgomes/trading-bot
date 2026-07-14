@@ -147,7 +147,7 @@ def test_checked_in_autopilot_configs_validate_and_cover_core_jobs():
 
         assert validate_config(cfg, require_core_products=True, require_core_jobs=True) == []
         assert cfg.max_jobs_per_cycle == 1
-        assert cfg.max_consecutive_job_deferrals == 3
+        assert cfg.max_consecutive_job_deferrals == 16
         assert CORE_AUTOPILOT_JOBS <= job_names
 
 

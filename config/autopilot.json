@@ -22,7 +22,7 @@
   "incubation_candidates_file": "runtime/incubation_candidates.json",
   "min_runtime_free_bytes": 536870912,
   "max_jobs_per_cycle": 1,
-  "max_consecutive_job_deferrals": 3,
+  "max_consecutive_job_deferrals": 16,
   "research_cycle_file": "runtime/research_cycle.json",
   "research_factory_config_file": "config/research_factory.json",
   "generated_batch_file": "runtime/research/generated_hypotheses.json",

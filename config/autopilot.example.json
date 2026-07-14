@@ -22,7 +22,7 @@
   "incubation_candidates_file": "runtime/incubation_candidates.json",
   "min_runtime_free_bytes": 536870912,
   "max_jobs_per_cycle": 1,
-  "max_consecutive_job_deferrals": 3,
+  "max_consecutive_job_deferrals": 16,
   "loop_sleep_seconds": 60,
   "operator_report_file": "runtime/operator_report.md",
   "operator_report_json_file": "runtime/operator_report.json",

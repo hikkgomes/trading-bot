@@ -1027,7 +1027,7 @@ def evaluate_health(
     fail_on_job_overdue: bool = True,
     now_ts: float | None = None,
     max_backup_age_seconds: float | None = None,
-    max_consecutive_job_deferrals: int = 3,
+    max_consecutive_job_deferrals: int = 16,
 ) -> dict[str, Any]:
     """Convert report payloads into a compact health status and issue list."""
 

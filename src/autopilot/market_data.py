@@ -248,6 +248,29 @@ def _command_values(command: Sequence[str], flag: str) -> list[str]:
     return values
 
 
+def _history_bootstrap_timeframes(job: Any, command: Sequence[str], market: str) -> list[str]:
+    """Resolve the implicit factory-driven timeframes used by a bootstrap job."""
+
+    if _command_value(command, "-m") != "src.autopilot.history_bootstrap":
+        return []
+    config_value = _command_value(command, "--config") or DEFAULT_RESEARCH_FACTORY_CONFIG
+    config_path = Path(config_value)
+    if not config_path.is_absolute():
+        working_dir = Path(getattr(job, "working_dir", None) or Path.cwd())
+        config_path = working_dir / config_path
+    try:
+        from src.autopilot.history_bootstrap import build_default_requirements
+
+        requirements = build_default_requirements(
+            config_path=config_path,
+            markets=(market,),
+            exclude_timeframes=_command_values(command, "--exclude-timeframes"),
+        )
+    except (OSError, TypeError, ValueError):
+        return []
+    return list(dict.fromkeys(item.timeframe for item in requirements if item.market == market))
+
+
 def required_indicator_features_by_market(
     markets: Iterable[str],
     *,
@@ -271,7 +294,10 @@ def required_indicator_features_by_market(
         market = _command_value(command, "--market")
         if market not in selected:
             continue
-        for timeframe in _command_values(command, "--timeframes"):
+        timeframes = _command_values(command, "--timeframes")
+        if not timeframes:
+            timeframes = _history_bootstrap_timeframes(job, command, market)
+        for timeframe in timeframes:
             by_market[market][timeframe] = list(INDICATOR_CANARY_FEATURES)
     return {
         market: features if features else dict(DEFAULT_REQUIRED_INDICATOR_FEATURES)

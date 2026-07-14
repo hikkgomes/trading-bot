@@ -110,7 +110,7 @@ at most `max_jobs_per_cycle` (`1` by default). The scheduler rotates the startin
 job after each execution, so a backlog drains over multiple cycles instead of
 always favoring the first configured job. Deferred due jobs remain due for a
 later cycle, are persisted in job state as `cycle_job_limit`, and are surfaced as
-healthcheck warnings. A job that reaches `max_consecutive_job_deferrals` (`3` by
+healthcheck warnings. A job that reaches `max_consecutive_job_deferrals` (`16` by
 default) becomes a healthcheck failure so scheduler starvation cannot stay silent.
 
 Commands:

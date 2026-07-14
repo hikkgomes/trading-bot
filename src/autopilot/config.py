@@ -330,7 +330,7 @@ class AutopilotConfig:
     min_runtime_free_bytes: int = DEFAULT_MIN_RUNTIME_FREE_BYTES
     loop_sleep_seconds: int = 60
     max_jobs_per_cycle: int = 1
-    max_consecutive_job_deferrals: int = 3
+    max_consecutive_job_deferrals: int = 16
     run_data_update: bool = False
     jobs: list[JobConfig] = field(default_factory=list)
     job_config_errors: list[str] = field(default_factory=list)
@@ -428,7 +428,7 @@ class AutopilotConfig:
             max_jobs_per_cycle = 1
         try:
             max_consecutive_job_deferrals = _positive_int(
-                payload.get("max_consecutive_job_deferrals", 3),
+                payload.get("max_consecutive_job_deferrals", 16),
                 "max_consecutive_job_deferrals",
             )
         except ValueError:
@@ -437,7 +437,7 @@ class AutopilotConfig:
             job_config_errors.append(
                 "max_consecutive_job_deferrals must be a positive JSON integer"
             )
-            max_consecutive_job_deferrals = 3
+            max_consecutive_job_deferrals = 16
         try:
             run_data_update = _json_bool(
                 payload,

@@ -1,4 +1,5 @@
 import datetime as dt
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -231,6 +232,31 @@ def test_required_indicator_features_follow_enabled_market_data_jobs():
     assert requirements["futures"] == {
         "1m": ["volume_z_20"],
         "5m": ["volume_z_20"],
+    }
+
+
+def test_required_indicator_features_follow_implicit_history_factory_timeframes():
+    class Job:
+        enabled = True
+        working_dir = Path.cwd()
+        command = [
+            "python",
+            "-m",
+            "src.autopilot.history_bootstrap",
+            "--config",
+            "config/research_factory.json",
+            "--market",
+            "spot",
+        ]
+
+    requirements = required_indicator_features_by_market({"spot"}, jobs=[Job()])
+
+    assert requirements["spot"] == {
+        "1m": ["volume_z_20"],
+        "1h": ["volume_z_20"],
+        "4h": ["volume_z_20"],
+        "1d": ["volume_z_20"],
+        "1w": ["volume_z_20"],
     }
 
 
