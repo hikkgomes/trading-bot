@@ -415,6 +415,31 @@ def _shared_group_enabled() -> bool:
     return os.environ.get("OPENCLAW_SHARED_GROUP") == "1"
 
 
+def _chmod_if_needed(path: Path, mode: int) -> None:
+    """Enforce an owned directory mode without chmodding a bind-mount root."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        observed = os.fstat(descriptor)
+        if not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.geteuid():
+            raise ProposalValidationError(
+                f"directory must be real and owned by the current process user: {path}"
+            )
+        if stat.S_IMODE(observed.st_mode) != mode:
+            os.fchmod(descriptor, mode)
+        final = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(final.st_mode)
+            or final.st_uid != os.geteuid()
+            or stat.S_IMODE(final.st_mode) != mode
+        ):
+            raise ProposalValidationError(f"directory mode enforcement failed: {path}")
+    finally:
+        os.close(descriptor)
+
+
 def _safe_directory(
     path: Path,
     *,
@@ -427,11 +452,12 @@ def _safe_directory(
     if not path.is_dir():
         raise ProposalValidationError(f"inbox path must be a directory: {path}")
     if _shared_group_enabled() and shared_incoming:
-        path.chmod(0o2770)
+        mode = 0o2770
     elif _shared_group_enabled() and shared_traverse:
-        path.chmod(0o2710)
+        mode = 0o2710
     else:
-        path.chmod(0o700)
+        mode = 0o700
+    _chmod_if_needed(path, mode)
 
 
 @contextmanager
@@ -1247,7 +1273,7 @@ def export_research_context(
     if output_path.is_symlink():
         raise ValueError(f"OpenClaw context output must not be a symlink: {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    output_path.parent.chmod(0o2750 if _shared_group_enabled() else 0o700)
+    _chmod_if_needed(output_path.parent, 0o2750 if _shared_group_enabled() else 0o700)
     write_json_atomic(output_path, context)
     output_path.chmod(0o640 if _shared_group_enabled() else 0o600)
     return context

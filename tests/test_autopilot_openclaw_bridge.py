@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,35 @@ def inbox_paths(tmp_path):
         "archive_dir": root / "archive",
         "index_path": root / "index.json",
     }
+
+
+def emulate_linux_directory_modes(monkeypatch, *, preset=None, immutable=()):
+    """Preserve requested setgid bits on test filesystems that strip them."""
+
+    remembered = dict(preset or {})
+    immutable = set(immutable)
+    real_fstat = os.fstat
+    real_fchmod = os.fchmod
+
+    def linux_fstat(descriptor):
+        result = real_fstat(descriptor)
+        mode = remembered.get((result.st_dev, result.st_ino))
+        if mode is None:
+            return result
+        values = list(result)
+        values[0] = (values[0] & ~0o7777) | mode
+        return os.stat_result(values)
+
+    def linux_fchmod(descriptor, mode):
+        result = real_fstat(descriptor)
+        identity = (result.st_dev, result.st_ino)
+        if identity in immutable:
+            raise PermissionError("systemd bind-mount root metadata is immutable")
+        real_fchmod(descriptor, mode)
+        remembered[identity] = mode
+
+    monkeypatch.setattr(os, "fstat", linux_fstat)
+    monkeypatch.setattr(os, "fchmod", linux_fchmod)
 
 
 def test_accepted_proposal_is_inert_digest_bound_and_keeps_provenance():
@@ -549,6 +579,7 @@ def test_export_context_is_private_and_rejects_symlink_output(tmp_path):
 
 def test_shared_group_mode_exposes_only_context_and_incoming_spool(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENCLAW_SHARED_GROUP", "1")
+    emulate_linux_directory_modes(monkeypatch)
     output = tmp_path / "context" / "research_context.json"
     export_research_context(
         output,
@@ -565,3 +596,83 @@ def test_shared_group_mode_exposes_only_context_and_incoming_spool(monkeypatch, 
     assert paths["incoming_dir"].parent.stat().st_mode & 0o777 == 0o710
     assert paths["incoming_dir"].stat().st_mode & 0o777 == 0o770
     assert paths["accepted_dir"].stat().st_mode & 0o777 == 0o700
+
+
+def test_shared_group_export_accepts_correct_non_chmodable_mount_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENCLAW_SHARED_GROUP", "1")
+    output = tmp_path / "context" / "research_context.json"
+    output.parent.mkdir()
+    output.parent.chmod(0o2750)
+    mount_identity = (output.parent.stat().st_dev, output.parent.stat().st_ino)
+    emulate_linux_directory_modes(
+        monkeypatch,
+        preset={mount_identity: 0o2750},
+        immutable={mount_identity},
+    )
+
+    context = export_research_context(
+        output,
+        research_cycle_path=tmp_path / "missing-research.json",
+        generated_batch_path=tmp_path / "missing-batch.json",
+    )
+
+    assert json.loads(output.read_text()) == context
+    assert output.stat().st_mode & 0o777 == 0o640
+
+
+def test_shared_group_ingest_accepts_correct_non_chmodable_mount_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENCLAW_SHARED_GROUP", "1")
+    paths = inbox_paths(tmp_path)
+    root = paths["incoming_dir"].parent
+    root.mkdir(parents=True)
+    root.chmod(0o2710)
+    mount_identity = (root.stat().st_dev, root.stat().st_ino)
+    emulate_linux_directory_modes(
+        monkeypatch,
+        preset={mount_identity: 0o2710},
+        immutable={mount_identity},
+    )
+
+    report = ingest_inbox(**paths)
+
+    assert report["ok"] is True
+    assert root.stat().st_mode & 0o777 == 0o710
+
+
+def test_mode_enforcement_rejects_exact_mode_foreign_owned_directory(monkeypatch, tmp_path):
+    directory = tmp_path / "foreign"
+    directory.mkdir(mode=0o700)
+    identity = (directory.stat().st_dev, directory.stat().st_ino)
+    real_fstat = os.fstat
+
+    def foreign_owner(descriptor):
+        result = real_fstat(descriptor)
+        if (result.st_dev, result.st_ino) == identity:
+            values = list(result)
+            values[4] = os.geteuid() + 1
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(os, "fstat", foreign_owner)
+
+    with pytest.raises(ProposalValidationError, match="owned by the current process user"):
+        openclaw_bridge_module._chmod_if_needed(directory, 0o700)
+
+
+def test_mode_enforcement_fails_when_wrong_mode_mount_is_immutable(monkeypatch, tmp_path):
+    directory = tmp_path / "immutable"
+    directory.mkdir(mode=0o755)
+    identity = (directory.stat().st_dev, directory.stat().st_ino)
+    real_fstat = os.fstat
+    real_fchmod = os.fchmod
+
+    def deny_mount_root_chmod(descriptor, mode):
+        result = real_fstat(descriptor)
+        if (result.st_dev, result.st_ino) == identity:
+            raise PermissionError("systemd bind-mount root metadata is immutable")
+        return real_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(os, "fchmod", deny_mount_root_chmod)
+
+    with pytest.raises(PermissionError, match="bind-mount root metadata is immutable"):
+        openclaw_bridge_module._chmod_if_needed(directory, 0o700)
