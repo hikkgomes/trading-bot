@@ -1,17 +1,23 @@
 import json
 import sys
+import time
+from dataclasses import fields, replace
 
 import pytest
 
+from research_exploration.dsr import DSR_METHOD
 from src.autopilot.approvals import (
     ApprovalError,
     ApprovalLedger,
     artifact_digest,
     assert_artifact_live_approved,
     main,
+    preflight_report_digest,
     strategy_fingerprint,
 )
-from src.autopilot.config import ProductConfig
+from src.autopilot.config import ProductConfig, canonical_product_config, load_config
+from src.autopilot.execution_identity import execution_engine_digest
+from src.execution.config import ExchangeConfig
 
 
 def strategy(strategy_id="s1", take_profit=0.02):
@@ -43,7 +49,16 @@ def strategy(strategy_id="s1", take_profit=0.02):
             "max_trades_per_day": 4,
         },
         "fees": {"fee_bps": 5, "slippage_bps": 2},
-        "metrics": {"holdout_total_return": 0.03, "dsr_deflated": 0.72},
+        "metrics": {
+            "holdout_total_return": 0.03,
+            "dsr_deflated": 0.72,
+            "dsr_method": DSR_METHOD,
+            "n_trials": 8,
+            "sr_std_trials": 0.20,
+            "trial_sharpe_count": 8,
+            "trial_sharpe_observed_std": 0.15,
+            "trial_sharpe_conservative_floor": 0.10,
+        },
     }
 
 
@@ -65,7 +80,7 @@ def write_artifact(path, strategies):
     )
 
 
-def write_config(path, artifact):
+def write_config(path, artifact, *, execution_mode="paper"):
     path.write_text(
         json.dumps(
             {
@@ -76,14 +91,77 @@ def write_config(path, artifact):
                         "objective": "active_income",
                         "base_asset": "USDT",
                         "market": "futures",
-                        "execution_mode": "paper",
+                        "execution_mode": execution_mode,
                         "symbol": "BTCUSDT",
                         "strategies_path": str(artifact),
                         "state_file": str(path.parent / "state.json"),
                         "trade_log": str(path.parent / "trades.csv"),
+                        "preflight_report": str(path.parent / "preflight.json"),
                         "starting_equity": 1000.0,
                     }
                 ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_successful_production_preflight(path, configured_product, artifact):
+    artifact_payload = json.loads(artifact.read_text(encoding="utf-8"))
+    engine_digest = execution_engine_digest()
+    exchange = ExchangeConfig(
+        exchange="binanceusdm",
+        market_type="futures",
+        api_key="key",
+        testnet=False,
+    )
+    check_names = [
+        "product_config",
+        "execution_engine_identity",
+        "strategy_artifact_exists",
+        "strategy_fingerprints",
+        "strategy_policy",
+        "exchange_environment",
+        "broker_constructed",
+        "exchange_read_connectivity",
+        "broker_position_mode_one_way",
+        "broker_native_protective_stops",
+        "broker_open_orders_empty",
+        "broker_position_flat",
+    ]
+    checks = [{"name": name, "ok": True} for name in check_names]
+    next(item for item in checks if item["name"] == "exchange_environment")["detail"] = {
+        "exchange": "binanceusdm",
+        "market_type": "futures",
+        "testnet": False,
+        "require_testnet": False,
+        "quote_asset": "USDT",
+        "account_fingerprint": exchange.account_fingerprint,
+        "max_notional_usd": 100.0,
+        "max_fill_slippage_bps": 100.0,
+        "max_futures_leverage": 1,
+        "futures_margin_mode": "isolated",
+    }
+    generated_ts = time.time()
+    path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-01-01T00:00:00+00:00",
+                "generated_ts": generated_ts,
+                "ok": True,
+                "products": [
+                    {
+                        "ok": True,
+                        "product": canonical_product_config(configured_product),
+                        "checks": checks,
+                        "errors": [],
+                        "execution_engine_digest": engine_digest,
+                        "artifact_fingerprints": [
+                            strategy_fingerprint(artifact_payload["strategies"][0])
+                        ],
+                        "artifact_digest": artifact_digest(artifact_payload),
+                    }
+                ],
             }
         ),
         encoding="utf-8",
@@ -150,7 +228,9 @@ def test_approval_entry_records_fingerprint(tmp_path):
     strat = strategy()
     write_artifact(artifact, [strat])
 
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="henrique")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="henrique"
+    )
 
     payload = json.loads(ledger.read_text(encoding="utf-8"))
     assert payload["approvals"][fingerprint]["fingerprint"] == fingerprint
@@ -192,7 +272,9 @@ def test_revoke_actor_is_required(tmp_path):
     ledger = tmp_path / "approvals.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="henrique")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="henrique"
+    )
 
     with pytest.raises(ApprovalError, match="revoked_by must be a non-empty"):
         ApprovalLedger(ledger).revoke(fingerprint, revoked_by="\t")
@@ -204,7 +286,9 @@ def test_revoke_actor_must_be_human_operator(tmp_path, actor):
     ledger = tmp_path / "approvals.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="henrique")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="henrique"
+    )
 
     with pytest.raises(ApprovalError, match="must identify a human operator"):
         ApprovalLedger(ledger).revoke(fingerprint, revoked_by=actor, reason="manual risk review")
@@ -215,7 +299,9 @@ def test_revoke_reason_is_required(tmp_path):
     ledger = tmp_path / "approvals.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="henrique")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="henrique"
+    )
 
     with pytest.raises(ApprovalError, match="revocation reason must be non-empty"):
         ApprovalLedger(ledger).revoke(fingerprint, revoked_by="henrique", reason="  ")
@@ -226,7 +312,9 @@ def test_live_check_fails_closed_for_blank_approval_actor(tmp_path):
     ledger = tmp_path / "approvals.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="henrique")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="henrique"
+    )
     payload = json.loads(ledger.read_text(encoding="utf-8"))
     payload["approvals"][fingerprint]["approved_by"] = " "
     ledger.write_text(json.dumps(payload), encoding="utf-8")
@@ -240,7 +328,9 @@ def test_live_check_fails_closed_for_automation_approval_actor(tmp_path):
     ledger = tmp_path / "approvals.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="henrique")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="henrique"
+    )
     payload = json.loads(ledger.read_text(encoding="utf-8"))
     payload["approvals"][fingerprint]["approved_by"] = "autopilot"
     ledger.write_text(json.dumps(payload), encoding="utf-8")
@@ -402,7 +492,9 @@ def test_live_check_fails_closed_for_entry_fingerprint_mismatch(tmp_path):
     ledger = tmp_path / "approvals.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="henrique")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="henrique"
+    )
     payload = json.loads(ledger.read_text(encoding="utf-8"))
     payload["approvals"][fingerprint]["fingerprint"] = "sha256:other"
     ledger.write_text(json.dumps(payload), encoding="utf-8")
@@ -416,7 +508,9 @@ def test_live_check_fails_closed_for_missing_entry_fingerprint(tmp_path):
     ledger = tmp_path / "approvals.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="henrique")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="henrique"
+    )
     payload = json.loads(ledger.read_text(encoding="utf-8"))
     del payload["approvals"][fingerprint]["fingerprint"]
     ledger.write_text(json.dumps(payload), encoding="utf-8")
@@ -499,6 +593,51 @@ def test_product_bound_approval_cannot_be_reused_for_another_symbol(tmp_path):
     assert_artifact_live_approved(artifact, ledger, product=active_product)
     with pytest.raises(ApprovalError, match="approval product mismatch"):
         assert_artifact_live_approved(artifact, ledger, product=other_symbol)
+
+
+def test_every_product_config_field_is_part_of_the_approval_identity(tmp_path):
+    artifact = tmp_path / "active.json"
+    ledger_path = tmp_path / "approvals.json"
+    strat = strategy()
+    write_artifact(artifact, [strat])
+    baseline = product(tmp_path, strategies_path=artifact)
+    ledger = ApprovalLedger(ledger_path)
+    ledger.approve(
+        strat,
+        artifact_path=artifact,
+        approved_by="henrique",
+        product=baseline,
+    )
+    mutations = {
+        "name": "other_income",
+        "enabled": False,
+        "objective": "btc_accumulation",
+        "base_asset": "BTC",
+        "market": "spot",
+        "execution_mode": "live",
+        "symbol": "ETHUSDT",
+        "strategies_path": tmp_path / "other-artifact.json",
+        "state_file": tmp_path / "other-state.json",
+        "trade_log": tmp_path / "other-trades.csv",
+        "starting_equity": 1001.0,
+        "regime_guard": True,
+        "regime_mayer_top": 2.5,
+        "require_preflight": False,
+        "preflight_report": tmp_path / "other-preflight.json",
+        "preflight_max_age_seconds": 3601,
+        "require_testnet_rehearsal": True,
+        "testnet_rehearsal_report": tmp_path / "other-rehearsal.json",
+        "testnet_rehearsal_max_age_seconds": 2592001,
+    }
+    assert set(mutations) == {descriptor.name for descriptor in fields(ProductConfig)}
+
+    for field, value in mutations.items():
+        with pytest.raises(ApprovalError):
+            ledger.assert_approved(
+                [strat],
+                artifact_path=artifact,
+                product=replace(baseline, **{field: value}),
+            )
 
 
 def test_live_approval_check_rejects_product_policy_failing_artifact(tmp_path):
@@ -750,7 +889,13 @@ def test_approval_cli_accepts_policy_passing_product_artifact(monkeypatch, tmp_p
     config = tmp_path / "autopilot.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    write_config(config, artifact)
+    write_config(config, artifact, execution_mode="live")
+    configured_product = load_config(config).products[0]
+    write_successful_production_preflight(
+        configured_product.preflight_report,
+        configured_product,
+        artifact,
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -767,6 +912,8 @@ def test_approval_cli_accepts_policy_passing_product_artifact(monkeypatch, tmp_p
             str(artifact),
             "--expected-artifact-digest",
             artifact_digest(json.loads(artifact.read_text(encoding="utf-8"))),
+            "--expected-preflight-digest",
+            preflight_report_digest(configured_product.preflight_report),
             "--all",
             "--approved-by",
             "test",
@@ -776,12 +923,153 @@ def test_approval_cli_accepts_policy_passing_product_artifact(monkeypatch, tmp_p
 
     main()
 
-    active_product = product(tmp_path, strategies_path=artifact)
-    ApprovalLedger(ledger).assert_approved([strat], artifact_path=artifact, product=active_product)
+    ApprovalLedger(ledger).assert_approved(
+        [strat],
+        artifact_path=artifact,
+        artifact_digest_value=artifact_digest(json.loads(artifact.read_text(encoding="utf-8"))),
+        product=configured_product,
+    )
     payload = json.loads(ledger.read_text(encoding="utf-8"))
     fingerprint = strategy_fingerprint(strat)
     approved_artifact = json.loads(artifact.read_text(encoding="utf-8"))
-    assert payload["approvals"][fingerprint]["artifact_digest"] == artifact_digest(approved_artifact)
+    assert payload["approvals"][fingerprint]["artifact_digest"] == artifact_digest(
+        approved_artifact
+    )
+    evidence = payload["approvals"][fingerprint]["production_preflight"]
+    assert evidence["source_report_path"] == str(configured_product.preflight_report.resolve())
+    assert evidence["source_report_digest"] == preflight_report_digest(
+        configured_product.preflight_report
+    )
+    assert evidence["source_generated_at"] == "2026-01-01T00:00:00+00:00"
+    assert evidence["manifest"] == {
+        "exchange_environment": {
+            "exchange": "binanceusdm",
+            "market_type": "futures",
+            "testnet": False,
+            "require_testnet": False,
+            "quote_asset": "USDT",
+            "account_fingerprint": ExchangeConfig(
+                exchange="binanceusdm",
+                market_type="futures",
+                api_key="key",
+                testnet=False,
+            ).account_fingerprint,
+            "max_notional_usd": 100.0,
+            "max_fill_slippage_bps": 100.0,
+            "max_futures_leverage": 1,
+            "futures_margin_mode": "isolated",
+        },
+    }
+    assert evidence["manifest_digest"].startswith("sha256:")
+
+
+def test_live_approval_is_invalidated_when_production_preflight_evidence_changes(tmp_path):
+    artifact = tmp_path / "active.json"
+    ledger_path = tmp_path / "approvals.json"
+    config_path = tmp_path / "autopilot.json"
+    strat = strategy()
+    write_artifact(artifact, [strat])
+    write_config(config_path, artifact, execution_mode="live")
+    configured_product = load_config(config_path).products[0]
+    write_successful_production_preflight(
+        configured_product.preflight_report,
+        configured_product,
+        artifact,
+    )
+    artifact_payload = json.loads(artifact.read_text(encoding="utf-8"))
+    digest = artifact_digest(artifact_payload)
+    ledger = ApprovalLedger(ledger_path)
+    ledger.approve(
+        strat,
+        artifact_path=artifact,
+        approved_by="henrique",
+        product=configured_product,
+        artifact=artifact_payload,
+    )
+
+    report = json.loads(configured_product.preflight_report.read_text(encoding="utf-8"))
+    exchange_check = next(
+        item for item in report["products"][0]["checks"] if item["name"] == "exchange_environment"
+    )
+    exchange_check["detail"]["max_notional_usd"] = 101.0
+    configured_product.preflight_report.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ApprovalError, match="approval production preflight mismatch"):
+        ledger.assert_approved(
+            [strat],
+            artifact_path=artifact,
+            artifact_digest_value=digest,
+            product=configured_product,
+        )
+
+
+def test_equivalent_fresh_preflight_preserves_live_approval(tmp_path):
+    artifact = tmp_path / "active.json"
+    ledger_path = tmp_path / "approvals.json"
+    config_path = tmp_path / "autopilot.json"
+    strat = strategy()
+    write_artifact(artifact, [strat])
+    write_config(config_path, artifact, execution_mode="live")
+    configured_product = load_config(config_path).products[0]
+    write_successful_production_preflight(
+        configured_product.preflight_report,
+        configured_product,
+        artifact,
+    )
+    artifact_payload = json.loads(artifact.read_text(encoding="utf-8"))
+    digest = artifact_digest(artifact_payload)
+    ledger = ApprovalLedger(ledger_path)
+    ledger.approve(
+        strat,
+        artifact_path=artifact,
+        approved_by="henrique",
+        product=configured_product,
+        artifact=artifact_payload,
+    )
+    approved_report_digest = preflight_report_digest(configured_product.preflight_report)
+
+    refreshed = json.loads(configured_product.preflight_report.read_text(encoding="utf-8"))
+    refreshed["generated_at"] = "2026-01-01T01:00:00+00:00"
+    refreshed["generated_ts"] = time.time()
+    configured_product.preflight_report.write_text(json.dumps(refreshed), encoding="utf-8")
+    assert preflight_report_digest(configured_product.preflight_report) != approved_report_digest
+
+    ledger.assert_approved(
+        [strat],
+        artifact_path=artifact,
+        artifact_digest_value=digest,
+        product=configured_product,
+    )
+
+
+def test_live_approval_rejects_boolean_futures_leverage(tmp_path):
+    artifact = tmp_path / "active.json"
+    ledger_path = tmp_path / "approvals.json"
+    config_path = tmp_path / "autopilot.json"
+    strat = strategy()
+    write_artifact(artifact, [strat])
+    write_config(config_path, artifact, execution_mode="live")
+    configured_product = load_config(config_path).products[0]
+    write_successful_production_preflight(
+        configured_product.preflight_report,
+        configured_product,
+        artifact,
+    )
+    report = json.loads(configured_product.preflight_report.read_text(encoding="utf-8"))
+    exchange_check = next(
+        item for item in report["products"][0]["checks"] if item["name"] == "exchange_environment"
+    )
+    exchange_check["detail"]["max_futures_leverage"] = True
+    configured_product.preflight_report.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ApprovalError, match="incomplete or unsafe"):
+        ApprovalLedger(ledger_path).approve(
+            strat,
+            artifact_path=artifact,
+            approved_by="henrique",
+            product=configured_product,
+            artifact=json.loads(artifact.read_text(encoding="utf-8")),
+        )
 
 
 def test_approval_cli_requires_product_context_for_check(monkeypatch, tmp_path):
@@ -814,7 +1102,9 @@ def test_approval_cli_revokes_fingerprint(monkeypatch, tmp_path):
     ledger = tmp_path / "approvals.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="henrique")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="henrique"
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -847,7 +1137,9 @@ def test_approval_cli_revoke_requires_reason(monkeypatch, tmp_path):
     ledger = tmp_path / "approvals.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="henrique")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="henrique"
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -897,8 +1189,12 @@ def test_approval_cli_list_uses_revocation_actor_and_reason(monkeypatch, tmp_pat
     ledger = tmp_path / "approvals.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="approver")
-    ApprovalLedger(ledger).revoke(fingerprint, revoked_by="reviewer", reason="paper drawdown breached")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="approver"
+    )
+    ApprovalLedger(ledger).revoke(
+        fingerprint, revoked_by="reviewer", reason="paper drawdown breached"
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -917,12 +1213,16 @@ def test_approval_cli_list_uses_revocation_actor_and_reason(monkeypatch, tmp_pat
     assert "reason=paper drawdown breached" in line
 
 
-def test_approval_cli_list_allows_revocation_reason_to_mention_automation(monkeypatch, tmp_path, capsys):
+def test_approval_cli_list_allows_revocation_reason_to_mention_automation(
+    monkeypatch, tmp_path, capsys
+):
     artifact = tmp_path / "active.json"
     ledger = tmp_path / "approvals.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="approver")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="approver"
+    )
     ApprovalLedger(ledger).revoke(fingerprint, revoked_by="reviewer", reason="system outage")
     monkeypatch.setattr(
         sys,
@@ -947,7 +1247,9 @@ def test_approval_cli_list_marks_automation_actor_invalid(monkeypatch, tmp_path,
     ledger = tmp_path / "approvals.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="approver")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="approver"
+    )
     payload = json.loads(ledger.read_text(encoding="utf-8"))
     payload["approvals"][fingerprint]["approved_by"] = "autopilot"
     ledger.write_text(json.dumps(payload), encoding="utf-8")
@@ -973,8 +1275,12 @@ def test_approval_cli_list_marks_invalid_revocation_audit(monkeypatch, tmp_path,
     ledger = tmp_path / "approvals.json"
     strat = strategy()
     write_artifact(artifact, [strat])
-    fingerprint = ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="approver")
-    ApprovalLedger(ledger).revoke(fingerprint, revoked_by="reviewer", reason="paper drawdown breached")
+    fingerprint = ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="approver"
+    )
+    ApprovalLedger(ledger).revoke(
+        fingerprint, revoked_by="reviewer", reason="paper drawdown breached"
+    )
     payload = json.loads(ledger.read_text(encoding="utf-8"))
     payload["approvals"][fingerprint]["revoked_by"] = " "
     payload["approvals"][fingerprint]["revocation_reason"] = ""

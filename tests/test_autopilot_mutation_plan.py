@@ -106,7 +106,9 @@ def test_mutation_plan_builds_research_only_proposals():
     assert plan["summary"]["executable"] is False
     first = plan["proposals"][0]
     assert first["source_candidate_id"] == "VOLBREAK_LONG"
-    assert all(not proposal["source_candidate_id"].startswith("MUT_") for proposal in plan["proposals"])
+    assert all(
+        not proposal["source_candidate_id"].startswith("MUT_") for proposal in plan["proposals"]
+    )
     assert first["safety"] == {
         "executable": False,
         "paper_trade_allowed": False,
@@ -142,7 +144,10 @@ def test_mutation_plan_waits_when_research_cycle_missing(tmp_path):
     assert plan["ok"] is True
     assert plan["status"] == "waiting_for_research_cycle"
     assert plan["summary"]["proposals"] == 0
-    assert json.loads(output_path.read_text(encoding="utf-8"))["status"] == "waiting_for_research_cycle"
+    assert (
+        json.loads(output_path.read_text(encoding="utf-8"))["status"]
+        == "waiting_for_research_cycle"
+    )
 
 
 def test_mutation_plan_markdown_handles_no_proposals():

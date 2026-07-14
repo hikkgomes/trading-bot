@@ -57,13 +57,13 @@ def create_artifact(
                 "conditions": [condition],
                 "rule": "tf_5m_rsi_14 >= 50.0",
                 "risk": {
-                "risk_per_trade": 0.02,
-                "daily_stop_loss": -0.05,
-                "max_consecutive_losses": 2,
-                "cooldown_bars": 10,
-                "max_position_fraction": 1.0,
-                "max_trades_per_day": max_trades_per_day,
-            },
+                    "risk_per_trade": 0.02,
+                    "daily_stop_loss": -0.05,
+                    "max_consecutive_losses": 2,
+                    "cooldown_bars": 10,
+                    "max_position_fraction": 1.0,
+                    "max_trades_per_day": max_trades_per_day,
+                },
                 "fees": {"fee_bps": 2.0, "slippage_bps": 1.0},
                 "metrics": {},
                 "baseline_win_rate": baseline_win_rate,
@@ -74,14 +74,28 @@ def create_artifact(
     path.write_text(json.dumps(artifact), encoding="utf-8")
 
 
-def get_mock_binance_klines(n=10, start_time_ms=BASE_TS_MS, close_price=100.0, high=100.0, low=100.0, open_p=100.0):
+def get_mock_binance_klines(
+    n=10, start_time_ms=BASE_TS_MS, close_price=100.0, high=100.0, low=100.0, open_p=100.0
+):
     klines = []
     current_time = start_time_ms
     for _ in range(n):
-        klines.append([
-            current_time, str(open_p), str(high), str(low), str(close_price),
-            "1000.0", current_time + 299999, "100000.0", 100, "500.0", "50000.0", "0",
-        ])
+        klines.append(
+            [
+                current_time,
+                str(open_p),
+                str(high),
+                str(low),
+                str(close_price),
+                "1000.0",
+                current_time + 299999,
+                "100000.0",
+                100,
+                "500.0",
+                "50000.0",
+                "0",
+            ]
+        )
         current_time += 300000
     return klines
 
@@ -140,13 +154,28 @@ class ObservedQuoteLiveSpotBroker(SpotPaperBroker):
 
     config = Config()
 
-    def __init__(self, *args, sell_quote_delta: float, reported_fee: float = 0.0, **kwargs):
+    def __init__(
+        self,
+        *args,
+        sell_quote_delta: float,
+        reported_fee: float = 0.0,
+        buy_base_delta_adjustment: float = 0.0,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.sell_quote_delta = float(sell_quote_delta)
         self.reported_fee = float(reported_fee)
+        self.buy_base_delta_adjustment = float(buy_base_delta_adjustment)
 
     def place_order(self, order):
         fill = super().place_order(order)
+        if order.side == OrderSide.BUY and self.buy_base_delta_adjustment:
+            position = self.get_position(order.symbol)
+            self._positions[order.symbol] = Position(
+                symbol=position.symbol,
+                qty=position.qty + self.buy_base_delta_adjustment,
+                avg_price=position.avg_price,
+            )
         if order.side != OrderSide.SELL:
             return fill
         self._balance += self.sell_quote_delta
@@ -255,7 +284,10 @@ def test_bot_rejects_symlink_state_file_without_trusting_target(tmp_path):
         )
 
     assert state_file.is_symlink()
-    assert json.loads(target.read_text(encoding="utf-8")) == {"equity": 1234.0, "open_positions": {}}
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "equity": 1234.0,
+        "open_positions": {},
+    }
     assert not trade_log.exists()
 
 
@@ -800,7 +832,9 @@ def test_bot_init_rejects_artifact_market_mismatch(tmp_path):
     payload["market"] = "spot"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Strategy artifact market 'spot' does not match bot market 'futures'"):
+    with pytest.raises(
+        ValueError, match="Strategy artifact market 'spot' does not match bot market 'futures'"
+    ):
         PaperTradingBot(
             strategies_path=path,
             state_file=tmp_path / "state.json",
@@ -817,7 +851,9 @@ def test_bot_init_rejects_strategy_market_mismatch(tmp_path):
     payload["strategies"][0]["market"] = "spot"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Strategy 5m_long_r1 market 'spot' does not match bot market 'futures'"):
+    with pytest.raises(
+        ValueError, match="Strategy 5m_long_r1 market 'spot' does not match bot market 'futures'"
+    ):
         PaperTradingBot(
             strategies_path=path,
             state_file=tmp_path / "state.json",
@@ -880,7 +916,9 @@ def test_bot_init_rejects_artifact_symbol_mismatch(tmp_path):
     payload["symbol"] = "ETHUSDT"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Strategy artifact symbol 'ETHUSDT' does not match bot symbol 'BTCUSDT'"):
+    with pytest.raises(
+        ValueError, match="Strategy artifact symbol 'ETHUSDT' does not match bot symbol 'BTCUSDT'"
+    ):
         PaperTradingBot(
             strategies_path=path,
             state_file=tmp_path / "state.json",
@@ -898,7 +936,9 @@ def test_bot_init_rejects_strategy_symbol_mismatch(tmp_path):
     payload["strategies"][0]["symbol"] = "ETHUSDT"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Strategy 5m_long_r1 symbol 'ETHUSDT' does not match bot symbol 'BTCUSDT'"):
+    with pytest.raises(
+        ValueError, match="Strategy 5m_long_r1 symbol 'ETHUSDT' does not match bot symbol 'BTCUSDT'"
+    ):
         PaperTradingBot(
             strategies_path=path,
             state_file=tmp_path / "state.json",
@@ -944,8 +984,14 @@ def test_bot_init_rejects_spot_symbol_with_settlement_asset(tmp_path):
     [
         ({}, "feature must be a non-empty string"),
         ({"feature": "tf_5m_rsi_14", "kind": "unknown", "threshold": 50.0}, "kind is unsupported"),
-        ({"feature": "tf_5m_rsi_14", "kind": "value_ge", "threshold": float("nan")}, "threshold must be finite"),
-        ({"feature": "tf_5m_rsi_14", "kind": "ratio_ge", "threshold": 1.0}, "feature_b is required"),
+        (
+            {"feature": "tf_5m_rsi_14", "kind": "value_ge", "threshold": float("nan")},
+            "threshold must be finite",
+        ),
+        (
+            {"feature": "tf_5m_rsi_14", "kind": "ratio_ge", "threshold": 1.0},
+            "feature_b is required",
+        ),
     ],
 )
 def test_bot_init_rejects_invalid_condition_payloads(tmp_path, condition, message):
@@ -1111,15 +1157,20 @@ def test_bot_rejects_invalid_drawdown_state(bot_env, state_update, message):
 
 def test_bot_migrates_legacy_state(bot_env):
     strategies_path, state_file, trade_log = bot_env
-    state_file.write_text(json.dumps({
-        "equity": 5000.0,
-        "open_position": {"direction": "long"},
-        "strategy_active": True,
-        "consecutive_losses": 1,
-        "cooldown_until_ts": 0.0,
-        "daily_pnl": 0.0,
-        "last_pnl_reset_date": "2026-06-01",
-    }), encoding="utf-8")
+    state_file.write_text(
+        json.dumps(
+            {
+                "equity": 5000.0,
+                "open_position": {"direction": "long"},
+                "strategy_active": True,
+                "consecutive_losses": 1,
+                "cooldown_until_ts": 0.0,
+                "daily_pnl": 0.0,
+                "last_pnl_reset_date": "2026-06-01",
+            }
+        ),
+        encoding="utf-8",
+    )
     bot = make_bot(bot_env)
     assert bot.state["equity"] == 5000.0
     assert bot.state["open_positions"] == {}
@@ -1536,7 +1587,9 @@ def test_fetch_live_candles_rejects_inconsistent_closed_ohlc(mock_get, bot_env, 
     ],
 )
 @patch("src.run_bot.requests.get")
-def test_fetch_live_candles_rejects_duplicate_or_unsorted_closed_timestamps(mock_get, bot_env, timestamps):
+def test_fetch_live_candles_rejects_duplicate_or_unsorted_closed_timestamps(
+    mock_get, bot_env, timestamps
+):
     bot = make_bot(bot_env)
     klines = get_mock_binance_klines(3, open_p=100.0, high=101.0, low=99.0, close_price=100.0)
     for kline, timestamp in zip(klines, timestamps, strict=True):
@@ -1557,7 +1610,9 @@ def test_fetch_live_candles_compacts_ccxt_symbol_for_binance_rest(mock_get, bot_
     current_bar_start = int(now.floor("5min").value // 10**6)
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(2, start_time_ms=current_bar_start - 2 * 300000)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        2, start_time_ms=current_bar_start - 2 * 300000
+    )
     mock_get.return_value = mock_resp
 
     bot.fetch_live_candles("BTC/USDT:USDT", "futures", "5m", limit=2)
@@ -1594,7 +1649,9 @@ def test_build_feature_frame_uses_configured_symbol_and_market(bot_env, monkeypa
         )
 
     monkeypatch.setattr(bot, "fetch_live_candles", fake_fetch)
-    monkeypatch.setattr("build_binance_indicator_dataset.build_indicator_features", mock_indicator_features)
+    monkeypatch.setattr(
+        "build_binance_indicator_dataset.build_indicator_features", mock_indicator_features
+    )
 
     frame, base_close = bot._build_feature_frame(bot.strategies[0])
 
@@ -1633,7 +1690,9 @@ def test_build_feature_frame_requests_only_strategy_required_features(bot_env, m
         return mock_indicator_features(df, timeframe, rsi_value=60.0, atr_value=1.0)
 
     monkeypatch.setattr(bot, "fetch_live_candles", fake_fetch)
-    monkeypatch.setattr("build_binance_indicator_dataset.build_indicator_features", fake_build_features)
+    monkeypatch.setattr(
+        "build_binance_indicator_dataset.build_indicator_features", fake_build_features
+    )
 
     bot._build_feature_frame(bot.strategies[0])
 
@@ -1660,7 +1719,9 @@ def test_macro_regime_failure_marks_guard_fail_closed(bot_env, monkeypatch):
 
 
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_blocks_new_entries_when_macro_regime_unavailable(mock_build_ind, bot_env, monkeypatch):
+def test_run_cycle_blocks_new_entries_when_macro_regime_unavailable(
+    mock_build_ind, bot_env, monkeypatch
+):
     bot = PaperTradingBot(
         strategies_path=bot_env[0],
         state_file=bot_env[1],
@@ -1689,7 +1750,9 @@ def test_run_cycle_blocks_new_entries_when_macro_regime_unavailable(mock_build_i
         )
 
     monkeypatch.setattr(bot, "fetch_live_candles", fake_fetch)
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=60.0, atr_value=2.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
 
     bot.run_cycle()
 
@@ -1741,7 +1804,9 @@ def test_run_cycle_allow_entries_false_skips_flat_strategy_evaluation(bot_env, m
     )
 
     def unexpected_feature_build(strategy):
-        pytest.fail(f"flat strategy should not be evaluated while entries are disabled: {strategy['id']}")
+        pytest.fail(
+            f"flat strategy should not be evaluated while entries are disabled: {strategy['id']}"
+        )
 
     monkeypatch.setattr(bot, "_build_feature_frame", unexpected_feature_build)
 
@@ -1758,7 +1823,9 @@ def test_drawdown_halt_skips_flat_strategy_evaluation(bot_env, monkeypatch):
     bot._save_state()
 
     def unexpected_feature_build(strategy):
-        pytest.fail(f"flat strategy should not be evaluated while drawdown halted: {strategy['id']}")
+        pytest.fail(
+            f"flat strategy should not be evaluated while drawdown halted: {strategy['id']}"
+        )
 
     monkeypatch.setattr(bot, "_build_feature_frame", unexpected_feature_build)
 
@@ -1798,7 +1865,9 @@ def test_drawdown_halt_still_manages_and_closes_open_position(mock_build_ind, mo
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_allow_entries_false_still_manages_open_position(mock_build_ind, mock_get, bot_env):
+def test_run_cycle_allow_entries_false_still_manages_open_position(
+    mock_build_ind, mock_get, bot_env
+):
     strategies_path, state_file, trade_log = bot_env
     bot = PaperTradingBot(
         strategies_path=strategies_path,
@@ -1832,7 +1901,9 @@ def test_run_cycle_signal_triggered_opens_position(mock_build_ind, mock_get, bot
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
     mock_get.return_value = mock_resp
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=60.0, atr_value=2.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
 
     bot.run_cycle()
 
@@ -1896,7 +1967,9 @@ def test_run_cycle_caps_position_size_by_strategy_risk_limit(mock_build_ind, moc
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
     mock_get.return_value = mock_resp
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=60.0, atr_value=2.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
 
     bot.run_cycle()
 
@@ -1905,7 +1978,9 @@ def test_run_cycle_caps_position_size_by_strategy_risk_limit(mock_build_ind, moc
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_blocks_entry_after_strategy_daily_trade_limit(mock_build_ind, mock_get, tmp_path):
+def test_run_cycle_blocks_entry_after_strategy_daily_trade_limit(
+    mock_build_ind, mock_get, tmp_path
+):
     strategies_path = tmp_path / "active_strategies.json"
     state_file = tmp_path / "bot_state.json"
     trade_log = tmp_path / "paper_trades.csv"
@@ -1922,7 +1997,9 @@ def test_run_cycle_blocks_entry_after_strategy_daily_trade_limit(mock_build_ind,
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
     mock_get.return_value = mock_resp
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=60.0, atr_value=2.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
 
     bot.run_cycle()
 
@@ -1952,7 +2029,9 @@ def test_run_cycle_allows_only_one_open_position_per_product(mock_build_ind, moc
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
     mock_get.return_value = mock_resp
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=60.0, atr_value=2.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
 
     bot.run_cycle()
 
@@ -1963,7 +2042,9 @@ def test_run_cycle_allows_only_one_open_position_per_product(mock_build_ind, moc
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_reuses_feature_frame_for_shared_strategy_requirements(mock_build_ind, mock_get, tmp_path):
+def test_run_cycle_reuses_feature_frame_for_shared_strategy_requirements(
+    mock_build_ind, mock_get, tmp_path
+):
     strategies_path = tmp_path / "active_strategies.json"
     state_file = tmp_path / "bot_state.json"
     trade_log = tmp_path / "paper_trades.csv"
@@ -1985,7 +2066,9 @@ def test_run_cycle_reuses_feature_frame_for_shared_strategy_requirements(mock_bu
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
     mock_get.return_value = mock_resp
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=40.0, atr_value=2.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=40.0, atr_value=2.0
+    )
 
     bot.run_cycle()
 
@@ -2119,7 +2202,9 @@ def test_run_cycle_with_broker_places_entry_order(mock_build_ind, mock_get, bot_
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
     mock_get.return_value = mock_resp
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=60.0, atr_value=2.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
 
     bot.run_cycle()
 
@@ -2133,7 +2218,9 @@ def test_run_cycle_with_broker_places_entry_order(mock_build_ind, mock_get, bot_
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_rejects_unmanaged_broker_position_before_new_entry(mock_build_ind, mock_get, bot_env):
+def test_run_cycle_rejects_unmanaged_broker_position_before_new_entry(
+    mock_build_ind, mock_get, bot_env
+):
     strategies_path, state_file, trade_log = bot_env
 
     class UnmanagedPositionBroker:
@@ -2172,7 +2259,9 @@ def test_run_cycle_rejects_unmanaged_broker_position_before_new_entry(mock_build
 @pytest.mark.parametrize("balance", [0.0, float("nan"), float("inf")])
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_rejects_invalid_broker_balance_before_entry_order(mock_build_ind, mock_get, bot_env, balance):
+def test_run_cycle_rejects_invalid_broker_balance_before_entry_order(
+    mock_build_ind, mock_get, bot_env, balance
+):
     strategies_path, state_file, trade_log = bot_env
 
     class InvalidBalanceBroker:
@@ -2201,7 +2290,9 @@ def test_run_cycle_rejects_invalid_broker_balance_before_entry_order(mock_build_
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
     mock_get.return_value = mock_resp
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=60.0, atr_value=2.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
 
     with pytest.raises(ValueError, match="Broker quote balance"):
         bot.run_cycle()
@@ -2213,7 +2304,9 @@ def test_run_cycle_rejects_invalid_broker_balance_before_entry_order(mock_build_
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_rejects_partial_broker_entry_without_opening_state(mock_build_ind, mock_get, bot_env):
+def test_run_cycle_rejects_partial_broker_entry_without_opening_state(
+    mock_build_ind, mock_get, bot_env
+):
     strategies_path, state_file, trade_log = bot_env
 
     class PartialEntryBroker:
@@ -2234,7 +2327,9 @@ def test_run_cycle_rejects_partial_broker_entry_without_opening_state(mock_build
             return Position(symbol=symbol, qty=self.position_qty, avg_price=100.0)
 
         def place_order(self, order):
-            self.pending_at_submit = json.loads(state_file.read_text(encoding="utf-8"))["pending_order"]
+            self.pending_at_submit = json.loads(state_file.read_text(encoding="utf-8"))[
+                "pending_order"
+            ]
             self.orders.append(order)
             self.position_qty = 50.0
             return Fill(order.symbol, order.side, qty=50.0, price=100.0, fee=0.0)
@@ -2251,7 +2346,9 @@ def test_run_cycle_rejects_partial_broker_entry_without_opening_state(mock_build
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
     mock_get.return_value = mock_resp
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=60.0, atr_value=2.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
 
     with pytest.raises(RuntimeError, match="Broker entry partial fill"):
         bot.run_cycle()
@@ -2375,7 +2472,9 @@ def test_run_cycle_rejects_unresolved_emergency_flatten_intent(bot_env):
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_rejects_overfilled_broker_entry_without_opening_state(mock_build_ind, mock_get, bot_env):
+def test_run_cycle_rejects_overfilled_broker_entry_without_opening_state(
+    mock_build_ind, mock_get, bot_env
+):
     strategies_path, state_file, trade_log = bot_env
 
     class OverfilledEntryBroker:
@@ -2409,7 +2508,9 @@ def test_run_cycle_rejects_overfilled_broker_entry_without_opening_state(mock_bu
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
     mock_get.return_value = mock_resp
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=60.0, atr_value=2.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
 
     with pytest.raises(RuntimeError, match="Broker entry overfill"):
         bot.run_cycle()
@@ -2422,7 +2523,9 @@ def test_run_cycle_rejects_overfilled_broker_entry_without_opening_state(mock_bu
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_rejects_invalid_broker_entry_fill_without_opening_state(mock_build_ind, mock_get, bot_env):
+def test_run_cycle_rejects_invalid_broker_entry_fill_without_opening_state(
+    mock_build_ind, mock_get, bot_env
+):
     strategies_path, state_file, trade_log = bot_env
 
     class InvalidEntryBroker:
@@ -2456,7 +2559,9 @@ def test_run_cycle_rejects_invalid_broker_entry_fill_without_opening_state(mock_
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
     mock_get.return_value = mock_resp
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=60.0, atr_value=2.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
 
     with pytest.raises(RuntimeError, match="Broker entry invalid fill"):
         bot.run_cycle()
@@ -2523,7 +2628,9 @@ def test_run_cycle_rejects_nonfinite_broker_entry_fill_without_opening_state(
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
     mock_get.return_value = mock_resp
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=60.0, atr_value=2.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
 
     with pytest.raises(RuntimeError, match="Broker entry invalid fill"):
         bot.run_cycle()
@@ -2536,7 +2643,9 @@ def test_run_cycle_rejects_nonfinite_broker_entry_fill_without_opening_state(
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_rejects_mismatched_broker_entry_fill_without_opening_state(mock_build_ind, mock_get, bot_env):
+def test_run_cycle_rejects_mismatched_broker_entry_fill_without_opening_state(
+    mock_build_ind, mock_get, bot_env
+):
     strategies_path, state_file, trade_log = bot_env
 
     class MismatchedEntryBroker:
@@ -2570,7 +2679,9 @@ def test_run_cycle_rejects_mismatched_broker_entry_fill_without_opening_state(mo
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
     mock_get.return_value = mock_resp
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=60.0, atr_value=2.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
 
     with pytest.raises(RuntimeError, match="Broker entry fill mismatch"):
         bot.run_cycle()
@@ -2583,7 +2694,9 @@ def test_run_cycle_rejects_mismatched_broker_entry_fill_without_opening_state(mo
 
 def test_spot_sell_order_qty_uses_existing_base_position(bot_env):
     strategies_path, state_file, trade_log = bot_env
-    broker = SpotPaperBroker(price_source=PriceSource(100.0), starting_balance=10_000, fee_bps=0, slippage_bps=0)
+    broker = SpotPaperBroker(
+        price_source=PriceSource(100.0), starting_balance=10_000, fee_bps=0, slippage_bps=0
+    )
     broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=2.0))
     bot = PaperTradingBot(
         strategies_path=strategies_path,
@@ -2605,7 +2718,9 @@ def test_spot_step_aside_entry_records_base_and_quote_budget(mock_build_ind, moc
     state_file = tmp_path / "bot_state.json"
     trade_log = tmp_path / "paper_trades.csv"
     create_artifact(strategies_path, direction="short", pnl_unit="btc")
-    broker = SpotPaperBroker(price_source=PriceSource(100.0), starting_balance=10_000, fee_bps=0, slippage_bps=0)
+    broker = SpotPaperBroker(
+        price_source=PriceSource(100.0), starting_balance=10_000, fee_bps=0, slippage_bps=0
+    )
     broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=2.0))
     bot = PaperTradingBot(
         strategies_path=strategies_path,
@@ -2618,7 +2733,9 @@ def test_spot_step_aside_entry_records_base_and_quote_budget(mock_build_ind, moc
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
     mock_get.return_value = mock_resp
-    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf, rsi_value=60.0, atr_value=4.0)
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=4.0
+    )
 
     bot.run_cycle()
 
@@ -2685,8 +2802,7 @@ def test_live_spot_step_aside_reinvests_observed_free_quote_delta(
     assert position["broker_entry_quote_value"] == pytest.approx(99.75)
     assert position["broker_entry_quote_value_source"] == "observed_free_quote_delta"
     assert position["broker_entry_quote_value"] != pytest.approx(
-        position["broker_qty"] * position["broker_entry_price"]
-        - position["broker_entry_fee"]
+        position["broker_qty"] * position["broker_entry_price"] - position["broker_entry_fee"]
     )
     buyback_qty = bot._broker_exit_order_qty(
         bot.strategies[0],
@@ -2704,10 +2820,9 @@ def test_live_spot_step_aside_reinvests_observed_free_quote_delta(
         market="spot",
         live_gate_approved=True,
     )
-    assert (
-        restarted.state["open_positions"]["5m_long_r1"]["broker_entry_quote_value"]
-        == pytest.approx(99.75)
-    )
+    assert restarted.state["open_positions"]["5m_long_r1"][
+        "broker_entry_quote_value"
+    ] == pytest.approx(99.75)
     tampered = json.loads(state_file.read_text(encoding="utf-8"))
     tampered["open_positions"]["5m_long_r1"]["broker_entry_quote_value"] = 95.0
     state_file.write_text(json.dumps(tampered), encoding="utf-8")
@@ -2721,6 +2836,142 @@ def test_live_spot_step_aside_reinvests_observed_free_quote_delta(
             market="spot",
             live_gate_approved=True,
         )
+
+
+@patch("src.run_bot.requests.get")
+@patch("build_binance_indicator_dataset.build_indicator_features")
+def test_live_spot_exit_accounts_from_observed_btc_balance(
+    mock_build_ind,
+    mock_get,
+    tmp_path,
+):
+    strategies_path = tmp_path / "active_strategies.json"
+    state_file = tmp_path / "bot_state.json"
+    trade_log = tmp_path / "paper_trades.csv"
+    create_artifact(strategies_path, direction="short", pnl_unit="btc")
+    price = PriceSource(100.0)
+    broker = ObservedQuoteLiveSpotBroker(
+        price_source=price,
+        starting_balance=10.0,
+        fee_bps=0,
+        slippage_bps=0,
+        sell_quote_delta=99.75,
+    )
+    broker._positions["BTCUSDT"] = Position(
+        symbol="BTCUSDT",
+        qty=2.0,
+        avg_price=100.0,
+    )
+    bot = PaperTradingBot(
+        strategies_path=strategies_path,
+        state_file=state_file,
+        trade_log=trade_log,
+        starting_equity=1.0,
+        broker=broker,
+        market="spot",
+        live_gate_approved=True,
+    )
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5,
+        close_price=100.0,
+    )
+    mock_get.return_value = mock_resp
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df,
+        tf,
+        rsi_value=60.0,
+        atr_value=4.0,
+    )
+
+    bot.run_cycle()
+    entry_position = bot.state["open_positions"]["5m_long_r1"]
+    assert entry_position["broker_entry_base_qty_before"] == pytest.approx(2.0)
+    assert entry_position["broker_entry_base_qty_after"] == pytest.approx(1.0)
+
+    price.price = 90.0
+    mock_resp.json.return_value = get_mock_binance_klines(
+        6,
+        close_price=90.0,
+        high=100.0,
+        low=89.0,
+    )
+    bot.run_cycle()
+
+    expected_final_btc = 1.0 + (99.75 / 90.0)
+    expected_btc_return = (expected_final_btc - 2.0) / 2.0
+    assert broker.get_position("BTCUSDT").qty == pytest.approx(expected_final_btc)
+    assert bot.state["equity"] == pytest.approx(1.0 + expected_btc_return)
+    trade = pd.read_csv(trade_log).iloc[0]
+    assert trade["accounting_return_source"] == "observed_btc_balance"
+    assert trade["sized_return"] == pytest.approx(expected_btc_return)
+    assert trade["broker_entry_base_balance"] == pytest.approx(2.0)
+    assert trade["broker_exit_base_balance"] == pytest.approx(expected_final_btc)
+    assert trade["broker_base_balance_return"] == pytest.approx(expected_btc_return)
+
+
+@patch("src.run_bot.requests.get")
+@patch("build_binance_indicator_dataset.build_indicator_features")
+def test_live_spot_exit_preserves_intent_when_observed_btc_fill_is_wrong(
+    mock_build_ind,
+    mock_get,
+    tmp_path,
+):
+    strategies_path = tmp_path / "active_strategies.json"
+    state_file = tmp_path / "bot_state.json"
+    trade_log = tmp_path / "paper_trades.csv"
+    create_artifact(strategies_path, direction="short", pnl_unit="btc")
+    price = PriceSource(100.0)
+    broker = ObservedQuoteLiveSpotBroker(
+        price_source=price,
+        starting_balance=10.0,
+        fee_bps=0,
+        slippage_bps=0,
+        sell_quote_delta=99.75,
+        buy_base_delta_adjustment=-0.1,
+    )
+    broker._positions["BTCUSDT"] = Position(
+        symbol="BTCUSDT",
+        qty=2.0,
+        avg_price=100.0,
+    )
+    bot = PaperTradingBot(
+        strategies_path=strategies_path,
+        state_file=state_file,
+        trade_log=trade_log,
+        starting_equity=1.0,
+        broker=broker,
+        market="spot",
+        live_gate_approved=True,
+    )
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
+    mock_get.return_value = mock_resp
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df,
+        tf,
+        rsi_value=60.0,
+        atr_value=4.0,
+    )
+
+    bot.run_cycle()
+    price.price = 90.0
+    mock_resp.json.return_value = get_mock_binance_klines(
+        6,
+        close_price=90.0,
+        high=100.0,
+        low=89.0,
+    )
+
+    with pytest.raises(RuntimeError, match="base-balance reconciliation failed"):
+        bot.run_cycle()
+
+    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    assert persisted["pending_order"]["stage"] == "exit"
+    assert "5m_long_r1" in persisted["open_positions"]
+    assert not trade_log.exists()
 
 
 @pytest.mark.parametrize("observed_quote_delta", [0.0, 98.0, 101.0])
@@ -2779,7 +3030,9 @@ def test_live_spot_step_aside_rejects_unbounded_free_quote_delta(
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_spot_step_aside_exit_reinvests_quote_budget_to_accumulate_btc(mock_build_ind, mock_get, tmp_path):
+def test_spot_step_aside_exit_reinvests_quote_budget_to_accumulate_btc(
+    mock_build_ind, mock_get, tmp_path
+):
     strategies_path = tmp_path / "active_strategies.json"
     state_file = tmp_path / "bot_state.json"
     trade_log = tmp_path / "paper_trades.csv"
@@ -2919,7 +3172,9 @@ def test_run_cycle_exit_take_profit(mock_build_ind, mock_get, bot_env):
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=101.0, high=105.0, low=99.0)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5, close_price=101.0, high=105.0, low=99.0
+    )
     mock_get.return_value = mock_resp
     mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf)
 
@@ -3210,7 +3465,9 @@ def test_run_cycle_with_broker_reduces_strategy_qty_on_exit(mock_build_ind, mock
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=101.0, high=105.0, low=99.0)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5, close_price=101.0, high=105.0, low=99.0
+    )
     mock_get.return_value = mock_resp
     mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf)
 
@@ -3272,7 +3529,9 @@ def test_run_cycle_rejects_invalid_broker_qty_state_before_broker_use(
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=101.0, high=105.0, low=99.0)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5, close_price=101.0, high=105.0, low=99.0
+    )
     mock_get.return_value = mock_resp
     mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf)
 
@@ -3286,7 +3545,9 @@ def test_run_cycle_rejects_invalid_broker_qty_state_before_broker_use(
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_with_broker_rejects_open_position_without_broker_metadata(mock_build_ind, mock_get, bot_env):
+def test_run_cycle_with_broker_rejects_open_position_without_broker_metadata(
+    mock_build_ind, mock_get, bot_env
+):
     strategies_path, state_file, trade_log = bot_env
 
     class UnusedBroker:
@@ -3315,7 +3576,9 @@ def test_run_cycle_with_broker_rejects_open_position_without_broker_metadata(moc
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=101.0, high=105.0, low=99.0)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5, close_price=101.0, high=105.0, low=99.0
+    )
     mock_get.return_value = mock_resp
     mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf)
 
@@ -3328,7 +3591,9 @@ def test_run_cycle_with_broker_rejects_open_position_without_broker_metadata(moc
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_rejects_incomplete_broker_metadata_before_broker_use(mock_build_ind, mock_get, bot_env):
+def test_run_cycle_rejects_incomplete_broker_metadata_before_broker_use(
+    mock_build_ind, mock_get, bot_env
+):
     strategies_path, state_file, trade_log = bot_env
 
     class UnusedBroker:
@@ -3338,13 +3603,19 @@ def test_run_cycle_rejects_incomplete_broker_metadata_before_broker_use(mock_bui
             raise AssertionError("broker price should not be read with incomplete broker metadata")
 
         def get_balance(self):
-            raise AssertionError("broker balance should not be read with incomplete broker metadata")
+            raise AssertionError(
+                "broker balance should not be read with incomplete broker metadata"
+            )
 
         def get_position(self, symbol):
-            raise AssertionError("broker position should not be read with incomplete broker metadata")
+            raise AssertionError(
+                "broker position should not be read with incomplete broker metadata"
+            )
 
         def place_order(self, order):
-            raise AssertionError("broker order should not be placed with incomplete broker metadata")
+            raise AssertionError(
+                "broker order should not be placed with incomplete broker metadata"
+            )
 
     bot = PaperTradingBot(
         strategies_path=strategies_path,
@@ -3365,7 +3636,9 @@ def test_run_cycle_rejects_incomplete_broker_metadata_before_broker_use(mock_bui
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=101.0, high=105.0, low=99.0)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5, close_price=101.0, high=105.0, low=99.0
+    )
     mock_get.return_value = mock_resp
     mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf)
 
@@ -3378,7 +3651,9 @@ def test_run_cycle_rejects_incomplete_broker_metadata_before_broker_use(mock_bui
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_rejects_partial_broker_exit_without_closing_local_state(mock_build_ind, mock_get, bot_env):
+def test_run_cycle_rejects_partial_broker_exit_without_closing_local_state(
+    mock_build_ind, mock_get, bot_env
+):
     strategies_path, state_file, trade_log = bot_env
 
     class PartialExitBroker:
@@ -3399,7 +3674,9 @@ def test_run_cycle_rejects_partial_broker_exit_without_closing_local_state(mock_
             return Position(symbol=symbol, qty=self.position_qty, avg_price=100.0)
 
         def place_order(self, order):
-            self.pending_at_submit = json.loads(state_file.read_text(encoding="utf-8"))["pending_order"]
+            self.pending_at_submit = json.loads(state_file.read_text(encoding="utf-8"))[
+                "pending_order"
+            ]
             self.orders.append(order)
             self.position_qty = 50.0
             return Fill(order.symbol, order.side, qty=50.0, price=104.0, fee=0.0)
@@ -3426,7 +3703,9 @@ def test_run_cycle_rejects_partial_broker_exit_without_closing_local_state(mock_
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=101.0, high=105.0, low=99.0)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5, close_price=101.0, high=105.0, low=99.0
+    )
     mock_get.return_value = mock_resp
     mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf)
 
@@ -3460,7 +3739,9 @@ def test_run_cycle_rejects_partial_broker_exit_without_closing_local_state(mock_
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_rejects_overfilled_broker_exit_without_closing_local_state(mock_build_ind, mock_get, bot_env):
+def test_run_cycle_rejects_overfilled_broker_exit_without_closing_local_state(
+    mock_build_ind, mock_get, bot_env
+):
     strategies_path, state_file, trade_log = bot_env
 
     class OverfilledExitBroker:
@@ -3506,7 +3787,9 @@ def test_run_cycle_rejects_overfilled_broker_exit_without_closing_local_state(mo
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=101.0, high=105.0, low=99.0)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5, close_price=101.0, high=105.0, low=99.0
+    )
     mock_get.return_value = mock_resp
     mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf)
 
@@ -3521,7 +3804,9 @@ def test_run_cycle_rejects_overfilled_broker_exit_without_closing_local_state(mo
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_rejects_invalid_broker_exit_fill_without_closing_local_state(mock_build_ind, mock_get, bot_env):
+def test_run_cycle_rejects_invalid_broker_exit_fill_without_closing_local_state(
+    mock_build_ind, mock_get, bot_env
+):
     strategies_path, state_file, trade_log = bot_env
 
     class InvalidExitBroker:
@@ -3567,7 +3852,9 @@ def test_run_cycle_rejects_invalid_broker_exit_fill_without_closing_local_state(
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=101.0, high=105.0, low=99.0)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5, close_price=101.0, high=105.0, low=99.0
+    )
     mock_get.return_value = mock_resp
     mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf)
 
@@ -3647,7 +3934,9 @@ def test_run_cycle_rejects_nonfinite_broker_exit_fill_without_closing_local_stat
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=101.0, high=105.0, low=99.0)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5, close_price=101.0, high=105.0, low=99.0
+    )
     mock_get.return_value = mock_resp
     mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf)
 
@@ -3662,7 +3951,9 @@ def test_run_cycle_rejects_nonfinite_broker_exit_fill_without_closing_local_stat
 
 @patch("src.run_bot.requests.get")
 @patch("build_binance_indicator_dataset.build_indicator_features")
-def test_run_cycle_rejects_mismatched_broker_exit_fill_without_closing_local_state(mock_build_ind, mock_get, bot_env):
+def test_run_cycle_rejects_mismatched_broker_exit_fill_without_closing_local_state(
+    mock_build_ind, mock_get, bot_env
+):
     strategies_path, state_file, trade_log = bot_env
 
     class MismatchedExitBroker:
@@ -3709,7 +4000,9 @@ def test_run_cycle_rejects_mismatched_broker_exit_fill_without_closing_local_sta
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=101.0, high=105.0, low=99.0)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5, close_price=101.0, high=105.0, low=99.0
+    )
     mock_get.return_value = mock_resp
     mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf)
 
@@ -3842,7 +4135,9 @@ def test_trade_log_exit_event_id_deduplicates_identical_row_and_rejects_conflict
 @patch("build_binance_indicator_dataset.build_indicator_features")
 def test_run_cycle_with_broker_reconciliation_failure(mock_build_ind, mock_get, bot_env):
     strategies_path, state_file, trade_log = bot_env
-    broker = PaperBroker(price_source=PriceSource(100.0), starting_balance=10_000, fee_bps=0, slippage_bps=0)
+    broker = PaperBroker(
+        price_source=PriceSource(100.0), starting_balance=10_000, fee_bps=0, slippage_bps=0
+    )
     bot = PaperTradingBot(
         strategies_path=strategies_path,
         state_file=state_file,
@@ -3864,7 +4159,9 @@ def test_run_cycle_with_broker_reconciliation_failure(mock_build_ind, mock_get, 
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=101.0, high=101.0, low=99.0)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5, close_price=101.0, high=101.0, low=99.0
+    )
     mock_get.return_value = mock_resp
     mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf)
 
@@ -4052,9 +4349,7 @@ def test_exit_accounting_restart_deduplicates_row_after_post_log_state_failure(
     assert restarted._resume_exit_accounting_intent() is True
     assert pd.read_csv(trade_log)["exit_event_id"].tolist() == [event_id]
     assert restarted.state["equity"] == pytest.approx(10_394.0)
-    assert "exit_accounting_intent" not in json.loads(
-        state_file.read_text(encoding="utf-8")
-    )
+    assert "exit_accounting_intent" not in json.loads(state_file.read_text(encoding="utf-8"))
 
 
 def test_exit_accounting_restart_rejects_tampered_intent_payload(bot_env):
@@ -4104,7 +4399,9 @@ def test_run_cycle_exit_time_horizon_from_timestamps(mock_build_ind, mock_get, b
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=101.5, high=102.0, low=99.0)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5, close_price=101.5, high=102.0, low=99.0
+    )
     mock_get.return_value = mock_resp
     mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf)
 
@@ -4127,7 +4424,9 @@ def test_run_cycle_cooldown_trigger(mock_build_ind, mock_get, bot_env):
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=97.0, high=99.0, low=96.0, open_p=97.0)
+    mock_resp.json.return_value = get_mock_binance_klines(
+        5, close_price=97.0, high=99.0, low=96.0, open_p=97.0
+    )
     mock_get.return_value = mock_resp
     mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(df, tf)
 
@@ -4226,12 +4525,22 @@ def test_check_drift_no_kill_when_winrate_matches(bot_env):
     trades = []
     for i in range(15):
         net = 0.02 if i < 9 else -0.01
-        trades.append({
-            "strategy_id": "5m_long_r1", "entry_time": "x", "exit_time": "x",
-            "direction": "long", "entry_price": 100.0, "exit_price": 100.0,
-            "exit_reason": "time", "gross_return": net, "net_return": net,
-            "sized_return": net, "position_size": 1.0, "equity_after": 10000.0,
-        })
+        trades.append(
+            {
+                "strategy_id": "5m_long_r1",
+                "entry_time": "x",
+                "exit_time": "x",
+                "direction": "long",
+                "entry_price": 100.0,
+                "exit_price": 100.0,
+                "exit_reason": "time",
+                "gross_return": net,
+                "net_return": net,
+                "sized_return": net,
+                "position_size": 1.0,
+                "equity_after": 10000.0,
+            }
+        )
     pd.DataFrame(trades).to_csv(trade_log, index=False)
     bot.check_drift_and_ood(bot.strategies[0])
     assert bot.state["inactive_strategies"] == []
@@ -4318,9 +4627,9 @@ class NativeStopPaperBroker(PaperBroker):
 
     def place_protective_stop(self, *, symbol, side, qty, trigger_price, client_id):
         self.events.append("place_stop")
-        self.pending_during_stop = json.loads(
-            self.state_file.read_text(encoding="utf-8")
-        ).get("pending_order")
+        self.pending_during_stop = json.loads(self.state_file.read_text(encoding="utf-8")).get(
+            "pending_order"
+        )
         self.stop_request = {
             "symbol": symbol,
             "side": side,
@@ -4456,9 +4765,10 @@ def test_live_pre_entry_gate_runs_after_feature_fetch_before_intent_or_order(bot
         pre_entry_gate=block_after_panic,
     )
 
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         with pytest.raises(RuntimeError, match="observed panic"):
             bot.run_cycle()
@@ -4518,9 +4828,10 @@ def test_live_entry_timeout_after_acceptance_is_flattened_in_same_cycle(bot_env)
         state_file=state_file,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         with pytest.raises(RuntimeError, match="entry response timeout"):
             bot.run_cycle()
@@ -4530,10 +4841,7 @@ def test_live_entry_timeout_after_acceptance_is_flattened_in_same_cycle(bot_env)
     assert len(broker.recovery_orders) == 1
     assert broker.recovery_orders[0].reduce_only is True
     assert persisted["pending_order"]["stage"] == "entry"
-    assert (
-        persisted["pending_entry_recovery"]["status"]
-        == "recovery_close_filled_and_flat"
-    )
+    assert persisted["pending_entry_recovery"]["status"] == "recovery_close_filled_and_flat"
 
 
 @pytest.mark.parametrize(
@@ -4560,9 +4868,10 @@ def test_live_pending_entry_restart_flattens_accepted_long_or_short_once(
         process_crash_after_entry=True,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         with pytest.raises(KeyboardInterrupt, match="simulated process death"):
             bot.run_cycle()
@@ -4604,9 +4913,10 @@ def test_live_pending_entry_restart_records_flat_without_sending_close(bot_env):
         accept_entry=False,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         with pytest.raises(RuntimeError, match="entry response timeout"):
             bot.run_cycle()
@@ -4619,10 +4929,7 @@ def test_live_pending_entry_restart_records_flat_without_sending_close(bot_env):
     assert broker.get_position("BTCUSDT").is_flat
     assert broker.recovery_orders == []
     assert persisted["pending_order"]["stage"] == "entry"
-    assert (
-        persisted["pending_entry_recovery"]["status"]
-        == "broker_flat_observed_no_recovery_order"
-    )
+    assert persisted["pending_entry_recovery"]["status"] == "broker_flat_observed_no_recovery_order"
 
 
 def test_live_pending_entry_recovery_timeout_adopts_broker_flat_readback(bot_env):
@@ -4636,9 +4943,10 @@ def test_live_pending_entry_recovery_timeout_adopts_broker_flat_readback(bot_env
         recovery_mode="timeout_after_fill",
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         with pytest.raises(RuntimeError, match="entry response timeout"):
             bot.run_cycle()
@@ -4669,9 +4977,10 @@ def test_live_pending_entry_recovery_failure_preserves_exposure_and_stable_inten
         process_crash_after_entry=True,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         with pytest.raises(KeyboardInterrupt, match="simulated process death"):
             bot.run_cycle()
@@ -4691,10 +5000,7 @@ def test_live_pending_entry_recovery_failure_preserves_exposure_and_stable_inten
     assert broker.recovery_orders[1].client_id == first_recovery_id
     assert persisted["pending_order"]["stage"] == "entry"
     assert persisted["pending_entry_recovery"]["attempt_count"] == 2
-    assert (
-        persisted["pending_entry_recovery"]["status"]
-        == "recovery_close_failed_position_remains"
-    )
+    assert persisted["pending_entry_recovery"]["status"] == "recovery_close_failed_position_remains"
 
 
 def test_live_spot_pending_entry_never_uses_futures_auto_flatten(bot_env):
@@ -4731,9 +5037,10 @@ def test_live_spot_pending_entry_never_uses_futures_auto_flatten(bot_env):
         market="spot",
         live_gate_approved=True,
     )
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         with pytest.raises(RuntimeError, match="spot entry response timeout"):
             bot.run_cycle()
@@ -4768,9 +5075,10 @@ def test_live_futures_entry_installs_verifies_and_persists_native_stop(bot_env):
     )
     bot = _native_stop_bot(bot_env, broker)
 
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
 
@@ -4787,7 +5095,9 @@ def test_live_futures_entry_installs_verifies_and_persists_native_stop(bot_env):
     assert position["strategy_snapshot"]["horizon_bars"] == 4
     assert "pending_order" not in bot.state
     assert persisted["open_positions"]["5m_long_r1"]["broker_stop_order_id"] == "stop-987"
-    assert persisted["open_positions"]["5m_long_r1"]["broker_entry_balance"] == pytest.approx(10_000.0)
+    assert persisted["open_positions"]["5m_long_r1"]["broker_entry_balance"] == pytest.approx(
+        10_000.0
+    )
     assert "pending_order" not in persisted
 
 
@@ -4801,9 +5111,10 @@ def test_live_futures_restart_rejects_changed_broker_account_before_reconciliati
         state_file=state_file,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
     events_before = list(broker.events)
@@ -4813,9 +5124,7 @@ def test_live_futures_restart_rejects_changed_broker_account_before_reconciliati
         _native_stop_bot(bot_env, broker)
 
     assert broker.events == events_before
-    assert "5m_long_r1" in json.loads(state_file.read_text(encoding="utf-8"))[
-        "open_positions"
-    ]
+    assert "5m_long_r1" in json.loads(state_file.read_text(encoding="utf-8"))["open_positions"]
 
 
 def test_live_futures_restart_rejects_missing_accounting_balance_baseline(bot_env):
@@ -4828,9 +5137,10 @@ def test_live_futures_restart_rejects_missing_accounting_balance_baseline(bot_en
         state_file=state_file,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
 
@@ -4854,9 +5164,10 @@ def test_failed_native_stop_immediately_flattens_and_only_then_clears_pending(bo
     broker.fail_stop_placement = True
     bot = _native_stop_bot(bot_env, broker)
 
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         with pytest.raises(RuntimeError, match="immediately flattened"):
             bot.run_cycle()
@@ -4883,9 +5194,10 @@ def test_failed_native_stop_recovery_keeps_pending_when_flat_cannot_be_proven(bo
     broker.fail_recovery_close = True
     bot = _native_stop_bot(bot_env, broker)
 
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         with pytest.raises(RuntimeError, match="pending entry intent remains"):
             bot.run_cycle()
@@ -4907,16 +5219,18 @@ def test_cycle_adopts_fully_triggered_native_stop_before_market_data(bot_env):
         state_file=state_file,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
 
     broker.trigger_stop(97.0)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         bot.run_cycle()
         mock_get.assert_not_called()
         mock_build_ind.assert_not_called()
@@ -4938,9 +5252,10 @@ def test_native_stop_exit_accounting_restart_never_resubmits_and_requires_flat_r
         state_file=state_file,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
 
@@ -5006,9 +5321,10 @@ def test_cycle_emergency_flattens_terminal_untriggered_native_stop(bot_env, term
         state_file=state_file,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
     broker.stop = ProtectiveOrder(
@@ -5032,9 +5348,7 @@ def test_cycle_emergency_flattens_terminal_untriggered_native_stop(bot_env, term
     expected_cause = f"native_stop_terminal_{terminal_status.value}"
     assert persisted["risk_recovery_incident"]["cause"] == expected_cause
     assert persisted["risk_recovery_incident"]["status"] == "recovery_close_filled_and_flat"
-    assert pd.read_csv(trade_log)["exit_reason"].tolist() == [
-        f"risk_recovery_{expected_cause}"
-    ]
+    assert pd.read_csv(trade_log)["exit_reason"].tolist() == [f"risk_recovery_{expected_cause}"]
 
 
 def test_terminal_native_stop_ambiguous_recovery_close_latches_after_flat_readback(bot_env):
@@ -5057,9 +5371,10 @@ def test_terminal_native_stop_ambiguous_recovery_close_latches_after_flat_readba
         state_file=state_file,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
     broker.stop = ProtectiveOrder(
@@ -5099,9 +5414,10 @@ def test_partial_triggered_native_stop_flattens_residual_without_false_accountin
         state_file=state_file,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
     original_qty = float(bot.state["open_positions"]["5m_long_r1"]["broker_qty"])
@@ -5160,9 +5476,10 @@ def test_malformed_native_stop_lookup_flattens_exposure_and_latches_accounting(b
         state_file=state_file,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
     broker.malformed = True
@@ -5207,9 +5524,10 @@ def test_live_futures_excess_same_direction_qty_flattens_full_actual_exposure(
         state_file=state_file,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
 
@@ -5218,9 +5536,10 @@ def test_live_futures_excess_same_direction_qty_flattens_full_actual_exposure(
         qty=actual_qty,
         avg_price=100.0,
     )
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(
             mock_get,
             mock_build_ind,
@@ -5251,16 +5570,18 @@ def test_normal_live_exit_proves_flat_then_cancels_native_stop(bot_env):
         state_file=state_file,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
 
     price.price = 104.0
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(
             mock_get,
             mock_build_ind,
@@ -5294,9 +5615,10 @@ def test_open_position_uses_frozen_strategy_after_active_artifact_removes_it(bot
         starting_equity=10_000.0,
         broker=broker,
     )
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
 
@@ -5315,9 +5637,10 @@ def test_open_position_uses_frozen_strategy_after_active_artifact_removes_it(bot
         broker=broker,
     )
     price.price = 104.0
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(
             mock_get,
             mock_build_ind,
@@ -5345,9 +5668,10 @@ def test_open_position_uses_frozen_strategy_when_same_id_artifact_changes(bot_en
         starting_equity=10_000.0,
         broker=broker,
     )
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
 
@@ -5366,9 +5690,10 @@ def test_open_position_uses_frozen_strategy_when_same_id_artifact_changes(bot_en
     )
 
     price.price = 104.0
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(
             mock_get,
             mock_build_ind,
@@ -5424,9 +5749,9 @@ class PrecisionNativeStopPaperBroker(NativeStopPaperBroker):
 
     def place_order(self, order):
         if not order.reduce_only:
-            self.entry_pending_at_submit = json.loads(
-                self.state_file.read_text(encoding="utf-8")
-            )["pending_order"]
+            self.entry_pending_at_submit = json.loads(self.state_file.read_text(encoding="utf-8"))[
+                "pending_order"
+            ]
         return super().place_order(order)
 
 
@@ -5441,9 +5766,10 @@ def test_bot_persists_normalized_entry_qty_and_native_stop_trigger(bot_env):
     )
     bot = _native_stop_bot(bot_env, broker)
 
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind, atr_value=1.7)
         bot.run_cycle()
 
@@ -5474,9 +5800,10 @@ def test_bot_rejects_below_minimum_normalized_qty_before_pending_or_order(bot_en
         broker=broker,
     )
 
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         with pytest.raises(ValueError, match="below exchange minimum"):
             bot.run_cycle()
@@ -5504,9 +5831,10 @@ def test_invalid_normalized_stop_trigger_flattens_without_canceling_unsubmitted_
     )
     bot = _native_stop_bot(bot_env, broker)
 
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         with pytest.raises(RuntimeError, match="immediately flattened"):
             bot.run_cycle()
@@ -5543,7 +5871,9 @@ class StopWinsSoftwareExitBroker(NativeStopPaperBroker):
                 average_price=fill.price,
                 fee=fill.fee,
             )
-            raise RuntimeError("reduce-only close rejected because native stop already flattened position")
+            raise RuntimeError(
+                "reduce-only close rejected because native stop already flattened position"
+            )
         return super().place_order(order)
 
 
@@ -5558,17 +5888,19 @@ def test_software_exit_adopts_native_stop_that_wins_submission_race(bot_env):
         state_file=state_file,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
 
     broker.race_enabled = True
     price.price = 104.0
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(
             mock_get,
             mock_build_ind,
@@ -5606,16 +5938,18 @@ def test_software_exit_error_keeps_pending_when_native_stop_is_still_open(bot_en
         state_file=state_file,
     )
     bot = _native_stop_bot(bot_env, broker)
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(mock_get, mock_build_ind)
         bot.run_cycle()
 
     price.price = 104.0
-    with patch("src.run_bot.requests.get") as mock_get, patch(
-        "build_binance_indicator_dataset.build_indicator_features"
-    ) as mock_build_ind:
+    with (
+        patch("src.run_bot.requests.get") as mock_get,
+        patch("build_binance_indicator_dataset.build_indicator_features") as mock_build_ind,
+    ):
         _configure_entry_cycle_mocks(
             mock_get,
             mock_build_ind,

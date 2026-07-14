@@ -16,6 +16,7 @@ from typing import Any
 
 import pandas as pd
 
+from research_exploration.dsr import DSR_METHOD
 from src.autopilot.approvals import ApprovalLedger, strategy_fingerprint
 from src.autopilot.config import AutopilotConfig, ProductConfig
 from src.autopilot.experiment_memory import ExperimentMemory
@@ -29,7 +30,7 @@ from src.autopilot.promotion import (
 from src.autopilot.research_factory import build_generation, load_factory_config
 from src.autopilot.research_smoke import run_research_smoke
 from src.config import PROJECT_ROOT
-from src.execution.broker import Position
+from src.execution.broker import FuturesPositionIdentity, Position
 
 DEFAULT_REHEARSAL_DIR = PROJECT_ROOT / "runtime" / "rehearsal"
 
@@ -67,7 +68,13 @@ def synthetic_active_income_strategy() -> dict[str, Any]:
         "metrics": {
             "holdout_total_return": 0.04,
             "holdout_win_rate": 0.58,
-            "dsr": 0.95,
+            "dsr_deflated": 0.95,
+            "dsr_method": DSR_METHOD,
+            "n_trials": 8,
+            "sr_std_trials": 0.20,
+            "trial_sharpe_count": 8,
+            "trial_sharpe_observed_std": 0.15,
+            "trial_sharpe_conservative_floor": 0.10,
         },
     }
 
@@ -107,7 +114,13 @@ def synthetic_btc_accumulation_strategy() -> dict[str, Any]:
             "holdout_excess_return_vs_buy_hold": 0.025,
             "holdout_buy_hold_return": 0.0,
             "holdout_win_rate": 0.55,
-            "dsr": 0.92,
+            "dsr_deflated": 0.92,
+            "dsr_method": DSR_METHOD,
+            "n_trials": 8,
+            "sr_std_trials": 0.20,
+            "trial_sharpe_count": 8,
+            "trial_sharpe_observed_std": 0.15,
+            "trial_sharpe_conservative_floor": 0.10,
         },
     }
 
@@ -217,6 +230,12 @@ class FakeReadOnlyBroker:
     def list_open_orders(self, symbol: str, *, conditional: bool) -> tuple:
         return ()
 
+    def list_account_open_orders(self, *, conditional: bool) -> tuple:
+        return ()
+
+    def list_account_futures_positions(self) -> tuple[FuturesPositionIdentity, ...]:
+        return ()
+
     def get_price(self, symbol: str) -> float:
         return 100.0
 
@@ -251,9 +270,7 @@ def run_rehearsal(work_dir: Path = DEFAULT_REHEARSAL_DIR) -> dict[str, Any]:
         seed=101,
         now="2026-01-01T00:00:00+00:00",
     )
-    first_hashes = {
-        str(item["strategy_hash"]) for item in first_generation["generation_metadata"]
-    }
+    first_hashes = {str(item["strategy_hash"]) for item in first_generation["generation_metadata"]}
     with ExperimentMemory(research_memory_path) as memory:
         for item in first_generation["generation_metadata"]:
             memory.record_outcome(
@@ -263,9 +280,7 @@ def run_rehearsal(work_dir: Path = DEFAULT_REHEARSAL_DIR) -> dict[str, Any]:
                 protocol={
                     "name": "offline_rehearsal",
                     "version": 1,
-                    "research_engine_digest": first_generation["source"][
-                        "research_engine_digest"
-                    ],
+                    "research_engine_digest": first_generation["source"]["research_engine_digest"],
                 },
                 phase="development",
                 outcome="reject",
@@ -293,10 +308,7 @@ def run_rehearsal(work_dir: Path = DEFAULT_REHEARSAL_DIR) -> dict[str, Any]:
         "second_generation": len(second_hashes),
         "new_behavioral_specs_after_feedback": len(second_hashes - first_hashes),
         "products": sorted(
-            {
-                str(item.get("product"))
-                for item in second_generation.get("generation_metadata", [])
-            }
+            {str(item.get("product")) for item in second_generation.get("generation_metadata", [])}
         ),
         "opportunity_types": sorted(
             {

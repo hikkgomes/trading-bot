@@ -1,6 +1,12 @@
 import pandas as pd
 
-from src.regime import add_regime_column, add_regime_column_from_daily, tag_regime_file
+from src.regime import (
+    REGIME_LABELS,
+    _regime_frame,
+    add_regime_column,
+    add_regime_column_from_daily,
+    tag_regime_file,
+)
 
 
 def test_add_regime_column_emits_regime_id():
@@ -58,6 +64,49 @@ def test_add_regime_column_from_daily_merges_to_intraday_rows():
     assert (out["tf_1d_regime_id"] != -1).sum() > 96
 
 
+def test_regime_labels_are_causal_prefix_invariant_and_semantically_stable():
+    rng = pd.Series(range(600), dtype=float)
+    returns = pd.concat(
+        [
+            pd.Series(0.002 + (rng.iloc[:150] % 7 - 3) * 0.0002),
+            pd.Series(-0.002 + (rng.iloc[:150] % 5 - 2) * 0.0003),
+            pd.Series((rng.iloc[:150] % 2 * 2 - 1) * 0.025),
+            pd.Series((rng.iloc[:150] % 3 - 1) * 0.0002),
+        ],
+        ignore_index=True,
+    )
+    close = 100.0 * (1.0 + returns).cumprod()
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2023-01-01", periods=len(close), freq="D", tz="UTC"),
+            "close": close,
+        }
+    )
+
+    prefix = _regime_frame(daily.iloc[:450], "close").set_index("timestamp")
+    extended = _regime_frame(daily, "close").set_index("timestamp").reindex(prefix.index)
+
+    pd.testing.assert_series_equal(
+        prefix["tf_1d_regime_id"],
+        extended["tf_1d_regime_id"],
+    )
+    observed = set(prefix["tf_1d_regime_id"].unique())
+    assert observed <= set(REGIME_LABELS)
+    assert {0, 1, 2, 3} <= observed
+
+
+def test_direct_daily_close_label_is_visible_only_on_following_day():
+    timestamps = pd.date_range("2024-01-01", periods=90, freq="D", tz="UTC")
+    close = pd.Series(100.0 * (1.002 ** pd.Series(range(90))), dtype=float)
+    daily = pd.DataFrame({"timestamp": timestamps, "close": close})
+    raw = _regime_frame(daily, "close").set_index("timestamp")["tf_1d_regime_id"]
+
+    tagged = add_regime_column(daily, price_column="close").set_index("timestamp")
+
+    assert tagged.loc[timestamps[-1], "tf_1d_regime_id"] == raw.loc[timestamps[-2]]
+    assert tagged.loc[timestamps[-1], "tf_1d_regime_id"] != -1
+
+
 def test_tag_regime_file_skip_if_missing(tmp_path):
     report = tag_regime_file(
         tmp_path / "missing.parquet",
@@ -92,6 +141,7 @@ def test_tag_regime_file_writes_reportable_output_from_daily(tmp_path):
     assert report["ok"] is True
     assert report["skipped"] is False
     assert report["rows"] == 96 * 80
+    assert report["regime_labels"] == {str(key): value for key, value in REGIME_LABELS.items()}
     assert output_path.exists()
     tagged = pd.read_parquet(output_path)
     assert "tf_1d_regime_id" in tagged.columns

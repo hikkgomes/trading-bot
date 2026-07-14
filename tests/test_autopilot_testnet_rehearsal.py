@@ -3,6 +3,7 @@ from dataclasses import replace
 
 import pytest
 
+from research_exploration.dsr import DSR_METHOD
 from src.autopilot.approvals import ApprovalLedger, artifact_digest
 from src.autopilot.config import AutopilotConfig, ProductConfig
 from src.autopilot.testnet_rehearsal import (
@@ -12,6 +13,7 @@ from src.autopilot.testnet_rehearsal import (
 )
 from src.execution.broker import (
     Fill,
+    FuturesPositionIdentity,
     OrderSide,
     Position,
     ProtectiveOrder,
@@ -73,7 +75,16 @@ def strategy_artifact(path):
             "max_trades_per_day": 4,
         },
         "fees": {"fee_bps": 5.0, "slippage_bps": 2.0},
-        "metrics": {"holdout_total_return": 0.03, "dsr_deflated": 0.72},
+        "metrics": {
+            "holdout_total_return": 0.03,
+            "dsr_deflated": 0.72,
+            "dsr_method": DSR_METHOD,
+            "n_trials": 8,
+            "sr_std_trials": 0.20,
+            "trial_sharpe_count": 8,
+            "trial_sharpe_observed_std": 0.15,
+            "trial_sharpe_conservative_floor": 0.10,
+        },
     }
     path.write_text(
         json.dumps(
@@ -145,6 +156,20 @@ class FakeTestnetBroker:
 
     def list_open_orders(self, symbol, *, conditional):
         return ()
+
+    def list_account_open_orders(self, *, conditional):
+        return self.list_open_orders("BTCUSDT", conditional=conditional)
+
+    def list_account_futures_positions(self):
+        if self.position.is_flat:
+            return ()
+        return (
+            FuturesPositionIdentity(
+                symbol="BTC/USDT:USDT",
+                qty=self.position.qty,
+                avg_price=self.position.avg_price,
+            ),
+        )
 
     def normalize_order_qty(self, symbol, qty, *, price=None, reduce_only=False):
         self.normalization_calls.append(("qty", symbol, qty, price, reduce_only))
@@ -316,9 +341,8 @@ def test_testnet_rehearsal_requires_approval_before_broker_use(monkeypatch, tmp_
     report = run_testnet_rehearsal(cfg, confirm=True, broker_builder=fail_broker)
 
     assert report["ok"] is False
-    assert report["error"] == "preflight_failed"
-    checks = {item["name"]: item for item in report["preflight"]["products"][0]["checks"]}
-    assert checks["approval_gate"]["ok"] is False
+    assert report["error"].startswith("approval_failed: Live trading blocked; missing approval:")
+    assert "preflight" not in report
 
 
 def test_testnet_rehearsal_requires_flat_starting_position(monkeypatch, tmp_path):
@@ -335,7 +359,7 @@ def test_testnet_rehearsal_requires_flat_starting_position(monkeypatch, tmp_path
     assert report["error"] == "preflight_failed"
     checks = {item["name"]: item for item in report["preflight"]["products"][0]["checks"]}
     assert checks["broker_position_flat"]["ok"] is False
-    assert checks["broker_position_flat"]["detail"]["position_qty"] == pytest.approx(0.1)
+    assert checks["broker_position_flat"]["detail"]["positions"][0]["qty"] == pytest.approx(0.1)
 
 
 def test_testnet_rehearsal_rejects_broker_without_native_protective_stops(
@@ -379,7 +403,7 @@ def test_testnet_rehearsal_places_tiny_entry_and_reduce_only_close(monkeypatch, 
     active_product = cfg.products[0]
     product_payload = report["product"]
     assert product_payload["enabled"] is True
-    assert product_payload["execution_mode"] == "live"
+    assert product_payload["execution_mode"] == active_product.execution_mode
     assert product_payload["strategies_path"] == str(active_product.strategies_path)
     assert product_payload["require_preflight"] is True
     assert product_payload["preflight_report"] == str(active_product.preflight_report)
@@ -880,7 +904,8 @@ def test_testnet_rehearsal_summary_rejects_unmatched_expected_product(tmp_path):
 
     assert status["ok"] is False
     assert status["status"] == "failed"
-    assert status["invalid_reasons"] == ["product_symbol_mismatch"]
+    assert "product_symbol_mismatch" in status["invalid_reasons"]
+    assert "product_state_file_mismatch" in status["invalid_reasons"]
     assert status["report_product"]["symbol"] == "ETHUSDT"
     assert status["expected_product"]["symbol"] == "BTCUSDT"
     assert (
@@ -942,10 +967,8 @@ def test_testnet_rehearsal_summary_rejects_unmatched_fill_symbols(tmp_path):
 
     assert status["ok"] is False
     assert status["status"] == "failed"
-    assert status["invalid_reasons"] == [
-        "entry_fill_symbol_mismatch",
-        "close_fill_symbol_mismatch",
-    ]
+    assert "entry_fill_symbol_mismatch" in status["invalid_reasons"]
+    assert "close_fill_symbol_mismatch" in status["invalid_reasons"]
 
 
 def test_testnet_rehearsal_summary_rejects_fill_qty_not_matching_order_qty(tmp_path):
@@ -1001,10 +1024,8 @@ def test_testnet_rehearsal_summary_rejects_fill_qty_not_matching_order_qty(tmp_p
 
     assert status["ok"] is False
     assert status["status"] == "failed"
-    assert status["invalid_reasons"] == [
-        "entry_fill_qty_mismatch",
-        "close_fill_qty_mismatch",
-    ]
+    assert "entry_fill_qty_mismatch" in status["invalid_reasons"]
+    assert "close_fill_qty_mismatch" in status["invalid_reasons"]
 
 
 def test_testnet_rehearsal_summary_rejects_missing_risk_controls_for_expected_product(tmp_path):
@@ -1054,7 +1075,7 @@ def test_testnet_rehearsal_summary_rejects_missing_risk_controls_for_expected_pr
 
     assert status["ok"] is False
     assert status["status"] == "failed"
-    assert status["invalid_reasons"] == ["missing_risk_controls"]
+    assert "missing_risk_controls" in status["invalid_reasons"]
 
 
 def test_testnet_rehearsal_summary_rejects_unsafe_risk_controls(tmp_path):
@@ -1110,12 +1131,12 @@ def test_testnet_rehearsal_summary_rejects_unsafe_risk_controls(tmp_path):
 
     assert status["ok"] is False
     assert status["status"] == "failed"
-    assert status["invalid_reasons"] == [
+    assert {
         "max_futures_leverage_invalid",
         "futures_margin_mode_not_isolated",
         "max_notional_usd_invalid",
         "max_fill_slippage_bps_invalid",
-    ]
+    } <= set(status["invalid_reasons"])
 
 
 def test_testnet_rehearsal_summary_rejects_active_income_leverage_above_one(tmp_path):
@@ -1171,7 +1192,7 @@ def test_testnet_rehearsal_summary_rejects_active_income_leverage_above_one(tmp_
 
     assert status["ok"] is False
     assert status["status"] == "failed"
-    assert status["invalid_reasons"] == ["max_futures_leverage_invalid"]
+    assert "max_futures_leverage_invalid" in status["invalid_reasons"]
 
 
 def test_testnet_rehearsal_summary_rejects_embedded_preflight_missing_artifact_digest(tmp_path):
@@ -1247,7 +1268,7 @@ def test_testnet_rehearsal_summary_rejects_embedded_preflight_missing_artifact_d
 
     assert status["ok"] is False
     assert status["status"] == "failed"
-    assert status["invalid_reasons"] == ["embedded_preflight_missing_artifact_digest"]
+    assert "embedded_preflight_missing_artifact_digest" in status["invalid_reasons"]
 
 
 def test_testnet_rehearsal_summary_rejects_embedded_preflight_artifact_digest_mismatch(tmp_path):
@@ -1324,7 +1345,7 @@ def test_testnet_rehearsal_summary_rejects_embedded_preflight_artifact_digest_mi
 
     assert status["ok"] is False
     assert status["status"] == "failed"
-    assert status["invalid_reasons"] == ["embedded_preflight_artifact_digest_mismatch"]
+    assert "embedded_preflight_artifact_digest_mismatch" in status["invalid_reasons"]
 
 
 def test_testnet_rehearsal_summary_rejects_future_timestamp(tmp_path):

@@ -3,7 +3,14 @@ import shlex
 
 import pandas as pd
 
-from src.autopilot.approvals import ApprovalLedger, strategy_fingerprint
+from research_exploration.dsr import DSR_METHOD
+from src.autopilot.approvals import ApprovalLedger, artifact_digest, strategy_fingerprint
+from src.autopilot.candidate_evidence import (
+    CANDIDATE_PAPER_EXECUTION_SCHEMA,
+    CANDIDATE_PAPER_FORWARD_FILL_SOURCE,
+    CANDIDATE_PAPER_FORWARD_REASON,
+    candidate_paper_engine_digest,
+)
 from src.autopilot.config import AutopilotConfig, ProductConfig
 from src.autopilot.promotion import (
     PromotionThresholds,
@@ -42,13 +49,30 @@ def strategy(strategy_id="s1", holdout=0.05):
             "max_trades_per_day": 4,
         },
         "fees": {"fee_bps": 5, "slippage_bps": 2},
-        "metrics": {"holdout_total_return": holdout, "dsr_deflated": 0.72},
+        "metrics": {
+            "holdout_total_return": holdout,
+            "dsr_deflated": 0.72,
+            "dsr_method": DSR_METHOD,
+            "n_trials": 20,
+            "sr_std_trials": 0.18,
+            "trial_sharpe_count": 12,
+            "trial_sharpe_observed_std": 0.16,
+            "trial_sharpe_conservative_floor": 0.10,
+        },
     }
 
 
 def write_artifact(path, strategies):
-    symbol = strategies[0].get("symbol", "BTCUSDT") if strategies and isinstance(strategies[0], dict) else "BTCUSDT"
-    pnl_unit = strategies[0].get("pnl_unit", "usdt") if strategies and isinstance(strategies[0], dict) else "usdt"
+    symbol = (
+        strategies[0].get("symbol", "BTCUSDT")
+        if strategies and isinstance(strategies[0], dict)
+        else "BTCUSDT"
+    )
+    pnl_unit = (
+        strategies[0].get("pnl_unit", "usdt")
+        if strategies and isinstance(strategies[0], dict)
+        else "usdt"
+    )
     path.write_text(
         json.dumps(
             {
@@ -80,9 +104,7 @@ def write_trades(
         {
             "strategy_id": strategy_id,
             "strategy_fingerprint": fingerprint,
-            "exit_time": str(
-                pd.Timestamp(start, tz="UTC") + pd.Timedelta(days=i * day_step)
-            ),
+            "exit_time": str(pd.Timestamp(start, tz="UTC") + pd.Timedelta(days=i * day_step)),
             "net_return": 0.02 if i % 2 == 0 else -0.01,
             "sized_return": sized_return,
             "equity_after": 1000 + i,
@@ -115,6 +137,22 @@ def write_config(path, artifact):
         ),
         encoding="utf-8",
     )
+
+
+def mark_forward_candidate_evidence(trades, indices):
+    trades["candidate_paper_evidence_eligible"] = ""
+    trades["candidate_paper_evidence_reason"] = ""
+    trades["candidate_paper_entry_fill_source"] = ""
+    trades["candidate_paper_observed_at"] = ""
+    trades["entry_time"] = ""
+    for index in indices:
+        exit_time = pd.Timestamp(trades.loc[index, "exit_time"])
+        entry_time = exit_time - pd.Timedelta(hours=1)
+        trades.loc[index, "candidate_paper_evidence_eligible"] = "true"
+        trades.loc[index, "candidate_paper_evidence_reason"] = CANDIDATE_PAPER_FORWARD_REASON
+        trades.loc[index, "candidate_paper_entry_fill_source"] = CANDIDATE_PAPER_FORWARD_FILL_SOURCE
+        trades.loc[index, "candidate_paper_observed_at"] = entry_time.isoformat()
+        trades.loc[index, "entry_time"] = entry_time.isoformat()
 
 
 def product(tmp_path, **overrides):
@@ -182,6 +220,112 @@ def test_promotion_review_never_inherits_trades_from_changed_same_id_strategy(tm
     assert item["recommendation"] == "not_ready"
     assert "exact-fingerprint paper trades 0 < 20" in item["reasons"]
     assert item["approval_command"] is None
+
+
+def test_candidate_promotion_quarantines_legacy_rows_without_execution_binding(
+    tmp_path,
+):
+    artifact = tmp_path / "candidate.json"
+    trade_log = tmp_path / "candidate_trades.csv"
+    write_artifact(artifact, [strategy()])
+    write_trades(trade_log, n=3)
+    trades = pd.read_csv(trade_log)
+    trades["artifact_digest"] = artifact_digest(json.loads(artifact.read_text()))
+    trades.to_csv(trade_log, index=False)
+
+    review = build_promotion_review(
+        artifact_path=artifact,
+        trade_log=trade_log,
+        ledger_path=tmp_path / "approvals.json",
+        thresholds=PromotionThresholds(min_paper_trades=1),
+        product=product(tmp_path, strategies_path=artifact, trade_log=trade_log),
+        require_candidate_paper_binding=True,
+    )
+
+    paper = review["strategies"][0]["paper"]
+    assert paper["trades"] == 0
+    assert paper["legacy_execution_rows"] == 3
+    assert paper["other_execution_rows"] == 0
+    assert review["strategies"][0]["recommendation"] == "not_ready"
+
+
+def test_candidate_promotion_mixed_log_counts_only_current_exact_engine_rows(
+    tmp_path,
+):
+    artifact = tmp_path / "candidate.json"
+    trade_log = tmp_path / "candidate_trades.csv"
+    write_artifact(artifact, [strategy()])
+    write_trades(trade_log, n=6, sized_return=0.01)
+    trades = pd.read_csv(trade_log)
+    current_artifact_digest = artifact_digest(json.loads(artifact.read_text()))
+    current_engine_digest = candidate_paper_engine_digest()
+    trades["artifact_digest"] = current_artifact_digest
+    trades["candidate_paper_execution_schema"] = ""
+    trades["candidate_paper_engine_digest"] = ""
+    current_indices = [0, 2, 4]
+    trades.loc[current_indices, "candidate_paper_execution_schema"] = (
+        CANDIDATE_PAPER_EXECUTION_SCHEMA
+    )
+    trades.loc[current_indices, "candidate_paper_engine_digest"] = current_engine_digest
+    trades.loc[5, "candidate_paper_execution_schema"] = CANDIDATE_PAPER_EXECUTION_SCHEMA
+    trades.loc[5, "candidate_paper_engine_digest"] = "sha256:" + "0" * 64
+    mark_forward_candidate_evidence(trades, current_indices)
+    trades.to_csv(trade_log, index=False)
+
+    review = build_promotion_review(
+        artifact_path=artifact,
+        trade_log=trade_log,
+        ledger_path=tmp_path / "approvals.json",
+        thresholds=PromotionThresholds(min_paper_trades=3, min_paper_sized_return=0.0),
+        product=product(tmp_path, strategies_path=artifact, trade_log=trade_log),
+        require_candidate_paper_binding=True,
+    )
+
+    item = review["strategies"][0]
+    assert item["paper"]["trades"] == 3
+    assert item["paper"]["total_sized_return"] == 0.03
+    assert item["paper"]["legacy_execution_rows"] == 2
+    assert item["paper"]["other_execution_rows"] == 1
+    assert item["paper"]["legacy_evidence_rows"] == 0
+    assert item["paper"]["non_promotable_evidence_rows"] == 0
+    assert item["recommendation"] == "needs_approval"
+
+
+def test_candidate_promotion_quarantines_downtime_backfill_rows(tmp_path):
+    artifact = tmp_path / "candidate.json"
+    trade_log = tmp_path / "candidate_trades.csv"
+    write_artifact(artifact, [strategy()])
+    write_trades(trade_log, n=2, sized_return=0.01)
+    trades = pd.read_csv(trade_log)
+    trades["artifact_digest"] = artifact_digest(json.loads(artifact.read_text()))
+    trades["candidate_paper_execution_schema"] = CANDIDATE_PAPER_EXECUTION_SCHEMA
+    trades["candidate_paper_engine_digest"] = candidate_paper_engine_digest()
+    mark_forward_candidate_evidence(trades, [0])
+    trades.loc[1, "candidate_paper_evidence_eligible"] = "false"
+    trades.loc[1, "candidate_paper_evidence_reason"] = "downtime_backfill_position_management"
+    trades.loc[1, "candidate_paper_entry_fill_source"] = "historical_next_open_replay"
+    trades.loc[1, "candidate_paper_observed_at"] = trades.loc[0, "entry_time"]
+    trades.loc[1, "entry_time"] = trades.loc[0, "entry_time"]
+    trades.to_csv(trade_log, index=False)
+
+    review = build_promotion_review(
+        artifact_path=artifact,
+        trade_log=trade_log,
+        ledger_path=tmp_path / "approvals.json",
+        thresholds=PromotionThresholds(
+            min_paper_trades=2,
+            min_paper_sized_return=0.0,
+        ),
+        product=product(tmp_path, strategies_path=artifact, trade_log=trade_log),
+        require_candidate_paper_binding=True,
+    )
+
+    paper = review["strategies"][0]["paper"]
+    assert paper["trades"] == 1
+    assert paper["last_equity"] == 1.01
+    assert paper["non_promotable_evidence_rows"] == 1
+    assert paper["invalid_evidence_rows"] == 0
+    assert review["strategies"][0]["recommendation"] == "not_ready"
 
 
 def test_promotion_review_waits_for_missing_strategy_artifact(tmp_path):
@@ -295,7 +439,9 @@ def test_promotion_review_blocks_non_numeric_holdout_metric(tmp_path):
     item = review["strategies"][0]
     assert item["recommendation"] == "not_ready"
     assert item["approval_command"] is None
-    assert any("holdout_total_return metric must be numeric" in reason for reason in item["reasons"])
+    assert any(
+        "holdout_total_return metric must be numeric" in reason for reason in item["reasons"]
+    )
     assert "python -m src.autopilot.approvals approve" not in markdown
 
 
@@ -343,6 +489,7 @@ def test_promotion_review_emits_approval_command_when_product_is_inferred_from_c
     assert item["recommendation"] == "needs_approval"
     assert "--strategy-id s1" in item["approval_command"]
     assert "--product active_income" in item["approval_command"]
+    assert "--expected-preflight-digest" in item["approval_command"]
     assert "--confirm-live" in item["approval_command"]
 
 
@@ -625,6 +772,8 @@ def test_promotion_review_shell_quotes_approval_command_paths_and_placeholder(tm
         str(artifact),
         "--expected-artifact-digest",
         review["artifact_digest"],
+        "--expected-preflight-digest",
+        "<reviewed-production-preflight-sha256>",
         "--strategy-id",
         "s1",
         "--approved-by",
@@ -643,7 +792,9 @@ def test_promotion_review_marks_approval_product_mismatch_for_different_symbol(t
     ledger = tmp_path / "approvals.json"
     approved_product = product(tmp_path, strategies_path=artifact, symbol="BTCUSDT")
     reviewed_product = product(tmp_path, strategies_path=artifact, symbol="ETHUSDT")
-    ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="test", product=approved_product)
+    ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="test", product=approved_product
+    )
 
     review = build_promotion_review(
         artifact_path=artifact,
@@ -675,7 +826,9 @@ def test_promotion_review_blocks_approval_command_when_policy_fails(tmp_path):
     assert item["recommendation"] == "not_ready"
     assert item["policy_status"] == "fail"
     assert item["approval_command"] is None
-    assert any("holdout_total_return -0.010000 must be positive" in reason for reason in item["reasons"])
+    assert any(
+        "holdout_total_return -0.010000 must be positive" in reason for reason in item["reasons"]
+    )
 
 
 def test_promotion_review_blocks_approval_command_when_artifact_policy_fails(tmp_path):
@@ -716,7 +869,9 @@ def test_promotion_review_already_approved(tmp_path):
     )
 
     assert review["strategies"][0]["recommendation"] == "already_approved"
-    assert review["strategies"][0]["reasons"] == ["approved and passes configured review thresholds"]
+    assert review["strategies"][0]["reasons"] == [
+        "approved and passes configured review thresholds"
+    ]
 
 
 def test_promotion_review_marks_content_mismatched_approval(tmp_path):
@@ -804,7 +959,9 @@ def test_promotion_review_marks_approved_strategy_that_later_fails_paper_thresho
     write_trades(trade_log, n=3, sized_return=-0.01)
     ledger = tmp_path / "approvals.json"
     active_product = product(tmp_path, strategies_path=artifact)
-    ApprovalLedger(ledger).approve(strat, artifact_path=artifact, approved_by="test", product=active_product)
+    ApprovalLedger(ledger).approve(
+        strat, artifact_path=artifact, approved_by="test", product=active_product
+    )
 
     review = build_promotion_review(
         artifact_path=artifact,

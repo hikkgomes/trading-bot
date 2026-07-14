@@ -154,7 +154,7 @@ def _command_value(command: list[str], flag: str) -> str | None:
     prefix = f"{flag}="
     for part in command:
         if part.startswith(prefix):
-            value = part[len(prefix):]
+            value = part[len(prefix) :]
             return value or None
     try:
         index = command.index(flag)
@@ -188,9 +188,8 @@ def _missing_bootstrap_seed_due(job: JobConfig, entry: dict[str, Any]) -> bool:
     if entry.get("last_ok") is False:
         return False
     command = list(job.command)
-    legacy_bootstrap = (
-        "src.update_candles" in command
-        and _positive_int(_command_value(command, "--bootstrap-days"))
+    legacy_bootstrap = "src.update_candles" in command and _positive_int(
+        _command_value(command, "--bootstrap-days")
     )
     native_history_bootstrap = "src.autopilot.history_bootstrap" in command
     if not legacy_bootstrap and not native_history_bootstrap:
@@ -266,7 +265,9 @@ def _state_mutation_batch_marker_current(state_value: Any, marker: dict[str, Any
         state_marker = state_value
     else:
         return False
-    return all(state_marker.get(key) == marker.get(key) for key in ("status", "generated_at", "hypotheses"))
+    return all(
+        state_marker.get(key) == marker.get(key) for key in ("status", "generated_at", "hypotheses")
+    )
 
 
 def _mutation_batch_awaiting_research_due(job: JobConfig, job_state: dict[str, Any]) -> bool:
@@ -286,8 +287,14 @@ def _mutation_batch_awaiting_research_due(job: JobConfig, job_state: dict[str, A
         return False
 
     job_entries = job_state.get("jobs", {}) if isinstance(job_state.get("jobs"), dict) else {}
-    research_entry = job_entries.get(job.name) if isinstance(job_entries.get(job.name), dict) else {}
-    mutation_entry = job_entries.get("mutation_batch") if isinstance(job_entries.get("mutation_batch"), dict) else {}
+    research_entry = (
+        job_entries.get(job.name) if isinstance(job_entries.get(job.name), dict) else {}
+    )
+    mutation_entry = (
+        job_entries.get("mutation_batch")
+        if isinstance(job_entries.get("mutation_batch"), dict)
+        else {}
+    )
     try:
         research_started = float(research_entry.get("last_started_ts"))
         mutation_started = float(mutation_entry.get("last_started_ts"))
@@ -457,9 +464,7 @@ def _structured_report_size(payload: dict[str, Any]) -> int:
 
 def summarize_structured_report(payload: dict[str, Any]) -> dict[str, Any]:
     summary: dict[str, Any] = {
-        key: payload[key]
-        for key in STRUCTURED_REPORT_SCALAR_KEYS
-        if key in payload
+        key: payload[key] for key in STRUCTURED_REPORT_SCALAR_KEYS if key in payload
     }
     for key in ("summary", "source"):
         value = payload.get(key)
@@ -562,7 +567,9 @@ def run_job(job: JobConfig) -> dict[str, Any]:
             ok = result.returncode == 0 and structured_ok is not False
             failure_detail = None
             if structured_ok is False:
-                failure_detail = structured_failure_detail(structured_report) or "structured report failed"
+                failure_detail = (
+                    structured_failure_detail(structured_report) or "structured report failed"
+                )
             return {
                 "name": job.name,
                 "ok": ok,
@@ -572,9 +579,21 @@ def run_job(job: JobConfig) -> dict[str, Any]:
                 "duration_seconds": round(time.time() - started_ts, 3),
                 "stdout_tail": stdout_tail,
                 "stderr_tail": stderr_tail,
-                **({"stdout_truncated": True, "stdout_bytes": stdout_bytes} if stdout_truncated else {}),
-                **({"stderr_truncated": True, "stderr_bytes": stderr_bytes} if stderr_truncated else {}),
-                **(_structured_report_status_payload(structured_report) if structured_report is not None else {}),
+                **(
+                    {"stdout_truncated": True, "stdout_bytes": stdout_bytes}
+                    if stdout_truncated
+                    else {}
+                ),
+                **(
+                    {"stderr_truncated": True, "stderr_bytes": stderr_bytes}
+                    if stderr_truncated
+                    else {}
+                ),
+                **(
+                    _structured_report_status_payload(structured_report)
+                    if structured_report is not None
+                    else {}
+                ),
                 **({"error": str(failure_detail)} if failure_detail else {}),
             }
         except subprocess.TimeoutExpired:
@@ -589,8 +608,16 @@ def run_job(job: JobConfig) -> dict[str, Any]:
                 "duration_seconds": round(time.time() - started_ts, 3),
                 "stdout_tail": stdout_tail,
                 "stderr_tail": stderr_tail,
-                **({"stdout_truncated": True, "stdout_bytes": stdout_bytes} if stdout_truncated else {}),
-                **({"stderr_truncated": True, "stderr_bytes": stderr_bytes} if stderr_truncated else {}),
+                **(
+                    {"stdout_truncated": True, "stdout_bytes": stdout_bytes}
+                    if stdout_truncated
+                    else {}
+                ),
+                **(
+                    {"stderr_truncated": True, "stderr_bytes": stderr_bytes}
+                    if stderr_truncated
+                    else {}
+                ),
                 "error": f"timed out after {job.timeout_seconds}s",
             }
 

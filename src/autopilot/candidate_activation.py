@@ -70,8 +70,7 @@ def candidate_path_for_product(
 ) -> Path:
     if not SAFE_PRODUCT_NAME_RE.fullmatch(product_name):
         raise CandidateActivationError(
-            "product name is unsafe for a deterministic candidate path: "
-            f"{product_name!r}"
+            f"product name is unsafe for a deterministic candidate path: {product_name!r}"
         )
     return candidate_dir / f"{product_name}.json"
 
@@ -141,9 +140,7 @@ def _assert_distinct_paths(paths: dict[str, Path]) -> None:
         normalized = path.resolve(strict=False)
         previous = seen.get(normalized)
         if previous is not None:
-            raise CandidateActivationError(
-                f"{label} path must be distinct from {previous}: {path}"
-            )
+            raise CandidateActivationError(f"{label} path must be distinct from {previous}: {path}")
         seen[normalized] = label
 
 
@@ -151,9 +148,7 @@ def _load_flat_state(path: Path, *, product_name: str) -> dict[str, Any]:
     state = _strict_json_object(path, label=f"{product_name} state file")
     positions = state.get("open_positions", {})
     if not isinstance(positions, dict):
-        raise CandidateActivationError(
-            f"{product_name} state open_positions must be a JSON object"
-        )
+        raise CandidateActivationError(f"{product_name} state open_positions must be a JSON object")
     if positions:
         ids = ", ".join(sorted(str(value) for value in positions))
         raise CandidateActivationError(
@@ -316,9 +311,7 @@ def _activate_candidate_locked(
             f"control file is malformed; repair it before activation: {control['control_error']}"
         )
     if not is_product_paused(control, product.name):
-        raise CandidateActivationError(
-            f"{product.name} must be paused before candidate activation"
-        )
+        raise CandidateActivationError(f"{product.name} must be paused before candidate activation")
     if should_flatten_product(control, product.name):
         raise CandidateActivationError(
             f"{product.name} still has a flatten request; reconcile it before activation"
@@ -357,6 +350,7 @@ def _activate_candidate_locked(
         thresholds=PromotionThresholds(),
         product=product,
         config_path=config_path,
+        require_candidate_paper_binding=True,
     )
     not_ready = [
         {
@@ -369,9 +363,19 @@ def _activate_candidate_locked(
     ]
     if not forward_review.get("strategies") or not_ready:
         raise CandidateActivationError(
-            f"{product.name} candidate exact-fingerprint forward-paper evidence is not ready; "
+            f"{product.name} candidate exact-bound forward-paper evidence is not ready; "
             f"review {candidate_path.parent / f'{product.name}_promotion_review.md'}: "
             f"{not_ready or 'no strategy evidence'}"
+        )
+    forward_execution_binding = forward_review.get("candidate_paper_execution_binding")
+    if not isinstance(forward_execution_binding, dict) or (
+        forward_execution_binding.get("required") is not True
+        or forward_execution_binding.get("artifact_digest") != candidate_digest
+        or not forward_execution_binding.get("execution_schema")
+        or not forward_execution_binding.get("execution_engine_digest")
+    ):
+        raise CandidateActivationError(
+            f"{product.name} candidate forward-paper execution binding is missing or invalid"
         )
 
     old_digest: str | None = None
@@ -398,6 +402,7 @@ def _activate_candidate_locked(
         "activated_by": actor,
         "candidate_path": str(candidate_path),
         "candidate_artifact_digest": candidate_digest,
+        "candidate_paper_execution_binding": forward_execution_binding,
         "approval_granted": False,
     }
     new_digest = artifact_digest(activated)
@@ -416,6 +421,7 @@ def _activate_candidate_locked(
         "active_artifact": str(active_path),
         "previous_artifact_digest": old_digest,
         "candidate_artifact_digest": candidate_digest,
+        "candidate_paper_execution_binding": forward_execution_binding,
         "activated_artifact_digest": new_digest,
         "approval_granted": False,
     }
@@ -447,6 +453,7 @@ def _activate_candidate_locked(
         "approval_granted": False,
         "live_ready": False,
         "forward_paper_trade_log": str(candidate_trade_log),
+        "candidate_paper_execution_binding": forward_execution_binding,
         "forward_paper_evidence": [
             {
                 "id": item.get("id"),

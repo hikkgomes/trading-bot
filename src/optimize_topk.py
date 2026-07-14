@@ -33,6 +33,7 @@ def run(
     train, test = split_train_test(data, train_fraction)
     rows = []
     for _, row in rules.iterrows():
+
         def objective(trial: optuna.Trial, candidate_row: pd.Series = row) -> float:
             tp = trial.suggest_float("take_profit", 0.001, 0.03, log=True)
             sl = trial.suggest_float("stop_loss", 0.001, 0.03, log=True)
@@ -59,18 +60,32 @@ def run(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fine-tune top strategy hyperparameters with Optuna.")
-    parser.add_argument("--rules", type=Path, default=PROJECT_ROOT / "outputs" / "strategy_search" / "ranked_strategies.csv")
-    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "outputs" / "strategy_search" / "ranked_strategies_optuna.csv")
+    parser = argparse.ArgumentParser(
+        description="Fine-tune top strategy hyperparameters with Optuna."
+    )
+    parser.add_argument(
+        "--rules",
+        type=Path,
+        default=PROJECT_ROOT / "outputs" / "strategy_search" / "ranked_strategies.csv",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=PROJECT_ROOT / "outputs" / "strategy_search" / "ranked_strategies_optuna.csv",
+    )
     parser.add_argument("--top-k", type=int, default=25)
     parser.add_argument("--trials", type=int, default=50)
-    parser.add_argument("--input-path", type=Path, default=PROCESSED_DATA_DIR / "train_15m_indicators.parquet")
+    parser.add_argument(
+        "--input-path", type=Path, default=PROCESSED_DATA_DIR / "train_15m_indicators.parquet"
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    print(f"Wrote {run(args.rules, args.output, args.top_k, args.trials, input_path=args.input_path)}")
+    print(
+        f"Wrote {run(args.rules, args.output, args.top_k, args.trials, input_path=args.input_path)}"
+    )
 
 
 if __name__ == "__main__":

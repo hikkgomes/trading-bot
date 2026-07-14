@@ -123,9 +123,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     exact_duplicates = before - len(cleaned)
 
     before = len(cleaned)
-    cleaned = cleaned.sort_values("timestamp").drop_duplicates(
-        subset=["timestamp"], keep="last"
-    )
+    cleaned = cleaned.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
     timestamp_duplicates = before - len(cleaned)
 
     if exact_duplicates or timestamp_duplicates:

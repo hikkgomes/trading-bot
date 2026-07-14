@@ -28,11 +28,7 @@ from src.autopilot.research_factory import DEFAULT_CONFIG, load_factory_config
 
 def _summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     verdicts = Counter(str(result.get("verdict", "unknown")) for result in results)
-    reasons = Counter(
-        reason
-        for result in results
-        for reason in result.get("reasons", [])
-    )
+    reasons = Counter(reason for result in results for reason in result.get("reasons", []))
     return {
         "hypotheses": len(results),
         "verdicts": dict(sorted(verdicts.items())),
@@ -119,9 +115,7 @@ def run_research_smoke(
         "legacy_guards_requested": with_guards,
         "generator": "typed_compositional_grammar",
         "products": sorted({scenario.get("product") for scenario in scenarios}),
-        "opportunity_types": sorted(
-            {scenario.get("opportunity_type") for scenario in scenarios}
-        ),
+        "opportunity_types": sorted({scenario.get("opportunity_type") for scenario in scenarios}),
         "scenarios": scenarios,
     }
 

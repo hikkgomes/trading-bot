@@ -19,9 +19,7 @@ def test_get_feature_matrix_excludes_all_targets():
         }
     )
 
-    features, target = get_feature_matrix(
-        data, target_column="target_return_next_1_bar"
-    )
+    features, target = get_feature_matrix(data, target_column="target_return_next_1_bar")
 
     assert features.columns.tolist() == ["feature_a", "feature_b"]
     assert target.tolist() == [0.1, 0.2, 0.3]

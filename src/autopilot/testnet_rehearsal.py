@@ -19,8 +19,19 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from src.autopilot.approvals import ApprovalError, artifact_digest, load_artifact
-from src.autopilot.config import DEFAULT_CONFIG_PATH, AutopilotConfig, ProductConfig, load_config
+from src.autopilot.approvals import (
+    ApprovalError,
+    artifact_digest,
+    assert_loaded_artifact_live_approved,
+    load_artifact,
+)
+from src.autopilot.config import (
+    DEFAULT_CONFIG_PATH,
+    AutopilotConfig,
+    ProductConfig,
+    canonical_product_config,
+    load_config,
+)
 from src.autopilot.exchange_policy import ACTIVE_INCOME_MAX_FUTURES_LEVERAGE
 from src.autopilot.io import write_json_atomic
 from src.config import PROJECT_ROOT
@@ -40,7 +51,6 @@ DEFAULT_MAX_REPORT_AGE_SECONDS = 30 * 24 * 60 * 60
 TESTNET_REHEARSAL_CLOCK_SKEW_SECONDS = 300
 TESTNET_PROTECTIVE_STOP_DISTANCE_FRACTION = 0.05
 LOGGER = logging.getLogger("autopilot.testnet_rehearsal")
-EMBEDDED_PREFLIGHT_PRODUCT_KEYS = ("objective", "base_asset", "market", "symbol")
 
 
 def testnet_rehearsal_next_action() -> dict[str, Any]:
@@ -389,20 +399,7 @@ def _native_protective_stop_invalid_reasons(
 
 
 def _expected_product_payload(product: ProductConfig) -> dict[str, Any]:
-    return {
-        "name": product.name,
-        "objective": product.objective,
-        "base_asset": product.base_asset,
-        "market": product.market,
-        "symbol": product.symbol,
-    }
-
-
-def _normalize_product_value(field: str, value: Any) -> str:
-    text = str(value or "").strip()
-    if field == "symbol":
-        return text.upper()
-    return text.lower()
+    return canonical_product_config(product)
 
 
 def _product_invalid_reasons(
@@ -415,10 +412,10 @@ def _product_invalid_reasons(
     reasons = []
     expected = _expected_product_payload(expected_product)
     for field, expected_value in expected.items():
-        if _normalize_product_value(field, report_product.get(field)) != _normalize_product_value(
-            field, expected_value
-        ):
+        if field not in report_product or report_product[field] != expected_value:
             reasons.append(f"product_{field}_mismatch")
+    if set(report_product) - set(expected):
+        reasons.append("product_unexpected_fields")
     return reasons
 
 
@@ -490,18 +487,13 @@ def _embedded_preflight_invalid_reasons(
     reported_product = matched.get("product")
     if not isinstance(reported_product, dict):
         return [*reasons, "embedded_preflight_product_invalid"]
-    for field in EMBEDDED_PREFLIGHT_PRODUCT_KEYS:
-        if _normalize_product_value(field, reported_product.get(field)) != _normalize_product_value(
-            field, getattr(expected_product, field)
-        ):
+    preflight_product = replace(expected_product, execution_mode="live")
+    expected_payload = canonical_product_config(preflight_product)
+    for field, expected_value in expected_payload.items():
+        if field not in reported_product or reported_product[field] != expected_value:
             reasons.append(f"embedded_preflight_product_{field}_mismatch")
-    report_artifact = reported_product.get("strategies_path")
-    if report_artifact:
-        try:
-            if Path(report_artifact).resolve() != expected_product.strategies_path.resolve():
-                reasons.append("embedded_preflight_artifact_path_mismatch")
-        except OSError:
-            reasons.append("embedded_preflight_artifact_path_invalid")
+    if set(reported_product) - set(expected_payload):
+        reasons.append("embedded_preflight_product_unexpected_fields")
     reported_digest = matched.get("artifact_digest")
     if not isinstance(reported_digest, str) or not reported_digest:
         reasons.append("embedded_preflight_missing_artifact_digest")
@@ -569,7 +561,11 @@ def _embedded_preflight_invalid_reasons(
         inventory_detail = open_orders_check.get("detail")
         if not isinstance(inventory_detail, dict):
             return ["embedded_preflight_open_order_inventory_invalid"]
-        if str(inventory_detail.get("symbol") or "").upper() != expected_product.symbol.upper():
+        if (
+            inventory_detail.get("scope") != "whole_account"
+            or str(inventory_detail.get("configured_symbol") or "").upper()
+            != expected_product.symbol.upper()
+        ):
             return ["embedded_preflight_open_order_inventory_invalid"]
         for order_kind in ("regular", "conditional"):
             inventory = inventory_detail.get(order_kind)
@@ -585,6 +581,28 @@ def _embedded_preflight_invalid_reasons(
                 or orders
             ):
                 return ["embedded_preflight_open_order_inventory_invalid"]
+        position_inventory_check = next(
+            (
+                check
+                for check in checks
+                if isinstance(check, dict) and check.get("name") == "broker_position_flat"
+            ),
+            None,
+        )
+        if position_inventory_check is None:
+            return ["embedded_preflight_missing_position_inventory"]
+        if position_inventory_check.get("ok") is not True:
+            return ["embedded_preflight_position_inventory_failed"]
+        position_inventory = position_inventory_check.get("detail")
+        if (
+            not isinstance(position_inventory, dict)
+            or position_inventory.get("scope") != "whole_account"
+            or str(position_inventory.get("configured_symbol") or "").upper()
+            != expected_product.symbol.upper()
+            or position_inventory.get("count") != 0
+            or position_inventory.get("positions") != []
+        ):
+            return ["embedded_preflight_position_inventory_invalid"]
     return reasons
 
 
@@ -757,28 +775,7 @@ def summarize_testnet_rehearsal_report(
 
 
 def _product_status(product: ProductConfig) -> dict[str, Any]:
-    return {
-        "name": product.name,
-        "enabled": product.enabled,
-        "objective": product.objective,
-        "base_asset": product.base_asset,
-        "market": product.market,
-        "symbol": product.symbol,
-        "execution_mode": product.execution_mode,
-        "strategies_path": str(product.strategies_path),
-        "require_preflight": product.require_preflight,
-        "preflight_report": str(product.preflight_report)
-        if product.preflight_report is not None
-        else None,
-        "preflight_max_age_seconds": product.preflight_max_age_seconds,
-        "require_testnet_rehearsal": product.require_testnet_rehearsal,
-        "testnet_rehearsal_report": (
-            str(product.testnet_rehearsal_report)
-            if product.testnet_rehearsal_report is not None
-            else None
-        ),
-        "testnet_rehearsal_max_age_seconds": product.testnet_rehearsal_max_age_seconds,
-    }
+    return canonical_product_config(product)
 
 
 def _fail(product: ProductConfig | None, error: str, **extra: Any) -> dict[str, Any]:
@@ -904,6 +901,17 @@ def run_testnet_rehearsal(
                 required_flag="--confirm",
             )
         )
+
+    try:
+        approved_artifact = load_artifact(product.strategies_path)
+        assert_loaded_artifact_live_approved(
+            approved_artifact,
+            product.strategies_path,
+            config.approval_ledger,
+            product=product,
+        )
+    except (ApprovalError, FileNotFoundError, json.JSONDecodeError) as exc:
+        return finish(_fail(product, f"approval_failed: {exc}"))
 
     exchange_cfg, env_error = _validate_rehearsal_env(notional_usd)
     if env_error:
@@ -1238,7 +1246,7 @@ def run_testnet_rehearsal(
         "generated_at": utc_now(),
         "generated_ts": time.time(),
         "ok": ok,
-        "product": _product_status(live_product),
+        "product": _product_status(product),
         "exchange": exchange_cfg.exchange if exchange_cfg else None,
         "testnet": exchange_cfg.testnet if exchange_cfg else None,
         "risk_controls": _risk_controls_payload(exchange_cfg),

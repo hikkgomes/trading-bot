@@ -25,15 +25,17 @@ def _make_5m_data(n=100):
     timestamps = pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC")
     rng = np.random.default_rng(42)
     close = 100.0 + np.cumsum(rng.normal(0, 0.1, n))
-    return pd.DataFrame({
-        "timestamp": timestamps,
-        "tf_5m_open": close - rng.uniform(0, 0.05, n),
-        "tf_5m_high": close + rng.uniform(0.1, 0.5, n),
-        "tf_5m_low": close - rng.uniform(0.1, 0.5, n),
-        "tf_5m_close": close,
-        "tf_5m_rsi_14": rng.uniform(20, 80, n),
-        "tf_15m_rsi_14": rng.uniform(20, 80, n),
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "tf_5m_open": close - rng.uniform(0, 0.05, n),
+            "tf_5m_high": close + rng.uniform(0.1, 0.5, n),
+            "tf_5m_low": close - rng.uniform(0.1, 0.5, n),
+            "tf_5m_close": close,
+            "tf_5m_rsi_14": rng.uniform(20, 80, n),
+            "tf_15m_rsi_14": rng.uniform(20, 80, n),
+        }
+    )
 
 
 def test_timeframe_for_feature():
@@ -53,16 +55,21 @@ def test_combined_mask():
 
 
 def test_simulate_day_trades_take_profit():
-    data = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-01", periods=20, freq="5min", tz="UTC"),
-        "tf_5m_open": [100] * 20,
-        "tf_5m_high": [100, 101, 101, 101, 101] + [100] * 15,
-        "tf_5m_low": [100, 99.9, 99.9, 99.9, 99.9] + [100] * 15,
-        "tf_5m_close": [100] * 20,
-    })
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=20, freq="5min", tz="UTC"),
+            "tf_5m_open": [100] * 20,
+            "tf_5m_high": [100, 101, 101, 101, 101] + [100] * 15,
+            "tf_5m_low": [100, 99.9, 99.9, 99.9, 99.9] + [100] * 15,
+            "tf_5m_close": [100] * 20,
+        }
+    )
     signal = pd.Series([True] + [False] * 19)
     config = DayTradeConfig(
-        take_profit=0.01, stop_loss=0.02, fee_bps=0, slippage_bps=0,
+        take_profit=0.01,
+        stop_loss=0.02,
+        fee_bps=0,
+        slippage_bps=0,
         horizon_bars=8,
     )
     trades = simulate_day_trades(data, signal, "long", config)
@@ -72,16 +79,21 @@ def test_simulate_day_trades_take_profit():
 
 
 def test_simulate_day_trades_stop_loss():
-    data = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-01", periods=20, freq="5min", tz="UTC"),
-        "tf_5m_open": [100] * 20,
-        "tf_5m_high": [100, 100, 100, 100, 100] + [100] * 15,
-        "tf_5m_low": [100, 98, 98, 98, 98] + [100] * 15,
-        "tf_5m_close": [100] * 20,
-    })
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=20, freq="5min", tz="UTC"),
+            "tf_5m_open": [100] * 20,
+            "tf_5m_high": [100, 100, 100, 100, 100] + [100] * 15,
+            "tf_5m_low": [100, 98, 98, 98, 98] + [100] * 15,
+            "tf_5m_close": [100] * 20,
+        }
+    )
     signal = pd.Series([True] + [False] * 19)
     config = DayTradeConfig(
-        take_profit=0.05, stop_loss=0.01, fee_bps=0, slippage_bps=0,
+        take_profit=0.05,
+        stop_loss=0.01,
+        fee_bps=0,
+        slippage_bps=0,
         horizon_bars=8,
     )
     trades = simulate_day_trades(data, signal, "long", config)
@@ -115,18 +127,26 @@ def test_simulate_day_trades_short_uses_linear_usdt_futures_return():
 
 def test_simulate_day_trades_daily_stop():
     n = 100
-    data = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
-        "tf_5m_open": [100.0] * n,
-        "tf_5m_high": [100.0] * n,
-        "tf_5m_low": [97.0] * n,
-        "tf_5m_close": [100.0] * n,
-    })
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
+            "tf_5m_open": [100.0] * n,
+            "tf_5m_high": [100.0] * n,
+            "tf_5m_low": [97.0] * n,
+            "tf_5m_close": [100.0] * n,
+        }
+    )
     signal = pd.Series([True, False] * (n // 2))
     config = DayTradeConfig(
-        take_profit=0.05, stop_loss=0.01, fee_bps=0, slippage_bps=0,
-        horizon_bars=4, risk_per_trade=1.0, daily_stop_loss=-0.02,
-        max_consecutive_losses=100, cooldown_bars=0,
+        take_profit=0.05,
+        stop_loss=0.01,
+        fee_bps=0,
+        slippage_bps=0,
+        horizon_bars=4,
+        risk_per_trade=1.0,
+        daily_stop_loss=-0.02,
+        max_consecutive_losses=100,
+        cooldown_bars=0,
     )
     trades = simulate_day_trades(data, signal, "long", config)
     daily_pnl = {}
@@ -139,42 +159,62 @@ def test_simulate_day_trades_daily_stop():
 
 def test_simulate_day_trades_cooldown():
     n = 60
-    data = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
-        "tf_5m_open": [100.0] * n,
-        "tf_5m_high": [100.0] * n,
-        "tf_5m_low": [97.0] * n,
-        "tf_5m_close": [100.0] * n,
-    })
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
+            "tf_5m_open": [100.0] * n,
+            "tf_5m_high": [100.0] * n,
+            "tf_5m_low": [97.0] * n,
+            "tf_5m_close": [100.0] * n,
+        }
+    )
     signal = pd.Series([True, False, False, False, False, False] * 10)
     config = DayTradeConfig(
-        take_profit=0.05, stop_loss=0.01, fee_bps=0, slippage_bps=0,
-        horizon_bars=4, risk_per_trade=1.0, daily_stop_loss=-1.0,
-        max_consecutive_losses=2, cooldown_bars=12,
+        take_profit=0.05,
+        stop_loss=0.01,
+        fee_bps=0,
+        slippage_bps=0,
+        horizon_bars=4,
+        risk_per_trade=1.0,
+        daily_stop_loss=-1.0,
+        max_consecutive_losses=2,
+        cooldown_bars=12,
     )
     trades = simulate_day_trades(data, signal, "long", config)
     assert trades.attrs.get("cooldown_triggers", 0) > 0
     no_cool = DayTradeConfig(
-        take_profit=0.05, stop_loss=0.01, fee_bps=0, slippage_bps=0,
-        horizon_bars=4, risk_per_trade=1.0, daily_stop_loss=-1.0,
-        max_consecutive_losses=100, cooldown_bars=0,
+        take_profit=0.05,
+        stop_loss=0.01,
+        fee_bps=0,
+        slippage_bps=0,
+        horizon_bars=4,
+        risk_per_trade=1.0,
+        daily_stop_loss=-1.0,
+        max_consecutive_losses=100,
+        cooldown_bars=0,
     )
     trades_no_cool = simulate_day_trades(data, signal, "long", no_cool)
     assert len(trades) <= len(trades_no_cool)
 
 
 def test_simulate_day_trades_position_sizing():
-    data = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-01", periods=20, freq="5min", tz="UTC"),
-        "tf_5m_open": [100] * 20,
-        "tf_5m_high": [100, 101, 101, 101, 101] + [100] * 15,
-        "tf_5m_low": [100] * 20,
-        "tf_5m_close": [100] * 20,
-    })
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=20, freq="5min", tz="UTC"),
+            "tf_5m_open": [100] * 20,
+            "tf_5m_high": [100, 101, 101, 101, 101] + [100] * 15,
+            "tf_5m_low": [100] * 20,
+            "tf_5m_close": [100] * 20,
+        }
+    )
     signal = pd.Series([True] + [False] * 19)
     config = DayTradeConfig(
-        take_profit=0.01, stop_loss=0.005, fee_bps=0, slippage_bps=0,
-        horizon_bars=8, risk_per_trade=0.003,
+        take_profit=0.01,
+        stop_loss=0.005,
+        fee_bps=0,
+        slippage_bps=0,
+        horizon_bars=8,
+        risk_per_trade=0.003,
     )
     trades = simulate_day_trades(data, signal, "long", config)
     assert len(trades) == 1
@@ -184,13 +224,15 @@ def test_simulate_day_trades_position_sizing():
 
 
 def test_simulate_day_trades_respects_explicit_position_cap():
-    data = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-01", periods=20, freq="5min", tz="UTC"),
-        "tf_5m_open": [100] * 20,
-        "tf_5m_high": [100, 101, 101, 101, 101] + [100] * 15,
-        "tf_5m_low": [100] * 20,
-        "tf_5m_close": [100] * 20,
-    })
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=20, freq="5min", tz="UTC"),
+            "tf_5m_open": [100] * 20,
+            "tf_5m_high": [100, 101, 101, 101, 101] + [100] * 15,
+            "tf_5m_low": [100] * 20,
+            "tf_5m_close": [100] * 20,
+        }
+    )
     signal = pd.Series([True] + [False] * 19)
     config = DayTradeConfig(
         take_profit=0.01,
@@ -208,14 +250,16 @@ def test_simulate_day_trades_respects_explicit_position_cap():
 
 
 def test_day_trade_metrics_basic():
-    trades = pd.DataFrame({
-        "net_return": [0.01, -0.005, 0.008],
-        "sized_return": [0.006, -0.003, 0.0048],
-        "entry_time": pd.to_datetime([
-            "2024-01-01 10:00", "2024-01-01 11:00", "2024-01-02 10:00"
-        ]),
-        "holding_bars": [4, 3, 5],
-    })
+    trades = pd.DataFrame(
+        {
+            "net_return": [0.01, -0.005, 0.008],
+            "sized_return": [0.006, -0.003, 0.0048],
+            "entry_time": pd.to_datetime(
+                ["2024-01-01 10:00", "2024-01-01 11:00", "2024-01-02 10:00"]
+            ),
+            "holding_bars": [4, 3, 5],
+        }
+    )
     trades.attrs["daily_stop_hits"] = 1
     trades.attrs["cooldown_triggers"] = 0
     m = day_trade_metrics(trades)
@@ -226,9 +270,14 @@ def test_day_trade_metrics_basic():
 
 
 def test_day_trade_metrics_empty():
-    trades = pd.DataFrame(columns=[
-        "net_return", "sized_return", "entry_time", "holding_bars",
-    ])
+    trades = pd.DataFrame(
+        columns=[
+            "net_return",
+            "sized_return",
+            "entry_time",
+            "holding_bars",
+        ]
+    )
     m = day_trade_metrics(trades)
     assert m["trades"] == 0
     assert m["total_return"] == 0.0
@@ -236,18 +285,20 @@ def test_day_trade_metrics_empty():
 
 def test_score_candidate_runs():
     data = _make_5m_data(200)
-    data["future_return_4_bars"] = (
-        data["tf_5m_close"].shift(-4) / data["tf_5m_close"] - 1
-    )
+    data["future_return_4_bars"] = data["tf_5m_close"].shift(-4) / data["tf_5m_close"] - 1
     data = data.dropna().reset_index(drop=True)
     train = data.iloc[:140].copy()
     test = data.iloc[140:].copy()
     candidate = StrategyCandidate(
-        direction="long", horizon_bars=4,
+        direction="long",
+        horizon_bars=4,
         conditions=(Condition("tf_5m_rsi_14", "value_le", 50, "rsi low"),),
     )
     config = DayTradeConfig(
-        take_profit=0.002, stop_loss=0.002, fee_bps=5, slippage_bps=2,
+        take_profit=0.002,
+        stop_loss=0.002,
+        fee_bps=5,
+        slippage_bps=2,
         horizon_bars=4,
     )
     row = score_candidate(train, test, candidate, config)
@@ -259,7 +310,8 @@ def test_score_candidate_runs():
 
 def test_strategy_candidate_timeframes():
     candidate = StrategyCandidate(
-        direction="long", horizon_bars=4,
+        direction="long",
+        horizon_bars=4,
         conditions=(
             Condition("tf_5m_rsi_14", "value_le", 30, "5m rsi low"),
             Condition("tf_15m_ema_20", "value_ge", 100, "15m ema high"),
@@ -297,16 +349,18 @@ def test_condition_json_roundtrip():
 
 
 def test_numeric_feature_columns_excludes_label_and_diagnostics():
-    data = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-01", periods=10, freq="5min", tz="UTC"),
-        "tf_5m_open": np.arange(10, dtype=float),
-        "tf_5m_high": np.arange(10, dtype=float),
-        "tf_5m_low": np.arange(10, dtype=float),
-        "tf_5m_close": np.arange(10, dtype=float),
-        "tf_5m_rsi_14": np.arange(10, dtype=float),
-        "label_long_tp50_sl30_h8": np.ones(10, dtype=int),
-        "mfe_long_tp50_sl30_h8_exit": np.ones(10, dtype=float),
-    })
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=10, freq="5min", tz="UTC"),
+            "tf_5m_open": np.arange(10, dtype=float),
+            "tf_5m_high": np.arange(10, dtype=float),
+            "tf_5m_low": np.arange(10, dtype=float),
+            "tf_5m_close": np.arange(10, dtype=float),
+            "tf_5m_rsi_14": np.arange(10, dtype=float),
+            "label_long_tp50_sl30_h8": np.ones(10, dtype=int),
+            "mfe_long_tp50_sl30_h8_exit": np.ones(10, dtype=float),
+        }
+    )
     cols = numeric_feature_columns(data, "tf_5m_")
     assert "tf_5m_rsi_14" in cols
     assert "label_long_tp50_sl30_h8" not in cols
@@ -315,19 +369,25 @@ def test_numeric_feature_columns_excludes_label_and_diagnostics():
 
 def test_walk_forward_last_screened_out_no_keyerror_and_schema(monkeypatch, tmp_path):
     n = 140
-    data = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
-        "tf_5m_open": np.full(n, 100.0),
-        "tf_5m_high": np.full(n, 100.5),
-        "tf_5m_low": np.full(n, 99.5),
-        "tf_5m_close": np.full(n, 100.0),
-        "tf_5m_feat": np.linspace(0, 1, n),
-    })
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
+            "tf_5m_open": np.full(n, 100.0),
+            "tf_5m_high": np.full(n, 100.5),
+            "tf_5m_low": np.full(n, 99.5),
+            "tf_5m_close": np.full(n, 100.0),
+            "tf_5m_feat": np.linspace(0, 1, n),
+        }
+    )
     data["future_return_4_bars"] = data["tf_5m_close"].shift(-4) / data["tf_5m_close"] - 1
     data["label_long_tp50_sl30_h4"] = 1
     data = data.dropna().reset_index(drop=True)
 
-    candidate = StrategyCandidate("long", 4, (Condition("tf_5m_feat", "value_ge", 0.2, "x", threshold_source="quantile", quantile=0.8),))
+    candidate = StrategyCandidate(
+        "long",
+        4,
+        (Condition("tf_5m_feat", "value_ge", 0.2, "x", threshold_source="quantile", quantile=0.8),),
+    )
 
     monkeypatch.setattr(dts, "load_dataset", lambda *a, **k: data)
     monkeypatch.setattr(dts, "make_candidates", lambda *a, **k: [candidate])
@@ -349,7 +409,13 @@ def test_walk_forward_last_screened_out_no_keyerror_and_schema(monkeypatch, tmp_
     )
     assert isinstance(out, pd.DataFrame)
     scored = pd.read_csv(tmp_path / "scored_strategies_all.csv")
-    required = {"train_trades", "train_total_return", "test_trades", "test_total_return", "wf_total_windows"}
+    required = {
+        "train_trades",
+        "train_total_return",
+        "test_trades",
+        "test_total_return",
+        "wf_total_windows",
+    }
     assert required.issubset(set(scored.columns))
     report = (tmp_path / "report.md").read_text(encoding="utf-8")
     assert "wf_pass_rate" in report
@@ -368,36 +434,60 @@ def _fake_wf_row(candidate, take_profit, stop_loss, pass_rate, expectancy):
         "rule": candidate.rule,
     }
     row.update(dts._WF_ZEROED_COLUMNS)
-    row.update({
-        "wf_windows": 2, "wf_total_windows": 2, "wf_scored_windows": 2,
-        "wf_screened_out_windows": 0, "wf_pass_rate": pass_rate,
-        "wf_expectancy": expectancy, "wf_profit_factor_median": 1.2,
-        "wf_max_drawdown_worst": -0.02, "wf_avg_trades": 10.0,
-        "wf_trade_count_stability": 0.1, "wf_passes_walk_forward": True,
-        "wf_passes": True,
-        "wf_returns_sharpe": expectancy * 100, "wf_returns_skew": 0.0,
-        "wf_returns_kurt": 3.0, "test_sharpe_ci_low": 0.0,
-        "test_sharpe_ci_high": 0.1,
-        "wf_window_returns_json": json.dumps([expectancy, expectancy]),
-    })
+    row.update(
+        {
+            "wf_windows": 2,
+            "wf_total_windows": 2,
+            "wf_scored_windows": 2,
+            "wf_screened_out_windows": 0,
+            "wf_pass_rate": pass_rate,
+            "wf_expectancy": expectancy,
+            "wf_profit_factor_median": 1.2,
+            "wf_max_drawdown_worst": -0.02,
+            "wf_avg_trades": 10.0,
+            "wf_trade_count_stability": 0.1,
+            "wf_passes_walk_forward": True,
+            "wf_passes": True,
+            "wf_returns_sharpe": expectancy * 100,
+            "wf_returns_skew": 0.0,
+            "wf_returns_kurt": 3.0,
+            "test_sharpe_ci_low": 0.0,
+            "test_sharpe_ci_high": 0.1,
+            "wf_window_returns_json": json.dumps([expectancy, expectancy]),
+        }
+    )
     return row
 
 
 def test_walk_forward_sort_uses_aggregate_metrics(monkeypatch, tmp_path):
     n = 140
-    data = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
-        "tf_5m_open": np.full(n, 100.0),
-        "tf_5m_high": np.full(n, 100.5),
-        "tf_5m_low": np.full(n, 99.5),
-        "tf_5m_close": np.full(n, 100.0),
-        "tf_5m_feat": np.linspace(0, 1, n),
-        "tf_5m_feat2": np.linspace(1, 0, n),
-    })
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
+            "tf_5m_open": np.full(n, 100.0),
+            "tf_5m_high": np.full(n, 100.5),
+            "tf_5m_low": np.full(n, 99.5),
+            "tf_5m_close": np.full(n, 100.0),
+            "tf_5m_feat": np.linspace(0, 1, n),
+            "tf_5m_feat2": np.linspace(1, 0, n),
+        }
+    )
     data["future_return_4_bars"] = data["tf_5m_close"].shift(-4) / data["tf_5m_close"] - 1
     data = data.dropna().reset_index(drop=True)
-    c1 = StrategyCandidate("long", 4, (Condition("tf_5m_feat", "value_ge", 0.2, "a", threshold_source="quantile", quantile=0.8),))
-    c2 = StrategyCandidate("long", 4, (Condition("tf_5m_feat2", "value_ge", 0.2, "b", threshold_source="quantile", quantile=0.8),))
+    c1 = StrategyCandidate(
+        "long",
+        4,
+        (Condition("tf_5m_feat", "value_ge", 0.2, "a", threshold_source="quantile", quantile=0.8),),
+    )
+    c2 = StrategyCandidate(
+        "long",
+        4,
+        (
+            Condition(
+                "tf_5m_feat2", "value_ge", 0.2, "b", threshold_source="quantile", quantile=0.8
+            ),
+        ),
+    )
 
     monkeypatch.setattr(dts, "load_dataset", lambda *a, **k: data)
     monkeypatch.setattr(dts, "make_candidates", lambda *a, **k: [c1, c2])
@@ -434,15 +524,17 @@ def test_day_trade_walk_forward_end_to_end(tmp_path):
     n = 9_000
     rng = np.random.default_rng(5)
     close = 100 + np.cumsum(rng.normal(0, 0.05, size=n))
-    data = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
-        "tf_5m_open": close + rng.normal(0, 0.01, size=n),
-        "tf_5m_high": close + rng.uniform(0.01, 0.2, size=n),
-        "tf_5m_low": close - rng.uniform(0.01, 0.2, size=n),
-        "tf_5m_close": close,
-        "tf_5m_rsi_14": rng.uniform(10, 90, size=n),
-        "tf_15m_rsi_14": rng.uniform(10, 90, size=n),
-    })
+    data = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
+            "tf_5m_open": close + rng.normal(0, 0.01, size=n),
+            "tf_5m_high": close + rng.uniform(0.01, 0.2, size=n),
+            "tf_5m_low": close - rng.uniform(0.01, 0.2, size=n),
+            "tf_5m_close": close,
+            "tf_5m_rsi_14": rng.uniform(10, 90, size=n),
+            "tf_15m_rsi_14": rng.uniform(10, 90, size=n),
+        }
+    )
     input_path = tmp_path / "train.parquet"
     data.to_parquet(input_path, index=False)
     output_dir = tmp_path / "out"
@@ -490,10 +582,17 @@ def test_make_candidates_feature_pattern_restricts_universe():
     data["future_return_4_bars"] = data["tf_5m_close"].shift(-4) / data["tf_5m_close"] - 1
     data = data.dropna().reset_index(drop=True)
     candidates = dts.make_candidates(
-        data, horizons=(4,), directions=("long",),
-        max_features=5, top_conditions=5, max_pairs=5, max_triples=0,
-        rank_sample_rows=1_000, condition_depths=(1,),
-        ranking_method="spearman", enabled_kinds={"value", "delta"},
+        data,
+        horizons=(4,),
+        directions=("long",),
+        max_features=5,
+        top_conditions=5,
+        max_pairs=5,
+        max_triples=0,
+        rank_sample_rows=1_000,
+        condition_depths=(1,),
+        ranking_method="spearman",
+        enabled_kinds={"value", "delta"},
         feature_pattern="tf_5m_rsi",
     )
     assert candidates
@@ -503,10 +602,17 @@ def test_make_candidates_feature_pattern_restricts_universe():
 
     with pytest.raises(ValueError, match="matches no feature columns"):
         dts.make_candidates(
-            data, horizons=(4,), directions=("long",),
-            max_features=5, top_conditions=5, max_pairs=5, max_triples=0,
-            rank_sample_rows=1_000, condition_depths=(1,),
-            ranking_method="spearman", enabled_kinds={"value", "delta"},
+            data,
+            horizons=(4,),
+            directions=("long",),
+            max_features=5,
+            top_conditions=5,
+            max_pairs=5,
+            max_triples=0,
+            rank_sample_rows=1_000,
+            condition_depths=(1,),
+            ranking_method="spearman",
+            enabled_kinds={"value", "delta"},
             feature_pattern="does_not_exist",
         )
 
@@ -532,12 +638,14 @@ def test_day_trade_regime_breakdown_reports_per_regime_stats():
 
 def test_feature_screen_cache_reuses_same_fold_scenario(monkeypatch):
     n = 20
-    train = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
-        "tf_5m_a": np.arange(n, dtype=float),
-        "tf_5m_b": np.arange(n, dtype=float) * 2,
-        "label_long_tp50_sl30_h8": [0, 1] * (n // 2),
-    })
+    train = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
+            "tf_5m_a": np.arange(n, dtype=float),
+            "tf_5m_b": np.arange(n, dtype=float) * 2,
+            "label_long_tp50_sl30_h8": [0, 1] * (n // 2),
+        }
+    )
     calls = {"count": 0}
 
     def fake_screen(*args, **kwargs):
@@ -548,12 +656,28 @@ def test_feature_screen_cache_reuses_same_fold_scenario(monkeypatch):
     cache = dts.FeatureScreenCache.create()
     features = ["tf_5m_a", "tf_5m_b"]
     first = dts.get_screened_features_cached(
-        train, "label_long_tp50_sl30_h8", "long", 8, 0.005, 0.003,
-        features, 1, cache, method="importance",
+        train,
+        "label_long_tp50_sl30_h8",
+        "long",
+        8,
+        0.005,
+        0.003,
+        features,
+        1,
+        cache,
+        method="importance",
     )
     second = dts.get_screened_features_cached(
-        train, "label_long_tp50_sl30_h8", "long", 8, 0.005, 0.003,
-        features, 1, cache, method="importance",
+        train,
+        "label_long_tp50_sl30_h8",
+        "long",
+        8,
+        0.005,
+        0.003,
+        features,
+        1,
+        cache,
+        method="importance",
     )
     assert first == second == {"tf_5m_a"}
     assert calls["count"] == 1
@@ -563,13 +687,15 @@ def test_feature_screen_cache_reuses_same_fold_scenario(monkeypatch):
 
 def test_feature_screen_cache_separates_fold_label_and_scenario(monkeypatch):
     n = 20
-    base = pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-01", periods=n + 1, freq="5min", tz="UTC"),
-        "tf_5m_a": np.arange(n + 1, dtype=float),
-        "tf_5m_b": np.arange(n + 1, dtype=float) * 2,
-        "label_long_tp50_sl30_h8": [0, 1] * 10 + [0],
-        "label_short_tp50_sl30_h8": [1, 0] * 10 + [1],
-    })
+    base = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=n + 1, freq="5min", tz="UTC"),
+            "tf_5m_a": np.arange(n + 1, dtype=float),
+            "tf_5m_b": np.arange(n + 1, dtype=float) * 2,
+            "label_long_tp50_sl30_h8": [0, 1] * 10 + [0],
+            "label_short_tp50_sl30_h8": [1, 0] * 10 + [1],
+        }
+    )
     calls = {"count": 0}
 
     def fake_screen(*args, **kwargs):
@@ -593,9 +719,16 @@ def test_feature_screen_cache_separates_fold_label_and_scenario(monkeypatch):
     dts.get_screened_features_cached(base.iloc[1:], "label_long_tp50_sl30_h8", **common)
     dts.get_screened_features_cached(base.iloc[:n], "label_short_tp50_sl30_h8", **common)
     dts.get_screened_features_cached(
-        base.iloc[:n], "label_long_tp50_sl30_h8",
-        direction="long", horizon_bars=8, take_profit=0.008, stop_loss=0.003,
-        feature_columns=features, max_features=1, cache=cache, method="importance",
+        base.iloc[:n],
+        "label_long_tp50_sl30_h8",
+        direction="long",
+        horizon_bars=8,
+        take_profit=0.008,
+        stop_loss=0.003,
+        feature_columns=features,
+        max_features=1,
+        cache=cache,
+        method="importance",
     )
     assert calls["count"] == 4
     assert cache.hits == 0
@@ -604,6 +737,7 @@ def test_feature_screen_cache_separates_fold_label_and_scenario(monkeypatch):
 
 def test_simulate_day_trades_atr_based():
     import pytest
+
     n = 10
     data = pd.DataFrame(
         {

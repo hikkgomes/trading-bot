@@ -1,8 +1,8 @@
 """Tiny file-based control channel.
 
 This keeps the Linux server dependency-free. Operators can pause the whole
-system, one product, or selected scheduled jobs by editing ``runtime/control.json``
-or replacing it with the examples documented in README.
+system, one product, or selected scheduled jobs through the configured control
+file (by default ``runtime/operator-control/control.json``).
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ DEFAULT_CONTROL = {
 LOGGER = logging.getLogger("autopilot.control")
 TRUE_STRINGS = {"1", "true", "yes", "on"}
 FALSE_STRINGS = {"0", "false", "no", "off"}
+LEGACY_DEFAULT_CONTROL_FILE = DEFAULT_CONTROL_FILE.parent.parent / "control.json"
 
 
 class ControlConflictError(RuntimeError):
@@ -91,6 +92,18 @@ def _fail_closed(path: Path, error: str) -> dict[str, Any]:
 
 def _symlink_error(path: Path) -> str:
     return f"control file must not be a symlink: {path}"
+
+
+def _control_read_path(path: Path) -> Path:
+    """Read the legacy default until the first update creates the narrowed path."""
+
+    if path.exists() or path.is_symlink():
+        return path
+    if path.resolve(strict=False) == DEFAULT_CONTROL_FILE.resolve(strict=False) and (
+        LEGACY_DEFAULT_CONTROL_FILE.exists() or LEGACY_DEFAULT_CONTROL_FILE.is_symlink()
+    ):
+        return LEGACY_DEFAULT_CONTROL_FILE
+    return path
 
 
 def _as_bool(value: Any) -> bool:
@@ -181,19 +194,20 @@ def _normalize_control(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_control(path: Path) -> dict[str, Any]:
-    if path.is_symlink():
-        return _fail_closed(path, _symlink_error(path))
-    if not path.exists():
+    source = _control_read_path(path)
+    if source.is_symlink():
+        return _fail_closed(source, _symlink_error(source))
+    if not source.exists():
         return dict(DEFAULT_CONTROL)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return _fail_closed(path, f"{type(exc).__name__}: {exc}")
+        return _fail_closed(source, f"{type(exc).__name__}: {exc}")
     if not isinstance(payload, dict):
-        return _fail_closed(path, "control payload must be a JSON object")
+        return _fail_closed(source, "control payload must be a JSON object")
     control_error = _control_payload_error(payload)
     if control_error is not None:
-        return _fail_closed(path, control_error)
+        return _fail_closed(source, control_error)
     return _normalize_control(payload)
 
 
@@ -204,16 +218,19 @@ def _load_editable_control(path: Path) -> tuple[dict[str, Any], str | None]:
     defaults, so the CLI can repair a broken control file with ``clear`` or any
     explicit command.
     """
-    if path.is_symlink():
-        return dict(DEFAULT_CONTROL), _symlink_error(path)
-    if not path.exists():
+    source = _control_read_path(path)
+    if source.is_symlink():
+        return dict(DEFAULT_CONTROL), _symlink_error(source)
+    if not source.exists():
         return dict(DEFAULT_CONTROL), None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return dict(DEFAULT_CONTROL), f"{type(exc).__name__}: {exc}"
     if not isinstance(payload, dict):
-        return dict(DEFAULT_CONTROL), f"TypeError: control payload must be a JSON object, got {type(payload).__name__}"
+        return dict(
+            DEFAULT_CONTROL
+        ), f"TypeError: control payload must be a JSON object, got {type(payload).__name__}"
     control_error = _control_payload_error(payload)
     if control_error is not None:
         return dict(DEFAULT_CONTROL), control_error
@@ -305,8 +322,7 @@ def _update_control_locked(
             )
         if _control_snapshot(control) != _control_snapshot(expected_control):
             raise ControlConflictError(
-                "control changed after the runtime snapshot; "
-                f"refusing stale {command!r} mutation"
+                f"control changed after the runtime snapshot; refusing stale {command!r} mutation"
             )
     before = dict(control)
     if recovered_control_error is not None:
@@ -434,19 +450,31 @@ def is_product_paused(control: dict[str, Any], product_name: str) -> bool:
 
 
 def is_job_paused(control: dict[str, Any], job_name: str) -> bool:
-    return bool(control.get("paused")) or bool(control.get("pause_jobs")) or job_name in set(control.get("paused_jobs", []))
+    return (
+        bool(control.get("paused"))
+        or bool(control.get("pause_jobs"))
+        or job_name in set(control.get("paused_jobs", []))
+    )
 
 
 def should_flatten_product(control: dict[str, Any], product_name: str) -> bool:
-    return bool(control.get("flatten_all")) or product_name in set(control.get("flatten_products", []))
+    return bool(control.get("flatten_all")) or product_name in set(
+        control.get("flatten_products", [])
+    )
 
 
-def unknown_control_selectors(control: dict[str, Any], config: AutopilotConfig) -> dict[str, list[str]]:
+def unknown_control_selectors(
+    control: dict[str, Any], config: AutopilotConfig
+) -> dict[str, list[str]]:
     product_names = {product.name for product in config.products}
     job_names = {job.name for job in config.jobs}
     unknown: dict[str, list[str]] = {}
-    paused_products = sorted({name for name in control.get("paused_products", []) if name not in product_names})
-    flatten_products = sorted({name for name in control.get("flatten_products", []) if name not in product_names})
+    paused_products = sorted(
+        {name for name in control.get("paused_products", []) if name not in product_names}
+    )
+    flatten_products = sorted(
+        {name for name in control.get("flatten_products", []) if name not in product_names}
+    )
     paused_jobs = sorted({name for name in control.get("paused_jobs", []) if name not in job_names})
     if paused_products:
         unknown["paused_products"] = paused_products
@@ -457,7 +485,9 @@ def unknown_control_selectors(control: dict[str, Any], config: AutopilotConfig) 
     return unknown
 
 
-def _validate_selector_against_config(config: AutopilotConfig | None, command: str, name: str | None) -> None:
+def _validate_selector_against_config(
+    config: AutopilotConfig | None, command: str, name: str | None
+) -> None:
     if config is None or name is None:
         return
     if command in {"pause-product", "resume-product", "flatten", "clear-flatten"}:
@@ -473,8 +503,12 @@ def _validate_selector_against_config(config: AutopilotConfig | None, command: s
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Read or update the autopilot file-based control channel.")
-    parser.add_argument("--control", type=Path, default=DEFAULT_CONTROL_FILE, help="Path to control JSON file.")
+    parser = argparse.ArgumentParser(
+        description="Read or update the autopilot file-based control channel."
+    )
+    parser.add_argument(
+        "--control", type=Path, default=DEFAULT_CONTROL_FILE, help="Path to control JSON file."
+    )
     parser.add_argument(
         "--config",
         type=Path,
@@ -496,10 +530,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         sub = subparsers.add_parser(name, help=help_text)
         if needs_name:
             sub.add_argument(needs_name)
-        sub.add_argument("--reason", default=None, help="Optional operator note stored in the control file.")
+        sub.add_argument(
+            "--reason", default=None, help="Optional operator note stored in the control file."
+        )
 
     command("clear", help_text="Reset all pause and flatten controls to defaults.")
-    command("panic", help_text="Pause everything and request emergency flatten for all live products.")
+    command(
+        "panic", help_text="Pause everything and request emergency flatten for all live products."
+    )
     command("pause", help_text="Pause all products and scheduled jobs.")
     command("resume", help_text="Resume global product/job supervision.")
     command("pause-product", needs_name="product", help_text="Pause one product.")
@@ -508,11 +546,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     command("resume-job", needs_name="job", help_text="Resume one scheduled job.")
     command("pause-jobs", help_text="Pause all scheduled jobs while products can continue.")
     command("resume-jobs", help_text="Resume scheduled jobs.")
-    command("flatten", needs_name="product", help_text="Request emergency flatten for one live product.")
+    command(
+        "flatten", needs_name="product", help_text="Request emergency flatten for one live product."
+    )
     command("flatten-all", help_text="Request emergency flatten for all live products.")
     command("clear-flatten", needs_name="product", help_text="Clear one product's flatten request.")
     sub = subparsers.add_parser("clear-all-flatten", help="Clear all flatten requests.")
-    sub.add_argument("--reason", default=None, help="Optional operator note stored in the control file.")
+    sub.add_argument(
+        "--reason", default=None, help="Optional operator note stored in the control file."
+    )
     return parser.parse_args(argv)
 
 

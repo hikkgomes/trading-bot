@@ -160,7 +160,11 @@ def write_bootstrap_artifacts(
     product_name: str | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    products = [product for product in config.products if product.enabled and product.execution_mode == "paper"]
+    products = [
+        product
+        for product in config.products
+        if product.enabled and product.execution_mode == "paper"
+    ]
     if product_name:
         products = [product for product in products if product.name == product_name]
     if product_name and not products:
@@ -210,8 +214,12 @@ def write_bootstrap_artifacts(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Write paper-only bootstrap strategy artifacts.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--product", help="Optional product name. Defaults to all enabled paper products.")
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing configured strategy artifacts.")
+    parser.add_argument(
+        "--product", help="Optional product name. Defaults to all enabled paper products."
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Overwrite existing configured strategy artifacts."
+    )
     parser.add_argument("--report", type=Path, help="Optional JSON report path.")
     return parser.parse_args()
 

@@ -12,6 +12,7 @@ from typing import Any
 
 from src.autopilot.config import DEFAULT_CONFIG_PATH, load_config
 from src.autopilot.io import write_json_atomic, write_text_atomic
+from src.autopilot.locking import acquire_file_update_lock
 from src.config import PROJECT_ROOT
 
 DEFAULT_EXPERIMENT_LOG = PROJECT_ROOT / "outputs" / "research_exploration" / "experiment_log.jsonl"
@@ -29,6 +30,24 @@ def compact_jsonl(path: Path, max_lines: int, dry_run: bool = False) -> dict[str
     """Keep only the most recent JSONL records once a file exceeds max_lines."""
     if max_lines <= 0:
         raise ValueError("max_lines must be positive")
+    _reject_symlink_file(path, "jsonl path")
+    if not path.exists():
+        return {
+            "path": str(path),
+            "exists": False,
+            "max_lines": max_lines,
+            "dry_run": dry_run,
+            "line_count": 0,
+            "kept_lines": 0,
+            "trimmed_lines": 0,
+            "would_trim": False,
+            "changed": False,
+        }
+    with acquire_file_update_lock(path, label="JSONL compaction"):
+        return _compact_jsonl_locked(path, max_lines=max_lines, dry_run=dry_run)
+
+
+def _compact_jsonl_locked(path: Path, *, max_lines: int, dry_run: bool) -> dict[str, Any]:
     _reject_symlink_file(path, "jsonl path")
     report: dict[str, Any] = {
         "path": str(path),
@@ -72,6 +91,37 @@ def rotate_jsonl(
     """Archive older JSONL records to gzip and keep the hot file bounded."""
     if max_lines <= 0:
         raise ValueError("max_lines must be positive")
+    _reject_symlink_file(path, "jsonl path")
+    if not path.exists():
+        return {
+            "path": str(path),
+            "exists": False,
+            "max_lines": max_lines,
+            "archive_dir": str(archive_dir),
+            "dry_run": dry_run,
+            "line_count": 0,
+            "kept_lines": 0,
+            "archived_lines": 0,
+            "archive_path": None,
+            "would_rotate": False,
+            "changed": False,
+        }
+    with acquire_file_update_lock(path, label="JSONL rotation"):
+        return _rotate_jsonl_locked(
+            path,
+            max_lines=max_lines,
+            archive_dir=archive_dir,
+            dry_run=dry_run,
+        )
+
+
+def _rotate_jsonl_locked(
+    path: Path,
+    *,
+    max_lines: int,
+    archive_dir: Path,
+    dry_run: bool,
+) -> dict[str, Any]:
     _reject_symlink_file(path, "jsonl path")
     report: dict[str, Any] = {
         "path": str(path),
@@ -124,6 +174,35 @@ def compact_alert_state(path: Path, max_fingerprints: int, dry_run: bool = False
     """Keep the newest alert cooldown fingerprints in the state JSON."""
     if max_fingerprints <= 0:
         raise ValueError("max_fingerprints must be positive")
+    _reject_symlink_file(path, "alert state path")
+    if not path.exists():
+        return {
+            "path": str(path),
+            "exists": False,
+            "max_fingerprints": max_fingerprints,
+            "dry_run": dry_run,
+            "alert_count": 0,
+            "valid_alerts": 0,
+            "invalid_alerts": 0,
+            "kept_alerts": 0,
+            "pruned_alerts": 0,
+            "would_prune": False,
+            "changed": False,
+        }
+    with acquire_file_update_lock(path, label="alert state compaction"):
+        return _compact_alert_state_locked(
+            path,
+            max_fingerprints=max_fingerprints,
+            dry_run=dry_run,
+        )
+
+
+def _compact_alert_state_locked(
+    path: Path,
+    *,
+    max_fingerprints: int,
+    dry_run: bool,
+) -> dict[str, Any]:
     _reject_symlink_file(path, "alert state path")
     report: dict[str, Any] = {
         "path": str(path),
@@ -191,7 +270,11 @@ def compact_alert_state(path: Path, max_fingerprints: int, dry_run: bool = False
 
 def _remove_empty_dirs(root: Path) -> int:
     removed = 0
-    for path in sorted((item for item in root.rglob("*") if item.is_dir()), key=lambda p: len(p.parts), reverse=True):
+    for path in sorted(
+        (item for item in root.rglob("*") if item.is_dir()),
+        key=lambda p: len(p.parts),
+        reverse=True,
+    ):
         try:
             path.rmdir()
         except OSError:
@@ -303,7 +386,9 @@ def run_maintenance(
         "config": str(config_path),
         "errors": [],
     }
-    _run_maintenance_task(report, "alerts", compact_jsonl, config.alert_file, max_alert_lines, dry_run=dry_run)
+    _run_maintenance_task(
+        report, "alerts", compact_jsonl, config.alert_file, max_alert_lines, dry_run=dry_run
+    )
     _run_maintenance_task(
         report,
         "alert_state",
@@ -344,7 +429,9 @@ def run_maintenance(
     return report
 
 
-def run_alert_maintenance(config_path: Path, max_alert_lines: int, dry_run: bool = False) -> dict[str, Any]:
+def run_alert_maintenance(
+    config_path: Path, max_alert_lines: int, dry_run: bool = False
+) -> dict[str, Any]:
     return run_maintenance(
         config_path,
         max_alert_lines=max_alert_lines,
@@ -363,8 +450,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-experiment-lines", type=int, default=5000)
     parser.add_argument("--max-control-audit-lines", type=int, default=5000)
     parser.add_argument("--experiment-log", type=Path, default=DEFAULT_EXPERIMENT_LOG)
-    parser.add_argument("--experiment-archive-dir", type=Path, default=DEFAULT_EXPERIMENT_ARCHIVE_DIR)
-    parser.add_argument("--control-audit-archive-dir", type=Path, default=DEFAULT_CONTROL_AUDIT_ARCHIVE_DIR)
+    parser.add_argument(
+        "--experiment-archive-dir", type=Path, default=DEFAULT_EXPERIMENT_ARCHIVE_DIR
+    )
+    parser.add_argument(
+        "--control-audit-archive-dir", type=Path, default=DEFAULT_CONTROL_AUDIT_ARCHIVE_DIR
+    )
     parser.add_argument("--max-quarantine-bytes", type=int)
     parser.add_argument("--quarantine-dir", type=Path, default=DEFAULT_QUARANTINE_DIR)
     parser.add_argument("--dry-run", action="store_true")

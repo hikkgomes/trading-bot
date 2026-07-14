@@ -51,7 +51,14 @@ try:
 
     @njit(cache=True)
     def scan_tp_sl_numba(
-        high, low, entry_price: float, is_long: bool, tp: float, sl: float, start_idx: int, end_idx: int
+        high,
+        low,
+        entry_price: float,
+        is_long: bool,
+        tp: float,
+        sl: float,
+        start_idx: int,
+        end_idx: int,
     ) -> tuple[int, int]:
         for k in range(start_idx, end_idx + 1):
             if is_long:

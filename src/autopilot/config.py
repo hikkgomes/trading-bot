@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +20,8 @@ class NonStandardConfigConstantError(ValueError):
 
 
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "autopilot.json"
-DEFAULT_CONTROL_FILE = PROJECT_ROOT / "runtime" / "control.json"
-DEFAULT_CONTROL_AUDIT_FILE = PROJECT_ROOT / "runtime" / "control_audit.jsonl"
+DEFAULT_CONTROL_FILE = PROJECT_ROOT / "runtime" / "operator-control" / "control.json"
+DEFAULT_CONTROL_AUDIT_FILE = PROJECT_ROOT / "runtime" / "operator-control" / "control_audit.jsonl"
 DEFAULT_STATUS_FILE = PROJECT_ROOT / "runtime" / "status.json"
 DEFAULT_LOCK_FILE = PROJECT_ROOT / "runtime" / "autopilot.lock"
 DEFAULT_APPROVAL_LEDGER = PROJECT_ROOT / "runtime" / "approvals.json"
@@ -46,6 +46,7 @@ DEFAULT_OPERATOR_REPORT_FILE = PROJECT_ROOT / "runtime" / "operator_report.md"
 DEFAULT_OPERATOR_REPORT_JSON_FILE = PROJECT_ROOT / "runtime" / "operator_report.json"
 DEFAULT_READINESS_REPORT_FILE = PROJECT_ROOT / "runtime" / "readiness_report.md"
 DEFAULT_READINESS_REPORT_JSON_FILE = PROJECT_ROOT / "runtime" / "readiness_report.json"
+DEFAULT_CANDIDATE_PAPER_STATUS_FILE = PROJECT_ROOT / "runtime" / "candidate_paper_status.json"
 DEFAULT_MIN_RUNTIME_FREE_BYTES = 512 * 1024 * 1024
 JOB_CONFIG_KEYS = {
     "cadence_seconds",
@@ -84,7 +85,15 @@ AUTOPILOT_CONFIG_KEYS = {
     "approval_ledger",
     "artifact_hygiene_file",
     "auto_report_enabled",
+    "backup_cadence_seconds",
+    "backup_enabled",
     "backup_report_file",
+    "backup_timeout_seconds",
+    "candidate_paper_cadence_seconds",
+    "candidate_paper_enabled",
+    "candidate_paper_max_unseen_bars",
+    "candidate_paper_status_file",
+    "candidate_paper_timeout_seconds",
     "control_audit_file",
     "control_file",
     "experiment_memory_backup_file",
@@ -135,9 +144,16 @@ class JobConfig:
             raise ValueError(f"job {name}: command must be a list")
         if not command:
             raise ValueError(f"job {name}: command cannot be empty")
-        command_parts = [_non_empty_str(part, f"job {name}: command[{index}]") for index, part in enumerate(command)]
-        cadence_seconds = _positive_int(payload.get("cadence_seconds"), f"job {name}: cadence_seconds")
-        timeout_seconds = _positive_int(payload.get("timeout_seconds", 600), f"job {name}: timeout_seconds")
+        command_parts = [
+            _non_empty_str(part, f"job {name}: command[{index}]")
+            for index, part in enumerate(command)
+        ]
+        cadence_seconds = _positive_int(
+            payload.get("cadence_seconds"), f"job {name}: cadence_seconds"
+        )
+        timeout_seconds = _positive_int(
+            payload.get("timeout_seconds", 600), f"job {name}: timeout_seconds"
+        )
         return cls(
             name=name,
             enabled=_json_bool(payload, "enabled", default=True, field=f"job {name}: enabled"),
@@ -191,15 +207,21 @@ class ProductConfig:
                 default="paper",
                 field=f"product {name}: execution_mode",
             ),
-            symbol=_optional_non_empty_str(payload, "symbol", default="BTCUSDT", field=f"product {name}: symbol"),
-            strategies_path=_required_project_path(payload, "strategies_path", label=f"product {name}"),
+            symbol=_optional_non_empty_str(
+                payload, "symbol", default="BTCUSDT", field=f"product {name}: symbol"
+            ),
+            strategies_path=_required_project_path(
+                payload, "strategies_path", label=f"product {name}"
+            ),
             state_file=_required_project_path(payload, "state_file", label=f"product {name}"),
             trade_log=_required_project_path(payload, "trade_log", label=f"product {name}"),
             starting_equity=_positive_float(
                 payload.get("starting_equity", 1000.0),
                 f"product {name}: starting_equity",
             ),
-            regime_guard=_json_bool(payload, "regime_guard", default=False, field=f"product {name}: regime_guard"),
+            regime_guard=_json_bool(
+                payload, "regime_guard", default=False, field=f"product {name}: regime_guard"
+            ),
             regime_mayer_top=_positive_float(
                 payload.get("regime_mayer_top", 2.4),
                 f"product {name}: regime_mayer_top",
@@ -239,6 +261,34 @@ class ProductConfig:
         )
 
 
+def canonical_product_config(product: ProductConfig) -> dict[str, Any]:
+    """Return the complete, stable identity used by live-safety evidence.
+
+    Keeping this derived from the dataclass fields makes newly added product
+    settings fail closed until approvals and readiness evidence are regenerated.
+    Paths are absolute so the identity is independent of the caller's working
+    directory, while enum-like values use the same semantic casing everywhere.
+    """
+
+    payload: dict[str, Any] = {}
+    for descriptor in fields(product):
+        value = getattr(product, descriptor.name)
+        if isinstance(value, Path):
+            value = str(value.resolve(strict=False))
+        elif isinstance(value, str):
+            value = value.strip()
+            if descriptor.name in {"objective", "market", "execution_mode"}:
+                value = value.lower()
+            elif descriptor.name in {"base_asset", "symbol"}:
+                value = value.upper()
+        elif value is not None and not isinstance(value, bool | int | float):
+            raise TypeError(
+                f"unsupported ProductConfig field {descriptor.name!r}: {type(value).__name__}"
+            )
+        payload[descriptor.name] = value
+    return payload
+
+
 @dataclass
 class AutopilotConfig:
     control_file: Path = DEFAULT_CONTROL_FILE
@@ -261,10 +311,18 @@ class AutopilotConfig:
     mutation_batch_file: Path = DEFAULT_MUTATION_BATCH_FILE
     artifact_hygiene_file: Path = DEFAULT_ARTIFACT_HYGIENE_FILE
     backup_report_file: Path = DEFAULT_BACKUP_REPORT_FILE
+    backup_enabled: bool = False
+    backup_cadence_seconds: int = 86400
+    backup_timeout_seconds: int = 60
     operator_report_file: Path = DEFAULT_OPERATOR_REPORT_FILE
     operator_report_json_file: Path = DEFAULT_OPERATOR_REPORT_JSON_FILE
     readiness_report_file: Path = DEFAULT_READINESS_REPORT_FILE
     readiness_report_json_file: Path = DEFAULT_READINESS_REPORT_JSON_FILE
+    candidate_paper_status_file: Path = DEFAULT_CANDIDATE_PAPER_STATUS_FILE
+    candidate_paper_enabled: bool = False
+    candidate_paper_cadence_seconds: int = 45
+    candidate_paper_max_unseen_bars: int = 240
+    candidate_paper_timeout_seconds: int = 240
     auto_report_enabled: bool = False
     alerts_enabled: bool = True
     alert_cooldown_seconds: int = 900
@@ -335,7 +393,29 @@ class AutopilotConfig:
             payload.get("min_runtime_free_bytes", DEFAULT_MIN_RUNTIME_FREE_BYTES),
             "min_runtime_free_bytes",
         )
-        loop_sleep_seconds = _positive_int(payload.get("loop_sleep_seconds", 60), "loop_sleep_seconds")
+        loop_sleep_seconds = _positive_int(
+            payload.get("loop_sleep_seconds", 60), "loop_sleep_seconds"
+        )
+        candidate_paper_cadence_seconds = _positive_int(
+            payload.get("candidate_paper_cadence_seconds", 45),
+            "candidate_paper_cadence_seconds",
+        )
+        candidate_paper_max_unseen_bars = _positive_int(
+            payload.get("candidate_paper_max_unseen_bars", 240),
+            "candidate_paper_max_unseen_bars",
+        )
+        candidate_paper_timeout_seconds = _positive_int(
+            payload.get("candidate_paper_timeout_seconds", 240),
+            "candidate_paper_timeout_seconds",
+        )
+        backup_cadence_seconds = _positive_int(
+            payload.get("backup_cadence_seconds", 86400),
+            "backup_cadence_seconds",
+        )
+        backup_timeout_seconds = _positive_int(
+            payload.get("backup_timeout_seconds", 60),
+            "backup_timeout_seconds",
+        )
         try:
             max_jobs_per_cycle = _positive_int(
                 payload.get("max_jobs_per_cycle", 1),
@@ -371,15 +451,21 @@ class AutopilotConfig:
             job_config_errors.append("run_data_update must be a JSON boolean")
             run_data_update = False
         return cls(
-            control_file=_optional_project_path(payload, "control_file", default=DEFAULT_CONTROL_FILE, field="control_file"),
+            control_file=_optional_project_path(
+                payload, "control_file", default=DEFAULT_CONTROL_FILE, field="control_file"
+            ),
             control_audit_file=_optional_project_path(
                 payload,
                 "control_audit_file",
                 default=DEFAULT_CONTROL_AUDIT_FILE,
                 field="control_audit_file",
             ),
-            status_file=_optional_project_path(payload, "status_file", default=DEFAULT_STATUS_FILE, field="status_file"),
-            lock_file=_optional_project_path(payload, "lock_file", default=DEFAULT_LOCK_FILE, field="lock_file"),
+            status_file=_optional_project_path(
+                payload, "status_file", default=DEFAULT_STATUS_FILE, field="status_file"
+            ),
+            lock_file=_optional_project_path(
+                payload, "lock_file", default=DEFAULT_LOCK_FILE, field="lock_file"
+            ),
             approval_ledger=_optional_project_path(
                 payload,
                 "approval_ledger",
@@ -392,7 +478,9 @@ class AutopilotConfig:
                 default=DEFAULT_JOB_STATE_FILE,
                 field="job_state_file",
             ),
-            alert_file=_optional_project_path(payload, "alert_file", default=DEFAULT_ALERT_FILE, field="alert_file"),
+            alert_file=_optional_project_path(
+                payload, "alert_file", default=DEFAULT_ALERT_FILE, field="alert_file"
+            ),
             alert_state_file=_optional_project_path(
                 payload,
                 "alert_state_file",
@@ -471,6 +559,14 @@ class AutopilotConfig:
                 default=DEFAULT_BACKUP_REPORT_FILE,
                 field="backup_report_file",
             ),
+            backup_enabled=_json_bool(
+                payload,
+                "backup_enabled",
+                default=False,
+                field="backup_enabled",
+            ),
+            backup_cadence_seconds=backup_cadence_seconds,
+            backup_timeout_seconds=backup_timeout_seconds,
             operator_report_file=_optional_project_path(
                 payload,
                 "operator_report_file",
@@ -495,13 +591,30 @@ class AutopilotConfig:
                 default=DEFAULT_READINESS_REPORT_JSON_FILE,
                 field="readiness_report_json_file",
             ),
+            candidate_paper_status_file=_optional_project_path(
+                payload,
+                "candidate_paper_status_file",
+                default=DEFAULT_CANDIDATE_PAPER_STATUS_FILE,
+                field="candidate_paper_status_file",
+            ),
+            candidate_paper_enabled=_json_bool(
+                payload,
+                "candidate_paper_enabled",
+                default=False,
+                field="candidate_paper_enabled",
+            ),
+            candidate_paper_cadence_seconds=candidate_paper_cadence_seconds,
+            candidate_paper_max_unseen_bars=candidate_paper_max_unseen_bars,
+            candidate_paper_timeout_seconds=candidate_paper_timeout_seconds,
             auto_report_enabled=_json_bool(
                 payload,
                 "auto_report_enabled",
                 default=False,
                 field="auto_report_enabled",
             ),
-            alerts_enabled=_json_bool(payload, "alerts_enabled", default=True, field="alerts_enabled"),
+            alerts_enabled=_json_bool(
+                payload, "alerts_enabled", default=True, field="alerts_enabled"
+            ),
             alert_cooldown_seconds=alert_cooldown_seconds,
             webhook_url_env=_optional_non_empty_str(
                 payload,
@@ -552,7 +665,9 @@ def _required_project_path(payload: dict[str, Any], key: str, *, label: str) -> 
     return _project_path(payload[key], f"{label}: {key}")
 
 
-def _optional_project_path(payload: dict[str, Any], key: str, *, default: str | Path, field: str) -> Path:
+def _optional_project_path(
+    payload: dict[str, Any], key: str, *, default: str | Path, field: str
+) -> Path:
     return _project_path(payload.get(key, default), field)
 
 
@@ -653,7 +768,9 @@ def load_config(
     except json.JSONDecodeError as exc:
         raise ValueError(f"autopilot config must be valid JSON: {path}: {exc}") from exc
     except DuplicateConfigKeyError as exc:
-        raise ValueError(f"autopilot config must not contain duplicate JSON keys: {path}: {exc}") from exc
+        raise ValueError(
+            f"autopilot config must not contain duplicate JSON keys: {path}: {exc}"
+        ) from exc
     except NonStandardConfigConstantError as exc:
         raise ValueError(f"autopilot config must be strict JSON: {path}: {exc}") from exc
     if not isinstance(payload, dict):

@@ -35,9 +35,9 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
 
 def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
     prev_close = close.shift(1)
-    tr = pd.concat(
-        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1
-    ).max(axis=1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(
+        axis=1
+    )
     return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
 
 
@@ -92,7 +92,12 @@ def bollinger_bandwidth(close: pd.Series, window: int = 20, num_std: float = 2.0
 
 
 def keltner_channels(
-    high: pd.Series, low: pd.Series, close: pd.Series, window: int = 20, mult: float = 2.0, atr_period: int = 14
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    window: int = 20,
+    mult: float = 2.0,
+    atr_period: int = 14,
 ):
     """Return (lower, middle, upper) Keltner channels (EMA mid + ATR bands)."""
     middle = ema(close, window)
@@ -100,7 +105,9 @@ def keltner_channels(
     return middle - band, middle, middle + band
 
 
-def stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k_period: int = 14, d_period: int = 3):
+def stochastic(
+    high: pd.Series, low: pd.Series, close: pd.Series, k_period: int = 14, d_period: int = 3
+):
     """Return (%K, %D) of the stochastic oscillator (0..100)."""
     hh = rolling_high(high, k_period)
     ll = rolling_low(low, k_period)
@@ -128,13 +135,17 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
     minus_dm = down_move.where((down_move > up_move) & (down_move > 0.0), 0.0)
 
     prev_close = close.shift(1)
-    tr = pd.concat(
-        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1
-    ).max(axis=1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(
+        axis=1
+    )
     # Wilder smoothing == EWM with alpha = 1/period.
     atr_w = tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-    plus_di = 100.0 * plus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean() / atr_w
-    minus_di = 100.0 * minus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean() / atr_w
+    plus_di = (
+        100.0 * plus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean() / atr_w
+    )
+    minus_di = (
+        100.0 * minus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean() / atr_w
+    )
     dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
     adx_line = dx.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
     return adx_line, plus_di, minus_di
@@ -193,7 +204,9 @@ def _candle_parts(open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.S
     return body, high - top, bot - low
 
 
-def bullish_engulfing(open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+def bullish_engulfing(
+    open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series
+) -> pd.Series:
     """Current green candle whose body fully engulfs the prior red candle's body."""
     prev_red = close.shift(1) < open_.shift(1)
     curr_green = close > open_
@@ -201,7 +214,9 @@ def bullish_engulfing(open_: pd.Series, high: pd.Series, low: pd.Series, close: 
     return (prev_red & curr_green & engulf).fillna(False)
 
 
-def bearish_engulfing(open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+def bearish_engulfing(
+    open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series
+) -> pd.Series:
     """Current red candle whose body fully engulfs the prior green candle's body."""
     prev_green = close.shift(1) > open_.shift(1)
     curr_red = close < open_
@@ -209,19 +224,25 @@ def bearish_engulfing(open_: pd.Series, high: pd.Series, low: pd.Series, close: 
     return (prev_green & curr_red & engulf).fillna(False)
 
 
-def hammer(open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series, wick_ratio: float = 2.0) -> pd.Series:
+def hammer(
+    open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series, wick_ratio: float = 2.0
+) -> pd.Series:
     """Small body near the top with a long lower wick (bullish rejection)."""
     body, upper, lower = _candle_parts(open_, high, low, close)
     return ((lower >= wick_ratio * body) & (upper <= body) & (body > 0)).fillna(False)
 
 
-def shooting_star(open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series, wick_ratio: float = 2.0) -> pd.Series:
+def shooting_star(
+    open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series, wick_ratio: float = 2.0
+) -> pd.Series:
     """Small body near the bottom with a long upper wick (bearish rejection)."""
     body, upper, lower = _candle_parts(open_, high, low, close)
     return ((upper >= wick_ratio * body) & (lower <= body) & (body > 0)).fillna(False)
 
 
-def doji(open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series, max_body_frac: float = 0.1) -> pd.Series:
+def doji(
+    open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series, max_body_frac: float = 0.1
+) -> pd.Series:
     """Indecision candle: body is a tiny fraction of the total range."""
     body = (close - open_).abs()
     rng = (high - low).replace(0.0, np.nan)
@@ -335,11 +356,11 @@ def regression_channel(close: pd.Series, window: int = 100, num_std: float = 2.0
     upper = np.full(n, np.nan)
     if n >= window:
         x = np.arange(window)
-        A = np.vstack([x, np.ones(window)]).T            # (window, 2)
-        pinv = np.linalg.pinv(A)                          # (2, window)
-        win = sliding_window_view(y, window)             # (n-window+1, window)
-        coeffs = win @ pinv.T                            # (m, 2): slope, intercept
-        fit = coeffs[:, [0]] * x + coeffs[:, [1]]        # (m, window)
+        A = np.vstack([x, np.ones(window)]).T  # (window, 2)
+        pinv = np.linalg.pinv(A)  # (2, window)
+        win = sliding_window_view(y, window)  # (n-window+1, window)
+        coeffs = win @ pinv.T  # (m, 2): slope, intercept
+        fit = coeffs[:, [0]] * x + coeffs[:, [1]]  # (m, window)
         resid_std = (win - fit).std(axis=1)
         fit_last = coeffs[:, 0] * (window - 1) + coeffs[:, 1]
         sl = slice(window - 1, n)

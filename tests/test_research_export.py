@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from research_exploration.dsr import DSR_METHOD
 from research_exploration.experiment_log import ExperimentRecord, log_result
 from research_exploration.export import build_payload
 from research_exploration.export import run as export_run
@@ -45,28 +46,59 @@ def simple_hypothesis(hyp_id="TEST_LONG_5m_001", direction="long") -> Hypothesis
     )
 
 
-def keep_record(hyp: Hypothesis, dsr=0.91, holdout_return=0.03, holdout_trades=12,
-                pnl_unit="usdt", verdict="keep", market=None, symbol="BTCUSDT") -> ExperimentRecord:
+def keep_record(
+    hyp: Hypothesis,
+    dsr=0.91,
+    holdout_return=0.03,
+    holdout_trades=12,
+    pnl_unit="usdt",
+    verdict="keep",
+    market=None,
+    symbol="BTCUSDT",
+) -> ExperimentRecord:
     """Record shaped exactly like validation.validate_batch logs it."""
     metrics = {
         "dsr_deflated": dsr,
+        "dsr_method": DSR_METHOD,
         "n_trials": 20,
+        "sr_std_trials": 0.18,
+        "trial_sharpe_count": 12,
+        "trial_sharpe_observed_std": 0.16,
+        "trial_sharpe_conservative_floor": 0.10,
         "reasons": [],
         "train": {"trades": 80, "total_return": 0.10, "win_rate": 0.58, "sharpe": 1.1},
         "validation": {"trades": 25, "total_return": 0.04, "win_rate": 0.56, "sharpe": 0.9},
-        "holdout": {"trades": holdout_trades, "total_return": holdout_return,
-                    "win_rate": 0.55, "sharpe": 0.8},
+        "holdout": {
+            "trades": holdout_trades,
+            "total_return": holdout_return,
+            "win_rate": 0.55,
+            "sharpe": 0.8,
+        },
         "oos_pass_rate": 0.83,
         "sensitivity_pass_fraction": 0.75,
     }
     if market is None:
         market = "spot" if pnl_unit == "btc" else "futures"
-    config = {"validation": {"train_frac": 0.6}, "eval": {"fee_bps": 5.0,
-              "slippage_bps": 2.0, "pnl_unit": pnl_unit, "market": market, "symbol": symbol}}
+    config = {
+        "validation": {"train_frac": 0.6},
+        "eval": {
+            "fee_bps": 5.0,
+            "slippage_bps": 2.0,
+            "pnl_unit": pnl_unit,
+            "market": market,
+            "symbol": symbol,
+        },
+    }
     return ExperimentRecord(
-        hypothesis_id=hyp.id, family=hyp.family, direction=hyp.direction,
-        fingerprint=f"fp_{hyp.id}", verdict=verdict, metrics=metrics, config=config,
-        notes="validation.py staged pipeline", hypothesis=hyp.to_dict(),
+        hypothesis_id=hyp.id,
+        family=hyp.family,
+        direction=hyp.direction,
+        fingerprint=f"fp_{hyp.id}",
+        verdict=verdict,
+        metrics=metrics,
+        config=config,
+        notes="validation.py staged pipeline",
+        hypothesis=hyp.to_dict(),
     )
 
 
@@ -77,8 +109,16 @@ def write_log(tmp_path: Path, records) -> Path:
     return log
 
 
-def product(tmp_path, *, name="active_income", objective="active_income", base_asset="USDT",
-            market="futures", symbol="BTCUSDT", strategies_path=None) -> ProductConfig:
+def product(
+    tmp_path,
+    *,
+    name="active_income",
+    objective="active_income",
+    base_asset="USDT",
+    market="futures",
+    symbol="BTCUSDT",
+    strategies_path=None,
+) -> ProductConfig:
     return ProductConfig(
         name=name,
         enabled=True,
@@ -101,11 +141,14 @@ def test_export_only_keeps_with_positive_holdout(tmp_path):
     kept = simple_hypothesis("KEEP_001")
     rejected = simple_hypothesis("REJECT_001")
     lost_holdout = simple_hypothesis("KEEP_BAD_HOLDOUT")
-    log = write_log(tmp_path, [
-        keep_record(kept),
-        keep_record(rejected, verdict="reject"),
-        keep_record(lost_holdout, holdout_return=-0.02),
-    ])
+    log = write_log(
+        tmp_path,
+        [
+            keep_record(kept),
+            keep_record(rejected, verdict="reject"),
+            keep_record(lost_holdout, holdout_return=-0.02),
+        ],
+    )
     payload = build_payload(log)
     ids = [s["id"] for s in payload["strategies"]]
     assert ids == ["KEEP_001"]
@@ -118,10 +161,13 @@ def test_export_only_keeps_with_positive_holdout(tmp_path):
 
 
 def test_export_ranks_by_deflated_dsr_and_respects_top_k(tmp_path):
-    log = write_log(tmp_path, [
-        keep_record(simple_hypothesis("LOW_DSR"), dsr=0.62),
-        keep_record(simple_hypothesis("HIGH_DSR"), dsr=0.95),
-    ])
+    log = write_log(
+        tmp_path,
+        [
+            keep_record(simple_hypothesis("LOW_DSR"), dsr=0.62),
+            keep_record(simple_hypothesis("HIGH_DSR"), dsr=0.95),
+        ],
+    )
     payload = build_payload(log)
     assert [s["id"] for s in payload["strategies"]] == ["HIGH_DSR", "LOW_DSR"]
     payload = build_payload(log, top_k=1)
@@ -130,21 +176,43 @@ def test_export_ranks_by_deflated_dsr_and_respects_top_k(tmp_path):
         build_payload(log, min_dsr=0.99)
 
 
+def test_export_rejects_legacy_plain_psr_mislabeled_as_deflated(tmp_path):
+    record = keep_record(simple_hypothesis("STALE_DSR"), dsr=0.99)
+    for field in (
+        "dsr_method",
+        "sr_std_trials",
+        "trial_sharpe_count",
+        "trial_sharpe_observed_std",
+        "trial_sharpe_conservative_floor",
+    ):
+        record.metrics.pop(field)
+    log = write_log(tmp_path, [record])
+
+    with pytest.raises(ValueError, match="No exportable strategies"):
+        build_payload(log)
+
+
 def test_export_rejects_mixed_symbols(tmp_path):
-    log = write_log(tmp_path, [
-        keep_record(simple_hypothesis("BTC_SYMBOL"), symbol="BTCUSDT"),
-        keep_record(simple_hypothesis("ETH_SYMBOL"), symbol="ETHUSDT"),
-    ])
+    log = write_log(
+        tmp_path,
+        [
+            keep_record(simple_hypothesis("BTC_SYMBOL"), symbol="BTCUSDT"),
+            keep_record(simple_hypothesis("ETH_SYMBOL"), symbol="ETHUSDT"),
+        ],
+    )
 
     with pytest.raises(ValueError, match="mix symbols"):
         build_payload(log)
 
 
 def test_export_pnl_unit_filter_and_mixed_unit_guard(tmp_path):
-    log = write_log(tmp_path, [
-        keep_record(simple_hypothesis("USDT_ONE"), pnl_unit="usdt"),
-        keep_record(simple_hypothesis("BTC_ONE", direction="short"), pnl_unit="btc"),
-    ])
+    log = write_log(
+        tmp_path,
+        [
+            keep_record(simple_hypothesis("USDT_ONE"), pnl_unit="usdt"),
+            keep_record(simple_hypothesis("BTC_ONE", direction="short"), pnl_unit="btc"),
+        ],
+    )
     btc = build_payload(log, pnl_unit="btc")
     assert [s["id"] for s in btc["strategies"]] == ["BTC_ONE"]
     assert btc["pnl_unit"] == "btc"
@@ -185,10 +253,13 @@ def test_export_active_income_artifact_passes_product_policy(tmp_path):
     assert artifact["paper_trade_allowed"] is True
     assert artifact["live_allowed"] is True
     assert artifact["promotion_eligible"] is True
-    assert validate_strategy_artifact(
-        product(tmp_path, strategies_path=tmp_path / "active_income.json"),
-        artifact,
-    ) == []
+    assert (
+        validate_strategy_artifact(
+            product(tmp_path, strategies_path=tmp_path / "active_income.json"),
+            artifact,
+        )
+        == []
+    )
 
 
 def test_export_btc_accumulation_artifact_passes_product_policy(tmp_path):
@@ -202,17 +273,20 @@ def test_export_btc_accumulation_artifact_passes_product_policy(tmp_path):
     assert entry["risk"]["daily_stop_loss"] == pytest.approx(-0.01)
     assert entry["risk"]["cooldown_bars"] == 24
     assert entry["risk"]["max_trades_per_day"] == 1
-    assert validate_strategy_artifact(
-        product(
-            tmp_path,
-            name="btc_accumulation",
-            objective="btc_accumulation",
-            base_asset="BTC",
-            market="spot",
-            strategies_path=tmp_path / "btc_accumulation.json",
-        ),
-        artifact,
-    ) == []
+    assert (
+        validate_strategy_artifact(
+            product(
+                tmp_path,
+                name="btc_accumulation",
+                objective="btc_accumulation",
+                base_asset="BTC",
+                market="spot",
+                strategies_path=tmp_path / "btc_accumulation.json",
+            ),
+            artifact,
+        )
+        == []
+    )
 
 
 def test_export_allows_explicit_matching_market_stamp(tmp_path):
@@ -263,15 +337,28 @@ def test_export_empty_log_raises(tmp_path):
 # --------------------------------------------------------------------------- #
 # Bot executes an exported hypothesis strategy (golden path)
 # --------------------------------------------------------------------------- #
-def get_mock_binance_klines(n=10, start_time_ms=BASE_TS_MS, close_price=100.0,
-                            high=100.0, low=100.0, open_p=100.0):
+def get_mock_binance_klines(
+    n=10, start_time_ms=BASE_TS_MS, close_price=100.0, high=100.0, low=100.0, open_p=100.0
+):
     klines = []
     current_time = start_time_ms
     for _ in range(n):
-        klines.append([
-            current_time, str(open_p), str(high), str(low), str(close_price),
-            "1000.0", current_time + 299999, "100000.0", 100, "500.0", "50000.0", "0",
-        ])
+        klines.append(
+            [
+                current_time,
+                str(open_p),
+                str(high),
+                str(low),
+                str(close_price),
+                "1000.0",
+                current_time + 299999,
+                "100000.0",
+                100,
+                "500.0",
+                "50000.0",
+                "0",
+            ]
+        )
         current_time += 300000
     return klines
 
@@ -295,9 +382,13 @@ def export_and_load_bot(tmp_path, rsi_value):
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.json.return_value = get_mock_binance_klines(5)
-    with patch("src.run_bot.requests.get", return_value=mock_resp), \
-         patch("build_binance_indicator_dataset.build_indicator_features",
-               side_effect=lambda df, tf: mock_indicator_features(df, tf, rsi_value)):
+    with (
+        patch("src.run_bot.requests.get", return_value=mock_resp),
+        patch(
+            "build_binance_indicator_dataset.build_indicator_features",
+            side_effect=lambda df, tf: mock_indicator_features(df, tf, rsi_value),
+        ),
+    ):
         bot.run_cycle()
     return bot
 
@@ -321,26 +412,41 @@ def test_bot_hypothesis_no_entry_when_trigger_fails(tmp_path):
 def test_bot_rejects_hypothesis_entry_missing_payload(tmp_path):
     artifact = {
         "version": 2,
-        "strategies": [{
-            "id": "x", "entry_type": "hypothesis", "base_timeframe": "5m",
-            "direction": "long", "horizon_bars": 4, "take_profit": 0.04,
-            "stop_loss": 0.02, "risk": {}, "fees": {},
-        }],
+        "strategies": [
+            {
+                "id": "x",
+                "entry_type": "hypothesis",
+                "base_timeframe": "5m",
+                "direction": "long",
+                "horizon_bars": 4,
+                "take_profit": 0.04,
+                "stop_loss": 0.02,
+                "risk": {},
+                "fees": {},
+            }
+        ],
     }
     path = tmp_path / "active_strategies.json"
     path.write_text(json.dumps(artifact), encoding="utf-8")
     with pytest.raises(ValueError, match="missing required key 'hypothesis'"):
-        PaperTradingBot(strategies_path=path, state_file=tmp_path / "s.json",
-                        trade_log=tmp_path / "t.csv")
+        PaperTradingBot(
+            strategies_path=path, state_file=tmp_path / "s.json", trade_log=tmp_path / "t.csv"
+        )
 
 
 def test_fetch_limits_cover_rolling_windows(tmp_path):
     """A 180-bar 4h rolling quantile on a 15m base needs 180*16 base rows —
     the executor must size its fetches so the mask is defined on the last bar."""
     hyp = Hypothesis(
-        id="DEEP_WINDOW", family="volatility_breakout", idea="x", market_logic="x",
-        direction="long", base_timeframe="15m", regime_timeframe="4h",
-        setup_timeframe="1h", trigger_timeframe="15m",
+        id="DEEP_WINDOW",
+        family="volatility_breakout",
+        idea="x",
+        market_logic="x",
+        direction="long",
+        base_timeframe="15m",
+        regime_timeframe="4h",
+        setup_timeframe="1h",
+        trigger_timeframe="15m",
         regime=[Predicate("4h", "natr_14", "q_le", quantile=0.35, window=180)],
         setup=[Predicate("1h", "adx_14", "le", reference=20.0)],
         trigger=[Predicate("15m", "close", "gt_feature", feature_b="max_20", shift_b=1)],
@@ -348,12 +454,13 @@ def test_fetch_limits_cover_rolling_windows(tmp_path):
     )
     needed = hypothesis_history_requirements(hyp)
     assert needed["15m"] >= 180 * 16  # scaled quantile window on the base frame
-    assert needed["4h"] >= 180        # native bars for the HTF fetch
+    assert needed["4h"] >= 180  # native bars for the HTF fetch
 
     log = write_log(tmp_path, [keep_record(hyp)])
     artifact = export_run(log, tmp_path / "art.json")
-    bot = PaperTradingBot(strategies_path=artifact, state_file=tmp_path / "s.json",
-                          trade_log=tmp_path / "t.csv")
+    bot = PaperTradingBot(
+        strategies_path=artifact, state_file=tmp_path / "s.json", trade_log=tmp_path / "t.csv"
+    )
     base_limit, htf_limits = bot._fetch_limits(bot.strategies[0])
     assert base_limit >= 180 * 16
     assert htf_limits["4h"] >= 180
@@ -364,8 +471,9 @@ def test_fetch_limits_cover_rolling_windows(tmp_path):
 def test_fetch_live_candles_paginates_past_request_cap(mock_get, tmp_path):
     log = write_log(tmp_path, [keep_record(simple_hypothesis())])
     artifact = export_run(log, tmp_path / "art.json")
-    bot = PaperTradingBot(strategies_path=artifact, state_file=tmp_path / "s.json",
-                          trade_log=tmp_path / "t.csv")
+    bot = PaperTradingBot(
+        strategies_path=artifact, state_file=tmp_path / "s.json", trade_log=tmp_path / "t.csv"
+    )
     bot.KLINES_PER_REQUEST = 3
 
     newest = get_mock_binance_klines(3, start_time_ms=BASE_TS_MS + 2 * 300000)
@@ -400,9 +508,14 @@ def test_position_trading_set_is_short_coarse_and_wider():
         assert hyp.base_timeframe in ("1h", "4h")
     # Exits widened vs the day-trade counterpart of the same family/stack.
     from research_exploration.strategy_families import build_family
+
     pos = next(h for h in hyps if h.family == "trend_continuation")
-    day = build_family("trend_continuation", "short",
-                       (pos.regime_timeframe, pos.setup_timeframe, pos.trigger_timeframe), 1)
+    day = build_family(
+        "trend_continuation",
+        "short",
+        (pos.regime_timeframe, pos.setup_timeframe, pos.trigger_timeframe),
+        1,
+    )
     assert pos.exit.take_profit > day.exit.take_profit
     assert pos.exit.stop_loss > day.exit.stop_loss
     assert pos.exit.horizon_bars > day.exit.horizon_bars

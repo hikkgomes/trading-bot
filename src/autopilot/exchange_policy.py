@@ -36,14 +36,22 @@ def validate_product_symbol_policy(product: ProductConfig) -> list[str]:
     base, quote, settlement = split_symbol(product.symbol)
     if product.objective == "btc_accumulation":
         if (base, quote) != ("BTC", "USDT"):
-            errors.append(f"{product.name}: BTC accumulation symbol must be BTC/USDT; got {product.symbol!r}.")
+            errors.append(
+                f"{product.name}: BTC accumulation symbol must be BTC/USDT; got {product.symbol!r}."
+            )
         if settlement is not None:
-            errors.append(f"{product.name}: BTC accumulation spot symbol must not include a settlement asset.")
+            errors.append(
+                f"{product.name}: BTC accumulation spot symbol must not include a settlement asset."
+            )
     if product.objective == "active_income":
         if (base, quote) != ("BTC", "USDT"):
-            errors.append(f"{product.name}: active income symbol must be BTC/USDT; got {product.symbol!r}.")
+            errors.append(
+                f"{product.name}: active income symbol must be BTC/USDT; got {product.symbol!r}."
+            )
         if settlement is not None and settlement != "USDT":
-            errors.append(f"{product.name}: active income futures settlement must be USDT; got {settlement!r}.")
+            errors.append(
+                f"{product.name}: active income futures settlement must be USDT; got {settlement!r}."
+            )
     return errors
 
 
@@ -62,7 +70,9 @@ def validate_exchange_policy(product: ProductConfig, cfg: ExchangeConfig) -> lis
                 f"(FUTURES_EXCHANGE={allowed}); got {cfg.exchange!r}."
             )
         if quote_asset != "USDT":
-            errors.append(f"{product.name}: active income quote asset must be USDT; got {cfg.quote_asset!r}.")
+            errors.append(
+                f"{product.name}: active income quote asset must be USDT; got {cfg.quote_asset!r}."
+            )
         if getattr(cfg, "max_futures_leverage", None) != ACTIVE_INCOME_MAX_FUTURES_LEVERAGE:
             errors.append(
                 f"{product.name}: active income futures must use "
@@ -80,5 +90,7 @@ def validate_exchange_policy(product: ProductConfig, cfg: ExchangeConfig) -> lis
                 f"(SPOT_EXCHANGE={allowed}); got {cfg.exchange!r}."
             )
         if quote_asset != "USDT":
-            errors.append(f"{product.name}: BTC accumulation trades BTC/USDT, so QUOTE_ASSET must be USDT.")
+            errors.append(
+                f"{product.name}: BTC accumulation trades BTC/USDT, so QUOTE_ASSET must be USDT."
+            )
     return errors

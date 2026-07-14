@@ -27,10 +27,10 @@ def compute_tp_sl_labels(
         exit_idx, reason = scan_tp_sl(high, low, entry, is_long, tp, sl, entry_idx, end_idx)
         bars_to_exit[i] = exit_idx - entry_idx
         hit_tp[i] = reason == 2
-        highs_full = high[entry_idx:end_idx + 1]
-        lows_full = low[entry_idx:end_idx + 1]
-        highs_exit = high[entry_idx:exit_idx + 1]
-        lows_exit = low[entry_idx:exit_idx + 1]
+        highs_full = high[entry_idx : end_idx + 1]
+        lows_full = low[entry_idx : end_idx + 1]
+        highs_exit = high[entry_idx : exit_idx + 1]
+        lows_exit = low[entry_idx : exit_idx + 1]
         if is_long:
             mfe_full[i] = float(np.max(highs_full) / entry - 1.0)
             mae_full[i] = float(np.min(lows_full) / entry - 1.0)
@@ -83,7 +83,12 @@ def run(
     input_path: Path,
     output_path: Path,
     base_timeframe: str = "5m",
-    tp_sl_pairs: Sequence[tuple[float, float]] = ((0.003, 0.002), (0.005, 0.003), (0.008, 0.004), (0.012, 0.006)),
+    tp_sl_pairs: Sequence[tuple[float, float]] = (
+        (0.003, 0.002),
+        (0.005, 0.003),
+        (0.008, 0.004),
+        (0.012, 0.006),
+    ),
     horizons: Sequence[int] = (4, 8, 16),
     directions: Sequence[str] = ("long", "short"),
 ) -> Path:
@@ -97,8 +102,20 @@ def run(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate TP-before-SL labels.")
-    parser.add_argument("--input-path", "--input", dest="input_path", type=Path, default=PROCESSED_DATA_DIR / "train_5m_indicators.parquet")
-    parser.add_argument("--output-path", "--output", dest="output_path", type=Path, default=PROCESSED_DATA_DIR / "train_5m_indicators_labels.parquet")
+    parser.add_argument(
+        "--input-path",
+        "--input",
+        dest="input_path",
+        type=Path,
+        default=PROCESSED_DATA_DIR / "train_5m_indicators.parquet",
+    )
+    parser.add_argument(
+        "--output-path",
+        "--output",
+        dest="output_path",
+        type=Path,
+        default=PROCESSED_DATA_DIR / "train_5m_indicators_labels.parquet",
+    )
     parser.add_argument("--base-timeframe", default="5m")
     return parser.parse_args()
 

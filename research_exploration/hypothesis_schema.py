@@ -34,23 +34,34 @@ DIRECTIONS = ("long", "short")
 # grammar is auditable and safe to round-trip through JSON.
 OPS = {
     # feature  vs  numeric reference
-    "gt", "ge", "lt", "le",
+    "gt",
+    "ge",
+    "lt",
+    "le",
     # feature  vs  another feature on the same timeframe (state, not event)
-    "gt_feature", "lt_feature",
+    "gt_feature",
+    "lt_feature",
     # event: feature crosses another feature this bar
-    "cross_above", "cross_below",
+    "cross_above",
+    "cross_below",
     # feature now relative to itself `lookback` bars ago
-    "rising", "falling",
+    "rising",
+    "falling",
     # slope = (f - f.shift(lookback)) / lookback  compared to `reference` (default 0)
-    "slope_up", "slope_down",
+    "slope_up",
+    "slope_down",
     # percentage distance to another feature: (f / f_b - 1)  vs reference
-    "pct_above", "pct_below",
+    "pct_above",
+    "pct_below",
     # low <= feature <= high  (band / range membership)
     "between",
     # causal rolling-quantile membership over `window` bars (refit-free, no leak)
-    "q_ge", "q_le",
+    "q_ge",
+    "q_le",
     # discrete pattern columns (candlesticks are -100/0/+100)
-    "bullish", "bearish", "nonzero",
+    "bullish",
+    "bearish",
+    "nonzero",
 }
 
 
@@ -59,16 +70,16 @@ class Predicate:
     """A single causal condition on one feature of one timeframe."""
 
     timeframe: str
-    feature: str                       # unprefixed root, e.g. 'ema_50', 'rsi_14', 'close', 'max_20'
+    feature: str  # unprefixed root, e.g. 'ema_50', 'rsi_14', 'close', 'max_20'
     op: str
     reference: float | None = None  # numeric RHS for gt/ge/lt/le/slope_*/pct_*
-    feature_b: str | None = None    # unprefixed root on the same timeframe (cross/pct/gt_feature)
-    lookback: int | None = None     # rising/falling/slope_*
-    window: int | None = None       # q_ge/q_le rolling quantile window (in NATIVE bars of this tf)
-    quantile: float | None = None   # q_ge/q_le
-    low: float | None = None        # between
-    high: float | None = None       # between
-    shift_b: int = 0                # shift feature_b back N bars before comparing (prior-range breakouts)
+    feature_b: str | None = None  # unprefixed root on the same timeframe (cross/pct/gt_feature)
+    lookback: int | None = None  # rising/falling/slope_*
+    window: int | None = None  # q_ge/q_le rolling quantile window (in NATIVE bars of this tf)
+    quantile: float | None = None  # q_ge/q_le
+    low: float | None = None  # between
+    high: float | None = None  # between
+    shift_b: int = 0  # shift feature_b back N bars before comparing (prior-range breakouts)
     note: str = ""
 
     def __post_init__(self) -> None:
@@ -88,14 +99,18 @@ class Predicate:
             raise ValueError("predicate quantile must be in (0, 1)")
         if self.op in {"gt", "ge", "lt", "le", "pct_above", "pct_below"} and self.reference is None:
             raise ValueError(f"predicate op {self.op!r} requires reference")
-        if self.op in {
-            "gt_feature",
-            "lt_feature",
-            "cross_above",
-            "cross_below",
-            "pct_above",
-            "pct_below",
-        } and not self.feature_b:
+        if (
+            self.op
+            in {
+                "gt_feature",
+                "lt_feature",
+                "cross_above",
+                "cross_below",
+                "pct_above",
+                "pct_below",
+            }
+            and not self.feature_b
+        ):
             raise ValueError(f"predicate op {self.op!r} requires feature_b")
         if self.op in {"rising", "falling", "slope_up", "slope_down"} and self.lookback is None:
             raise ValueError(f"predicate op {self.op!r} requires lookback")
@@ -149,7 +164,8 @@ class Predicate:
 
     def to_dict(self) -> dict:
         return {
-            k: v for k, v in asdict(self).items()
+            k: v
+            for k, v in asdict(self).items()
             if v is not None and v != "" and not (k == "shift_b" and v == 0)
         }
 
@@ -189,7 +205,9 @@ class ExitRule:
             raise ValueError("atr_stop_loss must be positive")
 
     def to_dict(self) -> dict:
-        return {k: v for k, v in asdict(self).items() if v is not None and v != "" and v is not False}
+        return {
+            k: v for k, v in asdict(self).items() if v is not None and v != "" and v is not False
+        }
 
     @staticmethod
     def from_dict(d: dict) -> ExitRule:
@@ -249,7 +267,7 @@ class Hypothesis:
     idea: str
     market_logic: str
     direction: str  # 'long' | 'short'
-    base_timeframe: str       # execution/trigger TF; the aligned frame is built on this
+    base_timeframe: str  # execution/trigger TF; the aligned frame is built on this
     regime_timeframe: str
     setup_timeframe: str
     trigger_timeframe: str
@@ -275,7 +293,11 @@ class Hypothesis:
             if timeframe not in TF_RANK:
                 raise ValueError(f"{label} has unknown timeframe {timeframe!r}")
         # Causality sanity: regime should be >= setup >= trigger in coarseness.
-        if not (TF_RANK[self.regime_timeframe] >= TF_RANK[self.setup_timeframe] >= TF_RANK[self.trigger_timeframe]):
+        if not (
+            TF_RANK[self.regime_timeframe]
+            >= TF_RANK[self.setup_timeframe]
+            >= TF_RANK[self.trigger_timeframe]
+        ):
             raise ValueError(
                 f"Timeframe ordering must satisfy regime >= setup >= trigger "
                 f"(got {self.regime_timeframe} / {self.setup_timeframe} / {self.trigger_timeframe})"
@@ -287,8 +309,13 @@ class Hypothesis:
         return [*self.regime, *self.setup, *self.trigger]
 
     def timeframes(self) -> set[str]:
-        return {self.base_timeframe, self.regime_timeframe, self.setup_timeframe,
-                self.trigger_timeframe, *(p.timeframe for p in self.all_predicates())}
+        return {
+            self.base_timeframe,
+            self.regime_timeframe,
+            self.setup_timeframe,
+            self.trigger_timeframe,
+            *(p.timeframe for p in self.all_predicates()),
+        }
 
     def feature_columns(self) -> list[str]:
         cols: list[str] = []
@@ -365,9 +392,7 @@ class Hypothesis:
         )
 
 
-def validate_columns_against_inventory(
-    hyp: Hypothesis, inventory: dict[str, dict]
-) -> list[str]:
+def validate_columns_against_inventory(hyp: Hypothesis, inventory: dict[str, dict]) -> list[str]:
     """Return a list of referenced columns that don't exist in the inventory.
 
     ``inventory`` is the JSON produced by ``feature_inventory`` *with*

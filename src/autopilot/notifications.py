@@ -3,16 +3,31 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import logging
 import math
 import os
+import queue
+import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
+from src.autopilot.alert_settings import alert_environment
 from src.autopilot.io import append_json_line, write_json_atomic
+from src.autopilot.locking import acquire_file_update_lock
 from src.autopilot.reporting import utc_now
-from src.autopilot.telegram_edge import send_alert_from_environment
+from src.autopilot.telegram_edge import redact_sensitive, send_alert_from_environment
+
+LOGGER = logging.getLogger(__name__)
+REMOTE_DELIVERY_QUEUE_LIMIT = 256
+_REMOTE_DELIVERY_QUEUE: queue.Queue[tuple[Path, dict[str, Any], str, dict[str, str]]] = queue.Queue(
+    maxsize=REMOTE_DELIVERY_QUEUE_LIMIT
+)
+_REMOTE_WORKER_LOCK = threading.Lock()
+_REMOTE_WORKER: threading.Thread | None = None
 
 VOLATILE_FINGERPRINT_KEYS = {
     "age_seconds",
@@ -66,9 +81,7 @@ def _load_state(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return _fresh_state(
-            load_error={"path": str(path), "error": f"{type(exc).__name__}: {exc}"}
-        )
+        return _fresh_state(load_error={"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
     if not isinstance(payload, dict):
         return _fresh_state(
             load_error={
@@ -100,7 +113,26 @@ def _write_jsonl(path: Path, payload: dict[str, Any]) -> None:
 def _post_webhook(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     import requests
 
-    response = requests.post(url, json=payload, timeout=10)
+    parsed = urlsplit(url)
+    hostname = parsed.hostname
+    if not hostname or parsed.username is not None or parsed.password is not None:
+        raise ValueError("webhook URL must have a host and must not contain user credentials")
+    loopback = hostname.lower() == "localhost"
+    try:
+        loopback = loopback or ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        pass
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
+        raise ValueError("webhook URL must use HTTPS; HTTP is allowed only for loopback testing")
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=10,
+            allow_redirects=False,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"webhook request failed: {type(exc).__name__}") from exc
     return {"status_code": response.status_code, "ok": 200 <= response.status_code < 300}
 
 
@@ -129,6 +161,55 @@ def emit_alert(
     if not math.isfinite(cooldown_seconds) or cooldown_seconds < 0:
         raise ValueError("alert cooldown_seconds must be finite and non-negative")
     fingerprint = alert_fingerprint(severity, title, detail)
+    with acquire_file_update_lock(state_file, label="alert cooldown state"):
+        result, payload = _emit_alert_locked(
+            alert_file=alert_file,
+            state_file=state_file,
+            severity=severity,
+            title=title,
+            detail=detail,
+            cooldown_seconds=cooldown_seconds,
+            now=now,
+            fingerprint=fingerprint,
+        )
+    if payload is not None:
+        try:
+            operations_environment = alert_environment(os.environ)
+        except Exception as exc:
+            result["remote_delivery"] = {
+                "status": "invalid_settings",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            return result
+        webhook_url = operations_environment.get(webhook_url_env, "").strip()
+        remote_configured = bool(
+            webhook_url
+            or operations_environment.get("AUTOPILOT_TELEGRAM_BOT_TOKEN", "").strip()
+            or operations_environment.get("AUTOPILOT_TELEGRAM_SETTINGS_FILE", "").strip()
+        )
+        if remote_configured:
+            result["remote_delivery"] = _enqueue_remote_delivery(
+                alert_file,
+                payload,
+                webhook_url,
+                operations_environment,
+            )
+        else:
+            result["remote_delivery"] = {"status": "not_configured"}
+    return result
+
+
+def _emit_alert_locked(
+    *,
+    alert_file: Path,
+    state_file: Path,
+    severity: str,
+    title: str,
+    detail: dict[str, Any],
+    cooldown_seconds: float,
+    now: float,
+    fingerprint: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     state = _load_state(state_file)
     state_load_error = state.pop("_load_error", None)
     entry = state["alerts"].get(fingerprint, {})
@@ -156,9 +237,13 @@ def emit_alert(
         }
         last_sent_ts = 0.0
     if now - last_sent_ts < cooldown_seconds:
-        return {"sent": False, "reason": "cooldown", "fingerprint": fingerprint}
+        return (
+            {"sent": False, "reason": "cooldown", "fingerprint": fingerprint},
+            None,
+        )
 
     payload = {
+        "schema": "autopilot.alert/v1",
         "generated_at": utc_now(),
         "severity": severity,
         "title": title,
@@ -169,20 +254,6 @@ def emit_alert(
         payload["alert_state_recovered"] = state_load_error
     if entry_recovery is not None:
         payload["alert_state_entry_recovered"] = entry_recovery
-    webhook_url = os.environ.get(webhook_url_env, "").strip()
-    if webhook_url:
-        try:
-            payload["webhook"] = _post_webhook(webhook_url, payload)
-        except Exception as exc:  # local alerting/cooldown must survive webhook outages
-            payload["webhook"] = {"ok": False, "error": str(exc)}
-
-    try:
-        telegram = send_alert_from_environment(payload)
-        if telegram is not None:
-            payload["telegram"] = telegram
-    except Exception as exc:  # local alerting/cooldown must survive Telegram outages
-        payload["telegram"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
     _write_jsonl(alert_file, payload)
 
     state["alerts"][fingerprint] = {
@@ -192,15 +263,111 @@ def emit_alert(
         "title": title,
     }
     result = {"sent": True, "fingerprint": fingerprint}
-    if "webhook" in payload:
-        result["webhook"] = payload["webhook"]
-    if "telegram" in payload:
-        result["telegram"] = payload["telegram"]
     try:
         _save_state(state_file, state)
     except Exception as exc:
         result["state_error"] = f"{type(exc).__name__}: {exc}"
-    return result
+    return result, payload
+
+
+def _deliver_remote_alert(
+    alert_file: Path,
+    payload: dict[str, Any],
+    webhook_url: str,
+    operations_environment: dict[str, str],
+) -> None:
+    """Deliver one already-durable local alert without blocking supervision."""
+
+    delivery: dict[str, Any] = {
+        "schema": "autopilot.alert_delivery/v1",
+        "generated_at": utc_now(),
+        "fingerprint": payload["fingerprint"],
+    }
+    if webhook_url:
+        try:
+            remote_payload = redact_sensitive(payload)
+            if not isinstance(remote_payload, dict):
+                raise ValueError("sanitized webhook payload must be a JSON object")
+            delivery["webhook"] = _post_webhook(webhook_url, remote_payload)
+        except Exception as exc:
+            delivery["webhook"] = {"ok": False, "error": str(exc)}
+    try:
+        telegram = send_alert_from_environment(payload, environ=operations_environment)
+        if telegram is not None:
+            delivery["telegram"] = telegram
+    except Exception as exc:
+        delivery["telegram"] = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if "webhook" not in delivery and "telegram" not in delivery:
+        return
+    _write_jsonl(alert_file, delivery)
+
+
+def _remote_delivery_worker() -> None:
+    while True:
+        alert_file, payload, webhook_url, operations_environment = _REMOTE_DELIVERY_QUEUE.get()
+        try:
+            _deliver_remote_alert(
+                alert_file,
+                payload,
+                webhook_url,
+                operations_environment,
+            )
+        except Exception:
+            # The originating local alert and cooldown state are already
+            # durable. A delivery-record write failure is still visible in the
+            # service journal without destabilizing trading supervision.
+            LOGGER.exception(
+                "Asynchronous remote alert delivery failed for fingerprint %s",
+                payload.get("fingerprint"),
+            )
+        finally:
+            _REMOTE_DELIVERY_QUEUE.task_done()
+
+
+def _ensure_remote_worker() -> None:
+    global _REMOTE_WORKER
+    with _REMOTE_WORKER_LOCK:
+        if _REMOTE_WORKER is not None and _REMOTE_WORKER.is_alive():
+            return
+        _REMOTE_WORKER = threading.Thread(
+            target=_remote_delivery_worker,
+            name="autopilot-alert-delivery",
+            daemon=True,
+        )
+        _REMOTE_WORKER.start()
+
+
+def _enqueue_remote_delivery(
+    alert_file: Path,
+    payload: dict[str, Any],
+    webhook_url: str,
+    operations_environment: dict[str, str],
+) -> dict[str, Any]:
+    _ensure_remote_worker()
+    try:
+        _REMOTE_DELIVERY_QUEUE.put_nowait(
+            (alert_file, payload, webhook_url, dict(operations_environment))
+        )
+    except queue.Full:
+        return {
+            "status": "queue_full",
+            "queue_limit": REMOTE_DELIVERY_QUEUE_LIMIT,
+        }
+    return {"status": "queued"}
+
+
+def wait_for_remote_alerts(timeout_seconds: float = 5.0) -> bool:
+    """Wait for queued deliveries; intended for tests and orderly shutdowns."""
+
+    deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
+    while _REMOTE_DELIVERY_QUEUE.unfinished_tasks:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
 
 
 def failure_detail(report: dict[str, Any]) -> dict[str, Any]:
@@ -223,7 +390,9 @@ def failure_detail(report: dict[str, Any]) -> dict[str, Any]:
                 "mode": product.get("product", {}).get("execution_mode"),
                 "market": product.get("product", {}).get("market"),
                 "action": product.get("action"),
-                "error": product.get("error") or product.get("close_error") or product.get("reason"),
+                "error": product.get("error")
+                or product.get("close_error")
+                or product.get("reason"),
                 "cycle_errors": product.get("cycle_errors", []),
                 "state_errors": product.get("state_errors", []),
             }
@@ -362,8 +531,10 @@ def promotion_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
                     "generated_at": generated_at,
                 }
             )
-        if review.get("enabled") is not False and review.get("exists") is True and (
-            review.get("fresh") is False or generated_at is None
+        if (
+            review.get("enabled") is not False
+            and review.get("exists") is True
+            and (review.get("fresh") is False or generated_at is None)
         ):
             warning = {
                 "name": "promotion_review_stale",
@@ -383,9 +554,15 @@ def promotion_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
 
 def research_handoff_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = []
-    research_cycle = report.get("research_cycle") if isinstance(report.get("research_cycle"), dict) else {}
-    mutation_plan = report.get("mutation_plan") if isinstance(report.get("mutation_plan"), dict) else {}
-    mutation_batch = report.get("mutation_batch") if isinstance(report.get("mutation_batch"), dict) else {}
+    research_cycle = (
+        report.get("research_cycle") if isinstance(report.get("research_cycle"), dict) else {}
+    )
+    mutation_plan = (
+        report.get("mutation_plan") if isinstance(report.get("mutation_plan"), dict) else {}
+    )
+    mutation_batch = (
+        report.get("mutation_batch") if isinstance(report.get("mutation_batch"), dict) else {}
+    )
 
     def unsafe_flags(payload: dict[str, Any]) -> list[str]:
         flags = [
@@ -414,11 +591,7 @@ def research_handoff_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
                 "unsafe_flags": plan_unsafe_flags,
             }
             warnings.append(
-                {
-                    key: value
-                    for key, value in warning.items()
-                    if value is not None and value != []
-                }
+                {key: value for key, value in warning.items() if value is not None and value != []}
             )
 
     if mutation_batch:
@@ -436,17 +609,19 @@ def research_handoff_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
                 else None,
             }
             warnings.append(
-                {
-                    key: value
-                    for key, value in warning.items()
-                    if value is not None and value != []
-                }
+                {key: value for key, value in warning.items() if value is not None and value != []}
             )
 
     research_generated_at = research_cycle.get("generated_at")
-    plan_source = mutation_plan.get("source") if isinstance(mutation_plan.get("source"), dict) else {}
+    plan_source = (
+        mutation_plan.get("source") if isinstance(mutation_plan.get("source"), dict) else {}
+    )
     plan_research_generated_at = plan_source.get("research_generated_at")
-    if research_generated_at and plan_research_generated_at and research_generated_at != plan_research_generated_at:
+    if (
+        research_generated_at
+        and plan_research_generated_at
+        and research_generated_at != plan_research_generated_at
+    ):
         warnings.append(
             {
                 "name": "mutation_plan_stale_source",
@@ -457,9 +632,15 @@ def research_handoff_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
         )
 
     plan_generated_at = mutation_plan.get("generated_at")
-    batch_source = mutation_batch.get("source") if isinstance(mutation_batch.get("source"), dict) else {}
+    batch_source = (
+        mutation_batch.get("source") if isinstance(mutation_batch.get("source"), dict) else {}
+    )
     batch_plan_generated_at = batch_source.get("plan_generated_at")
-    if plan_generated_at and batch_plan_generated_at and plan_generated_at != batch_plan_generated_at:
+    if (
+        plan_generated_at
+        and batch_plan_generated_at
+        and plan_generated_at != batch_plan_generated_at
+    ):
         warnings.append(
             {
                 "name": "mutation_batch_stale_source",
@@ -474,13 +655,19 @@ def research_handoff_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
 def research_progress_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
     """Summarize research that is healthy but not yet producing paper artifacts."""
 
-    research_cycle = report.get("research_cycle") if isinstance(report.get("research_cycle"), dict) else {}
-    summary = research_cycle.get("summary") if isinstance(research_cycle.get("summary"), dict) else {}
+    research_cycle = (
+        report.get("research_cycle") if isinstance(report.get("research_cycle"), dict) else {}
+    )
+    summary = (
+        research_cycle.get("summary") if isinstance(research_cycle.get("summary"), dict) else {}
+    )
     if research_cycle.get("ok") is not True:
         return {"warnings": []}
     if int(summary.get("hypotheses") or 0) <= 0:
         return {"warnings": []}
-    export_reasons = summary.get("export_reasons") if isinstance(summary.get("export_reasons"), dict) else {}
+    export_reasons = (
+        summary.get("export_reasons") if isinstance(summary.get("export_reasons"), dict) else {}
+    )
     if int(export_reasons.get("open_positions_block_export") or 0) > 0:
         open_products = []
         for product in _dict_list(report.get("products")):
@@ -550,10 +737,11 @@ def research_progress_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
 def required_testnet_rehearsal_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
     """Summarize missing or stale exchange-facing rehearsal evidence."""
 
-    rehearsal = report.get("testnet_rehearsal") if isinstance(report.get("testnet_rehearsal"), dict) else {}
+    rehearsal = (
+        report.get("testnet_rehearsal") if isinstance(report.get("testnet_rehearsal"), dict) else {}
+    )
     rehearsal_required = bool(rehearsal.get("required")) or any(
-        product.get("enabled") is not False
-        and bool(product.get("require_testnet_rehearsal"))
+        product.get("enabled") is not False and bool(product.get("require_testnet_rehearsal"))
         for product in _dict_list(report.get("products"))
     )
     if not rehearsal_required or rehearsal.get("ok") is True:

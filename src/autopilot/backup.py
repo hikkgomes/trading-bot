@@ -98,6 +98,8 @@ def configured_backup_paths(config: AutopilotConfig, *, config_path: Path) -> li
         config.readiness_report_json_file,
     ):
         _add_path(paths, seen, path)
+    if config.candidate_paper_enabled:
+        _add_path(paths, seen, config.candidate_paper_status_file)
     for product in config.products:
         candidate_path = candidate_path_for_product(product.name)
         for path in (
@@ -112,14 +114,79 @@ def configured_backup_paths(config: AutopilotConfig, *, config_path: Path) -> li
             product.testnet_rehearsal_report,
         ):
             _add_path(paths, seen, path)
-        for state_path in sorted(
-            candidate_path.parent.glob(f"{product.name}_paper_state_*.json")
-        ):
+        for state_path in sorted(candidate_path.parent.glob(f"{product.name}_paper_state_*.json")):
             _add_path(paths, seen, state_path)
     for job in config.jobs:
         for flag in JOB_PATH_FLAGS:
             _add_path(paths, seen, _job_command_path(job, flag))
     return paths
+
+
+def _configured_backup_roles(
+    config: AutopilotConfig,
+    *,
+    config_path: Path,
+) -> dict[Path, str]:
+    roles: dict[Path, str] = {}
+
+    def add(path: Path | None, role: str) -> None:
+        if path is not None:
+            roles.setdefault(path.resolve(strict=False), role)
+
+    for path, role in (
+        (config_path, "autopilot_config"),
+        (config.approval_ledger, "approval_ledger"),
+        (config.control_file, "operator_control"),
+        (config.control_audit_file, "operator_control_audit"),
+        (config.status_file, "runtime_status"),
+        (config.job_state_file, "scheduled_job_state"),
+        (config.alert_file, "alert_log"),
+        (config.alert_state_file, "alert_cooldown_state"),
+        (config.research_smoke_file, "research_smoke"),
+        (config.strategy_smoke_file, "strategy_smoke"),
+        (config.research_cycle_file, "research_cycle"),
+        (config.research_factory_config_file, "research_factory_config"),
+        (config.generated_batch_file, "generated_research_batch"),
+        (config.experiment_memory_backup_file, "experiment_memory_snapshot"),
+        (config.incubation_candidates_file, "incubation_candidates"),
+        (config.mutation_plan_file, "mutation_plan"),
+        (config.mutation_batch_file, "mutation_batch"),
+        (config.artifact_hygiene_file, "artifact_hygiene"),
+        (config.backup_report_file, "previous_backup_report"),
+        (config.operator_report_file, "operator_report_markdown"),
+        (config.operator_report_json_file, "operator_report_json"),
+        (config.readiness_report_file, "readiness_report_markdown"),
+        (config.readiness_report_json_file, "readiness_report_json"),
+    ):
+        add(path, role)
+    if config.candidate_paper_enabled:
+        add(config.candidate_paper_status_file, "candidate_paper_status")
+    for product in config.products:
+        candidate_path = candidate_path_for_product(product.name)
+        for path, field in (
+            (product.strategies_path, "strategy_artifact"),
+            (candidate_path, "staged_candidate"),
+            (candidate_path.parent / f"{product.name}_paper_trades.csv", "candidate_paper_log"),
+            (
+                candidate_path.parent / f"{product.name}_promotion_review.json",
+                "candidate_promotion_review_json",
+            ),
+            (
+                candidate_path.parent / f"{product.name}_promotion_review.md",
+                "candidate_promotion_review_markdown",
+            ),
+            (product.state_file, "product_state"),
+            (product.trade_log, "product_trade_log"),
+            (product.preflight_report, "preflight_report"),
+            (product.testnet_rehearsal_report, "testnet_rehearsal_report"),
+        ):
+            add(path, f"product:{product.name}:{field}")
+        for state_path in sorted(candidate_path.parent.glob(f"{product.name}_paper_state_*.json")):
+            add(state_path, f"product:{product.name}:candidate_paper_state")
+    for job in config.jobs:
+        for flag in JOB_PATH_FLAGS:
+            add(_job_command_path(job, flag), f"job:{job.name}:{flag.removeprefix('--')}")
+    return roles
 
 
 def _arcname(path: Path, root: Path) -> str:
@@ -249,6 +316,8 @@ def build_backup_archive(
     if output.is_symlink():
         raise ValueError(f"backup output must not be a symlink: {output}")
     paths = configured_backup_paths(config, config_path=config_path)
+    configured_roles = _configured_backup_roles(config, config_path=config_path)
+    configured_path_count = len(paths)
     seen_paths = {path.resolve(strict=False) for path in paths}
     for path in extra_paths or []:
         _add_path(paths, seen_paths, path)
@@ -262,21 +331,27 @@ def build_backup_archive(
             compression=zipfile.ZIP_DEFLATED,
             compresslevel=6,
         ) as archive:
-            for path in paths:
+            for path_index, path in enumerate(paths):
+                configured_recovery_file = path_index < configured_path_count
+                observed_exists = path.exists() or path.is_symlink()
                 entry: dict[str, Any] = {
                     "path": str(path),
                     "arcname": _arcname(path, root),
-                    "exists": path.exists(),
+                    "exists": observed_exists,
                     "included": False,
+                    "role": configured_roles.get(
+                        path.resolve(strict=False),
+                        "operator_extra"
+                        if not configured_recovery_file
+                        else "configured_recovery_file",
+                    ),
+                    "required_if_present": configured_recovery_file,
                 }
-                if path.resolve(strict=False) == config.experiment_memory_backup_file.resolve(
-                    strict=False
-                ):
-                    entry["role"] = "experiment_memory_snapshot"
-                if not path.exists():
-                    entry["reason"] = "missing"
-                elif path.is_symlink():
+                if path.is_symlink():
                     entry["reason"] = "symlink"
+                elif not path.exists():
+                    entry["reason"] = "missing"
+                    entry["optional_missing"] = True
                 elif not path.is_file():
                     entry["reason"] = "not_file"
                 else:
@@ -297,9 +372,15 @@ def build_backup_archive(
                 "max_file_bytes": max_file_bytes,
                 "experiment_memory_snapshot": memory_snapshot,
                 "files": manifest_entries,
-                "included_files": sum(
-                    1 for item in manifest_entries if item.get("included")
+                "required_recovery_files": sum(
+                    1 for item in manifest_entries if item.get("required_if_present") is True
                 ),
+                "required_recovery_roles": sorted(
+                    str(item["role"])
+                    for item in manifest_entries
+                    if item.get("required_if_present") is True
+                ),
+                "included_files": sum(1 for item in manifest_entries if item.get("included")),
                 "missing_files": sum(
                     1 for item in manifest_entries if item.get("reason") == "missing"
                 ),
@@ -308,10 +389,18 @@ def build_backup_archive(
                     for item in manifest_entries
                     if item.get("exists") and not item.get("included")
                 ),
+                "optional_missing_files": sum(
+                    1 for item in manifest_entries if item.get("optional_missing") is True
+                ),
+                "critical_skipped_files": sum(
+                    1
+                    for item in manifest_entries
+                    if item.get("required_if_present") is True
+                    and item.get("exists") is True
+                    and item.get("included") is not True
+                ),
             }
-            archive.writestr(
-                "MANIFEST.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-            )
+            archive.writestr("MANIFEST.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         archive_handle.flush()
         os.fsync(archive_handle.fileno())
     report = {
@@ -367,7 +456,9 @@ def verify_backup_archive(path: Path) -> dict[str, Any]:
                 return report
             files = manifest.get("files")
             if not isinstance(files, list):
-                issues.append({"code": "invalid_manifest_files", "message": "manifest files must be a list"})
+                issues.append(
+                    {"code": "invalid_manifest_files", "message": "manifest files must be a list"}
+                )
                 return report
             version = manifest.get("version")
             if version != SUPPORTED_MANIFEST_VERSION:
@@ -378,15 +469,37 @@ def verify_backup_archive(path: Path) -> dict[str, Any]:
                         "supported_version": SUPPORTED_MANIFEST_VERSION,
                     }
                 )
-            included_entries = [item for item in files if isinstance(item, dict) and item.get("included")]
+            included_entries = [
+                item for item in files if isinstance(item, dict) and item.get("included")
+            ]
+            required_entries = [
+                item
+                for item in files
+                if isinstance(item, dict) and item.get("required_if_present") is True
+            ]
+            for item in files:
+                if not isinstance(item, dict):
+                    continue
+                if (
+                    item.get("required_if_present") is True
+                    and item.get("exists") is True
+                    and item.get("included") is not True
+                ):
+                    issues.append(
+                        {
+                            "code": "required_recovery_file_skipped",
+                            "path": item.get("path"),
+                            "role": item.get("role"),
+                            "reason": item.get("reason"),
+                        }
+                    )
             memory_snapshot = manifest.get("experiment_memory_snapshot")
             if isinstance(memory_snapshot, dict):
                 report["experiment_memory_snapshot"] = memory_snapshot
                 snapshot_entries = [
                     item
                     for item in files
-                    if isinstance(item, dict)
-                    and item.get("role") == "experiment_memory_snapshot"
+                    if isinstance(item, dict) and item.get("role") == "experiment_memory_snapshot"
                 ]
                 if len(snapshot_entries) > 1:
                     issues.append(
@@ -423,6 +536,10 @@ def verify_backup_archive(path: Path) -> dict[str, Any]:
                 "included_files": manifest.get("included_files"),
                 "missing_files": manifest.get("missing_files"),
                 "skipped_files": manifest.get("skipped_files"),
+                "optional_missing_files": manifest.get("optional_missing_files"),
+                "critical_skipped_files": manifest.get("critical_skipped_files"),
+                "required_recovery_files": manifest.get("required_recovery_files"),
+                "required_recovery_roles": manifest.get("required_recovery_roles"),
             }
             if manifest.get("included_files") != len(included_entries):
                 issues.append(
@@ -432,6 +549,92 @@ def verify_backup_archive(path: Path) -> dict[str, Any]:
                         "actual_included_files": len(included_entries),
                     }
                 )
+            actual_counts = {
+                "missing_files": sum(
+                    1
+                    for item in files
+                    if isinstance(item, dict) and item.get("reason") == "missing"
+                ),
+                "skipped_files": sum(
+                    1
+                    for item in files
+                    if isinstance(item, dict)
+                    and item.get("exists") is True
+                    and item.get("included") is not True
+                ),
+                "optional_missing_files": sum(
+                    1
+                    for item in files
+                    if isinstance(item, dict) and item.get("optional_missing") is True
+                ),
+                "critical_skipped_files": sum(
+                    1
+                    for item in required_entries
+                    if item.get("exists") is True and item.get("included") is not True
+                ),
+            }
+            for field, actual_count in actual_counts.items():
+                if field in manifest and manifest.get(field) != actual_count:
+                    issues.append(
+                        {
+                            "code": f"{field.removesuffix('_files')}_count_mismatch",
+                            "manifest_count": manifest.get(field),
+                            "actual_count": actual_count,
+                        }
+                    )
+            declared_required_count = manifest.get("required_recovery_files")
+            if declared_required_count is not None and declared_required_count != len(
+                required_entries
+            ):
+                issues.append(
+                    {
+                        "code": "required_recovery_count_mismatch",
+                        "manifest_count": declared_required_count,
+                        "actual_count": len(required_entries),
+                    }
+                )
+            declared_required_roles = manifest.get("required_recovery_roles")
+            if declared_required_roles is not None:
+                if not isinstance(declared_required_roles, list) or any(
+                    not isinstance(role, str) or not role for role in declared_required_roles
+                ):
+                    issues.append({"code": "invalid_required_recovery_roles"})
+                else:
+                    actual_required_roles = [
+                        str(item.get("role") or "") for item in required_entries
+                    ]
+                    duplicate_declared_roles = sorted(
+                        role
+                        for role in set(declared_required_roles)
+                        if declared_required_roles.count(role) > 1
+                    )
+                    duplicate_actual_roles = sorted(
+                        role
+                        for role in set(actual_required_roles)
+                        if actual_required_roles.count(role) > 1
+                    )
+                    if duplicate_declared_roles or duplicate_actual_roles:
+                        issues.append(
+                            {
+                                "code": "duplicate_required_recovery_roles",
+                                "declared": duplicate_declared_roles,
+                                "actual": duplicate_actual_roles,
+                            }
+                        )
+                    missing_roles = sorted(
+                        set(declared_required_roles) - set(actual_required_roles)
+                    )
+                    unexpected_roles = sorted(
+                        set(actual_required_roles) - set(declared_required_roles)
+                    )
+                    if missing_roles or unexpected_roles:
+                        issues.append(
+                            {
+                                "code": "required_recovery_roles_mismatch",
+                                "missing_roles": missing_roles,
+                                "unexpected_roles": unexpected_roles,
+                            }
+                        )
             expected_archive_members = {
                 item.get("arcname")
                 for item in included_entries
@@ -505,7 +708,9 @@ def _safe_restore_target(restore_dir: Path, arcname: str) -> Path:
     return target
 
 
-def restore_backup_archive(path: Path, restore_dir: Path, *, overwrite: bool = False) -> dict[str, Any]:
+def restore_backup_archive(
+    path: Path, restore_dir: Path, *, overwrite: bool = False
+) -> dict[str, Any]:
     verification = verify_backup_archive(path)
     if not verification.get("ok"):
         raise ValueError(f"backup verification failed: {path}")
@@ -517,7 +722,8 @@ def restore_backup_archive(path: Path, restore_dir: Path, *, overwrite: bool = F
     with zipfile.ZipFile(path) as archive:
         manifest = json.loads(archive.read("MANIFEST.json"))
         included_entries = [
-            item for item in manifest.get("files", [])
+            item
+            for item in manifest.get("files", [])
             if isinstance(item, dict) and item.get("included")
         ]
         planned: list[tuple[dict[str, Any], Path]] = []
@@ -600,6 +806,9 @@ def backup_output_summary(report: dict[str, Any]) -> dict[str, Any]:
         "included_files": manifest.get("included_files"),
         "missing_files": manifest.get("missing_files"),
         "skipped_files": manifest.get("skipped_files"),
+        "optional_missing_files": manifest.get("optional_missing_files"),
+        "critical_skipped_files": manifest.get("critical_skipped_files"),
+        "required_recovery_files": manifest.get("required_recovery_files"),
         "experiment_memory_snapshot": manifest.get("experiment_memory_snapshot"),
         "retention": report.get("retention"),
         "verification": {
@@ -615,16 +824,32 @@ def backup_output_summary(report: dict[str, Any]) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create a small autopilot recovery backup zip.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--output", type=Path, help="Output zip path. Defaults to runtime/backups timestamped zip.")
+    parser.add_argument(
+        "--output", type=Path, help="Output zip path. Defaults to runtime/backups timestamped zip."
+    )
     parser.add_argument("--report", type=Path, help="Optional JSON report path.")
-    parser.add_argument("--verify", type=Path, help="Verify an existing backup zip instead of creating one.")
+    parser.add_argument(
+        "--verify", type=Path, help="Verify an existing backup zip instead of creating one."
+    )
     parser.add_argument("--restore", type=Path, help="Verify and extract an existing backup zip.")
-    parser.add_argument("--restore-dir", type=Path, help="Directory where --restore should extract files.")
-    parser.add_argument("--overwrite", action="store_true", help="Allow --restore to overwrite existing files.")
+    parser.add_argument(
+        "--restore-dir", type=Path, help="Directory where --restore should extract files."
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Allow --restore to overwrite existing files."
+    )
     parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
-    parser.add_argument("--max-backups", type=int, help="Keep only the newest N generated backup zip files.")
-    parser.add_argument("--extra", type=Path, action="append", default=[], help="Additional small file to include.")
-    parser.add_argument("--full-output", action="store_true", help="Print the full manifest instead of a compact summary.")
+    parser.add_argument(
+        "--max-backups", type=int, help="Keep only the newest N generated backup zip files."
+    )
+    parser.add_argument(
+        "--extra", type=Path, action="append", default=[], help="Additional small file to include."
+    )
+    parser.add_argument(
+        "--full-output",
+        action="store_true",
+        help="Print the full manifest instead of a compact summary.",
+    )
     return parser.parse_args()
 
 
@@ -640,7 +865,9 @@ def main() -> None:
         if args.restore_dir is None:
             raise SystemExit("--restore-dir is required with --restore")
         try:
-            report = restore_backup_archive(args.restore, args.restore_dir, overwrite=args.overwrite)
+            report = restore_backup_archive(
+                args.restore, args.restore_dir, overwrite=args.overwrite
+            )
         except Exception as exc:
             report = {
                 "ok": False,
@@ -659,7 +886,9 @@ def main() -> None:
         max_file_bytes=args.max_file_bytes,
     )
     if args.max_backups is not None and report["ok"]:
-        report["retention"] = prune_backup_archives(Path(report["output"]).parent, keep=args.max_backups)
+        report["retention"] = prune_backup_archives(
+            Path(report["output"]).parent, keep=args.max_backups
+        )
     if args.report:
         write_json_atomic(args.report, report)
     output = report if args.full_output else backup_output_summary(report)

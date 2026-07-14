@@ -23,9 +23,22 @@ from src.autopilot.approvals import (
     artifact_digest,
     is_valid_approval_actor,
     load_artifact,
+    load_production_preflight_evidence,
     strategy_fingerprint,
 )
-from src.autopilot.config import DEFAULT_CONFIG_PATH, ProductConfig, load_config
+from src.autopilot.candidate_evidence import (
+    CANDIDATE_PAPER_EXECUTION_SCHEMA,
+    CANDIDATE_PAPER_FORWARD_FILL_SOURCE,
+    CANDIDATE_PAPER_FORWARD_REASON,
+    candidate_paper_engine_digest,
+    validate_candidate_paper_engine_digest,
+)
+from src.autopilot.config import (
+    DEFAULT_CONFIG_PATH,
+    ProductConfig,
+    canonical_product_config,
+    load_config,
+)
 from src.autopilot.execution_identity import execution_engine_digest
 from src.autopilot.io import write_json_atomic, write_text_atomic
 from src.autopilot.reporting import utc_now
@@ -85,10 +98,31 @@ def _load_trade_log(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+def _strict_csv_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    return None
+
+
 def _empty_paper_stats(
     *,
     unbound_trade_rows: int = 0,
     other_fingerprint_rows: int = 0,
+    unbound_artifact_rows: int = 0,
+    other_artifact_rows: int = 0,
+    legacy_execution_rows: int = 0,
+    other_execution_rows: int = 0,
+    legacy_evidence_rows: int = 0,
+    non_promotable_evidence_rows: int = 0,
+    invalid_evidence_rows: int = 0,
+    expected_artifact_digest: str | None = None,
+    expected_execution_schema: str | None = None,
+    expected_execution_engine_digest: str | None = None,
 ) -> dict[str, Any]:
     return {
         "trades": 0,
@@ -104,6 +138,16 @@ def _empty_paper_stats(
         "invalid_return_rows": 0,
         "unbound_trade_rows": unbound_trade_rows,
         "other_fingerprint_rows": other_fingerprint_rows,
+        "unbound_artifact_rows": unbound_artifact_rows,
+        "other_artifact_rows": other_artifact_rows,
+        "legacy_execution_rows": legacy_execution_rows,
+        "other_execution_rows": other_execution_rows,
+        "legacy_evidence_rows": legacy_evidence_rows,
+        "non_promotable_evidence_rows": non_promotable_evidence_rows,
+        "invalid_evidence_rows": invalid_evidence_rows,
+        "expected_artifact_digest": expected_artifact_digest,
+        "expected_execution_schema": expected_execution_schema,
+        "expected_execution_engine_digest": expected_execution_engine_digest,
     }
 
 
@@ -111,24 +155,134 @@ def _paper_stats(
     trades: pd.DataFrame,
     strategy_id: str,
     fingerprint: str,
+    *,
+    expected_artifact_digest: str | None = None,
+    expected_execution_schema: str | None = None,
+    expected_execution_engine_digest: str | None = None,
 ) -> dict[str, Any]:
+    binding_stats = {
+        "expected_artifact_digest": expected_artifact_digest,
+        "expected_execution_schema": expected_execution_schema,
+        "expected_execution_engine_digest": expected_execution_engine_digest,
+    }
     if trades.empty or "strategy_id" not in trades.columns:
-        return _empty_paper_stats()
+        return _empty_paper_stats(**binding_stats)
     id_subset = trades[trades["strategy_id"] == strategy_id].copy()
     if id_subset.empty:
-        return _empty_paper_stats()
+        return _empty_paper_stats(**binding_stats)
     if "strategy_fingerprint" not in id_subset.columns:
-        return _empty_paper_stats(unbound_trade_rows=int(len(id_subset)))
+        return _empty_paper_stats(
+            unbound_trade_rows=int(len(id_subset)),
+            **binding_stats,
+        )
     fingerprints = id_subset["strategy_fingerprint"]
     bound = fingerprints.map(lambda value: isinstance(value, str) and bool(value.strip()))
     exact = bound & (fingerprints == fingerprint)
     unbound_trade_rows = int((~bound).sum())
     other_fingerprint_rows = int((bound & ~exact).sum())
     subset = id_subset[exact].copy()
+    unbound_artifact_rows = 0
+    other_artifact_rows = 0
+    if expected_artifact_digest is not None:
+        if "artifact_digest" not in subset.columns:
+            unbound_artifact_rows = int(len(subset))
+            subset = subset.iloc[0:0].copy()
+        else:
+            artifacts = subset["artifact_digest"]
+            artifact_bound = artifacts.map(
+                lambda value: isinstance(value, str) and bool(value.strip())
+            )
+            artifact_exact = artifact_bound & (artifacts == expected_artifact_digest)
+            unbound_artifact_rows = int((~artifact_bound).sum())
+            other_artifact_rows = int((artifact_bound & ~artifact_exact).sum())
+            subset = subset[artifact_exact].copy()
+
+    legacy_execution_rows = 0
+    other_execution_rows = 0
+    legacy_evidence_rows = 0
+    non_promotable_evidence_rows = 0
+    invalid_evidence_rows = 0
+    if expected_execution_schema is not None:
+        if expected_execution_engine_digest is None:
+            raise ValueError("expected_execution_engine_digest is required with execution schema")
+        if (
+            "candidate_paper_execution_schema" not in subset.columns
+            or "candidate_paper_engine_digest" not in subset.columns
+        ):
+            legacy_execution_rows = int(len(subset))
+            subset = subset.iloc[0:0].copy()
+        else:
+            schemas = subset["candidate_paper_execution_schema"]
+            engines = subset["candidate_paper_engine_digest"]
+            schema_bound = schemas.map(lambda value: isinstance(value, str) and bool(value.strip()))
+            engine_bound = engines.map(lambda value: isinstance(value, str) and bool(value.strip()))
+            execution_bound = schema_bound & engine_bound
+            execution_exact = (
+                execution_bound
+                & (schemas == expected_execution_schema)
+                & (engines == expected_execution_engine_digest)
+            )
+            legacy_execution_rows = int((~execution_bound).sum())
+            other_execution_rows = int((execution_bound & ~execution_exact).sum())
+            subset = subset[execution_exact].copy()
+        required_evidence_columns = {
+            "candidate_paper_evidence_eligible",
+            "candidate_paper_evidence_reason",
+            "candidate_paper_entry_fill_source",
+            "candidate_paper_observed_at",
+            "entry_time",
+            "exit_time",
+        }
+        if not required_evidence_columns.issubset(subset.columns):
+            legacy_evidence_rows = int(len(subset))
+            subset = subset.iloc[0:0].copy()
+        elif not subset.empty:
+            eligibility = subset["candidate_paper_evidence_eligible"].map(_strict_csv_bool)
+            explicitly_non_promotable = eligibility.map(lambda value: value is False)
+            potentially_promotable = eligibility.map(lambda value: value is True)
+            observed_at = pd.to_datetime(
+                subset["candidate_paper_observed_at"],
+                utc=True,
+                errors="coerce",
+            )
+            entry_time = pd.to_datetime(
+                subset["entry_time"],
+                utc=True,
+                errors="coerce",
+            )
+            exit_time = pd.to_datetime(
+                subset["exit_time"],
+                utc=True,
+                errors="coerce",
+            )
+            valid_forward = (
+                potentially_promotable
+                & (subset["candidate_paper_evidence_reason"] == CANDIDATE_PAPER_FORWARD_REASON)
+                & (
+                    subset["candidate_paper_entry_fill_source"]
+                    == CANDIDATE_PAPER_FORWARD_FILL_SOURCE
+                )
+                & observed_at.notna()
+                & entry_time.notna()
+                & exit_time.notna()
+                & (observed_at == entry_time)
+                & (exit_time > observed_at)
+            )
+            non_promotable_evidence_rows = int(explicitly_non_promotable.sum())
+            invalid_evidence_rows = int((~valid_forward & ~explicitly_non_promotable).sum())
+            subset = subset[valid_forward].copy()
     if subset.empty:
         return _empty_paper_stats(
             unbound_trade_rows=unbound_trade_rows,
             other_fingerprint_rows=other_fingerprint_rows,
+            unbound_artifact_rows=unbound_artifact_rows,
+            other_artifact_rows=other_artifact_rows,
+            legacy_execution_rows=legacy_execution_rows,
+            other_execution_rows=other_execution_rows,
+            legacy_evidence_rows=legacy_evidence_rows,
+            non_promotable_evidence_rows=non_promotable_evidence_rows,
+            invalid_evidence_rows=invalid_evidence_rows,
+            **binding_stats,
         )
     if "exit_time" in subset.columns:
         subset["_exit_time"] = pd.to_datetime(subset["exit_time"], utc=True, errors="coerce")
@@ -148,16 +302,26 @@ def _paper_stats(
     net = pd.to_numeric(net_raw, errors="coerce")
     sized = pd.to_numeric(sized_raw, errors="coerce")
     net_finite = net.map(lambda value: math.isfinite(float(value)) if pd.notna(value) else False)
-    sized_finite = sized.map(lambda value: math.isfinite(float(value)) if pd.notna(value) else False)
+    sized_finite = sized.map(
+        lambda value: math.isfinite(float(value)) if pd.notna(value) else False
+    )
     valid_return_rows = net_finite & sized_finite
     invalid_return_rows = int((~valid_return_rows).sum())
     valid_net = net[net_finite]
     sized_for_stats = sized.where(sized_finite, 0.0).fillna(0.0)
     equity = pd.to_numeric(subset.get("equity_after"), errors="coerce")
-    if equity.notna().any():
+    if expected_execution_schema is not None:
+        # Candidate account equity may include quarantined downtime replay.
+        # Rebuild the promotion curve only from genuine-forward rows so those
+        # historical simulations cannot improve or worsen qualifying evidence.
+        equity_curve = (1.0 + sized_for_stats).cumprod()
+        last_equity = float(equity_curve.iloc[-1]) if len(equity_curve) else None
+    elif equity.notna().any():
         equity_curve = equity.dropna().astype(float)
+        last_equity = float(equity.dropna().iloc[-1])
     else:
         equity_curve = (1.0 + sized_for_stats).cumprod()
+        last_equity = float(equity_curve.iloc[-1]) if len(equity_curve) else None
     running_peak = equity_curve.cummax()
     drawdown = (equity_curve / running_peak) - 1.0
     max_drawdown = abs(float(drawdown.min())) if len(drawdown) else None
@@ -178,7 +342,7 @@ def _paper_stats(
         "win_rate": float((valid_net > 0).mean()) if not valid_net.empty else None,
         "total_sized_return": float(sized_for_stats.sum()),
         "avg_net_return": float(valid_net.mean()) if not valid_net.empty else None,
-        "last_equity": float(equity.dropna().iloc[-1]) if equity.notna().any() else None,
+        "last_equity": last_equity,
         "max_drawdown": max_drawdown,
         "max_consecutive_losses": max_loss_streak,
         "first_exit_time": first_exit.isoformat() if first_exit is not None else None,
@@ -187,6 +351,14 @@ def _paper_stats(
         "invalid_return_rows": invalid_return_rows,
         "unbound_trade_rows": unbound_trade_rows,
         "other_fingerprint_rows": other_fingerprint_rows,
+        "unbound_artifact_rows": unbound_artifact_rows,
+        "other_artifact_rows": other_artifact_rows,
+        "legacy_execution_rows": legacy_execution_rows,
+        "other_execution_rows": other_execution_rows,
+        "legacy_evidence_rows": legacy_evidence_rows,
+        "non_promotable_evidence_rows": non_promotable_evidence_rows,
+        "invalid_evidence_rows": invalid_evidence_rows,
+        **binding_stats,
     }
 
 
@@ -231,19 +403,24 @@ def _approval_status(
         return "execution_engine_mismatch"
     if product is not None:
         approved_product = entry.get("product")
-        if not isinstance(approved_product, dict):
+        if approved_product != canonical_product_config(product):
             return "product_mismatch"
-        if (
-            approved_product.get("name") != product.name
-            or approved_product.get("objective") != product.objective
-            or approved_product.get("market") != product.market
-            or str(approved_product.get("symbol", "")).upper() != product.symbol.upper()
-            or str(approved_product.get("base_asset", "")).upper() != product.base_asset.upper()
-            or approved_product.get("starting_equity") != product.starting_equity
-            or approved_product.get("regime_guard") is not product.regime_guard
-            or approved_product.get("regime_mayer_top") != product.regime_mayer_top
-        ):
-            return "product_mismatch"
+        if product.execution_mode == "live":
+            try:
+                current_preflight = load_production_preflight_evidence(
+                    product,
+                    expected_artifact_digest=artifact_digest_value,
+                    require_fresh=False,
+                )
+            except ApprovalError:
+                return "production_preflight_invalid"
+            approved_preflight = entry.get("production_preflight")
+            if not isinstance(approved_preflight, dict) or (
+                approved_preflight.get("manifest") != current_preflight.get("manifest")
+                or approved_preflight.get("manifest_digest")
+                != current_preflight.get("manifest_digest")
+            ):
+                return "production_preflight_mismatch"
     return "approved"
 
 
@@ -297,20 +474,25 @@ def _recommendation(
         reasons.append(f"holdout_total_return {holdout:.6f} <= {thresholds.min_holdout_return:.6f}")
     if paper["trades"] < thresholds.min_paper_trades:
         reasons.append(
-            "exact-fingerprint paper trades "
-            f"{paper['trades']} < {thresholds.min_paper_trades}"
+            f"exact-fingerprint paper trades {paper['trades']} < {thresholds.min_paper_trades}"
         )
     if paper.get("invalid_return_rows", 0) > 0:
         reasons.append(f"paper trade log has {paper['invalid_return_rows']} invalid return row(s)")
+    if paper.get("invalid_evidence_rows", 0) > 0:
+        reasons.append(
+            f"paper trade log has {paper['invalid_evidence_rows']} invalid forward-evidence row(s)"
+        )
     if paper["total_sized_return"] <= thresholds.min_paper_sized_return:
         reasons.append(
             f"paper total_sized_return {paper['total_sized_return']:.6f} "
             f"<= {thresholds.min_paper_sized_return:.6f}"
         )
-    if paper.get("max_drawdown") is not None and paper["max_drawdown"] > thresholds.max_paper_drawdown:
+    if (
+        paper.get("max_drawdown") is not None
+        and paper["max_drawdown"] > thresholds.max_paper_drawdown
+    ):
         reasons.append(
-            f"paper max_drawdown {paper['max_drawdown']:.6f} "
-            f"> {thresholds.max_paper_drawdown:.6f}"
+            f"paper max_drawdown {paper['max_drawdown']:.6f} > {thresholds.max_paper_drawdown:.6f}"
         )
     if paper.get("max_consecutive_losses", 0) > thresholds.max_paper_consecutive_losses:
         reasons.append(
@@ -318,7 +500,9 @@ def _recommendation(
             f"> {thresholds.max_paper_consecutive_losses}"
         )
     if paper.get("paper_days", 0.0) < thresholds.min_paper_days:
-        reasons.append(f"paper days {paper.get('paper_days', 0.0):.2f} < {thresholds.min_paper_days:.2f}")
+        reasons.append(
+            f"paper days {paper.get('paper_days', 0.0):.2f} < {thresholds.min_paper_days:.2f}"
+        )
     if approval_status == "approved":
         if reasons:
             return "approved_review_failed", reasons
@@ -336,6 +520,7 @@ def build_promotion_review(
     thresholds: PromotionThresholds | None = None,
     product: ProductConfig | None = None,
     config_path: Path = DEFAULT_CONFIG_PATH,
+    require_candidate_paper_binding: bool = False,
 ) -> dict[str, Any]:
     thresholds = thresholds or PromotionThresholds()
     threshold_errors = _threshold_errors(thresholds)
@@ -364,6 +549,26 @@ def build_promotion_review(
     artifact = load_artifact(artifact_path)
     current_artifact_digest = artifact_digest(artifact)
     current_execution_engine_digest = execution_engine_digest()
+    require_candidate_paper_binding = bool(
+        require_candidate_paper_binding or isinstance(artifact.get("candidate_activation"), dict)
+    )
+    candidate_execution_schema = None
+    candidate_execution_engine_digest = None
+    candidate_evidence_artifact_digest = None
+    if require_candidate_paper_binding:
+        candidate_execution_schema = CANDIDATE_PAPER_EXECUTION_SCHEMA
+        candidate_execution_engine_digest = candidate_paper_engine_digest(
+            runtime_digest=current_execution_engine_digest
+        )
+        validate_candidate_paper_engine_digest(candidate_execution_engine_digest)
+        activation = artifact.get("candidate_activation")
+        candidate_evidence_artifact_digest = (
+            activation.get("candidate_artifact_digest")
+            if isinstance(activation, dict)
+            else current_artifact_digest
+        )
+        if not isinstance(candidate_evidence_artifact_digest, str):
+            candidate_evidence_artifact_digest = current_artifact_digest
     trades = _load_trade_log(trade_log)
     ledger_error = None
     try:
@@ -378,11 +583,7 @@ def build_promotion_review(
     if product is None:
         artifact_policy_errors: list[str] = []
     else:
-        strategy_error_set = {
-            error
-            for errors in per_strategy_policy_errors
-            for error in errors
-        }
+        strategy_error_set = {error for errors in per_strategy_policy_errors for error in errors}
         artifact_policy_errors = [
             error
             for error in validate_strategy_artifact(product, artifact)
@@ -392,7 +593,14 @@ def build_promotion_review(
     strategies = []
     for index, strategy in enumerate(artifact.get("strategies", [])):
         fingerprint = strategy_fingerprint(strategy)
-        paper = _paper_stats(trades, strategy.get("id", ""), fingerprint)
+        paper = _paper_stats(
+            trades,
+            strategy.get("id", ""),
+            fingerprint,
+            expected_artifact_digest=candidate_evidence_artifact_digest,
+            expected_execution_schema=candidate_execution_schema,
+            expected_execution_engine_digest=candidate_execution_engine_digest,
+        )
         status = (
             "ledger_error"
             if ledger_error is not None
@@ -419,6 +627,17 @@ def build_promotion_review(
             recommendation = "not_ready"
             reasons.append("product context is required before generating an approval command")
         if recommendation == "needs_approval":
+            preflight_digest = "<reviewed-production-preflight-sha256>"
+            if product is not None and product.execution_mode == "live":
+                try:
+                    evidence = load_production_preflight_evidence(
+                        product,
+                        expected_artifact_digest=current_artifact_digest,
+                    )
+                except ApprovalError:
+                    pass
+                else:
+                    preflight_digest = str(evidence["source_report_digest"])
             command = [
                 "python",
                 "-m",
@@ -435,6 +654,8 @@ def build_promotion_review(
                     str(artifact_path),
                     "--expected-artifact-digest",
                     current_artifact_digest,
+                    "--expected-preflight-digest",
+                    preflight_digest,
                     "--strategy-id",
                     str(strategy.get("id")),
                     "--approved-by",
@@ -469,6 +690,12 @@ def build_promotion_review(
         "artifact_path": str(artifact_path),
         "artifact_digest": current_artifact_digest,
         "execution_engine_digest": current_execution_engine_digest,
+        "candidate_paper_execution_binding": {
+            "required": require_candidate_paper_binding,
+            "execution_schema": candidate_execution_schema,
+            "execution_engine_digest": candidate_execution_engine_digest,
+            "artifact_digest": candidate_evidence_artifact_digest,
+        },
         "trade_log": str(trade_log),
         "ledger_path": str(ledger_path),
         "product": None
@@ -530,6 +757,18 @@ def render_markdown(review: dict[str, Any]) -> str:
         if approval_ledger.get("error"):
             lines.append(f"Approval ledger error: `{approval_ledger['error']}`")
         lines.append("")
+    candidate_binding = review.get("candidate_paper_execution_binding")
+    if isinstance(candidate_binding, dict) and candidate_binding.get("required") is True:
+        lines.extend(
+            [
+                "Candidate paper execution binding: `required`",
+                f"Candidate paper schema: `{candidate_binding.get('execution_schema')}`",
+                "Candidate paper engine digest: "
+                f"`{candidate_binding.get('execution_engine_digest')}`",
+                f"Candidate evidence artifact digest: `{candidate_binding.get('artifact_digest')}`",
+                "",
+            ]
+        )
     if review.get("status") == "waiting_for_strategy_artifact":
         lines.extend(
             [
@@ -567,6 +806,15 @@ def render_markdown(review: dict[str, Any]) -> str:
                 "",
                 f"Fingerprint: `{item['fingerprint']}`",
                 f"Policy: `{item.get('policy_status', 'not_checked')}`",
+                "Quarantined candidate rows: "
+                f"legacy execution={item['paper'].get('legacy_execution_rows', 0)}, "
+                f"other execution={item['paper'].get('other_execution_rows', 0)}, "
+                f"legacy evidence={item['paper'].get('legacy_evidence_rows', 0)}, "
+                "downtime/non-promotable evidence="
+                f"{item['paper'].get('non_promotable_evidence_rows', 0)}, "
+                f"invalid evidence={item['paper'].get('invalid_evidence_rows', 0)}, "
+                f"unbound artifact={item['paper'].get('unbound_artifact_rows', 0)}, "
+                f"other artifact={item['paper'].get('other_artifact_rows', 0)}",
                 "",
                 "Reasons:",
             ]
@@ -577,7 +825,9 @@ def render_markdown(review: dict[str, Any]) -> str:
         if item.get("approval_command"):
             lines.extend([f"```bash\n{item['approval_command']}\n```", ""])
         else:
-            lines.extend(["Not emitted because this strategy is not in `needs_approval` state.", ""])
+            lines.extend(
+                ["Not emitted because this strategy is not in `needs_approval` state.", ""]
+            )
     return "\n".join(lines)
 
 
@@ -587,7 +837,9 @@ def write_review(review: dict[str, Any], output_json: Path, output_md: Path | No
         write_text_atomic(output_md, render_markdown(review))
 
 
-def find_product_for_review(config_path: Path, product_name: str | None, artifact_path: Path) -> ProductConfig | None:
+def find_product_for_review(
+    config_path: Path, product_name: str | None, artifact_path: Path
+) -> ProductConfig | None:
     if product_name is None and not config_path.exists():
         return None
     config = load_config(config_path)
@@ -598,7 +850,9 @@ def find_product_for_review(config_path: Path, product_name: str | None, artifac
         raise ValueError(f"No product named {product_name!r} in {config_path}.")
 
     expected = artifact_path.resolve()
-    matches = [product for product in config.products if product.strategies_path.resolve() == expected]
+    matches = [
+        product for product in config.products if product.strategies_path.resolve() == expected
+    ]
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:

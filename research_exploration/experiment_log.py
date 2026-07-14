@@ -18,7 +18,7 @@ import argparse
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 DEFAULT_LOG = Path("outputs/research_exploration/experiment_log.jsonl")
@@ -29,9 +29,14 @@ VERDICTS = ("keep", "reject", "inconclusive", "needs_data", "error")
 def _git_sha() -> str | None:
     try:
         import subprocess
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
-        ).decode().strip()
+
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
     except Exception:
         return None
 
@@ -48,10 +53,10 @@ class ExperimentRecord:
     family: str
     direction: str
     fingerprint: str
-    verdict: str                       # one of VERDICTS
+    verdict: str  # one of VERDICTS
     metrics: dict[str, float] = field(default_factory=dict)
     config: dict[str, object] = field(default_factory=dict)
-    data_window: dict[str, str] = field(default_factory=dict)   # train/val/holdout ranges
+    data_window: dict[str, str] = field(default_factory=dict)  # train/val/holdout ranges
     notes: str = ""
     hypothesis: dict | None = None  # full hypothesis dict for provenance
     timestamp: str = ""
@@ -61,7 +66,7 @@ class ExperimentRecord:
         if self.verdict not in VERDICTS:
             raise ValueError(f"verdict must be one of {VERDICTS}, got {self.verdict!r}")
         if not self.timestamp:
-            self.timestamp = datetime.now(timezone.utc).isoformat()
+            self.timestamp = datetime.now(UTC).isoformat()
         if self.git_sha is None:
             self.git_sha = _git_sha()
 
@@ -92,6 +97,7 @@ def summarize(log_path: Path = DEFAULT_LOG) -> str:
     if not rows:
         return "No experiments logged yet."
     from collections import Counter
+
     by_verdict = Counter(r["verdict"] for r in rows)
     by_family = Counter(r["family"] for r in rows)
     keepers = [r for r in rows if r["verdict"] == "keep"]
@@ -104,8 +110,8 @@ def summarize(log_path: Path = DEFAULT_LOG) -> str:
         for r in keepers:
             m = r.get("metrics", {})
             lines.append(
-                f"  {r['hypothesis_id']:40} trades={m.get('trades','?')} "
-                f"sharpe={m.get('sharpe','?')} dsr={m.get('psr', m.get('dsr','?'))}"
+                f"  {r['hypothesis_id']:40} trades={m.get('trades', '?')} "
+                f"sharpe={m.get('sharpe', '?')} dsr={m.get('psr', m.get('dsr', '?'))}"
             )
     return "\n".join(lines)
 
@@ -118,7 +124,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.tail:
-        for r in load_log(args.log)[-args.tail:]:
+        for r in load_log(args.log)[-args.tail :]:
             m = r.get("metrics", {})
             print(f"[{r['timestamp'][:19]}] {r['verdict']:12} {r['hypothesis_id']}  {m}")
     if args.summary or not args.tail:

@@ -28,7 +28,7 @@ def test_service_dry_run_make_target_uses_local_unit_dir():
 
     assert ".PHONY: service-dry-run" in makefile
     assert 'UNIT_DIR="$(CURDIR)/runtime/systemd-dry-run"' in makefile
-    assert 'DRY_RUN=1 bash scripts/install_autopilot_service.sh' in makefile
+    assert "DRY_RUN=1 bash scripts/install_autopilot_service.sh" in makefile
 
 
 def test_candidate_activation_make_target_requires_explicit_confirmation():
@@ -45,7 +45,10 @@ def test_autonomous_research_targets_generate_then_validate_typed_batch():
     makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
 
     assert ".PHONY: research-factory-validate" in makefile
-    assert "-m src.autopilot.research_factory --config config/research_factory.json --validate" in makefile
+    assert (
+        "-m src.autopilot.research_factory --config config/research_factory.json --validate"
+        in makefile
+    )
     assert ".PHONY: research-generate" in makefile
     assert "--output runtime/research/generated_hypotheses.json" in makefile
     assert "--include-generated --generated-only" in makefile

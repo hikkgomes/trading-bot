@@ -27,7 +27,9 @@ def _summarize_table(table: pd.DataFrame) -> dict[str, Any]:
     return {
         "rows": int(len(table)),
         "positive_return_rows": int((table.get("total_return", pd.Series(dtype=float)) > 0).sum()),
-        "error_rows": int(table.get("error", pd.Series(dtype=object)).notna().sum()) if "error" in table else 0,
+        "error_rows": int(table.get("error", pd.Series(dtype=object)).notna().sum())
+        if "error" in table
+        else 0,
         "best_strategy": str(best.get("strategy", "")),
         "best_total_return": _finite_float(best.get("total_return")),
         "best_dsr": _finite_float(best.get("dsr")),
@@ -129,7 +131,9 @@ def run_strategy_smoke(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run lightweight strategy framework smoke checks.")
     parser.add_argument("--synthetic-rows", type=int, default=1600)
-    parser.add_argument("--regime-input", type=Path, default=Path("runtime/regime/futures_15m_regime.parquet"))
+    parser.add_argument(
+        "--regime-input", type=Path, default=Path("runtime/regime/futures_15m_regime.parquet")
+    )
     parser.add_argument("--max-regime-rows", type=int, default=50_000)
     parser.add_argument("--output", type=Path, help="Optional JSON report path.")
     return parser.parse_args()

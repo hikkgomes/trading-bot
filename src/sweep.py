@@ -87,7 +87,10 @@ def _param_combos(grid: dict[str, list]) -> list[dict]:
     if not grid:
         return [{}]
     keys = list(grid)
-    return [dict(zip(keys, combo, strict=False)) for combo in itertools.product(*(grid[k] for k in keys))]
+    return [
+        dict(zip(keys, combo, strict=False))
+        for combo in itertools.product(*(grid[k] for k in keys))
+    ]
 
 
 def _deflated_sharpe(returns: np.ndarray, *, n_trials: int) -> float:
@@ -153,7 +156,9 @@ def _walk_forward_stats(
         "wf_pass_rate": float(passed / len(rows)) if rows else 0.0,
         "wf_expectancy": float(np.mean([row["total_return"] for row in rows])) if rows else 0.0,
         "wf_trades": int(sum(row["trades"] for row in rows)),
-        "wf_window_returns": json_dumps_compact([round(float(row["total_return"]), 8) for row in rows]),
+        "wf_window_returns": json_dumps_compact(
+            [round(float(row["total_return"]), 8) for row in rows]
+        ),
         "wf_returns": np.asarray(returns, dtype=float),
     }
 
@@ -184,14 +189,18 @@ def run_sweep(
     split = int(len(df) * train_fraction)
     train_df, score_df = df.iloc[:split], df.iloc[split:]
     if len(score_df) < 50:
-        raise SystemExit(f"Holdout too small ({len(score_df)} rows). Lower --train-fraction or add data.")
+        raise SystemExit(
+            f"Holdout too small ({len(score_df)} rows). Lower --train-fraction or add data."
+        )
 
     rows: list[dict] = []
     n_trials = sum(len(_param_combos(grids.get(name, {}))) for name in strategy_names)
     for name in strategy_names:
         cls = get(name)
         for params in _param_combos(grids.get(name, {})):
-            label = name if not params else f"{name}[{','.join(f'{k}={v}' for k, v in params.items())}]"
+            label = (
+                name if not params else f"{name}[{','.join(f'{k}={v}' for k, v in params.items())}]"
+            )
             try:
                 strat = cls(**params)
                 cfg = _apply_overrides(_default_config(strat), overrides)
@@ -219,7 +228,15 @@ def run_sweep(
                 rows.append(summary)
             except Exception as exc:  # keep the sweep going if one strategy fails
                 LOGGER.warning("Strategy %s failed: %s", label, exc)
-                rows.append({"strategy": label, "trades": 0, "n_trials": n_trials, "dsr": 0.0, "error": str(exc)})
+                rows.append(
+                    {
+                        "strategy": label,
+                        "trades": 0,
+                        "n_trials": n_trials,
+                        "dsr": 0.0,
+                        "error": str(exc),
+                    }
+                )
 
     pnl_unit = overrides.get("pnl_unit") or "usdt"
     bh = _buy_and_hold(score_df, base_tf, pnl_unit)
@@ -244,16 +261,39 @@ def main(argv=None):
     src.add_argument("--input", help="Parquet/CSV with OHLCV (+ features).")
     src.add_argument("--synthetic", type=int, metavar="N", help="Use N bars of synthetic OHLCV.")
 
-    parser.add_argument("--grid", action="append", help="Param grid key=v1,v2,.. (repeatable; needs --strategy).")
-    parser.add_argument("--base-tf", default=None, help="Base timeframe for tf_{tf}_ column resolution.")
-    parser.add_argument("--train-fraction", type=float, default=0.7, help="Chronological train split (rest is the scored holdout).")
-    parser.add_argument("--walk-forward-windows", type=int, default=0,
-                        help="Optional number of chronological post-train windows to score.")
-    parser.add_argument("--min-dsr", type=float, default=None,
-                        help="Filter displayed/output rows to deflated Sharpe >= this value.")
-    parser.add_argument("--min-wf-pass-rate", type=float, default=None,
-                        help="With --walk-forward-windows, filter rows to wf_pass_rate >= this value.")
-    parser.add_argument("--sort-by", default="sharpe", help="Metric column to sort the table by (default: sharpe).")
+    parser.add_argument(
+        "--grid", action="append", help="Param grid key=v1,v2,.. (repeatable; needs --strategy)."
+    )
+    parser.add_argument(
+        "--base-tf", default=None, help="Base timeframe for tf_{tf}_ column resolution."
+    )
+    parser.add_argument(
+        "--train-fraction",
+        type=float,
+        default=0.7,
+        help="Chronological train split (rest is the scored holdout).",
+    )
+    parser.add_argument(
+        "--walk-forward-windows",
+        type=int,
+        default=0,
+        help="Optional number of chronological post-train windows to score.",
+    )
+    parser.add_argument(
+        "--min-dsr",
+        type=float,
+        default=None,
+        help="Filter displayed/output rows to deflated Sharpe >= this value.",
+    )
+    parser.add_argument(
+        "--min-wf-pass-rate",
+        type=float,
+        default=None,
+        help="With --walk-forward-windows, filter rows to wf_pass_rate >= this value.",
+    )
+    parser.add_argument(
+        "--sort-by", default="sharpe", help="Metric column to sort the table by (default: sharpe)."
+    )
     parser.add_argument("--out", help="Write the ranked table to this CSV path.")
     # Trade-model overrides (apply to every strategy in the sweep).
     parser.add_argument("--fee-bps", type=float, default=None)
@@ -287,13 +327,20 @@ def main(argv=None):
     LOGGER.info("Loaded %d rows; %d strategies", len(df), len(names))
 
     overrides = {
-        "fee_bps": args.fee_bps, "slippage_bps": args.slippage_bps,
-        "take_profit": args.tp, "stop_loss": args.sl,
-        "horizon_bars": args.horizon, "pnl_unit": args.pnl_unit,
+        "fee_bps": args.fee_bps,
+        "slippage_bps": args.slippage_bps,
+        "take_profit": args.tp,
+        "stop_loss": args.sl,
+        "horizon_bars": args.horizon,
+        "pnl_unit": args.pnl_unit,
     }
     table = run_sweep(
-        df, names, base_tf=args.base_tf, train_fraction=args.train_fraction,
-        overrides=overrides, grids=grids,
+        df,
+        names,
+        base_tf=args.base_tf,
+        train_fraction=args.train_fraction,
+        overrides=overrides,
+        grids=grids,
         walk_forward_windows=max(0, int(args.walk_forward_windows)),
     )
     if args.min_dsr is not None and "dsr" in table.columns:
@@ -304,14 +351,31 @@ def main(argv=None):
     sort_col = args.sort_by if args.sort_by in table.columns else "total_return"
     table = table.sort_values(sort_col, ascending=False, na_position="last").reset_index(drop=True)
 
-    display_cols = [c for c in
-                    ["strategy", "trades", "win_rate", "total_return", "vs_buy_hold",
-                     "max_drawdown", "profit_factor", "sharpe", "psr", "dsr",
-                     "wf_pass_rate", "wf_expectancy", "wf_dsr", "error"]
-                    if c in table.columns]
+    display_cols = [
+        c
+        for c in [
+            "strategy",
+            "trades",
+            "win_rate",
+            "total_return",
+            "vs_buy_hold",
+            "max_drawdown",
+            "profit_factor",
+            "sharpe",
+            "psr",
+            "dsr",
+            "wf_pass_rate",
+            "wf_expectancy",
+            "wf_dsr",
+            "error",
+        ]
+        if c in table.columns
+    ]
     bh = table.attrs.get("buy_and_hold", float("nan"))
     print(f"\nHoldout rows: {table.attrs.get('holdout_rows')}  |  buy & hold return: {bh:+.4f}\n")
-    with pd.option_context("display.max_rows", None, "display.width", 160, "display.float_format", lambda v: f"{v:.4f}"):
+    with pd.option_context(
+        "display.max_rows", None, "display.width", 160, "display.float_format", lambda v: f"{v:.4f}"
+    ):
         print(table[display_cols].to_string(index=False))
 
     if args.out:

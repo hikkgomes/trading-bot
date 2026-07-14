@@ -12,11 +12,44 @@ from typing import Any
 
 from src.autopilot.config import DEFAULT_CONFIG_PATH, AutopilotConfig, load_config
 from src.autopilot.io import write_json_atomic
-from src.autopilot.notifications import emit_alert, research_handoff_warning_detail
+from src.autopilot.notifications import (
+    emit_alert,
+    research_handoff_warning_detail,
+    wait_for_remote_alerts,
+)
 from src.autopilot.readiness import build_readiness_report
 from src.autopilot.reporting import build_operator_report
 
 LOGGER = logging.getLogger("autopilot.healthcheck")
+REMOTE_ALERT_DRAIN_SECONDS = 30.0
+
+
+def _drain_oneshot_remote_alert(health: dict[str, Any]) -> None:
+    """Keep a oneshot watchdog alive until its queued remote alert is delivered.
+
+    Long-running supervision remains non-blocking, but a daemon delivery thread
+    cannot outlive a systemd ``Type=oneshot`` process.  The local JSONL alert is
+    already durable; this bounded drain gives webhook/Telegram delivery enough
+    time to finish and records a timeout without hiding the health result.
+    """
+
+    alert = health.get("healthcheck_alert")
+    if not isinstance(alert, dict):
+        return
+    remote = alert.get("remote_delivery")
+    if not isinstance(remote, dict) or remote.get("status") != "queued":
+        return
+    try:
+        drained = wait_for_remote_alerts(REMOTE_ALERT_DRAIN_SECONDS)
+    except Exception as exc:  # alert delivery must not suppress watchdog output
+        LOGGER.exception("Failed while draining the healthcheck remote-alert queue")
+        remote.update(drained=False, drain_error=f"{type(exc).__name__}: {exc}")
+        return
+    remote["drained"] = bool(drained)
+    if not drained:
+        remote["drain_error"] = (
+            f"remote alert queue did not drain within {REMOTE_ALERT_DRAIN_SECONDS:g} seconds"
+        )
 
 
 def _issue(code: str, message: str, *, detail: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -69,6 +102,15 @@ def _backup_stale_limit_seconds(
     operator_report: dict[str, Any],
     fallback_seconds: float = 48 * 60 * 60,
 ) -> float:
+    schedule = operator_report.get("backup_schedule")
+    if isinstance(schedule, dict) and schedule.get("enabled") is True:
+        cadence = schedule.get("cadence_seconds")
+        try:
+            cadence_seconds = float(cadence)
+        except (TypeError, ValueError):
+            cadence_seconds = 0.0
+        if cadence_seconds > 0:
+            return max(cadence_seconds * 2.0, 3600.0)
     for job in _dict_list(operator_report, "scheduled_jobs"):
         if not job.get("enabled"):
             continue
@@ -85,7 +127,7 @@ def _backup_stale_limit_seconds(
 
 
 def _enabled_backup_jobs(operator_report: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
+    jobs = [
         {
             "name": job.get("name"),
             "status": job.get("status"),
@@ -95,6 +137,17 @@ def _enabled_backup_jobs(operator_report: dict[str, Any]) -> list[dict[str, Any]
         for job in _dict_list(operator_report, "scheduled_jobs")
         if job.get("enabled") and "backup" in str(job.get("name") or "")
     ]
+    schedule = operator_report.get("backup_schedule")
+    if isinstance(schedule, dict) and schedule.get("enabled") is True:
+        jobs.append(
+            {
+                "name": schedule.get("name") or "runtime_backup_timer",
+                "status": "dedicated_timer",
+                "effective_cadence_seconds": schedule.get("cadence_seconds"),
+                "cadence_seconds": schedule.get("cadence_seconds"),
+            }
+        )
+    return jobs
 
 
 def _scheduled_job_state_issues(operator_report: dict[str, Any]) -> list[dict[str, Any]]:
@@ -118,7 +171,9 @@ def _scheduled_job_state_issues(operator_report: dict[str, Any]) -> list[dict[st
     return invalid_jobs
 
 
-def _scheduled_job_output_truncation_warnings(operator_report: dict[str, Any]) -> list[dict[str, Any]]:
+def _scheduled_job_output_truncation_warnings(
+    operator_report: dict[str, Any],
+) -> list[dict[str, Any]]:
     noisy_jobs = []
     for job in _dict_list(operator_report, "scheduled_jobs"):
         if not job.get("enabled"):
@@ -294,7 +349,9 @@ def _stale_promotion_reviews(operator_report: dict[str, Any]) -> list[dict[str, 
     return stale_reviews
 
 
-def _product_state_error_details(operator_report: dict[str, Any], *, mode: str) -> list[dict[str, Any]]:
+def _product_state_error_details(
+    operator_report: dict[str, Any], *, mode: str
+) -> list[dict[str, Any]]:
     state_error_details = []
     for product in _dict_list(operator_report, "products"):
         if product.get("enabled") is False or product.get("mode") != mode:
@@ -303,7 +360,9 @@ def _product_state_error_details(operator_report: dict[str, Any], *, mode: str) 
         if not raw_errors:
             continue
         if isinstance(raw_errors, list):
-            state_errors = [item if isinstance(item, dict) else {"error": str(item)} for item in raw_errors]
+            state_errors = [
+                item if isinstance(item, dict) else {"error": str(item)} for item in raw_errors
+            ]
         else:
             state_errors = [
                 {
@@ -323,7 +382,9 @@ def _product_state_error_details(operator_report: dict[str, Any], *, mode: str) 
     return state_error_details
 
 
-def _product_drawdown_halt_details(operator_report: dict[str, Any], *, mode: str) -> list[dict[str, Any]]:
+def _product_drawdown_halt_details(
+    operator_report: dict[str, Any], *, mode: str
+) -> list[dict[str, Any]]:
     halted_products = []
     for product in _dict_list(operator_report, "products"):
         if product.get("enabled") is False or product.get("mode") != mode:
@@ -382,11 +443,7 @@ def _product_recovery_state_details(
     for product in _dict_list(operator_report, "products"):
         if product.get("enabled") is False or product.get("mode") != mode:
             continue
-        states = {
-            key: product[key]
-            for key in state_keys
-            if product.get(key) is not None
-        }
+        states = {key: product[key] for key in state_keys if product.get(key) is not None}
         if not states:
             continue
         pending_products.append(
@@ -401,7 +458,9 @@ def _product_recovery_state_details(
     return pending_products
 
 
-def _product_trade_log_issue_details(operator_report: dict[str, Any], *, mode: str) -> list[dict[str, Any]]:
+def _product_trade_log_issue_details(
+    operator_report: dict[str, Any], *, mode: str
+) -> list[dict[str, Any]]:
     trade_log_issues = []
     for product in _dict_list(operator_report, "products"):
         if product.get("enabled") is False or product.get("mode") != mode:
@@ -427,12 +486,8 @@ def _product_trade_log_issue_details(operator_report: dict[str, Any], *, mode: s
                 else [],
                 **(
                     {
-                        "exit_event_id_errors": trade_summary.get(
-                            "exit_event_id_errors", []
-                        )[:10]
-                        if isinstance(
-                            trade_summary.get("exit_event_id_errors"), list
-                        )
+                        "exit_event_id_errors": trade_summary.get("exit_event_id_errors", [])[:10]
+                        if isinstance(trade_summary.get("exit_event_id_errors"), list)
                         else []
                     }
                     if "exit_event_id_errors" in trade_summary
@@ -463,7 +518,9 @@ def _reporting_failure_detail(operator_report: dict[str, Any]) -> dict[str, Any]
     detail: dict[str, Any] = {}
     errors = reporting.get("errors")
     if isinstance(errors, list):
-        detail["errors"] = [item if isinstance(item, dict) else {"error": str(item)} for item in errors]
+        detail["errors"] = [
+            item if isinstance(item, dict) else {"error": str(item)} for item in errors
+        ]
     elif errors:
         detail["errors"] = [{"error": str(errors)}]
     elif reporting.get("error"):
@@ -473,7 +530,12 @@ def _reporting_failure_detail(operator_report: dict[str, Any]) -> dict[str, Any]
     outputs = reporting.get("outputs")
     if isinstance(outputs, dict):
         detail["outputs"] = outputs
-    for key in ("operator_report", "operator_report_json", "readiness_report", "readiness_report_json"):
+    for key in (
+        "operator_report",
+        "operator_report_json",
+        "readiness_report",
+        "readiness_report_json",
+    ):
         if key in reporting and key not in detail:
             detail[key] = reporting.get(key)
     return detail
@@ -483,9 +545,7 @@ def _cycle_failure_detail(operator_report: dict[str, Any]) -> dict[str, Any] | N
     control_error = operator_report.get("control_error")
     unknown_control_selectors = operator_report.get("unknown_control_selectors")
     control_clear = [
-        item
-        for item in _dict_list(operator_report, "control_clear")
-        if item.get("ok") is False
+        item for item in _dict_list(operator_report, "control_clear") if item.get("ok") is False
     ]
     products = []
     for product in _dict_list(operator_report, "products"):
@@ -533,7 +593,9 @@ def _cycle_failure_detail(operator_report: dict[str, Any]) -> dict[str, Any] | N
         )
 
     data_update = operator_report.get("data_update")
-    failed_data_update = data_update if isinstance(data_update, dict) and data_update.get("ok") is False else None
+    failed_data_update = (
+        data_update if isinstance(data_update, dict) and data_update.get("ok") is False else None
+    )
     if (
         not products
         and not jobs
@@ -567,10 +629,16 @@ def _active_control_detail(operator_report: dict[str, Any]) -> dict[str, Any] | 
     detail = {
         "paused": bool(control.get("paused")),
         "pause_jobs": bool(control.get("pause_jobs")),
-        "paused_products": control.get("paused_products") if isinstance(control.get("paused_products"), list) else [],
-        "paused_jobs": control.get("paused_jobs") if isinstance(control.get("paused_jobs"), list) else [],
+        "paused_products": control.get("paused_products")
+        if isinstance(control.get("paused_products"), list)
+        else [],
+        "paused_jobs": control.get("paused_jobs")
+        if isinstance(control.get("paused_jobs"), list)
+        else [],
         "flatten_all": bool(control.get("flatten_all")),
-        "flatten_products": control.get("flatten_products") if isinstance(control.get("flatten_products"), list) else [],
+        "flatten_products": control.get("flatten_products")
+        if isinstance(control.get("flatten_products"), list)
+        else [],
     }
     active = (
         detail["paused"]
@@ -685,7 +753,9 @@ def _non_negative_float(value: Any) -> float | None:
     return result
 
 
-def _open_position_risk_issues(operator_report: dict[str, Any], *, mode: str) -> list[dict[str, Any]]:
+def _open_position_risk_issues(
+    operator_report: dict[str, Any], *, mode: str
+) -> list[dict[str, Any]]:
     risk_issues = []
     for product in _dict_list(operator_report, "products"):
         if product.get("enabled") is False or product.get("mode") != mode:
@@ -812,7 +882,10 @@ def _live_open_position_broker_issues(operator_report: dict[str, Any]) -> list[d
                 exit_sizing = position.get("broker_exit_sizing")
                 if direction == "short" and exit_sizing != "quote_reinvest":
                     reasons.append("invalid_spot_step_aside_exit_sizing")
-                if direction == "short" and _positive_float(position.get("broker_entry_quote_value")) is None:
+                if (
+                    direction == "short"
+                    and _positive_float(position.get("broker_entry_quote_value")) is None
+                ):
                     reasons.append("invalid_spot_step_aside_quote_value")
             if reasons:
                 broker_issues.append(
@@ -838,7 +911,9 @@ def _live_open_position_broker_issues(operator_report: dict[str, Any]) -> list[d
     return broker_issues
 
 
-def _open_position_monitoring_issues(operator_report: dict[str, Any], *, mode: str, now_ts: float) -> list[dict[str, Any]]:
+def _open_position_monitoring_issues(
+    operator_report: dict[str, Any], *, mode: str, now_ts: float
+) -> list[dict[str, Any]]:
     monitoring_issues = []
     for product in _dict_list(operator_report, "products"):
         if product.get("enabled") is False or product.get("mode") != mode:
@@ -876,15 +951,21 @@ def _open_position_monitoring_issues(operator_report: dict[str, Any], *, mode: s
     return monitoring_issues
 
 
-def _live_open_position_monitoring_issues(operator_report: dict[str, Any], *, now_ts: float) -> list[dict[str, Any]]:
+def _live_open_position_monitoring_issues(
+    operator_report: dict[str, Any], *, now_ts: float
+) -> list[dict[str, Any]]:
     return _open_position_monitoring_issues(operator_report, mode="live", now_ts=now_ts)
 
 
-def _paper_open_position_monitoring_issues(operator_report: dict[str, Any], *, now_ts: float) -> list[dict[str, Any]]:
+def _paper_open_position_monitoring_issues(
+    operator_report: dict[str, Any], *, now_ts: float
+) -> list[dict[str, Any]]:
     return _open_position_monitoring_issues(operator_report, mode="paper", now_ts=now_ts)
 
 
-def _open_position_visibility_issues(operator_report: dict[str, Any], *, mode: str) -> list[dict[str, Any]]:
+def _open_position_visibility_issues(
+    operator_report: dict[str, Any], *, mode: str
+) -> list[dict[str, Any]]:
     visibility_issues = []
     for product in _dict_list(operator_report, "products"):
         if product.get("enabled") is False or product.get("mode") != mode:
@@ -897,7 +978,11 @@ def _open_position_visibility_issues(operator_report: dict[str, Any], *, mode: s
             open_count_float = float(raw_count)
         except (TypeError, ValueError):
             open_count_float = float("nan")
-        if not math.isfinite(open_count_float) or open_count_float < 0 or not open_count_float.is_integer():
+        if (
+            not math.isfinite(open_count_float)
+            or open_count_float < 0
+            or not open_count_float.is_integer()
+        ):
             reasons.append("invalid_open_position_count")
             open_count = None
         else:
@@ -1022,9 +1107,21 @@ def evaluate_health(
             )
         )
     artifact_hygiene = operator_report.get("artifact_hygiene")
-    if isinstance(artifact_hygiene, dict) and artifact_hygiene and artifact_hygiene.get("ok") is False:
-        summary = artifact_hygiene.get("summary") if isinstance(artifact_hygiene.get("summary"), dict) else {}
-        errors = artifact_hygiene.get("errors") if isinstance(artifact_hygiene.get("errors"), list) else []
+    if (
+        isinstance(artifact_hygiene, dict)
+        and artifact_hygiene
+        and artifact_hygiene.get("ok") is False
+    ):
+        summary = (
+            artifact_hygiene.get("summary")
+            if isinstance(artifact_hygiene.get("summary"), dict)
+            else {}
+        )
+        errors = (
+            artifact_hygiene.get("errors")
+            if isinstance(artifact_hygiene.get("errors"), list)
+            else []
+        )
         warnings.append(
             _issue(
                 "artifact_hygiene_unhealthy",
@@ -1032,7 +1129,9 @@ def evaluate_health(
                 detail={
                     "summary": {
                         "quarantine_candidates": summary.get("quarantine_candidates"),
-                        "unreferenced_active_artifacts": summary.get("unreferenced_active_artifacts"),
+                        "unreferenced_active_artifacts": summary.get(
+                            "unreferenced_active_artifacts"
+                        ),
                         "historical_search_outputs": summary.get("historical_search_outputs"),
                         "errors": summary.get("errors", len(errors)),
                         "quarantined": summary.get("quarantined"),
@@ -1104,9 +1203,7 @@ def evaluate_health(
                 detail={"products": paper_drawdown_halts},
             )
         )
-    live_exit_accounting = _product_exit_accounting_intent_details(
-        operator_report, mode="live"
-    )
+    live_exit_accounting = _product_exit_accounting_intent_details(operator_report, mode="live")
     if live_exit_accounting:
         issues.append(
             _issue(
@@ -1115,9 +1212,7 @@ def evaluate_health(
                 detail={"products": live_exit_accounting},
             )
         )
-    paper_exit_accounting = _product_exit_accounting_intent_details(
-        operator_report, mode="paper"
-    )
+    paper_exit_accounting = _product_exit_accounting_intent_details(operator_report, mode="paper")
     if paper_exit_accounting:
         warnings.append(
             _issue(
@@ -1180,9 +1275,92 @@ def evaluate_health(
                     detail={"warning_checks": warning_checks},
                 )
             )
+    raw_candidate_paper = operator_report.get("candidate_paper")
+    candidate_paper = raw_candidate_paper if isinstance(raw_candidate_paper, dict) else {}
+    if raw_candidate_paper is not None and not isinstance(raw_candidate_paper, dict):
+        issues.append(
+            _issue(
+                "candidate_paper_status_malformed",
+                "candidate paper status summary must be a JSON object",
+                detail={"type": type(raw_candidate_paper).__name__},
+            )
+        )
+    if candidate_paper.get("configured") is True and candidate_paper.get("enabled") is True:
+        if candidate_paper.get("exists") is not True:
+            warnings.append(
+                _issue(
+                    "candidate_paper_status_missing",
+                    "candidate paper cycle is enabled but has not produced a status file",
+                    detail={
+                        "job": candidate_paper.get("job"),
+                        "path": candidate_paper.get("path"),
+                    },
+                )
+            )
+        elif candidate_paper.get("ok") is not True:
+            issues.append(
+                _issue(
+                    "candidate_paper_unhealthy",
+                    "latest staged-candidate paper status is stale, invalid, or failed",
+                    detail={
+                        "job": candidate_paper.get("job"),
+                        "path": candidate_paper.get("path"),
+                        "status": candidate_paper.get("status"),
+                        "generated_at": candidate_paper.get("generated_at"),
+                        "age_seconds": candidate_paper.get("age_seconds"),
+                        "max_age_seconds": candidate_paper.get("max_age_seconds"),
+                        "fresh": candidate_paper.get("fresh"),
+                        "reason": candidate_paper.get("reason"),
+                        "error": candidate_paper.get("error"),
+                        "errors": candidate_paper.get("errors") or [],
+                        "open_positions": candidate_paper.get("open_positions"),
+                        "activation_ready_products": candidate_paper.get(
+                            "activation_ready_products"
+                        )
+                        or [],
+                    },
+                )
+            )
+        halted_products = candidate_paper.get("drawdown_halted_products") or []
+        if halted_products:
+            warnings.append(
+                _issue(
+                    "candidate_paper_drawdown_halted",
+                    "one or more staged candidates are halted by paper drawdown controls",
+                    detail={"products": halted_products},
+                )
+            )
     backup_report = operator_report.get("backup_report") or {}
     if backup_report:
         verification = backup_report.get("verification") or {}
+        manifest = backup_report.get("manifest") or {}
+        critical_skipped = [
+            {
+                "path": item.get("path"),
+                "role": item.get("role"),
+                "reason": item.get("reason"),
+            }
+            for item in _dict_list(manifest, "files")
+            if item.get("required_if_present") is True
+            and item.get("exists") is True
+            and item.get("included") is not True
+        ]
+        reported_critical_skipped = _int_value(manifest.get("critical_skipped_files")) or 0
+        if critical_skipped or reported_critical_skipped > 0:
+            issues.append(
+                _issue(
+                    "backup_incomplete",
+                    "latest backup omitted one or more existing recovery files",
+                    detail={
+                        "output": backup_report.get("output"),
+                        "critical_skipped_files": max(
+                            reported_critical_skipped,
+                            len(critical_skipped),
+                        ),
+                        "files": critical_skipped[:10],
+                    },
+                )
+            )
         if backup_report.get("ok") is not True or verification.get("ok") is not True:
             issues.append(
                 _issue(
@@ -1197,7 +1375,6 @@ def evaluate_health(
                 )
             )
         else:
-            manifest = backup_report.get("manifest") or {}
             generated_at = manifest.get("generated_at") or backup_report.get("generated_at")
             generated_ts = _parse_timestamp(generated_at)
             stale_limit = (
@@ -1210,7 +1387,10 @@ def evaluate_health(
                     _issue(
                         "backup_timestamp_missing",
                         "latest backup report has no valid generation timestamp",
-                        detail={"output": backup_report.get("output"), "generated_at": generated_at},
+                        detail={
+                            "output": backup_report.get("output"),
+                            "generated_at": generated_at,
+                        },
                     )
                 )
             elif generated_ts > now_ts:
@@ -1326,12 +1506,16 @@ def evaluate_health(
                 continue
             try:
                 age_seconds = float(job.get("age_seconds"))
-                cadence_seconds = float(job.get("effective_cadence_seconds") or job.get("cadence_seconds"))
+                cadence_seconds = float(
+                    job.get("effective_cadence_seconds") or job.get("cadence_seconds")
+                )
             except (TypeError, ValueError):
                 continue
             if age_seconds < 0 or cadence_seconds <= 0:
                 continue
-            limit_seconds = max(cadence_seconds * 2.0, cadence_seconds + float(job.get("timeout_seconds") or 0))
+            limit_seconds = max(
+                cadence_seconds * 2.0, cadence_seconds + float(job.get("timeout_seconds") or 0)
+            )
             if age_seconds > limit_seconds:
                 overdue_jobs.append(
                     {
@@ -1375,8 +1559,12 @@ def evaluate_health(
             )
         )
     stale_positions = _stale_open_positions(operator_report, now_ts)
-    live_stale_positions = [position for position in stale_positions if position.get("mode") == "live"]
-    paper_stale_positions = [position for position in stale_positions if position.get("mode") != "live"]
+    live_stale_positions = [
+        position for position in stale_positions if position.get("mode") == "live"
+    ]
+    paper_stale_positions = [
+        position for position in stale_positions if position.get("mode") != "live"
+    ]
     if live_stale_positions:
         issues.append(
             _issue(
@@ -1456,8 +1644,14 @@ def evaluate_health(
                 detail={"products": paper_visibility_issues},
             )
         )
-    research_cycle = operator_report.get("research_cycle") if isinstance(operator_report.get("research_cycle"), dict) else {}
-    research_summary = research_cycle.get("summary") if isinstance(research_cycle.get("summary"), dict) else {}
+    research_cycle = (
+        operator_report.get("research_cycle")
+        if isinstance(operator_report.get("research_cycle"), dict)
+        else {}
+    )
+    research_summary = (
+        research_cycle.get("summary") if isinstance(research_cycle.get("summary"), dict) else {}
+    )
     if research_cycle.get("state_recovered") is True:
         warnings.append(
             _issue(
@@ -1470,7 +1664,10 @@ def evaluate_health(
             )
         )
     cycle_mutation_batch = research_cycle.get("mutation_batch")
-    if isinstance(cycle_mutation_batch, dict) and cycle_mutation_batch.get("status") == "read_error":
+    if (
+        isinstance(cycle_mutation_batch, dict)
+        and cycle_mutation_batch.get("status") == "read_error"
+    ):
         warnings.append(
             _issue(
                 "research_cycle_mutation_batch_read_error",
@@ -1570,9 +1767,7 @@ def evaluate_health(
                     detail={
                         "generated_at": generated_batch.get("generated_at"),
                         "rejected_attempts": generated_summary.get("rejected_attempts"),
-                        "unique_behavioral_specs": generated_summary.get(
-                            "unique_behavioral_specs"
-                        ),
+                        "unique_behavioral_specs": generated_summary.get("unique_behavioral_specs"),
                     },
                 )
             )
@@ -1612,9 +1807,7 @@ def evaluate_health(
                     "experiment-memory reporting does not confirm protected holdout exclusion",
                     detail={
                         "path": experiment_memory.get("path"),
-                        "adaptive_evidence_scope": experiment_memory.get(
-                            "adaptive_evidence_scope"
-                        ),
+                        "adaptive_evidence_scope": experiment_memory.get("adaptive_evidence_scope"),
                     },
                 )
             )
@@ -1641,9 +1834,7 @@ def evaluate_health(
         else {}
     )
     coverage_failures = int(
-        research_summary.get("coverage_failures")
-        or history_coverage.get("failure_count")
-        or 0
+        research_summary.get("coverage_failures") or history_coverage.get("failure_count") or 0
     )
     coverage_failed_scenarios = (
         research_summary.get("coverage_failed_scenarios")
@@ -1720,10 +1911,14 @@ def evaluate_health(
         else {}
     )
     required_testnet_products = _products_requiring_testnet_rehearsal(operator_report)
-    live_testnet_products = [product for product in required_testnet_products if product.get("mode") == "live"]
+    live_testnet_products = [
+        product for product in required_testnet_products if product.get("mode") == "live"
+    ]
     rehearsal_required = bool(testnet_rehearsal.get("required")) or bool(required_testnet_products)
     if rehearsal_required and testnet_rehearsal.get("ok") is not True:
-        detail = _testnet_rehearsal_issue_detail(testnet_rehearsal, live_products=live_testnet_products)
+        detail = _testnet_rehearsal_issue_detail(
+            testnet_rehearsal, live_products=live_testnet_products
+        )
         if live_testnet_products:
             issues.append(
                 _issue(
@@ -1776,14 +1971,10 @@ def evaluate_health(
         else {}
     )
     memory_totals = (
-        memory_feedback.get("totals")
-        if isinstance(memory_feedback.get("totals"), dict)
-        else {}
+        memory_feedback.get("totals") if isinstance(memory_feedback.get("totals"), dict) else {}
     )
     generated_summary = (
-        generated_batch.get("summary")
-        if isinstance(generated_batch.get("summary"), dict)
-        else {}
+        generated_batch.get("summary") if isinstance(generated_batch.get("summary"), dict) else {}
     )
     generative_research = {
         "batch_ok": generated_batch.get("ok"),
@@ -1812,6 +2003,7 @@ def evaluate_health(
         "operator_report_generated_at": operator_report.get("generated_at"),
         "readiness_ok": None if readiness_report is None else readiness_report.get("ok"),
         "generative_research": generative_research,
+        "candidate_paper": candidate_paper,
     }
 
 
@@ -1860,7 +2052,9 @@ def build_healthcheck(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Exit nonzero when the autopilot needs operator attention.")
+    parser = argparse.ArgumentParser(
+        description="Exit nonzero when the autopilot needs operator attention."
+    )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--output", type=Path, help="Optional JSON output path.")
     parser.add_argument(
@@ -1922,6 +2116,7 @@ def main() -> None:
             "warnings": [],
             "config": str(args.config),
         }
+    _drain_oneshot_remote_alert(health)
     if args.output:
         try:
             write_json_atomic(args.output, health)

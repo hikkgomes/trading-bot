@@ -25,14 +25,21 @@ from src.strategies.registry import register
 
 LOGGER = logging.getLogger(__name__)
 
+
 def _make_model(kind: str):
     if kind in ("auto", "lightgbm"):
         try:
             from lightgbm import LGBMClassifier
 
             return LGBMClassifier(
-                n_estimators=200, num_leaves=31, learning_rate=0.05, subsample=0.8,
-                colsample_bytree=0.8, random_state=42, n_jobs=-1, verbosity=-1,
+                n_estimators=200,
+                num_leaves=31,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                n_jobs=-1,
+                verbosity=-1,
             )
         except ImportError:
             if kind == "lightgbm":
@@ -45,7 +52,9 @@ def _make_model(kind: str):
 @register
 class MlClassifierStrategy(Strategy):
     name = "ml_classifier"
-    description = "Gradient-boosted classifier on feature columns predicting next-horizon direction."
+    description = (
+        "Gradient-boosted classifier on feature columns predicting next-horizon direction."
+    )
 
     @classmethod
     def default_params(cls):
@@ -54,8 +63,8 @@ class MlClassifierStrategy(Strategy):
             "long_threshold": 0.55,
             "short_threshold": 0.45,
             "allow_short": True,
-            "model": "auto",          # "auto" | "lightgbm" | "sklearn"
-            "feature_cols": None,      # None = auto-select numeric feature columns
+            "model": "auto",  # "auto" | "lightgbm" | "sklearn"
+            "feature_cols": None,  # None = auto-select numeric feature columns
             "max_features": 80,
             "feature_screen": "spearman",
             "min_feature_corr": 0.0,
@@ -112,13 +121,18 @@ class MlClassifierStrategy(Strategy):
             raise ValueError(f"Too few training rows ({int(valid.sum())}) for the ML strategy.")
         self._model = _make_model(self.params["model"])
         self._model.fit(X[valid], y[valid].to_numpy())
-        LOGGER.info("Fitted %s on %d rows, %d features", self.name, int(valid.sum()), len(self._features))
+        LOGGER.info(
+            "Fitted %s on %d rows, %d features", self.name, int(valid.sum()), len(self._features)
+        )
         return self
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         if self._model is None:
-            warnings.warn("ml_classifier.generate_signals called before fit(); fitting in-sample "
-                          "(smoke-test only — results are leaked).", stacklevel=2)
+            warnings.warn(
+                "ml_classifier.generate_signals called before fit(); fitting in-sample "
+                "(smoke-test only — results are leaked).",
+                stacklevel=2,
+            )
             self.fit(df)
         X = df[self._features].replace([np.inf, -np.inf], np.nan)
         proba = pd.Series(np.nan, index=df.index)

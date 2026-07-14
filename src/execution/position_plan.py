@@ -28,15 +28,19 @@ class PlanLeg:
     """One leg of an execution plan."""
 
     side: OrderSide
-    price: float          # limit price for this leg
-    qty: float            # base-asset quantity
-    fraction: float       # share of the budget / position this leg represents
+    price: float  # limit price for this leg
+    qty: float  # base-asset quantity
+    fraction: float  # share of the budget / position this leg represents
     note: str = ""
 
     def to_order(self, symbol: str, reduce_only: bool = False) -> Order:
         return Order(
-            symbol=symbol, side=self.side, qty=self.qty, type=OrderType.LIMIT,
-            price=self.price, reduce_only=reduce_only,
+            symbol=symbol,
+            side=self.side,
+            qty=self.qty,
+            type=OrderType.LIMIT,
+            price=self.price,
+            reduce_only=reduce_only,
         )
 
 
@@ -83,7 +87,9 @@ def dca_buy_plan(
     high = _positive_float("high", high)
     if not isinstance(levels, int) or levels < 1 or high < low:
         raise ValueError("Need levels>=1 and 0 < low <= high.")
-    prices = [high] if levels == 1 else [high - (high - low) * i / (levels - 1) for i in range(levels)]
+    prices = (
+        [high] if levels == 1 else [high - (high - low) * i / (levels - 1) for i in range(levels)]
+    )
     raw = [1.0 + i if lower_heavy else 1.0 for i in range(levels)]  # heavier toward lower prices
     weights = _normalize(raw)
     legs: list[PlanLeg] = []
@@ -143,5 +149,7 @@ def stink_bid_plan(
             raise ValueError("each depth must be in (0, 1).")
         price = ref_price * (1.0 - depth)
         quote = quote_budget * weight
-        legs.append(PlanLeg(OrderSide.BUY, price, quote / price, weight, note=f"stink_bid:-{depth:.0%}"))
+        legs.append(
+            PlanLeg(OrderSide.BUY, price, quote / price, weight, note=f"stink_bid:-{depth:.0%}")
+        )
     return legs

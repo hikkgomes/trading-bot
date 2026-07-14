@@ -45,13 +45,28 @@ Protect the file and never put exchange credentials in it:
 chmod 600 runtime/telegram.env
 ```
 
-The file accepts exactly the four `AUTOPILOT_TELEGRAM_*` keys shown above.
-Unknown, duplicate, malformed, symlinked, oversized, or group/world-readable
-settings fail closed without printing any setting value. The dedicated systemd
-units do not load this file as an `EnvironmentFile`; the edge reads it directly,
-so an accidental non-Telegram assignment cannot enter the network-facing
-process environment. The token does not need to be duplicated in the trading
-`.env`.
+Create the separate alert-routing settings file as well. It contains no
+exchange credentials and is the only operations settings file read by the
+watchdog:
+
+```bash
+cp config/alerts.env.example runtime/alerts.env
+chmod 600 runtime/alerts.env
+```
+
+```dotenv
+AUTOPILOT_WEBHOOK_URL=
+AUTOPILOT_TELEGRAM_SETTINGS_FILE=runtime/telegram.env
+```
+
+`runtime/telegram.env` accepts exactly the four `AUTOPILOT_TELEGRAM_*` keys in
+the first example. `runtime/alerts.env` accepts exactly the two alert-routing
+keys in the second example. Unknown, duplicate, malformed, symlinked,
+oversized, or group/world-readable settings in either file fail closed without
+printing any setting value. The dedicated systemd units do not load either file
+as an `EnvironmentFile`; each consumer reads its settings file directly, so an
+accidental assignment cannot enter the network-facing process environment. The
+token does not need to be duplicated in the trading `.env`.
 
 Telegram payloads are a second allowlisted boundary. Secret-bearing keys and
 string patterns (bearer/JWT/Telegram tokens, credential query parameters,
@@ -59,15 +74,22 @@ signed URLs, and embedded credential assignments) are redacted. Raw diagnostic
 fields are replaced with a marker, and protected holdout/final-test keys or
 content are recursively omitted. Detailed errors and protected research results
 remain in the private local reports and logs. The outbound path is added
-alongside the existing local JSONL and webhook alert destinations, so a Telegram
-outage does not stop supervision or erase local alerts.
-
-Ensure the trading `.env` points at that separate file (new copies of
-`.env.example` already contain this line):
-
-```dotenv
-AUTOPILOT_TELEGRAM_SETTINGS_FILE=runtime/telegram.env
-```
+alongside the existing local JSONL and webhook alert destinations. Local alerts
+and cooldown state are committed before outbound delivery is queued; webhook
+and Telegram outcomes are appended later under the same fingerprint. A slow or
+unavailable remote endpoint therefore cannot stop supervision or erase local
+alerts. The long-running supervisor delivers asynchronously. The systemd
+healthcheck is a short-lived oneshot, so it performs a bounded drain of its
+queued remote alert before exiting; delivery success or failure is appended to
+the local alert log. Its unit passes only the path to `runtime/alerts.env`; the
+application opens a non-symlink owner-matched `0600` file and accepts exactly
+the webhook URL and Telegram-settings path keys. Systemd never imports its
+assignments into the process environment. The unit explicitly removes inherited
+exchange and direct operations variables, cannot read `.env`, and runs
+readiness-free watchdog checks. Full credential-aware readiness remains an
+install/preflight operation. Generic research, candidate-paper, and backup units
+both unset inherited operations variables and cannot read either private
+operations settings file.
 
 Check the sanitized view without using the network, send a one-off status, then
 install the isolated polling service:
@@ -96,6 +118,23 @@ The installer also creates a deterministic sanitized status report timer. It
 runs every 24 hours by default; set `REPORT_INTERVAL=12h` (or another systemd
 duration) while running the installer to change the cadence.
 
+The polling unit mounts the repository read-only. It can write only the two
+dedicated state directories required for crash-safe atomic replacement:
+`runtime/operator-control/` for `control.json`, `control_audit.jsonl`, their
+sibling locks and temporary replacements, and `runtime/telegram/` for
+`telegram_poll_state.json`. The settings file `runtime/telegram.env` is an
+explicit read-only path; `.env`, approvals, outputs, and market data are
+inaccessible. File-only write mounts are intentionally not used because atomic
+`os.replace` updates require write permission on the target parent directory.
+
+For upgrades from the older flat layout, a real installer run copies existing
+`runtime/control.json`, `runtime/control_audit.jsonl`, and
+`runtime/telegram_poll_state.json` into the dedicated directories with mode
+`0600`, while retaining the originals for review. Until the first narrowed
+control or poll-state write, the readers can fall back to the legacy file. Pause
+or stop the core services during the upgrade, verify the new copies, and remove
+legacy files only after all installed units use the new config.
+
 Start with `AUTOPILOT_TELEGRAM_PAUSE_COMMANDS=0`. After status and alerts have
 been verified, set it to `1` only if the numeric user allowlist is correct, then
 restart the service. Both the exact chat ID and the sender user ID must match.
@@ -103,9 +142,12 @@ restart the service. Both the exact chat ID and the sender user ID must match.
 ## OpenClaw
 
 OpenClaw is an optional idea and reporting assistant, not part of the trusted
-trading process. Do not run OpenClaw from the autopilot job worker: that worker
-inherits the trading environment. Keep the existing OpenClaw installation in a
-separate service, container, or Unix account with access only to:
+trading process. Do not run OpenClaw from the autopilot job worker: that trusted
+worker has broad research/runtime write access and is not a sandbox for an
+untrusted assistant. Its installed unit strips trading and operations variables,
+but that does not replace process and filesystem isolation. Keep the existing
+OpenClaw installation in a separate service, container, or Unix account with
+access only to:
 
 - read: `runtime/openclaw/research_context.json`
 - write: `runtime/research_inbox/openclaw/incoming/`

@@ -54,9 +54,7 @@ def write_config(tmp_path):
                 "research_factory_config_file": str(tmp_path / "research_factory.json"),
                 "generated_batch_file": str(tmp_path / "generated_batch.json"),
                 "experiment_memory_file": str(tmp_path / "experiment_memory.sqlite3"),
-                "experiment_memory_backup_file": str(
-                    tmp_path / "experiment_memory.backup.sqlite3"
-                ),
+                "experiment_memory_backup_file": str(tmp_path / "experiment_memory.backup.sqlite3"),
                 "incubation_candidates_file": str(tmp_path / "incubation_candidates.json"),
                 "mutation_plan_file": str(tmp_path / "mutation_plan.json"),
                 "mutation_batch_file": str(tmp_path / "mutation_batch.json"),
@@ -175,7 +173,9 @@ def test_build_backup_archive_writes_manifest_and_existing_files(tmp_path):
     (tmp_path / "approvals.json").write_text('{"version": 1, "approvals": {}}\n', encoding="utf-8")
     (tmp_path / "control.json").write_text('{"paused": false}\n', encoding="utf-8")
     (tmp_path / "active_income_state.json").write_text('{"equity": 1000}\n', encoding="utf-8")
-    (tmp_path / "active_income_trades.csv").write_text("exit_time,net_return,sized_return\n", encoding="utf-8")
+    (tmp_path / "active_income_trades.csv").write_text(
+        "exit_time,net_return,sized_return\n", encoding="utf-8"
+    )
     output = tmp_path / "backup.zip"
 
     report = build_backup_archive(config_path=config_path, output=output, root=tmp_path)
@@ -355,9 +355,13 @@ def test_build_backup_archive_includes_existing_job_state_paths(tmp_path):
     state_path.parent.mkdir()
     state_path.write_text('{"last_run_id": "abc"}\n', encoding="utf-8")
 
-    report = build_backup_archive(config_path=config_path, output=tmp_path / "backup.zip", root=tmp_path)
+    report = build_backup_archive(
+        config_path=config_path, output=tmp_path / "backup.zip", root=tmp_path
+    )
 
-    state_entry = next(item for item in report["manifest"]["files"] if item["path"] == str(state_path))
+    state_entry = next(
+        item for item in report["manifest"]["files"] if item["path"] == str(state_path)
+    )
     assert state_entry["included"] is True
     assert state_entry["arcname"] == "runtime/research_cycle_state.json"
     with zipfile.ZipFile(report["output"]) as archive:
@@ -367,19 +371,39 @@ def test_build_backup_archive_includes_existing_job_state_paths(tmp_path):
 def test_build_backup_archive_skips_files_above_size_limit(tmp_path):
     config_path = write_config(tmp_path)
     large_state = tmp_path / "active_income_state.json"
-    large_state.write_text("x" * 20, encoding="utf-8")
+    max_file_bytes = config_path.stat().st_size + 10
+    large_state.write_text("x" * (max_file_bytes + 1), encoding="utf-8")
     output = tmp_path / "backup.zip"
 
     report = build_backup_archive(
         config_path=config_path,
         output=output,
-        max_file_bytes=10,
+        max_file_bytes=max_file_bytes,
         root=tmp_path,
     )
 
-    state_entry = next(item for item in report["manifest"]["files"] if item["path"] == str(large_state))
+    state_entry = next(
+        item for item in report["manifest"]["files"] if item["path"] == str(large_state)
+    )
     assert state_entry["included"] is False
     assert state_entry["reason"] == "too_large"
+    assert state_entry["required_if_present"] is True
+    assert report["manifest"]["critical_skipped_files"] == 1
+    assert report["manifest"]["required_recovery_files"] == len(
+        report["manifest"]["required_recovery_roles"]
+    )
+    assert len(report["manifest"]["required_recovery_roles"]) == len(
+        set(report["manifest"]["required_recovery_roles"])
+    )
+    assert report["ok"] is False
+    assert report["verification"]["issues"] == [
+        {
+            "code": "required_recovery_file_skipped",
+            "path": str(large_state),
+            "role": "product:active_income:product_state",
+            "reason": "too_large",
+        }
+    ]
     with zipfile.ZipFile(output) as archive:
         assert "active_income_state.json" not in archive.namelist()
 
@@ -396,7 +420,9 @@ def test_build_backup_archive_can_include_external_extra_files(tmp_path):
         root=tmp_path,
     )
 
-    extra_entry = next(item for item in report["manifest"]["files"] if item["path"] == str(external))
+    extra_entry = next(
+        item for item in report["manifest"]["files"] if item["path"] == str(external)
+    )
     assert extra_entry["included"] is True
     assert extra_entry["arcname"].startswith("external/")
 
@@ -418,6 +444,9 @@ def test_build_backup_archive_skips_symlink_sources(tmp_path):
     link_entry = next(item for item in report["manifest"]["files"] if item["path"] == str(link))
     assert link_entry["included"] is False
     assert link_entry["reason"] == "symlink"
+    assert link_entry["required_if_present"] is False
+    assert report["manifest"]["critical_skipped_files"] == 0
+    assert report["ok"] is True
     with zipfile.ZipFile(report["output"]) as archive:
         assert "operator-notes-link.txt" not in archive.namelist()
 
@@ -439,7 +468,9 @@ def test_build_backup_archive_rejects_non_positive_size_limit(tmp_path):
     config_path = write_config(tmp_path)
 
     with pytest.raises(ValueError, match="max_file_bytes must be positive"):
-        build_backup_archive(config_path=config_path, output=tmp_path / "backup.zip", max_file_bytes=0)
+        build_backup_archive(
+            config_path=config_path, output=tmp_path / "backup.zip", max_file_bytes=0
+        )
 
 
 def test_backup_output_summary_omits_full_manifest():
@@ -452,6 +483,9 @@ def test_backup_output_summary_omits_full_manifest():
                 "included_files": 3,
                 "missing_files": 2,
                 "skipped_files": 1,
+                "optional_missing_files": 2,
+                "critical_skipped_files": 0,
+                "required_recovery_files": 5,
                 "files": [{"path": "runtime/status.json"}],
             },
             "retention": {"deleted_archives": 1},
@@ -466,6 +500,9 @@ def test_backup_output_summary_omits_full_manifest():
         "included_files": 3,
         "missing_files": 2,
         "skipped_files": 1,
+        "optional_missing_files": 2,
+        "critical_skipped_files": 0,
+        "required_recovery_files": 5,
         "experiment_memory_snapshot": None,
         "retention": {"deleted_archives": 1},
         "verification": {"ok": True, "checked_files": 3, "issues": 0},
@@ -483,6 +520,37 @@ def test_verify_backup_archive_accepts_valid_archive(tmp_path):
     assert report["ok"] is True
     assert report["checked_files"] >= 2
     assert report["issues"] == []
+
+
+def test_verify_backup_archive_rejects_missing_declared_recovery_role(tmp_path):
+    output = tmp_path / "backup.zip"
+    manifest = {
+        "version": 1,
+        "included_files": 0,
+        "missing_files": 0,
+        "skipped_files": 0,
+        "optional_missing_files": 0,
+        "critical_skipped_files": 0,
+        "required_recovery_files": 1,
+        "required_recovery_roles": ["autopilot_config"],
+        "files": [],
+    }
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("MANIFEST.json", json.dumps(manifest))
+
+    report = verify_backup_archive(output)
+
+    assert report["ok"] is False
+    assert {
+        "code": "required_recovery_count_mismatch",
+        "manifest_count": 1,
+        "actual_count": 0,
+    } in report["issues"]
+    assert {
+        "code": "required_recovery_roles_mismatch",
+        "missing_roles": ["autopilot_config"],
+        "unexpected_roles": [],
+    } in report["issues"]
 
 
 def test_verify_backup_archive_rejects_missing_manifest(tmp_path):
@@ -618,7 +686,9 @@ def test_verify_backup_archive_rejects_unexpected_archive_member(tmp_path):
     assert {"code": "unexpected_member", "arcname": "runtime/unexpected.json"} in report["issues"]
 
 
-@pytest.mark.parametrize("arcname", ["../status.json", "/runtime/status.json", "runtime/../../status.json"])
+@pytest.mark.parametrize(
+    "arcname", ["../status.json", "/runtime/status.json", "runtime/../../status.json"]
+)
 def test_verify_backup_archive_rejects_unsafe_manifest_arcname(tmp_path, arcname):
     output = tmp_path / "backup.zip"
     payload = b"{}"
@@ -681,7 +751,9 @@ def test_verify_backup_archive_rejects_duplicate_manifest_arcname(tmp_path):
     report = verify_backup_archive(output)
 
     assert report["ok"] is False
-    assert {"code": "duplicate_manifest_arcname", "arcname": "runtime/status.json"} in report["issues"]
+    assert {"code": "duplicate_manifest_arcname", "arcname": "runtime/status.json"} in report[
+        "issues"
+    ]
 
 
 def test_verify_backup_archive_rejects_duplicate_archive_member(tmp_path):
@@ -711,7 +783,9 @@ def test_verify_backup_archive_rejects_duplicate_archive_member(tmp_path):
     report = verify_backup_archive(output)
 
     assert report["ok"] is False
-    assert {"code": "duplicate_archive_member", "arcname": "runtime/status.json"} in report["issues"]
+    assert {"code": "duplicate_archive_member", "arcname": "runtime/status.json"} in report[
+        "issues"
+    ]
 
 
 def test_restore_backup_archive_extracts_verified_files(tmp_path):
@@ -725,16 +799,18 @@ def test_restore_backup_archive_extracts_verified_files(tmp_path):
     report = restore_backup_archive(archive_path, restore_dir)
 
     assert report["ok"] is True
-    assert (restore_dir / "approvals.json").read_text(encoding="utf-8") == '{"version": 1, "approvals": {}}\n'
-    assert (restore_dir / "active_income_state.json").read_text(encoding="utf-8") == '{"equity": 1000}\n'
+    assert (restore_dir / "approvals.json").read_text(
+        encoding="utf-8"
+    ) == '{"version": 1, "approvals": {}}\n'
+    assert (restore_dir / "active_income_state.json").read_text(
+        encoding="utf-8"
+    ) == '{"equity": 1000}\n'
     assert (restore_dir / "RESTORE_REPORT.json").exists()
 
 
 def test_restore_forces_private_directory_and_file_modes_with_permissive_umask(tmp_path):
     config_path = write_config(tmp_path)
-    (tmp_path / "approvals.json").write_text(
-        '{"version": 1, "approvals": {}}\n', encoding="utf-8"
-    )
+    (tmp_path / "approvals.json").write_text('{"version": 1, "approvals": {}}\n', encoding="utf-8")
     archive_path = tmp_path / "backup.zip"
     build_backup_archive(config_path=config_path, output=archive_path, root=tmp_path)
     restore_dir = tmp_path / "restore"
@@ -766,7 +842,9 @@ def test_restore_backup_archive_refuses_to_overwrite_existing_files(tmp_path):
 
     assert report["ok"] is False
     assert report["reason"] == "target_exists"
-    assert report["conflicts"] == [{"arcname": "approvals.json", "target": str(restore_dir / "approvals.json")}]
+    assert report["conflicts"] == [
+        {"arcname": "approvals.json", "target": str(restore_dir / "approvals.json")}
+    ]
     assert (restore_dir / "approvals.json").read_text(encoding="utf-8") == "existing\n"
 
 
@@ -783,7 +861,9 @@ def test_restore_backup_archive_can_overwrite_when_requested(tmp_path):
     report = restore_backup_archive(archive_path, restore_dir, overwrite=True)
 
     assert report["ok"] is True
-    assert (restore_dir / "approvals.json").read_text(encoding="utf-8") == '{"version": 1, "approvals": {}}\n'
+    assert (restore_dir / "approvals.json").read_text(
+        encoding="utf-8"
+    ) == '{"version": 1, "approvals": {}}\n'
     assert stat.S_IMODE((restore_dir / "approvals.json").stat().st_mode) == 0o600
 
 

@@ -12,17 +12,29 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from src.autopilot.config import DEFAULT_CONFIG_PATH, ProductConfig, load_config
+from src.autopilot.config import (
+    DEFAULT_CONFIG_PATH,
+    ProductConfig,
+    canonical_product_config,
+    load_config,
+)
+from src.autopilot.exchange_policy import (
+    ACTIVE_INCOME_FUTURES_EXCHANGES,
+    BTC_ACCUMULATION_SPOT_EXCHANGES,
+)
 from src.autopilot.execution_identity import execution_engine_digest
 from src.autopilot.io import write_json_atomic
 from src.autopilot.locking import acquire_file_update_lock
 from src.autopilot.strategy_policy import StrategyPolicyError, validate_strategy_artifact
 from src.config import PROJECT_ROOT
+from src.execution.config import ACCOUNT_FINGERPRINT_PREFIX
 
 DEFAULT_APPROVAL_LEDGER = PROJECT_ROOT / "runtime" / "approvals.json"
 
@@ -62,6 +74,17 @@ AUTOMATION_APPROVAL_ACTOR_KEYS = {
     "system",
     "trading-bot",
 }
+PRODUCTION_PREFLIGHT_CLOCK_SKEW_SECONDS = 300
+PRODUCTION_PREFLIGHT_REQUIRED_CHECKS = (
+    "product_config",
+    "execution_engine_identity",
+    "strategy_artifact_exists",
+    "strategy_fingerprints",
+    "strategy_policy",
+    "exchange_environment",
+    "broker_constructed",
+    "exchange_read_connectivity",
+)
 
 
 class ApprovalError(RuntimeError):
@@ -83,7 +106,9 @@ def normalize_approval_actor(value: str, *, field: str) -> str:
     if not actor:
         raise ApprovalError(f"{field} must be a non-empty operator identifier.")
     if _is_automation_approval_actor(actor):
-        raise ApprovalError(f"{field} must identify a human operator, not automation identity {actor!r}.")
+        raise ApprovalError(
+            f"{field} must identify a human operator, not automation identity {actor!r}."
+        )
     return actor
 
 
@@ -97,7 +122,9 @@ def normalize_revocation_reason(value: str) -> str:
 
 
 def is_valid_approval_actor(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip()) and not _is_automation_approval_actor(value)
+    return (
+        isinstance(value, str) and bool(value.strip()) and not _is_automation_approval_actor(value)
+    )
 
 
 def is_valid_revocation_reason(value: Any) -> bool:
@@ -149,7 +176,9 @@ def strategy_behavior(strategy: dict[str, Any]) -> dict[str, Any]:
 
 
 def strategy_fingerprint(strategy: dict[str, Any]) -> str:
-    digest = hashlib.sha256(_canonical_json(strategy_behavior(strategy)).encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(
+        _canonical_json(strategy_behavior(strategy)).encode("utf-8")
+    ).hexdigest()
     return f"sha256:{digest}"
 
 
@@ -172,7 +201,9 @@ def load_artifact(path: Path) -> dict[str, Any]:
     strategies = artifact.get("strategies")
     if not isinstance(strategies, list) or not strategies:
         raise ApprovalError(f"{path} has no strategies to approve.")
-    bad_indexes = [index for index, strategy in enumerate(strategies) if not isinstance(strategy, dict)]
+    bad_indexes = [
+        index for index, strategy in enumerate(strategies) if not isinstance(strategy, dict)
+    ]
     if bad_indexes:
         indexes = ", ".join(str(index) for index in bad_indexes)
         raise ApprovalError(f"{path} strategies must be JSON objects; invalid indexes: {indexes}.")
@@ -188,19 +219,197 @@ def _same_path(left: str | Path | None, right: Path) -> bool:
         return False
 
 
+def preflight_report_digest(path: Path) -> str:
+    """Digest the exact reviewed preflight report bytes."""
+
+    if path.is_symlink():
+        raise ApprovalError(f"Production preflight report must not be a symlink: {path}")
+    try:
+        return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ApprovalError(f"Could not read production preflight report {path}: {exc}") from exc
+
+
+def _positive_json_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int | float)
+        and math.isfinite(float(value))
+        and float(value) > 0
+    )
+
+
+def load_production_preflight_evidence(
+    product: ProductConfig,
+    *,
+    expected_artifact_digest: str | None = None,
+    require_fresh: bool = True,
+) -> dict[str, Any]:
+    """Validate and capture the exact connected production preflight for approval."""
+
+    if product.execution_mode != "live":
+        raise ApprovalError(f"{product.name}: final live approval requires execution_mode='live'.")
+    path = product.preflight_report
+    if path is None:
+        raise ApprovalError(f"{product.name}: final live approval requires preflight_report.")
+    if path.is_symlink():
+        raise ApprovalError(f"Production preflight report must not be a symlink: {path}")
+    try:
+        report_bytes = path.read_bytes()
+        digest = "sha256:" + hashlib.sha256(report_bytes).hexdigest()
+        report = json.loads(report_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ApprovalError(
+            f"Production preflight report must be valid JSON: {path}: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise ApprovalError(f"Could not read production preflight report {path}: {exc}") from exc
+    if not isinstance(report, dict) or report.get("ok") is not True:
+        raise ApprovalError(f"{product.name}: production preflight report is not successful.")
+    generated_ts = report.get("generated_ts")
+    if not _positive_json_number(generated_ts):
+        raise ApprovalError(f"{product.name}: production preflight generated_ts is invalid.")
+    age_seconds = time.time() - float(generated_ts)
+    if require_fresh and age_seconds < -PRODUCTION_PREFLIGHT_CLOCK_SKEW_SECONDS:
+        raise ApprovalError(f"{product.name}: production preflight timestamp is in the future.")
+    if require_fresh and age_seconds > product.preflight_max_age_seconds:
+        raise ApprovalError(f"{product.name}: production preflight report is stale.")
+    products = report.get("products")
+    if not isinstance(products, list):
+        raise ApprovalError(f"{product.name}: production preflight products must be a list.")
+    matches = [
+        item
+        for item in products
+        if isinstance(item, dict)
+        and isinstance(item.get("product"), dict)
+        and item["product"].get("name") == product.name
+    ]
+    if len(matches) != 1:
+        raise ApprovalError(
+            f"{product.name}: production preflight must contain exactly one matching product."
+        )
+    matched = matches[0]
+    if matched.get("ok") is not True:
+        raise ApprovalError(f"{product.name}: product production preflight is not successful.")
+    expected_product = canonical_product_config(product)
+    if matched.get("product") != expected_product:
+        raise ApprovalError(
+            f"{product.name}: production preflight product identity does not match current config."
+        )
+    checks = matched.get("checks")
+    if not isinstance(checks, list) or any(not isinstance(item, dict) for item in checks):
+        raise ApprovalError(f"{product.name}: production preflight checks are invalid.")
+    checks_by_name = {
+        item.get("name"): item
+        for item in checks
+        if isinstance(item.get("name"), str) and item.get("name")
+    }
+    required_checks = list(PRODUCTION_PREFLIGHT_REQUIRED_CHECKS)
+    if product.objective == "active_income" and product.market == "futures":
+        required_checks.extend(
+            (
+                "broker_position_mode_one_way",
+                "broker_native_protective_stops",
+                "broker_open_orders_empty",
+                "broker_position_flat",
+            )
+        )
+    if product.objective == "btc_accumulation" and product.market == "spot":
+        required_checks.append("broker_spot_position_non_negative")
+    failed = [
+        name for name in required_checks if checks_by_name.get(name, {}).get("ok") is not True
+    ]
+    if failed:
+        raise ApprovalError(
+            f"{product.name}: production preflight missing successful checks: {', '.join(failed)}."
+        )
+    current_engine_digest = execution_engine_digest()
+    if matched.get("execution_engine_digest") != current_engine_digest:
+        raise ApprovalError(
+            f"{product.name}: production preflight execution engine digest is not current."
+        )
+    if (
+        expected_artifact_digest is not None
+        and matched.get("artifact_digest") != expected_artifact_digest
+    ):
+        raise ApprovalError(
+            f"{product.name}: production preflight artifact digest does not match the reviewed artifact."
+        )
+    fingerprints = matched.get("artifact_fingerprints")
+    if not isinstance(fingerprints, list) or not fingerprints:
+        raise ApprovalError(f"{product.name}: production preflight has no artifact fingerprints.")
+    exchange_check = checks_by_name["exchange_environment"]
+    exchange = exchange_check.get("detail")
+    if not isinstance(exchange, dict) or exchange.get("custom_checker"):
+        raise ApprovalError(f"{product.name}: production preflight exchange evidence is invalid.")
+    expected_market = "spot" if product.objective == "btc_accumulation" else "futures"
+    allowed_exchanges = (
+        BTC_ACCUMULATION_SPOT_EXCHANGES
+        if expected_market == "spot"
+        else ACTIVE_INCOME_FUTURES_EXCHANGES
+    )
+    account_fingerprint = exchange.get("account_fingerprint")
+    fingerprint_digest = (
+        account_fingerprint.removeprefix(ACCOUNT_FINGERPRINT_PREFIX)
+        if isinstance(account_fingerprint, str)
+        and account_fingerprint.startswith(ACCOUNT_FINGERPRINT_PREFIX)
+        else ""
+    )
+    invalid_exchange = (
+        str(exchange.get("exchange") or "").lower() not in allowed_exchanges
+        or str(exchange.get("market_type") or "").lower() != expected_market
+        or str(exchange.get("quote_asset") or "").upper() != "USDT"
+        or exchange.get("testnet") is not False
+        or exchange.get("require_testnet") is not False
+        or len(fingerprint_digest) != 64
+        or any(char not in "0123456789abcdef" for char in fingerprint_digest)
+        or not _positive_json_number(exchange.get("max_notional_usd"))
+        or not _positive_json_number(exchange.get("max_fill_slippage_bps"))
+    )
+    if expected_market == "futures":
+        leverage = exchange.get("max_futures_leverage")
+        invalid_exchange = invalid_exchange or (
+            isinstance(leverage, bool)
+            or not isinstance(leverage, int)
+            or leverage != 1
+            or str(exchange.get("futures_margin_mode") or "").lower() != "isolated"
+        )
+    if invalid_exchange:
+        raise ApprovalError(
+            f"{product.name}: production preflight exchange evidence is incomplete or unsafe."
+        )
+    manifest = {"exchange_environment": exchange}
+    manifest_digest = (
+        "sha256:" + hashlib.sha256(_canonical_json(manifest).encode("utf-8")).hexdigest()
+    )
+    return {
+        "manifest": manifest,
+        "manifest_digest": manifest_digest,
+        # Retained as audit provenance for the human review. These rotating
+        # report fields are deliberately not part of approval identity.
+        "source_report_path": str(path.resolve(strict=False)),
+        "source_report_digest": digest,
+        "source_generated_at": report.get("generated_at"),
+        "source_generated_ts": generated_ts,
+    }
+
+
+def _entry_matches_production_preflight(
+    entry: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    approved = entry.get("production_preflight")
+    if not isinstance(approved, dict):
+        return False
+    return approved.get("manifest") == current.get("manifest") and approved.get(
+        "manifest_digest"
+    ) == current.get("manifest_digest")
+
+
 def _product_approval_payload(product: ProductConfig | None) -> dict[str, Any] | None:
     if product is None:
         return None
-    return {
-        "name": product.name,
-        "objective": product.objective,
-        "market": product.market,
-        "symbol": product.symbol,
-        "base_asset": product.base_asset,
-        "starting_equity": product.starting_equity,
-        "regime_guard": product.regime_guard,
-        "regime_mayer_top": product.regime_mayer_top,
-    }
+    return canonical_product_config(product)
 
 
 def _entry_matches_product(entry: dict[str, Any], product: ProductConfig | None) -> bool:
@@ -209,16 +418,7 @@ def _entry_matches_product(entry: dict[str, Any], product: ProductConfig | None)
     approved_product = entry.get("product")
     if not isinstance(approved_product, dict):
         return False
-    return (
-        approved_product.get("name") == product.name
-        and approved_product.get("objective") == product.objective
-        and approved_product.get("market") == product.market
-        and str(approved_product.get("symbol", "")).upper() == product.symbol.upper()
-        and str(approved_product.get("base_asset", "")).upper() == product.base_asset.upper()
-        and approved_product.get("starting_equity") == product.starting_equity
-        and approved_product.get("regime_guard") is product.regime_guard
-        and approved_product.get("regime_mayer_top") == product.regime_mayer_top
-    )
+    return approved_product == canonical_product_config(product)
 
 
 def _entry_event(entry: dict[str, Any]) -> dict[str, Any] | None:
@@ -242,6 +442,7 @@ def _entry_event(entry: dict[str, Any]) -> dict[str, Any] | None:
         "artifact_digest": entry.get("artifact_digest"),
         "execution_engine_digest": entry.get("execution_engine_digest"),
         "product": entry.get("product"),
+        "production_preflight": entry.get("production_preflight"),
         "revocation_reason": entry.get("revocation_reason"),
     }
 
@@ -323,6 +524,15 @@ class ApprovalLedger:
         if current_artifact is None and artifact_path.exists():
             current_artifact = load_artifact(artifact_path)
         product_payload = _product_approval_payload(product)
+        current_artifact_digest = (
+            artifact_digest(current_artifact) if current_artifact is not None else None
+        )
+        production_preflight = None
+        if product is not None and product.execution_mode == "live":
+            production_preflight = load_production_preflight_evidence(
+                product,
+                expected_artifact_digest=current_artifact_digest,
+            )
         engine_digest = execution_engine_digest()
         approved_at = utc_now()
         fingerprints: list[str] = []
@@ -346,9 +556,11 @@ class ApprovalLedger:
                 if history:
                     entry["history"] = history
                 if current_artifact is not None:
-                    entry["artifact_digest"] = artifact_digest(current_artifact)
+                    entry["artifact_digest"] = current_artifact_digest
                 if product_payload is not None:
                     entry["product"] = product_payload
+                if production_preflight is not None:
+                    entry["production_preflight"] = production_preflight
                 payload["approvals"][fingerprint] = entry
                 fingerprints.append(fingerprint)
             self.save(payload)
@@ -390,7 +602,20 @@ class ApprovalLedger:
         product_mismatch: list[str] = []
         fingerprint_mismatch: list[str] = []
         execution_engine_mismatch: list[str] = []
+        production_preflight_mismatch: list[str] = []
         current_execution_engine_digest = execution_engine_digest()
+        current_production_preflight = None
+        if product is not None and product.execution_mode == "live":
+            try:
+                current_production_preflight = load_production_preflight_evidence(
+                    product,
+                    expected_artifact_digest=artifact_digest_value,
+                    require_fresh=False,
+                )
+            except ApprovalError as exc:
+                raise ApprovalError(
+                    f"Live trading blocked; production preflight approval evidence is invalid: {exc}"
+                ) from exc
         malformed: list[str] = []
         invalid_actor: list[str] = []
         for strategy in strategies:
@@ -407,9 +632,14 @@ class ApprovalLedger:
                 invalid_actor.append(label)
             elif entry.get("fingerprint") != fingerprint:
                 fingerprint_mismatch.append(label)
-            elif artifact_path is not None and not _same_path(entry.get("artifact_path"), artifact_path):
+            elif artifact_path is not None and not _same_path(
+                entry.get("artifact_path"), artifact_path
+            ):
                 artifact_mismatch.append(label)
-            elif artifact_digest_value is not None and entry.get("artifact_digest") != artifact_digest_value:
+            elif (
+                artifact_digest_value is not None
+                and entry.get("artifact_digest") != artifact_digest_value
+            ):
                 artifact_content_mismatch.append(
                     f"{label} approved={entry.get('artifact_digest') or '<missing>'} current={artifact_digest_value}"
                 )
@@ -420,6 +650,14 @@ class ApprovalLedger:
                 )
             elif not _entry_matches_product(entry, product):
                 product_mismatch.append(label)
+            elif (
+                current_production_preflight is not None
+                and not _entry_matches_production_preflight(
+                    entry,
+                    current_production_preflight,
+                )
+            ):
+                production_preflight_mismatch.append(label)
         if missing or revoked or malformed or invalid_actor:
             parts = []
             if missing:
@@ -437,6 +675,7 @@ class ApprovalLedger:
             or product_mismatch
             or fingerprint_mismatch
             or execution_engine_mismatch
+            or production_preflight_mismatch
         ):
             parts = []
             if fingerprint_mismatch:
@@ -444,13 +683,19 @@ class ApprovalLedger:
             if artifact_mismatch:
                 parts.append("approval artifact mismatch: " + ", ".join(artifact_mismatch))
             if artifact_content_mismatch:
-                parts.append("approval artifact content mismatch: " + ", ".join(artifact_content_mismatch))
+                parts.append(
+                    "approval artifact content mismatch: " + ", ".join(artifact_content_mismatch)
+                )
             if product_mismatch:
                 parts.append("approval product mismatch: " + ", ".join(product_mismatch))
             if execution_engine_mismatch:
                 parts.append(
-                    "approval execution engine mismatch: "
-                    + ", ".join(execution_engine_mismatch)
+                    "approval execution engine mismatch: " + ", ".join(execution_engine_mismatch)
+                )
+            if production_preflight_mismatch:
+                parts.append(
+                    "approval production preflight mismatch: "
+                    + ", ".join(production_preflight_mismatch)
                 )
             raise ApprovalError("Live trading blocked; " + "; ".join(parts))
 
@@ -520,7 +765,9 @@ def find_product_for_artifact(
         raise ApprovalError(f"No product named {product_name!r} in {config_path}.")
 
     expected = artifact_path.resolve()
-    matches = [product for product in config.products if product.strategies_path.resolve() == expected]
+    matches = [
+        product for product in config.products if product.strategies_path.resolve() == expected
+    ]
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -541,7 +788,9 @@ def assert_artifact_policy_allowed_for_product(
         )
 
 
-def require_product_for_cli(product: ProductConfig | None, *, artifact_path: Path, config_path: Path) -> ProductConfig:
+def require_product_for_cli(
+    product: ProductConfig | None, *, artifact_path: Path, config_path: Path
+) -> ProductConfig:
     if product is None:
         raise ApprovalError(
             f"Approval CLI requires a product context for {artifact_path}; "
@@ -565,7 +814,9 @@ def _select_strategies(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Approve or check strategy artifacts for live trading.")
+    parser = argparse.ArgumentParser(
+        description="Approve or check strategy artifacts for live trading."
+    )
     parser.add_argument("--ledger", type=Path, default=DEFAULT_APPROVAL_LEDGER)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -575,6 +826,13 @@ def parse_args() -> argparse.Namespace:
         "--expected-artifact-digest",
         required=True,
         help="Digest printed by the reviewed promotion packet; blocks path-replacement races.",
+    )
+    approve.add_argument(
+        "--expected-preflight-digest",
+        help=(
+            "Exact sha256 digest of the reviewed successful connected production-preflight "
+            "report. Required for final live approval."
+        ),
     )
     approve.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     approve.add_argument("--product", help="Product name for product-aware policy validation.")
@@ -609,7 +867,9 @@ def main() -> None:
     ledger = ApprovalLedger(args.ledger)
     if args.command == "approve":
         if not args.confirm_live:
-            raise SystemExit("Approval requires --confirm-live because this can unlock live trading.")
+            raise SystemExit(
+                "Approval requires --confirm-live because this can unlock live trading."
+            )
         artifact = load_artifact(args.artifact)
         current_digest = artifact_digest(artifact)
         if args.expected_artifact_digest != current_digest:
@@ -626,6 +886,28 @@ def main() -> None:
             assert_artifact_policy_allowed_for_product(artifact, product)
         except StrategyPolicyError as exc:
             raise SystemExit(str(exc)) from exc
+        if product.execution_mode != "live":
+            raise SystemExit(
+                f"Approval refused: product {product.name} must be configured live while paused "
+                "before final approval."
+            )
+        try:
+            production_preflight = load_production_preflight_evidence(
+                product,
+                expected_artifact_digest=current_digest,
+            )
+        except ApprovalError as exc:
+            raise SystemExit(str(exc)) from exc
+        if not args.expected_preflight_digest:
+            raise SystemExit(
+                "Approval refused: --expected-preflight-digest is required for final live approval."
+            )
+        if args.expected_preflight_digest != production_preflight["source_report_digest"]:
+            raise SystemExit(
+                "Approval refused: reviewed production-preflight digest does not match the "
+                f"current report ({args.expected_preflight_digest} != "
+                f"{production_preflight['source_report_digest']})."
+            )
         selected = _select_strategies(artifact, args.strategy_id, args.all)
         fingerprints = ledger.approve_many(
             selected,

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from research_exploration.dsr import DSR_METHOD, LIVE_MIN_DSR
 from research_exploration.hypothesis_schema import Hypothesis
 from src.autopilot.config import ProductConfig
 from src.autopilot.exchange_policy import split_symbol
@@ -45,7 +46,7 @@ ENVELOPES = {
         max_stop_loss=0.05,
     ),
 }
-ACTIVE_INCOME_MIN_DSR = 0.60
+ACTIVE_INCOME_MIN_DSR = LIVE_MIN_DSR
 REQUIRED_RISK_KEYS = (
     "risk_per_trade",
     "max_position_fraction",
@@ -92,10 +93,14 @@ def load_strategy_artifact(path: Path, *, require_live_eligible: bool = True) ->
     strategies = artifact.get("strategies")
     if not isinstance(strategies, list) or not strategies:
         raise StrategyPolicyError(f"{path} has no strategies.")
-    bad_indexes = [index for index, strategy in enumerate(strategies) if not isinstance(strategy, dict)]
+    bad_indexes = [
+        index for index, strategy in enumerate(strategies) if not isinstance(strategy, dict)
+    ]
     if bad_indexes:
         indexes = ", ".join(str(index) for index in bad_indexes)
-        raise StrategyPolicyError(f"{path} strategies must be JSON objects; invalid indexes: {indexes}.")
+        raise StrategyPolicyError(
+            f"{path} strategies must be JSON objects; invalid indexes: {indexes}."
+        )
     return artifact
 
 
@@ -117,7 +122,9 @@ def _non_executable_artifact_errors(
         errors.append(f"{label}: artifact is not allowed for paper trading.")
     if require_live_eligible:
         if paper_trade_allowed is not False and paper_trade_allowed is not True:
-            errors.append(f"{label}: artifact must explicitly allow paper trading before live review.")
+            errors.append(
+                f"{label}: artifact must explicitly allow paper trading before live review."
+            )
         if live_allowed is False:
             errors.append(f"{label}: artifact is not allowed for live trading.")
         elif live_allowed is not True:
@@ -159,7 +166,9 @@ def _positive_int(value: Any, label: str, errors: list[str]) -> int | None:
     return integer
 
 
-def _required_finite_float(mapping: dict[str, Any], key: str, label: str, errors: list[str]) -> float | None:
+def _required_finite_float(
+    mapping: dict[str, Any], key: str, label: str, errors: list[str]
+) -> float | None:
     if key not in mapping:
         errors.append(f"{label}: missing required key {key}.")
         return None
@@ -167,7 +176,9 @@ def _required_finite_float(mapping: dict[str, Any], key: str, label: str, errors
 
 
 def _valid_condition_kind(kind: str) -> bool:
-    return kind in CONDITION_KINDS or bool(SLOPE_KIND_RE.match(kind) or DIVERGENCE_KIND_RE.match(kind))
+    return kind in CONDITION_KINDS or bool(
+        SLOPE_KIND_RE.match(kind) or DIVERGENCE_KIND_RE.match(kind)
+    )
 
 
 def _symbols_match(left: str, right: str) -> bool:
@@ -285,13 +296,17 @@ def validate_strategy(
     if strategy_market is None:
         errors.append(f"{label}: missing strategy market.")
     elif str(strategy_market) != product.market:
-        errors.append(f"{label}: strategy market {strategy_market!r} does not match product market {product.market!r}.")
+        errors.append(
+            f"{label}: strategy market {strategy_market!r} does not match product market {product.market!r}."
+        )
     strategy_symbol = strategy.get("symbol")
     if strategy_symbol is None:
         if require_live_metadata:
             errors.append(f"{label}: missing strategy symbol.")
     elif not _symbols_match(str(strategy_symbol), product.symbol):
-        errors.append(f"{label}: strategy symbol {strategy_symbol!r} does not match product symbol {product.symbol!r}.")
+        errors.append(
+            f"{label}: strategy symbol {strategy_symbol!r} does not match product symbol {product.symbol!r}."
+        )
     direction = strategy.get("direction")
     if direction not in {"long", "short"}:
         errors.append(f"{label}: direction must be long or short.")
@@ -359,7 +374,9 @@ def validate_strategy(
         )
 
     max_losses = (
-        _positive_int(risk.get("max_consecutive_losses"), f"{label}: max_consecutive_losses", errors)
+        _positive_int(
+            risk.get("max_consecutive_losses"), f"{label}: max_consecutive_losses", errors
+        )
         if "max_consecutive_losses" in risk
         else None
     )
@@ -392,8 +409,7 @@ def validate_strategy(
         errors.append(f"{label}: missing required key max_trades_per_day.")
     if max_trades is not None and max_trades > envelope.max_trades_per_day:
         errors.append(
-            f"{label}: max_trades_per_day {max_trades} exceeds "
-            f"{envelope.max_trades_per_day}."
+            f"{label}: max_trades_per_day {max_trades} exceeds {envelope.max_trades_per_day}."
         )
 
     fees = strategy.get("fees")
@@ -406,7 +422,9 @@ def validate_strategy(
             errors.append(f"{label}: {fee_key} must be non-negative.")
 
     if strategy.get("baseline_win_rate") is not None:
-        baseline_win_rate = _finite_float(strategy.get("baseline_win_rate"), f"{label}: baseline_win_rate", errors)
+        baseline_win_rate = _finite_float(
+            strategy.get("baseline_win_rate"), f"{label}: baseline_win_rate", errors
+        )
         if baseline_win_rate is not None and not 0 < baseline_win_rate < 1:
             errors.append(f"{label}: baseline_win_rate must be between 0 and 1.")
 
@@ -418,7 +436,9 @@ def validate_strategy(
         else:
             holdout_value = _finite_float(holdout, f"{label}: holdout_total_return", errors)
             if holdout_value is not None and holdout_value <= 0:
-                errors.append(f"{label}: holdout_total_return {holdout_value:.6f} must be positive.")
+                errors.append(
+                    f"{label}: holdout_total_return {holdout_value:.6f} must be positive."
+                )
 
     pnl_unit = strategy.get("pnl_unit")
     if pnl_unit is None:
@@ -433,23 +453,82 @@ def validate_strategy(
         if excess is None:
             errors.append(f"{label}: missing holdout_excess_return_vs_buy_hold metric.")
         else:
-            excess_value = _finite_float(excess, f"{label}: holdout_excess_return_vs_buy_hold", errors)
+            excess_value = _finite_float(
+                excess, f"{label}: holdout_excess_return_vs_buy_hold", errors
+            )
             if excess_value is not None and excess_value <= 0:
                 errors.append(
                     f"{label}: holdout_excess_return_vs_buy_hold "
                     f"{excess_value:.6f} must be positive."
                 )
-    if require_performance_evidence and product.objective == "active_income":
+    if require_performance_evidence and product.objective in {
+        "active_income",
+        "btc_accumulation",
+    }:
+        objective_label = (
+            "active income" if product.objective == "active_income" else "BTC accumulation"
+        )
         dsr = metrics.get("dsr_deflated", metrics.get("dsr"))
+        dsr_value = None
         if dsr is None:
-            errors.append(f"{label}: missing active income DSR metric.")
+            errors.append(f"{label}: missing {objective_label} DSR metric.")
         else:
-            dsr_value = _finite_float(dsr, f"{label}: active income DSR", errors)
-            if dsr_value is not None and dsr_value < ACTIVE_INCOME_MIN_DSR:
+            dsr_value = _finite_float(dsr, f"{label}: {objective_label} DSR", errors)
+            if dsr_value is not None and dsr_value < LIVE_MIN_DSR:
                 errors.append(
-                    f"{label}: active income DSR {dsr_value:.6f} below "
-                    f"{ACTIVE_INCOME_MIN_DSR:.6f}."
+                    f"{label}: {objective_label} DSR {dsr_value:.6f} below {LIVE_MIN_DSR:.6f}."
                 )
+
+        # Every numeric score used for live review must carry V2 evidence so a
+        # pre-fix artifact whose value was actually plain PSR cannot pass under
+        # a ``dsr_deflated`` label. Paper-only bootstrap artifacts bypass this
+        # through the existing require_performance_evidence gate.
+        if dsr_value is not None:
+            if metrics.get("dsr_method") != DSR_METHOD:
+                errors.append(
+                    f"{label}: DSR method must be {DSR_METHOD!r}; "
+                    "legacy plain-PSR evidence is not live-eligible."
+                )
+            n_trials = _positive_int(metrics.get("n_trials"), f"{label}: n_trials", errors)
+            trial_sharpe_count = metrics.get("trial_sharpe_count")
+            if (
+                isinstance(trial_sharpe_count, bool)
+                or not isinstance(trial_sharpe_count, int)
+                or trial_sharpe_count < 0
+            ):
+                errors.append(f"{label}: trial_sharpe_count must be a non-negative integer.")
+            dispersion = _finite_float(
+                metrics.get("sr_std_trials"),
+                f"{label}: sr_std_trials",
+                errors,
+            )
+            observed_std = _finite_float(
+                metrics.get("trial_sharpe_observed_std"),
+                f"{label}: trial_sharpe_observed_std",
+                errors,
+            )
+            floor = _finite_float(
+                metrics.get("trial_sharpe_conservative_floor"),
+                f"{label}: trial_sharpe_conservative_floor",
+                errors,
+            )
+            for field, value in (
+                ("sr_std_trials", dispersion),
+                ("trial_sharpe_observed_std", observed_std),
+                ("trial_sharpe_conservative_floor", floor),
+            ):
+                if value is not None and value < 0:
+                    errors.append(f"{label}: {field} must be non-negative.")
+            if n_trials is not None and n_trials > 1:
+                if dispersion is not None and dispersion <= 0:
+                    errors.append(
+                        f"{label}: sr_std_trials must be positive for multiple-trial DSR."
+                    )
+                if floor is not None and floor <= 0:
+                    errors.append(
+                        f"{label}: trial_sharpe_conservative_floor must be positive "
+                        "for multiple-trial DSR."
+                    )
 
     return errors
 
@@ -501,10 +580,14 @@ def validate_strategy_artifact(
     if not strategies:
         errors.append(f"{product.name}: artifact has no strategies.")
         return errors
-    bad_indexes = [index for index, strategy in enumerate(strategies) if not isinstance(strategy, dict)]
+    bad_indexes = [
+        index for index, strategy in enumerate(strategies) if not isinstance(strategy, dict)
+    ]
     if bad_indexes:
         indexes = ", ".join(str(index) for index in bad_indexes)
-        errors.append(f"{product.name}: artifact strategies must be JSON objects; invalid indexes: {indexes}.")
+        errors.append(
+            f"{product.name}: artifact strategies must be JSON objects; invalid indexes: {indexes}."
+        )
         return errors
 
     require_performance_evidence = require_live_eligible or not (
@@ -559,7 +642,9 @@ def assert_loaded_strategy_artifact_allowed(
     path = artifact_path or product.strategies_path
     if require_live_eligible is None:
         require_live_eligible = product.execution_mode == "live"
-    errors = validate_strategy_artifact(product, artifact, require_live_eligible=require_live_eligible)
+    errors = validate_strategy_artifact(
+        product, artifact, require_live_eligible=require_live_eligible
+    )
     if errors:
         raise StrategyPolicyError(
             f"{product.name}: strategy artifact violates policy: " + "; ".join(errors)

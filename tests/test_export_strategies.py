@@ -28,8 +28,7 @@ def write_search_dir(tmp_path, rows, config_extra=None):
     return search_dir
 
 
-def make_row(passes=True, expectancy=0.002, win_rate=0.6, direction="long",
-             holdout_return=0.05):
+def make_row(passes=True, expectancy=0.002, win_rate=0.6, direction="long", holdout_return=0.05):
     condition = {
         "feature": "tf_5m_rsi_14",
         "kind": "value_le",
@@ -138,7 +137,10 @@ def test_build_payload_rejects_invalid_top_k(tmp_path):
         ({"pnl_unit": "eth"}, "pnl_unit must be 'btc' or 'usdt'"),
         ({"market": "margin"}, "market must be 'spot' or 'futures'"),
         ({"pnl_unit": "usdt", "market": "spot"}, "spot strategy exports must use pnl_unit 'btc'"),
-        ({"pnl_unit": "btc", "market": "futures"}, "futures strategy exports must use pnl_unit 'usdt'"),
+        (
+            {"pnl_unit": "btc", "market": "futures"},
+            "futures strategy exports must use pnl_unit 'usdt'",
+        ),
         ({"risk_per_trade": 0.0}, "risk_per_trade must be positive"),
         ({"daily_stop_loss": 0.0}, "daily_stop_loss must be negative"),
         ({"max_consecutive_losses": 1.5}, "max_consecutive_losses must be an integer"),
@@ -228,7 +230,9 @@ def test_build_payload_stamps_symbol_from_search_config(tmp_path):
 
 
 def test_build_payload_marks_btc_holdout_as_excess_vs_buy_hold(tmp_path):
-    search_dir = write_search_dir(tmp_path, [make_row(holdout_return=0.04)], config_extra={"pnl_unit": "btc"})
+    search_dir = write_search_dir(
+        tmp_path, [make_row(holdout_return=0.04)], config_extra={"pnl_unit": "btc"}
+    )
 
     payload = build_payload(search_dir)
     metrics = payload["strategies"][0]["metrics"]

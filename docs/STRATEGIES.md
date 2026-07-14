@@ -58,6 +58,11 @@ on a later one. The CLI does the chronological split for you.
 | `ml_regressor` | machine learning | Gradient boosting predicts forward or TP/SL-capped barrier return; trade above an edge |
 | `condition_grid` | bridge | Runs a `discover_patterns` rule (e.g. from `active_strategies.json`) |
 
+Regime IDs are causal and stable: `-1=unknown`, `0=range`, `1=bull_trend`,
+`2=bear_trend`, and `3=high_volatility`. A daily close can affect intraday
+labels only from the following UTC day, and appending future observations does
+not relabel historical rows.
+
 All indicators they use are pure-pandas (no TA-Lib) and live in
 `src/strategies/indicators.py` — `sma/ema/rsi/atr`, `macd`, `bollinger_bands`,
 `keltner_channels`, `stochastic`, `adx`, `supertrend`, `roc`, `williams_r`,

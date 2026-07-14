@@ -21,7 +21,8 @@ def candidate_feature_columns(
         return [column for column in feature_cols if column in df.columns][: int(max_features)]
     numeric = df.select_dtypes(include=[np.number]).columns
     cols = [
-        column for column in numeric
+        column
+        for column in numeric
         if not any(sub in column for sub in EXCLUDE_SUBSTRINGS)
         and not column.endswith(OHLCV_SUFFIXES)
         and column not in ("open", "high", "low", "close", "volume")

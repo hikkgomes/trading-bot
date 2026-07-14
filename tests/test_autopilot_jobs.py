@@ -688,7 +688,9 @@ def test_research_cycle_waits_when_open_position_export_remains_blocked(tmp_path
         json.dumps(
             {
                 "version": 1,
-                "open_positions": {"active_bootstrap_short_rsi_5m": {"side": "short", "qty": 0.001}},
+                "open_positions": {
+                    "active_bootstrap_short_rsi_5m": {"side": "short", "qty": 0.001}
+                },
             }
         ),
         encoding="utf-8",
@@ -720,7 +722,9 @@ def test_run_due_jobs_persists_success(tmp_path):
     assert "ok" in results[0]["stdout_tail"]
     state = load_job_state(state_path)
     assert state["jobs"]["smoke"]["last_ok"] is True
-    assert state["jobs"]["smoke"]["definition_fingerprint"] == job_definition_fingerprint(job(tmp_path))
+    assert state["jobs"]["smoke"]["definition_fingerprint"] == job_definition_fingerprint(
+        job(tmp_path)
+    )
 
 
 def test_load_job_state_rejects_non_object_payload(tmp_path):
@@ -828,9 +832,16 @@ def test_run_due_jobs_rotates_after_cycle_limited_execution(tmp_path):
 
 def test_run_due_jobs_repairs_invalid_scheduler_cursor(tmp_path):
     state_path = tmp_path / "jobs.json"
-    state_path.write_text(json.dumps({"version": 1, "jobs": {}, "scheduler": {"next_index": "bad"}}), encoding="utf-8")
+    state_path.write_text(
+        json.dumps({"version": 1, "jobs": {}, "scheduler": {"next_index": "bad"}}), encoding="utf-8"
+    )
 
-    results = run_due_jobs([job(tmp_path, name="first"), job(tmp_path, name="second")], state_path, now=100.0, max_jobs_per_cycle=1)
+    results = run_due_jobs(
+        [job(tmp_path, name="first"), job(tmp_path, name="second")],
+        state_path,
+        now=100.0,
+        max_jobs_per_cycle=1,
+    )
 
     assert [item["name"] for item in results] == ["first", "second"]
     assert load_job_state(state_path)["scheduler"]["next_index"] == 1
@@ -923,14 +934,12 @@ def test_parse_structured_stdout_reads_json_objects_only():
         "reason": "empty_seed_dataset",
     }
     assert parse_structured_stdout(
-        "2026-01-01 00:00:00 INFO starting\n"
-        "progress 50%\n"
-        '{"ok": true, "reason": "refreshed"}\n'
+        '2026-01-01 00:00:00 INFO starting\nprogress 50%\n{"ok": true, "reason": "refreshed"}\n'
     ) == {"ok": True, "reason": "refreshed"}
     assert parse_structured_stdout(
         "2026-01-01 00:00:00 INFO starting\n"
         "progress 50%\n"
-        '{\n'
+        "{\n"
         '  "ok": true,\n'
         '  "reason": "refreshed",\n'
         '  "summary": {\n'
@@ -1105,7 +1114,10 @@ def test_run_due_jobs_summarizes_large_structured_report_errors_for_status(tmp_p
     }
     state = load_job_state(state_path)
     assert state["jobs"]["smoke"]["last_ok"] is False
-    assert state["jobs"]["smoke"]["last_error"] == "alert_state: ValueError: alert state path must not be a symlink"
+    assert (
+        state["jobs"]["smoke"]["last_error"]
+        == "alert_state: ValueError: alert state path must not be a symlink"
+    )
     assert state["jobs"]["smoke"]["last_structured_errors_count"] == 4
     assert state["jobs"]["smoke"]["last_structured_errors"] == [
         {"task": "alert_state", "error": "ValueError: alert state path must not be a symlink"},

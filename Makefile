@@ -5,7 +5,7 @@
 VENV ?= .venv
 PY ?= $(VENV)/bin/python
 BOOTSTRAP_PY ?= python3
-PREFLIGHT_OUTPUT ?= $(if $(PRODUCT),runtime/$(PRODUCT)_preflight_report.json,runtime/preflight_report.json)
+PREFLIGHT_OUTPUT ?= $(if $(REQUIRE_TESTNET),runtime/$(PRODUCT)_testnet_preflight_report.json,$(if $(PRODUCT),runtime/$(PRODUCT)_preflight_report.json,runtime/preflight_report.json))
 BACKUP ?= $(shell ls -t runtime/backups/autopilot_state_*.zip 2>/dev/null | head -1)
 RESTORE_DIR ?= runtime/restore_rehearsal
 
@@ -41,7 +41,8 @@ test-fast:  ## Run tests excluding ones marked slow
 
 .PHONY: lint
 lint:  ## Lint with ruff
-	$(PY) -m ruff check src tests
+	$(PY) -m ruff check .
+	$(PY) -m ruff format --check .
 
 .PHONY: lint-autopilot
 lint-autopilot:  ## Lint autonomous runtime + execution surface
@@ -50,8 +51,8 @@ lint-autopilot:  ## Lint autonomous runtime + execution surface
 
 .PHONY: format
 format:  ## Auto-format + autofix with ruff
-	$(PY) -m ruff format src tests
-	$(PY) -m ruff check --fix src tests
+	$(PY) -m ruff format .
+	$(PY) -m ruff check --fix .
 
 .PHONY: clean
 clean:  ## Remove caches and build artifacts

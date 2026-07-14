@@ -24,7 +24,7 @@ from research_exploration.strategy_families import FAMILIES, apply_no_trade_guar
 # end up with MORE BTC than buy-and-hold is to be short during drawdowns —
 # these are "dodge the pullback" hypotheses, validated in BTC terms.
 POSITION_TF_COMBOS = [("1w", "1d", "4h"), ("1d", "4h", "1h"), ("1d", "4h", "4h")]
-POSITION_EXIT_SCALE = 3.0     # day-trade exits are far too tight for multi-day swings
+POSITION_EXIT_SCALE = 3.0  # day-trade exits are far too tight for multi-day swings
 POSITION_HORIZON_SCALE = 2.0
 
 # Active-income swing trading is a separate research horizon, not a label for
@@ -36,9 +36,9 @@ SWING_HORIZON_SCALE = 4.0
 SWING_MIN_HORIZON_BARS = 48
 
 
-def generate_batch(per_family_combos: int | None = None,
-                   directions=("long", "short"),
-                   with_guards: bool = False) -> list[Hypothesis]:
+def generate_batch(
+    per_family_combos: int | None = None, directions=("long", "short"), with_guards: bool = False
+) -> list[Hypothesis]:
     """Build the candidate batch. ``per_family_combos`` caps timeframe combos
     per family (None == use all the family's default combos).
 
@@ -64,16 +64,17 @@ def generate_batch(per_family_combos: int | None = None,
     return out
 
 
-def first_smoke_set(directions=("long", "short"),
-                    with_guards: bool = False) -> list[Hypothesis]:
+def first_smoke_set(directions=("long", "short"), with_guards: bool = False) -> list[Hypothesis]:
     """A small (~20) diversified set: 2 timeframe combos per family, both
     directions. Good for the initial controlled smoke test."""
     return generate_batch(per_family_combos=2, directions=directions, with_guards=with_guards)
 
 
-def position_trading_set(with_guards: bool = False,
-                         exit_scale: float = POSITION_EXIT_SCALE,
-                         horizon_scale: float = POSITION_HORIZON_SCALE) -> list[Hypothesis]:
+def position_trading_set(
+    with_guards: bool = False,
+    exit_scale: float = POSITION_EXIT_SCALE,
+    horizon_scale: float = POSITION_HORIZON_SCALE,
+) -> list[Hypothesis]:
     """Scenario 1: BTC-accumulation candidates. Same named families, but on
     coarse timeframe stacks, SHORT side only, with exits widened for multi-day
     swings. Validate with ``--pnl-unit btc``: a keep means the rule ended with
@@ -180,10 +181,9 @@ def load_batch(path: Path) -> list[Hypothesis]:
 
 def summarize(hyps: list[Hypothesis]) -> str:
     from collections import Counter
+
     by_family = Counter(h.family for h in hyps)
-    by_tf = Counter(
-        f"{h.regime_timeframe}+{h.setup_timeframe}+{h.trigger_timeframe}" for h in hyps
-    )
+    by_tf = Counter(f"{h.regime_timeframe}+{h.setup_timeframe}+{h.trigger_timeframe}" for h in hyps)
     lines = [f"Generated {len(hyps)} hypotheses.", "", "By family:"]
     lines += [f"  {fam:24} {n}" for fam, n in by_family.most_common()]
     lines += ["", "By timeframe stack:"]
@@ -193,26 +193,42 @@ def summarize(hyps: list[Hypothesis]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate a curated hypothesis batch.")
-    parser.add_argument("--out", type=Path, default=None,
-                        help="Output JSON (default: hypotheses_batch_001.json, or "
-                             "hypotheses_position_001.json with --position).")
-    parser.add_argument("--smoke", action="store_true",
-                        help="Only the small diversified smoke set (~20).")
-    parser.add_argument("--position", action="store_true",
-                        help="Scenario-1 batch: BTC-accumulation shorts on coarse stacks "
-                             "(validate with --pnl-unit btc).")
-    parser.add_argument("--with-guards", dest="with_guards", action="store_true",
-                        help="Layer Family-F regime-avoidance guards (anti-chop + vol band) onto every candidate.")
-    parser.add_argument("--print", dest="echo", action="store_true",
-                        help="Echo each hypothesis' human summary.")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Output JSON (default: hypotheses_batch_001.json, or "
+        "hypotheses_position_001.json with --position).",
+    )
+    parser.add_argument(
+        "--smoke", action="store_true", help="Only the small diversified smoke set (~20)."
+    )
+    parser.add_argument(
+        "--position",
+        action="store_true",
+        help="Scenario-1 batch: BTC-accumulation shorts on coarse stacks "
+        "(validate with --pnl-unit btc).",
+    )
+    parser.add_argument(
+        "--with-guards",
+        dest="with_guards",
+        action="store_true",
+        help="Layer Family-F regime-avoidance guards (anti-chop + vol band) onto every candidate.",
+    )
+    parser.add_argument(
+        "--print", dest="echo", action="store_true", help="Echo each hypothesis' human summary."
+    )
     args = parser.parse_args()
 
     if args.position:
         hyps = position_trading_set(with_guards=args.with_guards)
         default_out = Path("outputs/research_exploration/hypotheses_position_001.json")
     else:
-        hyps = (first_smoke_set(with_guards=args.with_guards) if args.smoke
-                else generate_batch(with_guards=args.with_guards))
+        hyps = (
+            first_smoke_set(with_guards=args.with_guards)
+            if args.smoke
+            else generate_batch(with_guards=args.with_guards)
+        )
         default_out = Path("outputs/research_exploration/hypotheses_batch_001.json")
     args.out = args.out or default_out
     write_batch(hyps, args.out)

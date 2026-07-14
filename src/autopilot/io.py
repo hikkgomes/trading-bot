@@ -9,6 +9,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from src.autopilot.locking import acquire_file_update_lock
+
 
 def write_text_atomic(path: Path, content: str, *, encoding: str = "utf-8") -> None:
     """Write text by replacing the target after the full payload reaches disk."""
@@ -47,6 +49,13 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 def append_json_line(path: Path, payload: dict[str, Any]) -> None:
     """Append one durable JSONL record."""
+    with acquire_file_update_lock(path, label="JSONL append"):
+        _append_json_line_locked(path, payload)
+
+
+def _append_json_line_locked(path: Path, payload: dict[str, Any]) -> None:
+    """Append while the shared sibling update lock is held."""
+
     if path.is_symlink():
         raise ValueError(f"jsonl path must not be a symlink: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -58,6 +67,7 @@ def append_json_line(path: Path, payload: dict[str, Any]) -> None:
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise ValueError(f"jsonl path must be a regular file: {path}")
+        os.fchmod(descriptor, 0o600)
         record = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
         written = os.write(descriptor, record)
         if written != len(record):

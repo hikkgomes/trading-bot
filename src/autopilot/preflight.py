@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -20,11 +21,16 @@ from typing import Any
 from src.autopilot.approvals import (
     ApprovalError,
     artifact_digest,
-    assert_artifact_live_approved,
     load_artifact,
     strategy_fingerprint,
 )
-from src.autopilot.config import DEFAULT_CONFIG_PATH, AutopilotConfig, ProductConfig, load_config
+from src.autopilot.config import (
+    DEFAULT_CONFIG_PATH,
+    AutopilotConfig,
+    ProductConfig,
+    canonical_product_config,
+    load_config,
+)
 from src.autopilot.exchange_policy import (
     ACTIVE_INCOME_MAX_FUTURES_LEVERAGE,
     validate_exchange_policy,
@@ -34,7 +40,7 @@ from src.autopilot.io import write_json_atomic
 from src.autopilot.reporting import utc_now
 from src.autopilot.runtime import build_live_broker, validate_config
 from src.autopilot.strategy_policy import StrategyPolicyError, assert_strategy_artifact_allowed
-from src.execution.broker import OpenOrderIdentity
+from src.execution.broker import FuturesPositionIdentity, OpenOrderIdentity
 from src.execution.config import ExchangeConfig
 
 LOGGER = logging.getLogger("autopilot.preflight")
@@ -105,31 +111,7 @@ def _check_exchange_env(
 
 
 def _product_status(product: ProductConfig) -> dict[str, Any]:
-    return {
-        "name": product.name,
-        "enabled": product.enabled,
-        "objective": product.objective,
-        "base_asset": product.base_asset,
-        "market": product.market,
-        "symbol": product.symbol,
-        "execution_mode": product.execution_mode,
-        "starting_equity": product.starting_equity,
-        "regime_guard": product.regime_guard,
-        "regime_mayer_top": product.regime_mayer_top,
-        "strategies_path": str(product.strategies_path),
-        "require_preflight": product.require_preflight,
-        "preflight_report": str(product.preflight_report)
-        if product.preflight_report is not None
-        else None,
-        "preflight_max_age_seconds": product.preflight_max_age_seconds,
-        "require_testnet_rehearsal": product.require_testnet_rehearsal,
-        "testnet_rehearsal_report": (
-            str(product.testnet_rehearsal_report)
-            if product.testnet_rehearsal_report is not None
-            else None
-        ),
-        "testnet_rehearsal_max_age_seconds": product.testnet_rehearsal_max_age_seconds,
-    }
+    return canonical_product_config(product)
 
 
 def _artifact_fingerprints(path: Path) -> list[str]:
@@ -152,7 +134,6 @@ def _requires_non_negative_spot_position(product: ProductConfig) -> bool:
 def _sanitized_open_order_evidence(
     orders: Any,
     *,
-    symbol: str,
     conditional: bool,
 ) -> list[dict[str, Any]]:
     if not isinstance(orders, list | tuple):
@@ -161,10 +142,13 @@ def _sanitized_open_order_evidence(
     for index, order in enumerate(orders):
         if not isinstance(order, OpenOrderIdentity):
             raise ValueError(f"broker open-order inventory item {index} must be OpenOrderIdentity")
-        if order.symbol != symbol:
-            raise ValueError(
-                f"broker open-order inventory symbol mismatch: {order.symbol!r} != {symbol!r}"
-            )
+        if (
+            not isinstance(order.symbol, str)
+            or not order.symbol.strip()
+            or len(order.symbol) > 128
+            or not order.symbol.isprintable()
+        ):
+            raise ValueError("broker open-order inventory symbol is invalid")
         if order.conditional is not conditional:
             raise ValueError("broker open-order inventory conditional flag mismatch")
         if order.status not in {"open", "partially_filled"}:
@@ -185,19 +169,52 @@ def _sanitized_open_order_evidence(
 
 def _open_order_inventory_evidence(broker: Any, symbol: str) -> dict[str, Any]:
     regular = _sanitized_open_order_evidence(
-        broker.list_open_orders(symbol, conditional=False),
-        symbol=symbol,
+        broker.list_account_open_orders(conditional=False),
         conditional=False,
     )
     conditional = _sanitized_open_order_evidence(
-        broker.list_open_orders(symbol, conditional=True),
-        symbol=symbol,
+        broker.list_account_open_orders(conditional=True),
         conditional=True,
     )
     return {
-        "symbol": symbol,
+        "scope": "whole_account",
+        "configured_symbol": symbol,
         "regular": {"count": len(regular), "orders": regular},
         "conditional": {"count": len(conditional), "orders": conditional},
+    }
+
+
+def _position_inventory_evidence(broker: Any, symbol: str) -> dict[str, Any]:
+    positions = broker.list_account_futures_positions()
+    if not isinstance(positions, list | tuple):
+        raise ValueError("broker futures-position inventory must be a list or tuple")
+    evidence: list[dict[str, Any]] = []
+    for index, position in enumerate(positions):
+        if not isinstance(position, FuturesPositionIdentity):
+            raise ValueError(
+                f"broker futures-position inventory item {index} must be FuturesPositionIdentity"
+            )
+        if (
+            not isinstance(position.symbol, str)
+            or not position.symbol.strip()
+            or len(position.symbol) > 128
+            or not position.symbol.isprintable()
+        ):
+            raise ValueError("broker futures-position inventory symbol is invalid")
+        qty = float(position.qty)
+        avg_price = float(position.avg_price)
+        if not math.isfinite(qty) or qty == 0:
+            raise ValueError(
+                "broker futures-position inventory quantity must be finite and non-zero"
+            )
+        if not math.isfinite(avg_price) or avg_price <= 0:
+            raise ValueError("broker futures-position inventory entry price must be positive")
+        evidence.append({"symbol": position.symbol, "qty": qty, "avg_price": avg_price})
+    return {
+        "scope": "whole_account",
+        "configured_symbol": symbol,
+        "count": len(evidence),
+        "positions": evidence,
     }
 
 
@@ -275,14 +292,6 @@ def preflight_product(
             check("strategy_policy", True, detail)
         except (StrategyPolicyError, FileNotFoundError) as exc:
             check("strategy_policy", False, error=str(exc))
-
-    try:
-        assert_artifact_live_approved(
-            live_product.strategies_path, config.approval_ledger, product=live_product
-        )
-        check("approval_gate", True)
-    except (ApprovalError, FileNotFoundError) as exc:
-        check("approval_gate", False, error=str(exc))
 
     if exchange_env_checker is None:
         env_errors, env_detail = _check_exchange_env(live_product, require_testnet=require_testnet)
@@ -395,9 +404,37 @@ def preflight_product(
                     None
                     if empty
                     else (
-                        f"{live_product.name}: broker has outstanding {live_product.symbol} "
+                        f"{live_product.name}: dedicated broker account has outstanding "
                         f"orders (regular={regular_count}, conditional={conditional_count}); "
                         "manual reconciliation is required before live/testnet entry."
+                    ),
+                )
+            try:
+                account_positions = _position_inventory_evidence(
+                    broker,
+                    live_product.symbol,
+                )
+            except Exception as exc:
+                check(
+                    "broker_position_flat",
+                    False,
+                    error=(
+                        f"{live_product.name}: could not prove the whole futures account "
+                        f"is flat: {exc}"
+                    ),
+                )
+            else:
+                empty = account_positions["count"] == 0
+                check(
+                    "broker_position_flat",
+                    empty,
+                    account_positions,
+                    None
+                    if empty
+                    else (
+                        f"{live_product.name}: dedicated broker account has "
+                        f"{account_positions['count']} non-flat position(s); manual "
+                        "reconciliation is required before live/testnet entry."
                     ),
                 )
         try:
@@ -415,22 +452,6 @@ def preflight_product(
                     "position_is_flat": position.is_flat,
                 },
             )
-            if _requires_flat_connect_position(live_product):
-                check(
-                    "broker_position_flat",
-                    position.is_flat,
-                    {
-                        "symbol": live_product.symbol,
-                        "position_qty": position.qty,
-                        "position_avg_price": position.avg_price,
-                    },
-                    None
-                    if position.is_flat
-                    else (
-                        f"{live_product.name}: broker position must be flat before "
-                        f"active-income live/testnet enablement; got qty {position.qty:g}."
-                    ),
-                )
             if _requires_non_negative_spot_position(live_product):
                 check(
                     "broker_spot_position_non_negative",

@@ -99,6 +99,21 @@ class OpenOrderIdentity:
     conditional: bool
 
 
+@dataclass(frozen=True)
+class FuturesPositionIdentity:
+    """Sanitized non-flat position from a whole futures account inventory.
+
+    Entry and production-readiness gates use this deliberately small record so
+    an adapter cannot accidentally copy arbitrary authenticated exchange
+    payloads into logs.  ``qty`` is signed using the same convention as
+    :class:`Position`.
+    """
+
+    symbol: str
+    qty: float
+    avg_price: float
+
+
 @dataclass
 class Position:
     symbol: str
@@ -191,6 +206,35 @@ class Broker(ABC):
 
         order_kind = "conditional" if conditional else "regular"
         raise NotImplementedError(f"{self.name} cannot verify {order_kind} open orders.")
+
+    def list_account_open_orders(
+        self,
+        *,
+        conditional: bool,
+    ) -> tuple[OpenOrderIdentity, ...]:
+        """Return every active futures order in the authenticated account.
+
+        This is intentionally separate from the symbol-scoped method: passing
+        a configured symbol to an exchange endpoint cannot prove that a
+        dedicated execution account has no exposure elsewhere.  The default
+        fails closed for adapters that have not implemented a validated
+        whole-account read.
+        """
+
+        order_kind = "conditional" if conditional else "regular"
+        raise NotImplementedError(
+            f"{self.name} cannot verify account-wide {order_kind} open orders."
+        )
+
+    def list_account_futures_positions(self) -> tuple[FuturesPositionIdentity, ...]:
+        """Return every sanitized non-flat futures position in the account.
+
+        Implementations must parse the complete authenticated response and
+        fail on malformed records instead of dropping records they do not
+        understand.
+        """
+
+        raise NotImplementedError(f"{self.name} cannot verify account-wide futures positions.")
 
     def place_protective_stop(
         self,

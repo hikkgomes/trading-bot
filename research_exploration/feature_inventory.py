@@ -31,61 +31,117 @@ from src.config import INDICATOR_DATA_DIR
 ALL_TIMEFRAMES: tuple[str, ...] = ("1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 
 # Approx bars-per-day, used only to translate horizons into wall-clock for the report.
-BARS_PER_DAY = {"1m": 1440, "5m": 288, "15m": 96, "30m": 48, "1h": 24, "4h": 6, "1d": 1, "1w": 1 / 7}
+BARS_PER_DAY = {
+    "1m": 1440,
+    "5m": 288,
+    "15m": 96,
+    "30m": 48,
+    "1h": 24,
+    "4h": 6,
+    "1d": 1,
+    "1w": 1 / 7,
+}
 
 RAW_OHLCV = {
-    "open", "high", "low", "close", "volume", "quote_asset_volume",
-    "number_of_trades", "taker_buy_base_volume", "taker_buy_quote_volume",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "quote_asset_volume",
+    "number_of_trades",
+    "taker_buy_base_volume",
+    "taker_buy_quote_volume",
 }
 
 # Pure element-wise TA-Lib math operators: little strategy value, flagged low-priority.
 MATH_SCALAR = {
-    "add", "div", "mult", "sub", "acos", "asin", "atan", "ceil", "cos", "cosh",
-    "exp", "floor", "ln", "log10", "sin", "sinh", "sqrt", "tan", "tanh",
+    "add",
+    "div",
+    "mult",
+    "sub",
+    "acos",
+    "asin",
+    "atan",
+    "ceil",
+    "cos",
+    "cosh",
+    "exp",
+    "floor",
+    "ln",
+    "log10",
+    "sin",
+    "sinh",
+    "sqrt",
+    "tan",
+    "tanh",
 }
 
 # Ordered (feature_family, regex) rules. First match wins, so order matters:
 # order-flow before volume, candlesticks before everything, etc.
 _FAMILY_RULES: list[tuple[str, re.Pattern]] = [
-    ("orderflow",      re.compile(r"^(cvd|taker_imbalance|taker_buy_ratio|trades_z|avg_trade_size|volume_z|delta)(_|$)")),
-    ("candlestick",    re.compile(r"^cdl")),
-    ("cycle_hilbert",  re.compile(r"^ht_")),
+    (
+        "orderflow",
+        re.compile(
+            r"^(cvd|taker_imbalance|taker_buy_ratio|trades_z|avg_trade_size|volume_z|delta)(_|$)"
+        ),
+    ),
+    ("candlestick", re.compile(r"^cdl")),
+    ("cycle_hilbert", re.compile(r"^ht_")),
     ("price_transform", re.compile(r"^(avgprice|medprice|typprice|wclprice)$")),
     # Rolling extrema / Donchian boundaries — directly usable for breakout & sweep families.
-    ("range_extrema",  re.compile(r"^(max|min|sum|maxindex|minindex|minmax|minmaxindex)(_|$)")),
-    ("volatility",     re.compile(r"^(atr|natr|trange|true_range|stddev|stdev|var|bbands)(_|$)")),
-    ("statistic",      re.compile(r"^(beta|correl|linearreg|linearreg_angle|linearreg_intercept|linearreg_slope|tsf)(_|$)")),
-    ("trend_ma",       re.compile(r"^(sma|ema|dema|tema|trima|wma|kama|t3|mama|fama|ma|midpoint|midprice|sar|sarext|trendline)(_|$)")),
-    ("trend_dmi",      re.compile(r"^(adx|adxr|dx|plus_di|minus_di|plus_dm|minus_dm|aroon|aroonosc)(_|$)")),
-    ("momentum",       re.compile(r"^(rsi|stoch|stochf|stochrsi|macd|macdext|macdfix|mom|roc|rocp|rocr|rocr100|cci|cmo|ppo|apo|willr|ultosc|trix|bop|mfi)(_|$)")),
-    ("volume",         re.compile(r"^(ad|adosc|obv)(_|$)")),
+    ("range_extrema", re.compile(r"^(max|min|sum|maxindex|minindex|minmax|minmaxindex)(_|$)")),
+    ("volatility", re.compile(r"^(atr|natr|trange|true_range|stddev|stdev|var|bbands)(_|$)")),
+    (
+        "statistic",
+        re.compile(
+            r"^(beta|correl|linearreg|linearreg_angle|linearreg_intercept|linearreg_slope|tsf)(_|$)"
+        ),
+    ),
+    (
+        "trend_ma",
+        re.compile(
+            r"^(sma|ema|dema|tema|trima|wma|kama|t3|mama|fama|ma|midpoint|midprice|sar|sarext|trendline)(_|$)"
+        ),
+    ),
+    (
+        "trend_dmi",
+        re.compile(r"^(adx|adxr|dx|plus_di|minus_di|plus_dm|minus_dm|aroon|aroonosc)(_|$)"),
+    ),
+    (
+        "momentum",
+        re.compile(
+            r"^(rsi|stoch|stochf|stochrsi|macd|macdext|macdfix|mom|roc|rocp|rocr|rocr100|cci|cmo|ppo|apo|willr|ultosc|trix|bop|mfi)(_|$)"
+        ),
+    ),
+    ("volume", re.compile(r"^(ad|adosc|obv)(_|$)")),
 ]
 
 # Short human descriptions of each family, used in the report.
 FAMILY_DESCRIPTIONS = {
-    "raw_ohlcv":       "Raw candle fields (price, volume, trade counts, taker buy volume).",
-    "orderflow":       "Order-flow: CVD, taker imbalance, volume/trade z-scores, avg trade size.",
-    "trend_ma":        "Trend / overlap: moving averages (sma/ema/...), SAR, MAMA, midprice.",
-    "trend_dmi":       "Directional movement & trend strength: ADX, DI+/-, Aroon.",
-    "momentum":        "Momentum oscillators: RSI, MACD, stoch, CCI, ROC, Williams %R, MFI...",
-    "volatility":      "Volatility & bands: ATR/NATR, true range, stddev/var, Bollinger bands.",
-    "range_extrema":   "Rolling highs/lows & sums (Donchian boundaries; bars-since-extreme).",
-    "statistic":       "Linear-regression family: slope, angle, forecast (tsf), beta, correl.",
-    "volume":          "Classic volume indicators: OBV, A/D, A/D oscillator.",
-    "candlestick":     "TA-Lib candlestick patterns (-100/0/+100 signals).",
-    "cycle_hilbert":   "Hilbert-transform cycle features: dominant period/phase, trendmode.",
+    "raw_ohlcv": "Raw candle fields (price, volume, trade counts, taker buy volume).",
+    "orderflow": "Order-flow: CVD, taker imbalance, volume/trade z-scores, avg trade size.",
+    "trend_ma": "Trend / overlap: moving averages (sma/ema/...), SAR, MAMA, midprice.",
+    "trend_dmi": "Directional movement & trend strength: ADX, DI+/-, Aroon.",
+    "momentum": "Momentum oscillators: RSI, MACD, stoch, CCI, ROC, Williams %R, MFI...",
+    "volatility": "Volatility & bands: ATR/NATR, true range, stddev/var, Bollinger bands.",
+    "range_extrema": "Rolling highs/lows & sums (Donchian boundaries; bars-since-extreme).",
+    "statistic": "Linear-regression family: slope, angle, forecast (tsf), beta, correl.",
+    "volume": "Classic volume indicators: OBV, A/D, A/D oscillator.",
+    "candlestick": "TA-Lib candlestick patterns (-100/0/+100 signals).",
+    "cycle_hilbert": "Hilbert-transform cycle features: dominant period/phase, trendmode.",
     "price_transform": "Price transforms: average/median/typical/weighted-close price.",
-    "math_scalar":     "Element-wise math operators (sin/cos/sqrt/...) — low strategy value.",
-    "time":            "Timestamp.",
-    "unclassified":    "Columns not matched by any family rule.",
+    "math_scalar": "Element-wise math operators (sin/cos/sqrt/...) — low strategy value.",
+    "time": "Timestamp.",
+    "unclassified": "Columns not matched by any family rule.",
 }
 
 # Families a research hypothesis would actually reach for, grouped by role.
 TRADING_FAMILIES = {
     "regime_context": ["trend_ma", "trend_dmi", "statistic"],
-    "setup":          ["momentum", "volatility", "range_extrema", "price_transform"],
-    "trigger":        ["momentum", "orderflow", "candlestick", "range_extrema"],
-    "filter":         ["volatility", "orderflow", "cycle_hilbert"],
+    "setup": ["momentum", "volatility", "range_extrema", "price_transform"],
+    "trigger": ["momentum", "orderflow", "candlestick", "range_extrema"],
+    "filter": ["volatility", "orderflow", "cycle_hilbert"],
 }
 
 
@@ -133,7 +189,9 @@ class TimeframeInventory:
     columns: list[str] = field(default_factory=list)
 
 
-def _column_stats_from_metadata(pf: pq.ParquetFile) -> tuple[dict[str, float], dict[str, bool], str | None, str | None]:
+def _column_stats_from_metadata(
+    pf: pq.ParquetFile,
+) -> tuple[dict[str, float], dict[str, bool], str | None, str | None]:
     """Null fractions + constant flags + timestamp range, all from the footer."""
     md = pf.metadata
     schema = pf.schema_arrow
@@ -159,10 +217,14 @@ def _column_stats_from_metadata(pf: pq.ParquetFile) -> tuple[dict[str, float], d
                 g_min[name] = lo if g_min[name] is None else min(g_min[name], lo)
                 g_max[name] = hi if g_max[name] is None else max(g_max[name], hi)
 
-    null_fraction = {name: (null_counts[name] / n_rows) if has_stats[name] else float("nan")
-                     for name in schema.names}
-    is_constant = {name: (has_stats[name] and g_min[name] is not None and g_min[name] == g_max[name])
-                   for name in schema.names}
+    null_fraction = {
+        name: (null_counts[name] / n_rows) if has_stats[name] else float("nan")
+        for name in schema.names
+    }
+    is_constant = {
+        name: (has_stats[name] and g_min[name] is not None and g_min[name] == g_max[name])
+        for name in schema.names
+    }
 
     ts_min = ts_max = None
     if "timestamp" in g_min and g_min["timestamp"] is not None:
@@ -170,8 +232,9 @@ def _column_stats_from_metadata(pf: pq.ParquetFile) -> tuple[dict[str, float], d
     return null_fraction, is_constant, ts_min, ts_max
 
 
-def inventory_timeframe(timeframe: str, indicator_dir: Path = INDICATOR_DATA_DIR,
-                        high_null_threshold: float = 0.5) -> TimeframeInventory:
+def inventory_timeframe(
+    timeframe: str, indicator_dir: Path = INDICATOR_DATA_DIR, high_null_threshold: float = 0.5
+) -> TimeframeInventory:
     path = indicator_dir / f"BTCUSDT_{timeframe}_all_indicators.parquet"
     if not path.exists():
         return TimeframeInventory(timeframe=timeframe, path=str(path), exists=False)
@@ -187,9 +250,12 @@ def inventory_timeframe(timeframe: str, indicator_dir: Path = INDICATOR_DATA_DIR
         family_counts[fam] = family_counts.get(fam, 0) + 1
         family_roots.setdefault(fam, set()).add(feature_root(col))
 
-    high_null = sorted(c for c in columns
-                       if null_fraction.get(c) == null_fraction.get(c)  # not NaN
-                       and null_fraction.get(c, 0) >= high_null_threshold)
+    high_null = sorted(
+        c
+        for c in columns
+        if null_fraction.get(c) == null_fraction.get(c)  # not NaN
+        and null_fraction.get(c, 0) >= high_null_threshold
+    )
     constants = sorted(c for c in columns if is_constant.get(c))
 
     return TimeframeInventory(
@@ -209,8 +275,9 @@ def inventory_timeframe(timeframe: str, indicator_dir: Path = INDICATOR_DATA_DIR
     )
 
 
-def build_inventory(timeframes: tuple[str, ...] = ALL_TIMEFRAMES,
-                    indicator_dir: Path = INDICATOR_DATA_DIR) -> dict[str, TimeframeInventory]:
+def build_inventory(
+    timeframes: tuple[str, ...] = ALL_TIMEFRAMES, indicator_dir: Path = INDICATOR_DATA_DIR
+) -> dict[str, TimeframeInventory]:
     return {tf: inventory_timeframe(tf, indicator_dir) for tf in timeframes}
 
 
@@ -248,7 +315,9 @@ def print_summary(inv: dict[str, TimeframeInventory]) -> None:
             print(f"{tf:>4}  MISSING  ({ti.path})")
             continue
         rng = f"{(ti.timestamp_min or '?')[:10]} -> {(ti.timestamp_max or '?')[:10]}"
-        print(f"{tf:>4} {ti.num_rows:>12,} {ti.num_columns:>5} {('yes' if ti.orderflow_available else 'no'):>5}  {rng}")
+        print(
+            f"{tf:>4} {ti.num_rows:>12,} {ti.num_columns:>5} {('yes' if ti.orderflow_available else 'no'):>5}  {rng}"
+        )
 
     # Families present (union across timeframes), with the per-tf count.
     print("\nFeature families (count of columns per timeframe):")
@@ -261,12 +330,18 @@ def print_summary(inv: dict[str, TimeframeInventory]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Inventory features across all timeframes (metadata only).")
+    parser = argparse.ArgumentParser(
+        description="Inventory features across all timeframes (metadata only)."
+    )
     parser.add_argument("--indicator-dir", type=Path, default=INDICATOR_DATA_DIR)
-    parser.add_argument("--out", type=Path,
-                        default=Path("outputs/research_exploration/feature_inventory.json"))
-    parser.add_argument("--include-columns", action="store_true",
-                        help="Embed the full column list per timeframe in the JSON (large).")
+    parser.add_argument(
+        "--out", type=Path, default=Path("outputs/research_exploration/feature_inventory.json")
+    )
+    parser.add_argument(
+        "--include-columns",
+        action="store_true",
+        help="Embed the full column list per timeframe in the JSON (large).",
+    )
     parser.add_argument("--high-null-threshold", type=float, default=0.5)
     args = parser.parse_args()
 

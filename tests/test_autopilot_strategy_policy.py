@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from research_exploration.dsr import DSR_METHOD
 from src.autopilot.config import ProductConfig
 from src.autopilot.strategy_policy import (
     StrategyPolicyError,
@@ -26,6 +27,20 @@ def product(tmp_path, **overrides):
     }
     payload.update(overrides)
     return ProductConfig(**payload)
+
+
+def current_dsr_metrics(**overrides):
+    payload = {
+        "dsr_deflated": 0.72,
+        "dsr_method": DSR_METHOD,
+        "n_trials": 20,
+        "sr_std_trials": 0.18,
+        "trial_sharpe_count": 12,
+        "trial_sharpe_observed_std": 0.16,
+        "trial_sharpe_conservative_floor": 0.10,
+    }
+    payload.update(overrides)
+    return payload
 
 
 def strategy(**overrides):
@@ -56,7 +71,7 @@ def strategy(**overrides):
             "max_trades_per_day": 4,
         },
         "fees": {"fee_bps": 5.0, "slippage_bps": 2.0},
-        "metrics": {"holdout_total_return": 0.03, "dsr_deflated": 0.72},
+        "metrics": current_dsr_metrics(holdout_total_return=0.03),
     }
     payload.update(overrides)
     return payload
@@ -101,7 +116,9 @@ def test_strategy_policy_rejects_non_object_strategy_payloads(tmp_path):
 
     errors = validate_strategy_artifact(product(tmp_path), artifact)
 
-    assert errors == ["active_income: artifact strategies must be JSON objects; invalid indexes: 1, 2."]
+    assert errors == [
+        "active_income: artifact strategies must be JSON objects; invalid indexes: 1, 2."
+    ]
 
 
 def test_strategy_policy_rejects_missing_live_eligibility_flags(tmp_path):
@@ -168,11 +185,14 @@ def test_strategy_policy_allows_paper_only_artifact_for_paper_mode(tmp_path):
     }
     artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
 
-    assert validate_strategy_artifact(
-        product(tmp_path),
-        artifact,
-        require_live_eligible=False,
-    ) == []
+    assert (
+        validate_strategy_artifact(
+            product(tmp_path),
+            artifact,
+            require_live_eligible=False,
+        )
+        == []
+    )
     detail = assert_strategy_artifact_allowed(product(tmp_path, strategies_path=artifact_path))
     assert detail["ok"] is True
     assert detail["strategies"] == 1
@@ -317,7 +337,10 @@ def test_strategy_policy_rejects_artifact_market_mismatch(tmp_path):
 
     errors = validate_strategy_artifact(product(tmp_path), artifact)
 
-    assert errors[0] == "active_income: artifact market 'spot' does not match product market 'futures'."
+    assert (
+        errors[0]
+        == "active_income: artifact market 'spot' does not match product market 'futures'."
+    )
 
 
 def test_strategy_policy_rejects_strategy_market_mismatch(tmp_path):
@@ -341,7 +364,10 @@ def test_strategy_policy_rejects_artifact_symbol_mismatch(tmp_path):
 
     errors = validate_strategy_artifact(product(tmp_path), artifact)
 
-    assert errors[0] == "active_income: artifact symbol 'ETHUSDT' does not match product symbol 'BTCUSDT'."
+    assert (
+        errors[0]
+        == "active_income: artifact symbol 'ETHUSDT' does not match product symbol 'BTCUSDT'."
+    )
 
 
 def test_strategy_policy_rejects_strategy_symbol_mismatch(tmp_path):
@@ -349,7 +375,9 @@ def test_strategy_policy_rejects_strategy_symbol_mismatch(tmp_path):
 
     errors = validate_strategy_artifact(product(tmp_path), artifact)
 
-    assert errors[0] == "policy_r1: strategy symbol 'ETHUSDT' does not match product symbol 'BTCUSDT'."
+    assert (
+        errors[0] == "policy_r1: strategy symbol 'ETHUSDT' does not match product symbol 'BTCUSDT'."
+    )
 
 
 def test_strategy_policy_rejects_negative_holdout(tmp_path):
@@ -368,9 +396,20 @@ def test_strategy_policy_rejects_active_income_without_dsr_evidence(tmp_path):
     assert errors == ["policy_r1: missing active income DSR metric."]
 
 
+def test_strategy_policy_rejects_legacy_plain_psr_artifact(tmp_path):
+    artifact = live_artifact(
+        [strategy(metrics={"holdout_total_return": 0.03, "dsr_deflated": 0.99})]
+    )
+
+    errors = validate_strategy_artifact(product(tmp_path), artifact)
+
+    assert any("legacy plain-PSR evidence is not live-eligible" in error for error in errors)
+
+
 @pytest.mark.parametrize("value", [0.0, 0.59])
 def test_strategy_policy_rejects_active_income_low_dsr(tmp_path, value):
-    artifact = live_artifact([strategy(metrics={"holdout_total_return": 0.03, "dsr_deflated": value})])
+    metrics = dict(strategy()["metrics"], dsr_deflated=value)
+    artifact = live_artifact([strategy(metrics=metrics)])
 
     errors = validate_strategy_artifact(product(tmp_path), artifact)
 
@@ -379,11 +418,15 @@ def test_strategy_policy_rejects_active_income_low_dsr(tmp_path, value):
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), "not-a-number"])
 def test_strategy_policy_rejects_invalid_active_income_dsr(tmp_path, value):
-    artifact = live_artifact([strategy(metrics={"holdout_total_return": 0.03, "dsr_deflated": value})])
+    metrics = dict(strategy()["metrics"], dsr_deflated=value)
+    artifact = live_artifact([strategy(metrics=metrics)])
 
     errors = validate_strategy_artifact(product(tmp_path), artifact)
 
-    assert any("active income DSR" in error and ("must be finite" in error or "must be numeric" in error) for error in errors)
+    assert any(
+        "active income DSR" in error and ("must be finite" in error or "must be numeric" in error)
+        for error in errors
+    )
 
 
 @pytest.mark.parametrize("value", [0, 1, -0.1, 1.1, float("nan"), float("inf"), "not-a-number"])
@@ -466,9 +509,18 @@ def test_strategy_policy_rejects_missing_conditions_for_condition_entry(tmp_path
     ("condition", "message"),
     [
         ({"feature": "", "kind": "value_ge", "threshold": 50.0}, "condition[0].feature"),
-        ({"feature": "tf_5m_rsi_14", "kind": "unknown", "threshold": 50.0}, "unsupported condition kind"),
-        ({"feature": "tf_5m_rsi_14", "kind": "value_ge", "threshold": float("nan")}, "threshold: must be finite"),
-        ({"feature": "tf_5m_rsi_14", "kind": "value_ge", "threshold": "bad"}, "threshold: must be numeric"),
+        (
+            {"feature": "tf_5m_rsi_14", "kind": "unknown", "threshold": 50.0},
+            "unsupported condition kind",
+        ),
+        (
+            {"feature": "tf_5m_rsi_14", "kind": "value_ge", "threshold": float("nan")},
+            "threshold: must be finite",
+        ),
+        (
+            {"feature": "tf_5m_rsi_14", "kind": "value_ge", "threshold": "bad"},
+            "threshold: must be numeric",
+        ),
         ({"feature": "tf_5m_rsi_14", "kind": "ratio_ge", "threshold": 1.0}, "feature_b: required"),
         (
             {"feature": "tf_5m_rsi_14", "kind": "slope_3_ge", "threshold": 0.0, "lookback": 0},
@@ -491,7 +543,12 @@ def test_strategy_policy_rejects_invalid_conditions(tmp_path, condition, message
 def test_strategy_policy_accepts_supported_condition_variants(tmp_path):
     conditions = [
         {"feature": "tf_5m_rsi_14", "kind": "slope_3_ge", "threshold": 0.0, "lookback": 3},
-        {"feature": "tf_5m_rsi_14", "feature_b": "tf_5m_sma_20", "kind": "cross_above", "threshold": 0.0},
+        {
+            "feature": "tf_5m_rsi_14",
+            "feature_b": "tf_5m_sma_20",
+            "kind": "cross_above",
+            "threshold": 0.0,
+        },
         {"feature": "tf_5m_rsi_14", "kind": "divergence_bull_10", "threshold": 0.0},
     ]
     artifact = live_artifact([strategy(conditions=conditions)])
@@ -532,7 +589,9 @@ def test_strategy_policy_rejects_invalid_tp_sl_numbers(tmp_path, field, value):
 
     assert any(
         field in error
-        and ("must be finite" in error or "must be numeric" in error or "must be an integer" in error)
+        and (
+            "must be finite" in error or "must be numeric" in error or "must be an integer" in error
+        )
         for error in errors
     )
 
@@ -575,7 +634,9 @@ def test_strategy_policy_rejects_invalid_risk_numbers(tmp_path, field, value):
 
     assert any(
         field in error
-        and ("must be finite" in error or "must be numeric" in error or "must be an integer" in error)
+        and (
+            "must be finite" in error or "must be numeric" in error or "must be an integer" in error
+        )
         for error in errors
     )
 
@@ -633,7 +694,8 @@ def test_strategy_policy_rejects_invalid_holdout_metric_numbers(tmp_path, value)
     errors = validate_strategy_artifact(product(tmp_path), artifact)
 
     assert any(
-        "holdout_total_return" in error and ("must be finite" in error or "must be numeric" in error)
+        "holdout_total_return" in error
+        and ("must be finite" in error or "must be numeric" in error)
         for error in errors
     )
 
@@ -664,10 +726,10 @@ def test_btc_accumulation_policy_requires_btc_pnl_unit(tmp_path):
                     "cooldown_bars": 24,
                     "max_trades_per_day": 1,
                 },
-                metrics={
-                    "holdout_total_return": 0.03,
-                    "holdout_excess_return_vs_buy_hold": 0.02,
-                },
+                metrics=current_dsr_metrics(
+                    holdout_total_return=0.03,
+                    holdout_excess_return_vs_buy_hold=0.02,
+                ),
             )
         ],
         market="spot",
@@ -703,10 +765,10 @@ def test_btc_accumulation_policy_rejects_strategy_leverage_above_one(tmp_path):
                     "cooldown_bars": 24,
                     "max_trades_per_day": 1,
                 },
-                metrics={
-                    "holdout_total_return": 0.03,
-                    "holdout_excess_return_vs_buy_hold": 0.02,
-                },
+                metrics=current_dsr_metrics(
+                    holdout_total_return=0.03,
+                    holdout_excess_return_vs_buy_hold=0.02,
+                ),
             )
         ],
         market="spot",
@@ -742,10 +804,10 @@ def test_btc_accumulation_policy_rejects_spot_margin_metadata(tmp_path):
                     "cooldown_bars": 24,
                     "max_trades_per_day": 1,
                 },
-                metrics={
-                    "holdout_total_return": 0.03,
-                    "holdout_excess_return_vs_buy_hold": 0.02,
-                },
+                metrics=current_dsr_metrics(
+                    holdout_total_return=0.03,
+                    holdout_excess_return_vs_buy_hold=0.02,
+                ),
             )
         ],
         market="spot",
@@ -780,10 +842,10 @@ def test_btc_accumulation_policy_requires_step_aside_short_direction(tmp_path):
                     "cooldown_bars": 24,
                     "max_trades_per_day": 1,
                 },
-                metrics={
-                    "holdout_total_return": 0.03,
-                    "holdout_excess_return_vs_buy_hold": 0.02,
-                },
+                metrics=current_dsr_metrics(
+                    holdout_total_return=0.03,
+                    holdout_excess_return_vs_buy_hold=0.02,
+                ),
             )
         ],
         market="spot",
@@ -818,7 +880,7 @@ def test_btc_accumulation_policy_requires_buy_hold_excess_metric(tmp_path):
                     "cooldown_bars": 24,
                     "max_trades_per_day": 1,
                 },
-                metrics={"holdout_total_return": 0.03},
+                metrics=current_dsr_metrics(holdout_total_return=0.03),
             )
         ],
         market="spot",
@@ -853,10 +915,10 @@ def test_btc_accumulation_policy_rejects_buy_hold_underperformance(tmp_path):
                     "cooldown_bars": 24,
                     "max_trades_per_day": 1,
                 },
-                metrics={
-                    "holdout_total_return": 0.03,
-                    "holdout_excess_return_vs_buy_hold": 0.0,
-                },
+                metrics=current_dsr_metrics(
+                    holdout_total_return=0.03,
+                    holdout_excess_return_vs_buy_hold=0.0,
+                ),
             )
         ],
         market="spot",
@@ -892,10 +954,10 @@ def test_btc_accumulation_policy_rejects_invalid_buy_hold_excess_metric(tmp_path
                     "cooldown_bars": 24,
                     "max_trades_per_day": 1,
                 },
-                metrics={
-                    "holdout_total_return": 0.03,
-                    "holdout_excess_return_vs_buy_hold": value,
-                },
+                metrics=current_dsr_metrics(
+                    holdout_total_return=0.03,
+                    holdout_excess_return_vs_buy_hold=value,
+                ),
             )
         ],
         market="spot",
@@ -913,6 +975,7 @@ def test_btc_accumulation_policy_rejects_invalid_buy_hold_excess_metric(tmp_path
     errors = validate_strategy_artifact(btc_product, artifact)
 
     assert any(
-        "holdout_excess_return_vs_buy_hold" in error and ("must be finite" in error or "must be numeric" in error)
+        "holdout_excess_return_vs_buy_hold" in error
+        and ("must be finite" in error or "must be numeric" in error)
         for error in errors
     )

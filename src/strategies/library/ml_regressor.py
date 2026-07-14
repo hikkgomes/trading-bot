@@ -23,14 +23,21 @@ from src.strategies.registry import register
 
 LOGGER = logging.getLogger(__name__)
 
+
 def _make_model(kind: str):
     if kind in ("auto", "lightgbm"):
         try:
             from lightgbm import LGBMRegressor
 
             return LGBMRegressor(
-                n_estimators=300, num_leaves=31, learning_rate=0.05, subsample=0.8,
-                colsample_bytree=0.8, random_state=42, n_jobs=-1, verbosity=-1,
+                n_estimators=300,
+                num_leaves=31,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                n_jobs=-1,
+                verbosity=-1,
             )
         except ImportError:
             if kind == "lightgbm":
@@ -43,16 +50,18 @@ def _make_model(kind: str):
 @register
 class MlRegressorStrategy(Strategy):
     name = "ml_regressor"
-    description = "Gradient-boosted regressor on feature columns; trade when predicted edge > min_edge."
+    description = (
+        "Gradient-boosted regressor on feature columns; trade when predicted edge > min_edge."
+    )
 
     @classmethod
     def default_params(cls):
         return {
             "horizon": 96,
-            "min_edge": 0.004,        # predicted forward return needed to trade
+            "min_edge": 0.004,  # predicted forward return needed to trade
             "allow_short": True,
-            "model": "auto",          # "auto" | "lightgbm" | "sklearn"
-            "feature_cols": None,      # None = auto-select numeric feature columns
+            "model": "auto",  # "auto" | "lightgbm" | "sklearn"
+            "feature_cols": None,  # None = auto-select numeric feature columns
             "max_features": 80,
             "feature_screen": "spearman",
             "min_feature_corr": 0.0,
@@ -92,7 +101,9 @@ class MlRegressorStrategy(Strategy):
                 stop_loss=float(self.params["label_sl"] or cfg.stop_loss),
             )
         if self.params["target_mode"] != "forward_return":
-            raise ValueError(f"Unsupported ml_regressor target_mode: {self.params['target_mode']!r}")
+            raise ValueError(
+                f"Unsupported ml_regressor target_mode: {self.params['target_mode']!r}"
+            )
         close = pd.Series(self.ohlcv(df).close, index=df.index)
         return close.shift(-horizon) / close - 1.0
 
@@ -107,13 +118,18 @@ class MlRegressorStrategy(Strategy):
             raise ValueError(f"Too few training rows ({int(valid.sum())}) for the ML regressor.")
         self._model = _make_model(self.params["model"])
         self._model.fit(X[valid], y[valid].to_numpy())
-        LOGGER.info("Fitted %s on %d rows, %d features", self.name, int(valid.sum()), len(self._features))
+        LOGGER.info(
+            "Fitted %s on %d rows, %d features", self.name, int(valid.sum()), len(self._features)
+        )
         return self
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         if self._model is None:
-            warnings.warn("ml_regressor.generate_signals called before fit(); fitting in-sample "
-                          "(smoke-test only — results are leaked).", stacklevel=2)
+            warnings.warn(
+                "ml_regressor.generate_signals called before fit(); fitting in-sample "
+                "(smoke-test only — results are leaked).",
+                stacklevel=2,
+            )
             self.fit(df)
         X = df[self._features].replace([np.inf, -np.inf], np.nan)
         pred = pd.Series(np.nan, index=df.index)

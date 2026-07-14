@@ -3,7 +3,13 @@ import json
 import pytest
 
 from src.autopilot.config import AutopilotConfig
-from src.autopilot.healthcheck import build_healthcheck, evaluate_health, main
+from src.autopilot.healthcheck import (
+    REMOTE_ALERT_DRAIN_SECONDS,
+    _drain_oneshot_remote_alert,
+    build_healthcheck,
+    evaluate_health,
+    main,
+)
 
 
 def operator_report(**overrides):
@@ -30,6 +36,73 @@ def test_healthcheck_passes_for_fresh_ok_report():
     assert health["issues"] == []
     assert health["warnings"] == []
     assert health["readiness_ok"] is True
+
+
+def test_healthcheck_fails_for_unhealthy_candidate_paper_status_and_returns_summary():
+    candidate_paper = {
+        "configured": True,
+        "enabled": True,
+        "job": "candidate_paper_cycle",
+        "path": "runtime/candidate_paper_status.json",
+        "exists": True,
+        "status": "error",
+        "ok": False,
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "age_seconds": 901.0,
+        "max_age_seconds": 600.0,
+        "fresh": False,
+        "reason": "invalid_candidate_paper_status",
+        "errors": [
+            {
+                "scope": "product",
+                "product": "active_income",
+                "field": "candidate_digest",
+                "reason": "invalid_sha256_digest",
+            }
+        ],
+        "open_positions": 1,
+        "activation_ready_products": [],
+        "drawdown_halted_products": [],
+    }
+
+    health = evaluate_health(operator_report(candidate_paper=candidate_paper))
+
+    assert health["ok"] is False
+    assert health["candidate_paper"] == candidate_paper
+    issue = next(item for item in health["issues"] if item["code"] == "candidate_paper_unhealthy")
+    assert issue["detail"]["fresh"] is False
+    assert issue["detail"]["open_positions"] == 1
+    assert issue["detail"]["errors"][0]["reason"] == "invalid_sha256_digest"
+
+
+def test_healthcheck_warns_when_candidate_paper_drawdown_is_halted():
+    health = evaluate_health(
+        operator_report(
+            candidate_paper={
+                "configured": True,
+                "enabled": True,
+                "job": "candidate_paper_cycle",
+                "path": "runtime/candidate_paper_status.json",
+                "exists": True,
+                "status": "ready",
+                "ok": True,
+                "fresh": True,
+                "open_positions": 0,
+                "activation_ready_products": [],
+                "drawdown_halted_products": ["active_income"],
+                "errors": [],
+            }
+        )
+    )
+
+    assert health["ok"] is True
+    assert health["warnings"] == [
+        {
+            "code": "candidate_paper_drawdown_halted",
+            "message": "one or more staged candidates are halted by paper drawdown controls",
+            "detail": {"products": ["active_income"]},
+        }
+    ]
 
 
 def test_healthcheck_fails_for_stale_status():
@@ -89,7 +162,12 @@ def test_healthcheck_fails_for_malformed_operator_report_sections():
             jobs=["bad-job-entry"],
             scheduled_jobs=[
                 "bad-scheduled-entry",
-                {"name": "research_cycle", "enabled": True, "status": "fail", "consecutive_failures": 2},
+                {
+                    "name": "research_cycle",
+                    "enabled": True,
+                    "status": "fail",
+                    "consecutive_failures": 2,
+                },
             ],
         )
     )
@@ -311,7 +389,13 @@ def test_healthcheck_cycle_failed_surfaces_failed_product_details():
                     "action": "flatten",
                     "broker": "fake-live",
                     "close_error": "RuntimeError: exchange timeout",
-                    "fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.4, "price": 125.0, "fee": 0.02},
+                    "fill": {
+                        "symbol": "BTCUSDT",
+                        "side": "buy",
+                        "qty": 0.4,
+                        "price": 125.0,
+                        "fee": 0.02,
+                    },
                     "spot_step_aside": {
                         "strategy_id": "btc_step_aside",
                         "quote_value": 50.0,
@@ -342,7 +426,13 @@ def test_healthcheck_cycle_failed_surfaces_failed_product_details():
                         "action": "flatten",
                         "close_error": "RuntimeError: exchange timeout",
                         "broker": "fake-live",
-                        "fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.4, "price": 125.0, "fee": 0.02},
+                        "fill": {
+                            "symbol": "BTCUSDT",
+                            "side": "buy",
+                            "qty": 0.4,
+                            "price": 125.0,
+                            "fee": 0.02,
+                        },
                         "spot_step_aside": {
                             "strategy_id": "btc_step_aside",
                             "quote_value": 50.0,
@@ -351,7 +441,11 @@ def test_healthcheck_cycle_failed_surfaces_failed_product_details():
                         "local_state": {"path": "runtime/btc_state.json", "recovered": False},
                         "position_before": {"symbol": "BTCUSDT", "qty": 0.5},
                         "position_after_error": "RuntimeError: readback timeout",
-                        "position_after_attempt": {"symbol": "BTCUSDT", "qty": 0.5, "is_flat": False},
+                        "position_after_attempt": {
+                            "symbol": "BTCUSDT",
+                            "qty": 0.5,
+                            "is_flat": False,
+                        },
                     }
                 ],
                 "jobs": [],
@@ -591,8 +685,7 @@ def test_healthcheck_surfaces_unresolved_exit_accounting_intent(
         {
             "code": code,
             "message": (
-                f"one or more {mode} products have an unresolved idempotent "
-                "exit accounting intent"
+                f"one or more {mode} products have an unresolved idempotent exit accounting intent"
             ),
             "detail": {
                 "products": [
@@ -747,9 +840,7 @@ def test_healthcheck_warns_for_paper_trade_log_issues():
                         "path": "runtime/active_income_paper_trades.csv",
                         "invalid_rows": 1,
                         "issue": "trade log has 1 row(s) with invalid numeric fields",
-                        "numeric_errors": [
-                            {"line": 2, "field": "net_return", "value": "bad"}
-                        ],
+                        "numeric_errors": [{"line": 2, "field": "net_return", "value": "bad"}],
                     },
                 }
             ]
@@ -772,9 +863,7 @@ def test_healthcheck_warns_for_paper_trade_log_issues():
                         "path": "runtime/active_income_paper_trades.csv",
                         "invalid_rows": 1,
                         "issue": "trade log has 1 row(s) with invalid numeric fields",
-                        "numeric_errors": [
-                            {"line": 2, "field": "net_return", "value": "bad"}
-                        ],
+                        "numeric_errors": [{"line": 2, "field": "net_return", "value": "bad"}],
                     }
                 ]
             },
@@ -1106,7 +1195,9 @@ def test_healthcheck_fails_for_live_open_position_missing_broker_metadata():
     )
 
     assert health["ok"] is False
-    broker_issue = next(item for item in health["issues"] if item["code"] == "live_open_position_broker_invalid")
+    broker_issue = next(
+        item for item in health["issues"] if item["code"] == "live_open_position_broker_invalid"
+    )
     assert broker_issue == {
         "code": "live_open_position_broker_invalid",
         "message": "one or more live open positions have missing or invalid broker metadata",
@@ -1238,7 +1329,9 @@ def test_healthcheck_fails_for_live_open_position_invalid_broker_entry_fee():
     )
 
     assert health["ok"] is False
-    broker_issue = next(item for item in health["issues"] if item["code"] == "live_open_position_broker_invalid")
+    broker_issue = next(
+        item for item in health["issues"] if item["code"] == "live_open_position_broker_invalid"
+    )
     assert broker_issue["detail"]["positions"][0]["broker_entry_fee"] == -0.01
     assert broker_issue["detail"]["positions"][0]["reasons"] == ["invalid_broker_entry_fee"]
 
@@ -1286,7 +1379,9 @@ def test_healthcheck_fails_for_live_open_position_partial_broker_fill_metadata()
     )
 
     assert health["ok"] is False
-    broker_issue = next(item for item in health["issues"] if item["code"] == "live_open_position_broker_invalid")
+    broker_issue = next(
+        item for item in health["issues"] if item["code"] == "live_open_position_broker_invalid"
+    )
     assert broker_issue["detail"]["positions"][0]["reasons"] == [
         "broker_fill_ratio_not_complete",
         "broker_qty_mismatch_requested",
@@ -1336,7 +1431,9 @@ def test_healthcheck_fails_for_live_futures_position_with_mismatched_native_stop
     )
 
     assert health["ok"] is False
-    broker_issue = next(item for item in health["issues"] if item["code"] == "live_open_position_broker_invalid")
+    broker_issue = next(
+        item for item in health["issues"] if item["code"] == "live_open_position_broker_invalid"
+    )
     assert broker_issue["detail"]["positions"][0]["reasons"] == [
         "broker_stop_trigger_mismatch_strategy_stop"
     ]
@@ -1381,9 +1478,13 @@ def test_healthcheck_fails_for_live_btc_step_aside_missing_quote_budget_metadata
         now_ts=1767229200.0,
     )
 
-    broker_issue = next(item for item in health["issues"] if item["code"] == "live_open_position_broker_invalid")
+    broker_issue = next(
+        item for item in health["issues"] if item["code"] == "live_open_position_broker_invalid"
+    )
     assert broker_issue["detail"]["positions"][0]["product"] == "btc_accumulation"
-    assert broker_issue["detail"]["positions"][0]["reasons"] == ["invalid_spot_step_aside_quote_value"]
+    assert broker_issue["detail"]["positions"][0]["reasons"] == [
+        "invalid_spot_step_aside_quote_value"
+    ]
 
 
 def test_healthcheck_fails_for_live_open_position_missing_monitoring_metadata():
@@ -1578,7 +1679,11 @@ def test_healthcheck_warns_for_paper_open_position_future_entry_time():
 
     assert health["ok"] is True
     assert health["issues"] == []
-    warning = next(item for item in health["warnings"] if item["code"] == "paper_open_position_monitoring_invalid")
+    warning = next(
+        item
+        for item in health["warnings"]
+        if item["code"] == "paper_open_position_monitoring_invalid"
+    )
     assert warning["detail"]["positions"] == [
         {
             "product": "active_income",
@@ -1870,7 +1975,11 @@ def test_healthcheck_fails_when_live_open_position_details_exceed_count():
 
 
 def test_healthcheck_fails_for_runtime_load_errors():
-    load_error = {"name": "status", "path": "runtime/status.json", "error": "JSONDecodeError: bad json"}
+    load_error = {
+        "name": "status",
+        "path": "runtime/status.json",
+        "error": "JSONDecodeError: bad json",
+    }
     health = evaluate_health(operator_report(runtime_load_errors=[load_error]))
 
     assert health["ok"] is False
@@ -2038,8 +2147,18 @@ def test_healthcheck_fails_for_readiness_blockers():
         readiness_report={
             "ok": False,
             "checks": [
-                {"name": "runtime directory writable", "level": "error", "ok": False, "detail": "runtime"},
-                {"name": "environment file present", "level": "warning", "ok": False, "detail": ".env"},
+                {
+                    "name": "runtime directory writable",
+                    "level": "error",
+                    "ok": False,
+                    "detail": "runtime",
+                },
+                {
+                    "name": "environment file present",
+                    "level": "warning",
+                    "ok": False,
+                    "detail": ".env",
+                },
             ],
         },
     )
@@ -2096,9 +2215,24 @@ def test_healthcheck_fails_for_enabled_failed_scheduled_job():
     health = evaluate_health(
         operator_report(
             scheduled_jobs=[
-                {"name": "research_cycle", "enabled": True, "status": "fail", "consecutive_failures": 3},
-                {"name": "market_data_update", "enabled": True, "status": "recovered", "consecutive_failures": 1},
-                {"name": "disabled_job", "enabled": False, "status": "fail", "consecutive_failures": 1},
+                {
+                    "name": "research_cycle",
+                    "enabled": True,
+                    "status": "fail",
+                    "consecutive_failures": 3,
+                },
+                {
+                    "name": "market_data_update",
+                    "enabled": True,
+                    "status": "recovered",
+                    "consecutive_failures": 1,
+                },
+                {
+                    "name": "disabled_job",
+                    "enabled": False,
+                    "status": "fail",
+                    "consecutive_failures": 1,
+                },
             ]
         )
     )
@@ -2570,7 +2704,9 @@ def test_healthcheck_warns_for_unsafe_mutation_handoff_artifacts():
 
     assert health["ok"] is True
     assert health["issues"] == []
-    warning = next(item for item in health["warnings"] if item["code"] == "research_handoff_warning")
+    warning = next(
+        item for item in health["warnings"] if item["code"] == "research_handoff_warning"
+    )
     assert warning == {
         "code": "research_handoff_warning",
         "message": "research handoff artifacts are stale, unsafe, or failed",
@@ -2622,7 +2758,9 @@ def test_healthcheck_warns_for_failed_artifact_hygiene_report():
 
     assert health["ok"] is True
     assert health["issues"] == []
-    warning = next(item for item in health["warnings"] if item["code"] == "artifact_hygiene_unhealthy")
+    warning = next(
+        item for item in health["warnings"] if item["code"] == "artifact_hygiene_unhealthy"
+    )
     assert warning == {
         "code": "artifact_hygiene_unhealthy",
         "message": "artifact hygiene reported cleanup or inspection failures",
@@ -2709,6 +2847,52 @@ def test_healthcheck_fails_for_failed_backup_verification():
     }
 
 
+def test_healthcheck_fails_when_existing_recovery_file_was_skipped_from_backup():
+    health = evaluate_health(
+        operator_report(
+            backup_report={
+                "ok": True,
+                "output": "runtime/backups/incomplete.zip",
+                "manifest": {
+                    "generated_at": "2026-01-01T00:00:00+00:00",
+                    "critical_skipped_files": 1,
+                    "files": [
+                        {
+                            "path": "runtime/active_income_state.json",
+                            "role": "product:active_income:product_state",
+                            "reason": "too_large",
+                            "exists": True,
+                            "included": False,
+                            "required_if_present": True,
+                        }
+                    ],
+                },
+                "verification": {"ok": True, "issues": []},
+            }
+        ),
+        now_ts=1767225600.0,
+    )
+
+    assert health["ok"] is False
+    assert health["issues"] == [
+        {
+            "code": "backup_incomplete",
+            "message": "latest backup omitted one or more existing recovery files",
+            "detail": {
+                "output": "runtime/backups/incomplete.zip",
+                "critical_skipped_files": 1,
+                "files": [
+                    {
+                        "path": "runtime/active_income_state.json",
+                        "role": "product:active_income:product_state",
+                        "reason": "too_large",
+                    }
+                ],
+            },
+        }
+    ]
+
+
 def test_healthcheck_fails_when_enabled_backup_job_has_no_report():
     health = evaluate_health(
         operator_report(
@@ -2734,6 +2918,35 @@ def test_healthcheck_fails_when_enabled_backup_job_has_no_report():
                     "status": "ok",
                     "effective_cadence_seconds": 86400,
                     "cadence_seconds": None,
+                }
+            ]
+        },
+    }
+
+
+def test_healthcheck_tracks_dedicated_backup_timer_without_generic_job():
+    health = evaluate_health(
+        operator_report(
+            backup_schedule={
+                "enabled": True,
+                "name": "runtime_backup_timer",
+                "cadence_seconds": 86400,
+                "timeout_seconds": 60,
+            }
+        )
+    )
+
+    assert health["ok"] is False
+    assert health["issues"][0] == {
+        "code": "backup_report_missing",
+        "message": "backup job is enabled but no backup report is available",
+        "detail": {
+            "scheduled_jobs": [
+                {
+                    "name": "runtime_backup_timer",
+                    "status": "dedicated_timer",
+                    "effective_cadence_seconds": 86400,
+                    "cadence_seconds": 86400,
                 }
             ]
         },
@@ -2897,7 +3110,12 @@ def test_healthcheck_can_ignore_scheduled_job_failures():
     health = evaluate_health(
         operator_report(
             scheduled_jobs=[
-                {"name": "research_cycle", "enabled": True, "status": "fail", "consecutive_failures": 3}
+                {
+                    "name": "research_cycle",
+                    "enabled": True,
+                    "status": "fail",
+                    "consecutive_failures": 3,
+                }
             ]
         ),
         fail_on_job_failures=False,
@@ -2978,7 +3196,11 @@ def test_healthcheck_warns_when_research_found_no_exportable_strategies():
                     "exported": 0,
                     "top_reasons": {"no_train_edge": 8, "insufficient_train_trades": 4},
                     "next_actions": ["continue rotating curated candidates"],
-                    "mutation_effectiveness": {"evaluated_hypotheses": 4, "keepers": 0, "outcome": "no_keeper"},
+                    "mutation_effectiveness": {
+                        "evaluated_hypotheses": 4,
+                        "keepers": 0,
+                        "outcome": "no_keeper",
+                    },
                 },
             },
         )
@@ -3001,7 +3223,11 @@ def test_healthcheck_warns_when_research_found_no_exportable_strategies():
                     "market": "futures",
                 }
             ],
-            "mutation_effectiveness": {"evaluated_hypotheses": 4, "keepers": 0, "outcome": "no_keeper"},
+            "mutation_effectiveness": {
+                "evaluated_hypotheses": 4,
+                "keepers": 0,
+                "outcome": "no_keeper",
+            },
         },
     }
 
@@ -3188,7 +3414,9 @@ def test_healthcheck_does_not_warn_no_exportable_before_research_runs():
     )
 
     assert health["ok"] is True
-    assert [warning["code"] for warning in health["warnings"]] == ["paper_product_waiting_for_strategy_artifact"]
+    assert [warning["code"] for warning in health["warnings"]] == [
+        "paper_product_waiting_for_strategy_artifact"
+    ]
 
 
 def test_healthcheck_warns_when_required_testnet_rehearsal_is_missing():
@@ -3360,7 +3588,11 @@ def test_healthcheck_surfaces_warning_alerts_without_failing():
     health = evaluate_health(
         operator_report(
             readiness_alert={"sent": True, "fingerprint": "ready123"},
-            research_handoff_alert={"sent": False, "reason": "cooldown", "fingerprint": "research123"},
+            research_handoff_alert={
+                "sent": False,
+                "reason": "cooldown",
+                "fingerprint": "research123",
+            },
             testnet_rehearsal_alert={"sent": True, "fingerprint": "testnet123"},
             promotion_alert={
                 "sent": True,
@@ -3480,6 +3712,47 @@ def test_build_healthcheck_records_alert_failure_without_crashing(monkeypatch, t
     assert not cfg.alert_file.exists()
 
 
+def test_oneshot_healthcheck_drains_queued_remote_alert_before_exit(monkeypatch):
+    waits = []
+    monkeypatch.setattr(
+        "src.autopilot.healthcheck.wait_for_remote_alerts",
+        lambda timeout: waits.append(timeout) or True,
+    )
+    health = {
+        "healthcheck_alert": {
+            "sent": True,
+            "remote_delivery": {"status": "queued"},
+        }
+    }
+
+    _drain_oneshot_remote_alert(health)
+
+    assert waits == [REMOTE_ALERT_DRAIN_SECONDS]
+    assert health["healthcheck_alert"]["remote_delivery"] == {
+        "status": "queued",
+        "drained": True,
+    }
+
+
+def test_oneshot_healthcheck_records_remote_alert_drain_timeout(monkeypatch):
+    monkeypatch.setattr(
+        "src.autopilot.healthcheck.wait_for_remote_alerts",
+        lambda _timeout: False,
+    )
+    health = {
+        "healthcheck_alert": {
+            "sent": True,
+            "remote_delivery": {"status": "queued"},
+        }
+    }
+
+    _drain_oneshot_remote_alert(health)
+
+    remote = health["healthcheck_alert"]["remote_delivery"]
+    assert remote["drained"] is False
+    assert "did not drain" in remote["drain_error"]
+
+
 def test_build_healthcheck_does_not_alert_when_ok(monkeypatch, tmp_path):
     cfg = AutopilotConfig(
         alert_file=tmp_path / "alerts.jsonl",
@@ -3505,7 +3778,14 @@ def test_healthcheck_cli_prints_json_when_output_write_fails(monkeypatch, tmp_pa
     output = tmp_path / "healthcheck.json"
     monkeypatch.setattr(
         "sys.argv",
-        ["healthcheck", "--config", str(tmp_path / "config.json"), "--output", str(output), "--no-alert"],
+        [
+            "healthcheck",
+            "--config",
+            str(tmp_path / "config.json"),
+            "--output",
+            str(output),
+            "--no-alert",
+        ],
     )
     monkeypatch.setattr("src.autopilot.healthcheck.load_config", lambda path: AutopilotConfig())
     monkeypatch.setattr(

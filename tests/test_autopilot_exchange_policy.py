@@ -58,7 +58,9 @@ def test_product_symbol_policy_rejects_spot_btc_accumulation_settlement(tmp_path
 
     errors = validate_product_symbol_policy(btc_product)
 
-    assert errors == ["btc_accumulation: BTC accumulation spot symbol must not include a settlement asset."]
+    assert errors == [
+        "btc_accumulation: BTC accumulation spot symbol must not include a settlement asset."
+    ]
 
 
 def test_exchange_policy_rejects_non_binance_btc_accumulation_spot(tmp_path):

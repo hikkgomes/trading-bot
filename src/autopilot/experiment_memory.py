@@ -39,7 +39,11 @@ MAX_COMPACTION_ROWS = 5_000
 MAX_DECOMPRESSED_JSON_BYTES = 64 * 1024 * 1024
 COMPACT_JSON_PREFIX = "zlib-json-v1:"
 ENGINE_SCOPE_BACKFILL_META = "evaluation_engine_scopes_backfill_v1"
+HOLDOUT_COHORT_BACKFILL_META = "holdout_cohorts_backfill_v1"
+PROTECTED_INTERVAL_BACKFILL_META = "protected_intervals_backfill_v1"
 PROTECTED_PHASES = frozenset({"holdout", "final_holdout", "final"})
+UNKNOWN_MARKET = "__unknown_market__"
+UNKNOWN_SYMBOL = "__UNKNOWN_SYMBOL__"
 
 # These fields describe or identify an idea, but do not change its executable
 # behavior.  They are ignored only at the top level; a nested ``id`` may be a
@@ -169,6 +173,17 @@ class EvaluationResult:
     created: bool
     completed: bool
     was_claimed: bool
+
+
+@dataclass(frozen=True)
+class HoldoutCohort:
+    """Frozen candidate universe allowed to inspect one protected slice."""
+
+    scope_key: str
+    data_snapshot_id: str
+    protocol_hashes: tuple[str, ...]
+    member_hashes: tuple[str, ...]
+    created: bool
 
 
 def _utc_now() -> str:
@@ -351,6 +366,128 @@ def canonical_test_hash(
             "protocol_hash": protocol_hash,
         }
     )
+
+
+def _holdout_scope_key(data_snapshot_id: str) -> str:
+    """Identify the protected data itself, independent of later protocols."""
+
+    return _sha256_json({"data_snapshot_id": data_snapshot_id})
+
+
+def _normalise_utc_timestamp(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty UTC timestamp")
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        timestamp = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be an ISO-8601 UTC timestamp") from exc
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    timestamp = timestamp.astimezone(UTC)
+    return timestamp.isoformat(timespec="microseconds")
+
+
+def _normalise_interval(window: Mapping[str, Any], *, label: str) -> tuple[str, str]:
+    if not isinstance(window, Mapping):
+        raise ValueError(f"{label} must be a JSON object")
+    start = _normalise_utc_timestamp(window.get("start"), label=f"{label}.start")
+    end = _normalise_utc_timestamp(window.get("end"), label=f"{label}.end")
+    if start > end:
+        raise ValueError(f"{label}.start must not be after {label}.end")
+    return start, end
+
+
+def _adaptive_intervals(
+    window: Mapping[str, Any],
+    *,
+    phase: str,
+) -> tuple[tuple[str, str, str], ...]:
+    """Extract every adaptive train/validation interval from an evaluation window."""
+
+    intervals: list[tuple[str, str, str]] = []
+    if phase == "development":
+        candidates = [
+            (name, window.get(name))
+            for name in ("train", "validation")
+            if window.get(name) is not None
+        ]
+        if not candidates and (window.get("start") is not None or window.get("end") is not None):
+            candidates = [(phase, window)]
+    else:
+        candidates = [(phase, window)]
+    for name, candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            raise ValueError(f"{name} window must be a JSON object")
+        has_start = candidate.get("start") is not None
+        has_end = candidate.get("end") is not None
+        if not has_start and not has_end and int(candidate.get("rows") or 0) == 0:
+            continue
+        if has_start != has_end:
+            raise ValueError(f"{name} window must contain both start and end")
+        start, end = _normalise_interval(candidate, label=f"{name} window")
+        intervals.append((name, start, end))
+    return tuple(intervals)
+
+
+def _market_symbol(
+    dataset: Mapping[str, Any],
+    protocol: Mapping[str, Any] | None = None,
+) -> tuple[str, str]:
+    protocol = protocol or {}
+    market_value = dataset.get("market") or protocol.get("market") or UNKNOWN_MARKET
+    symbol_value = dataset.get("symbol") or protocol.get("symbol") or UNKNOWN_SYMBOL
+    market = _validate_text(str(market_value), label="dataset.market", maximum=64).lower()
+    symbol = _validate_text(str(symbol_value), label="dataset.symbol", maximum=64).upper()
+    return market, symbol
+
+
+def _portable_evidence(value: Any) -> Any:
+    """Remove machine-local paths while retaining every immutable evidence field."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _portable_evidence(child)
+            for key, child in sorted(value.items())
+            if key != "path"
+        }
+    if isinstance(value, list):
+        return [_portable_evidence(child) for child in value]
+    return value
+
+
+def _evidence_is_subset(submitted: Any, sealed: Any) -> bool:
+    """Allow claim callers to omit evidence, but never to contradict sealed evidence."""
+
+    if isinstance(submitted, Mapping) and isinstance(sealed, Mapping):
+        return all(
+            key in sealed and _evidence_is_subset(child, sealed[key])
+            for key, child in submitted.items()
+        )
+    return submitted == sealed
+
+
+def _protected_interval_identity(
+    *,
+    market: str,
+    symbol: str,
+    start_utc: str,
+    end_utc: str,
+    dataset: Mapping[str, Any],
+) -> tuple[str, dict[str, Any], str]:
+    evidence = _validate_json(_portable_evidence(dataset), label="protected dataset evidence")
+    evidence_hash = _sha256_json(evidence)
+    interval_key = _sha256_json(
+        {
+            "market": market,
+            "symbol": symbol,
+            "start_utc": start_utc,
+            "end_utc": end_utc,
+        }
+    )
+    return interval_key, evidence, evidence_hash
 
 
 def _validate_text(value: str, *, label: str, maximum: int = 256) -> str:
@@ -622,6 +759,26 @@ class ExperimentMemory:
                     FOREIGN KEY(evaluation_key) REFERENCES evaluations(evaluation_key),
                     FOREIGN KEY(behavior_hash) REFERENCES strategies(behavior_hash)
                 );
+                CREATE TABLE IF NOT EXISTS holdout_cohorts (
+                    scope_key TEXT PRIMARY KEY,
+                    data_snapshot_id TEXT NOT NULL,
+                    protocol_hashes_json TEXT NOT NULL,
+                    member_hashes_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS protected_intervals (
+                    interval_key TEXT PRIMARY KEY,
+                    market TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    start_utc TEXT NOT NULL,
+                    end_utc TEXT NOT NULL,
+                    data_snapshot_id TEXT NOT NULL,
+                    dataset_evidence_json TEXT NOT NULL,
+                    evidence_hash TEXT NOT NULL,
+                    cohort_scope_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(cohort_scope_key) REFERENCES holdout_cohorts(scope_key)
+                );
                 CREATE TABLE IF NOT EXISTS evaluation_engine_scopes (
                     evaluation_key TEXT PRIMARY KEY,
                     behavior_hash TEXT NOT NULL,
@@ -644,6 +801,8 @@ class ExperimentMemory:
                     ON evaluation_engine_scopes(
                         behavior_hash, research_engine_digest, phase, claimed_at
                     );
+                CREATE INDEX IF NOT EXISTS idx_protected_intervals_overlap
+                    ON protected_intervals(market, symbol, start_utc, end_utc);
                 INSERT OR IGNORE INTO memory_meta(key, value)
                     VALUES ('schema_version', '1');
                 INSERT OR IGNORE INTO memory_meta(key, value)
@@ -666,6 +825,8 @@ class ExperimentMemory:
                     "experiment memory format marker is missing or invalid"
                 )
             self._backfill_engine_scopes(connection)
+            self._backfill_holdout_cohorts(connection)
+            self._backfill_protected_intervals(connection)
         except BaseException:
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
@@ -718,6 +879,154 @@ class ExperimentMemory:
             connection.execute(
                 "INSERT OR REPLACE INTO memory_meta(key, value) VALUES (?, 'complete')",
                 (ENGINE_SCOPE_BACKFILL_META,),
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _backfill_holdout_cohorts(connection: sqlite3.Connection) -> None:
+        """Seal protected scopes written before cohort preregistration existed."""
+
+        marker = connection.execute(
+            "SELECT value FROM memory_meta WHERE key = ?",
+            (HOLDOUT_COHORT_BACKFILL_META,),
+        ).fetchone()
+        if marker is not None and marker["value"] == "complete":
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            grouped_members: dict[str, set[str]] = defaultdict(set)
+            grouped_protocols: dict[str, set[str]] = defaultdict(set)
+            first_claimed_at: dict[str, str] = {}
+            for row in connection.execute(
+                """
+                SELECT behavior_hash, data_snapshot_id, protocol_hash, claimed_at
+                FROM evaluations
+                WHERE phase IN ('holdout', 'final_holdout', 'final')
+                ORDER BY claimed_at, evaluation_key
+                """
+            ):
+                snapshot_id = row["data_snapshot_id"]
+                grouped_members[snapshot_id].add(row["behavior_hash"])
+                grouped_protocols[snapshot_id].add(row["protocol_hash"])
+                first_claimed_at.setdefault(snapshot_id, row["claimed_at"])
+            for snapshot_id, member_hashes in grouped_members.items():
+                scope_key = _holdout_scope_key(snapshot_id)
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO holdout_cohorts(
+                        scope_key, data_snapshot_id, protocol_hashes_json,
+                        member_hashes_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        scope_key,
+                        snapshot_id,
+                        _canonical_json(sorted(grouped_protocols[snapshot_id])),
+                        _canonical_json(sorted(member_hashes)),
+                        first_claimed_at[snapshot_id],
+                    ),
+                )
+            connection.execute(
+                "INSERT OR REPLACE INTO memory_meta(key, value) VALUES (?, 'complete')",
+                (HOLDOUT_COHORT_BACKFILL_META,),
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _backfill_protected_intervals(connection: sqlite3.Connection) -> None:
+        """Build the wall-clock protection ledger for pre-ledger evaluations."""
+
+        marker = connection.execute(
+            "SELECT value FROM memory_meta WHERE key = ?",
+            (PROTECTED_INTERVAL_BACKFILL_META,),
+        ).fetchone()
+        if marker is not None and marker["value"] == "complete":
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            for row in connection.execute(
+                """
+                SELECT data_snapshot_id, dataset_json, window_json, protocol_json, claimed_at
+                FROM evaluations
+                WHERE phase IN ('holdout', 'final_holdout', 'final')
+                ORDER BY claimed_at, evaluation_key
+                """
+            ):
+                dataset = _stored_json(row["dataset_json"], label="evaluation dataset JSON")
+                window = _stored_json(row["window_json"], label="evaluation window JSON")
+                protocol = _stored_json(row["protocol_json"], label="evaluation protocol JSON")
+                if not isinstance(dataset, Mapping) or not isinstance(protocol, Mapping):
+                    raise ExperimentMemoryCorruptionError(
+                        "protected evaluation context is not an object"
+                    )
+                start_utc, end_utc = _normalise_interval(
+                    window,
+                    label="protected evaluation window",
+                )
+                market, symbol = _market_symbol(dataset, protocol)
+                interval_key, evidence, evidence_hash = _protected_interval_identity(
+                    market=market,
+                    symbol=symbol,
+                    start_utc=start_utc,
+                    end_utc=end_utc,
+                    dataset=dataset,
+                )
+                scope_key = _holdout_scope_key(row["data_snapshot_id"])
+                existing = connection.execute(
+                    "SELECT * FROM protected_intervals WHERE interval_key = ?",
+                    (interval_key,),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        existing["data_snapshot_id"] != row["data_snapshot_id"]
+                        or existing["evidence_hash"] != evidence_hash
+                        or existing["cohort_scope_key"] != scope_key
+                    ):
+                        raise ExperimentMemoryCorruptionError(
+                            "conflicting evidence exists for a previously protected interval"
+                        )
+                    continue
+                overlap = ExperimentMemory._overlapping_protected_interval(
+                    connection,
+                    market=market,
+                    symbol=symbol,
+                    start_utc=start_utc,
+                    end_utc=end_utc,
+                )
+                if overlap is not None:
+                    raise ExperimentMemoryCorruptionError(
+                        "legacy protected evaluations contain overlapping wall-clock intervals"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO protected_intervals(
+                        interval_key, market, symbol, start_utc, end_utc,
+                        data_snapshot_id, dataset_evidence_json, evidence_hash,
+                        cohort_scope_key, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        interval_key,
+                        market,
+                        symbol,
+                        start_utc,
+                        end_utc,
+                        row["data_snapshot_id"],
+                        _canonical_json(evidence),
+                        evidence_hash,
+                        scope_key,
+                        row["claimed_at"],
+                    ),
+                )
+            connection.execute(
+                "INSERT OR REPLACE INTO memory_meta(key, value) VALUES (?, 'complete')",
+                (PROTECTED_INTERVAL_BACKFILL_META,),
             )
             connection.execute("COMMIT")
         except BaseException:
@@ -792,6 +1101,121 @@ class ExperimentMemory:
         for behavior_hash in strategy_hashes:
             visit(behavior_hash)
 
+        holdout_cohorts: dict[str, tuple[set[str], set[str]]] = {}
+        for row in connection.execute("SELECT * FROM holdout_cohorts"):
+            expected_scope_key = _holdout_scope_key(row["data_snapshot_id"])
+            if row["scope_key"] != expected_scope_key:
+                raise ExperimentMemoryCorruptionError(
+                    f"holdout cohort scope mismatch: {row['scope_key']}"
+                )
+            members = _stored_json(
+                row["member_hashes_json"],
+                label="holdout cohort member JSON",
+            )
+            if (
+                not isinstance(members, list)
+                or not members
+                or members != sorted(set(members))
+                or any(member not in strategy_hashes for member in members)
+            ):
+                raise ExperimentMemoryCorruptionError(
+                    f"holdout cohort has invalid members: {row['scope_key']}"
+                )
+            protocol_hashes = _stored_json(
+                row["protocol_hashes_json"],
+                label="holdout cohort protocol JSON",
+            )
+            if (
+                not isinstance(protocol_hashes, list)
+                or not protocol_hashes
+                or protocol_hashes != sorted(set(protocol_hashes))
+            ):
+                raise ExperimentMemoryCorruptionError(
+                    f"holdout cohort has invalid protocols: {row['scope_key']}"
+                )
+            try:
+                validated_protocols = {
+                    _validate_hash(value, label="holdout cohort protocol_hash")
+                    for value in protocol_hashes
+                }
+            except ValueError as exc:
+                raise ExperimentMemoryCorruptionError(
+                    f"holdout cohort has invalid protocols: {row['scope_key']}"
+                ) from exc
+            holdout_cohorts[row["scope_key"]] = (set(members), validated_protocols)
+
+        protected_intervals: dict[str, sqlite3.Row] = {}
+        for row in connection.execute("SELECT * FROM protected_intervals"):
+            try:
+                market = _validate_text(row["market"], label="protected market", maximum=64)
+                symbol = _validate_text(row["symbol"], label="protected symbol", maximum=64)
+                start_utc, end_utc = _normalise_interval(
+                    {"start": row["start_utc"], "end": row["end_utc"]},
+                    label="protected interval",
+                )
+                evidence = _stored_json(
+                    row["dataset_evidence_json"],
+                    label="protected interval evidence JSON",
+                )
+                if not isinstance(evidence, Mapping):
+                    raise ValueError("protected evidence is not an object")
+                interval_key, canonical_evidence, evidence_hash = _protected_interval_identity(
+                    market=market,
+                    symbol=symbol,
+                    start_utc=start_utc,
+                    end_utc=end_utc,
+                    dataset=evidence,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ExperimentMemoryCorruptionError(
+                    f"protected interval is invalid: {row['interval_key']}"
+                ) from exc
+            if (
+                market != market.lower()
+                or symbol != symbol.upper()
+                or start_utc != row["start_utc"]
+                or end_utc != row["end_utc"]
+                or interval_key != row["interval_key"]
+                or evidence_hash != row["evidence_hash"]
+                or canonical_evidence != evidence
+                or evidence.get("snapshot_id") != row["data_snapshot_id"]
+                or row["cohort_scope_key"] != _holdout_scope_key(row["data_snapshot_id"])
+                or row["cohort_scope_key"] not in holdout_cohorts
+            ):
+                raise ExperimentMemoryCorruptionError(
+                    f"protected interval identity mismatch: {row['interval_key']}"
+                )
+            protected_intervals[row["interval_key"]] = row
+
+        overlap = connection.execute(
+            """
+            SELECT left_interval.interval_key AS left_key,
+                   right_interval.interval_key AS right_key
+            FROM protected_intervals left_interval
+            JOIN protected_intervals right_interval
+              ON left_interval.rowid < right_interval.rowid
+             AND (
+                    left_interval.market = right_interval.market
+                    OR left_interval.market = ?
+                    OR right_interval.market = ?
+                 )
+             AND (
+                    left_interval.symbol = right_interval.symbol
+                    OR left_interval.symbol = ?
+                    OR right_interval.symbol = ?
+                 )
+             AND left_interval.start_utc <= right_interval.end_utc
+             AND left_interval.end_utc >= right_interval.start_utc
+            LIMIT 1
+            """,
+            (UNKNOWN_MARKET, UNKNOWN_MARKET, UNKNOWN_SYMBOL, UNKNOWN_SYMBOL),
+        ).fetchone()
+        if overlap is not None:
+            raise ExperimentMemoryCorruptionError(
+                "protected interval registry contains overlapping entries: "
+                f"{overlap['left_key']} and {overlap['right_key']}"
+            )
+
         protected_hashes: set[str] = set()
         expected_engine_scopes: dict[str, tuple[str, str, str, str]] = {}
         for row in connection.execute("SELECT * FROM evaluations"):
@@ -832,6 +1256,44 @@ class ExperimentMemory:
                 )
             if row["phase"] in PROTECTED_PHASES:
                 protected_hashes.add(row["behavior_hash"])
+                scope_key = _holdout_scope_key(row["data_snapshot_id"])
+                cohort_members, cohort_protocols = holdout_cohorts.get(
+                    scope_key,
+                    (set(), set()),
+                )
+                if (
+                    row["behavior_hash"] not in cohort_members
+                    or row["protocol_hash"] not in cohort_protocols
+                ):
+                    raise ExperimentMemoryCorruptionError(
+                        f"protected evaluation is outside its frozen cohort: {row['evaluation_key']}"
+                    )
+                start_utc, end_utc = _normalise_interval(
+                    window,
+                    label="protected evaluation window",
+                )
+                interval_matches = [
+                    item
+                    for item in protected_intervals.values()
+                    if item["cohort_scope_key"] == scope_key
+                    and item["start_utc"] == start_utc
+                    and item["end_utc"] == end_utc
+                ]
+                if len(interval_matches) != 1:
+                    raise ExperimentMemoryCorruptionError(
+                        "protected evaluation is outside its wall-clock interval registry: "
+                        f"{row['evaluation_key']}"
+                    )
+                protected_interval = interval_matches[0]
+                sealed_evidence = _stored_json(
+                    protected_interval["dataset_evidence_json"],
+                    label="protected interval evidence JSON",
+                )
+                if not _evidence_is_subset(_portable_evidence(dataset), sealed_evidence):
+                    raise ExperimentMemoryCorruptionError(
+                        "protected evaluation contradicts its sealed dataset evidence: "
+                        f"{row['evaluation_key']}"
+                    )
             digest = _research_engine_digest(protocol)
             if digest is not None:
                 expected_engine_scopes[row["evaluation_key"]] = (
@@ -1005,9 +1467,7 @@ class ExperimentMemory:
                     )
             else:
                 if (
-                    _stored_json(
-                        existing["canonical_spec_json"], label="strategy canonical JSON"
-                    )
+                    _stored_json(existing["canonical_spec_json"], label="strategy canonical JSON")
                     != canonical_spec
                 ):
                     raise ExperimentMemoryCorruptionError(
@@ -1136,9 +1596,7 @@ class ExperimentMemory:
             "behavior_hash": row["behavior_hash"],
             "strategy_id": row["primary_strategy_id"],
             "spec": _stored_json(row["canonical_spec_json"], label="strategy canonical JSON"),
-            "submitted_spec": _stored_json(
-                row["primary_spec_json"], label="strategy primary JSON"
-            ),
+            "submitted_spec": _stored_json(row["primary_spec_json"], label="strategy primary JSON"),
             "generation_method": row["generation_method"],
             "parent_hashes": parents,
             "metadata": _stored_json(row["metadata_json"], label="strategy metadata JSON"),
@@ -1188,6 +1646,377 @@ class ExperimentMemory:
             (evaluation_key, behavior_hash, digest, phase, claimed_at),
         )
 
+    def register_holdout_cohort(
+        self,
+        behavior_hashes: Sequence[str],
+        *,
+        dataset: Mapping[str, Any],
+        window: Mapping[str, Any],
+        protocol: Mapping[str, Any] | None = None,
+        phase: str = "holdout",
+    ) -> HoldoutCohort:
+        """Freeze the candidate universe allowed to inspect a protected slice.
+
+        The first caller seals ``snapshot + protocol + window`` to an exact set
+        of already-registered behaviors. Later callers may resume members of
+        that set, but cannot add freshly generated candidates to the same final
+        evaluation data.
+        """
+
+        if phase not in PROTECTED_PHASES:
+            raise ValueError(f"holdout phase must be one of {sorted(PROTECTED_PHASES)}")
+        members = tuple(
+            sorted(
+                {
+                    _validate_hash(value, label="holdout cohort behavior_hash")
+                    for value in behavior_hashes
+                }
+            )
+        )
+        if not members:
+            raise ValueError("holdout cohort must contain at least one behavior")
+        dataset_json, window_json, protocol_json, snapshot_id, protocol_hash = _normalise_context(
+            dataset,
+            window,
+            protocol,
+            phase,
+        )
+        start_utc, end_utc = _normalise_interval(window_json, label="protected window")
+        market, symbol = _market_symbol(dataset_json, protocol_json)
+        interval_key, evidence, evidence_hash = _protected_interval_identity(
+            market=market,
+            symbol=symbol,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            dataset=dataset_json,
+        )
+        scope_key = _holdout_scope_key(snapshot_id)
+        now = _utc_now()
+        with self._database(write=True) as connection:
+            for behavior_hash in members:
+                self._strategy_row(connection, behavior_hash)
+            overlap = self._overlapping_protected_interval(
+                connection,
+                market=market,
+                symbol=symbol,
+                start_utc=start_utc,
+                end_utc=end_utc,
+            )
+            if overlap is not None and overlap["interval_key"] != interval_key:
+                raise EvaluationConflictError(
+                    "protected wall-clock interval overlaps an already sealed interval: "
+                    f"market={market} symbol={symbol} start={start_utc} end={end_utc}"
+                )
+            existing = connection.execute(
+                "SELECT * FROM holdout_cohorts WHERE scope_key = ?",
+                (scope_key,),
+            ).fetchone()
+            cohort_created = existing is None
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO holdout_cohorts(
+                        scope_key, data_snapshot_id, protocol_hashes_json,
+                        member_hashes_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        scope_key,
+                        snapshot_id,
+                        _canonical_json([protocol_hash]),
+                        _canonical_json(list(members)),
+                        now,
+                    ),
+                )
+                stored_members = members
+                stored_protocols = (protocol_hash,)
+            else:
+                stored = _stored_json(
+                    existing["member_hashes_json"],
+                    label="holdout cohort member JSON",
+                )
+                if not isinstance(stored, list) or any(
+                    not isinstance(item, str) for item in stored
+                ):
+                    raise ExperimentMemoryCorruptionError(
+                        f"holdout cohort members are invalid: {scope_key}"
+                    )
+                stored_protocol_values = _stored_json(
+                    existing["protocol_hashes_json"],
+                    label="holdout cohort protocol JSON",
+                )
+                if not isinstance(stored_protocol_values, list) or any(
+                    not isinstance(item, str) for item in stored_protocol_values
+                ):
+                    raise ExperimentMemoryCorruptionError(
+                        f"holdout cohort protocols are invalid: {scope_key}"
+                    )
+                stored_members = tuple(stored)
+                stored_protocols = tuple(stored_protocol_values)
+                new_members = sorted(set(members) - set(stored_members))
+                if new_members:
+                    raise EvaluationConflictError(
+                        "protected evaluation scope is sealed against new candidates: "
+                        f"snapshot={snapshot_id} behaviors={','.join(new_members)}"
+                    )
+                if protocol_hash not in stored_protocols:
+                    raise EvaluationConflictError(
+                        "protected data snapshot is sealed to a different preregistered protocol: "
+                        f"snapshot={snapshot_id}"
+                    )
+
+            scope_evidence = connection.execute(
+                "SELECT evidence_hash FROM protected_intervals WHERE cohort_scope_key = ? LIMIT 1",
+                (scope_key,),
+            ).fetchone()
+            if scope_evidence is not None and scope_evidence["evidence_hash"] != evidence_hash:
+                raise EvaluationConflictError(
+                    "immutable evidence changed for an already sealed data snapshot: "
+                    f"snapshot={snapshot_id}"
+                )
+            if overlap is None:
+                if not cohort_created and scope_evidence is None:
+                    raise EvaluationConflictError(
+                        "legacy protected cohort has no trustworthy wall-clock interval evidence: "
+                        f"snapshot={snapshot_id}"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO protected_intervals(
+                        interval_key, market, symbol, start_utc, end_utc,
+                        data_snapshot_id, dataset_evidence_json, evidence_hash,
+                        cohort_scope_key, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        interval_key,
+                        market,
+                        symbol,
+                        start_utc,
+                        end_utc,
+                        snapshot_id,
+                        _canonical_json(evidence),
+                        evidence_hash,
+                        scope_key,
+                        now,
+                    ),
+                )
+            elif (
+                overlap["cohort_scope_key"] != scope_key
+                or overlap["data_snapshot_id"] != snapshot_id
+                or overlap["evidence_hash"] != evidence_hash
+            ):
+                raise EvaluationConflictError(
+                    "immutable evidence changed for an already sealed wall-clock interval: "
+                    f"market={market} symbol={symbol} start={start_utc} end={end_utc}"
+                )
+            return HoldoutCohort(
+                scope_key=scope_key,
+                data_snapshot_id=snapshot_id,
+                protocol_hashes=stored_protocols,
+                member_hashes=stored_members,
+                created=cohort_created,
+            )
+
+    @staticmethod
+    def _overlapping_protected_interval(
+        connection: sqlite3.Connection,
+        *,
+        market: str,
+        symbol: str,
+        start_utc: str,
+        end_utc: str,
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            """
+            SELECT * FROM protected_intervals
+            WHERE (market = ? OR market = ? OR ? = ?)
+              AND (symbol = ? OR symbol = ? OR ? = ?)
+              AND start_utc <= ?
+              AND end_utc >= ?
+            ORDER BY start_utc, interval_key
+            LIMIT 1
+            """,
+            (
+                market,
+                UNKNOWN_MARKET,
+                market,
+                UNKNOWN_MARKET,
+                symbol,
+                UNKNOWN_SYMBOL,
+                symbol,
+                UNKNOWN_SYMBOL,
+                end_utc,
+                start_utc,
+            ),
+        ).fetchone()
+
+    def assert_adaptive_window_allowed(
+        self,
+        *,
+        dataset: Mapping[str, Any],
+        window: Mapping[str, Any],
+        protocol: Mapping[str, Any] | None = None,
+        phase: str = "development",
+    ) -> None:
+        """Reject adaptive rows that overlap any permanently protected timestamp."""
+
+        dataset_json, window_json, protocol_json, _, _ = _normalise_context(
+            dataset,
+            window,
+            protocol,
+            phase,
+        )
+        market, symbol = _market_symbol(dataset_json, protocol_json)
+        intervals = _adaptive_intervals(window_json, phase=phase.strip())
+        with self._database(write=False) as connection:
+            self._assert_adaptive_intervals_allowed(
+                connection,
+                market=market,
+                symbol=symbol,
+                intervals=intervals,
+            )
+
+    def protected_intervals(
+        self,
+        *,
+        market: str,
+        symbol: str,
+    ) -> tuple[dict[str, str], ...]:
+        """Return immutable protected intervals applicable to one market account.
+
+        Callers use this read-only view to choose a new contiguous evaluation
+        epoch before loading an adaptive split. Unknown legacy identities are
+        conservatively treated as applicable to every matching request.
+        """
+
+        market = _validate_text(market, label="market", maximum=64).lower()
+        symbol = _validate_text(symbol, label="symbol", maximum=64).upper()
+        with self._database(write=False) as connection:
+            rows = connection.execute(
+                """
+                SELECT interval_key, market, symbol, start_utc, end_utc
+                FROM protected_intervals
+                WHERE (market = ? OR market = ? OR ? = ?)
+                  AND (symbol = ? OR symbol = ? OR ? = ?)
+                ORDER BY start_utc, end_utc, interval_key
+                """,
+                (
+                    market,
+                    UNKNOWN_MARKET,
+                    market,
+                    UNKNOWN_MARKET,
+                    symbol,
+                    UNKNOWN_SYMBOL,
+                    symbol,
+                    UNKNOWN_SYMBOL,
+                ),
+            ).fetchall()
+        return tuple(
+            {
+                "interval_key": str(row["interval_key"]),
+                "market": str(row["market"]),
+                "symbol": str(row["symbol"]),
+                "start": str(row["start_utc"]),
+                "end": str(row["end_utc"]),
+            }
+            for row in rows
+        )
+
+    @classmethod
+    def _assert_adaptive_intervals_allowed(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        market: str,
+        symbol: str,
+        intervals: Sequence[tuple[str, str, str]],
+    ) -> None:
+        for name, start_utc, end_utc in intervals:
+            overlap = cls._overlapping_protected_interval(
+                connection,
+                market=market,
+                symbol=symbol,
+                start_utc=start_utc,
+                end_utc=end_utc,
+            )
+            if overlap is not None:
+                raise EvaluationConflictError(
+                    "adaptive evaluation overlaps permanently protected timestamps: "
+                    f"phase={name} market={market} symbol={symbol} "
+                    f"adaptive={start_utc}..{end_utc} "
+                    f"protected={overlap['start_utc']}..{overlap['end_utc']}"
+                )
+
+    @staticmethod
+    def _assert_holdout_cohort_member(
+        connection: sqlite3.Connection,
+        *,
+        behavior_hash: str,
+        dataset_json: Mapping[str, Any],
+        window_json: Mapping[str, Any],
+        data_snapshot_id: str,
+        protocol_hash: str,
+    ) -> None:
+        scope_key = _holdout_scope_key(data_snapshot_id)
+        row = connection.execute(
+            """
+            SELECT member_hashes_json, protocol_hashes_json
+            FROM holdout_cohorts WHERE scope_key = ?
+            """,
+            (scope_key,),
+        ).fetchone()
+        if row is None:
+            raise EvaluationConflictError(
+                "protected evaluation scope was not preregistered as a frozen cohort: "
+                f"snapshot={data_snapshot_id} protocol={protocol_hash}"
+            )
+        protocol_hashes = _stored_json(
+            row["protocol_hashes_json"],
+            label="holdout cohort protocol JSON",
+        )
+        if not isinstance(protocol_hashes, list) or protocol_hash not in protocol_hashes:
+            raise EvaluationConflictError(
+                "protected data snapshot is sealed to a different preregistered protocol: "
+                f"snapshot={data_snapshot_id}"
+            )
+        members = _stored_json(
+            row["member_hashes_json"],
+            label="holdout cohort member JSON",
+        )
+        if not isinstance(members, list) or behavior_hash not in members:
+            raise EvaluationConflictError(
+                "protected evaluation scope is sealed against new candidates: "
+                f"snapshot={data_snapshot_id} behavior={behavior_hash}"
+            )
+        start_utc, end_utc = _normalise_interval(window_json, label="protected window")
+        interval = connection.execute(
+            """
+            SELECT * FROM protected_intervals
+            WHERE cohort_scope_key = ? AND start_utc = ? AND end_utc = ?
+            """,
+            (scope_key, start_utc, end_utc),
+        ).fetchone()
+        if (
+            interval is None
+            or interval["cohort_scope_key"] != scope_key
+            or interval["data_snapshot_id"] != data_snapshot_id
+        ):
+            raise EvaluationConflictError(
+                "protected wall-clock interval was not preregistered: "
+                f"snapshot={data_snapshot_id} start={start_utc} end={end_utc}"
+            )
+        sealed_evidence = _stored_json(
+            interval["dataset_evidence_json"],
+            label="protected interval evidence JSON",
+        )
+        submitted_evidence = _portable_evidence(dataset_json)
+        if not _evidence_is_subset(submitted_evidence, sealed_evidence):
+            raise EvaluationConflictError(
+                "immutable evidence changed for an already sealed wall-clock interval: "
+                f"snapshot={data_snapshot_id} start={start_utc} end={end_utc}"
+            )
+
     def claim_evaluation(
         self,
         behavior_hash: str,
@@ -1218,6 +2047,23 @@ class ExperimentMemory:
         now = _utc_now()
         with self._database(write=True) as connection:
             self._strategy_row(connection, behavior_hash)
+            if phase in PROTECTED_PHASES:
+                self._assert_holdout_cohort_member(
+                    connection,
+                    behavior_hash=behavior_hash,
+                    dataset_json=dataset_json,
+                    window_json=window_json,
+                    data_snapshot_id=snapshot_id,
+                    protocol_hash=protocol_hash,
+                )
+            else:
+                market, symbol = _market_symbol(dataset_json, protocol_json)
+                self._assert_adaptive_intervals_allowed(
+                    connection,
+                    market=market,
+                    symbol=symbol,
+                    intervals=_adaptive_intervals(window_json, phase=phase),
+                )
             existing = connection.execute(
                 "SELECT * FROM evaluations WHERE evaluation_key = ?", (evaluation_key,)
             ).fetchone()
@@ -1568,6 +2414,13 @@ class ExperimentMemory:
         now = _utc_now()
         with self._database(write=True) as connection:
             self._strategy_row(connection, behavior_hash)
+            market, symbol = _market_symbol(dataset_json, protocol_json)
+            self._assert_adaptive_intervals_allowed(
+                connection,
+                market=market,
+                symbol=symbol,
+                intervals=_adaptive_intervals(window_json, phase=phase),
+            )
             existing = connection.execute(
                 "SELECT * FROM evaluations WHERE evaluation_key = ?", (evaluation_key,)
             ).fetchone()
@@ -1924,11 +2777,7 @@ class ExperimentMemory:
         """
 
         product = _validate_text(product, label="product", maximum=128)
-        if (
-            not isinstance(maximum, int)
-            or isinstance(maximum, bool)
-            or not 1 <= maximum <= 100_000
-        ):
+        if not isinstance(maximum, int) or isinstance(maximum, bool) or not 1 <= maximum <= 100_000:
             raise ValueError("maximum must be an integer between 1 and 100000")
         with self._database(write=False) as connection:
             rows = list(
@@ -1951,9 +2800,7 @@ class ExperimentMemory:
                 "submitted_spec": _stored_json(
                     row["primary_spec_json"], label="strategy primary JSON"
                 ),
-                "metadata": _stored_json(
-                    row["metadata_json"], label="strategy metadata JSON"
-                ),
+                "metadata": _stored_json(row["metadata_json"], label="strategy metadata JSON"),
             }
             for row in rows
         ]
@@ -2162,9 +3009,7 @@ class ExperimentMemory:
                 protected_phases,
             ):
                 if research_engine_digest is not None:
-                    protocol = _stored_json(
-                        row["protocol_json"], label="evaluation protocol JSON"
-                    )
+                    protocol = _stored_json(row["protocol_json"], label="evaluation protocol JSON")
                     if protocol.get("research_engine_digest") != research_engine_digest:
                         continue
                 outcome = row["outcome"]
@@ -2306,9 +3151,7 @@ class ExperimentMemory:
             or isinstance(maximum_rows, bool)
             or not 1 <= maximum_rows <= MAX_COMPACTION_ROWS
         ):
-            raise ValueError(
-                f"maximum_rows must be an integer between 1 and {MAX_COMPACTION_ROWS}"
-            )
+            raise ValueError(f"maximum_rows must be an integer between 1 and {MAX_COMPACTION_ROWS}")
         if not isinstance(vacuum, bool):
             raise ValueError("vacuum must be boolean")
 
@@ -2349,9 +3192,7 @@ class ExperimentMemory:
             for table, key_column, json_columns in table_specs:
                 if remaining <= 0:
                     break
-                needs_compaction = " OR ".join(
-                    f"{column} NOT LIKE ?" for column in json_columns
-                )
+                needs_compaction = " OR ".join(f"{column} NOT LIKE ?" for column in json_columns)
                 rows = list(
                     connection.execute(
                         f"SELECT {key_column}, {', '.join(json_columns)} FROM {table} "

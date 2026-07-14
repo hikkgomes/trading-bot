@@ -46,9 +46,7 @@ def audit_file(path: Path, mostly_null_threshold: float) -> dict[str, object]:
     for column_index, column_name in enumerate(names):
         ratio = _column_null_ratio(parquet_file, column_index)
         if ratio is not None and ratio >= mostly_null_threshold:
-            mostly_null_columns.append(
-                {"column": column_name, "null_ratio": round(ratio, 6)}
-            )
+            mostly_null_columns.append({"column": column_name, "null_ratio": round(ratio, 6)})
 
     return {
         "file": str(path),
@@ -69,8 +67,7 @@ def run(
     mostly_null_threshold: float = 0.95,
 ) -> None:
     reports = [
-        audit_file(path, mostly_null_threshold)
-        for path in sorted(indicator_dir.glob("*.parquet"))
+        audit_file(path, mostly_null_threshold) for path in sorted(indicator_dir.glob("*.parquet"))
     ]
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(reports, indent=2), encoding="utf-8")

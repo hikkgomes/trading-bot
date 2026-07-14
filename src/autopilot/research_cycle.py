@@ -26,6 +26,7 @@ from typing import Any
 import pandas as pd
 import pyarrow.parquet as pq
 
+from research_exploration.dsr import DSR_METHOD, LIVE_MIN_DSR
 from research_exploration.evaluate import EvalConfig, _needed_columns, build_aligned_frame
 from research_exploration.experiment_log import DEFAULT_LOG
 from research_exploration.export import run as export_strategies
@@ -37,13 +38,20 @@ from research_exploration.hypothesis_generator import (
 )
 from research_exploration.hypothesis_schema import Hypothesis
 from research_exploration.strategy_grammar import validate_hypothesis_against_space
-from research_exploration.validation import ValidationConfig, split_frame, validate_batch
+from research_exploration.validation import (
+    ValidationConfig,
+    _segment_bounds,
+    split_frame,
+    validate_batch,
+    with_trial_sharpe_dispersion,
+)
 from src.autopilot.approvals import artifact_digest, load_artifact
 from src.autopilot.candidate_activation import (
     DEFAULT_CANDIDATE_DIR,
     candidate_path_for_product,
     product_identity,
 )
+from src.autopilot.candidate_paper import candidate_paper_paths
 from src.autopilot.config import DEFAULT_CONFIG_PATH, ProductConfig, load_config
 from src.autopilot.execution_identity import execution_engine_digest
 from src.autopilot.experiment_memory import (
@@ -66,6 +74,7 @@ from src.autopilot.research_factory import (
 )
 from src.autopilot.research_history_contract import generated_history_contract
 from src.autopilot.strategy_policy import assert_loaded_strategy_artifact_allowed
+from src.build_dataset import TIMEFRAME_SECONDS
 from src.config import indicator_data_dir
 
 DEFAULT_OUTPUT = Path("runtime/research_cycle.json")
@@ -79,6 +88,23 @@ DEFAULT_PRODUCT_STATE_FILES = {
     "active_income": Path("runtime/active_income_state.json"),
     "btc_accumulation": Path("runtime/btc_accumulation_state.json"),
 }
+FEATURE_DEPENDENCY_MAX_NATIVE_BARS = 240
+
+
+def _protected_epoch_scenario_order(scenario: ResearchScenario) -> tuple[Any, ...]:
+    """Give short-history/fast scenarios first choice of the newest epoch."""
+
+    start = pd.Timestamp(scenario.start)
+    if start.tzinfo is None:
+        start = start.tz_localize("UTC")
+    else:
+        start = start.tz_convert("UTC")
+    return (
+        scenario.market,
+        -int(start.value),
+        int(TIMEFRAME_SECONDS.get(scenario.base_tf, 10**9)),
+        scenario.name,
+    )
 
 
 @dataclass(frozen=True)
@@ -230,12 +256,13 @@ DEFAULT_EXPORTS = {
         "pnl_unit": "usdt",
         "market": "futures",
         "top_k": 3,
-        "min_dsr": 0.60,
+        "min_dsr": LIVE_MIN_DSR,
     },
     "btc_accumulation": {
         "pnl_unit": "btc",
         "market": "spot",
         "top_k": 3,
+        "min_dsr": LIVE_MIN_DSR,
     },
 }
 MAX_INCUBATION_CANDIDATES_PER_SCENARIO = 3
@@ -1498,7 +1525,8 @@ def _scenario_indicator_coverage_status(
         now=now,
         research_factory_config_path=research_factory_config_path,
     )
-    assert status is not None
+    if status is None:
+        raise RuntimeError(f"{scenario.name}: required indicator coverage status was not produced")
     status["path"] = str(path)
     if read_error:
         status["read_error"] = read_error
@@ -1705,10 +1733,131 @@ def _development_window(frame: pd.DataFrame, config: ValidationConfig) -> dict[s
     }
 
 
+def _select_unprotected_epoch(
+    frame: pd.DataFrame,
+    protected_intervals: tuple[dict[str, str], ...],
+    *,
+    feature_timeframes: tuple[str, ...] = (),
+) -> tuple[pd.DataFrame, dict[str, Any] | None]:
+    """Choose the largest contiguous row run that has never been protected.
+
+    Protected observations are never recycled into adaptive research. Rather
+    than letting one timeframe permanently starve every other scenario for the
+    same market, later scenarios consume a disjoint chronological epoch. Ties
+    prefer the newest run so regime research remains as current as the
+    protection boundary permits.
+    """
+
+    if not protected_intervals or frame.empty:
+        return frame, None
+    if "timestamp" not in frame.columns:
+        raise ValueError("protected-epoch selection requires a timestamp column")
+    timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="raise")
+    normalized_timeframes = tuple(sorted(set(feature_timeframes)))
+    unknown_timeframes = sorted(set(normalized_timeframes) - set(TIMEFRAME_SECONDS))
+    if unknown_timeframes:
+        raise ValueError(
+            "protected-epoch embargo has unsupported feature timeframe(s): "
+            + ", ".join(unknown_timeframes)
+        )
+    max_timeframe = (
+        max(normalized_timeframes, key=lambda item: TIMEFRAME_SECONDS[item])
+        if normalized_timeframes
+        else None
+    )
+    embargo_seconds = (
+        FEATURE_DEPENDENCY_MAX_NATIVE_BARS * TIMEFRAME_SECONDS[max_timeframe]
+        if max_timeframe is not None
+        else 0
+    )
+    protected_blocked = pd.Series(False, index=frame.index)
+    embargo_blocked = pd.Series(False, index=frame.index)
+    relevant: list[dict[str, str]] = []
+    for interval in protected_intervals:
+        start = pd.Timestamp(interval["start"])
+        end = pd.Timestamp(interval["end"])
+        overlap = (timestamps >= start) & (timestamps <= end)
+        embargo = pd.Series(False, index=frame.index)
+        if embargo_seconds:
+            embargo_end = end + pd.Timedelta(seconds=embargo_seconds)
+            embargo = (timestamps > end) & (timestamps <= embargo_end)
+        if bool(overlap.any()) or bool(embargo.any()):
+            protected_blocked |= overlap
+            embargo_blocked |= embargo
+            relevant.append(interval)
+    if not relevant:
+        return frame, None
+    # A row covered by another protected interval is classified as protected,
+    # not embargo, so the returned counts remain disjoint and auditable.
+    embargo_blocked &= ~protected_blocked
+    blocked = protected_blocked | embargo_blocked
+
+    runs: list[tuple[int, int]] = []
+    run_start: int | None = None
+    for position, is_blocked in enumerate(blocked.to_numpy(dtype=bool)):
+        if not is_blocked and run_start is None:
+            run_start = position
+        elif is_blocked and run_start is not None:
+            runs.append((run_start, position))
+            run_start = None
+    if run_start is not None:
+        runs.append((run_start, len(frame)))
+    if not runs:
+        raise EvaluationConflictError(
+            "no unprotected chronological research epoch remains for this market and symbol"
+        )
+    start_position, end_position = max(
+        runs,
+        key=lambda run: (
+            run[1] - run[0],
+            timestamps.iloc[run[1] - 1],
+        ),
+    )
+    selected = frame.iloc[start_position:end_position].reset_index(drop=True)
+    detail: dict[str, Any] = {
+        "policy": "largest_contiguous_unprotected_epoch",
+        "input_rows": int(len(frame)),
+        "selected_rows": int(len(selected)),
+        "excluded_rows": int(blocked.sum()),
+        "start": str(pd.Timestamp(selected["timestamp"].iloc[0])),
+        "end": str(pd.Timestamp(selected["timestamp"].iloc[-1])),
+        "protected_intervals_considered": len(relevant),
+    }
+    if normalized_timeframes:
+        detail.update(
+            protected_rows_excluded=int(protected_blocked.sum()),
+            feature_dependency_embargo_rows_excluded=int(embargo_blocked.sum()),
+            feature_dependency_embargo={
+                "policy": "maximum_supported_native_rolling_dependency",
+                "max_native_bars": FEATURE_DEPENDENCY_MAX_NATIVE_BARS,
+                "feature_timeframes": list(normalized_timeframes),
+                "max_timeframe": max_timeframe,
+                "duration_seconds": embargo_seconds,
+            },
+        )
+    return selected, detail
+
+
+def _hypothesis_feature_timeframes(hypotheses: list[Hypothesis]) -> tuple[str, ...]:
+    """Return every native timeframe whose values can influence the batch."""
+
+    timeframes: set[str] = set()
+    for hypothesis in hypotheses:
+        timeframes.add(hypothesis.base_timeframe)
+        timeframes.update(hypothesis.timeframes())
+    return tuple(sorted(timeframes))
+
+
 def _development_metrics(result: dict[str, Any]) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "stage_reached": _candidate_stage(result),
         "dsr_deflated": result.get("dsr_deflated"),
+        "dsr_method": result.get("dsr_method"),
+        "n_trials": result.get("n_trials"),
+        "sr_std_trials": result.get("sr_std_trials"),
+        "trial_sharpe_count": result.get("trial_sharpe_count"),
+        "trial_sharpe_observed_std": result.get("trial_sharpe_observed_std"),
+        "trial_sharpe_conservative_floor": result.get("trial_sharpe_conservative_floor"),
     }
     for stage in ("train", "validation"):
         if summary := _segment_summary(result, stage):
@@ -1726,7 +1875,7 @@ def _memory_protocol(
     eval_config: EvalConfig,
 ) -> dict[str, Any]:
     return {
-        "schema": "autopilot.staged_validation/v2",
+        "schema": "autopilot.staged_validation/v3",
         "research_engine_digest": execution_engine_digest(),
         "scenario": scenario.name,
         "product": scenario.product,
@@ -1735,6 +1884,14 @@ def _memory_protocol(
         "base_timeframe": scenario.base_tf,
         "validation": dataclasses.asdict(validation_config),
         "evaluation": dataclasses.asdict(eval_config),
+        "dsr": {
+            "method": DSR_METHOD,
+            "n_trials": validation_config.n_trials,
+            "sr_std_trials": validation_config.sr_std_trials,
+            "trial_sharpe_count": validation_config.trial_sharpe_count,
+            "trial_sharpe_observed_std": validation_config.trial_sharpe_observed_std,
+            "trial_sharpe_conservative_floor": (validation_config.trial_sharpe_conservative_floor),
+        },
     }
 
 
@@ -1841,6 +1998,16 @@ def run_validation_scenario(
         end=scenario.end,
         indicator_dir=selected_indicator_dir,
     )
+    epoch_selection = None
+    if experiment_memory is not None:
+        frame, epoch_selection = _select_unprotected_epoch(
+            frame,
+            experiment_memory.protected_intervals(
+                market=scenario.market,
+                symbol="BTCUSDT",
+            ),
+            feature_timeframes=_hypothesis_feature_timeframes(supported_hypotheses),
+        )
     coverage = _scenario_coverage_status(
         frame,
         scenario,
@@ -1864,6 +2031,12 @@ def run_validation_scenario(
             supported_hypotheses=len(supported_hypotheses),
         ),
     )
+    validation_cfg = with_trial_sharpe_dispersion(
+        frame,
+        supported_hypotheses,
+        validation_cfg,
+        eval_cfg,
+    )
     memory_hashes: dict[str, str] = {}
     dataset_snapshot: dict[str, Any] | None = None
     development_window: dict[str, Any] | None = None
@@ -1878,6 +2051,15 @@ def run_validation_scenario(
         )
         development_window = _development_window(frame, validation_cfg)
         protocol = _memory_protocol(scenario, validation_cfg, eval_cfg)
+        # This check runs before validate_batch receives the frame. A protected
+        # candle remains unavailable to adaptive train/validation forever,
+        # even when a later snapshot grows or changes timeframe.
+        experiment_memory.assert_adaptive_window_allowed(
+            dataset=dataset_snapshot,
+            window=development_window,
+            protocol=protocol,
+            phase="development",
+        )
         hypothesis_metadata = hypothesis_metadata or {}
         pending_hypotheses: list[Hypothesis] = []
         for hypothesis in supported_hypotheses:
@@ -1896,7 +2078,10 @@ def run_validation_scenario(
                 if canonical_strategy_hash(submitted) != behavior_hash:
                     raise ValueError(f"{hypothesis.id}: experiment-memory identity mismatch")
             memory_hashes[hypothesis.id] = behavior_hash
-            if experiment_memory.is_tested(
+            registered_strategy = experiment_memory.get_strategy(behavior_hash)
+            if registered_strategy.get("holdout_exposed_at") is not None:
+                already_evaluated.append(hypothesis.id)
+            elif experiment_memory.is_tested(
                 behavior_hash,
                 dataset=dataset_snapshot,
                 window=development_window,
@@ -1938,13 +2123,32 @@ def run_validation_scenario(
             }
 
     holdout_claims: dict[str, str] = {}
+    holdout_cohort_members: set[str] = set()
+    holdout_cohort_created: bool | None = None
+    holdout_cohort_scope: str | None = None
+    if experiment_memory is not None:
+        if dataset_snapshot is None or protocol is None:
+            raise RuntimeError(
+                f"{scenario.name}: experiment-memory holdout context was not initialized"
+            )
+        holdout_window = _segment_bounds(split_frame(frame, validation_cfg)["holdout"])
+        cohort = experiment_memory.register_holdout_cohort(
+            [memory_hashes[hypothesis.id] for hypothesis in supported_hypotheses],
+            dataset=dataset_snapshot,
+            window=holdout_window,
+            protocol=protocol,
+        )
+        holdout_cohort_members = set(cohort.member_hashes)
+        holdout_cohort_created = cohort.created
+        holdout_cohort_scope = cohort.scope_key
 
     def before_holdout(hypothesis: Hypothesis, partial_result: dict[str, Any]) -> bool:
         if experiment_memory is None:
             return True
-        assert (
-            dataset_snapshot is not None and development_window is not None and protocol is not None
-        )
+        if dataset_snapshot is None or development_window is None or protocol is None:
+            raise RuntimeError(
+                f"{scenario.name}: experiment-memory claim context was not initialized"
+            )
         behavior_hash = memory_hashes[hypothesis.id]
         experiment_memory.record_outcome(
             behavior_hash,
@@ -1956,6 +2160,8 @@ def run_validation_scenario(
             metrics=_development_metrics(partial_result),
             details={"stage_reached": "sensitivity", "holdout_feedback_allowed": False},
         )
+        if behavior_hash not in holdout_cohort_members:
+            return False
         snapshot_id = str(dataset_snapshot["snapshot_id"])
         if experiment_memory.holdout_claimed(behavior_hash, snapshot_id=snapshot_id):
             return False
@@ -1979,9 +2185,10 @@ def run_validation_scenario(
 
         if experiment_memory is None:
             return
-        assert (
-            dataset_snapshot is not None and development_window is not None and protocol is not None
-        )
+        if dataset_snapshot is None or development_window is None or protocol is None:
+            raise RuntimeError(
+                f"{scenario.name}: experiment-memory checkpoint context was not initialized"
+            )
         behavior_hash = memory_hashes[hypothesis.id]
         if result.get("holdout") is not None:
             evaluation_key = holdout_claims.get(hypothesis.id)
@@ -2045,6 +2252,7 @@ def run_validation_scenario(
         "start": scenario.start,
         "end": scenario.end,
         "rows": int(len(frame)),
+        **({"protected_epoch_selection": epoch_selection} if epoch_selection is not None else {}),
         "coverage": coverage,
         "unsupported_hypotheses": unsupported_hypotheses,
         "retired_unsupported_ids": retired_unsupported_ids,
@@ -2053,6 +2261,15 @@ def run_validation_scenario(
         **(
             {"dataset_snapshot_id": dataset_snapshot["snapshot_id"]}
             if dataset_snapshot is not None
+            else {}
+        ),
+        **(
+            {
+                "holdout_cohort_scope": holdout_cohort_scope,
+                "holdout_cohort_created": holdout_cohort_created,
+                "holdout_cohort_members": len(holdout_cohort_members),
+            }
+            if holdout_cohort_scope is not None
             else {}
         ),
         "trial_count": validation_cfg.n_trials,
@@ -2182,6 +2399,12 @@ def stage_live_product_candidate(
             f"{product.name}: candidate staging directory must not be a symlink: {out.parent}"
         )
 
+    existing_candidate: dict[str, Any] | None = None
+    existing_digest: str | None = None
+    if out.exists():
+        existing_candidate = load_artifact(out)
+        existing_digest = artifact_digest(existing_candidate)
+
     scratch_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -2236,6 +2459,58 @@ def stage_live_product_candidate(
             artifact_path=out,
             require_live_eligible=True,
         )
+        if existing_candidate is not None and existing_digest is not None:
+            if _candidate_paper_identity(existing_candidate) == _candidate_paper_identity(payload):
+                return {
+                    "ok": True,
+                    "product": product.name,
+                    "pnl_unit": pnl_unit,
+                    "market": market,
+                    "exported": False,
+                    "staged": False,
+                    "destination": "staging",
+                    "activation_required": True,
+                    "approval_granted": False,
+                    "reason": "candidate_already_staged",
+                    "artifact_digest": existing_digest,
+                    "artifact": str(out),
+                    "active_artifact": str(product.strategies_path),
+                    "strategies": len(existing_candidate.get("strategies", [])),
+                    "ids": ids or [],
+                    "min_dsr": min_dsr,
+                }
+            old_state = candidate_paper_paths(
+                product.name,
+                existing_digest,
+                candidate_dir=out.parent,
+            )["state"]
+            old_open_positions = _open_position_ids_for_export(
+                product.name,
+                state_file=old_state,
+            )
+            if old_open_positions:
+                return {
+                    "ok": True,
+                    "product": product.name,
+                    "pnl_unit": pnl_unit,
+                    "market": market,
+                    "exported": False,
+                    "staged": False,
+                    "destination": "staging",
+                    "activation_required": True,
+                    "reason": "prior_candidate_open_positions",
+                    "detail": (
+                        "the staged artifact is unchanged until its digest-isolated "
+                        "paper positions are flat"
+                    ),
+                    "artifact_digest": existing_digest,
+                    "artifact": str(out),
+                    "active_artifact": str(product.strategies_path),
+                    "open_positions": old_open_positions,
+                    "state_file": str(old_state),
+                    "ids": ids or [],
+                    "min_dsr": min_dsr,
+                }
         write_json_atomic(out, payload)
     finally:
         if scratch_path is not None and scratch_path.exists():
@@ -2258,6 +2533,23 @@ def stage_live_product_candidate(
         "ids": ids or [],
         "min_dsr": min_dsr,
     }
+
+
+def _candidate_paper_identity(payload: dict[str, Any]) -> str:
+    """Identity whose unchanged value must preserve accumulated paper state."""
+
+    keys = (
+        "version",
+        "market",
+        "symbol",
+        "pnl_unit",
+        "paper_trade_allowed",
+        "live_allowed",
+        "promotion_eligible",
+        "product",
+        "strategies",
+    )
+    return artifact_digest({key: payload.get(key) for key in keys})
 
 
 def _open_position_ids_for_export(product: str, *, state_file: Path | None = None) -> list[str]:
@@ -2336,7 +2628,12 @@ def run_research_cycle(
             factory_config_path=research_factory_config_path,
         )
     base_scenarios = () if generated_only else scenarios
-    scenarios = (*base_scenarios, *generated_scenarios, *mutation_scenarios)
+    scenarios = tuple(
+        sorted(
+            (*base_scenarios, *generated_scenarios, *mutation_scenarios),
+            key=_protected_epoch_scenario_order,
+        )
+    )
     scenario_markets = sorted({scenario.market for scenario in scenarios}) or ["futures"]
     market_data_by_market = build_market_data_statuses(scenario_markets)
     ready_markets = {market for market, status in market_data_by_market.items() if status.get("ok")}

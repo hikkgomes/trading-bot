@@ -2,8 +2,8 @@ import gc
 import os
 import re
 import zipfile
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -66,6 +66,7 @@ def configure_dataset(
     CANDLE_DIR = candle_data_dir(SYMBOL, MARKET, legacy_fallback=legacy_fallback)
     INDICATOR_DIR = indicator_data_dir(SYMBOL, MARKET, legacy_fallback=legacy_fallback)
 
+
 TIMEFRAME_RULES = {
     "1m": None,
     "5m": "5min",
@@ -121,7 +122,8 @@ BINANCE_COLUMNS = [
 # BINANCE DOWNLOAD
 # =========================
 
-def parse_month(value: str) -> Tuple[int, int]:
+
+def parse_month(value: str) -> tuple[int, int]:
     year_text, month_text = value.split("-", 1)
     year = int(year_text)
     month = int(month_text)
@@ -130,7 +132,7 @@ def parse_month(value: str) -> Tuple[int, int]:
     return year, month
 
 
-def iter_months(start_month: str, end_month: str) -> Iterable[Tuple[int, int]]:
+def iter_months(start_month: str, end_month: str) -> Iterable[tuple[int, int]]:
     start_year, start_month_number = parse_month(start_month)
     end_year, end_month_number = parse_month(end_month)
     current_year = start_year
@@ -177,6 +179,7 @@ def download_binance_1m() -> None:
 # CANDLE BUILDING
 # =========================
 
+
 def read_binance_zip(path: Path) -> pd.DataFrame:
     with zipfile.ZipFile(path) as archive:
         csv_files = [name for name in archive.namelist() if name.endswith(".csv")]
@@ -210,13 +213,15 @@ def load_1m_from_zips() -> pd.DataFrame:
         frames.append(read_binance_zip(path))
 
     df = pd.concat(frames, ignore_index=True).sort_values("timestamp")
-    validate_1m_candles(df, candle_columns=CANDLE_COLUMNS, label=f"{SYMBOL} {MARKET} loaded raw 1m candles")
+    validate_1m_candles(
+        df, candle_columns=CANDLE_COLUMNS, label=f"{SYMBOL} {MARKET} loaded raw 1m candles"
+    )
     df = df.set_index("timestamp")
     df.index.name = "timestamp"
     return df
 
 
-def load_existing_1m_candles() -> Optional[pd.DataFrame]:
+def load_existing_1m_candles() -> pd.DataFrame | None:
     path = CANDLE_DIR / f"{SYMBOL}_1m.parquet"
     if not path.exists():
         return None
@@ -238,7 +243,7 @@ def load_existing_1m_candles() -> Optional[pd.DataFrame]:
 def build_timeframes(
     df_1m: pd.DataFrame,
     timeframes: list[str] | tuple[str, ...] | set[str] | None = None,
-) -> Dict[str, pd.DataFrame]:
+) -> dict[str, pd.DataFrame]:
     CANDLE_DIR.mkdir(parents=True, exist_ok=True)
 
     datasets = {}
@@ -274,10 +279,7 @@ def build_timeframes(
                 }
             )
             period = TIMEFRAME_PERIODS[timeframe]
-            df = df[
-                (df.index >= first_timestamp)
-                & (df.index + period <= complete_until)
-            ]
+            df = df[(df.index >= first_timestamp) & (df.index + period <= complete_until)]
 
         df = df.dropna(subset=["open", "high", "low", "close"])
         df.index.name = "timestamp"
@@ -297,7 +299,8 @@ def build_timeframes(
 # TA-LIB INDICATORS
 # =========================
 
-def make_talib_inputs(df: pd.DataFrame) -> Dict[str, np.ndarray]:
+
+def make_talib_inputs(df: pd.DataFrame) -> dict[str, np.ndarray]:
     return {
         "open": df["open"].astype(float).values,
         "high": df["high"].astype(float).values,
@@ -307,7 +310,7 @@ def make_talib_inputs(df: pd.DataFrame) -> Dict[str, np.ndarray]:
     }
 
 
-def normalise_output(result, output_names, prefix: str) -> Dict[str, object]:
+def normalise_output(result, output_names, prefix: str) -> dict[str, object]:
     output = {}
 
     if isinstance(result, pd.DataFrame):
@@ -324,7 +327,7 @@ def normalise_output(result, output_names, prefix: str) -> Dict[str, object]:
             output[f"{prefix}_{key}"] = values
         return output
 
-    if isinstance(result, (tuple, list)):
+    if isinstance(result, tuple | list):
         for index, values in enumerate(result):
             name = (
                 output_names[index]
@@ -351,10 +354,10 @@ def normalise_output(result, output_names, prefix: str) -> Dict[str, object]:
 
 def run_indicator(
     function_name: str,
-    inputs: Dict[str, np.ndarray],
-    params: Optional[Dict[str, object]] = None,
-    suffix: Optional[str] = None,
-) -> Dict[str, object]:
+    inputs: dict[str, np.ndarray],
+    params: dict[str, object] | None = None,
+    suffix: str | None = None,
+) -> dict[str, object]:
     function = abstract.Function(function_name)
     prefix = function_name.lower()
     if suffix:
@@ -364,7 +367,7 @@ def run_indicator(
     return normalise_output(result, function.output_names, prefix)
 
 
-def get_variant_candidates() -> List[str]:
+def get_variant_candidates() -> list[str]:
     candidates = []
     for function_name in talib.get_functions():
         try:
@@ -395,7 +398,7 @@ def flow_feature_names() -> set[str]:
     return names
 
 
-def build_flow_features(df: pd.DataFrame) -> Dict[str, pd.Series]:
+def build_flow_features(df: pd.DataFrame) -> dict[str, pd.Series]:
     """Order-flow features from Binance taker/volume candle fields.
 
     Captures who is aggressing (taker buys vs sells) — information OHLCV
@@ -412,7 +415,7 @@ def build_flow_features(df: pd.DataFrame) -> Dict[str, pd.Series]:
     # Net aggressive buy volume: buys minus sells, where sells = volume - buys.
     delta = 2.0 * taker_buy - volume
     imbalance = delta / safe_volume
-    features: Dict[str, pd.Series] = {
+    features: dict[str, pd.Series] = {
         "taker_buy_ratio": taker_buy / safe_volume,
         "taker_imbalance": imbalance,
         "avg_trade_size": volume / trades.replace(0, np.nan),
@@ -486,7 +489,9 @@ def build_indicator_features(
         if required is None:
             features.update(flow_features)
         else:
-            features.update({name: values for name, values in flow_features.items() if name in required})
+            features.update(
+                {name: values for name, values in flow_features.items() if name in required}
+            )
 
     if required is not None:
         for function_name, period in sorted(
@@ -559,7 +564,7 @@ def reduce_numeric_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def base_columns_for(df: pd.DataFrame) -> List[str]:
+def base_columns_for(df: pd.DataFrame) -> list[str]:
     return [column for column in CANDLE_COLUMNS if column in df.columns]
 
 
@@ -606,8 +611,7 @@ def build_chunked_indicator_file(timeframe: str, df: pd.DataFrame) -> None:
                 end = min(start + CHUNK_SIZE, total_rows)
                 warmup_start = max(0, start - WARMUP_ROWS)
                 print(
-                    f"[{timeframe}] Chunk rows {start:,} to {end:,} "
-                    f"(warmup from {warmup_start:,})",
+                    f"[{timeframe}] Chunk rows {start:,} to {end:,} (warmup from {warmup_start:,})",
                     flush=True,
                 )
 
@@ -640,7 +644,7 @@ def build_chunked_indicator_file(timeframe: str, df: pd.DataFrame) -> None:
     print(f"Saved chunked indicators: {output_path}", flush=True)
 
 
-def build_indicator_files(datasets: Dict[str, pd.DataFrame]) -> None:
+def build_indicator_files(datasets: dict[str, pd.DataFrame]) -> None:
     INDICATOR_DIR.mkdir(parents=True, exist_ok=True)
     # Iterate only the timeframes actually provided (callers may pass a
     # subset), preserving the canonical TIMEFRAMES build order.
@@ -657,6 +661,7 @@ def build_indicator_files(datasets: Dict[str, pd.DataFrame]) -> None:
 # =========================
 # MAIN
 # =========================
+
 
 def main() -> None:
     print(

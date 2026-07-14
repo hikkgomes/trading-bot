@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from research_exploration.dsr import DSR_METHOD
 from src.autopilot.artifact_hygiene import (
     build_artifact_hygiene_report,
     find_unreferenced_active_artifacts,
@@ -63,7 +64,16 @@ def write_artifact(path, *, holdout=0.03):
                             "max_trades_per_day": 4,
                         },
                         "fees": {"fee_bps": 5.0, "slippage_bps": 2.0},
-                        "metrics": {"holdout_total_return": holdout, "dsr_deflated": 0.72},
+                        "metrics": {
+                            "holdout_total_return": holdout,
+                            "dsr_deflated": 0.72,
+                            "dsr_method": DSR_METHOD,
+                            "n_trials": 12,
+                            "sr_std_trials": 0.18,
+                            "trial_sharpe_count": 12,
+                            "trial_sharpe_observed_std": 0.16,
+                            "trial_sharpe_conservative_floor": 0.10,
+                        },
                     }
                 ],
             }
@@ -186,12 +196,16 @@ def test_build_artifact_hygiene_report_continues_after_product_quarantine_error(
     assert list(real_quarantine.iterdir()) == []
 
 
-def test_inspect_product_artifact_does_not_overwrite_broken_symlink_quarantine_target(tmp_path, monkeypatch):
+def test_inspect_product_artifact_does_not_overwrite_broken_symlink_quarantine_target(
+    tmp_path, monkeypatch
+):
     artifact = tmp_path / "active_strategies_flow.json"
     write_artifact(artifact, holdout=-0.01)
     quarantine_dir = tmp_path / "quarantine"
     quarantine_dir.mkdir()
-    monkeypatch.setattr("src.autopilot.artifact_hygiene.time.strftime", lambda *args, **kwargs: "20260101T000000Z")
+    monkeypatch.setattr(
+        "src.autopilot.artifact_hygiene.time.strftime", lambda *args, **kwargs: "20260101T000000Z"
+    )
     first_collision = quarantine_dir / "active_strategies_flow.20260101T000000Z.json"
     first_collision.symlink_to(tmp_path / "missing-target.json")
 

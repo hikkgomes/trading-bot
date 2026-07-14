@@ -140,8 +140,14 @@ def cache_key_for_screening(
         start = None
         stop = None
     else:
-        start = str(train["timestamp"].iloc[0]) if "timestamp" in train.columns else int(train.index[0])
-        stop = str(train["timestamp"].iloc[-1]) if "timestamp" in train.columns else int(train.index[-1])
+        start = (
+            str(train["timestamp"].iloc[0]) if "timestamp" in train.columns else int(train.index[0])
+        )
+        stop = (
+            str(train["timestamp"].iloc[-1])
+            if "timestamp" in train.columns
+            else int(train.index[-1])
+        )
     return (
         start,
         stop,
@@ -169,22 +175,31 @@ def get_screened_features_cached(
     method: str = "shap",
 ) -> set[str]:
     key = cache_key_for_screening(
-        train, label_column, direction, horizon_bars,
-        take_profit, stop_loss, feature_columns,
-        max_features, method,
+        train,
+        label_column,
+        direction,
+        horizon_bars,
+        take_profit,
+        stop_loss,
+        feature_columns,
+        max_features,
+        method,
     )
     if key in cache.values:
         cache.hits += 1
         return cache.values[key]
     from src.feature_screener import screen_features
+
     cache.misses += 1
-    screened = set(screen_features(
-        train,
-        label_column,
-        feature_columns,
-        max_features=max_features,
-        method=method,
-    ))
+    screened = set(
+        screen_features(
+            train,
+            label_column,
+            feature_columns,
+            max_features=max_features,
+            method=method,
+        )
+    )
     cache.values[key] = screened
     return screened
 
@@ -194,6 +209,7 @@ def _ensure_dataset(path: Path, base_timeframe: str) -> None:
         return
     LOGGER.info("Dataset %s not found — building it now", path)
     from src.build_dataset import run as build_run
+
     build_run(
         indicator_dir=INDICATOR_DATA_DIR,
         input_kind="indicators",
@@ -224,7 +240,9 @@ def load_dataset(
     read_columns = None
     if columns is not None:
         read_columns = sorted(set(columns) | base_columns)
-    data = pd.read_parquet(path, columns=read_columns).sort_values("timestamp").reset_index(drop=True)
+    data = (
+        pd.read_parquet(path, columns=read_columns).sort_values("timestamp").reset_index(drop=True)
+    )
     required = base_columns
     missing = required - set(data.columns)
     if missing:
@@ -234,9 +252,7 @@ def load_dataset(
         data[f"future_return_{horizon}_bars"] = (
             data[close_col].shift(-horizon) / data[close_col] - 1
         )
-    return data.dropna(
-        subset=[f"future_return_{h}_bars" for h in horizons]
-    ).reset_index(drop=True)
+    return data.dropna(subset=[f"future_return_{h}_bars" for h in horizons]).reset_index(drop=True)
 
 
 def numeric_feature_columns(
@@ -252,7 +268,8 @@ def numeric_feature_columns(
     } | set(TARGET_COLUMNS)
     excluded.update(c for c in data.columns if c.startswith("future_return_"))
     return [
-        c for c in data.select_dtypes(include="number").columns
+        c
+        for c in data.select_dtypes(include="number").columns
         if c not in excluded and c.startswith("tf_")
     ]
 
@@ -278,13 +295,22 @@ class PrecomputedArrays:
         unique_dates = sorted(set(ts_dates))
         date_to_id = {d: i for i, d in enumerate(unique_dates)}
         day_ids = np.array([date_to_id[d] for d in ts_dates], dtype=np.int64)
-        atr_col = f"{base_prefix}atr" if f"{base_prefix}atr" in data.columns else f"{base_prefix}atr_14"
+        atr_col = (
+            f"{base_prefix}atr" if f"{base_prefix}atr" in data.columns else f"{base_prefix}atr_14"
+        )
         if atr_col not in data.columns:
             atr_cols = [c for c in data.columns if c.endswith("_atr") or c.endswith("_atr_14")]
             atr_col = atr_cols[0] if atr_cols else None
         atr = data[atr_col].astype(float).to_numpy() if atr_col else np.zeros(len(data))
-        return cls(open_=open_, high=high, low=low, close=close,
-                   timestamps=timestamps, day_ids=day_ids, atr=atr)
+        return cls(
+            open_=open_,
+            high=high,
+            low=low,
+            close=close,
+            timestamps=timestamps,
+            day_ids=day_ids,
+            atr=atr,
+        )
 
 
 try:
@@ -292,11 +318,25 @@ try:
 
     @njit(cache=True)
     def _simulate_inner(
-        open_, high, low, close, day_ids, signal,
-        is_long, horizon_bars, take_profit, stop_loss,
-        total_cost, position_size, daily_stop_loss,
-        max_consecutive_losses, cooldown_bars,
-        atr, use_atr_tp_sl, risk_per_trade, max_position_fraction,
+        open_,
+        high,
+        low,
+        close,
+        day_ids,
+        signal,
+        is_long,
+        horizon_bars,
+        take_profit,
+        stop_loss,
+        total_cost,
+        position_size,
+        daily_stop_loss,
+        max_consecutive_losses,
+        cooldown_bars,
+        atr,
+        use_atr_tp_sl,
+        risk_per_trade,
+        max_position_fraction,
     ):
         n = len(signal)
         max_entry_index = n - horizon_bars - 1
@@ -446,7 +486,9 @@ def _simulate_day_trades_python(
         low = data[f"{base_prefix}low"].astype(float).to_numpy()
         close = data[f"{base_prefix}close"].astype(float).to_numpy()
         timestamps = data["timestamp"].to_numpy()
-        atr_col = f"{base_prefix}atr" if f"{base_prefix}atr" in data.columns else f"{base_prefix}atr_14"
+        atr_col = (
+            f"{base_prefix}atr" if f"{base_prefix}atr" in data.columns else f"{base_prefix}atr_14"
+        )
         if atr_col not in data.columns:
             atr_cols = [c for c in data.columns if c.endswith("_atr") or c.endswith("_atr_14")]
             atr_col = atr_cols[0] if atr_cols else None
@@ -474,11 +516,7 @@ def _simulate_day_trades_python(
 
     for signal_index, should_enter in enumerate(signal):
         entry_index = signal_index + 1
-        if (
-            not should_enter
-            or entry_index < next_allowed_entry
-            or entry_index > max_entry_index
-        ):
+        if not should_enter or entry_index < next_allowed_entry or entry_index > max_entry_index:
             continue
 
         day = pd.Timestamp(timestamps[signal_index]).date()
@@ -507,13 +545,21 @@ def _simulate_day_trades_python(
             sl_pct = 0.01
 
         if config.use_atr_tp_sl:
-            trade_position_size = min(config.risk_per_trade / sl_pct, config.max_position_fraction, 1.0)
+            trade_position_size = min(
+                config.risk_per_trade / sl_pct, config.max_position_fraction, 1.0
+            )
         else:
             trade_position_size = position_size
 
         exit_index, reason_code = scan_tp_sl(
-            high, low, entry, direction == "long",
-            tp_pct, sl_pct, entry_index, entry_index + config.horizon_bars,
+            high,
+            low,
+            entry,
+            direction == "long",
+            tp_pct,
+            sl_pct,
+            entry_index,
+            entry_index + config.horizon_bars,
         )
         if reason_code == 1:
             exit_price = entry * (1 - sl_pct) if direction == "long" else entry * (1 + sl_pct)
@@ -596,7 +642,9 @@ def _simulate_day_trades_numba(
         unique_dates = sorted(set(ts_dates))
         date_to_id = {d: i for i, d in enumerate(unique_dates)}
         day_ids = np.array([date_to_id[d] for d in ts_dates], dtype=np.int64)
-        atr_col = f"{base_prefix}atr" if f"{base_prefix}atr" in data.columns else f"{base_prefix}atr_14"
+        atr_col = (
+            f"{base_prefix}atr" if f"{base_prefix}atr" in data.columns else f"{base_prefix}atr_14"
+        )
         if atr_col not in data.columns:
             atr_cols = [c for c in data.columns if c.endswith("_atr") or c.endswith("_atr_14")]
             atr_col = atr_cols[0] if atr_cols else None
@@ -612,43 +660,81 @@ def _simulate_day_trades_numba(
     )
 
     (
-        signal_indices, entry_indices, exit_indices, exit_reasons,
-        entries, exits, gross_returns, net_returns, sized_returns,
-        equities, position_sizes, daily_stop_hits, cooldown_triggers,
+        signal_indices,
+        entry_indices,
+        exit_indices,
+        exit_reasons,
+        entries,
+        exits,
+        gross_returns,
+        net_returns,
+        sized_returns,
+        equities,
+        position_sizes,
+        daily_stop_hits,
+        cooldown_triggers,
     ) = _simulate_inner(
-        open_, high, low, close, day_ids, signal,
-        direction == "long", config.horizon_bars, config.take_profit,
-        config.stop_loss, total_cost, position_size, config.daily_stop_loss,
-        config.max_consecutive_losses, config.cooldown_bars,
-        atr, config.use_atr_tp_sl, config.risk_per_trade, config.max_position_fraction,
+        open_,
+        high,
+        low,
+        close,
+        day_ids,
+        signal,
+        direction == "long",
+        config.horizon_bars,
+        config.take_profit,
+        config.stop_loss,
+        total_cost,
+        position_size,
+        config.daily_stop_loss,
+        config.max_consecutive_losses,
+        config.cooldown_bars,
+        atr,
+        config.use_atr_tp_sl,
+        config.risk_per_trade,
+        config.max_position_fraction,
     )
 
     if len(signal_indices) == 0:
-        result = pd.DataFrame(columns=[
-            "signal_time", "entry_time", "exit_time", "direction",
-            "entry", "exit", "exit_reason", "gross_return", "net_return",
-            "sized_return", "position_size", "holding_bars", "equity_after",
-        ])
+        result = pd.DataFrame(
+            columns=[
+                "signal_time",
+                "entry_time",
+                "exit_time",
+                "direction",
+                "entry",
+                "exit",
+                "exit_reason",
+                "gross_return",
+                "net_return",
+                "sized_return",
+                "position_size",
+                "holding_bars",
+                "equity_after",
+            ]
+        )
         result.attrs["daily_stop_hits"] = int(daily_stop_hits)
         result.attrs["cooldown_triggers"] = int(cooldown_triggers)
         return result
 
     reason_map = {0: "time", 1: "stop", 2: "take_profit"}
-    result = pd.DataFrame({
-        "signal_time": timestamps[signal_indices],
-        "entry_time": timestamps[entry_indices],
-        "exit_time": timestamps[exit_indices],
-        "direction": direction,
-        "entry": entries,
-        "exit": exits,
-        "exit_reason": [reason_map[r] for r in exit_reasons],
-        "gross_return": gross_returns,
-        "net_return": net_returns,
-        "sized_return": sized_returns,
-        "position_size": position_sizes,
-        "holding_bars": exit_indices - entry_indices,
-        "equity_after": equities,
-    })
+    result = pd.DataFrame(
+        {
+            "signal_time": timestamps[signal_indices],
+            "entry_time": timestamps[entry_indices],
+            "exit_time": timestamps[exit_indices],
+            "direction": direction,
+            "entry": entries,
+            "exit": exits,
+            "exit_reason": [reason_map[r] for r in exit_reasons],
+            "gross_return": gross_returns,
+            "net_return": net_returns,
+            "sized_return": sized_returns,
+            "position_size": position_sizes,
+            "holding_bars": exit_indices - entry_indices,
+            "equity_after": equities,
+        }
+    )
     result.attrs["daily_stop_hits"] = int(daily_stop_hits)
     result.attrs["cooldown_triggers"] = int(cooldown_triggers)
     return result
@@ -663,8 +749,12 @@ def simulate_day_trades(
     precomputed: PrecomputedArrays | None = None,
 ) -> pd.DataFrame:
     if _HAS_NUMBA:
-        return _simulate_day_trades_numba(data, signal_mask, direction, config, base_prefix, precomputed)
-    return _simulate_day_trades_python(data, signal_mask, direction, config, base_prefix, precomputed)
+        return _simulate_day_trades_numba(
+            data, signal_mask, direction, config, base_prefix, precomputed
+        )
+    return _simulate_day_trades_python(
+        data, signal_mask, direction, config, base_prefix, precomputed
+    )
 
 
 def day_trade_metrics(trades: pd.DataFrame) -> dict[str, float]:
@@ -698,9 +788,7 @@ def day_trade_metrics(trades: pd.DataFrame) -> dict[str, float]:
     daily_returns = sized_returns.groupby(entry_times.dt.date).sum()
     sharpe = np.nan
     if len(daily_returns) > 1 and daily_returns.std() > 0:
-        sharpe = float(
-            daily_returns.mean() / daily_returns.std() * np.sqrt(365)
-        )
+        sharpe = float(daily_returns.mean() / daily_returns.std() * np.sqrt(365))
 
     return {
         "trades": int(len(trades)),
@@ -735,10 +823,20 @@ def score_candidate(
     if test_mask is None:
         test_mask = combined_mask(test, candidate.conditions)
     train_trades = simulate_day_trades(
-        train, train_mask, candidate.direction, config, base_prefix, train_arrays,
+        train,
+        train_mask,
+        candidate.direction,
+        config,
+        base_prefix,
+        train_arrays,
     )
     test_trades = simulate_day_trades(
-        test, test_mask, candidate.direction, config, base_prefix, test_arrays,
+        test,
+        test_mask,
+        candidate.direction,
+        config,
+        base_prefix,
+        test_arrays,
     )
     train_m = day_trade_metrics(train_trades)
     test_m = day_trade_metrics(test_trades)
@@ -751,8 +849,12 @@ def score_candidate(
         "timeframe_count": len(candidate.timeframes),
         "conditions": len(candidate.conditions),
         "rule": candidate.rule,
-        "train_returns": train_trades["net_return"].astype(float).to_numpy() if not train_trades.empty else np.array([], dtype=float),
-        "test_returns": test_trades["net_return"].astype(float).to_numpy() if not test_trades.empty else np.array([], dtype=float),
+        "train_returns": train_trades["net_return"].astype(float).to_numpy()
+        if not train_trades.empty
+        else np.array([], dtype=float),
+        "test_returns": test_trades["net_return"].astype(float).to_numpy()
+        if not test_trades.empty
+        else np.array([], dtype=float),
         **{f"train_{k}": v for k, v in train_m.items()},
         **{f"test_{k}": v for k, v in test_m.items()},
     }
@@ -789,8 +891,7 @@ def _attach_statistical_metrics(
     out = strategies.copy()
     n_trials = max(1, len(out))
     train_srs = [
-        sharpe_ratio(np.asarray(row.get("train_returns", []), dtype=float))
-        for row in return_rows
+        sharpe_ratio(np.asarray(row.get("train_returns", []), dtype=float)) for row in return_rows
     ]
     finite_srs = np.asarray([sr for sr in train_srs if np.isfinite(sr)], dtype=float)
     sr_std_trials = float(np.std(finite_srs, ddof=1)) if finite_srs.size > 1 else 0.0
@@ -837,7 +938,11 @@ def regime_breakdown(
             base_prefix,
         )
         metrics = day_trade_metrics(trades)
-        returns = trades["net_return"].astype(float).to_numpy() if not trades.empty else np.array([], dtype=float)
+        returns = (
+            trades["net_return"].astype(float).to_numpy()
+            if not trades.empty
+            else np.array([], dtype=float)
+        )
         breakdown[str(int(regime_id))] = {
             "trades": int(metrics["trades"]),
             "total_return": float(metrics["total_return"]),
@@ -853,7 +958,9 @@ def regime_breakdown(
     return breakdown
 
 
-def cluster_ranked_strategies(data: pd.DataFrame, strategies: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
+def cluster_ranked_strategies(
+    data: pd.DataFrame, strategies: pd.DataFrame, threshold: float = 0.8
+) -> pd.DataFrame:
     out = strategies.copy()
     if out.empty or "conditions_json" not in out.columns:
         out["cluster_id"] = pd.Series(dtype=int)
@@ -868,11 +975,23 @@ def cluster_ranked_strategies(data: pd.DataFrame, strategies: pd.DataFrame, thre
         member_indices = [int(member) for member in members]
         cluster_rows = out.loc[member_indices].copy()
         cluster_rows["cluster_id"] = int(cluster_id)
-        sort_cols = [col for col in ["dsr", "test_total_return", "test_avg_net_return", "test_trades"] if col in cluster_rows.columns]
+        sort_cols = [
+            col
+            for col in ["dsr", "test_total_return", "test_avg_net_return", "test_trades"]
+            if col in cluster_rows.columns
+        ]
         cluster_rows = cluster_rows.sort_values(sort_cols, ascending=[False] * len(sort_cols))
         representatives.append(cluster_rows.iloc[0])
-    sort_cols = [col for col in ["dsr", "test_total_return", "test_avg_net_return", "test_trades"] if col in representatives[0].index]
-    return pd.DataFrame(representatives).sort_values(sort_cols, ascending=[False] * len(sort_cols)).reset_index(drop=True)
+    sort_cols = [
+        col
+        for col in ["dsr", "test_total_return", "test_avg_net_return", "test_trades"]
+        if col in representatives[0].index
+    ]
+    return (
+        pd.DataFrame(representatives)
+        .sort_values(sort_cols, ascending=[False] * len(sort_cols))
+        .reset_index(drop=True)
+    )
 
 
 def rank_features_by_direction(
@@ -910,18 +1029,30 @@ def _rank_features(
 ) -> list[str]:
     if ranking_method == "spearman":
         return rank_features_by_direction(
-            train, all_features, horizon, direction,
-            max_features=max_features, sample_rows=rank_sample_rows,
+            train,
+            all_features,
+            horizon,
+            direction,
+            max_features=max_features,
+            sample_rows=rank_sample_rows,
         )
     from src.feature_ranking import rank_features_blended, rank_features_by_importance
 
     target_column = f"future_return_{horizon}_bars"
     if ranking_method == "importance":
         return rank_features_by_importance(
-            train, all_features, target_column, max_features, direction=direction,
+            train,
+            all_features,
+            target_column,
+            max_features,
+            direction=direction,
         )
     return rank_features_blended(
-        train, all_features, target_column, max_features, direction=direction,
+        train,
+        all_features,
+        target_column,
+        max_features,
+        direction=direction,
     )
 
 
@@ -936,15 +1067,25 @@ def build_feature_conditions(train: pd.DataFrame, feature: str) -> list[Conditio
             continue
         if q < 0.5:
             conditions.append(
-                Condition(feature, "value_le", threshold,
-                          f"{feature} <= train q{int(q * 100)} ({threshold:.6g})",
-                          threshold_source="quantile", quantile=float(q))
+                Condition(
+                    feature,
+                    "value_le",
+                    threshold,
+                    f"{feature} <= train q{int(q * 100)} ({threshold:.6g})",
+                    threshold_source="quantile",
+                    quantile=float(q),
+                )
             )
         else:
             conditions.append(
-                Condition(feature, "value_ge", threshold,
-                          f"{feature} >= train q{int(q * 100)} ({threshold:.6g})",
-                          threshold_source="quantile", quantile=float(q))
+                Condition(
+                    feature,
+                    "value_ge",
+                    threshold,
+                    f"{feature} >= train q{int(q * 100)} ({threshold:.6g})",
+                    threshold_source="quantile",
+                    quantile=float(q),
+                )
             )
     delta = train[feature].diff()
     delta_clean = delta.replace([np.inf, -np.inf], np.nan).dropna()
@@ -955,15 +1096,25 @@ def build_feature_conditions(train: pd.DataFrame, feature: str) -> list[Conditio
                 continue
             if q < 0.5:
                 conditions.append(
-                    Condition(feature, "delta_le", threshold,
-                              f"{feature} falling fast: 1-bar change <= train q10 ({threshold:.6g})",
-                              threshold_source="delta_quantile", quantile=float(q))
+                    Condition(
+                        feature,
+                        "delta_le",
+                        threshold,
+                        f"{feature} falling fast: 1-bar change <= train q10 ({threshold:.6g})",
+                        threshold_source="delta_quantile",
+                        quantile=float(q),
+                    )
                 )
             else:
                 conditions.append(
-                    Condition(feature, "delta_ge", threshold,
-                              f"{feature} rising fast: 1-bar change >= train q90 ({threshold:.6g})",
-                              threshold_source="delta_quantile", quantile=float(q))
+                    Condition(
+                        feature,
+                        "delta_ge",
+                        threshold,
+                        f"{feature} rising fast: 1-bar change >= train q90 ({threshold:.6g})",
+                        threshold_source="delta_quantile",
+                        quantile=float(q),
+                    )
                 )
     return conditions
 
@@ -975,12 +1126,11 @@ def _build_conditions_for_features(
     cross_feature_pairs: Sequence[tuple[str, str]] | None,
 ) -> list[Condition]:
     if enabled_kinds == {"value", "delta"}:
-        return [
-            c for feature in ranked_features
-            for c in build_feature_conditions(train, feature)
-        ]
+        return [c for feature in ranked_features for c in build_feature_conditions(train, feature)]
     return build_all_conditions(
-        train, ranked_features, enabled_kinds=enabled_kinds,
+        train,
+        ranked_features,
+        enabled_kinds=enabled_kinds,
         cross_feature_pairs=cross_feature_pairs,
     )
 
@@ -1014,7 +1164,7 @@ def _generate_pairs_flat(
 ) -> list[tuple[int, int]]:
     pairs = []
     for left_pos, left_idx in enumerate(selected_indices):
-        for right_idx in selected_indices[left_pos + 1:]:
+        for right_idx in selected_indices[left_pos + 1 :]:
             if conditions[left_idx].feature == conditions[right_idx].feature:
                 continue
             pairs.append((left_idx, right_idx))
@@ -1034,9 +1184,7 @@ def _generate_pairs_pool(
         pools[tf].append(idx)
     tf_keys = sorted(pools.keys())
     tf_combos = [
-        (tf_keys[i], tf_keys[j])
-        for i in range(len(tf_keys))
-        for j in range(i + 1, len(tf_keys))
+        (tf_keys[i], tf_keys[j]) for i in range(len(tf_keys)) for j in range(i + 1, len(tf_keys))
     ]
     if not tf_combos:
         return _generate_pairs_flat(conditions, selected_indices, max_pairs)
@@ -1081,17 +1229,28 @@ def make_candidates(
         all_features = [column for column in all_features if compiled.search(column)]
         if not all_features:
             raise ValueError(f"feature_pattern {feature_pattern!r} matches no feature columns")
-        LOGGER.info("Feature pattern %r restricts the universe to %s columns", feature_pattern, len(all_features))
+        LOGGER.info(
+            "Feature pattern %r restricts the universe to %s columns",
+            feature_pattern,
+            len(all_features),
+        )
     candidates: list[StrategyCandidate] = []
     for horizon in horizons:
         for direction in directions:
             LOGGER.info(
                 "Ranking features for direction=%s horizon=%s method=%s",
-                direction, horizon, ranking_method,
+                direction,
+                horizon,
+                ranking_method,
             )
             ranked = _rank_features(
-                train, all_features, horizon, direction,
-                max_features, ranking_method, rank_sample_rows,
+                train,
+                all_features,
+                horizon,
+                direction,
+                max_features,
+                ranking_method,
+                rank_sample_rows,
             )
             cross_pairs = (
                 detect_cross_feature_pairs(ranked)
@@ -1099,21 +1258,28 @@ def make_candidates(
                 else None
             )
             conditions = _build_conditions_for_features(
-                train, ranked, enabled_kinds, cross_pairs,
+                train,
+                ranked,
+                enabled_kinds,
+                cross_pairs,
             )
             selected = _score_and_select_conditions(
-                train, conditions, horizon, direction, top_conditions,
+                train,
+                conditions,
+                horizon,
+                direction,
+                top_conditions,
             )
             LOGGER.info(
                 "Selected %s base conditions for direction=%s horizon=%s",
-                len(selected), direction, horizon,
+                len(selected),
+                direction,
+                horizon,
             )
 
             if 1 in condition_depths:
                 for idx in selected:
-                    candidates.append(
-                        StrategyCandidate(direction, horizon, (conditions[idx],))
-                    )
+                    candidates.append(StrategyCandidate(direction, horizon, (conditions[idx],)))
 
             if 2 in condition_depths or 3 in condition_depths:
                 if cross_tf_mode == "pool":
@@ -1125,7 +1291,8 @@ def make_candidates(
                     for l_idx, r_idx in pairs:
                         candidates.append(
                             StrategyCandidate(
-                                direction, horizon,
+                                direction,
+                                horizon,
                                 (conditions[l_idx], conditions[r_idx]),
                             )
                         )
@@ -1146,7 +1313,8 @@ def make_candidates(
                             seen.add(triple)
                             candidates.append(
                                 StrategyCandidate(
-                                    direction, horizon,
+                                    direction,
+                                    horizon,
                                     tuple(conditions[i] for i in triple),
                                 )
                             )
@@ -1181,11 +1349,11 @@ def add_year_metrics(
         return pd.DataFrame()
     rows = []
     for rank, (_, strategy) in enumerate(strategies.head(top_n).iterrows(), start=1):
-        conditions = tuple(
-            Condition(**c) for c in json.loads(strategy["conditions_json"])
-        )
+        conditions = tuple(Condition(**c) for c in json.loads(strategy["conditions_json"]))
         candidate = StrategyCandidate(
-            strategy["direction"], int(strategy["horizon_bars"]), conditions,
+            strategy["direction"],
+            int(strategy["horizon_bars"]),
+            conditions,
         )
         config = DayTradeConfig(
             take_profit=strategy["take_profit"],
@@ -1202,23 +1370,29 @@ def add_year_metrics(
         )
         mask = combined_mask(data, candidate.conditions)
         trades = simulate_day_trades(
-            data, mask, candidate.direction, config, base_prefix,
+            data,
+            mask,
+            candidate.direction,
+            config,
+            base_prefix,
         )
         if trades.empty:
             continue
         entry_times = pd.to_datetime(trades["entry_time"])
         for year, group in trades.groupby(entry_times.dt.year):
             m = day_trade_metrics(group)
-            rows.append({
-                "strategy_rank": rank,
-                "year": year,
-                "direction": candidate.direction,
-                "horizon_bars": config.horizon_bars,
-                "take_profit": config.take_profit,
-                "stop_loss": config.stop_loss,
-                **m,
-                "rule": candidate.rule,
-            })
+            rows.append(
+                {
+                    "strategy_rank": rank,
+                    "year": year,
+                    "direction": candidate.direction,
+                    "horizon_bars": config.horizon_bars,
+                    "take_profit": config.take_profit,
+                    "stop_loss": config.stop_loss,
+                    **m,
+                    "rule": candidate.rule,
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -1286,8 +1460,12 @@ _WF_ZEROED_COLUMNS = {
     f"{split}_{metric}": 0.0
     for split in ("train", "test")
     for metric in (
-        "trades", "total_return", "win_rate", "avg_net_return",
-        "profit_factor", "max_drawdown",
+        "trades",
+        "total_return",
+        "win_rate",
+        "avg_net_return",
+        "profit_factor",
+        "max_drawdown",
     )
 }
 
@@ -1302,20 +1480,22 @@ _SCREENED_OUT_STATS = {
 
 
 def _conditions_payload_day(candidate: StrategyCandidate) -> str:
-    return json.dumps([
-        {
-            "feature": c.feature,
-            "kind": c.kind,
-            "threshold": c.threshold,
-            "description": c.description,
-            **({"feature_b": c.feature_b} if c.feature_b else {}),
-            **({"threshold_source": c.threshold_source} if c.threshold_source else {}),
-            **({"quantile": c.quantile} if c.quantile is not None else {}),
-            **({"lookback": c.lookback} if c.lookback is not None else {}),
-            **({"cross_feature": c.cross_feature} if c.cross_feature else {}),
-        }
-        for c in candidate.conditions
-    ])
+    return json.dumps(
+        [
+            {
+                "feature": c.feature,
+                "kind": c.kind,
+                "threshold": c.threshold,
+                "description": c.description,
+                **({"feature_b": c.feature_b} if c.feature_b else {}),
+                **({"threshold_source": c.threshold_source} if c.threshold_source else {}),
+                **({"quantile": c.quantile} if c.quantile is not None else {}),
+                **({"lookback": c.lookback} if c.lookback is not None else {}),
+                **({"cross_feature": c.cross_feature} if c.cross_feature else {}),
+            }
+            for c in candidate.conditions
+        ]
+    )
 
 
 def _score_candidate_walk_forward_day(
@@ -1352,10 +1532,16 @@ def _score_candidate_walk_forward_day(
                 if label_column in train_frame.columns:
                     feature_columns = numeric_feature_columns(train_frame, engine.base_prefix)
                     screened = get_screened_features_cached(
-                        train_frame, label_column,
-                        candidate.direction, candidate.horizon_bars,
-                        take_profit, stop_loss,
-                        feature_columns, max_features, screen_cache, method="shap",
+                        train_frame,
+                        label_column,
+                        candidate.direction,
+                        candidate.horizon_bars,
+                        take_profit,
+                        stop_loss,
+                        feature_columns,
+                        max_features,
+                        screen_cache,
+                        method="shap",
                     )
                     if any(c.feature not in screened for c in candidate.conditions):
                         per_scenario_stats[scenario_index].append(dict(_SCREENED_OUT_STATS))
@@ -1374,14 +1560,23 @@ def _score_candidate_walk_forward_day(
                 use_atr_tp_sl=use_atr_tp_sl,
             )
             trades = simulate_day_trades(
-                test_frame, signal, candidate.direction, config, engine.base_prefix, arrays,
+                test_frame,
+                signal,
+                candidate.direction,
+                config,
+                engine.base_prefix,
+                arrays,
             )
             metrics = day_trade_metrics(trades)
             per_scenario_stats[scenario_index].append(
                 {
                     "test_total_return": metrics["total_return"],
-                    "test_avg_net_return": metrics["avg_net_return"] if metrics["trades"] > 0 else 0.0,
-                    "test_profit_factor": metrics["profit_factor"] if np.isfinite(metrics["profit_factor"]) else 0.0,
+                    "test_avg_net_return": metrics["avg_net_return"]
+                    if metrics["trades"] > 0
+                    else 0.0,
+                    "test_profit_factor": metrics["profit_factor"]
+                    if np.isfinite(metrics["profit_factor"])
+                    else 0.0,
                     "test_max_drawdown": metrics["max_drawdown"],
                     "test_trades": metrics["trades"],
                     "screened_out": False,
@@ -1411,7 +1606,9 @@ def _score_candidate_walk_forward_day(
             {
                 "wf_returns_sharpe": sharpe_ratio(window_returns),
                 "wf_returns_skew": float(returns_series.skew()) if len(window_returns) > 2 else 0.0,
-                "wf_returns_kurt": float(returns_series.kurt() + 3.0) if len(window_returns) > 3 else 3.0,
+                "wf_returns_kurt": float(returns_series.kurt() + 3.0)
+                if len(window_returns) > 3
+                else 3.0,
                 "test_sharpe_ci_low": ci_low,
                 "test_sharpe_ci_high": ci_high,
                 "wf_window_returns_json": json.dumps([round(float(r), 8) for r in window_returns]),
@@ -1441,7 +1638,12 @@ def _evaluate_holdout_day(
     from src.walk_forward import _compute_threshold
 
     out = strategies.copy()
-    for column in ("holdout_trades", "holdout_total_return", "holdout_win_rate", "holdout_avg_net_return"):
+    for column in (
+        "holdout_trades",
+        "holdout_total_return",
+        "holdout_win_rate",
+        "holdout_avg_net_return",
+    ):
         out[column] = np.nan
     if out.empty or holdout.empty:
         return out
@@ -1483,7 +1685,10 @@ _DT_WORKER: dict[str, object] = {}
 def _dt_worker_init(payload: dict[str, object]) -> None:
     base_prefix = f"tf_{payload['base_timeframe']}_"
     data = load_dataset(
-        Path(payload["input_path"]), payload["horizons"], base_prefix, payload["base_timeframe"],
+        Path(payload["input_path"]),
+        payload["horizons"],
+        base_prefix,
+        payload["base_timeframe"],
         columns=payload.get("columns"),
     )
     _DT_WORKER.update(payload)
@@ -1501,7 +1706,9 @@ def _dt_score_chunk(indices: Sequence[int]) -> list[dict[str, object]]:
     for index in indices:
         candidate = candidates[index]
         candidate_rows = _score_candidate_walk_forward_day(
-            _DT_WORKER["engine"], candidate, scenarios,
+            _DT_WORKER["engine"],
+            candidate,
+            scenarios,
             fee_bps=_DT_WORKER["fee_bps"],
             slippage_bps=_DT_WORKER["slippage_bps"],
             risk_per_trade=_DT_WORKER["risk_per_trade"],
@@ -1555,19 +1762,40 @@ def write_report(
     else:
         if walk_forward:
             columns = [
-                "direction", "horizon_bars", "take_profit", "stop_loss",
-                "timeframes", "wf_pass_rate", "wf_expectancy",
-                "wf_profit_factor_median", "wf_max_drawdown_worst",
-                "wf_avg_trades", "wf_total_windows",
-                "wf_scored_windows", "wf_screened_out_windows", "dsr", "rule",
+                "direction",
+                "horizon_bars",
+                "take_profit",
+                "stop_loss",
+                "timeframes",
+                "wf_pass_rate",
+                "wf_expectancy",
+                "wf_profit_factor_median",
+                "wf_max_drawdown_worst",
+                "wf_avg_trades",
+                "wf_total_windows",
+                "wf_scored_windows",
+                "wf_screened_out_windows",
+                "dsr",
+                "rule",
             ]
         else:
             columns = [
-                "direction", "horizon_bars", "take_profit", "stop_loss",
-                "timeframes", "train_trades", "train_total_return",
-                "test_trades", "test_total_return", "test_win_rate",
-                "test_avg_net_return", "test_max_drawdown",
-                "test_avg_trades_per_day", "test_sharpe_ratio", "dsr", "rule",
+                "direction",
+                "horizon_bars",
+                "take_profit",
+                "stop_loss",
+                "timeframes",
+                "train_trades",
+                "train_total_return",
+                "test_trades",
+                "test_total_return",
+                "test_win_rate",
+                "test_avg_net_return",
+                "test_max_drawdown",
+                "test_avg_trades_per_day",
+                "test_sharpe_ratio",
+                "dsr",
+                "rule",
             ]
         available = [c for c in columns if c in strategies.columns]
         lines.append("```text")
@@ -1580,20 +1808,40 @@ def write_report(
     else:
         if walk_forward:
             columns = [
-                "direction", "horizon_bars", "take_profit", "stop_loss",
-                "timeframes", "wf_pass_rate", "wf_expectancy",
-                "wf_profit_factor_median", "wf_max_drawdown_worst",
-                "wf_avg_trades", "wf_total_windows",
-                "wf_scored_windows", "wf_screened_out_windows",
-                "dsr", "passes_filters", "rule",
+                "direction",
+                "horizon_bars",
+                "take_profit",
+                "stop_loss",
+                "timeframes",
+                "wf_pass_rate",
+                "wf_expectancy",
+                "wf_profit_factor_median",
+                "wf_max_drawdown_worst",
+                "wf_avg_trades",
+                "wf_total_windows",
+                "wf_scored_windows",
+                "wf_screened_out_windows",
+                "dsr",
+                "passes_filters",
+                "rule",
             ]
         else:
             columns = [
-                "direction", "horizon_bars", "take_profit", "stop_loss",
-                "timeframes", "train_trades", "train_total_return",
-                "test_trades", "test_total_return", "test_win_rate",
-                "test_avg_net_return", "test_max_drawdown",
-                "dsr", "passes_filters", "rule",
+                "direction",
+                "horizon_bars",
+                "take_profit",
+                "stop_loss",
+                "timeframes",
+                "train_trades",
+                "train_total_return",
+                "test_trades",
+                "test_total_return",
+                "test_win_rate",
+                "test_avg_net_return",
+                "test_max_drawdown",
+                "dsr",
+                "passes_filters",
+                "rule",
             ]
         available = [c for c in columns if c in diagnostics.columns]
         lines.append("```text")
@@ -1601,14 +1849,30 @@ def write_report(
         lines.append("```")
 
     if walk_forward:
-        lines.extend(["", "## Year Breakdown", "", "Walk-forward mode: year metrics disabled to avoid stale-threshold reporting."])
+        lines.extend(
+            [
+                "",
+                "## Year Breakdown",
+                "",
+                "Walk-forward mode: year metrics disabled to avoid stale-threshold reporting.",
+            ]
+        )
     elif not yearly.empty:
         lines.extend(["", "## Year Breakdown", "", "```text"])
         year_cols = [
-            "strategy_rank", "year", "direction", "horizon_bars",
-            "take_profit", "stop_loss", "trades", "total_return",
-            "win_rate", "avg_net_return", "max_drawdown",
-            "avg_trades_per_day", "sharpe_ratio",
+            "strategy_rank",
+            "year",
+            "direction",
+            "horizon_bars",
+            "take_profit",
+            "stop_loss",
+            "trades",
+            "total_return",
+            "win_rate",
+            "avg_net_return",
+            "max_drawdown",
+            "avg_trades_per_day",
+            "sharpe_ratio",
         ]
         available = [c for c in year_cols if c in yearly.columns]
         lines.append(yearly[available].to_string(index=False))
@@ -1666,7 +1930,9 @@ def run(
     base_prefix = f"tf_{base_timeframe}_"
     data = load_dataset(input_path, horizons, base_prefix, base_timeframe)
     if regime_conditional and "tf_1d_regime_id" not in data.columns:
-        LOGGER.warning("--regime-conditional requested but tf_1d_regime_id is missing; skipping regime breakdown")
+        LOGGER.warning(
+            "--regime-conditional requested but tf_1d_regime_id is missing; skipping regime breakdown"
+        )
         regime_conditional = False
     directions = ("long", "short")
     scenarios = list(itertools.product(take_profits, stop_losses))
@@ -1681,9 +1947,13 @@ def run(
     if not walk_forward:
         train, test = split_train_test(data, train_fraction)
         candidates = make_candidates(
-            train, horizons, directions=directions,
-            max_features=max_features, top_conditions=top_conditions,
-            max_pairs=max_pairs, max_triples=max_triples,
+            train,
+            horizons,
+            directions=directions,
+            max_features=max_features,
+            top_conditions=top_conditions,
+            max_pairs=max_pairs,
+            max_triples=max_triples,
             rank_sample_rows=rank_sample_rows,
             condition_depths=condition_depths,
             ranking_method=ranking_method,
@@ -1694,7 +1964,8 @@ def run(
         )
         LOGGER.info(
             "Scoring %s strategy candidates across %s TP/SL scenarios",
-            len(candidates), len(scenarios),
+            len(candidates),
+            len(scenarios),
         )
         LOGGER.info("Pre-computing OHLC arrays for train/test splits...")
         train_arrays = PrecomputedArrays.from_dataframe(train, base_prefix)
@@ -1720,9 +1991,15 @@ def run(
                     use_atr_tp_sl=use_atr_tp_sl,
                 )
                 row = score_candidate(
-                    train, test, candidate, config, base_prefix,
-                    train_mask=train_mask, test_mask=test_mask,
-                    train_arrays=train_arrays, test_arrays=test_arrays,
+                    train,
+                    test,
+                    candidate,
+                    config,
+                    base_prefix,
+                    train_mask=train_mask,
+                    test_mask=test_mask,
+                    train_arrays=train_arrays,
+                    test_arrays=test_arrays,
                 )
                 if regime_conditional:
                     row["regime_breakdown_json"] = json.dumps(
@@ -1752,7 +2029,9 @@ def run(
             pass_rate=wf_pass_rate,
             embargo_bars=wf_embargo_bars if wf_embargo_bars is not None else max(horizons),
         )
-        core_rows = len(data) - int(len(data) * holdout_fraction) if holdout_fraction > 0 else len(data)
+        core_rows = (
+            len(data) - int(len(data) * holdout_fraction) if holdout_fraction > 0 else len(data)
+        )
         core = data.iloc[:core_rows]
         holdout = data.iloc[core_rows:]
         windows = generate_windows(len(core), wf_cfg)
@@ -1760,9 +2039,13 @@ def run(
         # window (nor the holdout) influences candidate selection.
         first_train = core.iloc[windows[0][0]].copy()
         candidates = make_candidates(
-            first_train, horizons, directions=directions,
-            max_features=max_features, top_conditions=top_conditions,
-            max_pairs=max_pairs, max_triples=max_triples,
+            first_train,
+            horizons,
+            directions=directions,
+            max_features=max_features,
+            top_conditions=top_conditions,
+            max_pairs=max_pairs,
+            max_triples=max_triples,
             rank_sample_rows=rank_sample_rows,
             condition_depths=condition_depths,
             ranking_method=ranking_method,
@@ -1773,7 +2056,10 @@ def run(
         )
         LOGGER.info(
             "Walk-forward: %s windows over %s core rows, %s holdout rows reserved, %s candidates",
-            len(windows), len(core), len(holdout), len(candidates),
+            len(windows),
+            len(core),
+            len(holdout),
+            len(candidates),
         )
         # Prune to the columns scoring actually touches. The 5m training table
         # is ~3k columns (~16 GB as float64); loading it whole in every worker
@@ -1789,13 +2075,12 @@ def run(
         else:
             base_columns = {
                 "timestamp",
-                f"{base_prefix}open", f"{base_prefix}high",
-                f"{base_prefix}low", f"{base_prefix}close",
+                f"{base_prefix}open",
+                f"{base_prefix}high",
+                f"{base_prefix}low",
+                f"{base_prefix}close",
             }
-            atr_columns = {
-                c for c in data.columns
-                if c.endswith("_atr") or c.endswith("_atr_14")
-            }
+            atr_columns = {c for c in data.columns if c.endswith("_atr") or c.endswith("_atr_14")}
             worker_columns = sorted(
                 (candidate_feature_columns(candidates) & set(data.columns)) | atr_columns
             )
@@ -1850,14 +2135,18 @@ def run(
                 meta_path.unlink()
         meta_path.write_text(
             json.dumps(
-                {"config_hash": config_hash, "n_candidates": len(candidates), "n_scenarios": len(scenarios)},
+                {
+                    "config_hash": config_hash,
+                    "n_candidates": len(candidates),
+                    "n_scenarios": len(scenarios),
+                },
                 indent=2,
             ),
             encoding="utf-8",
         )
         pending = [index for index in range(len(candidates)) if index not in done]
         chunks = [
-            pending[start: start + checkpoint_every]
+            pending[start : start + checkpoint_every]
             for start in range(0, len(pending), checkpoint_every)
         ]
         worker_payload = {
@@ -1893,7 +2182,9 @@ def run(
             from concurrent.futures import ProcessPoolExecutor, as_completed
 
             with ProcessPoolExecutor(
-                max_workers=n_jobs, initializer=_dt_worker_init, initargs=(worker_payload,),
+                max_workers=n_jobs,
+                initializer=_dt_worker_init,
+                initargs=(worker_payload,),
             ) as pool:
                 futures = [pool.submit(_dt_score_chunk, chunk) for chunk in chunks]
                 for future in as_completed(futures):
@@ -1931,23 +2222,18 @@ def run(
     if not diagnostics.empty:
         if walk_forward:
             diagnostics["passes_trade_count"] = diagnostics["wf_avg_trades"] >= min_test_trades
-            diagnostics["passes_profitability"] = (
-                (diagnostics["wf_pass_rate"] >= wf_pass_rate)
-                & (diagnostics["wf_expectancy"] > 0)
+            diagnostics["passes_profitability"] = (diagnostics["wf_pass_rate"] >= wf_pass_rate) & (
+                diagnostics["wf_expectancy"] > 0
             )
         else:
             diagnostics["passes_trade_count"] = (
-                (diagnostics["train_trades"] >= min_train_trades)
-                & (diagnostics["test_trades"] >= min_test_trades)
-            )
-            diagnostics["passes_profitability"] = (
-                (diagnostics["train_total_return"] > 0)
-                & (diagnostics["test_total_return"] > 0)
+                diagnostics["train_trades"] >= min_train_trades
+            ) & (diagnostics["test_trades"] >= min_test_trades)
+            diagnostics["passes_profitability"] = (diagnostics["train_total_return"] > 0) & (
+                diagnostics["test_total_return"] > 0
             )
         diagnostics["passes_multitimeframe"] = (
-            diagnostics["timeframe_count"] >= 2
-            if require_multitimeframe
-            else True
+            diagnostics["timeframe_count"] >= 2 if require_multitimeframe else True
         )
         diagnostics["passes_dsr"] = diagnostics["dsr"] >= dsr_threshold
         diagnostics["passes_filters"] = (
@@ -1960,8 +2246,12 @@ def run(
             diagnostics["passes_filters"] = diagnostics["passes_filters"] & diagnostics["wf_passes"]
         if walk_forward:
             sort_cols = [
-                "dsr", "wf_pass_rate", "wf_expectancy", "wf_profit_factor_median",
-                "wf_max_drawdown_worst", "wf_avg_trades",
+                "dsr",
+                "wf_pass_rate",
+                "wf_expectancy",
+                "wf_profit_factor_median",
+                "wf_max_drawdown_worst",
+                "wf_avg_trades",
             ]
             sort_asc = [False, False, False, False, False, False]
         else:
@@ -1976,13 +2266,25 @@ def run(
     if walk_forward and not holdout.empty and not strategies.empty:
         refit_frame = core.iloc[windows[-1][0]]
         strategies = _evaluate_holdout_day(
-            holdout, refit_frame, strategies, base_prefix,
-            fee_bps, slippage_bps, risk_per_trade, max_position_fraction, daily_stop_loss,
-            max_consecutive_losses, cooldown_bars, use_atr_tp_sl,
+            holdout,
+            refit_frame,
+            strategies,
+            base_prefix,
+            fee_bps,
+            slippage_bps,
+            risk_per_trade,
+            max_position_fraction,
+            daily_stop_loss,
+            max_consecutive_losses,
+            cooldown_bars,
+            use_atr_tp_sl,
         )
 
     rejection_summary = summarize_filter_rejections(
-        diagnostics, min_train_trades, min_test_trades, require_multitimeframe,
+        diagnostics,
+        min_train_trades,
+        min_test_trades,
+        require_multitimeframe,
         walk_forward=walk_forward,
     )
 
@@ -2003,7 +2305,11 @@ def run(
         yearly = pd.DataFrame()
     else:
         yearly = add_year_metrics(
-            data, strategies, config_template, base_prefix, top_n=10,
+            data,
+            strategies,
+            config_template,
+            base_prefix,
+            top_n=10,
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2071,14 +2377,17 @@ def run(
         "report": report,
     }
     (output_dir / "config.json").write_text(
-        json.dumps(config_dict, indent=2, sort_keys=True), encoding="utf-8",
+        json.dumps(config_dict, indent=2, sort_keys=True),
+        encoding="utf-8",
     )
     heavy_columns = ["wf_window_returns_json"]
     diagnostics.drop(columns=heavy_columns, errors="ignore").to_csv(
-        output_dir / "scored_strategies_all.csv", index=False,
+        output_dir / "scored_strategies_all.csv",
+        index=False,
     )
     (output_dir / "filter_summary.json").write_text(
-        json.dumps(rejection_summary, indent=2, sort_keys=True), encoding="utf-8",
+        json.dumps(rejection_summary, indent=2, sort_keys=True),
+        encoding="utf-8",
     )
     strategies = strategies.drop(columns=heavy_columns, errors="ignore")
     strategies.to_csv(output_dir / "ranked_strategies.csv", index=False)
@@ -2086,8 +2395,13 @@ def run(
     clustered.to_csv(output_dir / "ranked_strategies_clustered.csv", index=False)
     yearly.to_csv(output_dir / "ranked_strategies_by_year.csv", index=False)
     write_report(
-        strategies, yearly, diagnostics, rejection_summary,
-        output_dir / "report.md", base_timeframe, walk_forward=walk_forward,
+        strategies,
+        yearly,
+        diagnostics,
+        rejection_summary,
+        output_dir / "report.md",
+        base_timeframe,
+        walk_forward=walk_forward,
     )
     if checkpoint_path.exists():
         checkpoint_path.unlink()
@@ -2101,7 +2415,8 @@ def parse_args() -> argparse.Namespace:
         description="Search for day trading strategies with risk management."
     )
     parser.add_argument(
-        "--input-path", type=Path,
+        "--input-path",
+        type=Path,
         default=PROCESSED_DATA_DIR / "train_5m_indicators.parquet",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -2114,7 +2429,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-triples", type=int, default=2500)
     parser.add_argument("--rank-sample-rows", type=int, default=50_000)
     parser.add_argument(
-        "--condition-depth", action="append", type=int, choices=(1, 2, 3),
+        "--condition-depth",
+        action="append",
+        type=int,
+        choices=(1, 2, 3),
     )
     parser.add_argument("--min-train-trades", type=int, default=100)
     parser.add_argument("--min-test-trades", type=int, default=50)
@@ -2122,15 +2440,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slippage-bps", type=float, default=2.0)
     parser.add_argument("--take-profit", action="append", type=float)
     parser.add_argument("--stop-loss", action="append", type=float)
-    parser.add_argument("--use-atr-tp-sl", action="store_true", help="Use ATR-based dynamic stop loss and take profit.")
-    parser.add_argument("--require-multitimeframe", action="store_true", default=True)
-    parser.add_argument("--no-require-multitimeframe", dest="require_multitimeframe", action="store_false")
     parser.add_argument(
-        "--ranking-method", choices=("spearman", "importance", "blended"),
+        "--use-atr-tp-sl",
+        action="store_true",
+        help="Use ATR-based dynamic stop loss and take profit.",
+    )
+    parser.add_argument("--require-multitimeframe", action="store_true", default=True)
+    parser.add_argument(
+        "--no-require-multitimeframe", dest="require_multitimeframe", action="store_false"
+    )
+    parser.add_argument(
+        "--ranking-method",
+        choices=("spearman", "importance", "blended"),
         default="blended",
     )
     parser.add_argument(
-        "--cross-tf-mode", choices=("none", "pool"), default="pool",
+        "--cross-tf-mode",
+        choices=("none", "pool"),
+        default="pool",
     )
     parser.add_argument("--enabled-kinds", nargs="+", default=None)
     parser.add_argument("--risk-per-trade", type=float, default=0.003)
@@ -2151,25 +2478,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cluster-jaccard", type=float, default=0.8)
     parser.add_argument("--report", action="store_true")
     parser.add_argument(
-        "--holdout-fraction", type=float, default=0.2,
+        "--holdout-fraction",
+        type=float,
+        default=0.2,
         help="Final fraction of data excluded from walk-forward; scored report-only.",
     )
     parser.add_argument(
-        "--n-jobs", type=int, default=1,
+        "--n-jobs",
+        type=int,
+        default=1,
         help="Worker processes for walk-forward candidate scoring. 1 = sequential.",
     )
     parser.add_argument(
-        "--checkpoint-every", type=int, default=25,
+        "--checkpoint-every",
+        type=int,
+        default=25,
         help="Flush scored candidates to the checkpoint file every N candidates (walk-forward mode).",
     )
     parser.add_argument(
-        "--resume", action="store_true",
+        "--resume",
+        action="store_true",
         help="Resume a walk-forward run from an existing checkpoint in --output-dir.",
     )
     parser.add_argument(
-        "--feature-pattern", default=None,
+        "--feature-pattern",
+        default=None,
         help="Regex restricting the candidate feature universe (e.g. 'cvd_|taker_' "
-             "to mine only order-flow features).",
+        "to mine only order-flow features).",
     )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()

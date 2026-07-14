@@ -53,7 +53,11 @@ def test_rank_features_blended_with_direction():
     features = [c for c in df.columns if c != "target"]
 
     ranked = rank_features_blended(
-        df, features, "target", max_features=5, direction="short",
+        df,
+        features,
+        "target",
+        max_features=5,
+        direction="short",
     )
 
     assert len(ranked) == 5

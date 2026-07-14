@@ -54,7 +54,11 @@ def _find_source_hypothesis(proposal: dict[str, Any]) -> Hypothesis | None:
     source_id = str(proposal.get("source_candidate_id") or "")
     if not source_id:
         return None
-    scope = proposal.get("validation_scope") if isinstance(proposal.get("validation_scope"), dict) else {}
+    scope = (
+        proposal.get("validation_scope")
+        if isinstance(proposal.get("validation_scope"), dict)
+        else {}
+    )
     universe = _candidate_universe(scope)
     by_id = {hyp.id: hyp for hyp in universe}
     if source_id in by_id:
@@ -85,15 +89,29 @@ def _mutate_predicate(pred: Predicate, reason: str) -> Predicate:
     if reason == "insufficient_train_trades":
         if pred.op in {"ge", "gt"} and pred.reference is not None:
             if pred.feature == "volume_z_20":
-                return _with_note(dataclasses.replace(pred, reference=round(max(0.0, pred.reference - 0.25), 4)), suffix)
+                return _with_note(
+                    dataclasses.replace(pred, reference=round(max(0.0, pred.reference - 0.25), 4)),
+                    suffix,
+                )
             if pred.feature == "adx_14":
-                return _with_note(dataclasses.replace(pred, reference=round(max(10.0, pred.reference - 3.0), 4)), suffix)
+                return _with_note(
+                    dataclasses.replace(pred, reference=round(max(10.0, pred.reference - 3.0), 4)),
+                    suffix,
+                )
         if pred.op in {"le", "lt"} and pred.reference is not None and pred.feature == "rsi_14":
-            return _with_note(dataclasses.replace(pred, reference=round(min(85.0, pred.reference + 4.0), 4)), suffix)
+            return _with_note(
+                dataclasses.replace(pred, reference=round(min(85.0, pred.reference + 4.0), 4)),
+                suffix,
+            )
         if pred.op in {"ge", "gt"} and pred.reference is not None and pred.feature == "rsi_14":
-            return _with_note(dataclasses.replace(pred, reference=round(max(15.0, pred.reference - 4.0), 4)), suffix)
+            return _with_note(
+                dataclasses.replace(pred, reference=round(max(15.0, pred.reference - 4.0), 4)),
+                suffix,
+            )
         if pred.op in {"q_ge", "q_le"} and pred.window is not None:
-            return _with_note(dataclasses.replace(pred, window=max(30, round(pred.window * 0.75))), suffix)
+            return _with_note(
+                dataclasses.replace(pred, window=max(30, round(pred.window * 0.75))), suffix
+            )
         if pred.op == "between" and pred.low is not None and pred.high is not None:
             return _with_note(
                 dataclasses.replace(
@@ -108,16 +126,37 @@ def _mutate_predicate(pred: Predicate, reason: str) -> Predicate:
     if reason == "no_train_edge":
         if pred.op in {"ge", "gt"} and pred.reference is not None:
             if pred.feature == "volume_z_20":
-                return _with_note(dataclasses.replace(pred, reference=round(pred.reference + 0.25, 4)), suffix)
+                return _with_note(
+                    dataclasses.replace(pred, reference=round(pred.reference + 0.25, 4)), suffix
+                )
             if pred.feature == "adx_14":
-                return _with_note(dataclasses.replace(pred, reference=round(pred.reference + 3.0, 4)), suffix)
+                return _with_note(
+                    dataclasses.replace(pred, reference=round(pred.reference + 3.0, 4)), suffix
+                )
         if pred.op == "q_le" and pred.quantile is not None:
-            return _with_note(dataclasses.replace(pred, quantile=round(_clamp(pred.quantile - 0.05, 0.05, 0.95), 4)), suffix)
-        if pred.op == "q_ge" and pred.quantile is not None:
-            return _with_note(dataclasses.replace(pred, quantile=round(_clamp(pred.quantile + 0.05, 0.05, 0.95), 4)), suffix)
-        if pred.op == "between" and pred.low is not None and pred.high is not None and pred.high - pred.low > 8.0:
             return _with_note(
-                dataclasses.replace(pred, low=round(pred.low + 2.0, 4), high=round(pred.high - 2.0, 4)),
+                dataclasses.replace(
+                    pred, quantile=round(_clamp(pred.quantile - 0.05, 0.05, 0.95), 4)
+                ),
+                suffix,
+            )
+        if pred.op == "q_ge" and pred.quantile is not None:
+            return _with_note(
+                dataclasses.replace(
+                    pred, quantile=round(_clamp(pred.quantile + 0.05, 0.05, 0.95), 4)
+                ),
+                suffix,
+            )
+        if (
+            pred.op == "between"
+            and pred.low is not None
+            and pred.high is not None
+            and pred.high - pred.low > 8.0
+        ):
+            return _with_note(
+                dataclasses.replace(
+                    pred, low=round(pred.low + 2.0, 4), high=round(pred.high - 2.0, 4)
+                ),
                 suffix,
             )
         return pred
@@ -129,12 +168,16 @@ def _mutate_exit(exit_rule: ExitRule, reason: str) -> ExitRule:
     if reason == "no_train_edge":
         return dataclasses.replace(exit_rule, take_profit=round(exit_rule.take_profit * 1.1, 6))
     if reason == "insufficient_train_trades":
-        return dataclasses.replace(exit_rule, horizon_bars=max(1, round(exit_rule.horizon_bars * 1.15)))
+        return dataclasses.replace(
+            exit_rule, horizon_bars=max(1, round(exit_rule.horizon_bars * 1.15))
+        )
     return exit_rule
 
 
 def _mutation_id(source_id: str, reason: str, index: int) -> str:
-    reason_part = "".join(ch if ch.isalnum() else "_" for ch in reason.upper()).strip("_") or "UNKNOWN"
+    reason_part = (
+        "".join(ch if ch.isalnum() else "_" for ch in reason.upper()).strip("_") or "UNKNOWN"
+    )
     return f"MUT_{source_id}_{reason_part}_{index:03d}"
 
 
@@ -300,7 +343,9 @@ def run(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build non-executable mutation hypotheses for research validation.")
+    parser = argparse.ArgumentParser(
+        description="Build non-executable mutation hypotheses for research validation."
+    )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--max-total", type=int, default=None)

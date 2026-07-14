@@ -23,6 +23,29 @@ def test_load_control_missing_file_uses_safe_defaults(tmp_path):
     assert control["paused_products"] == []
 
 
+def test_default_control_path_reads_legacy_state_until_first_atomic_update(tmp_path, monkeypatch):
+    from src.autopilot import control as control_module
+
+    new_path = tmp_path / "operator-control" / "control.json"
+    legacy_path = tmp_path / "control.json"
+    legacy_path.write_text(
+        json.dumps({"paused": True, "reason": "legacy maintenance"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(control_module, "DEFAULT_CONTROL_FILE", new_path)
+    monkeypatch.setattr(control_module, "LEGACY_DEFAULT_CONTROL_FILE", legacy_path)
+
+    assert load_control(new_path)["reason"] == "legacy maintenance"
+
+    updated = update_control(new_path, "pause-jobs", reason="migrated update")
+
+    assert new_path.exists()
+    assert updated["paused"] is True
+    assert updated["pause_jobs"] is True
+    assert load_control(new_path)["reason"] == "migrated update"
+    assert json.loads(legacy_path.read_text(encoding="utf-8"))["reason"] == "legacy maintenance"
+
+
 def test_stale_runtime_auto_clear_cannot_erase_new_operator_panic(tmp_path):
     path = tmp_path / "control.json"
     audit = tmp_path / "control_audit.jsonl"
@@ -151,8 +174,14 @@ def test_load_control_non_object_fails_closed(tmp_path):
 @pytest.mark.parametrize(
     "payload,error",
     [
-        ({"paused_products": ["active_income", 123]}, "paused_products must contain only non-empty strings"),
-        ({"paused_jobs": {"name": "market_data_update"}}, "paused_jobs must be a string or list of strings"),
+        (
+            {"paused_products": ["active_income", 123]},
+            "paused_products must contain only non-empty strings",
+        ),
+        (
+            {"paused_jobs": {"name": "market_data_update"}},
+            "paused_jobs must be a string or list of strings",
+        ),
         ({"flatten_products": [" "]}, "flatten_products must contain only non-empty strings"),
     ],
 )
@@ -253,7 +282,9 @@ def test_control_status_with_config_reports_valid_selectors(capsys, tmp_path):
     config = tmp_path / "autopilot.json"
     write_config(config)
     path.write_text(
-        json.dumps({"paused_products": ["active_income"], "paused_jobs": ["market_data_update_futures"]}),
+        json.dumps(
+            {"paused_products": ["active_income"], "paused_jobs": ["market_data_update_futures"]}
+        ),
         encoding="utf-8",
     )
 
@@ -489,7 +520,9 @@ def test_control_cli_surfaces_recovery_when_repairing_invalid_control_shape(tmp_
     persisted = json.loads(path.read_text(encoding="utf-8"))
 
     assert printed["paused"] is True
-    assert "paused_products must contain only non-empty strings" in printed["recovered_control_error"]
+    assert (
+        "paused_products must contain only non-empty strings" in printed["recovered_control_error"]
+    )
     assert persisted == {
         "flatten_all": False,
         "flatten_products": [],

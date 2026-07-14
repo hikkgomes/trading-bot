@@ -426,6 +426,56 @@ def test_empty_incremental_response_cannot_claim_stale_history_is_complete(tmp_p
     assert len(pd.read_parquet(candle_path)) == 2
 
 
+def test_stale_manifest_cannot_hide_truncated_history_prefix(tmp_path, monkeypatch):
+    patch_data_paths(monkeypatch, tmp_path)
+    start = pd.Timestamp("2026-01-01T00:00:00Z")
+    candle_path = tmp_path / "futures" / "BTCUSDT" / "BTCUSDT_1m.parquet"
+    manifest_path = candle_path.parent / ".BTCUSDT_1m.history.json"
+    candle_path.parent.mkdir(parents=True)
+    complete = candle_frame(start, 6)
+    complete.iloc[2:].to_parquet(candle_path)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "prefix_checked_from": start.isoformat(),
+                "prefix_complete": True,
+                "first_timestamp": start.isoformat(),
+                "last_timestamp": complete.index.max().isoformat(),
+                "rows": len(complete),
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fetch_page(**kwargs):
+        calls.append(kwargs)
+        left = pd.to_datetime(kwargs["start_ms"], unit="ms", utc=True)
+        right = pd.to_datetime(kwargs["end_ms"], unit="ms", utc=True)
+        periods = int((right - left) / pd.Timedelta(minutes=1)) + 1
+        return candle_frame(left, periods)
+
+    result = hb.sync_requirement(
+        hb.HistoryRequirement(
+            market="futures",
+            timeframe="1m",
+            start=start,
+            required_features=frozenset(),
+            scenario_names=("prefix-repair",),
+            build_indicators=False,
+        ),
+        now="2026-01-01T00:06:00Z",
+        request_delay_seconds=0,
+        fetch_page=fetch_page,
+    )
+
+    repaired = pd.read_parquet(candle_path)
+    assert result["rows"] == 6
+    assert pd.to_datetime(repaired.index.min(), utc=True) == start
+    assert any(pd.to_datetime(call["start_ms"], unit="ms", utc=True) == start for call in calls)
+
+
 def test_run_history_bootstrap_writes_failure_report_with_resume_remediation(
     tmp_path,
     monkeypatch,

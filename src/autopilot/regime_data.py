@@ -21,7 +21,7 @@ def _command_value(command: list[str], flag: str) -> str | None:
     prefix = f"{flag}="
     for part in command:
         if part.startswith(prefix):
-            value = part[len(prefix):]
+            value = part[len(prefix) :]
             return value or None
     try:
         index = command.index(flag)

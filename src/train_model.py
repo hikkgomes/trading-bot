@@ -1,11 +1,11 @@
 import argparse
 import json
 import logging
-import os
 from pathlib import Path
 
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/trading-bot-matplotlib")
-os.environ.setdefault("XDG_CACHE_HOME", "/tmp/trading-bot-cache")
+from src.cache_env import configure_private_process_cache
+
+configure_private_process_cache()
 
 import lightgbm as lgb
 import matplotlib
@@ -52,9 +52,7 @@ def get_feature_matrix(
 
     excluded = {"timestamp"} | set(TARGET_COLUMNS)
     feature_columns = [
-        column
-        for column in data.select_dtypes(include="number").columns
-        if column not in excluded
+        column for column in data.select_dtypes(include="number").columns if column not in excluded
     ]
     if not feature_columns:
         raise ValueError("No numeric feature columns found")
@@ -132,7 +130,9 @@ def train_model(
             target_horizon_bars=target_horizon_bars,
         )
     except ValueError as exc:
-        raise ValueError("Not enough training rows to create a purged early-stopping slice") from exc
+        raise ValueError(
+            "Not enough training rows to create a purged early-stopping slice"
+        ) from exc
 
     common_params = {
         "n_estimators": 1000,
@@ -281,9 +281,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-path", type=Path, default=DEFAULT_INPUT_PATH)
     parser.add_argument("--metrics-dir", type=Path, default=DEFAULT_METRICS_DIR)
     parser.add_argument("--charts-dir", type=Path, default=DEFAULT_CHARTS_DIR)
-    parser.add_argument(
-        "--feature-reports-dir", type=Path, default=DEFAULT_FEATURE_REPORTS_DIR
-    )
+    parser.add_argument("--feature-reports-dir", type=Path, default=DEFAULT_FEATURE_REPORTS_DIR)
     parser.add_argument("--train-fraction", type=float, default=0.8)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()

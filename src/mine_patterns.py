@@ -149,10 +149,7 @@ def extract_rules(
                 "lift_up": up_rate / baseline_up_rate if baseline_up_rate else np.nan,
                 "avg_future_return": avg_return,
                 "used_features": sorted(
-                    {
-                        condition.split(" <= ")[0].split(" > ")[0]
-                        for condition in conditions
-                    }
+                    {condition.split(" <= ")[0].split(" > ")[0] for condition in conditions}
                 ),
             }
         )

@@ -71,8 +71,8 @@ def _synthetic_ohlcv(n: int, seed: int = 7, with_features: bool = True) -> pd.Da
     open_ = np.concatenate([[close[0]], close[:-1]])
     idx = pd.date_range("2020-01-01", periods=n, freq="15min", name="timestamp")
     df = pd.DataFrame(
-        {"open": open_, "high": high, "low": low, "close": close,
-         "volume": rng.uniform(1, 100, n)}, index=idx,
+        {"open": open_, "high": high, "low": low, "close": close, "volume": rng.uniform(1, 100, n)},
+        index=idx,
     )
     if with_features:
         # A few derived feature columns so ML strategies have something to fit
@@ -99,9 +99,12 @@ def _build_config(args, strategy) -> BacktestConfig:
     resolver = getattr(strategy, "resolved_default_config", None)
     cfg = resolver() if callable(resolver) else strategy.default_config()
     overrides = {
-        "fee_bps": args.fee_bps, "slippage_bps": args.slippage_bps,
-        "take_profit": args.tp, "stop_loss": args.sl,
-        "horizon_bars": args.horizon, "pnl_unit": args.pnl_unit,
+        "fee_bps": args.fee_bps,
+        "slippage_bps": args.slippage_bps,
+        "take_profit": args.tp,
+        "stop_loss": args.sl,
+        "horizon_bars": args.horizon,
+        "pnl_unit": args.pnl_unit,
     }
     for key, val in overrides.items():
         if val is not None:
@@ -110,14 +113,27 @@ def _build_config(args, strategy) -> BacktestConfig:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--list", action="store_true", help="List registered strategies and exit.")
     parser.add_argument("--strategy", help="Registered strategy name.")
     parser.add_argument("--input", help="Parquet/CSV with OHLCV (+ features).")
-    parser.add_argument("--synthetic", type=int, metavar="N", help="Use N bars of synthetic OHLCV instead of --input.")
-    parser.add_argument("--param", action="append", help="Strategy param override key=value (repeatable).")
-    parser.add_argument("--train-fraction", type=float, default=0.7, help="Train split for fittable strategies.")
-    parser.add_argument("--base-tf", default=None, help="Base timeframe for tf_{tf}_ column resolution.")
+    parser.add_argument(
+        "--synthetic",
+        type=int,
+        metavar="N",
+        help="Use N bars of synthetic OHLCV instead of --input.",
+    )
+    parser.add_argument(
+        "--param", action="append", help="Strategy param override key=value (repeatable)."
+    )
+    parser.add_argument(
+        "--train-fraction", type=float, default=0.7, help="Train split for fittable strategies."
+    )
+    parser.add_argument(
+        "--base-tf", default=None, help="Base timeframe for tf_{tf}_ column resolution."
+    )
     parser.add_argument("--fee-bps", type=float, default=None)
     parser.add_argument("--slippage-bps", type=float, default=None)
     parser.add_argument("--tp", type=float, default=None, help="Take-profit (fractional).")

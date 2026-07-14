@@ -1,9 +1,11 @@
 import csv
 import json
+import time
 from contextlib import contextmanager
 
 import pytest
 
+from research_exploration.dsr import DSR_METHOD
 from src.autopilot import candidate_activation as activation_module
 from src.autopilot.approvals import (
     ApprovalError,
@@ -18,8 +20,17 @@ from src.autopilot.candidate_activation import (
     activate_candidate,
     product_identity,
 )
-from src.autopilot.config import load_config
+from src.autopilot.candidate_evidence import (
+    CANDIDATE_PAPER_EXECUTION_SCHEMA,
+    CANDIDATE_PAPER_FORWARD_FILL_SOURCE,
+    CANDIDATE_PAPER_FORWARD_REASON,
+    candidate_paper_engine_digest,
+)
+from src.autopilot.config import canonical_product_config, load_config
+from src.autopilot.execution_identity import execution_engine_digest
 from src.autopilot.locking import acquire_runtime_lock
+from src.autopilot.promotion import PromotionThresholds, build_promotion_review
+from src.execution.config import ExchangeConfig
 
 
 def _strategy(strategy_id="candidate", *, take_profit=0.02):
@@ -50,7 +61,16 @@ def _strategy(strategy_id="candidate", *, take_profit=0.02):
             "max_trades_per_day": 4,
         },
         "fees": {"fee_bps": 5, "slippage_bps": 2},
-        "metrics": {"holdout_total_return": 0.03, "dsr_deflated": 0.72},
+        "metrics": {
+            "holdout_total_return": 0.03,
+            "dsr_deflated": 0.72,
+            "dsr_method": DSR_METHOD,
+            "n_trials": 20,
+            "sr_std_trials": 0.18,
+            "trial_sharpe_count": 12,
+            "trial_sharpe_observed_std": 0.16,
+            "trial_sharpe_conservative_floor": 0.10,
+        },
     }
 
 
@@ -74,12 +94,20 @@ def _write_forward_paper_evidence(files, candidate):
     path = files["candidate_dir"] / "active_income_paper_trades.csv"
     strategy = candidate["strategies"][0]
     fingerprint = strategy_fingerprint(strategy)
+    paper_engine_digest = candidate_paper_engine_digest()
     rows = [
         {
             "strategy_id": strategy["id"],
             "strategy_fingerprint": fingerprint,
             "artifact_digest": artifact_digest(candidate),
-            "exit_time": f"2026-01-{index + 1:02d}T00:00:00+00:00",
+            "candidate_paper_execution_schema": CANDIDATE_PAPER_EXECUTION_SCHEMA,
+            "candidate_paper_engine_digest": paper_engine_digest,
+            "candidate_paper_evidence_eligible": True,
+            "candidate_paper_evidence_reason": CANDIDATE_PAPER_FORWARD_REASON,
+            "candidate_paper_entry_fill_source": CANDIDATE_PAPER_FORWARD_FILL_SOURCE,
+            "candidate_paper_observed_at": (f"2026-01-{index + 1:02d}T00:00:00+00:00"),
+            "entry_time": f"2026-01-{index + 1:02d}T00:00:00+00:00",
+            "exit_time": f"2026-01-{index + 1:02d}T01:00:00+00:00",
             "net_return": 0.01,
             "sized_return": 0.001,
             "equity_after": 1000.0 + index + 1,
@@ -136,6 +164,7 @@ def _setup(tmp_path, *, paused=True, state=None):
                         "strategies_path": str(active),
                         "state_file": str(state_path),
                         "trade_log": str(tmp_path / "trades.csv"),
+                        "preflight_report": str(tmp_path / "preflight.json"),
                         "starting_equity": 1000.0,
                     }
                 ],
@@ -158,11 +187,72 @@ def _setup(tmp_path, *, paused=True, state=None):
     }
 
 
+def _write_production_preflight(files, artifact):
+    product = files["product"]
+    strategy = artifact["strategies"][0]
+    exchange = ExchangeConfig(
+        exchange="binanceusdm",
+        market_type="futures",
+        api_key="key",
+        testnet=False,
+    )
+    checks = [
+        {"name": name, "ok": True}
+        for name in (
+            "product_config",
+            "execution_engine_identity",
+            "strategy_artifact_exists",
+            "strategy_fingerprints",
+            "strategy_policy",
+            "exchange_environment",
+            "broker_constructed",
+            "exchange_read_connectivity",
+            "broker_position_mode_one_way",
+            "broker_native_protective_stops",
+            "broker_open_orders_empty",
+            "broker_position_flat",
+        )
+    ]
+    next(item for item in checks if item["name"] == "exchange_environment")["detail"] = {
+        "exchange": "binanceusdm",
+        "market_type": "futures",
+        "testnet": False,
+        "require_testnet": False,
+        "quote_asset": "USDT",
+        "account_fingerprint": exchange.account_fingerprint,
+        "max_notional_usd": 100.0,
+        "max_fill_slippage_bps": 100.0,
+        "max_futures_leverage": 1,
+        "futures_margin_mode": "isolated",
+    }
+    product.preflight_report.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-01-01T00:00:00+00:00",
+                "generated_ts": time.time(),
+                "ok": True,
+                "products": [
+                    {
+                        "ok": True,
+                        "product": canonical_product_config(product),
+                        "checks": checks,
+                        "execution_engine_digest": execution_engine_digest(),
+                        "artifact_fingerprints": [strategy_fingerprint(strategy)],
+                        "artifact_digest": artifact_digest(artifact),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_activation_atomically_replaces_active_but_does_not_approve(tmp_path):
     files = _setup(tmp_path)
     old_strategy = _strategy("old", take_profit=0.015)
     old_artifact = _artifact(old_strategy)
     files["active"].write_text(json.dumps(old_artifact), encoding="utf-8")
+    _write_production_preflight(files, old_artifact)
     ApprovalLedger(files["ledger"]).approve(
         old_strategy,
         artifact_path=files["active"],
@@ -178,6 +268,7 @@ def test_activation_atomically_replaces_active_but_does_not_approve(tmp_path):
     _write_forward_paper_evidence(files, candidate)
     # Even a stale historical approval for these exact candidate bytes must
     # not carry through activation; activation provenance changes the digest.
+    _write_production_preflight(files, candidate)
     ApprovalLedger(files["ledger"]).approve(
         candidate["strategies"][0],
         artifact_path=files["active"],
@@ -212,7 +303,17 @@ def test_activation_atomically_replaces_active_but_does_not_approve(tmp_path):
     assert all(event["approval_granted"] is False for event in events)
     assert events[1]["activated_artifact_digest"] == report["artifact_digest"]
     assert events[1]["candidate_artifact_digest"] == report["candidate_artifact_digest"]
-    with pytest.raises(ApprovalError, match="artifact content mismatch"):
+    post_activation_review = build_promotion_review(
+        artifact_path=files["active"],
+        trade_log=files["candidate_dir"] / "active_income_paper_trades.csv",
+        ledger_path=files["ledger"],
+        thresholds=PromotionThresholds(),
+        product=files["product"],
+        config_path=files["config"],
+    )
+    assert post_activation_review["candidate_paper_execution_binding"]["required"] is True
+    assert post_activation_review["strategies"][0]["paper"]["trades"] == 20
+    with pytest.raises(ApprovalError, match="artifact (?:content|digest)"):
         assert_artifact_live_approved(
             files["active"],
             files["ledger"],
@@ -361,6 +462,37 @@ def test_activation_requires_exact_fingerprint_forward_paper_evidence(tmp_path):
     files = _setup(tmp_path)
     candidate = _artifact(_strategy(), identity=product_identity(files["product"]))
     files["candidate"].write_text(json.dumps(candidate), encoding="utf-8")
+
+    with pytest.raises(CandidateActivationError, match="forward-paper evidence is not ready"):
+        activate_candidate(
+            config_path=files["config"],
+            product_name="active_income",
+            confirm=True,
+            expected_candidate_digest=artifact_digest(candidate),
+            candidate_dir=files["candidate_dir"],
+        )
+
+    assert not files["active"].exists()
+    assert not files["audit"].exists()
+
+
+def test_activation_rejects_legacy_forward_paper_rows_without_execution_binding(
+    tmp_path,
+):
+    files = _setup(tmp_path)
+    candidate = _artifact(_strategy(), identity=product_identity(files["product"]))
+    files["candidate"].write_text(json.dumps(candidate), encoding="utf-8")
+    _write_forward_paper_evidence(files, candidate)
+    trade_log = files["candidate_dir"] / "active_income_paper_trades.csv"
+    with trade_log.open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    for row in rows:
+        row.pop("candidate_paper_execution_schema", None)
+        row.pop("candidate_paper_engine_digest", None)
+    with trade_log.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
 
     with pytest.raises(CandidateActivationError, match="forward-paper evidence is not ready"):
         activate_candidate(

@@ -8,18 +8,20 @@ from build_binance_indicator_dataset import FLOW_WINDOWS, build_flow_features
 def make_candles(n=200, buy_fraction=0.5, seed=1):
     rng = np.random.default_rng(seed)
     volume = rng.uniform(50, 150, size=n)
-    return pd.DataFrame({
-        "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
-        "open": np.full(n, 100.0),
-        "high": np.full(n, 101.0),
-        "low": np.full(n, 99.0),
-        "close": np.full(n, 100.0),
-        "volume": volume,
-        "quote_asset_volume": volume * 100,
-        "number_of_trades": rng.integers(10, 100, size=n).astype(float),
-        "taker_buy_base_volume": volume * buy_fraction,
-        "taker_buy_quote_volume": volume * buy_fraction * 100,
-    })
+    return pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
+            "open": np.full(n, 100.0),
+            "high": np.full(n, 101.0),
+            "low": np.full(n, 99.0),
+            "close": np.full(n, 100.0),
+            "volume": volume,
+            "quote_asset_volume": volume * 100,
+            "number_of_trades": rng.integers(10, 100, size=n).astype(float),
+            "taker_buy_base_volume": volume * buy_fraction,
+            "taker_buy_quote_volume": volume * buy_fraction * 100,
+        }
+    )
 
 
 def test_flow_features_missing_columns_returns_empty():
@@ -56,7 +58,9 @@ def test_flow_features_have_no_lookahead():
     features_before = build_flow_features(df)
     mutated = df.copy()
     mutated.loc[mutated.index[-1], ["volume", "taker_buy_base_volume", "number_of_trades"]] = [
-        10_000.0, 10_000.0, 5_000.0,
+        10_000.0,
+        10_000.0,
+        5_000.0,
     ]
     features_after = build_flow_features(mutated)
     for name in features_before:

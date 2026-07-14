@@ -27,7 +27,9 @@ class SupertrendStrategy(Strategy):
         high = pd.Series(o.high, index=df.index)
         low = pd.Series(o.low, index=df.index)
         close = pd.Series(o.close, index=df.index)
-        direction = ind.supertrend(high, low, close, int(self.params["period"]), float(self.params["mult"]))
+        direction = ind.supertrend(
+            high, low, close, int(self.params["period"]), float(self.params["mult"])
+        )
         prev = direction.shift(1)
         sig = self._empty_signals(df)
         sig[(direction > 0) & (prev <= 0)] = 1

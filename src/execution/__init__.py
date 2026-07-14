@@ -13,6 +13,7 @@ The ccxt-backed live/testnet adapter is imported lazily (it needs the optional
 from src.execution.broker import (
     Broker,
     Fill,
+    FuturesPositionIdentity,
     OpenOrderIdentity,
     Order,
     OrderSide,
@@ -30,6 +31,7 @@ __all__ = [
     "OrderSide",
     "OrderType",
     "Fill",
+    "FuturesPositionIdentity",
     "OpenOrderIdentity",
     "Position",
     "ProtectiveOrder",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import importlib.util
 import json
@@ -30,6 +31,7 @@ from src.autopilot.config import (
     AutopilotConfig,
     JobConfig,
     ProductConfig,
+    canonical_product_config,
     load_config,
 )
 from src.autopilot.control import (
@@ -89,23 +91,12 @@ from src.execution.config import ACCOUNT_FINGERPRINT_PREFIX
 from src.run_bot import PaperTradingBot, configure_logging
 
 LOGGER = logging.getLogger("autopilot")
-PREFLIGHT_PRODUCT_KEYS = (
-    "objective",
-    "base_asset",
-    "market",
-    "symbol",
-    "execution_mode",
-    "starting_equity",
-    "regime_guard",
-    "regime_mayer_top",
-)
 PREFLIGHT_REQUIRED_CHECKS = (
     "product_config",
     "execution_engine_identity",
     "strategy_artifact_exists",
     "strategy_fingerprints",
     "strategy_policy",
-    "approval_gate",
     "exchange_environment",
     "broker_constructed",
     "exchange_read_connectivity",
@@ -131,6 +122,30 @@ SPOT_FLATTEN_INTENT_KEYS = frozenset(
     }
 )
 SPOT_FLATTEN_POSITION_EVIDENCE_KEYS = frozenset({"symbol", "qty", "avg_price"})
+FUTURES_FLATTEN_INTENT_KEYS = frozenset(
+    {
+        "version",
+        "phase",
+        "strategy_id",
+        "symbol",
+        "side",
+        "order_type",
+        "reduce_only",
+        "submission_kind",
+        "client_id",
+        "broker_account_fingerprint",
+        "qty",
+        "position_digest",
+        "position_before",
+        "quote_balance_before",
+        "fill",
+        "position_after",
+        "quote_balance_after",
+        "realized_account_delta",
+        "created_ts",
+        "proven_ts",
+    }
+)
 BOT_STATUS_DURABLE_STATE_FIELDS = {
     "pending_order": (
         "version",
@@ -176,6 +191,7 @@ BOT_STATUS_DURABLE_STATE_FIELDS = {
     ),
     "flatten_intent": (
         "version",
+        "phase",
         "strategy_id",
         "symbol",
         "side",
@@ -184,6 +200,8 @@ BOT_STATUS_DURABLE_STATE_FIELDS = {
         "broker_account_fingerprint",
         "qty",
         "quote_budget",
+        "reduce_only",
+        "submission_kind",
         "created_ts",
     ),
 }
@@ -211,12 +229,10 @@ REQUIRED_CORE_JOBS = (
     "research_synthetic_smoke",
     "research_factory",
     "research_cycle",
-    "candidate_paper_cycle",
     "strategy_framework_smoke",
     "active_income_promotion_review",
     "btc_accumulation_promotion_review",
     "runtime_maintenance",
-    "runtime_backup",
     "artifact_hygiene",
 )
 REQUIRED_CORE_JOB_MODULES = {
@@ -227,12 +243,10 @@ REQUIRED_CORE_JOB_MODULES = {
     "research_synthetic_smoke": "src.autopilot.research_smoke",
     "research_factory": "src.autopilot.research_factory",
     "research_cycle": "src.autopilot.research_cycle",
-    "candidate_paper_cycle": "src.autopilot.candidate_paper",
     "strategy_framework_smoke": "src.autopilot.strategy_smoke",
     "active_income_promotion_review": "src.autopilot.promotion",
     "btc_accumulation_promotion_review": "src.autopilot.promotion",
     "runtime_maintenance": "src.autopilot.maintenance",
-    "runtime_backup": "src.autopilot.backup",
     "artifact_hygiene": "src.autopilot.artifact_hygiene",
 }
 REQUIRED_CORE_JOB_FLAG_VALUES = {
@@ -273,10 +287,6 @@ REQUIRED_CORE_JOB_FLAG_VALUES = {
         "--generated-batch": ("runtime/research/generated_hypotheses.json",),
         "--research-factory-config": ("config/research_factory.json",),
     },
-    "candidate_paper_cycle": {
-        "--config": ("config/autopilot.json",),
-        "--output": ("runtime/candidate_paper_status.json",),
-    },
     "strategy_framework_smoke": {
         "--output": ("runtime/strategy_framework_smoke.json",),
         "--regime-input": ("runtime/regime/futures_15m_regime.parquet",),
@@ -300,10 +310,6 @@ REQUIRED_CORE_JOB_FLAG_VALUES = {
     "runtime_maintenance": {
         "--config": ("config/autopilot.json",),
         "--max-quarantine-bytes": ("268435456",),
-    },
-    "runtime_backup": {
-        "--config": ("config/autopilot.json",),
-        "--report": ("runtime/backup_report.json",),
     },
     "artifact_hygiene": {
         "--config": ("config/autopilot.json",),
@@ -968,6 +974,33 @@ def _assert_preflight_checks_passed(
     return passed
 
 
+def _assert_preflight_product_identity(
+    product: ProductConfig,
+    reported_product: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(reported_product, dict):
+        raise RuntimeError(f"{product.name}: {label} product payload must be a JSON object.")
+    expected = canonical_product_config(product)
+    for field, expected_value in expected.items():
+        if field not in reported_product:
+            raise RuntimeError(f"{product.name}: {label} product {field} is missing.")
+        actual_value = reported_product[field]
+        if actual_value != expected_value:
+            raise RuntimeError(
+                f"{product.name}: {label} product {field} mismatch: "
+                f"{actual_value!r} != {expected_value!r}."
+            )
+    extra_fields = sorted(set(reported_product) - set(expected))
+    if extra_fields:
+        raise RuntimeError(
+            f"{product.name}: {label} product payload has unexpected fields: "
+            f"{', '.join(extra_fields)}."
+        )
+    return reported_product
+
+
 def _preflight_check_by_name(
     matched: dict[str, Any], name: str, *, label: str, product: ProductConfig
 ) -> dict[str, Any]:
@@ -1181,8 +1214,10 @@ def _assert_preflight_open_order_evidence(
     detail = check.get("detail")
     if not isinstance(detail, dict):
         raise RuntimeError(f"{product.name}: {label} open-order evidence is missing.")
-    if str(detail.get("symbol") or "").upper() != product.symbol.upper():
-        raise RuntimeError(f"{product.name}: {label} open-order evidence symbol is invalid.")
+    if detail.get("scope") != "whole_account":
+        raise RuntimeError(f"{product.name}: {label} open-order evidence is not account-wide.")
+    if str(detail.get("configured_symbol") or "").upper() != product.symbol.upper():
+        raise RuntimeError(f"{product.name}: {label} open-order configured symbol is invalid.")
     for order_kind in ("regular", "conditional"):
         inventory = detail.get(order_kind)
         if not isinstance(inventory, dict):
@@ -1199,6 +1234,40 @@ def _assert_preflight_open_order_evidence(
             raise RuntimeError(
                 f"{product.name}: {label} {order_kind} open-order list is not empty."
             )
+    return detail
+
+
+def _assert_preflight_position_inventory_evidence(
+    product: ProductConfig,
+    matched: dict[str, Any],
+    *,
+    label: str,
+) -> dict[str, Any] | None:
+    if product.objective != "active_income" or product.market != "futures":
+        return None
+    check = _preflight_check_by_name(
+        matched,
+        "broker_position_flat",
+        label=label,
+        product=product,
+    )
+    detail = check.get("detail")
+    if not isinstance(detail, dict):
+        raise RuntimeError(f"{product.name}: {label} position inventory evidence is missing.")
+    if detail.get("scope") != "whole_account":
+        raise RuntimeError(
+            f"{product.name}: {label} position inventory evidence is not account-wide."
+        )
+    if str(detail.get("configured_symbol") or "").upper() != product.symbol.upper():
+        raise RuntimeError(
+            f"{product.name}: {label} position inventory configured symbol is invalid."
+        )
+    count = detail.get("count")
+    positions = detail.get("positions")
+    if isinstance(count, bool) or not isinstance(count, int) or count != 0:
+        raise RuntimeError(f"{product.name}: {label} account position count is not zero.")
+    if not isinstance(positions, list) or positions:
+        raise RuntimeError(f"{product.name}: {label} account position list is not empty.")
     return detail
 
 
@@ -1283,27 +1352,22 @@ def assert_recent_preflight(
     connectivity_evidence = _assert_preflight_connectivity_evidence(
         product, matched, label="preflight report"
     )
-    reported_product = matched.get("product") or {}
-    if not isinstance(reported_product, dict):
-        raise RuntimeError(
-            f"{product.name}: preflight report product payload must be a JSON object."
-        )
-    for key in PREFLIGHT_PRODUCT_KEYS:
-        expected = str(getattr(product, key))
-        actual = str(reported_product.get(key, ""))
-        if key in {"base_asset", "symbol"}:
-            expected = expected.upper()
-            actual = actual.upper()
-        if actual != expected:
-            raise RuntimeError(
-                f"{product.name}: preflight product {key} mismatch: {actual or '<missing>'} != {expected}."
-            )
+    reported_product = _assert_preflight_product_identity(
+        product,
+        matched.get("product"),
+        label="preflight report",
+    )
     position_mode_evidence = _assert_preflight_position_mode_evidence(
         product,
         matched,
         label="preflight report",
     )
     open_order_evidence = _assert_preflight_open_order_evidence(
+        product,
+        matched,
+        label="preflight report",
+    )
+    position_inventory_evidence = _assert_preflight_position_inventory_evidence(
         product,
         matched,
         label="preflight report",
@@ -1355,6 +1419,7 @@ def assert_recent_preflight(
         "position_mode": position_mode_evidence,
         "exchange_connectivity": connectivity_evidence,
         "open_order_inventory": open_order_evidence,
+        "position_inventory": position_inventory_evidence,
     }
 
 
@@ -1461,28 +1526,22 @@ def assert_recent_testnet_rehearsal(
         label="testnet rehearsal preflight",
         require_testnet=True,
     )
-    reported_product = matched.get("product") or {}
-    if not isinstance(reported_product, dict):
-        raise RuntimeError(
-            f"{product.name}: testnet rehearsal preflight product payload must be a JSON object."
-        )
-    for key in PREFLIGHT_PRODUCT_KEYS:
-        expected = str(getattr(product, key))
-        actual = str(reported_product.get(key, ""))
-        if key in {"base_asset", "symbol"}:
-            expected = expected.upper()
-            actual = actual.upper()
-        if actual != expected:
-            raise RuntimeError(
-                f"{product.name}: testnet rehearsal preflight product {key} mismatch: "
-                f"{actual or '<missing>'} != {expected}."
-            )
+    reported_product = _assert_preflight_product_identity(
+        product,
+        matched.get("product"),
+        label="testnet rehearsal preflight",
+    )
     position_mode_evidence = _assert_preflight_position_mode_evidence(
         product,
         matched,
         label="testnet rehearsal preflight",
     )
     open_order_evidence = _assert_preflight_open_order_evidence(
+        product,
+        matched,
+        label="testnet rehearsal preflight",
+    )
+    position_inventory_evidence = _assert_preflight_position_inventory_evidence(
         product,
         matched,
         label="testnet rehearsal preflight",
@@ -1540,6 +1599,7 @@ def assert_recent_testnet_rehearsal(
         "preflight_exchange_environment": exchange_evidence,
         "preflight_position_mode": position_mode_evidence,
         "preflight_open_order_inventory": open_order_evidence,
+        "preflight_position_inventory": position_inventory_evidence,
     }
 
 
@@ -1668,9 +1728,11 @@ def _frozen_management_artifact(product: ProductConfig) -> dict[str, Any]:
     only that already-approved behaviour and cannot introduce a flat strategy.
     """
     state, state_error = _read_local_state_for_flatten(product)
-    if state_error:
-        raise RuntimeError(f"{product.name}: cannot recover frozen strategy state: {state_error}")
-    assert state is not None
+    if state_error or state is None:
+        raise RuntimeError(
+            f"{product.name}: cannot recover frozen strategy state: "
+            f"{state_error or 'state reader returned no payload'}"
+        )
     positions = state.get("open_positions")
     if not isinstance(positions, dict):
         raise RuntimeError(f"{product.name}: state open_positions must be an object.")
@@ -1786,6 +1848,393 @@ def _read_local_state_for_flatten(
     if not isinstance(loaded, dict):
         return None, f"state payload was not an object: {type(loaded).__name__}"
     return loaded, None
+
+
+class _FrozenQuoteBalanceBroker:
+    """Delegate broker reads except for the durable accounting balance.
+
+    Exit accounting must consume the quote-balance evidence captured at the
+    broker-flat boundary, not a later mutable value read after stop cleanup or
+    a process restart.
+    """
+
+    def __init__(self, broker: Any, quote_balance: float):
+        self._broker = broker
+        self._quote_balance = float(quote_balance)
+
+    def get_balance(self) -> float:
+        return self._quote_balance
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._broker, name)
+
+
+def _flatten_state_digest(value: Any, *, label: str) -> str:
+    try:
+        canonical = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} is not canonical JSON: {exc}") from exc
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _flatten_accounting_bot(
+    product: ProductConfig,
+    broker: Any,
+    *,
+    quote_balance: float | None = None,
+) -> PaperTradingBot:
+    accounting_broker = (
+        _FrozenQuoteBalanceBroker(broker, quote_balance) if quote_balance is not None else broker
+    )
+    return PaperTradingBot(
+        strategies_path=product.strategies_path,
+        state_file=product.state_file,
+        trade_log=product.trade_log,
+        starting_equity=product.starting_equity,
+        regime_guard=product.regime_guard,
+        regime_mayer_top=product.regime_mayer_top,
+        broker=accounting_broker,
+        symbol=product.symbol,
+        market=product.market,
+        objective=product.objective,
+        base_asset=product.base_asset,
+        live_gate_approved=True,
+        allow_entries=False,
+        artifact_payload=_frozen_management_artifact(product),
+    )
+
+
+def _flatten_strategy_and_position(
+    bot: PaperTradingBot,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    positions = bot.state.get("open_positions")
+    if not isinstance(positions, dict) or len(positions) != 1:
+        count = len(positions) if isinstance(positions, dict) else "invalid"
+        raise RuntimeError(
+            "Emergency flatten accounting requires exactly one durable open position; "
+            f"found {count}."
+        )
+    strategy_id, position = next(iter(positions.items()))
+    if not isinstance(position, dict):
+        raise RuntimeError("Emergency flatten position must be a JSON object.")
+    strategy = next(
+        (candidate for candidate in bot.strategies if candidate.get("id") == strategy_id),
+        None,
+    )
+    if not isinstance(strategy, dict):
+        raise RuntimeError(f"Emergency flatten strategy snapshot {strategy_id!r} is unavailable.")
+    return strategy, position
+
+
+def _resume_flatten_exit_accounting(
+    product: ProductConfig,
+    broker: Any,
+) -> dict[str, Any] | None:
+    state, state_error = _read_local_state_for_flatten(product)
+    if state_error or state is None or state.get("exit_accounting_intent") is None:
+        return None
+    bot = _flatten_accounting_bot(product, broker)
+    resumed = bot._resume_exit_accounting_intent()
+    return {
+        "resumed": resumed,
+        "state_file": str(product.state_file),
+        "trade_log": str(product.trade_log),
+        "equity": bot.state.get("equity"),
+        "open_positions": len(bot.state.get("open_positions", {})),
+    }
+
+
+def _commit_flatten_exit_accounting(
+    product: ProductConfig,
+    broker: Any,
+    *,
+    intent: dict[str, Any],
+    fill: Fill,
+    quote_balance_after: float,
+    spot_base_reconciliation: dict[str, float] | None = None,
+    native_stop_cleanup: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    bot = _flatten_accounting_bot(
+        product,
+        broker,
+        quote_balance=quote_balance_after,
+    )
+    strategy, position = _flatten_strategy_and_position(bot)
+    if strategy["id"] != intent.get("strategy_id"):
+        raise RuntimeError("Flatten accounting strategy changed underneath its durable intent.")
+    if bot.state.get("flatten_intent") != intent:
+        raise RuntimeError("Flatten accounting intent changed before the keyed commit.")
+    if _flatten_state_digest(position, label="Emergency flatten position") != intent.get(
+        "position_digest"
+    ):
+        raise RuntimeError("Flatten accounting position changed underneath its durable intent.")
+
+    exit_event_id = bot._exit_event_id(strategy["id"], position)
+    bot.state.pop("flatten_intent")
+    bot.state["last_flatten"] = {
+        "at": utc_now(),
+        "reason": "autopilot_control",
+        "flatten_client_id": intent["client_id"],
+        "exit_event_id": exit_event_id,
+        "broker_account_fingerprint": intent["broker_account_fingerprint"],
+        "submission_kind": intent["submission_kind"],
+        "fill": intent["fill"],
+        "position_before": intent["position_before"],
+        "position_after": intent["position_after"],
+        "quote_balance_before": intent["quote_balance_before"],
+        "quote_balance_after": intent["quote_balance_after"],
+        "realized_account_delta": intent["realized_account_delta"],
+        "native_stop_cleanup": native_stop_cleanup or [],
+    }
+    bot._complete_position_exit(
+        strategy,
+        position,
+        exit_time=utc_now(),
+        exit_price=float(fill.price),
+        exit_reason="emergency_flatten",
+        broker_exit_fill=fill,
+        clear_pending=False,
+        spot_base_reconciliation=spot_base_reconciliation,
+    )
+    return {
+        "state_file": str(product.state_file),
+        "trade_log": str(product.trade_log),
+        "exit_event_id": exit_event_id,
+        "equity": bot.state.get("equity"),
+        "daily_pnl": bot.state.get("daily_pnl"),
+        "consecutive_losses": bot.state.get("consecutive_losses"),
+        "cooldown_until_ts": bot.state.get("cooldown_until_ts"),
+        "open_positions": len(bot.state.get("open_positions", {})),
+        "pending_order_retained": bot.state.get("pending_order") is not None,
+    }
+
+
+def _futures_flatten_client_id(
+    *,
+    strategy_id: str,
+    symbol: str,
+    side: OrderSide,
+    qty: float,
+    position_digest: str,
+    broker_account_fingerprint: str,
+) -> str:
+    digest = _flatten_state_digest(
+        {
+            "strategy_id": strategy_id,
+            "symbol": symbol,
+            "side": side.value,
+            "qty": float(qty),
+            "position_digest": position_digest,
+            "broker_account_fingerprint": broker_account_fingerprint,
+        },
+        label="Futures flatten client identity",
+    )
+    return f"tb-ff-{digest[:28]}"
+
+
+def _strict_flatten_number(
+    value: Any,
+    *,
+    field: str,
+    positive: bool = False,
+    non_negative: bool = False,
+) -> float:
+    if isinstance(value, bool):
+        raise RuntimeError(f"flatten_intent.{field} must be numeric")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"flatten_intent.{field} must be numeric") from exc
+    if not math.isfinite(number):
+        raise RuntimeError(f"flatten_intent.{field} must be finite")
+    if positive and number <= 0:
+        raise RuntimeError(f"flatten_intent.{field} must be positive")
+    if non_negative and number < 0:
+        raise RuntimeError(f"flatten_intent.{field} must be non-negative")
+    return number
+
+
+def _validated_futures_flatten_intent(
+    product: ProductConfig,
+    raw: Any,
+    *,
+    position: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise RuntimeError("flatten_intent must be an object")
+    missing = sorted(FUTURES_FLATTEN_INTENT_KEYS - set(raw))
+    unexpected = sorted(set(raw) - FUTURES_FLATTEN_INTENT_KEYS)
+    if missing:
+        raise RuntimeError(f"flatten_intent is missing required key(s): {', '.join(missing)}")
+    if unexpected:
+        raise RuntimeError(f"flatten_intent has unexpected key(s): {', '.join(unexpected)}")
+    if raw.get("version") != 1:
+        raise RuntimeError("flatten_intent.version must be 1")
+    phase = raw.get("phase")
+    if phase not in {"prepared", "broker_flat_proven"}:
+        raise RuntimeError("flatten_intent.phase is invalid")
+    strategy_id = raw.get("strategy_id")
+    if not isinstance(strategy_id, str) or not strategy_id:
+        raise RuntimeError("flatten_intent.strategy_id is invalid")
+    if raw.get("symbol") != product.symbol:
+        raise RuntimeError("flatten_intent.symbol does not match the product")
+    if raw.get("order_type") != OrderType.MARKET.value or raw.get("reduce_only") is not True:
+        raise RuntimeError("flatten_intent is not a reduce-only market close")
+    submission_kind = raw.get("submission_kind")
+    if submission_kind not in {"reduce_only_market", "native_stop_triggered"}:
+        raise RuntimeError("flatten_intent.submission_kind is invalid")
+    fingerprint = raw.get("broker_account_fingerprint")
+    if not _valid_account_fingerprint(fingerprint):
+        raise RuntimeError("flatten_intent.broker_account_fingerprint is invalid")
+    client_id = raw.get("client_id")
+    if (
+        not isinstance(client_id, str)
+        or not client_id
+        or len(client_id) > 36
+        or any(char not in CLIENT_ORDER_ID_SAFE_CHARS for char in client_id)
+    ):
+        raise RuntimeError("flatten_intent.client_id is unsafe")
+    qty = _strict_flatten_number(raw.get("qty"), field="qty", positive=True)
+    _strict_flatten_number(raw.get("created_ts"), field="created_ts", positive=True)
+    position_digest = raw.get("position_digest")
+    expected_digest = _flatten_state_digest(position, label="Emergency flatten position")
+    if position_digest != expected_digest:
+        raise RuntimeError("flatten_intent.position_digest does not match local position")
+    position_before = raw.get("position_before")
+    if not isinstance(position_before, dict) or set(position_before) != {
+        "symbol",
+        "qty",
+        "avg_price",
+    }:
+        raise RuntimeError("flatten_intent.position_before is invalid")
+    if position_before.get("symbol") != product.symbol:
+        raise RuntimeError("flatten_intent.position_before symbol is invalid")
+    before_qty = _strict_flatten_number(position_before.get("qty"), field="position_before.qty")
+    if before_qty == 0:
+        raise RuntimeError("flatten_intent.position_before.qty must be non-zero")
+    _strict_flatten_number(
+        position_before.get("avg_price"),
+        field="position_before.avg_price",
+        positive=True,
+    )
+    expected_side = OrderSide.SELL if before_qty > 0 else OrderSide.BUY
+    if raw.get("side") != expected_side.value:
+        raise RuntimeError("flatten_intent.side does not reduce position_before")
+    qty_tolerance = max(qty * 1e-9, 1e-12)
+    if abs(abs(before_qty) - qty) > qty_tolerance:
+        raise RuntimeError("flatten_intent.qty does not match position_before")
+    quote_before = _strict_flatten_number(
+        raw.get("quote_balance_before"),
+        field="quote_balance_before",
+        non_negative=True,
+    )
+
+    fill = raw.get("fill")
+    position_after = raw.get("position_after")
+    quote_after = raw.get("quote_balance_after")
+    account_delta = raw.get("realized_account_delta")
+    proven_ts = raw.get("proven_ts")
+    if phase == "prepared":
+        if any(
+            value is not None
+            for value in (fill, position_after, quote_after, account_delta, proven_ts)
+        ):
+            raise RuntimeError("prepared flatten_intent contains unproven broker evidence")
+    else:
+        if not isinstance(fill, dict) or set(fill) != {
+            "symbol",
+            "side",
+            "qty",
+            "price",
+            "fee",
+            "timestamp",
+        }:
+            raise RuntimeError("flatten_intent.fill is invalid")
+        if fill.get("symbol") != product.symbol or fill.get("side") != expected_side.value:
+            raise RuntimeError("flatten_intent.fill identity is invalid")
+        fill_qty = _strict_flatten_number(fill.get("qty"), field="fill.qty", positive=True)
+        _strict_flatten_number(fill.get("price"), field="fill.price", positive=True)
+        _strict_flatten_number(fill.get("fee"), field="fill.fee", non_negative=True)
+        _strict_flatten_number(fill.get("timestamp"), field="fill.timestamp", positive=True)
+        if abs(fill_qty - qty) > qty_tolerance:
+            raise RuntimeError("flatten_intent.fill qty does not match its order")
+        if not isinstance(position_after, dict) or set(position_after) != {
+            "symbol",
+            "qty",
+            "avg_price",
+        }:
+            raise RuntimeError("flatten_intent.position_after is invalid")
+        if position_after.get("symbol") != product.symbol:
+            raise RuntimeError("flatten_intent.position_after symbol is invalid")
+        after_qty = _strict_flatten_number(position_after.get("qty"), field="position_after.qty")
+        after_avg = _strict_flatten_number(
+            position_after.get("avg_price"),
+            field="position_after.avg_price",
+            non_negative=True,
+        )
+        if abs(after_qty) >= 1e-12 or after_avg != 0:
+            raise RuntimeError("flatten_intent does not prove a flat broker position")
+        quote_after_number = _strict_flatten_number(
+            quote_after,
+            field="quote_balance_after",
+            non_negative=True,
+        )
+        delta_number = _strict_flatten_number(
+            account_delta,
+            field="realized_account_delta",
+        )
+        delta_tolerance = max(abs(quote_before) * 1e-12, 1e-9)
+        if abs((quote_after_number - quote_before) - delta_number) > delta_tolerance:
+            raise RuntimeError("flatten_intent realized account delta is inconsistent")
+        _strict_flatten_number(proven_ts, field="proven_ts", positive=True)
+
+    if submission_kind == "reduce_only_market":
+        expected_client_id = _futures_flatten_client_id(
+            strategy_id=strategy_id,
+            symbol=product.symbol,
+            side=expected_side,
+            qty=qty,
+            position_digest=position_digest,
+            broker_account_fingerprint=fingerprint,
+        )
+        if client_id != expected_client_id:
+            raise RuntimeError("flatten_intent.client_id does not match its deterministic intent")
+    return dict(raw)
+
+
+def _persist_flatten_intent(
+    product: ProductConfig,
+    state: dict[str, Any],
+    intent: dict[str, Any],
+) -> dict[str, Any]:
+    if state.get("flatten_intent") is not None:
+        raise RuntimeError("cannot replace an existing flatten_intent")
+    updated = dict(state)
+    updated["flatten_intent"] = intent
+    write_json_atomic(product.state_file, updated)
+    return updated
+
+
+def _persist_proven_flatten_intent(
+    product: ProductConfig,
+    expected_intent: dict[str, Any],
+    proven_intent: dict[str, Any],
+) -> dict[str, Any]:
+    state, state_error = _read_local_state_for_flatten(product)
+    if state_error or state is None:
+        raise RuntimeError(f"could not reread flatten state: {state_error}")
+    if state.get("flatten_intent") != expected_intent:
+        raise RuntimeError("durable flatten_intent changed before broker evidence commit")
+    updated = dict(state)
+    updated["flatten_intent"] = proven_intent
+    write_json_atomic(product.state_file, updated)
+    return updated
 
 
 def _local_state_clear_failed(local_state: dict[str, Any]) -> bool:
@@ -2083,48 +2532,83 @@ def _persist_spot_flatten_intent(
 
 def _commit_spot_flatten_state(
     product: ProductConfig,
-    state: dict[str, Any],
+    broker: Any,
     intent: dict[str, Any],
     *,
     balance_evidence: dict[str, Any],
-    auto_finalized: bool,
-    fill: Fill | None,
+    fill: Fill,
 ) -> dict[str, Any]:
-    if state.get("flatten_intent") != intent:
-        raise RuntimeError("durable flatten_intent changed before local-state commit")
     if balance_evidence.get("proven") is not True:
         raise RuntimeError("spot buyback balance postcondition is not proven")
-    updated = dict(state)
-    updated["open_positions"] = {}
-    updated.pop("flatten_intent", None)
-    cleared_pending_order = updated.pop("pending_order", None)
-    last_flatten: dict[str, Any] = {
+    quote_balance_after = _strict_flatten_number(
+        broker.get_balance(),
+        field="spot_quote_balance_after",
+        non_negative=True,
+    )
+    bot = _flatten_accounting_bot(
+        product,
+        broker,
+        quote_balance=quote_balance_after,
+    )
+    strategy, position = _flatten_strategy_and_position(bot)
+    if strategy["id"] != intent.get("strategy_id"):
+        raise RuntimeError("Spot flatten accounting strategy changed underneath its intent")
+    if bot.state.get("flatten_intent") != intent:
+        raise RuntimeError("durable flatten_intent changed before local accounting commit")
+    entry_base_balance = _positive_evidence_float(position.get("broker_entry_base_qty_before"))
+    after_base_balance = _evidence_float(balance_evidence.get("after_qty"))
+    if entry_base_balance is None or after_base_balance is None or after_base_balance < 0:
+        raise RuntimeError("spot flatten is missing durable BTC account-balance evidence")
+    account_return = (after_base_balance - entry_base_balance) / entry_base_balance
+    if not math.isfinite(account_return) or account_return <= -1:
+        raise RuntimeError("spot flatten BTC account return is invalid")
+    spot_reconciliation = {
+        "entry_base_balance_before": entry_base_balance,
+        "entry_base_balance_after": float(position["broker_entry_base_qty_after"]),
+        "exit_base_balance_before": float(balance_evidence["before_qty"]),
+        "exit_base_balance_after": after_base_balance,
+        "observed_buy_qty": float(balance_evidence["actual_increase"]),
+        "account_return": account_return,
+    }
+    exit_event_id = bot._exit_event_id(strategy["id"], position)
+    bot.state.pop("flatten_intent")
+    bot.state["last_flatten"] = {
         "at": utc_now(),
         "reason": "autopilot_control",
-        "recovered_state": False,
-        "cleared_pending_order": cleared_pending_order is not None,
         "flatten_client_id": intent["client_id"],
-        "auto_finalized": auto_finalized,
+        "exit_event_id": exit_event_id,
+        "broker_account_fingerprint": intent["broker_account_fingerprint"],
+        "submission_kind": "spot_quote_reinvestment",
         "balance_evidence": balance_evidence,
-    }
-    if isinstance(cleared_pending_order, dict):
-        last_flatten["pending_client_id"] = cleared_pending_order.get("client_id")
-    if fill is not None:
-        last_flatten["fill"] = {
+        "quote_balance_after": quote_balance_after,
+        "fill": {
             "symbol": fill.symbol,
             "side": _fill_side_value(fill),
-            "qty": fill.qty,
-            "price": fill.price,
-            "fee": fill.fee,
-            "timestamp": fill.timestamp,
-        }
-    updated["last_flatten"] = last_flatten
-    write_json_atomic(product.state_file, updated)
+            "qty": float(fill.qty),
+            "price": float(fill.price),
+            "fee": float(fill.fee),
+            "timestamp": float(fill.timestamp),
+        },
+    }
+    bot._complete_position_exit(
+        strategy,
+        position,
+        exit_time=utc_now(),
+        exit_price=float(fill.price),
+        exit_reason="emergency_flatten",
+        broker_exit_fill=fill,
+        clear_pending=False,
+        spot_base_reconciliation=spot_reconciliation,
+    )
     return {
         "path": str(product.state_file),
-        "recovered": False,
-        "cleared": True,
-        "error": None,
+        "trade_log": str(product.trade_log),
+        "exit_event_id": exit_event_id,
+        "equity": bot.state.get("equity"),
+        "daily_pnl": bot.state.get("daily_pnl"),
+        "cooldown_until_ts": bot.state.get("cooldown_until_ts"),
+        "open_positions": len(bot.state.get("open_positions", {})),
+        "pending_order_retained": bot.state.get("pending_order") is not None,
     }
 
 
@@ -2220,11 +2704,11 @@ def _local_futures_protective_stops(product: ProductConfig) -> list[dict[str, An
     and invalid stop evidence blocks local-state clearing after flat proof.
     """
     state, state_error = _read_local_state_for_flatten(product)
-    if state_error:
+    if state_error or state is None:
         raise RuntimeError(
-            f"{product.name}: cannot inspect native stops before flatten: {state_error}"
+            f"{product.name}: cannot inspect native stops before flatten: "
+            f"{state_error or 'state reader returned no payload'}"
         )
-    assert state is not None
     raw_positions = state.get("open_positions", {})
     if raw_positions in (None, {}):
         return []
@@ -2285,6 +2769,91 @@ def _local_futures_protective_stops(product: ProductConfig) -> list[dict[str, An
     return records
 
 
+def _validated_accounted_futures_flatten(
+    product: ProductConfig,
+    state: dict[str, Any],
+) -> dict[str, Any] | None:
+    if state.get("open_positions") != {}:
+        return None
+    if state.get("flatten_intent") is not None or state.get("exit_accounting_intent") is not None:
+        return None
+    last = state.get("last_flatten")
+    if not isinstance(last, dict) or last.get("reason") != "autopilot_control":
+        return None
+    fingerprint = last.get("broker_account_fingerprint")
+    if not _valid_account_fingerprint(fingerprint):
+        return None
+    event_id = last.get("exit_event_id")
+    if (
+        not isinstance(event_id, str)
+        or len(event_id) != 64
+        or any(char not in "0123456789abcdef" for char in event_id)
+    ):
+        return None
+    client_id = last.get("flatten_client_id")
+    if (
+        not isinstance(client_id, str)
+        or not client_id.startswith("tb-ff-")
+        or len(client_id) > 36
+        or any(char not in CLIENT_ORDER_ID_SAFE_CHARS for char in client_id)
+    ):
+        return None
+    if last.get("submission_kind") != "reduce_only_market":
+        return None
+    fill = last.get("fill")
+    if not isinstance(fill, dict) or fill.get("symbol") != product.symbol:
+        return None
+    if str(fill.get("side")) not in {OrderSide.BUY.value, OrderSide.SELL.value}:
+        return None
+    if any(
+        value is None
+        for value in (
+            _positive_evidence_float(fill.get("qty")),
+            _positive_evidence_float(fill.get("price")),
+            _evidence_float(fill.get("fee")),
+            _positive_evidence_float(fill.get("timestamp")),
+        )
+    ):
+        return None
+    if float(fill["fee"]) < 0:
+        return None
+    before = last.get("position_before")
+    before_qty = _evidence_float(before.get("qty")) if isinstance(before, dict) else None
+    if (
+        not isinstance(before, dict)
+        or before.get("symbol") != product.symbol
+        or before_qty in {None, 0}
+        or _positive_evidence_float(before.get("avg_price")) is None
+    ):
+        return None
+    expected_side = OrderSide.SELL.value if float(before_qty) > 0 else OrderSide.BUY.value
+    if fill.get("side") != expected_side:
+        return None
+    after = last.get("position_after")
+    if (
+        not isinstance(after, dict)
+        or after.get("symbol") != product.symbol
+        or _evidence_float(after.get("qty")) != 0
+        or _evidence_float(after.get("avg_price")) != 0
+    ):
+        return None
+    quote_before = _evidence_float(last.get("quote_balance_before"))
+    quote_after = _evidence_float(last.get("quote_balance_after"))
+    delta = _evidence_float(last.get("realized_account_delta"))
+    if (
+        quote_before is None
+        or quote_before < 0
+        or quote_after is None
+        or quote_after < 0
+        or delta is None
+    ):
+        return None
+    tolerance = max(abs(quote_before) * 1e-12, 1e-9)
+    if abs((quote_after - quote_before) - delta) > tolerance:
+        return None
+    return last
+
+
 def _assert_futures_flatten_account_binding(
     product: ProductConfig,
     broker: Any,
@@ -2292,11 +2861,11 @@ def _assert_futures_flatten_account_binding(
     """Bind panic-flatten reads and writes to the durable production account."""
 
     state, state_error = _read_local_state_for_flatten(product)
-    if state_error:
+    if state_error or state is None:
         raise RuntimeError(
-            f"{product.name}: cannot verify account identity before futures flatten: {state_error}"
+            f"{product.name}: cannot verify account identity before futures flatten: "
+            f"{state_error or 'state reader returned no payload'}"
         )
-    assert state is not None
     identities: list[tuple[str, Any]] = []
     positions = state.get("open_positions", {})
     if not isinstance(positions, dict):
@@ -2328,10 +2897,14 @@ def _assert_futures_flatten_account_binding(
             )
         identities.append((state_key, marker.get("broker_account_fingerprint")))
     if not identities:
-        raise RuntimeError(
-            f"{product.name}: no durable broker account identity exists; refusing to read or "
-            "flatten an arbitrary live account."
-        )
+        accounted = _validated_accounted_futures_flatten(product, state)
+        if accounted is not None:
+            identities.append(("last_flatten", accounted["broker_account_fingerprint"]))
+        else:
+            raise RuntimeError(
+                f"{product.name}: no durable broker account identity exists; refusing to read or "
+                "flatten an arbitrary live account."
+            )
     current = _live_broker_account_fingerprint(product, broker)
     for label, expected in identities:
         if not _valid_account_fingerprint(expected):
@@ -2511,14 +3084,16 @@ def _flatten_btc_spot_step_aside_product(
         return status
 
     state, state_error = _read_local_state_for_flatten(product)
-    if state_error:
+    if state_error or state is None:
         status.update(
             ok=False,
             reason="invalid_local_state",
-            local_state={"path": str(product.state_file), "error": state_error},
+            local_state={
+                "path": str(product.state_file),
+                "error": state_error or "state reader returned no payload",
+            },
         )
         return status
-    assert state is not None
     exit_accounting_intent = state.get("exit_accounting_intent")
     if exit_accounting_intent is not None:
         status.update(
@@ -2612,6 +3187,24 @@ def _flatten_btc_spot_step_aside_product(
         status.update(ok=False, reason="broker_account_mismatch", error=error)
         return status
 
+    try:
+        accounting_bot = _flatten_accounting_bot(product, broker)
+        accounting_strategy, _accounting_position = _flatten_strategy_and_position(accounting_bot)
+        if accounting_strategy["id"] != strategy_id:
+            raise RuntimeError("spot flatten strategy identity changed")
+        state = accounting_bot.state
+    except Exception as exc:
+        status.update(
+            ok=False,
+            reason="flatten_accounting_precondition_failed",
+            error=f"{type(exc).__name__}: {exc}",
+            operator_action=(
+                "Keep the product paused; repair or reconcile the durable strategy/position "
+                "accounting evidence before a BTC buyback is submitted."
+            ),
+        )
+        return status
+
     if existing_intent is not None:
         try:
             current = broker.get_position(product.symbol)
@@ -2635,41 +3228,15 @@ def _flatten_btc_spot_step_aside_product(
             },
             balance_evidence=balance_evidence,
         )
-        if not balance_evidence["proven"]:
-            return unresolved(
-                "existing flatten_intent cannot be proven filled from the broker BTC balance; "
-                "refusing duplicate buyback",
-                intent=existing_intent,
-                balance_evidence=balance_evidence,
-            )
-        try:
-            local_state = _commit_spot_flatten_state(
-                product,
-                state,
-                existing_intent,
-                balance_evidence=balance_evidence,
-                auto_finalized=True,
-                fill=None,
-            )
-        except Exception as exc:
-            return unresolved(
-                f"buyback is proven but local-state commit failed: {type(exc).__name__}: {exc}",
-                intent=existing_intent,
-                balance_evidence=balance_evidence,
-            )
-        status.update(
-            ok=True,
-            flattened=True,
-            auto_finalized=True,
-            reason="flatten_intent_auto_finalized",
-            local_state=local_state,
-            position_after={
-                "symbol": current.symbol,
-                "qty": current.qty,
-                "avg_price": current.avg_price,
-            },
+        return unresolved(
+            (
+                "existing flatten_intent may have changed the broker BTC balance, but its "
+                "fill price/fee response was not durably committed; refusing both a duplicate "
+                "buyback and silent local accounting"
+            ),
+            intent=existing_intent,
+            balance_evidence=balance_evidence,
         )
-        return status
 
     before = broker.get_position(product.symbol)
     before_qty = _evidence_float(before.qty)
@@ -2851,10 +3418,9 @@ def _flatten_btc_spot_step_aside_product(
     try:
         local_state = _commit_spot_flatten_state(
             product,
-            state,
+            broker,
             intent,
             balance_evidence=balance_evidence,
-            auto_finalized=False,
             fill=fill,
         )
     except Exception as exc:
@@ -2865,6 +3431,416 @@ def _flatten_btc_spot_step_aside_product(
         )
     status.update(ok=True, local_state=local_state)
     return status
+
+
+def _fill_from_flatten_intent(intent: dict[str, Any]) -> Fill:
+    payload = intent.get("fill")
+    if not isinstance(payload, dict):
+        raise RuntimeError("Proven flatten intent has no fill payload.")
+    return Fill(
+        symbol=str(payload["symbol"]),
+        side=OrderSide(str(payload["side"])),
+        qty=float(payload["qty"]),
+        price=float(payload["price"]),
+        fee=float(payload["fee"]),
+        timestamp=float(payload["timestamp"]),
+    )
+
+
+def _already_accounted_futures_flatten(
+    product: ProductConfig,
+    broker: Any,
+) -> dict[str, Any] | None:
+    state, state_error = _read_local_state_for_flatten(product)
+    if state_error or state is None:
+        return None
+    last = _validated_accounted_futures_flatten(product, state)
+    if last is None:
+        return None
+    for marker in ("pending_order", "pending_entry_recovery", "risk_recovery_incident"):
+        if state.get(marker) is not None:
+            return None
+    current = broker.get_position(product.symbol)
+    if current.symbol != product.symbol or not current.is_flat:
+        return None
+    positions = broker.list_account_futures_positions()
+    regular = broker.list_account_open_orders(conditional=False)
+    conditional = broker.list_account_open_orders(conditional=True)
+    if not isinstance(positions, list | tuple) or positions:
+        return None
+    if not isinstance(regular, list | tuple) or regular:
+        return None
+    if not isinstance(conditional, list | tuple) or conditional:
+        return None
+    if product.trade_log.is_symlink() or not product.trade_log.exists():
+        return None
+    try:
+        with product.trade_log.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error):
+        return None
+    matches = [row for row in rows if row.get("exit_event_id") == last["exit_event_id"]]
+    if len(matches) != 1 or matches[0].get("exit_reason") != "emergency_flatten":
+        return None
+    return {
+        "exit_event_id": last["exit_event_id"],
+        "flatten_client_id": last["flatten_client_id"],
+        "trade_log": str(product.trade_log),
+        "whole_account_positions": 0,
+        "whole_account_regular_orders": 0,
+        "whole_account_conditional_orders": 0,
+    }
+
+
+def _finalize_proven_futures_flatten(
+    product: ProductConfig,
+    broker: Any,
+    status: dict[str, Any],
+    intent: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        current = broker.get_position(product.symbol)
+        if not current.is_flat:
+            raise RuntimeError(
+                "Durable broker-flat evidence exists but the account is exposed again."
+            )
+        fill = _fill_from_flatten_intent(intent)
+        expected_stops = _local_futures_protective_stops(product)
+        stop_cleanup = _finish_futures_native_stop_cleanup(product, broker, expected_stops)
+        accounting = _commit_flatten_exit_accounting(
+            product,
+            broker,
+            intent=intent,
+            fill=fill,
+            quote_balance_after=float(intent["quote_balance_after"]),
+            native_stop_cleanup=stop_cleanup,
+        )
+    except Exception as exc:
+        status.update(
+            ok=False,
+            reason="flatten_accounting_unresolved",
+            error=f"{type(exc).__name__}: {exc}",
+            flatten_intent=intent,
+            operator_action=(
+                "Keep the product paused; broker exposure may be flat, but the durable stop, "
+                "trade ledger, or local accounting transition is not committed."
+            ),
+        )
+        return status
+    unresolved_pending = bool(accounting["pending_order_retained"])
+    status.update(
+        ok=not unresolved_pending,
+        flattened=True,
+        reason=(
+            "flatten_accounted"
+            if not unresolved_pending
+            else "preexisting_order_reconciliation_retained"
+        ),
+        fill=intent["fill"],
+        position_after=intent["position_after"],
+        native_stop_cleanup=stop_cleanup,
+        accounting=accounting,
+    )
+    return status
+
+
+def _flatten_futures_product(
+    product: ProductConfig,
+    status: dict[str, Any],
+    broker: Any,
+    account_fingerprint: str,
+) -> dict[str, Any]:
+    try:
+        already_accounted = _already_accounted_futures_flatten(product, broker)
+    except Exception as exc:
+        status.update(
+            reason="already_accounted_flatten_verification_failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return status
+    if already_accounted is not None:
+        status.update(
+            ok=True,
+            skipped=True,
+            flattened=False,
+            reason="already_accounted_flat",
+            accounting=already_accounted,
+        )
+        return status
+    try:
+        resumed = _resume_flatten_exit_accounting(product, broker)
+    except Exception as exc:
+        status.update(
+            reason="unresolved_exit_accounting_intent",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return status
+    if resumed is not None:
+        status.update(
+            ok=True,
+            flattened=True,
+            reason="exit_accounting_resumed",
+            accounting=resumed,
+        )
+        return status
+
+    try:
+        accounting_bot = _flatten_accounting_bot(product, broker)
+        strategy, local_position = _flatten_strategy_and_position(accounting_bot)
+    except Exception as exc:
+        status.update(
+            reason="flatten_accounting_precondition_failed",
+            error=f"{type(exc).__name__}: {exc}",
+            operator_action=(
+                "Keep the product paused; reconcile durable strategy/position accounting "
+                "evidence before submitting a close."
+            ),
+        )
+        return status
+    state = accounting_bot.state
+    existing_raw = state.get("flatten_intent")
+    if existing_raw is not None:
+        try:
+            existing = _validated_futures_flatten_intent(
+                product,
+                existing_raw,
+                position=local_position,
+            )
+        except Exception as exc:
+            status.update(
+                reason="unresolved_flatten_intent",
+                error=f"{type(exc).__name__}: {exc}",
+                flatten_intent=existing_raw,
+            )
+            return status
+        if existing["phase"] == "broker_flat_proven":
+            return _finalize_proven_futures_flatten(product, broker, status, existing)
+        current = broker.get_position(product.symbol)
+        status.update(
+            reason="unresolved_flatten_intent",
+            error=(
+                "Prepared futures flatten intent has an ambiguous submission boundary; "
+                "reconcile its deterministic client ID before any retry."
+            ),
+            flatten_intent=existing,
+            position_current={
+                "symbol": current.symbol,
+                "qty": current.qty,
+                "avg_price": current.avg_price,
+            },
+            operator_action=(
+                "Keep the product paused. The runtime will not submit a second close order."
+            ),
+        )
+        return status
+
+    before = broker.get_position(product.symbol)
+    status["position_before"] = {
+        "symbol": before.symbol,
+        "qty": before.qty,
+        "avg_price": before.avg_price,
+    }
+    if before.is_flat:
+        status.update(
+            reason="unresolved_flat_without_exit_fill",
+            error=(
+                "Broker is flat while local accounting remains open, but no durable close "
+                "fill proves price and fees. Local position state was retained."
+            ),
+        )
+        return status
+
+    expected_qty = _positive_evidence_float(local_position.get("broker_qty"))
+    direction = str(local_position.get("direction") or "").lower()
+    expected_signed = (
+        expected_qty
+        if direction == "long" and expected_qty is not None
+        else -expected_qty
+        if direction == "short" and expected_qty is not None
+        else None
+    )
+    before_qty = _evidence_float(before.qty)
+    before_price = _positive_evidence_float(before.avg_price)
+    tolerance = max(abs(float(before_qty or 0.0)) * 1e-9, 1e-12)
+    if (
+        before.symbol != product.symbol
+        or before_qty is None
+        or before_price is None
+        or expected_signed is None
+        or abs(before_qty - expected_signed) > tolerance
+    ):
+        status.update(
+            reason="broker_position_reconciliation_failed",
+            error="Broker position does not exactly match the single durable position.",
+        )
+        return status
+
+    side = OrderSide.SELL if before_qty > 0 else OrderSide.BUY
+    normalizer = getattr(broker, "normalize_order_qty", None)
+    try:
+        normalized_qty = float(
+            normalizer(
+                product.symbol,
+                abs(before_qty),
+                price=before_price,
+                reduce_only=True,
+            )
+            if callable(normalizer)
+            else abs(before_qty)
+        )
+    except Exception as exc:
+        status.update(reason="invalid_futures_flatten_qty", error=str(exc))
+        return status
+    if (
+        not math.isfinite(normalized_qty)
+        or normalized_qty <= 0
+        or abs(normalized_qty - abs(before_qty)) > tolerance
+    ):
+        status.update(
+            reason="invalid_futures_flatten_qty",
+            error="Venue normalization did not preserve the complete open-position size.",
+        )
+        return status
+
+    quote_before = _strict_flatten_number(
+        broker.get_balance(),
+        field="quote_balance_before",
+        non_negative=True,
+    )
+    position_digest = _flatten_state_digest(
+        local_position,
+        label="Emergency flatten position",
+    )
+    client_id = _futures_flatten_client_id(
+        strategy_id=strategy["id"],
+        symbol=product.symbol,
+        side=side,
+        qty=normalized_qty,
+        position_digest=position_digest,
+        broker_account_fingerprint=account_fingerprint,
+    )
+    raw_intent = {
+        "version": 1,
+        "phase": "prepared",
+        "strategy_id": strategy["id"],
+        "symbol": product.symbol,
+        "side": side.value,
+        "order_type": OrderType.MARKET.value,
+        "reduce_only": True,
+        "submission_kind": "reduce_only_market",
+        "client_id": client_id,
+        "broker_account_fingerprint": account_fingerprint,
+        "qty": normalized_qty,
+        "position_digest": position_digest,
+        "position_before": {
+            "symbol": before.symbol,
+            "qty": before_qty,
+            "avg_price": before_price,
+        },
+        "quote_balance_before": quote_before,
+        "fill": None,
+        "position_after": None,
+        "quote_balance_after": None,
+        "realized_account_delta": None,
+        "created_ts": time.time(),
+        "proven_ts": None,
+    }
+    intent = _validated_futures_flatten_intent(
+        product,
+        raw_intent,
+        position=local_position,
+    )
+    try:
+        _persist_flatten_intent(product, state, intent)
+    except Exception as exc:
+        status.update(reason="flatten_intent_persist_failed", error=str(exc))
+        return status
+
+    order = Order(
+        symbol=product.symbol,
+        side=side,
+        qty=normalized_qty,
+        type=OrderType.MARKET,
+        reduce_only=True,
+        client_id=client_id,
+    )
+    status["flatten_intent"] = intent
+    try:
+        fill = broker.place_order(order)
+        _assert_futures_flatten_fill_valid(product, before, fill)
+    except Exception as exc:
+        status.update(
+            reason="unresolved_flatten_intent",
+            close_error=f"{type(exc).__name__}: {exc}",
+            operator_action=(
+                "Keep the product paused and reconcile the deterministic client ID; no "
+                "automatic retry will submit another close."
+            ),
+        )
+        try:
+            attempted = broker.get_position(product.symbol)
+            status["position_after_attempt"] = {
+                "symbol": attempted.symbol,
+                "qty": attempted.qty,
+                "avg_price": attempted.avg_price,
+                "is_flat": attempted.is_flat,
+            }
+        except Exception as readback_exc:
+            status["position_after_attempt_error"] = str(readback_exc)
+        return status
+
+    after = broker.get_position(product.symbol)
+    quote_after = _strict_flatten_number(
+        broker.get_balance(),
+        field="quote_balance_after",
+        non_negative=True,
+    )
+    fill_payload = {
+        "symbol": fill.symbol,
+        "side": _fill_side_value(fill),
+        "qty": float(fill.qty),
+        "price": float(fill.price),
+        "fee": float(fill.fee),
+        "timestamp": float(fill.timestamp),
+    }
+    status.update(fill=fill_payload, flattened=True)
+    if not after.is_flat:
+        status.update(
+            reason="unresolved_flatten_intent",
+            error=f"Flatten fill returned but broker position remains {after.qty:g}.",
+        )
+        return status
+    proven_raw = {
+        **intent,
+        "phase": "broker_flat_proven",
+        "fill": fill_payload,
+        "position_after": {
+            "symbol": after.symbol,
+            "qty": float(after.qty),
+            "avg_price": float(after.avg_price),
+        },
+        "quote_balance_after": quote_after,
+        "realized_account_delta": quote_after - quote_before,
+        "proven_ts": time.time(),
+    }
+    proven = _validated_futures_flatten_intent(
+        product,
+        proven_raw,
+        position=local_position,
+    )
+    try:
+        _persist_proven_flatten_intent(product, intent, proven)
+    except Exception as exc:
+        status.update(
+            reason="flatten_accounting_evidence_persist_failed",
+            error=str(exc),
+            operator_action=(
+                "Keep the product paused; broker exposure is flat but fill/account evidence "
+                "did not reach durable state."
+            ),
+        )
+        return status
+    return _finalize_proven_futures_flatten(product, broker, status, proven)
 
 
 def flatten_product_once(product: ProductConfig) -> dict[str, Any]:
@@ -2889,58 +3865,16 @@ def flatten_product_once(product: ProductConfig) -> dict[str, Any]:
     )
     broker = build_live_broker(product)
     account_fingerprint = _assert_futures_flatten_account_binding(product, broker)
-    status["broker_account_fingerprint"] = account_fingerprint
-    before = broker.get_position(product.symbol)
     status.update(
         broker=broker.name,
-        position_before={"symbol": before.symbol, "qty": before.qty, "avg_price": before.avg_price},
+        broker_account_fingerprint=account_fingerprint,
     )
-    if before.is_flat:
-        status.update(flattened=False, reason="already_flat")
-        return _finalize_futures_flatten_state(product, broker, status)
-
-    try:
-        fill = broker.close_position(product.symbol)
-        if fill is not None:
-            _assert_futures_flatten_fill_valid(product, before, fill)
-    except Exception as exc:
-        status["close_error"] = f"{type(exc).__name__}: {exc}"
-        try:
-            after = broker.get_position(product.symbol)
-            status["position_after_attempt"] = {
-                "symbol": after.symbol,
-                "qty": after.qty,
-                "avg_price": after.avg_price,
-                "is_flat": after.is_flat,
-            }
-        except Exception as readback_exc:
-            status["position_after_attempt_error"] = (
-                f"{type(readback_exc).__name__}: {readback_exc}"
-            )
-        status["ok"] = False
-        return status
-    after = broker.get_position(product.symbol)
-    status.update(
-        flattened=fill is not None,
-        fill=None
-        if fill is None
-        else {
-            "symbol": fill.symbol,
-            "side": fill.side.value,
-            "qty": fill.qty,
-            "price": fill.price,
-            "fee": fill.fee,
-            "timestamp": fill.timestamp,
-        },
-        position_after={"symbol": after.symbol, "qty": after.qty, "avg_price": after.avg_price},
+    return _flatten_futures_product(
+        product,
+        status,
+        broker,
+        account_fingerprint,
     )
-    if not after.is_flat:
-        status["ok"] = False
-        status["error"] = (
-            f"{product.name}: flatten order sent but broker position is not flat: {after.qty}"
-        )
-        return status
-    return _finalize_futures_flatten_state(product, broker, status)
 
 
 def _bot_cycle_errors(bot: PaperTradingBot) -> list[dict[str, Any]]:

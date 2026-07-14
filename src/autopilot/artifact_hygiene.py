@@ -120,7 +120,9 @@ def inspect_product_artifact(
     return report
 
 
-def find_unreferenced_active_artifacts(config: AutopilotConfig, outputs_dir: Path) -> list[dict[str, Any]]:
+def find_unreferenced_active_artifacts(
+    config: AutopilotConfig, outputs_dir: Path
+) -> list[dict[str, Any]]:
     referenced = {product.strategies_path.resolve() for product in config.products}
     if not outputs_dir.exists():
         return []
@@ -230,7 +232,9 @@ def build_artifact_hygiene_report(
     products = []
     for product in config.products:
         try:
-            products.append(inspect_product_artifact(product, apply=apply, quarantine_dir=quarantine_dir))
+            products.append(
+                inspect_product_artifact(product, apply=apply, quarantine_dir=quarantine_dir)
+            )
         except Exception as exc:
             error = _hygiene_error("configured_product", product.strategies_path, exc)
             errors.append({**error, "product": product.name})
@@ -277,9 +281,7 @@ def build_artifact_hygiene_report(
             for item in historical
             if item.get("action") == "error" and item.get("error")
         )
-    quarantine_candidates = [
-        item for item in products if item.get("quarantine_candidate")
-    ]
+    quarantine_candidates = [item for item in products if item.get("quarantine_candidate")]
     return {
         "ok": not errors,
         "generated_at": utc_now(),
@@ -309,7 +311,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("runtime/artifact_hygiene.json"))
     parser.add_argument("--outputs-dir", type=Path, default=PROJECT_ROOT / "outputs")
     parser.add_argument("--quarantine-dir", type=Path, default=DEFAULT_QUARANTINE_DIR)
-    parser.add_argument("--apply", action="store_true", help="Move policy-blocked paper artifacts to quarantine.")
+    parser.add_argument(
+        "--apply", action="store_true", help="Move policy-blocked paper artifacts to quarantine."
+    )
     parser.add_argument(
         "--quarantine-unreferenced-active",
         action="store_true",

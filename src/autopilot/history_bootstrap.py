@@ -333,15 +333,33 @@ def _merge_frames(*frames: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
-def _manifest_prefix_complete(path: Path, requested_start: pd.Timestamp) -> bool:
-    if not path.exists() or path.is_symlink():
+def _manifest_prefix_complete(
+    path: Path,
+    requested_start: pd.Timestamp,
+    available: pd.DataFrame,
+) -> bool:
+    """Trust a prior empty-prefix probe only while its saved prefix survives.
+
+    A manifest may legitimately record that Binance history starts after the
+    requested date.  It must not, however, hide accidental truncation of the
+    candle parquet.  Binding the probe to the first saved timestamp preserves
+    the listing-date case and forces a prefix repair when initial rows vanish.
+    """
+
+    if not path.exists() or path.is_symlink() or available.empty:
         return False
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         checked = _utc_timestamp(payload["prefix_checked_from"])
+        recorded_first = _utc_timestamp(payload["first_timestamp"])
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return False
-    return bool(payload.get("prefix_complete") is True and checked <= requested_start)
+    actual_first = _utc_timestamp(available.index.min())
+    return bool(
+        payload.get("prefix_complete") is True
+        and checked <= requested_start
+        and actual_first <= recorded_first
+    )
 
 
 def _missing_ranges(
@@ -467,7 +485,11 @@ def sync_requirement(
     existing = _load_candles(candle_path, requirement.timeframe)
     checkpoint = _load_candles(checkpoint_path, requirement.timeframe, checkpoint=True)
     available = _merge_frames(existing, checkpoint)
-    prefix_complete = _manifest_prefix_complete(manifest_path, requirement.start)
+    prefix_complete = _manifest_prefix_complete(
+        manifest_path,
+        requirement.start,
+        available,
+    )
     ranges = _missing_ranges(
         available,
         start=requirement.start,

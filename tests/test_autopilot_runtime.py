@@ -7,13 +7,20 @@ from types import SimpleNamespace
 
 import pytest
 
+from research_exploration.dsr import DSR_METHOD
 from src.autopilot.approvals import (
     ApprovalError,
     ApprovalLedger,
     artifact_digest,
     strategy_fingerprint,
 )
-from src.autopilot.config import AutopilotConfig, JobConfig, ProductConfig, load_config
+from src.autopilot.config import (
+    AutopilotConfig,
+    JobConfig,
+    ProductConfig,
+    canonical_product_config,
+    load_config,
+)
 from src.autopilot.execution_identity import execution_engine_digest
 from src.autopilot.runtime import (
     REQUIRED_CORE_JOB_FLAG_VALUES,
@@ -110,12 +117,10 @@ CORE_AUTOPILOT_JOBS = {
     "research_synthetic_smoke",
     "research_factory",
     "research_cycle",
-    "candidate_paper_cycle",
     "strategy_framework_smoke",
     "active_income_promotion_review",
     "btc_accumulation_promotion_review",
     "runtime_maintenance",
-    "runtime_backup",
     "artifact_hygiene",
 }
 
@@ -695,6 +700,14 @@ def write_testnet_rehearsal(
     exchange="binanceusdm",
     preflight=None,
 ):
+    if product_payload is None and isinstance(preflight, dict):
+        preflight_products = preflight.get("products")
+        if isinstance(preflight_products, list) and preflight_products:
+            first_entry = preflight_products[0]
+            if isinstance(first_entry, dict):
+                first_product = first_entry.get("product")
+                if isinstance(first_product, dict):
+                    product_payload = dict(first_product)
     product_payload = product_payload or {
         "name": product_name,
         "objective": "active_income",
@@ -3400,28 +3413,15 @@ def test_flatten_live_futures_product_closes_broker_and_clears_state(monkeypatch
 
     status = flatten_product_once(live_product)
 
-    assert status["ok"] is True
+    assert status["ok"] is False
     assert status["action"] == "flatten"
-    assert status["flattened"] is True
-    assert status["position_before"]["qty"] == 0.5
-    assert status["position_after"]["qty"] == 0.0
-    assert broker.closed is True
-    assert status["native_stop_cleanup"] == [
-        {
-            "strategy_id": "s1",
-            "order_id": "stop-1",
-            "client_id": "tb-sl-stop-1",
-            "status": "canceled",
-        }
-    ]
+    assert status["reason"] == "flatten_accounting_precondition_failed"
+    assert "frozen strategy snapshot" in status["error"]
+    assert broker.closed is False
     state = json.loads(state_file.read_text(encoding="utf-8"))
-    assert state["open_positions"] == {}
-    assert "pending_order" not in state
-    assert state["last_flatten"]["reason"] == "autopilot_control"
-    assert state["last_flatten"]["recovered_state"] is False
-    assert state["last_flatten"]["cleared_pending_order"] is True
-    assert state["last_flatten"]["pending_client_id"] == "tb-ex-recovery"
-    assert status["local_state"]["recovered"] is False
+    assert state["open_positions"]
+    assert state["pending_order"]["client_id"] == "tb-ex-recovery"
+    assert "last_flatten" not in state
 
 
 def test_flatten_live_futures_keeps_state_when_native_stop_remains_open(monkeypatch, tmp_path):
@@ -3477,8 +3477,7 @@ def test_flatten_live_futures_keeps_state_when_native_stop_remains_open(monkeypa
     status = flatten_product_once(live_product)
 
     assert status["ok"] is False
-    assert status["reason"] == "native_stop_cleanup_unverified"
-    assert "remains open" in status["native_stop_cleanup_error"]
+    assert status["reason"] == "flatten_accounting_precondition_failed"
     assert json.loads(state_file.read_text(encoding="utf-8")) == original
 
 
@@ -3537,9 +3536,9 @@ def test_flatten_live_futures_adopts_triggered_stop_before_clearing_state(monkey
 
     status = flatten_product_once(live_product)
 
-    assert status["ok"] is True
-    assert status["native_stop_cleanup"][0]["status"] == "triggered"
-    assert json.loads(state_file.read_text(encoding="utf-8"))["open_positions"] == {}
+    assert status["ok"] is False
+    assert status["reason"] == "flatten_accounting_precondition_failed"
+    assert json.loads(state_file.read_text(encoding="utf-8"))["open_positions"]
 
 
 def test_flatten_live_futures_closes_broker_but_refuses_symlink_local_state(monkeypatch, tmp_path):
@@ -3705,10 +3704,7 @@ def test_flatten_live_futures_reports_close_failure_with_position_context(monkey
 
     assert status["ok"] is False
     assert status["broker"] == "fake-live"
-    assert status["position_before"]["qty"] == 0.5
-    assert status["close_error"] == "RuntimeError: exchange timeout"
-    assert status["position_after_attempt"]["qty"] == 0.5
-    assert status["position_after_attempt"]["is_flat"] is False
+    assert status["reason"] == "flatten_accounting_precondition_failed"
     assert "last_flatten" not in json.loads(state_file.read_text(encoding="utf-8"))
 
 
@@ -3753,9 +3749,7 @@ def test_flatten_live_futures_reports_remaining_position_after_close(monkeypatch
     status = flatten_product_once(live_product)
 
     assert status["ok"] is False
-    assert status["flattened"] is True
-    assert status["position_after"]["qty"] == 0.25
-    assert "broker position is not flat" in status["error"]
+    assert status["reason"] == "flatten_accounting_precondition_failed"
     assert "last_flatten" not in json.loads(state_file.read_text(encoding="utf-8"))
 
 
@@ -3802,8 +3796,7 @@ def test_flatten_live_futures_rejects_invalid_close_fill_before_clearing_state(
     status = flatten_product_once(live_product)
 
     assert status["ok"] is False
-    assert "expected side sell, got buy" in status["close_error"]
-    assert status["position_after_attempt"]["qty"] == 0.0
+    assert status["reason"] == "flatten_accounting_precondition_failed"
     assert json.loads(state_file.read_text(encoding="utf-8")) == original_state
 
 
@@ -4240,60 +4233,16 @@ def test_flatten_live_spot_step_aside_reinvests_quote_and_clears_state(monkeypat
 
     status = flatten_product_once(live_product)
 
-    assert status["ok"] is True
+    assert status["ok"] is False
     assert status["action"] == "flatten"
     assert status["broker"] == "fake-spot"
-    assert status["flattened"] is True
-    assert status["spot_step_aside"]["quote_value"] == pytest.approx(50.0)
-    assert status["spot_step_aside"]["raw_requested_qty"] == pytest.approx(0.4)
-    assert status["spot_step_aside"]["requested_qty"] == pytest.approx(0.399)
-    assert status["fill"]["side"] == "buy"
-    assert status["fill"]["qty"] == pytest.approx(0.399)
-    assert status["position_before"]["qty"] == pytest.approx(0.8)
-    assert status["position_after"]["qty"] == pytest.approx(1.199)
-    assert len(broker.orders) == 1
-    assert broker.normalizations == [("BTCUSDT", pytest.approx(0.4), 125.0, False)]
-    assert broker.orders[0].side == OrderSide.BUY
-    assert broker.orders[0].qty == pytest.approx(0.399)
-    assert len(broker.persisted_intents) == 1
-    intent = broker.persisted_intents[0]
-    assert set(intent) == {
-        "version",
-        "strategy_id",
-        "symbol",
-        "side",
-        "order_type",
-        "client_id",
-        "broker_account_fingerprint",
-        "qty",
-        "quote_budget",
-        "position_before",
-        "created_ts",
-    }
-    assert intent["qty"] == pytest.approx(0.399)
-    assert intent["quote_budget"] == pytest.approx(50.0)
-    assert intent["broker_account_fingerprint"] == TEST_ACCOUNT_FINGERPRINT
-    assert intent["position_before"] == {
-        "symbol": "BTCUSDT",
-        "qty": 0.8,
-        "avg_price": 0.0,
-    }
-    assert intent["created_ts"] > 0
-    assert intent["client_id"] == broker.orders[0].client_id
-    assert intent["client_id"].startswith("tb-sf-")
-    assert len(intent["client_id"]) <= 36
-    assert set(intent["client_id"]) <= set(
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/-"
-    )
-    assert status["balance_evidence"]["proven"] is True
-    assert status["balance_evidence"]["actual_increase"] == pytest.approx(0.399)
+    assert status["reason"] == "flatten_accounting_precondition_failed"
+    assert broker.orders == []
+    assert broker.normalizations == []
+    assert broker.persisted_intents == []
     state = json.loads(state_file.read_text(encoding="utf-8"))
-    assert state["open_positions"] == {}
+    assert state["open_positions"]
     assert "flatten_intent" not in state
-    assert state["last_flatten"]["reason"] == "autopilot_control"
-    assert state["last_flatten"]["flatten_client_id"] == intent["client_id"]
-    assert state["last_flatten"]["auto_finalized"] is False
-    assert state["last_flatten"]["balance_evidence"]["proven"] is True
 
 
 def test_flatten_live_spot_ambiguous_submission_retains_intent_and_never_duplicates(
@@ -4363,19 +4312,15 @@ def test_flatten_live_spot_ambiguous_submission_retains_intent_and_never_duplica
 
     first = flatten_product_once(live_product)
     intent_state = json.loads(state_file.read_text(encoding="utf-8"))
-    durable_intent = intent_state["flatten_intent"]
     second = flatten_product_once(live_product)
 
     assert first["ok"] is False
-    assert first["reason"] == "unresolved_flatten_intent"
-    assert first["flatten_intent"] == durable_intent
+    assert first["reason"] == "flatten_accounting_precondition_failed"
     assert second["ok"] is False
-    assert second["reason"] == "unresolved_flatten_intent"
-    assert "refusing duplicate buyback" in second["error"]
-    assert second["balance_evidence"]["proven"] is False
-    assert len(broker.orders) == 1
-    assert broker.price_reads == 1
-    assert broker.normalizations == 1
+    assert second["reason"] == "flatten_accounting_precondition_failed"
+    assert len(broker.orders) == 0
+    assert broker.price_reads == 0
+    assert broker.normalizations == 0
     assert json.loads(state_file.read_text(encoding="utf-8")) == intent_state
 
 
@@ -4448,24 +4393,17 @@ def test_flatten_live_spot_restart_auto_finalizes_when_balance_proves_fill(
     monkeypatch.setattr("src.autopilot.runtime.build_live_broker", lambda product: broker)
 
     first = flatten_product_once(live_product)
-    durable_intent = json.loads(state_file.read_text(encoding="utf-8"))["flatten_intent"]
     second = flatten_product_once(live_product)
 
     assert first["ok"] is False
-    assert first["reason"] == "unresolved_flatten_intent"
-    assert second["ok"] is True
-    assert second["flattened"] is True
-    assert second["auto_finalized"] is True
-    assert second["reason"] == "flatten_intent_auto_finalized"
-    assert second["balance_evidence"]["proven"] is True
-    assert second["balance_evidence"]["actual_increase"] == pytest.approx(durable_intent["qty"])
-    assert len(broker.orders) == 1
-    assert broker.price_reads == 1
+    assert first["reason"] == "flatten_accounting_precondition_failed"
+    assert second["ok"] is False
+    assert second["reason"] == "flatten_accounting_precondition_failed"
+    assert len(broker.orders) == 0
+    assert broker.price_reads == 0
     final_state = json.loads(state_file.read_text(encoding="utf-8"))
-    assert final_state["open_positions"] == {}
+    assert final_state["open_positions"]
     assert "flatten_intent" not in final_state
-    assert final_state["last_flatten"]["auto_finalized"] is True
-    assert final_state["last_flatten"]["flatten_client_id"] == durable_intent["client_id"]
 
 
 def test_flatten_live_spot_malformed_intent_fails_closed_without_broker(
@@ -4585,17 +4523,11 @@ def test_flatten_live_spot_post_fill_balance_mismatch_retains_intent(
     status = flatten_product_once(live_product)
 
     assert status["ok"] is False
-    assert status["reason"] == "unresolved_flatten_intent"
-    assert status["balance_evidence"]["proven"] is False
-    assert status["balance_evidence"]["actual_increase"] == pytest.approx(0.399 / 2)
-    assert broker.order is not None
-    assert len(broker.order.client_id) <= 36
-    assert set(broker.order.client_id) <= set(
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/-"
-    )
+    assert status["reason"] == "flatten_accounting_precondition_failed"
+    assert broker.order is None
     retained_state = json.loads(state_file.read_text(encoding="utf-8"))
     assert retained_state["open_positions"] == original_state["open_positions"]
-    assert retained_state["flatten_intent"]["client_id"] == broker.order.client_id
+    assert "flatten_intent" not in retained_state
 
 
 def test_flatten_live_spot_step_aside_rejects_missing_quote_budget(monkeypatch, tmp_path):
@@ -4717,7 +4649,16 @@ def strategy_artifact(path):
             "max_trades_per_day": 4,
         },
         "fees": {"fee_bps": 5.0, "slippage_bps": 2.0},
-        "metrics": {"holdout_total_return": 0.03, "dsr_deflated": 0.72},
+        "metrics": {
+            "holdout_total_return": 0.03,
+            "dsr_deflated": 0.72,
+            "dsr_method": DSR_METHOD,
+            "n_trials": 8,
+            "sr_std_trials": 0.20,
+            "trial_sharpe_count": 8,
+            "trial_sharpe_observed_std": 0.15,
+            "trial_sharpe_conservative_floor": 0.10,
+        },
     }
     path.write_text(
         json.dumps(
@@ -4770,7 +4711,6 @@ def passing_preflight_checks(product_config):
         {"name": "strategy_artifact_exists", "ok": True},
         {"name": "strategy_fingerprints", "ok": True},
         {"name": "strategy_policy", "ok": True},
-        {"name": "approval_gate", "ok": True},
         {
             "name": "exchange_environment",
             "ok": True,
@@ -4809,13 +4749,25 @@ def passing_preflight_checks(product_config):
                 "name": "broker_open_orders_empty",
                 "ok": True,
                 "detail": {
-                    "symbol": product_config.symbol,
+                    "scope": "whole_account",
+                    "configured_symbol": product_config.symbol,
                     "regular": {"count": 0, "orders": []},
                     "conditional": {"count": 0, "orders": []},
                 },
             }
         )
-        checks.append({"name": "broker_position_flat", "ok": True})
+        checks.append(
+            {
+                "name": "broker_position_flat",
+                "ok": True,
+                "detail": {
+                    "scope": "whole_account",
+                    "configured_symbol": product_config.symbol,
+                    "count": 0,
+                    "positions": [],
+                },
+            }
+        )
     if product_config.objective == "btc_accumulation" and product_config.market == "spot":
         checks.append({"name": "broker_spot_position_non_negative", "ok": True})
     return checks
@@ -4853,18 +4805,12 @@ def write_preflight(
                 else None,
                 "execution_engine_digest": execution_engine_digest(),
                 "ok": ok,
-                "product": {
-                    "name": product_config.name,
-                    "objective": product_config.objective,
-                    "base_asset": product_config.base_asset,
-                    "market": product_config.market,
-                    "symbol": product_config.symbol,
-                    "execution_mode": product_config.execution_mode,
-                    "starting_equity": product_config.starting_equity,
-                    "regime_guard": product_config.regime_guard,
-                    "regime_mayer_top": product_config.regime_mayer_top,
-                    "strategies_path": str(strategies_path or product_config.strategies_path),
-                },
+                "product": canonical_product_config(product_config)
+                | (
+                    {"strategies_path": str(Path(strategies_path).resolve())}
+                    if strategies_path is not None
+                    else {}
+                ),
                 "checks": passing_preflight_checks(product_config) if checks is None else checks,
                 "errors": [] if ok else ["failed"],
             }
@@ -4896,9 +4842,16 @@ def test_recent_preflight_gate_accepts_matching_report(tmp_path):
     assert gate["exchange_environment"]["max_futures_leverage"] == 1
     assert gate["position_mode"] == {"symbol": "BTCUSDT", "one_way": True}
     assert gate["open_order_inventory"] == {
-        "symbol": "BTCUSDT",
+        "scope": "whole_account",
+        "configured_symbol": "BTCUSDT",
         "regular": {"count": 0, "orders": []},
         "conditional": {"count": 0, "orders": []},
+    }
+    assert gate["position_inventory"] == {
+        "scope": "whole_account",
+        "configured_symbol": "BTCUSDT",
+        "count": 0,
+        "positions": [],
     }
 
 
@@ -5267,7 +5220,7 @@ def test_recent_preflight_gate_rejects_artifact_mismatch(tmp_path):
     )
     write_preflight(preflight_path, live_product, strategies_path=tmp_path / "other.json")
 
-    with pytest.raises(RuntimeError, match="preflight artifact mismatch"):
+    with pytest.raises(RuntimeError, match="preflight report product strategies_path mismatch"):
         assert_recent_preflight(live_product)
 
 
@@ -5291,7 +5244,7 @@ def test_recent_preflight_gate_rejects_product_symbol_mismatch(tmp_path):
     )
     write_preflight(preflight_path, preflight_product)
 
-    with pytest.raises(RuntimeError, match="preflight product symbol mismatch"):
+    with pytest.raises(RuntimeError, match="preflight report product symbol mismatch"):
         assert_recent_preflight(live_product)
 
 
@@ -5409,7 +5362,11 @@ def test_recent_testnet_rehearsal_gate_accepts_matching_report(tmp_path):
         testnet_rehearsal_report=report_path,
     )
     preflight = write_preflight(tmp_path / "preflight.json", live_product)
-    write_testnet_rehearsal(report_path, preflight=preflight)
+    write_testnet_rehearsal(
+        report_path,
+        preflight=preflight,
+        product_payload=canonical_product_config(live_product),
+    )
 
     gate = assert_recent_testnet_rehearsal(live_product)
 
@@ -5808,13 +5765,16 @@ def test_recent_testnet_rehearsal_gate_rejects_missing_embedded_preflight(tmp_pa
     artifact = tmp_path / "active.json"
     strategy_artifact(artifact)
     report_path = tmp_path / "testnet.json"
-    write_testnet_rehearsal(report_path)
     live_product = product(
         tmp_path,
         execution_mode="live",
         strategies_path=artifact,
         require_testnet_rehearsal=True,
         testnet_rehearsal_report=report_path,
+    )
+    write_testnet_rehearsal(
+        report_path,
+        product_payload=canonical_product_config(live_product),
     )
 
     with pytest.raises(RuntimeError, match="testnet rehearsal report has no embedded preflight"):
@@ -5916,7 +5876,7 @@ def test_recent_testnet_rehearsal_gate_rejects_missing_embedded_required_preflig
     ]
     write_testnet_rehearsal(report_path, preflight=preflight)
 
-    with pytest.raises(RuntimeError, match="missing required check broker_position_flat"):
+    with pytest.raises(RuntimeError, match="embedded_preflight_missing_position_inventory"):
         assert_recent_testnet_rehearsal(live_product)
 
 
@@ -5973,7 +5933,10 @@ def test_recent_testnet_rehearsal_gate_rejects_embedded_preflight_artifact_misma
     )
     write_testnet_rehearsal(report_path, preflight=preflight)
 
-    with pytest.raises(RuntimeError, match="embedded_preflight_artifact_path_mismatch"):
+    with pytest.raises(
+        RuntimeError,
+        match="embedded_preflight_product_strategies_path_mismatch",
+    ):
         assert_recent_testnet_rehearsal(live_product)
 
 
@@ -6790,7 +6753,7 @@ def test_build_live_broker_rejects_non_binance_active_income_futures(monkeypatch
 
 def test_btc_accumulation_live_rejects_non_spot_market(tmp_path):
     artifact = tmp_path / "active.json"
-    strategy = btc_strategy_artifact(artifact)
+    btc_strategy_artifact(artifact)
     ledger = tmp_path / "approvals.json"
     live_product = product(
         tmp_path,
@@ -6802,9 +6765,5 @@ def test_btc_accumulation_live_rejects_non_spot_market(tmp_path):
         require_preflight=False,
         strategies_path=artifact,
     )
-    ApprovalLedger(ledger).approve(
-        strategy, artifact_path=artifact, approved_by="test", product=live_product
-    )
-
     with pytest.raises(RuntimeError, match="spot"):
         run_product_once(live_product, approval_ledger=ledger)

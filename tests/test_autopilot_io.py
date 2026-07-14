@@ -21,7 +21,7 @@ def test_write_json_atomic_writes_sorted_pretty_json(tmp_path):
     write_json_atomic(path, {"b": 2, "a": {"c": 3}})
 
     assert json.loads(path.read_text(encoding="utf-8")) == {"a": {"c": 3}, "b": 2}
-    assert path.read_text(encoding="utf-8").startswith("{\n  \"a\"")
+    assert path.read_text(encoding="utf-8").startswith('{\n  "a"')
 
 
 def test_append_json_line_rejects_symlink_without_touching_target(tmp_path):

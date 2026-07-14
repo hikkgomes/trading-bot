@@ -3,7 +3,12 @@ import json
 
 import pytest
 
-from src.autopilot.config import AutopilotConfig, JobConfig, ProductConfig
+from src.autopilot.config import (
+    AutopilotConfig,
+    JobConfig,
+    ProductConfig,
+    canonical_product_config,
+)
 from src.autopilot.experiment_memory import ExperimentMemory
 from src.autopilot.jobs import job_definition_fingerprint
 from src.autopilot.reporting import (
@@ -54,8 +59,119 @@ def write_trades(path):
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["exit_time", "net_return", "sized_return"])
         writer.writeheader()
-        writer.writerow({"exit_time": "2026-01-01T00:00:00Z", "net_return": "0.02", "sized_return": "0.002"})
-        writer.writerow({"exit_time": "2026-01-01T01:00:00Z", "net_return": "-0.01", "sized_return": "-0.001"})
+        writer.writerow(
+            {"exit_time": "2026-01-01T00:00:00Z", "net_return": "0.02", "sized_return": "0.002"}
+        )
+        writer.writerow(
+            {"exit_time": "2026-01-01T01:00:00Z", "net_return": "-0.01", "sized_return": "-0.001"}
+        )
+
+
+def test_operator_report_surfaces_candidate_paper_digest_freshness_and_readiness(tmp_path):
+    status_file = tmp_path / "status.json"
+    status_file.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "generated_at": "1970-01-01T00:01:40+00:00",
+                "products": [],
+                "jobs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    digest = f"sha256:{'a' * 64}"
+    candidate_status = tmp_path / "candidate_paper_status.json"
+    candidate_status.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "generated_at": "1970-01-01T00:01:40+00:00",
+                "products": [
+                    {
+                        "product": "active_income",
+                        "ok": True,
+                        "candidate": "runtime/candidates/active_income_candidate.json",
+                        "candidate_digest": digest,
+                        "candidate_activation_ready": True,
+                        "open_positions": 2,
+                        "drawdown_halted": False,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = AutopilotConfig(
+        status_file=status_file,
+        approval_ledger=tmp_path / "approvals.json",
+        job_state_file=tmp_path / "jobs.json",
+        research_smoke_file=tmp_path / "research_smoke.json",
+        strategy_smoke_file=tmp_path / "strategy_smoke.json",
+        research_cycle_file=tmp_path / "research_cycle.json",
+        generated_batch_file=tmp_path / "generated.json",
+        experiment_memory_file=tmp_path / "experiment_memory.sqlite3",
+        incubation_candidates_file=tmp_path / "incubation.json",
+        mutation_plan_file=tmp_path / "mutation_plan.json",
+        mutation_batch_file=tmp_path / "mutation_batch.json",
+        artifact_hygiene_file=tmp_path / "hygiene.json",
+        backup_report_file=tmp_path / "backup.json",
+        candidate_paper_enabled=True,
+        candidate_paper_status_file=candidate_status,
+        candidate_paper_cadence_seconds=45,
+        candidate_paper_timeout_seconds=240,
+    )
+
+    report = build_operator_report(config, now_ts=120.0)
+    markdown = render_operator_markdown(report)
+
+    assert report["candidate_paper"] == {
+        "configured": True,
+        "enabled": True,
+        "job": "candidate_paper_timer",
+        "path": str(candidate_status),
+        "exists": True,
+        "status": "ready",
+        "ok": True,
+        "generated_at": "1970-01-01T00:01:40+00:00",
+        "age_seconds": 20.0,
+        "max_age_seconds": 285.0,
+        "fresh": True,
+        "reason": None,
+        "products": [
+            {
+                "product": "active_income",
+                "ok": True,
+                "skipped": False,
+                "reason": None,
+                "error": None,
+                "candidate": "runtime/candidates/active_income_candidate.json",
+                "candidate_digest": digest,
+                "candidate_digest_valid": True,
+                "candidate_activation_ready": True,
+                "open_positions": 2,
+                "drawdown_halted": False,
+            }
+        ],
+        "open_positions": 2,
+        "activation_ready_products": ["active_income"],
+        "drawdown_halted_products": [],
+        "errors": [],
+    }
+    assert "Candidate paper: `ready`" in markdown
+    assert "activation ready active_income" in markdown
+    assert "open positions 2" in markdown
+    assert "active_income aaaaaaaaaaaa valid" in markdown
+
+    candidate_status.unlink()
+    symlink_target = tmp_path / "outside_candidate_status.json"
+    symlink_target.write_text('{"ok": true, "products": []}\n', encoding="utf-8")
+    candidate_status.symlink_to(symlink_target)
+    symlink_report = build_operator_report(config, now_ts=120.0)
+
+    assert symlink_report["candidate_paper"]["status"] == "read_error"
+    assert symlink_report["candidate_paper"]["reason"] == "status_file_symlink"
+    assert symlink_report["candidate_paper"]["ok"] is False
 
 
 def test_operator_report_surfaces_generative_memory_without_holdout_outcomes(tmp_path):
@@ -119,6 +235,11 @@ def test_operator_report_surfaces_generative_memory_without_holdout_outcomes(tmp
             outcome="reject",
             rejection_reasons=("no_train_edge",),
         )
+        memory.register_holdout_cohort(
+            [registration.behavior_hash],
+            dataset={"snapshot_id": "protected-data"},
+            window={"start": "2025-06-01", "end": "2025-07-01"},
+        )
         claim = memory.claim_holdout(
             registration.behavior_hash,
             snapshot_id="protected-data",
@@ -155,9 +276,7 @@ def test_operator_report_surfaces_generative_memory_without_holdout_outcomes(tmp
     assert "private_full_spec" not in json.dumps(report["generated_batch"])
     assert report["experiment_memory"]["integrity"]["ok"] is True
     assert report["experiment_memory"]["feedback"]["outcomes"] == {"reject": 1}
-    assert report["experiment_memory"]["feedback"]["rejection_reasons"] == {
-        "no_train_edge": 1
-    }
+    assert report["experiment_memory"]["feedback"]["rejection_reasons"] == {"no_train_edge": 1}
     assert report["experiment_memory"]["protected_holdout_results_excluded"] is True
     assert "SECRET_HOLDOUT" not in memory_json
     assert "Generative research batch: `ok` (1 bounded hypotheses" in markdown
@@ -173,13 +292,13 @@ def test_operator_report_summarizes_status_approvals_and_trades(tmp_path):
         json.dumps(
             {
                 "ok": True,
-                    "generated_at": "1970-01-01T00:02:00+00:00",
-                    "control": {
-                        "paused": False,
-                        "pause_jobs": True,
-                        "paused_jobs": ["market_data_update_futures"],
-                        "flatten_products": ["active_income"],
-                    },
+                "generated_at": "1970-01-01T00:02:00+00:00",
+                "control": {
+                    "paused": False,
+                    "pause_jobs": True,
+                    "paused_jobs": ["market_data_update_futures"],
+                    "flatten_products": ["active_income"],
+                },
                 "products": [
                     {
                         "ok": True,
@@ -231,7 +350,9 @@ def test_operator_report_summarizes_status_approvals_and_trades(tmp_path):
     approval_ledger.write_text(json.dumps({"approvals": {"abc": {}, "def": {}}}), encoding="utf-8")
     research_smoke_file = tmp_path / "research_smoke.json"
     research_smoke_file.write_text(
-        json.dumps({"ok": True, "generated_at": "2026-01-01T01:00:00+00:00", "scenarios": [{}, {}]}),
+        json.dumps(
+            {"ok": True, "generated_at": "2026-01-01T01:00:00+00:00", "scenarios": [{}, {}]}
+        ),
         encoding="utf-8",
     )
     research_cycle_file = tmp_path / "research_cycle.json"
@@ -417,7 +538,10 @@ def test_operator_report_summarizes_status_approvals_and_trades(tmp_path):
     assert "active_income" in markdown
     assert "state error paper_state: example state warning" in markdown
     assert "## Open Positions" in markdown
-    assert "| active_income | paper | futures | live_r1 | short |  | 0.25 | 100.0 | 101.0 | 98.0 |" in markdown
+    assert (
+        "| active_income | paper | futures | live_r1 | short |  | 0.25 | 100.0 | 101.0 | 98.0 |"
+        in markdown
+    )
     assert "Flatten products: `active_income`" in markdown
     assert "Pause jobs: `True`" in markdown
     assert "Paused jobs: `market_data_update_futures`" in markdown
@@ -461,7 +585,10 @@ def test_operator_report_summarizes_status_approvals_and_trades(tmp_path):
             }
         ],
     }
-    assert "| market_data_update_futures | `True` | `ok` | `True` | 2026-01-01T00:00:00+00:00 | fresh |" in markdown
+    assert (
+        "| market_data_update_futures | `True` | `ok` | `True` | 2026-01-01T00:00:00+00:00 | fresh |"
+        in markdown
+    )
     assert "| disabled_heavy_search | `False` | `disabled` | `False` | never |  |" in markdown
     assert (
         "| active_income | paper | futures | ok | cycle | 1 | 1001.0000 | 1050.0000 | 4.67% | "
@@ -570,8 +697,7 @@ def test_operator_report_surfaces_compact_recovery_and_accounting_state(tmp_path
     expected_markdown = {
         "pending_order": "pending order pending (exit, tb-ex-1)",
         "pending_entry_recovery": (
-            "pending-entry recovery pending "
-            "(recovery_close_failed_position_remains, tb-rc-1)"
+            "pending-entry recovery pending (recovery_close_failed_position_remains, tb-rc-1)"
         ),
         "risk_recovery_incident": (
             "risk recovery incident pending "
@@ -605,7 +731,13 @@ def test_operator_report_surfaces_flatten_failure_diagnostics(tmp_path):
                             "quote_value": 50.0,
                             "requested_qty": 0.4,
                         },
-                        "fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.4, "price": 125.0, "fee": 0.02},
+                        "fill": {
+                            "symbol": "BTCUSDT",
+                            "side": "buy",
+                            "qty": 0.4,
+                            "price": 125.0,
+                            "fee": 0.02,
+                        },
                         "local_state": {"path": str(tmp_path / "state.json"), "recovered": False},
                         "position_before": {"symbol": "BTCUSDT", "qty": 0.5, "avg_price": 100.0},
                         "position_after_error": "RuntimeError: readback timeout",
@@ -844,7 +976,12 @@ def test_operator_report_marks_stale_research_handoffs():
             "research_cycle": {
                 "ok": True,
                 "generated_at": "2026-01-01T01:05:00+00:00",
-                "summary": {"scenarios": 1, "keepers": 0, "incubation_candidates": 1, "exported": 0},
+                "summary": {
+                    "scenarios": 1,
+                    "keepers": 0,
+                    "incubation_candidates": 1,
+                    "exported": 0,
+                },
                 "scenarios": [{}],
                 "exports": [],
             },
@@ -872,12 +1009,10 @@ def test_operator_report_marks_stale_research_handoffs():
     )
 
     assert (
-        "source stale (research 2026-01-01T01:05:00+00:00, "
-        "plan source 2026-01-01T00:55:00+00:00)"
+        "source stale (research 2026-01-01T01:05:00+00:00, plan source 2026-01-01T00:55:00+00:00)"
     ) in markdown
     assert (
-        "source stale (plan 2026-01-01T01:06:00+00:00, "
-        "batch source 2026-01-01T00:56:00+00:00)"
+        "source stale (plan 2026-01-01T01:06:00+00:00, batch source 2026-01-01T00:56:00+00:00)"
     ) in markdown
 
 
@@ -887,8 +1022,12 @@ def test_operator_report_surfaces_invalid_trade_log_rows(tmp_path):
     with trade_log.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["exit_time", "net_return", "sized_return"])
         writer.writeheader()
-        writer.writerow({"exit_time": "2026-01-01T00:00:00Z", "net_return": "0.02", "sized_return": "0.002"})
-        writer.writerow({"exit_time": "2026-01-01T01:00:00Z", "net_return": "bad", "sized_return": "also_bad"})
+        writer.writerow(
+            {"exit_time": "2026-01-01T00:00:00Z", "net_return": "0.02", "sized_return": "0.002"}
+        )
+        writer.writerow(
+            {"exit_time": "2026-01-01T01:00:00Z", "net_return": "bad", "sized_return": "also_bad"}
+        )
     status_file = tmp_path / "status.json"
     status_file.write_text(
         json.dumps(
@@ -1289,19 +1428,19 @@ def test_operator_markdown_surfaces_invalid_testnet_rehearsal_reasons():
 
 def test_operator_report_uses_required_product_testnet_rehearsal_path(tmp_path):
     rehearsal = tmp_path / "custom_testnet_rehearsal.json"
+    expected_product = product(
+        tmp_path,
+        require_testnet_rehearsal=True,
+        testnet_rehearsal_report=rehearsal,
+        testnet_rehearsal_max_age_seconds=60,
+    )
     rehearsal.write_text(
         json.dumps(
             {
                 "ok": True,
                 "generated_at": "1970-01-01T00:03:10+00:00",
                 "generated_ts": 190.0,
-                "product": {
-                    "name": "active_income",
-                    "objective": "active_income",
-                    "base_asset": "USDT",
-                    "market": "futures",
-                    "symbol": "BTCUSDT",
-                },
+                "product": canonical_product_config(expected_product),
                 "exchange": "binanceusdm",
                 "testnet": True,
                 "risk_controls": {
@@ -1312,8 +1451,22 @@ def test_operator_report_uses_required_product_testnet_rehearsal_path(tmp_path):
                 },
                 "notional_usd": 5.0,
                 "order_qty": 0.05,
-                "entry_fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-                "close_fill": {"symbol": "BTCUSDT", "side": "sell", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1001.0},
+                "entry_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1000.0,
+                },
+                "close_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "sell",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1001.0,
+                },
                 "native_protective_stop": {
                     "capability_supported": True,
                     "native": True,
@@ -1325,24 +1478,48 @@ def test_operator_report_uses_required_product_testnet_rehearsal_path(tmp_path):
                     "open_verified": True,
                     "canceled_verified": True,
                     "placed": {
-                        "symbol": "BTCUSDT", "side": "sell", "qty": 0.05,
-                        "trigger_price": 95.0, "status": "open", "order_id": "stop-1",
-                        "client_id": "testnet-stop-1", "filled_qty": 0.0, "fee": 0.0,
+                        "symbol": "BTCUSDT",
+                        "side": "sell",
+                        "qty": 0.05,
+                        "trigger_price": 95.0,
+                        "status": "open",
+                        "order_id": "stop-1",
+                        "client_id": "testnet-stop-1",
+                        "filled_qty": 0.0,
+                        "fee": 0.0,
                     },
                     "fetched_open": {
-                        "symbol": "BTCUSDT", "side": "sell", "qty": 0.05,
-                        "trigger_price": 95.0, "status": "open", "order_id": "stop-1",
-                        "client_id": "testnet-stop-1", "filled_qty": 0.0, "fee": 0.0,
+                        "symbol": "BTCUSDT",
+                        "side": "sell",
+                        "qty": 0.05,
+                        "trigger_price": 95.0,
+                        "status": "open",
+                        "order_id": "stop-1",
+                        "client_id": "testnet-stop-1",
+                        "filled_qty": 0.0,
+                        "fee": 0.0,
                     },
                     "cancel_result": {
-                        "symbol": "BTCUSDT", "side": "sell", "qty": 0.05,
-                        "trigger_price": 95.0, "status": "canceled", "order_id": "stop-1",
-                        "client_id": "testnet-stop-1", "filled_qty": 0.0, "fee": 0.0,
+                        "symbol": "BTCUSDT",
+                        "side": "sell",
+                        "qty": 0.05,
+                        "trigger_price": 95.0,
+                        "status": "canceled",
+                        "order_id": "stop-1",
+                        "client_id": "testnet-stop-1",
+                        "filled_qty": 0.0,
+                        "fee": 0.0,
                     },
                     "fetched_terminal": {
-                        "symbol": "BTCUSDT", "side": "sell", "qty": 0.05,
-                        "trigger_price": 95.0, "status": "canceled", "order_id": "stop-1",
-                        "client_id": "testnet-stop-1", "filled_qty": 0.0, "fee": 0.0,
+                        "symbol": "BTCUSDT",
+                        "side": "sell",
+                        "qty": 0.05,
+                        "trigger_price": 95.0,
+                        "status": "canceled",
+                        "order_id": "stop-1",
+                        "client_id": "testnet-stop-1",
+                        "filled_qty": 0.0,
+                        "fee": 0.0,
                     },
                 },
                 "final_position_qty": 0.0,
@@ -1353,14 +1530,7 @@ def test_operator_report_uses_required_product_testnet_rehearsal_path(tmp_path):
     cfg = AutopilotConfig(
         status_file=tmp_path / "missing_status.json",
         approval_ledger=tmp_path / "approvals.json",
-        products=[
-            product(
-                tmp_path,
-                require_testnet_rehearsal=True,
-                testnet_rehearsal_report=rehearsal,
-                testnet_rehearsal_max_age_seconds=60,
-            )
-        ],
+        products=[expected_product],
     )
 
     report = build_operator_report(cfg, now_ts=200.0)
@@ -1375,19 +1545,19 @@ def test_operator_report_uses_required_product_testnet_rehearsal_path(tmp_path):
 
 def test_operator_report_rejects_wrong_product_testnet_rehearsal(tmp_path):
     rehearsal = tmp_path / "custom_testnet_rehearsal.json"
+    expected_product = product(
+        tmp_path,
+        require_testnet_rehearsal=True,
+        testnet_rehearsal_report=rehearsal,
+        testnet_rehearsal_max_age_seconds=60,
+    )
     rehearsal.write_text(
         json.dumps(
             {
                 "ok": True,
                 "generated_at": "1970-01-01T00:03:10+00:00",
                 "generated_ts": 190.0,
-                "product": {
-                    "name": "active_income",
-                    "objective": "active_income",
-                    "base_asset": "USDT",
-                    "market": "futures",
-                    "symbol": "ETHUSDT",
-                },
+                "product": canonical_product_config(expected_product) | {"symbol": "ETHUSDT"},
                 "exchange": "binanceusdm",
                 "testnet": True,
                 "risk_controls": {
@@ -1398,8 +1568,22 @@ def test_operator_report_rejects_wrong_product_testnet_rehearsal(tmp_path):
                 },
                 "notional_usd": 5.0,
                 "order_qty": 0.05,
-                "entry_fill": {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1000.0},
-                "close_fill": {"symbol": "BTCUSDT", "side": "sell", "qty": 0.05, "price": 100.0, "fee": 0.01, "timestamp": 1001.0},
+                "entry_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1000.0,
+                },
+                "close_fill": {
+                    "symbol": "BTCUSDT",
+                    "side": "sell",
+                    "qty": 0.05,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "timestamp": 1001.0,
+                },
                 "final_position_qty": 0.0,
             }
         ),
@@ -1408,14 +1592,7 @@ def test_operator_report_rejects_wrong_product_testnet_rehearsal(tmp_path):
     cfg = AutopilotConfig(
         status_file=tmp_path / "missing_status.json",
         approval_ledger=tmp_path / "approvals.json",
-        products=[
-            product(
-                tmp_path,
-                require_testnet_rehearsal=True,
-                testnet_rehearsal_report=rehearsal,
-                testnet_rehearsal_max_age_seconds=60,
-            )
-        ],
+        products=[expected_product],
     )
 
     report = build_operator_report(cfg, now_ts=200.0)
@@ -1455,7 +1632,9 @@ def test_operator_markdown_surfaces_alert_outcomes():
     )
 
     assert "Error alert: `not sent (cooldown)`" in markdown
-    assert "Readiness alert: `sent, state error: OSError: cannot write alert_state.json`" in markdown
+    assert (
+        "Readiness alert: `sent, state error: OSError: cannot write alert_state.json`" in markdown
+    )
 
 
 def test_operator_report_summarizes_approval_status_and_latest_event(tmp_path):
@@ -1540,7 +1719,10 @@ def test_operator_report_summarizes_approval_status_and_latest_event(tmp_path):
     ]
     assert report["approval_summary"]["recent_events"][1]["strategy_id"] == "s1"
     assert report["approval_summary"]["recent_events"][1]["revocation_reason"] == "temporary halt"
-    assert "Strategy approvals: `2` (approved 1, revoked 1); latest revoked s2 def456789abc" in markdown
+    assert (
+        "Strategy approvals: `2` (approved 1, revoked 1); latest revoked s2 def456789abc"
+        in markdown
+    )
     assert "for active_income/BTCUSDT by henrique at 2026-01-02T00:00:00+00:00" in markdown
     assert "reason paper drawdown breached" in markdown
 
@@ -1981,7 +2163,9 @@ def test_operator_report_marks_missing_seed_bootstrap_job_due(tmp_path, monkeypa
     assert report["scheduled_jobs"][0]["due"] is True
 
 
-def test_operator_report_marks_failed_market_data_job_recovered_when_data_ready(tmp_path, monkeypatch):
+def test_operator_report_marks_failed_market_data_job_recovered_when_data_ready(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(
         "src.autopilot.reporting.build_market_data_statuses",
         lambda markets: {"spot": {"ok": True, "reason": "fresh"}},
@@ -2045,7 +2229,10 @@ def test_operator_report_marks_failed_market_data_job_recovered_when_data_ready(
 
     assert report["scheduled_jobs"][0]["status"] == "recovered"
     assert report["scheduled_jobs"][0]["last_error"] is None
-    assert report["scheduled_jobs"][0]["last_reason"] == "last failure resolved; current market data is ready"
+    assert (
+        report["scheduled_jobs"][0]["last_reason"]
+        == "last failure resolved; current market data is ready"
+    )
 
 
 def test_operator_report_summarizes_promotion_reviews_from_configured_jobs(tmp_path):
@@ -2114,7 +2301,10 @@ def test_operator_report_summarizes_promotion_reviews_from_configured_jobs(tmp_p
             "approval_commands": ["python -m src.autopilot.approvals approve --strategy-id s1"],
         }
     ]
-    assert "Promotion reviews: `active_income: ready (needs_approval 1, not_ready 1 approval command available)`" in markdown
+    assert (
+        "Promotion reviews: `active_income: ready (needs_approval 1, not_ready 1 approval command available)`"
+        in markdown
+    )
 
 
 def test_operator_report_summarizes_promotion_reviews_with_inline_flags(tmp_path):
@@ -2223,7 +2413,13 @@ def test_operator_report_summarizes_waiting_promotion_review(tmp_path):
             JobConfig(
                 name="btc_accumulation_promotion_review",
                 enabled=True,
-                command=["python", "--output-json", str(review_path), "--product", "btc_accumulation"],
+                command=[
+                    "python",
+                    "--output-json",
+                    str(review_path),
+                    "--product",
+                    "btc_accumulation",
+                ],
                 cadence_seconds=86400,
                 timeout_seconds=120,
                 working_dir=tmp_path,
@@ -2436,7 +2632,10 @@ def test_operator_report_surfaces_future_job_timestamp(tmp_path):
     assert report["scheduled_jobs"][0]["status"] == "ok"
     assert report["scheduled_jobs"][0]["due"] is True
     assert report["scheduled_jobs"][0]["age_seconds"] is None
-    assert report["scheduled_jobs"][0]["last_reason"] == "invalid job state future last_started_ts: 9999.0"
+    assert (
+        report["scheduled_jobs"][0]["last_reason"]
+        == "invalid job state future last_started_ts: 9999.0"
+    )
     assert "invalid job state future last_started_ts: 9999.0" in markdown
 
 
@@ -2535,7 +2734,10 @@ def test_operator_report_surfaces_failed_scheduled_job_reason(tmp_path):
     assert report["scheduled_jobs"][0]["due"] is True
     assert report["scheduled_jobs"][0]["effective_cadence_seconds"] == 900
     assert report["scheduled_jobs"][0]["last_reason"] == "empty_seed_dataset"
-    assert "| market_data_update_spot | `True` | `fail` | `True` | 2026-01-01T00:00:00+00:00 | 1m candle dataset is empty |" in markdown
+    assert (
+        "| market_data_update_spot | `True` | `fail` | `True` | 2026-01-01T00:00:00+00:00 | 1m candle dataset is empty |"
+        in markdown
+    )
 
 
 def test_operator_report_surfaces_scheduled_job_structured_errors(tmp_path):
@@ -2750,7 +2952,11 @@ def test_operator_report_surfaces_control_clear_outcomes(tmp_path):
                         "skipped": True,
                         "reason": "flatten_all_has_failures",
                         "targets": [
-                            {"product_name": "active_income", "ok": False, "error": "exchange timeout"},
+                            {
+                                "product_name": "active_income",
+                                "ok": False,
+                                "error": "exchange timeout",
+                            },
                             {
                                 "product_name": "btc_accumulation",
                                 "ok": True,
@@ -3007,7 +3213,10 @@ def test_operator_markdown_surfaces_artifact_hygiene_errors():
 
     assert "Artifact hygiene: `fail`" in markdown
     assert "1 quarantine candidates, 2 unreferenced active artifacts" in markdown
-    assert "errors 1, first unreferenced_active_artifact: ValueError: refusing to quarantine symlink source" in markdown
+    assert (
+        "errors 1, first unreferenced_active_artifact: ValueError: refusing to quarantine symlink source"
+        in markdown
+    )
 
 
 def test_operator_markdown_infers_research_coverage_from_older_cycle_reports():
@@ -3051,7 +3260,9 @@ def test_operator_markdown_infers_research_coverage_from_older_cycle_reports():
     assert "btc_accumulation: btc_accumulation" in markdown
 
 
-def test_operator_report_cli_writes_failure_report_when_config_load_fails(monkeypatch, tmp_path, capsys):
+def test_operator_report_cli_writes_failure_report_when_config_load_fails(
+    monkeypatch, tmp_path, capsys
+):
     config_path = tmp_path / "bad_config.json"
     markdown = tmp_path / "operator.md"
     json_output = tmp_path / "operator.json"
@@ -3092,7 +3303,9 @@ def test_operator_report_cli_writes_failure_report_when_config_load_fails(monkey
     assert "Report issues: `operator_report_build_failed: ValueError: bad config`" in markdown_text
 
 
-def test_operator_report_cli_prints_json_when_json_output_write_fails(monkeypatch, tmp_path, capsys):
+def test_operator_report_cli_prints_json_when_json_output_write_fails(
+    monkeypatch, tmp_path, capsys
+):
     markdown = tmp_path / "operator.md"
     json_output = tmp_path / "operator.json"
     monkeypatch.setattr(

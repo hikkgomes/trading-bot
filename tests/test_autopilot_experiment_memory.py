@@ -291,12 +291,20 @@ def test_holdout_claim_survives_restart_and_blocks_entire_lineage(tmp_path):
             parent_hashes=[root.behavior_hash],
             metadata=metadata(),
         )
+        final_window = window("2025-06-01", "2026-01-01")
+        final_protocol = {"fees_bps": 10}
+        memory.register_holdout_cohort(
+            [selected.behavior_hash, sibling.behavior_hash],
+            dataset={"snapshot_id": "final-snapshot-v1", "symbol": "BTCUSDT"},
+            window=final_window,
+            protocol=final_protocol,
+        )
         claim = memory.claim_holdout(
             selected.behavior_hash,
             snapshot_id="final-snapshot-v1",
             dataset={"symbol": "BTCUSDT"},
-            window=window("2025-06-01", "2026-01-01"),
-            protocol={"fees_bps": 10},
+            window=final_window,
+            protocol=final_protocol,
         )
         assert claim.created is True
         assert claim.status == "claimed"
@@ -343,6 +351,253 @@ def test_holdout_claim_survives_restart_and_blocks_entire_lineage(tmp_path):
             selected.behavior_hash,
             sibling.behavior_hash,
         }
+
+
+def test_holdout_cohort_seals_snapshot_against_later_independent_roots(tmp_path):
+    final_dataset = dataset("shared-final-snapshot")
+    final_window = window("2025-06-01", "2026-01-01")
+    final_protocol = {"fees_bps": 10, "cohort": "pre-registered"}
+    with ExperimentMemory(tmp_path / "memory.sqlite3") as memory:
+        first = memory.register_strategy(
+            strategy_spec("first-root"),
+            strategy_id="first-root",
+            generation_method="grammar_sample",
+            metadata=metadata(),
+        )
+        later = memory.register_strategy(
+            strategy_spec("later-root", reference=65),
+            strategy_id="later-root",
+            generation_method="grammar_sample",
+            metadata=metadata(),
+        )
+
+        created = memory.register_holdout_cohort(
+            [first.behavior_hash],
+            dataset=final_dataset,
+            window=final_window,
+            protocol=final_protocol,
+        )
+        assert created.created is True
+        with pytest.raises(EvaluationConflictError, match="sealed against new candidates"):
+            memory.register_holdout_cohort(
+                [later.behavior_hash],
+                dataset=final_dataset,
+                window=final_window,
+                protocol=final_protocol,
+            )
+        memory.claim_holdout(
+            first.behavior_hash,
+            snapshot_id=final_dataset["snapshot_id"],
+            dataset=final_dataset,
+            window=final_window,
+            protocol=final_protocol,
+        )
+        with pytest.raises(EvaluationConflictError, match="sealed against new candidates"):
+            memory.claim_holdout(
+                later.behavior_hash,
+                snapshot_id=final_dataset["snapshot_id"],
+                dataset=final_dataset,
+                window=final_window,
+                protocol=final_protocol,
+            )
+
+
+def test_protected_interval_blocks_grown_snapshot_adaptive_overlap(tmp_path):
+    with ExperimentMemory(tmp_path / "memory.sqlite3") as memory:
+        registered = memory.register_strategy(
+            strategy_spec("interval-owner"),
+            strategy_id="interval-owner",
+            generation_method="grammar_sample",
+            metadata=metadata(),
+        )
+        first_hundred = {
+            "snapshot_id": "rows-100",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "timeframe": "5m",
+            "rows": 100,
+            "content_digest": "sha256:" + "1" * 64,
+        }
+        protected_window = window("2026-01-01T06:40:00Z", "2026-01-01T08:15:00Z")
+        first = memory.register_holdout_cohort(
+            [registered.behavior_hash],
+            dataset=first_hundred,
+            window=protected_window,
+            protocol={"market": "futures", "base_timeframe": "5m"},
+        )
+        resumed = memory.register_holdout_cohort(
+            [registered.behavior_hash],
+            dataset=first_hundred,
+            window=protected_window,
+            protocol={"market": "futures", "base_timeframe": "5m"},
+        )
+
+        assert first.created is True
+        assert resumed.created is False
+        assert resumed.member_hashes == (registered.behavior_hash,)
+        intervals = memory.protected_intervals(
+            market="futures",
+            symbol="BTCUSDT",
+        )
+        assert len(intervals) == 1
+        assert set(intervals[0]) == {"interval_key", "market", "symbol", "start", "end"}
+        assert intervals[0]["market"] == "futures"
+        assert intervals[0]["symbol"] == "BTCUSDT"
+        assert intervals[0]["start"] == "2026-01-01T06:40:00.000000+00:00"
+        assert intervals[0]["end"] == "2026-01-01T08:15:00.000000+00:00"
+
+        grown_to_125 = {
+            **first_hundred,
+            "snapshot_id": "rows-125",
+            "rows": 125,
+            "content_digest": "sha256:" + "2" * 64,
+        }
+        with pytest.raises(EvaluationConflictError, match="permanently protected timestamps"):
+            memory.assert_adaptive_window_allowed(
+                dataset=grown_to_125,
+                window={
+                    "train": {
+                        "start": "2026-01-01T00:00:00Z",
+                        "end": "2026-01-01T06:10:00Z",
+                        "rows": 75,
+                    },
+                    "validation": {
+                        "start": "2026-01-01T06:15:00Z",
+                        "end": "2026-01-01T08:15:00Z",
+                        "rows": 25,
+                    },
+                },
+                protocol={"market": "futures", "base_timeframe": "5m"},
+            )
+
+
+def test_protected_interval_blocks_cross_timeframe_adaptive_overlap(tmp_path):
+    with ExperimentMemory(tmp_path / "memory.sqlite3") as memory:
+        registered = memory.register_strategy(
+            strategy_spec("cross-timeframe-owner"),
+            strategy_id="cross-timeframe-owner",
+            generation_method="grammar_sample",
+            metadata=metadata(),
+        )
+        memory.register_holdout_cohort(
+            [registered.behavior_hash],
+            dataset={
+                "snapshot_id": "five-minute-final",
+                "market": "futures",
+                "symbol": "BTCUSDT",
+                "timeframe": "5m",
+                "content_digest": "sha256:" + "3" * 64,
+            },
+            window=window("2026-02-01T00:00:00Z", "2026-02-02T00:00:00Z"),
+            protocol={"market": "futures", "base_timeframe": "5m"},
+        )
+
+        with pytest.raises(EvaluationConflictError, match="phase=validation"):
+            memory.assert_adaptive_window_allowed(
+                dataset={
+                    "snapshot_id": "hourly-later",
+                    "market": "futures",
+                    "symbol": "BTCUSDT",
+                    "timeframe": "1h",
+                },
+                window=window("2026-01-15T00:00:00Z", "2026-02-01T12:00:00Z"),
+                protocol={"market": "futures", "base_timeframe": "1h"},
+                phase="validation",
+            )
+        with pytest.raises(EvaluationConflictError, match="overlaps an already sealed interval"):
+            memory.register_holdout_cohort(
+                [registered.behavior_hash],
+                dataset={
+                    "snapshot_id": "hourly-final-overlap",
+                    "market": "futures",
+                    "symbol": "BTCUSDT",
+                    "timeframe": "1h",
+                },
+                window=window("2026-02-01T12:00:00Z", "2026-02-03T00:00:00Z"),
+                protocol={"market": "futures", "base_timeframe": "1h"},
+            )
+
+
+def test_changed_evidence_for_sealed_interval_fails_closed(tmp_path):
+    sealed_dataset = {
+        "snapshot_id": "sealed-evidence",
+        "market": "futures",
+        "symbol": "BTCUSDT",
+        "files": [{"file": "BTCUSDT_5m.parquet", "content_digest": "sha256:" + "4" * 64}],
+    }
+    protected_window = window("2026-03-01T00:00:00Z", "2026-03-02T00:00:00Z")
+    with ExperimentMemory(tmp_path / "memory.sqlite3") as memory:
+        registered = memory.register_strategy(
+            strategy_spec("evidence-owner"),
+            strategy_id="evidence-owner",
+            generation_method="grammar_sample",
+            metadata=metadata(),
+        )
+        memory.register_holdout_cohort(
+            [registered.behavior_hash],
+            dataset=sealed_dataset,
+            window=protected_window,
+            protocol={"market": "futures"},
+        )
+
+        changed = json.loads(json.dumps(sealed_dataset))
+        changed["files"][0]["content_digest"] = "sha256:" + "5" * 64
+        with pytest.raises(EvaluationConflictError, match="immutable evidence changed"):
+            memory.register_holdout_cohort(
+                [registered.behavior_hash],
+                dataset=changed,
+                window=protected_window,
+                protocol={"market": "futures"},
+            )
+
+
+def test_protected_interval_registry_migrates_and_detects_tampering(tmp_path):
+    path = tmp_path / "memory.sqlite3"
+    with ExperimentMemory(path) as memory:
+        registered = memory.register_strategy(
+            strategy_spec("migration-owner"),
+            strategy_id="migration-owner",
+            generation_method="grammar_sample",
+            metadata=metadata(),
+        )
+        final_dataset = dataset("migration-final")
+        final_window = window("2026-04-01", "2026-05-01")
+        final_protocol = {"fees_bps": 10}
+        memory.register_holdout_cohort(
+            [registered.behavior_hash],
+            dataset=final_dataset,
+            window=final_window,
+            protocol=final_protocol,
+        )
+        memory.claim_holdout(
+            registered.behavior_hash,
+            snapshot_id=final_dataset["snapshot_id"],
+            dataset=final_dataset,
+            window=final_window,
+            protocol=final_protocol,
+        )
+
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TABLE protected_intervals")
+    connection.execute(
+        "DELETE FROM memory_meta WHERE key = ?",
+        (experiment_memory_module.PROTECTED_INTERVAL_BACKFILL_META,),
+    )
+    connection.commit()
+    connection.close()
+
+    with ExperimentMemory(path) as memory:
+        assert memory.integrity_check(deep=True)["ok"] is True
+
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "UPDATE protected_intervals SET evidence_hash = ?",
+        ("sha256:" + "0" * 64,),
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(ExperimentMemoryCorruptionError, match="identity mismatch"):
+        ExperimentMemory(path)
 
 
 def test_pending_candidates_and_adaptive_feedback_are_bounded_and_actionable(tmp_path):
@@ -503,11 +758,19 @@ def test_adaptive_feedback_and_parents_are_scoped_to_current_research_engine(tmp
             outcome="reject",
             rejection_reasons=("no_train_edge",),
         )
+        protected_window = window()
+        protected_protocol = {"research_engine_digest": old_engine}
+        memory.register_holdout_cohort(
+            [protected.behavior_hash],
+            dataset={"snapshot_id": "protected-final"},
+            window=protected_window,
+            protocol=protected_protocol,
+        )
         memory.claim_holdout(
             protected.behavior_hash,
             snapshot_id="protected-final",
-            window=window(),
-            protocol={"research_engine_digest": old_engine},
+            window=protected_window,
+            protocol=protected_protocol,
         )
 
         feedback = memory.generator_feedback(research_engine_digest=current_engine)
@@ -555,11 +818,19 @@ def test_compaction_preserves_exact_evidence_engine_scope_and_holdout_claims(tmp
             metrics={"diagnostic": large},
             details={"trace": large},
         )
+        holdout_window = window("2025-01-01", "2026-01-01")
+        holdout_protocol = {"research_engine_digest": engine}
+        memory.register_holdout_cohort(
+            [registered.behavior_hash],
+            dataset={"snapshot_id": "holdout-v1"},
+            window=holdout_window,
+            protocol=holdout_protocol,
+        )
         holdout = memory.claim_holdout(
             registered.behavior_hash,
             snapshot_id="holdout-v1",
-            window=window("2025-01-01", "2026-01-01"),
-            protocol={"research_engine_digest": engine},
+            window=holdout_window,
+            protocol=holdout_protocol,
         )
         memory.complete_evaluation(
             holdout.evaluation_key,
@@ -593,9 +864,10 @@ def test_compaction_preserves_exact_evidence_engine_scope_and_holdout_claims(tmp
             snapshot_id="holdout-v1",
         )
         assert memory.pending_strategies(research_engine_digest=engine) == []
-        assert "failed_holdout" not in memory.generator_feedback(
-            research_engine_digest=engine
-        )["rejection_reasons"]
+        assert (
+            "failed_holdout"
+            not in memory.generator_feedback(research_engine_digest=engine)["rejection_reasons"]
+        )
 
     with ExperimentMemory(path) as reopened:
         assert reopened.integrity_check(deep=True)["ok"] is True
@@ -619,9 +891,7 @@ def test_legacy_engine_scope_backfill_runs_only_once(monkeypatch, tmp_path):
             outcome="keep",
         )
     connection = sqlite3.connect(path)
-    connection.execute(
-        "DELETE FROM memory_meta WHERE key = 'evaluation_engine_scopes_backfill_v1'"
-    )
+    connection.execute("DELETE FROM memory_meta WHERE key = 'evaluation_engine_scopes_backfill_v1'")
     connection.commit()
     connection.close()
 

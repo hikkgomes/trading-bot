@@ -101,7 +101,9 @@ def run_worker_once(config: AutopilotConfig) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run scheduled autopilot jobs outside trading supervision.")
+    parser = argparse.ArgumentParser(
+        description="Run scheduled autopilot jobs outside trading supervision."
+    )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--sleep", type=int, default=None)

@@ -30,6 +30,10 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B011"]
+# These two command entry points must configure a private writable Matplotlib
+# cache before importing Matplotlib or model modules that import it.
+"src/run_experiments.py" = ["E402"]
+"src/train_model.py" = ["E402"]
 
 [tool.ruff.format]
 quote-style = "double"

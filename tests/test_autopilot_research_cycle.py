@@ -3,10 +3,12 @@ import math
 
 import pytest
 
+from research_exploration.dsr import DSR_METHOD
 from research_exploration.hypothesis_generator import generate_batch
 from src.autopilot import research_cycle as rc
 from src.autopilot.approvals import artifact_digest
 from src.autopilot.candidate_activation import product_identity
+from src.autopilot.candidate_paper import candidate_paper_paths
 from src.autopilot.config import ProductConfig
 
 
@@ -63,7 +65,16 @@ def _live_candidate_payload():
                     "max_trades_per_day": 4,
                 },
                 "fees": {"fee_bps": 5, "slippage_bps": 2},
-                "metrics": {"holdout_total_return": 0.03, "dsr_deflated": 0.72},
+                "metrics": {
+                    "holdout_total_return": 0.03,
+                    "dsr_deflated": 0.72,
+                    "dsr_method": DSR_METHOD,
+                    "n_trials": 20,
+                    "sr_std_trials": 0.18,
+                    "trial_sharpe_count": 12,
+                    "trial_sharpe_observed_std": 0.16,
+                    "trial_sharpe_conservative_floor": 0.10,
+                },
             }
         ],
     }
@@ -98,6 +109,18 @@ def test_default_research_cycle_covers_active_income_horizons():
     assert all(scenario.market == "futures" for scenario in active.values())
 
 
+def test_protected_epoch_order_prioritizes_short_history_fast_scenarios():
+    ordered = sorted(rc.DEFAULT_SCENARIOS, key=rc._protected_epoch_scenario_order)
+
+    assert [
+        scenario.opportunity_type for scenario in ordered if scenario.product == "active_income"
+    ] == ["scalping", "day_trading", "swing_trading"]
+    btc_timeframes = [
+        scenario.base_tf for scenario in ordered if scenario.product == "btc_accumulation"
+    ]
+    assert btc_timeframes[:2] == ["1h", "1h"]
+
+
 def test_active_income_swing_scenario_uses_multi_day_hypotheses():
     scenarios = {
         scenario.opportunity_type: scenario
@@ -106,8 +129,7 @@ def test_active_income_swing_scenario_uses_multi_day_hypotheses():
     }
 
     hypotheses_by_opportunity = {
-        opportunity: rc._hypotheses_for(scenario)
-        for opportunity, scenario in scenarios.items()
+        opportunity: rc._hypotheses_for(scenario) for opportunity, scenario in scenarios.items()
     }
 
     assert all(hyp.base_timeframe == "1m" for hyp in hypotheses_by_opportunity["scalping"])
@@ -129,12 +151,10 @@ def test_active_income_swing_scenario_uses_multi_day_hypotheses():
     assert all(hyp.risk.max_position_fraction <= 0.15 for hyp in swing_hypotheses)
 
     scalp_max_seconds = max(
-        hyp.exit.horizon_bars * 60
-        for hyp in hypotheses_by_opportunity["scalping"]
+        hyp.exit.horizon_bars * 60 for hyp in hypotheses_by_opportunity["scalping"]
     )
     day_max_seconds = max(
-        hyp.exit.horizon_bars * 5 * 60
-        for hyp in hypotheses_by_opportunity["day_trading"]
+        hyp.exit.horizon_bars * 5 * 60 for hyp in hypotheses_by_opportunity["day_trading"]
     )
     swing_min_seconds = min(hyp.exit.horizon_bars * 60 * 60 for hyp in swing_hypotheses)
     assert scalp_max_seconds <= 2 * 60 * 60
@@ -270,7 +290,9 @@ def test_research_cycle_reruns_when_market_readiness_changes(tmp_path, monkeypat
     )
     monkeypatch.setattr(rc, "build_market_data_statuses", lambda markets: current_statuses)
 
-    def fake_validation(scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path=None):
+    def fake_validation(
+        scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path=None
+    ):
         return {
             "ok": True,
             "name": scenario.name,
@@ -301,9 +323,9 @@ def test_research_cycle_reruns_when_market_readiness_changes(tmp_path, monkeypat
         },
         sort_keys=True,
     )
-    assert json.loads(state_path.read_text(encoding="utf-8"))["last_market_marker"] == rc._market_data_skip_marker(
-        current_statuses
-    )
+    assert json.loads(state_path.read_text(encoding="utf-8"))[
+        "last_market_marker"
+    ] == rc._market_data_skip_marker(current_statuses)
 
 
 def test_research_cycle_recovers_corrupt_state_and_runs(tmp_path, monkeypatch):
@@ -324,7 +346,9 @@ def test_research_cycle_recovers_corrupt_state_and_runs(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(rc, "build_market_data_statuses", lambda markets: _market_statuses())
 
-    def fake_validation(scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path=None):
+    def fake_validation(
+        scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path=None
+    ):
         return {
             "ok": True,
             "name": scenario.name,
@@ -375,7 +399,9 @@ def test_research_cycle_runs_validation_and_handles_no_exportable_strategies(tmp
     )
     monkeypatch.setattr(rc, "build_market_data_statuses", lambda markets: _market_statuses())
 
-    def fake_validation(scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path):
+    def fake_validation(
+        scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path
+    ):
         hypothesis_count = len(hypotheses or [])
         return {
             "ok": True,
@@ -429,7 +455,9 @@ def test_research_cycle_runs_validation_and_handles_no_exportable_strategies(tmp
     assert report["summary"]["hypotheses"] == report["scenarios"][0]["hypotheses"]
     assert report["summary"]["keepers"] == 0
     assert report["summary"]["incubation_candidates"] == 1
-    assert report["summary"]["top_reasons"] == {"no_train_edge": report["scenarios"][0]["hypotheses"]}
+    assert report["summary"]["top_reasons"] == {
+        "no_train_edge": report["scenarios"][0]["hypotheses"]
+    }
     assert report["summary"]["next_actions"] == [
         "continue rotating curated candidates; no positive train edge found yet"
     ]
@@ -437,7 +465,7 @@ def test_research_cycle_runs_validation_and_handles_no_exportable_strategies(tmp
     assert {item["market"] for item in report["exports"]} == {"futures", "spot"}
     assert {item["product"]: item["min_dsr"] for item in report["exports"]} == {
         "active_income": 0.60,
-        "btc_accumulation": None,
+        "btc_accumulation": 0.60,
     }
     assert report["incubation_review"]["path"] == str(incubation_output_path)
     assert report["incubation_review"]["research_only"] is True
@@ -446,13 +474,15 @@ def test_research_cycle_runs_validation_and_handles_no_exportable_strategies(tmp
     incubation_review = json.loads(incubation_output_path.read_text(encoding="utf-8"))
     assert incubation_review["summary"] == {"candidates": 1, "by_product": {"active_income": 1}}
     assert incubation_review["products"]["active_income"][0]["id"] == "REJECTED_CANDIDATE"
-    assert json.loads(state_path.read_text(encoding="utf-8"))["last_market_timestamp"] == json.dumps(
+    assert json.loads(state_path.read_text(encoding="utf-8"))[
+        "last_market_timestamp"
+    ] == json.dumps(
         {"futures": "2026-07-08T11:22:00+00:00"},
         sort_keys=True,
     )
-    assert json.loads(state_path.read_text(encoding="utf-8"))["last_market_marker"] == rc._market_data_skip_marker(
-        _market_statuses()
-    )
+    assert json.loads(state_path.read_text(encoding="utf-8"))[
+        "last_market_marker"
+    ] == rc._market_data_skip_marker(_market_statuses())
 
 
 def test_incubation_candidates_rank_non_keeper_research_attention_only():
@@ -473,7 +503,12 @@ def test_incubation_candidates_rank_non_keeper_research_attention_only():
                 "verdict": "reject",
                 "reasons": ["failed_validation"],
                 "train": {"trades": 60, "total_return": 0.08, "win_rate": 0.58, "sharpe": 1.1},
-                "validation": {"trades": 12, "total_return": -0.01, "win_rate": 0.42, "sharpe": -0.2},
+                "validation": {
+                    "trades": 12,
+                    "total_return": -0.01,
+                    "win_rate": 0.42,
+                    "sharpe": -0.2,
+                },
             },
             {
                 "hypothesis_id": "KEEPER",
@@ -602,7 +637,9 @@ def test_research_cycle_exports_only_current_cycle_keeper_ids(tmp_path, monkeypa
     )
     monkeypatch.setattr(rc, "build_market_data_statuses", lambda markets: _market_statuses())
 
-    def fake_validation(scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path):
+    def fake_validation(
+        scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path
+    ):
         return {
             "ok": True,
             "name": scenario.name,
@@ -655,13 +692,17 @@ def test_research_cycle_exports_only_current_cycle_keeper_ids(tmp_path, monkeypa
     )
 
     assert report["ok"] is True
-    assert export_calls == [{"product": "active_income", "market": "futures", "ids": ["KEEP_THIS"], "min_dsr": 0.60}]
-    assert next(item for item in report["exports"] if item["product"] == "btc_accumulation")["reason"] == (
-        "no_current_cycle_keepers"
-    )
+    assert export_calls == [
+        {"product": "active_income", "market": "futures", "ids": ["KEEP_THIS"], "min_dsr": 0.60}
+    ]
+    assert next(item for item in report["exports"] if item["product"] == "btc_accumulation")[
+        "reason"
+    ] == ("no_current_cycle_keepers")
 
 
-def test_export_product_does_not_replace_active_artifact_while_positions_are_open(tmp_path, monkeypatch):
+def test_export_product_does_not_replace_active_artifact_while_positions_are_open(
+    tmp_path, monkeypatch
+):
     artifact = tmp_path / "active_strategies_flow.json"
     artifact.write_text('{"version": 1, "strategies": [{"id": "old"}]}', encoding="utf-8")
     state_file = tmp_path / "active_income_state.json"
@@ -740,9 +781,7 @@ def test_live_candidate_is_policy_checked_and_staged_without_touching_active(tmp
         log_path=tmp_path / "experiments.jsonl",
     )
 
-    assert json.loads(active.read_text(encoding="utf-8")) == {
-        "sentinel": "approved-live-artifact"
-    }
+    assert json.loads(active.read_text(encoding="utf-8")) == {"sentinel": "approved-live-artifact"}
     candidate = json.loads(staged.read_text(encoding="utf-8"))
     assert candidate["product"] == product_identity(product)
     assert candidate["candidate_staging"]["activation_required"] is True
@@ -751,6 +790,114 @@ def test_live_candidate_is_policy_checked_and_staged_without_touching_active(tmp
     assert report["staged"] is True
     assert report["active_artifact"] == str(active)
     assert report["artifact_digest"] == artifact_digest(candidate)
+
+
+def test_live_candidate_restage_preserves_exact_candidate_paper_state(tmp_path, monkeypatch):
+    active = tmp_path / "active.json"
+    active.write_text('{"sentinel": "approved-live-artifact"}', encoding="utf-8")
+    state = tmp_path / "state.json"
+    state.write_text("{}", encoding="utf-8")
+    staged = tmp_path / "candidates" / "active_income.json"
+    product = ProductConfig(
+        name="active_income",
+        enabled=True,
+        objective="active_income",
+        base_asset="USDT",
+        market="futures",
+        execution_mode="live",
+        symbol="BTCUSDT",
+        strategies_path=active,
+        state_file=state,
+        trade_log=tmp_path / "trades.csv",
+        starting_equity=1000.0,
+    )
+
+    def fake_export(*, output_path, **kwargs):
+        output_path.write_text(json.dumps(_live_candidate_payload()), encoding="utf-8")
+        return output_path
+
+    monkeypatch.setattr(rc, "export_strategies", fake_export)
+    first = rc.stage_live_product_candidate(
+        product,
+        pnl_unit="usdt",
+        market="futures",
+        out=staged,
+        top_k=3,
+    )
+    original = staged.read_bytes()
+    second = rc.stage_live_product_candidate(
+        product,
+        pnl_unit="usdt",
+        market="futures",
+        out=staged,
+        top_k=3,
+    )
+
+    assert first["staged"] is True
+    assert second["reason"] == "candidate_already_staged"
+    assert second["artifact_digest"] == first["artifact_digest"]
+    assert staged.read_bytes() == original
+
+
+def test_live_candidate_replacement_waits_for_prior_paper_position(tmp_path, monkeypatch):
+    active = tmp_path / "active.json"
+    active.write_text('{"sentinel": "approved-live-artifact"}', encoding="utf-8")
+    state = tmp_path / "state.json"
+    state.write_text("{}", encoding="utf-8")
+    staged = tmp_path / "candidates" / "active_income.json"
+    product = ProductConfig(
+        name="active_income",
+        enabled=True,
+        objective="active_income",
+        base_asset="USDT",
+        market="futures",
+        execution_mode="live",
+        symbol="BTCUSDT",
+        strategies_path=active,
+        state_file=state,
+        trade_log=tmp_path / "trades.csv",
+        starting_equity=1000.0,
+    )
+    existing = _live_candidate_payload()
+    existing["product"] = product_identity(product)
+    existing["candidate_staging"] = {
+        "staged_at": "2026-01-01T00:00:00+00:00",
+        "activation_required": True,
+        "approval_granted": False,
+        "active_artifact": str(active),
+    }
+    staged.parent.mkdir(parents=True)
+    staged.write_text(json.dumps(existing), encoding="utf-8")
+    existing_digest = artifact_digest(existing)
+    old_state = candidate_paper_paths(
+        product.name,
+        existing_digest,
+        candidate_dir=staged.parent,
+    )["state"]
+    old_state.write_text(
+        json.dumps({"open_positions": {"KEEP_THIS": {"entry_price": 100.0}}}),
+        encoding="utf-8",
+    )
+
+    replacement = _live_candidate_payload()
+    replacement["strategies"][0]["take_profit"] = 0.03
+
+    def fake_export(*, output_path, **kwargs):
+        output_path.write_text(json.dumps(replacement), encoding="utf-8")
+        return output_path
+
+    monkeypatch.setattr(rc, "export_strategies", fake_export)
+    report = rc.stage_live_product_candidate(
+        product,
+        pnl_unit="usdt",
+        market="futures",
+        out=staged,
+        top_k=3,
+    )
+
+    assert report["reason"] == "prior_candidate_open_positions"
+    assert report["open_positions"] == ["KEEP_THIS"]
+    assert artifact_digest(json.loads(staged.read_text(encoding="utf-8"))) == existing_digest
 
 
 def test_live_candidate_refuses_staging_path_that_aliases_active_artifact(tmp_path, monkeypatch):
@@ -890,9 +1037,7 @@ def test_research_cycle_routes_live_product_to_deterministic_staging_path(tmp_pa
     assert json.loads(active.read_text(encoding="utf-8")) == {"sentinel": "unchanged"}
     assert report["summary"]["staged"] == 1
     assert report["summary"]["active_exports"] == 0
-    assert report["summary"]["staged_candidates"][0]["artifact_digest"] == (
-        "sha256:" + "a" * 64
-    )
+    assert report["summary"]["staged_candidates"][0]["artifact_digest"] == ("sha256:" + "a" * 64)
     assert "activate it explicitly" in report["summary"]["next_actions"][0]
 
 
@@ -955,7 +1100,9 @@ def test_research_cycle_blocks_keeper_export_when_product_has_open_positions(tmp
     )
     monkeypatch.setattr(rc, "build_market_data_statuses", lambda markets: _market_statuses())
 
-    def fake_validation(scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path):
+    def fake_validation(
+        scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path
+    ):
         return {
             "ok": True,
             "name": scenario.name,
@@ -991,13 +1138,18 @@ def test_research_cycle_blocks_keeper_export_when_product_has_open_positions(tmp
     assert active_export["open_positions"] == ["running_strategy"]
     assert report["summary"]["keepers"] == 1
     assert report["summary"]["exported"] == 0
-    assert report["summary"]["export_reasons"] == {"open_positions_block_export": 1, "no_current_cycle_keepers": 1}
+    assert report["summary"]["export_reasons"] == {
+        "open_positions_block_export": 1,
+        "no_current_cycle_keepers": 1,
+    }
     assert report["summary"]["next_actions"] == [
         "wait for open positions to close before replacing the active paper artifact"
     ]
 
 
-def _mutation_batch_payload(hypothesis, *, executable=False, generated_at="2026-01-01T00:00:00+00:00"):
+def _mutation_batch_payload(
+    hypothesis, *, executable=False, generated_at="2026-01-01T00:00:00+00:00"
+):
     return {
         "ok": True,
         "schema": "research_exploration.hypothesis_schema/v1",
@@ -1036,11 +1188,17 @@ def test_research_cycle_validates_research_only_mutation_batch(tmp_path, monkeyp
     log_path = tmp_path / "experiment_log.jsonl"
     mutation_batch_path = tmp_path / "mutation_hypotheses.json"
     hypothesis = next(hyp for hyp in generate_batch(with_guards=True) if hyp.base_timeframe == "5m")
-    mutation_batch_path.write_text(json.dumps(_mutation_batch_payload(hypothesis)), encoding="utf-8")
-    monkeypatch.setattr(rc, "build_market_data_statuses", lambda markets: {"futures": _market_status()})
+    mutation_batch_path.write_text(
+        json.dumps(_mutation_batch_payload(hypothesis)), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        rc, "build_market_data_statuses", lambda markets: {"futures": _market_status()}
+    )
     validated = []
 
-    def fake_validation(scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path):
+    def fake_validation(
+        scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path
+    ):
         validated.append((scenario, hypotheses, selection, hypothesis_metadata))
         return {
             "ok": True,
@@ -1094,7 +1252,10 @@ def test_research_cycle_validates_research_only_mutation_batch(tmp_path, monkeyp
         "top_reasons": {"no_train_edge": 1},
         "outcome": "no_keeper",
     }
-    assert report["summary"]["next_actions"][0] == "mutation batch found no keepers; top mutation reason no_train_edge"
+    assert (
+        report["summary"]["next_actions"][0]
+        == "mutation batch found no keepers; top mutation reason no_train_edge"
+    )
     assert {item["reason"] for item in report["exports"]} == {"no_current_cycle_keepers"}
 
 
@@ -1107,7 +1268,9 @@ def test_research_cycle_ignores_executable_mutation_batch(tmp_path, monkeypatch)
         json.dumps(_mutation_batch_payload(hypothesis, executable=True)),
         encoding="utf-8",
     )
-    monkeypatch.setattr(rc, "build_market_data_statuses", lambda markets: {"futures": _market_status()})
+    monkeypatch.setattr(
+        rc, "build_market_data_statuses", lambda markets: {"futures": _market_status()}
+    )
 
     def fail_validation(*args, **kwargs):
         raise AssertionError("unsafe mutation batch should not create validation scenarios")
@@ -1132,7 +1295,9 @@ def test_research_cycle_ignores_executable_mutation_batch(tmp_path, monkeypatch)
     assert report["summary"]["mutation_effectiveness"]["evaluated_hypotheses"] == 0
 
 
-def test_research_cycle_ignores_corrupt_mutation_batch_and_runs_curated_scenarios(tmp_path, monkeypatch):
+def test_research_cycle_ignores_corrupt_mutation_batch_and_runs_curated_scenarios(
+    tmp_path, monkeypatch
+):
     state_path = tmp_path / "state.json"
     output_path = tmp_path / "research_cycle.json"
     mutation_batch_path = tmp_path / "mutation_hypotheses.json"
@@ -1148,10 +1313,14 @@ def test_research_cycle_ignores_corrupt_mutation_batch_and_runs_curated_scenario
             start="2022-01-01",
         ),
     )
-    monkeypatch.setattr(rc, "build_market_data_statuses", lambda markets: {"futures": _market_status()})
+    monkeypatch.setattr(
+        rc, "build_market_data_statuses", lambda markets: {"futures": _market_status()}
+    )
     validated = []
 
-    def fake_validation(scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path=None):
+    def fake_validation(
+        scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path=None
+    ):
         validated.append(scenario.name)
         return {
             "ok": True,
@@ -1182,7 +1351,10 @@ def test_research_cycle_ignores_corrupt_mutation_batch_and_runs_curated_scenario
     assert report["summary"]["scenarios"] == 1
     assert report["summary"]["mutation_effectiveness"]["status"] == "read_error"
     assert report["summary"]["mutation_effectiveness"]["outcome"] == "read_error"
-    assert json.loads(output_path.read_text(encoding="utf-8"))["mutation_batch"]["status"] == "read_error"
+    assert (
+        json.loads(output_path.read_text(encoding="utf-8"))["mutation_batch"]["status"]
+        == "read_error"
+    )
 
 
 def test_research_cycle_skip_marker_tracks_mutation_batch(tmp_path, monkeypatch):
@@ -1194,9 +1366,13 @@ def test_research_cycle_skip_marker_tracks_mutation_batch(tmp_path, monkeypatch)
         json.dumps(_mutation_batch_payload(hypothesis, generated_at="2026-01-01T00:00:00+00:00")),
         encoding="utf-8",
     )
-    monkeypatch.setattr(rc, "build_market_data_statuses", lambda markets: {"futures": _market_status()})
+    monkeypatch.setattr(
+        rc, "build_market_data_statuses", lambda markets: {"futures": _market_status()}
+    )
 
-    def fake_validation(scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path):
+    def fake_validation(
+        scenario, *, hypotheses=None, selection=None, hypothesis_metadata=None, log_path
+    ):
         return {
             "ok": True,
             "name": scenario.name,
@@ -1259,7 +1435,11 @@ def test_research_cycle_advances_scenario_offsets_after_success(tmp_path, monkey
             max_hypotheses=3,
         ),
     )
-    monkeypatch.setattr(rc, "build_market_data_statuses", lambda markets: _market_statuses("2026-07-08T11:23:00+00:00"))
+    monkeypatch.setattr(
+        rc,
+        "build_market_data_statuses",
+        lambda markets: _market_statuses("2026-07-08T11:23:00+00:00"),
+    )
 
     def fake_validation(scenario, *, hypotheses=None, selection=None, log_path):
         return {
@@ -1304,9 +1484,12 @@ def test_research_cycle_advances_scenario_offsets_after_success(tmp_path, monkey
     assert first["scenarios"][0]["selection"]["offset"] == 0
     assert first["scenarios"][0]["selection"]["selected"] == 3
     assert second["scenarios"][0]["selection"]["offset"] == 3
-    assert json.loads(state_path.read_text(encoding="utf-8"))["scenario_offsets"][
-        "active_income_5m_guarded"
-    ] == second["scenarios"][0]["selection"]["next_offset"]
+    assert (
+        json.loads(state_path.read_text(encoding="utf-8"))["scenario_offsets"][
+            "active_income_5m_guarded"
+        ]
+        == second["scenarios"][0]["selection"]["next_offset"]
+    )
 
 
 def test_research_cycle_never_reuses_consumed_holdout_candidate_and_skips_exhausted(
@@ -1377,9 +1560,7 @@ def test_research_cycle_never_reuses_consumed_holdout_candidate_and_skips_exhaus
     assert second["scenarios"][0]["reason"] == "holdout_registry_exhausted"
     assert second["scenarios"][0]["selection"]["exhausted"] is True
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert state["consumed_holdout_ids"][scenario.name] == sorted(
-        hyp.id for hyp in hypotheses
-    )
+    assert state["consumed_holdout_ids"][scenario.name] == sorted(hyp.id for hyp in hypotheses)
 
 
 def test_research_cycle_persists_holdout_consumption_even_if_export_fails(
@@ -1452,6 +1633,11 @@ def test_validation_scenario_deflates_by_available_rotation_universe(monkeypatch
     hypotheses, selection = rc._select_hypotheses(scenario, {"version": 1})
     captured = {}
     monkeypatch.setattr(rc, "_missing_columns_for_hypothesis", lambda hypothesis, indicator_dir: {})
+    monkeypatch.setattr(
+        rc,
+        "with_trial_sharpe_dispersion",
+        lambda _frame, _hypotheses, cfg, _eval_cfg: cfg,
+    )
 
     def fake_build_frame(hyps, *, base_tf, start, end, indicator_dir):
         import pandas as pd
@@ -1462,7 +1648,14 @@ def test_validation_scenario_deflates_by_available_rotation_universe(monkeypatch
     def fake_validate_batch(frame, hyps, cfg, *, eval_cfg, log_path):
         captured["n_trials"] = cfg.n_trials
         return [
-            {"hypothesis_id": hyp.id, "family": hyp.family, "direction": hyp.direction, "verdict": "reject", "reasons": ["no_train_edge"], "train": {"trades": 30}}
+            {
+                "hypothesis_id": hyp.id,
+                "family": hyp.family,
+                "direction": hyp.direction,
+                "verdict": "reject",
+                "reasons": ["no_train_edge"],
+                "train": {"trades": 30},
+            }
             for hyp in hyps
         ]
 
@@ -1499,13 +1692,16 @@ def test_validation_scenario_records_only_hypotheses_that_touch_holdout(monkeypa
         "_missing_columns_for_hypothesis",
         lambda hypothesis, indicator_dir: {},
     )
+    monkeypatch.setattr(
+        rc,
+        "with_trial_sharpe_dispersion",
+        lambda _frame, _hypotheses, cfg, _eval_cfg: cfg,
+    )
 
     def fake_build_frame(hyps, *, base_tf, start, end, indicator_dir):
         import pandas as pd
 
-        return pd.DataFrame(
-            {"timestamp": pd.date_range("2026-01-01", periods=3, tz="UTC")}
-        )
+        return pd.DataFrame({"timestamp": pd.date_range("2026-01-01", periods=3, tz="UTC")})
 
     monkeypatch.setattr(rc, "build_aligned_frame", fake_build_frame)
     monkeypatch.setattr(
@@ -1559,7 +1755,14 @@ def test_validation_scenario_skips_only_unsupported_hypotheses(monkeypatch):
     monkeypatch.setattr(
         rc,
         "_missing_columns_for_hypothesis",
-        lambda hypothesis, indicator_dir: {"5m": ["volume_z_20"]} if hypothesis.id == unsupported_id else {},
+        lambda hypothesis, indicator_dir: {"5m": ["volume_z_20"]}
+        if hypothesis.id == unsupported_id
+        else {},
+    )
+    monkeypatch.setattr(
+        rc,
+        "with_trial_sharpe_dispersion",
+        lambda _frame, _hypotheses, cfg, _eval_cfg: cfg,
     )
 
     def fake_build_frame(hyps, *, base_tf, start, end, indicator_dir):
@@ -1608,3 +1811,113 @@ def test_research_cycle_fails_closed_when_market_data_is_not_ready(tmp_path, mon
     assert report["ok"] is False
     assert report["error"] == "market_data_not_ready"
     assert json.loads(output_path.read_text(encoding="utf-8"))["ok"] is False
+
+
+def test_research_epoch_selection_uses_largest_contiguous_unprotected_run():
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range(
+                "2026-01-01T00:00:00Z",
+                periods=125,
+                freq="5min",
+            ),
+            "value": range(125),
+        }
+    )
+    protected = (
+        {
+            "interval_key": "sealed",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "start": str(frame["timestamp"].iloc[80]),
+            "end": str(frame["timestamp"].iloc[99]),
+        },
+    )
+
+    selected, detail = rc._select_unprotected_epoch(frame, protected)
+
+    assert selected["value"].tolist() == list(range(80))
+    assert detail == {
+        "policy": "largest_contiguous_unprotected_epoch",
+        "input_rows": 125,
+        "selected_rows": 80,
+        "excluded_rows": 20,
+        "start": str(frame["timestamp"].iloc[0]),
+        "end": str(frame["timestamp"].iloc[79]),
+        "protected_intervals_considered": 1,
+    }
+
+
+def test_research_epoch_selection_prefers_newest_run_when_sizes_tie():
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range(
+                "2026-01-01T00:00:00Z",
+                periods=21,
+                freq="5min",
+            ),
+            "value": range(21),
+        }
+    )
+    protected = (
+        {
+            "interval_key": "sealed",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "start": str(frame["timestamp"].iloc[10]),
+            "end": str(frame["timestamp"].iloc[10]),
+        },
+    )
+
+    selected, _ = rc._select_unprotected_epoch(frame, protected)
+
+    assert selected["value"].tolist() == list(range(11, 21))
+
+
+def test_research_epoch_selection_embargoes_cross_timeframe_feature_dependencies():
+    import pandas as pd
+
+    # A 5m strategy that consumes a 1d feature can retain protected-price
+    # influence for the grammar's full 240-day rolling dependency. Immediate
+    # post-holdout rows must therefore remain unavailable to adaptive research.
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range(
+                "2025-01-01T00:00:00Z",
+                periods=24 * 250 + 1,
+                freq="1h",
+            ),
+            "value": range(24 * 250 + 1),
+        }
+    )
+    protected_end = frame["timestamp"].iloc[0]
+    protected = (
+        {
+            "interval_key": "sealed",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "start": str(protected_end),
+            "end": str(protected_end),
+        },
+    )
+
+    selected, detail = rc._select_unprotected_epoch(
+        frame,
+        protected,
+        feature_timeframes=("5m", "1d"),
+    )
+
+    assert selected["timestamp"].iloc[0] > protected_end + pd.Timedelta(days=240)
+    assert detail["protected_rows_excluded"] == 1
+    assert detail["feature_dependency_embargo_rows_excluded"] == 24 * 240
+    assert detail["feature_dependency_embargo"] == {
+        "policy": "maximum_supported_native_rolling_dependency",
+        "max_native_bars": 240,
+        "feature_timeframes": ["1d", "5m"],
+        "max_timeframe": "1d",
+        "duration_seconds": 240 * 86_400,
+    }

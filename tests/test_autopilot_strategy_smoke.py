@@ -43,6 +43,8 @@ def test_strategy_smoke_skips_missing_regime_input(tmp_path):
     )
 
     assert report["ok"] is True
-    regime = next(scenario for scenario in report["scenarios"] if scenario["name"] == "regime_filter_sweep")
+    regime = next(
+        scenario for scenario in report["scenarios"] if scenario["name"] == "regime_filter_sweep"
+    )
     assert regime["skipped"] is True
     assert regime["reason"] == "missing_regime_input"

@@ -30,7 +30,8 @@ from src.envfile import parse_env_value
 TELEGRAM_API_ROOT = "https://api.telegram.org"
 TELEGRAM_MAX_TEXT = 4096
 TELEGRAM_SAFE_TEXT = 4000
-DEFAULT_POLL_STATE = Path("runtime/telegram_poll_state.json")
+DEFAULT_POLL_STATE = Path("runtime/telegram/telegram_poll_state.json")
+LEGACY_POLL_STATE = Path("runtime/telegram_poll_state.json")
 DEFAULT_JOB_WORKER_STATUS = Path("runtime/job_worker_status.json")
 DEFAULT_RESEARCH_CYCLE = Path("runtime/research_cycle.json")
 DEFAULT_SETTINGS_FILE = PROJECT_ROOT / "runtime" / "telegram.env"
@@ -112,9 +113,7 @@ _CREDENTIAL_QUERY_PARAMETER = re.compile(
     r"x-goog-(?:credential|signature))=)([^&#\s]+)"
 )
 _URL_USERINFO = re.compile(r"(?i)(https?://)([^/@\s:]+):([^/@\s]+)@")
-_JWT = re.compile(
-    r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b"
-)
+_JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b")
 _TELEGRAM_BOT_TOKEN = re.compile(r"\b\d{5,}:[A-Za-z0-9_-]{6,}\b")
 _OMIT = object()
 SAFE_CONTROL_KEYS = (
@@ -246,9 +245,7 @@ def _validate_env_value_syntax(raw: str, *, line_number: int) -> None:
     quote_chars = {"'", '"'}
     if syntax and syntax[0] in quote_chars:
         if len(syntax) < 2 or syntax[-1] != syntax[0]:
-            raise TelegramError(
-                f"Telegram settings line {line_number} has malformed value syntax"
-            )
+            raise TelegramError(f"Telegram settings line {line_number} has malformed value syntax")
     elif any(char in quote_chars for char in syntax):
         raise TelegramError(f"Telegram settings line {line_number} has malformed value syntax")
 
@@ -267,9 +264,7 @@ def load_settings_file(path: Path) -> dict[str, str]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError) as exc:
-        raise TelegramError(
-            f"cannot read Telegram settings file: {type(exc).__name__}"
-        ) from exc
+        raise TelegramError(f"cannot read Telegram settings file: {type(exc).__name__}") from exc
     values: dict[str, str] = {}
     for line_number, raw in enumerate(lines, start=1):
         line = raw.strip()
@@ -295,7 +290,8 @@ def load_settings_file(path: Path) -> dict[str, str]:
 def validate_settings_file(path: Path) -> dict[str, Any]:
     values = load_settings_file(path)
     settings = TelegramSettings.from_environment(values, required=True)
-    assert settings is not None
+    if settings is None:
+        raise TelegramError("required Telegram settings unexpectedly resolved to empty")
     return {
         "ok": True,
         "settings_file": str(path),
@@ -775,12 +771,21 @@ def _help_text(settings: TelegramSettings) -> str:
                 "/pause_product NAME — pause one product",
             ]
         )
-    lines.append("Approval, activation, resume, risk, flatten, and order commands are never available.")
+    lines.append(
+        "Approval, activation, resume, risk, flatten, and order commands are never available."
+    )
     return "\n".join(lines)
 
 
 def _load_poll_offset(path: Path) -> int:
-    payload = _read_json_object(path, max_bytes=64 * 1024)
+    source = path
+    if (
+        not source.exists()
+        and source.resolve(strict=False) == DEFAULT_POLL_STATE.resolve(strict=False)
+        and LEGACY_POLL_STATE.exists()
+    ):
+        source = LEGACY_POLL_STATE
+    payload = _read_json_object(source, max_bytes=64 * 1024)
     raw = payload.get("next_update_id", 0)
     return raw if isinstance(raw, int) and raw >= 0 else 0
 
@@ -875,12 +880,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Strictly validate the private Telegram-only settings file and exit.",
     )
+    parser.add_argument(
+        "--validate-service-paths",
+        action="store_true",
+        help="Validate the installer's dedicated writable path boundary and exit.",
+    )
+    parser.add_argument("--expected-control-file", type=Path)
+    parser.add_argument("--expected-control-audit", type=Path)
     parser.add_argument("--poll-state", type=Path, default=DEFAULT_POLL_STATE)
     parser.add_argument("--job-worker-status", type=Path, default=DEFAULT_JOB_WORKER_STATUS)
     parser.add_argument("--research-cycle", type=Path, default=DEFAULT_RESEARCH_CYCLE)
     parser.add_argument("--once", action="store_true")
-    parser.add_argument("--status", action="store_true", help="Print sanitized status without Telegram.")
-    parser.add_argument("--send-status", action="store_true", help="Send one sanitized status message.")
+    parser.add_argument(
+        "--status", action="store_true", help="Print sanitized status without Telegram."
+    )
+    parser.add_argument(
+        "--send-status", action="store_true", help="Send one sanitized status message."
+    )
     parser.add_argument("--long-poll-seconds", type=int, default=30)
     parser.add_argument("--retry-seconds", type=int, default=10)
     return parser.parse_args(argv)
@@ -897,6 +913,77 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(result, sort_keys=True))
         return
     config = load_config(args.config, strict_jobs=False)
+    if args.validate_service_paths:
+        expected = {
+            "control_file": args.expected_control_file,
+            "control_audit_file": args.expected_control_audit,
+            "poll_state": args.poll_state,
+        }
+        actual = {
+            "control_file": config.control_file,
+            "control_audit_file": config.control_audit_file,
+            "poll_state": args.poll_state,
+        }
+        missing = [name for name, path in expected.items() if path is None]
+        mismatched = [
+            name
+            for name, expected_path in expected.items()
+            if expected_path is not None
+            and actual[name].resolve(strict=False) != expected_path.resolve(strict=False)
+        ]
+        if missing or mismatched:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "Telegram service writable paths do not match the dedicated boundary",
+                        "missing": missing,
+                        "mismatched": mismatched,
+                    },
+                    sort_keys=True,
+                )
+            )
+            raise SystemExit(1)
+        unsafe_paths = [
+            name
+            for name, path in actual.items()
+            if path.is_symlink() or path.parent.is_symlink() or not path.parent.is_dir()
+        ]
+        if unsafe_paths:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "Telegram service writable paths require safe existing parent directories",
+                        "unsafe": unsafe_paths,
+                    },
+                    sort_keys=True,
+                )
+            )
+            raise SystemExit(1)
+        writable_parents = {path.parent.resolve(strict=False) for path in actual.values()}
+        runtime_root = (PROJECT_ROOT / "runtime").resolve(strict=False)
+        if runtime_root in writable_parents:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "Telegram service paths must not require the runtime root to be writable",
+                    },
+                    sort_keys=True,
+                )
+            )
+            raise SystemExit(1)
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "writable_directories": sorted(map(str, writable_parents)),
+                },
+                sort_keys=True,
+            )
+        )
+        return
     snapshot = build_status_snapshot(
         status_path=config.status_file,
         control_path=config.control_file,
@@ -911,7 +998,8 @@ def main(argv: list[str] | None = None) -> None:
     settings = TelegramSettings.from_environment(
         _environment_with_private_settings(settings_environment), required=True
     )
-    assert settings is not None
+    if settings is None:
+        raise TelegramError("required Telegram settings unexpectedly resolved to empty")
     if args.send_status:
         print(json.dumps(send_text(settings, format_status_message(snapshot)), sort_keys=True))
         return

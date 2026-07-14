@@ -11,9 +11,7 @@ def test_parse_timestamp_series_epoch_seconds_as_utc():
 
 
 def test_parse_timestamp_series_iso_strings_as_utc():
-    parsed = parse_timestamp_series(
-        pd.Series(["2024-05-01 00:00:00", "2024-05-01T01:00:00Z"])
-    )
+    parsed = parse_timestamp_series(pd.Series(["2024-05-01 00:00:00", "2024-05-01T01:00:00Z"]))
 
     assert parsed.iloc[0] == pd.Timestamp("2024-05-01T00:00:00Z")
     assert parsed.iloc[1] == pd.Timestamp("2024-05-01T01:00:00Z")

@@ -18,7 +18,9 @@ from src.strategies.registry import register
 @register
 class RegressionChannelStrategy(Strategy):
     name = "regression_channel"
-    description = "Trade a rolling linear-regression channel — fade the bands (revert) or follow breaks."
+    description = (
+        "Trade a rolling linear-regression channel — fade the bands (revert) or follow breaks."
+    )
 
     @classmethod
     def default_params(cls):

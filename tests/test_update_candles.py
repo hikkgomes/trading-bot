@@ -28,7 +28,13 @@ def candle_frame(**overrides):
     values.update(overrides)
     return pd.DataFrame(
         values,
-        index=pd.date_range("2026-01-01", periods=len(next(iter(values.values()))), freq="1min", tz="UTC", name="timestamp"),
+        index=pd.date_range(
+            "2026-01-01",
+            periods=len(next(iter(values.values()))),
+            freq="1min",
+            tz="UTC",
+            name="timestamp",
+        ),
     )
 
 
@@ -162,7 +168,9 @@ def test_update_1m_candles_rejects_corrupt_existing_seed(monkeypatch, tmp_path):
 
     monkeypatch.setattr(update_candles, "fetch_recent_candles", fail_fetch)
 
-    with pytest.raises(ValueError, match="existing 1m candles: OHLC values are internally inconsistent"):
+    with pytest.raises(
+        ValueError, match="existing 1m candles: OHLC values are internally inconsistent"
+    ):
         update_candles.update_1m_candles()
 
 
@@ -204,7 +212,9 @@ def test_load_existing_1m_candles_rejects_duplicate_seed_timestamps(monkeypatch,
     seed = pd.concat([seed, seed], ignore_index=True)
     seed.to_parquet(seed_path)
 
-    with pytest.raises(ValueError, match="stored 1m candles: timestamps must be strictly increasing"):
+    with pytest.raises(
+        ValueError, match="stored 1m candles: timestamps must be strictly increasing"
+    ):
         update_candles.bbid.load_existing_1m_candles()
 
 
@@ -268,6 +278,7 @@ def test_run_update_filters_indicator_rebuild_timeframes(monkeypatch, tmp_path):
     captured = {}
 
     monkeypatch.setattr(update_candles, "update_1m_candles", lambda: df_1m)
+
     def build_timeframes(frame, timeframes=None):
         captured["requested_timeframes"] = list(timeframes or [])
         return {tf: frame for tf in timeframes}
@@ -331,6 +342,7 @@ def test_run_update_bootstraps_missing_seed_when_requested(monkeypatch, tmp_path
     captured = {}
 
     monkeypatch.setattr(update_candles, "bootstrap_1m_candles", lambda days: df_1m)
+
     def build_timeframes(frame, timeframes=None):
         captured["requested_timeframes"] = list(timeframes or [])
         return {tf: frame for tf in timeframes}
@@ -439,7 +451,9 @@ def test_run_update_reports_fetch_error_without_rebuilding_indicators(monkeypatc
     assert report["timeframes"] == ["15m"]
 
 
-def test_run_update_treats_fetch_error_as_warning_when_existing_seed_is_fresh(monkeypatch, tmp_path):
+def test_run_update_treats_fetch_error_as_warning_when_existing_seed_is_fresh(
+    monkeypatch, tmp_path
+):
     configure_dataset(monkeypatch, tmp_path)
     seed_path = tmp_path / "BTCUSDT_1m.parquet"
     seed_path.write_text("seed", encoding="utf-8")

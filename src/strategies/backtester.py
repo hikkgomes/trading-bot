@@ -166,9 +166,7 @@ def run_backtest(
         signals = pd.Series(signals, index=df.index)
     direction = signals.reindex(df.index).fillna(0).clip(-1, 1).round().to_numpy(dtype=int)
 
-    trades = _simulate(
-        ohlcv.open, ohlcv.high, ohlcv.low, ohlcv.close, direction, df.index, cfg
-    )
+    trades = _simulate(ohlcv.open, ohlcv.high, ohlcv.low, ohlcv.close, direction, df.index, cfg)
     trades_df = pd.DataFrame(trades)
     if trades_df.empty:
         equity = pd.Series([cfg.initial_equity], index=df.index[:1] if len(df.index) else None)

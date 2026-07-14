@@ -65,23 +65,25 @@ def fetch_recent_candles(
     expected_width = len(bbid.BINANCE_COLUMNS)
     for index, row in enumerate(data):
         if not isinstance(row, list | tuple) or len(row) != expected_width:
-            raise ValueError(
-                f"{symbol} {market} fetched 1m candles: malformed Binance row {index}"
-            )
+            raise ValueError(f"{symbol} {market} fetched 1m candles: malformed Binance row {index}")
 
     # Parse klines data
     df = pd.DataFrame(data, columns=bbid.BINANCE_COLUMNS)
     df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
     open_times = df["open_time"].to_numpy(dtype="float64")
     if df["open_time"].isna().any() or not np.isfinite(open_times).all() or (open_times < 0).any():
-        raise ValueError(f"{symbol} {market} fetched 1m candles: open_time must be finite and non-negative")
+        raise ValueError(
+            f"{symbol} {market} fetched 1m candles: open_time must be finite and non-negative"
+        )
 
     for column in bbid.CANDLE_COLUMNS[1:]:
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
     df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     out = df[bbid.CANDLE_COLUMNS]
-    validate_1m_candles(out, candle_columns=bbid.CANDLE_COLUMNS, label=f"{symbol} {market} fetched 1m candles")
+    validate_1m_candles(
+        out, candle_columns=bbid.CANDLE_COLUMNS, label=f"{symbol} {market} fetched 1m candles"
+    )
     return out
 
 
@@ -121,7 +123,9 @@ def _seed_age_seconds(frame: pd.DataFrame) -> float | None:
     return max(0.0, (pd.Timestamp.now(tz="UTC") - last_timestamp).total_seconds())
 
 
-def _seed_is_fresh(frame: pd.DataFrame, *, max_age_seconds: int = DEFAULT_FETCH_ERROR_GRACE_SECONDS) -> bool:
+def _seed_is_fresh(
+    frame: pd.DataFrame, *, max_age_seconds: int = DEFAULT_FETCH_ERROR_GRACE_SECONDS
+) -> bool:
     age_seconds = _seed_age_seconds(frame)
     return age_seconds is not None and age_seconds <= max_age_seconds
 
@@ -221,7 +225,9 @@ def update_1m_candles() -> pd.DataFrame:
     current_time_ms = int(time.time() * 1000)
 
     LOGGER.info("Last candle timestamp: %s (ms: %d)", last_timestamp, last_timestamp.value // 10**6)
-    LOGGER.info("Fetching new candles starting from: %s", pd.to_datetime(start_time_ms, unit="ms", utc=True))
+    LOGGER.info(
+        "Fetching new candles starting from: %s", pd.to_datetime(start_time_ms, unit="ms", utc=True)
+    )
 
     new_frames = []
     fetch_start = start_time_ms
@@ -246,7 +252,11 @@ def update_1m_candles() -> pd.DataFrame:
 
         # Get the timestamp of the last retrieved candle
         last_fetched_ms = int(df_new["timestamp"].max().value // 10**6)
-        LOGGER.info("Fetched %d candles. Last timestamp: %s", len(df_new), pd.to_datetime(last_fetched_ms, unit="ms", utc=True))
+        LOGGER.info(
+            "Fetched %d candles. Last timestamp: %s",
+            len(df_new),
+            pd.to_datetime(last_fetched_ms, unit="ms", utc=True),
+        )
 
         # Check if we've reached the end of available data (if the last fetched time didn't advance)
         if last_fetched_ms <= fetch_start:
@@ -276,8 +286,12 @@ def update_1m_candles() -> pd.DataFrame:
             label=f"{bbid.SYMBOL} {bbid.MARKET} merged 1m candles",
         )
 
-        LOGGER.info("Merged candles. Previous rows: %d, New rows: %d, Merged rows: %d",
-                    len(df_existing), len(df_new_all), len(df_updated))
+        LOGGER.info(
+            "Merged candles. Previous rows: %d, New rows: %d, Merged rows: %d",
+            len(df_existing),
+            len(df_new_all),
+            len(df_updated),
+        )
 
         # Save back to 1m Parquet
         candle_path.parent.mkdir(parents=True, exist_ok=True)
@@ -294,12 +308,17 @@ def update_1m_candles() -> pd.DataFrame:
             df_existing.attrs["fetch_error"] = fetch_error
         return df_existing
 
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Incrementally update candles and rebuild indicators.")
+    parser = argparse.ArgumentParser(
+        description="Incrementally update candles and rebuild indicators."
+    )
     parser.add_argument(
-        "--timeframes", nargs="+", default=None,
+        "--timeframes",
+        nargs="+",
+        default=None,
         help="Only rebuild indicator parquets for these timeframes (e.g. 5m 15m 30m 1h). "
-             "Default rebuilds all. The chunked 1m build is by far the slowest.",
+        "Default rebuilds all. The chunked 1m build is by far the slowest.",
     )
     parser.add_argument(
         "--skip-if-missing",
@@ -317,7 +336,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="If the 1m seed is missing, bootstrap this many recent days via REST "
-             "(bounded to 366). Default 0 keeps skip/fail behavior.",
+        "(bounded to 366). Default 0 keeps skip/fail behavior.",
     )
     return parser.parse_args()
 
@@ -327,7 +346,9 @@ def _validate_timeframes(timeframes: list[str] | None) -> None:
         return
     unknown = set(timeframes) - set(bbid.TIMEFRAMES)
     if unknown:
-        raise ValueError(f"Unknown timeframes {sorted(unknown)}; available: {sorted(bbid.TIMEFRAMES)}")
+        raise ValueError(
+            f"Unknown timeframes {sorted(unknown)}; available: {sorted(bbid.TIMEFRAMES)}"
+        )
 
 
 def run_update(
@@ -440,6 +461,7 @@ def main():
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     raise SystemExit(0 if report.get("ok") else 1)
+
 
 if __name__ == "__main__":
     main()

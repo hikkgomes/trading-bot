@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from research_exploration.dsr import DSR_METHOD
 from src.autopilot.rehearsal import run_rehearsal
 
 
@@ -41,7 +42,7 @@ def test_run_rehearsal_writes_end_to_end_artifacts(tmp_path):
     assert preflight["ok"] is True
     assert len(preflight["products"]) == 2
     checks = {item["name"]: item for item in preflight["products"][0]["checks"]}
-    assert checks["approval_gate"]["ok"] is True
+    assert "approval_gate" not in checks
     assert checks["exchange_read_connectivity"]["detail"]["price"] == 100.0
     assert checks["broker_native_protective_stops"] == {
         "name": "broker_native_protective_stops",
@@ -52,7 +53,8 @@ def test_run_rehearsal_writes_end_to_end_artifacts(tmp_path):
         "name": "broker_open_orders_empty",
         "ok": True,
         "detail": {
-            "symbol": "BTCUSDT",
+            "scope": "whole_account",
+            "configured_symbol": "BTCUSDT",
             "regular": {"count": 0, "orders": []},
             "conditional": {"count": 0, "orders": []},
         },
@@ -62,6 +64,14 @@ def test_run_rehearsal_writes_end_to_end_artifacts(tmp_path):
         assert product_report["after_recommendation"] == "already_approved"
         for key in ("artifact", "trade_log", "promotion_review_json", "promotion_review_md"):
             assert Path(product_report[key]).exists(), product_name
+        product_artifact = json.loads(Path(product_report["artifact"]).read_text(encoding="utf-8"))
+        metrics = product_artifact["strategies"][0]["metrics"]
+        assert metrics["dsr_method"] == DSR_METHOD
+        assert metrics["n_trials"] == 8
+        assert metrics["sr_std_trials"] > 0
+        assert metrics["trial_sharpe_count"] == 8
+        assert metrics["trial_sharpe_observed_std"] >= 0
+        assert metrics["trial_sharpe_conservative_floor"] > 0
 
     btc_artifact = json.loads(
         Path(report["products"]["btc_accumulation"]["artifact"]).read_text(encoding="utf-8")

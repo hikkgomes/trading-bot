@@ -20,40 +20,20 @@ Run:  python -m research_exploration.export --pnl-unit usdt \
 from __future__ import annotations
 
 import argparse
-import datetime
 import json
+import math
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
+from research_exploration.dsr import DSR_METHOD, LIVE_MIN_DSR
 from research_exploration.experiment_log import DEFAULT_LOG, load_log
 from research_exploration.hypothesis_schema import Hypothesis
+from research_exploration.risk_policy import effective_risk_block
 from src.autopilot.io import write_json_atomic
 
 SCHEMA_VERSION = 2  # v1 = condition-grid entries only; v2 adds entry_type "hypothesis"
 DEFAULT_OUTPUT = Path("outputs/active_strategies_research.json")
-DEFAULT_DAILY_STOP_LOSS = -0.02
-DEFAULT_MAX_CONSECUTIVE_LOSSES = 3
-DEFAULT_COOLDOWN_BARS = 12
-EXECUTION_RISK_ENVELOPES = {
-    ("futures", "usdt"): {
-        "max_risk_per_trade": 0.005,
-        "max_position_fraction": 0.25,
-        "max_daily_loss": 0.03,
-        "max_consecutive_losses": 4,
-        "max_trades_per_day": 8,
-        "min_cooldown_bars": 12,
-        "default_max_trades_per_day": 4,
-    },
-    ("spot", "btc"): {
-        "max_risk_per_trade": 0.003,
-        "max_position_fraction": 0.35,
-        "max_daily_loss": 0.01,
-        "max_consecutive_losses": 3,
-        "max_trades_per_day": 2,
-        "min_cooldown_bars": 24,
-        "default_max_trades_per_day": 1,
-    },
-}
 
 
 def _git_sha() -> str:
@@ -80,9 +60,11 @@ def keep_records(log_path: Path = DEFAULT_LOG) -> list[dict]:
         hid = rec["hypothesis_id"]
         if hid not in latest or rec.get("timestamp", "") > latest[hid].get("timestamp", ""):
             latest[hid] = rec
-    return sorted(latest.values(),
-                  key=lambda r: (r.get("metrics") or {}).get("dsr_deflated") or 0.0,
-                  reverse=True)
+    return sorted(
+        latest.values(),
+        key=lambda r: (r.get("metrics") or {}).get("dsr_deflated") or 0.0,
+        reverse=True,
+    )
 
 
 def _record_market(record: dict) -> str | None:
@@ -108,8 +90,45 @@ def _exportable(
         return False, "holdout had no trades"
     if float(holdout.get("total_return") or 0.0) <= 0:
         return False, f"holdout not positive ({holdout.get('total_return')})"
-    dsr = (record.get("metrics") or {}).get("dsr_deflated")
-    if min_dsr is not None and (dsr is None or float(dsr) < min_dsr):
+    metrics = record.get("metrics") or {}
+    if metrics.get("dsr_method") != DSR_METHOD:
+        return False, f"DSR evidence method is not current ({metrics.get('dsr_method')!r})"
+    n_trials = metrics.get("n_trials")
+    if isinstance(n_trials, bool) or not isinstance(n_trials, int) or n_trials < 1:
+        return False, "DSR evidence n_trials must be a positive integer"
+    numeric_evidence: dict[str, float] = {}
+    for field in (
+        "sr_std_trials",
+        "trial_sharpe_observed_std",
+        "trial_sharpe_conservative_floor",
+    ):
+        try:
+            value = float(metrics.get(field))
+        except (TypeError, ValueError):
+            return False, f"DSR evidence {field} must be numeric"
+        if not math.isfinite(value) or value < 0:
+            return False, f"DSR evidence {field} must be finite and non-negative"
+        numeric_evidence[field] = value
+    trial_sharpe_count = metrics.get("trial_sharpe_count")
+    if (
+        isinstance(trial_sharpe_count, bool)
+        or not isinstance(trial_sharpe_count, int)
+        or trial_sharpe_count < 0
+    ):
+        return False, "DSR evidence trial_sharpe_count must be a non-negative integer"
+    if n_trials > 1 and (
+        numeric_evidence["sr_std_trials"] <= 0
+        or numeric_evidence["trial_sharpe_conservative_floor"] <= 0
+    ):
+        return False, "multiple-trial DSR evidence must use positive dispersion and floor"
+    dsr = metrics.get("dsr_deflated")
+    try:
+        dsr_value = float(dsr)
+    except (TypeError, ValueError):
+        return False, f"dsr_deflated {dsr!r} is not numeric"
+    if not math.isfinite(dsr_value):
+        return False, f"dsr_deflated {dsr!r} is not finite"
+    if min_dsr is not None and dsr_value < min_dsr:
         return False, f"dsr_deflated {dsr} < --min-dsr {min_dsr}"
     if pnl_unit is not None:
         rec_unit = _eval_config(record).get("pnl_unit", "usdt")
@@ -136,10 +155,20 @@ def _baseline_win_rate(record: dict) -> float | None:
 def _headline_metrics(record: dict) -> dict:
     eval_cfg = _eval_config(record)
     metrics = record.get("metrics") or {}
-    headline = {"dsr_deflated": metrics.get("dsr_deflated"),
-                "n_trials": metrics.get("n_trials"),
-                "oos_pass_rate": metrics.get("oos_pass_rate"),
-                "sensitivity_pass_fraction": metrics.get("sensitivity_pass_fraction")}
+    headline = {
+        key: metrics.get(key)
+        for key in (
+            "dsr_deflated",
+            "dsr_method",
+            "n_trials",
+            "sr_std_trials",
+            "trial_sharpe_count",
+            "trial_sharpe_observed_std",
+            "trial_sharpe_conservative_floor",
+            "oos_pass_rate",
+            "sensitivity_pass_fraction",
+        )
+    }
     for seg in ("train", "validation", "holdout"):
         for key, value in _seg_metrics(record, seg).items():
             headline[f"{seg}_{key}"] = value
@@ -151,41 +180,10 @@ def _headline_metrics(record: dict) -> dict:
     return headline
 
 
-def _execution_risk_envelope(market: str | None, pnl_unit: str | None) -> dict | None:
-    if market is None or pnl_unit is None:
-        return None
-    return EXECUTION_RISK_ENVELOPES.get((str(market).lower(), str(pnl_unit).lower()))
-
-
 def _risk_block(hyp: Hypothesis, *, market: str | None, pnl_unit: str | None) -> dict:
-    risk_per_trade = float(hyp.risk.risk_per_trade or 0.01)
-    if hyp.risk.max_daily_loss_r:
-        daily_stop_loss = -abs(float(hyp.risk.max_daily_loss_r) * risk_per_trade)
-    else:
-        daily_stop_loss = DEFAULT_DAILY_STOP_LOSS
-    max_position_fraction = float(hyp.risk.max_position_fraction)
-    max_consecutive_losses = DEFAULT_MAX_CONSECUTIVE_LOSSES
-    cooldown_bars = int(hyp.risk.cooldown_bars or DEFAULT_COOLDOWN_BARS)
-    max_trades_per_day = hyp.risk.max_trades_per_day
-    envelope = _execution_risk_envelope(market, pnl_unit)
-    if envelope is not None:
-        risk_per_trade = min(risk_per_trade, float(envelope["max_risk_per_trade"]))
-        max_position_fraction = min(max_position_fraction, float(envelope["max_position_fraction"]))
-        daily_stop_loss = max(daily_stop_loss, -float(envelope["max_daily_loss"]))
-        max_consecutive_losses = min(max_consecutive_losses, int(envelope["max_consecutive_losses"]))
-        cooldown_bars = max(cooldown_bars, int(envelope["min_cooldown_bars"]))
-        if max_trades_per_day is None:
-            max_trades_per_day = int(envelope["default_max_trades_per_day"])
-        else:
-            max_trades_per_day = min(int(max_trades_per_day), int(envelope["max_trades_per_day"]))
-    return {
-        "risk_per_trade": risk_per_trade,
-        "daily_stop_loss": daily_stop_loss,
-        "max_position_fraction": max_position_fraction,
-        "max_consecutive_losses": max_consecutive_losses,
-        "cooldown_bars": cooldown_bars,
-        "max_trades_per_day": max_trades_per_day,
-    }
+    if market is None or pnl_unit is None:
+        raise ValueError("market and pnl_unit are required to resolve effective strategy risk")
+    return effective_risk_block(hyp, market=market, pnl_unit=pnl_unit)
 
 
 def strategy_entry(record: dict, rank: int, *, market: str | None = None) -> dict:
@@ -230,9 +228,14 @@ def strategy_entry(record: dict, rank: int, *, market: str | None = None) -> dic
     }
 
 
-def build_payload(log_path: Path = DEFAULT_LOG, top_k: int | None = None,
-                  min_dsr: float | None = None, pnl_unit: str | None = None,
-                  ids: list[str] | None = None, market: str | None = None) -> dict:
+def build_payload(
+    log_path: Path = DEFAULT_LOG,
+    top_k: int | None = None,
+    min_dsr: float | None = LIVE_MIN_DSR,
+    pnl_unit: str | None = None,
+    ids: list[str] | None = None,
+    market: str | None = None,
+) -> dict:
     records = keep_records(log_path)
     if ids:
         records = [r for r in records if r["hypothesis_id"] in set(ids)]
@@ -251,8 +254,7 @@ def build_payload(log_path: Path = DEFAULT_LOG, top_k: int | None = None,
     if top_k is not None:
         kept = kept[:top_k]
     strategies = [
-        strategy_entry(rec, rank, market=market)
-        for rank, (rec, _) in enumerate(kept, start=1)
+        strategy_entry(rec, rank, market=market) for rank, (rec, _) in enumerate(kept, start=1)
     ]
     units = {s["pnl_unit"] for s in strategies}
     if len(units) > 1:
@@ -274,7 +276,7 @@ def build_payload(log_path: Path = DEFAULT_LOG, top_k: int | None = None,
         )
     return {
         "version": SCHEMA_VERSION,
-        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "export_git_sha": _git_sha(),
         "source": str(log_path),
         "pnl_unit": strategies[0]["pnl_unit"],
@@ -287,12 +289,18 @@ def build_payload(log_path: Path = DEFAULT_LOG, top_k: int | None = None,
     }
 
 
-def run(log_path: Path = DEFAULT_LOG, output_path: Path = DEFAULT_OUTPUT,
-        top_k: int | None = None, min_dsr: float | None = None,
-        pnl_unit: str | None = None, ids: list[str] | None = None,
-        market: str | None = None) -> Path:
-    payload = build_payload(log_path, top_k=top_k, min_dsr=min_dsr,
-                            pnl_unit=pnl_unit, ids=ids, market=market)
+def run(
+    log_path: Path = DEFAULT_LOG,
+    output_path: Path = DEFAULT_OUTPUT,
+    top_k: int | None = None,
+    min_dsr: float | None = LIVE_MIN_DSR,
+    pnl_unit: str | None = None,
+    ids: list[str] | None = None,
+    market: str | None = None,
+) -> Path:
+    payload = build_payload(
+        log_path, top_k=top_k, min_dsr=min_dsr, pnl_unit=pnl_unit, ids=ids, market=market
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_json_atomic(output_path, payload)
     return output_path
@@ -300,32 +308,67 @@ def run(log_path: Path = DEFAULT_LOG, output_path: Path = DEFAULT_OUTPUT,
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export kept (staged-validated) hypotheses to an active-strategies file.")
-    parser.add_argument("--log", type=Path, default=DEFAULT_LOG,
-                        help="Experiment log JSONL (default: outputs/research_exploration/experiment_log.jsonl).")
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT,
-                        help="Artifact path. Point the bot at it with `python -m src.run_bot --strategies <out>`.")
-    parser.add_argument("--top-k", type=int, default=None,
-                        help="Keep only the K best by deflated DSR (default: all that pass).")
-    parser.add_argument("--min-dsr", type=float, default=None,
-                        help="Minimum batch-deflated DSR recorded at validation time.")
-    parser.add_argument("--pnl-unit", choices=("usdt", "btc"), default=None,
-                        help="Only strategies validated in this unit (btc = position/accumulation bot, "
-                             "usdt = day-trade bot). Required when the log mixes units.")
-    parser.add_argument("--market", choices=("spot", "futures"), default=None,
-                        help="Execution market stamped into the artifact. Must match the market recorded "
-                             "during validation.")
-    parser.add_argument("--ids", nargs="*", default=None,
-                        help="Restrict to specific hypothesis ids.")
+        description="Export kept (staged-validated) hypotheses to an active-strategies file."
+    )
+    parser.add_argument(
+        "--log",
+        type=Path,
+        default=DEFAULT_LOG,
+        help="Experiment log JSONL (default: outputs/research_exploration/experiment_log.jsonl).",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=DEFAULT_OUTPUT,
+        help="Artifact path. Point the bot at it with `python -m src.run_bot --strategies <out>`.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Keep only the K best by deflated DSR (default: all that pass).",
+    )
+    parser.add_argument(
+        "--min-dsr",
+        type=float,
+        default=LIVE_MIN_DSR,
+        help="Minimum batch-deflated DSR recorded at validation time.",
+    )
+    parser.add_argument(
+        "--pnl-unit",
+        choices=("usdt", "btc"),
+        default=None,
+        help="Only strategies validated in this unit (btc = position/accumulation bot, "
+        "usdt = day-trade bot). Required when the log mixes units.",
+    )
+    parser.add_argument(
+        "--market",
+        choices=("spot", "futures"),
+        default=None,
+        help="Execution market stamped into the artifact. Must match the market recorded "
+        "during validation.",
+    )
+    parser.add_argument(
+        "--ids", nargs="*", default=None, help="Restrict to specific hypothesis ids."
+    )
     args = parser.parse_args()
 
-    path = run(args.log, args.out, top_k=args.top_k, min_dsr=args.min_dsr,
-               pnl_unit=args.pnl_unit, ids=args.ids, market=args.market)
+    path = run(
+        args.log,
+        args.out,
+        top_k=args.top_k,
+        min_dsr=args.min_dsr,
+        pnl_unit=args.pnl_unit,
+        ids=args.ids,
+        market=args.market,
+    )
     payload = json.loads(path.read_text(encoding="utf-8"))
     print(f"Wrote {path} ({len(payload['strategies'])} strategies, pnl_unit={payload['pnl_unit']})")
     for s in payload["strategies"]:
-        print(f"  #{s['rank']} {s['id']} [{s['direction']}, base {s['base_timeframe']}] "
-              f"dsr={s['metrics'].get('dsr_deflated')} holdout_ret={s['metrics'].get('holdout_total_return')}")
+        print(
+            f"  #{s['rank']} {s['id']} [{s['direction']}, base {s['base_timeframe']}] "
+            f"dsr={s['metrics'].get('dsr_deflated')} holdout_ret={s['metrics'].get('holdout_total_return')}"
+        )
 
 
 if __name__ == "__main__":

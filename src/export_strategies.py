@@ -227,7 +227,9 @@ def build_payload(
     config = json.loads(config_path.read_text(encoding="utf-8"))
     ranked = pd.read_csv(ranked_path)
     if ranked.empty:
-        raise ValueError(f"{ranked_path} contains no strategies — nothing passed the search filters.")
+        raise ValueError(
+            f"{ranked_path} contains no strategies — nothing passed the search filters."
+        )
     if "passes_filters" in ranked.columns:
         ranked = ranked[ranked["passes_filters"].astype(bool)]
     if not ranked.empty:
@@ -287,9 +289,16 @@ def build_payload(
         metrics = {
             name: _row_metric(row, name)
             for name in (
-                "dsr", "wf_pass_rate", "wf_expectancy", "wf_avg_trades",
-                "test_total_return", "test_avg_net_return", "test_win_rate",
-                "holdout_total_return", "holdout_win_rate", "pool_pbo",
+                "dsr",
+                "wf_pass_rate",
+                "wf_expectancy",
+                "wf_avg_trades",
+                "test_total_return",
+                "test_avg_net_return",
+                "test_win_rate",
+                "holdout_total_return",
+                "holdout_win_rate",
+                "pool_pbo",
             )
         }
         exported_metrics = _with_benchmark_metrics(
@@ -369,14 +378,17 @@ def parse_args() -> argparse.Namespace:
         help="Read ranked_strategies.csv even when ranked_strategies_clustered.csv exists.",
     )
     parser.add_argument(
-        "--min-holdout-return", type=float, default=0.0,
+        "--min-holdout-return",
+        type=float,
+        default=0.0,
         help="Require holdout_total_return strictly above this (default 0.0: the "
         "holdout gates admission).",
     )
     parser.add_argument(
-        "--no-holdout-gate", action="store_true",
+        "--no-holdout-gate",
+        action="store_true",
         help="Disable the holdout gate (NOT recommended — exports strategies that "
-             "may have lost on their own holdout).",
+        "may have lost on their own holdout).",
     )
     return parser.parse_args()
 

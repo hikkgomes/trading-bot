@@ -68,11 +68,7 @@ DEFAULT_MOSTLY_EMPTY_THRESHOLD = 0.95
 
 def prefix_columns(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     prefix = TIMEFRAME_PREFIXES.get(timeframe, f"tf_{timeframe}_")
-    renamed = {
-        column: f"{prefix}{column}"
-        for column in df.columns
-        if column != "timestamp"
-    }
+    renamed = {column: f"{prefix}{column}" for column in df.columns if column != "timestamp"}
     return df.rename(columns=renamed)
 
 
@@ -97,9 +93,7 @@ def normalize_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
             raise ValueError("Dataframe is missing a timestamp column or timestamp index")
 
     df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).astype(
-        "datetime64[ns, UTC]"
-    )
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).astype("datetime64[ns, UTC]")
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
@@ -142,9 +136,9 @@ def build_multitimeframe_dataset(
     dataset["target_return_next_1_bar"] = base_close.shift(-1) / base_close - 1
     dataset["target_return_next_4_bars"] = base_close.shift(-4) / base_close - 1
     dataset["target_direction_next_4_bars"] = (
-        dataset["target_return_next_4_bars"].map(
-            lambda value: float(value > 0) if pd.notna(value) else pd.NA
-        ).astype("Float64")
+        dataset["target_return_next_4_bars"]
+        .map(lambda value: float(value > 0) if pd.notna(value) else pd.NA)
+        .astype("Float64")
     )
 
     for timeframe in TIMEFRAME_JOIN_ORDER:
@@ -250,20 +244,22 @@ def drop_problem_columns(
     base_timeframe: str = BASE_TIMEFRAME,
 ) -> pd.DataFrame:
     prefix = TIMEFRAME_PREFIXES.get(base_timeframe, f"tf_{base_timeframe}_")
-    protected_columns = {"timestamp"} | set(TARGET_COLUMNS) | {
-        f"{prefix}open",
-        f"{prefix}high",
-        f"{prefix}low",
-        f"{prefix}close",
-        f"{prefix}volume",
-        f"{prefix}atr",
-        f"{prefix}atr_14",
-    }
+    protected_columns = (
+        {"timestamp"}
+        | set(TARGET_COLUMNS)
+        | {
+            f"{prefix}open",
+            f"{prefix}high",
+            f"{prefix}low",
+            f"{prefix}close",
+            f"{prefix}volume",
+            f"{prefix}atr",
+            f"{prefix}atr_14",
+        }
+    )
     cols_to_drop = set()
     cols_to_drop.update(find_constant_columns(dataset))
-    cols_to_drop.update(
-        find_mostly_empty_columns(dataset, threshold=mostly_empty_threshold)
-    )
+    cols_to_drop.update(find_mostly_empty_columns(dataset, threshold=mostly_empty_threshold))
     if include_duplicate_scan:
         for group in find_duplicate_columns(dataset):
             cols_to_drop.update(group[1:])

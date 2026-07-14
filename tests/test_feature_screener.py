@@ -9,13 +9,17 @@ from src.feature_screener import screen_features, screen_features_per_scenario
 def test_screen_features_respects_max_features():
     n = 1000
     rng = np.random.default_rng(42)
-    train = pd.DataFrame({
-        "x1": rng.normal(size=n),
-        "x2": rng.normal(size=n),
-        "x3": rng.normal(size=n),
-    })
+    train = pd.DataFrame(
+        {
+            "x1": rng.normal(size=n),
+            "x2": rng.normal(size=n),
+            "x3": rng.normal(size=n),
+        }
+    )
     train["label"] = (train["x1"] > 0).astype(int)
-    ranked = screen_features(train, "label", ["x1", "x2", "x3"], max_features=2, method="importance")
+    ranked = screen_features(
+        train, "label", ["x1", "x2", "x3"], max_features=2, method="importance"
+    )
     assert len(ranked) == 2
 
 
@@ -35,12 +39,16 @@ def test_screen_features_changes_with_train_frame_deterministic():
 def test_screen_features_per_scenario():
     n = 1000
     rng = np.random.default_rng(1)
-    df = pd.DataFrame({
-        "x1": rng.normal(size=n),
-        "x2": rng.normal(size=n),
-    })
+    df = pd.DataFrame(
+        {
+            "x1": rng.normal(size=n),
+            "x2": rng.normal(size=n),
+        }
+    )
     df["label_long_tp50_sl30_h8"] = (df["x1"] > 0).astype(int)
-    out = screen_features_per_scenario(df, [(0.005, 0.003)], [8], ["long"], ["x1", "x2"], max_features=1)
+    out = screen_features_per_scenario(
+        df, [(0.005, 0.003)], [8], ["long"], ["x1", "x2"], max_features=1
+    )
     assert "long|h8|tp50|sl30" in out
     assert len(out["long|h8|tp50|sl30"]) == 1
 

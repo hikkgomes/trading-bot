@@ -18,6 +18,7 @@ import math
 import re
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -31,6 +32,15 @@ from src.autopilot.approvals import (
 )
 from src.autopilot.approvals import (
     strategy_fingerprint as approval_strategy_fingerprint,
+)
+from src.autopilot.candidate_evidence import (
+    CANDIDATE_PAPER_BACKFILL_ENTRY_REASON,
+    CANDIDATE_PAPER_BACKFILL_FILL_SOURCE,
+    CANDIDATE_PAPER_BACKFILL_MANAGEMENT_REASON,
+    CANDIDATE_PAPER_EXECUTION_SCHEMA,
+    CANDIDATE_PAPER_FORWARD_FILL_SOURCE,
+    CANDIDATE_PAPER_FORWARD_REASON,
+    candidate_paper_engine_digest,
 )
 from src.autopilot.io import write_json_atomic, write_text_atomic
 from src.build_dataset import TIMEFRAME_SECONDS
@@ -66,11 +76,21 @@ MAX_EQUITY_DRAWDOWN_BY_OBJECTIVE = {
 }
 DEFAULT_MAX_EQUITY_DRAWDOWN = 0.05
 LIVE_SPOT_QUOTE_PROCEEDS_MAX_SHORTFALL_FRACTION = 0.01
+LIVE_SPOT_BASE_BALANCE_MAX_FEE_FRACTION = 0.01
+CANDIDATE_REPLAY_SCHEMA_VERSION = 2
+CANDIDATE_REPLAY_CURSOR_KEY = "candidate_replay_cursor_by_strategy"
+CANDIDATE_REPLAY_PENDING_KEY = "candidate_replay_pending_entries_by_strategy"
 TRADE_LOG_COLUMNS = (
     "exit_event_id",
     "strategy_id",
     "strategy_fingerprint",
     "artifact_digest",
+    "candidate_paper_execution_schema",
+    "candidate_paper_engine_digest",
+    "candidate_paper_evidence_eligible",
+    "candidate_paper_evidence_reason",
+    "candidate_paper_entry_fill_source",
+    "candidate_paper_observed_at",
     "entry_time",
     "exit_time",
     "direction",
@@ -111,9 +131,7 @@ BROKER_PROTECTIVE_STOP_REQUIRED_KEYS = (
     "broker_stop_client_id",
     "broker_stop_trigger_price",
 )
-BROKER_LIVE_FUTURES_ACCOUNTING_REQUIRED_KEYS = (
-    "broker_entry_balance",
-)
+BROKER_LIVE_FUTURES_ACCOUNTING_REQUIRED_KEYS = ("broker_entry_balance",)
 BROKER_LIVE_SPOT_ACCOUNTING_REQUIRED_KEYS = (
     "broker_entry_base_qty_before",
     "broker_entry_base_qty_after",
@@ -246,7 +264,9 @@ def _normalize_strategy_risk(strategy: dict) -> dict:
         raise ValueError(f"Strategy {strategy_id} risk must be an object.")
     missing = [key for key in REQUIRED_RISK_KEYS if key not in risk]
     if missing:
-        raise ValueError(f"Strategy {strategy_id} risk is missing required key(s): {', '.join(missing)}.")
+        raise ValueError(
+            f"Strategy {strategy_id} risk is missing required key(s): {', '.join(missing)}."
+        )
     if risk.get("max_trades_per_day") is None:
         raise ValueError(f"Strategy {strategy_id} max_trades_per_day must be a positive integer.")
     try:
@@ -294,7 +314,9 @@ def _normalize_strategy_fees(strategy: dict) -> dict:
         raise ValueError(f"Strategy {strategy_id} fees must be an object.")
     missing = [key for key in REQUIRED_FEE_KEYS if key not in fees]
     if missing:
-        raise ValueError(f"Strategy {strategy_id} fees is missing required key(s): {', '.join(missing)}.")
+        raise ValueError(
+            f"Strategy {strategy_id} fees is missing required key(s): {', '.join(missing)}."
+        )
     try:
         normalized = {
             "fee_bps": float(fees["fee_bps"]),
@@ -364,7 +386,9 @@ def _finite_metric(metrics: dict, key: str, strategy_id: str) -> float:
     try:
         value = float(metrics[key])
     except KeyError as exc:
-        raise ValueError(f"Strategy {strategy_id} metrics is missing required key {key!r}.") from exc
+        raise ValueError(
+            f"Strategy {strategy_id} metrics is missing required key {key!r}."
+        ) from exc
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Strategy {strategy_id} {key} must be numeric.") from exc
     if not math.isfinite(value):
@@ -373,7 +397,9 @@ def _finite_metric(metrics: dict, key: str, strategy_id: str) -> float:
 
 
 def _condition_kind_supported(kind: str) -> bool:
-    return kind in CONDITION_KINDS or bool(SLOPE_KIND_RE.match(kind) or DIVERGENCE_KIND_RE.match(kind))
+    return kind in CONDITION_KINDS or bool(
+        SLOPE_KIND_RE.match(kind) or DIVERGENCE_KIND_RE.match(kind)
+    )
 
 
 def _normalize_conditions(strategy: dict) -> list[Condition]:
@@ -387,16 +413,24 @@ def _normalize_conditions(strategy: dict) -> list[Condition]:
             raise ValueError(f"Strategy {strategy_id} condition[{index}] must be an object.")
         feature = payload.get("feature")
         if not isinstance(feature, str) or not feature:
-            raise ValueError(f"Strategy {strategy_id} condition[{index}].feature must be a non-empty string.")
+            raise ValueError(
+                f"Strategy {strategy_id} condition[{index}].feature must be a non-empty string."
+            )
         kind = payload.get("kind")
         if not isinstance(kind, str) or not kind:
-            raise ValueError(f"Strategy {strategy_id} condition[{index}].kind must be a non-empty string.")
+            raise ValueError(
+                f"Strategy {strategy_id} condition[{index}].kind must be a non-empty string."
+            )
         if not _condition_kind_supported(kind):
-            raise ValueError(f"Strategy {strategy_id} condition[{index}].kind is unsupported: {kind!r}.")
+            raise ValueError(
+                f"Strategy {strategy_id} condition[{index}].kind is unsupported: {kind!r}."
+            )
         try:
             threshold = float(payload["threshold"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"Strategy {strategy_id} condition[{index}].threshold must be numeric.") from exc
+            raise ValueError(
+                f"Strategy {strategy_id} condition[{index}].threshold must be numeric."
+            ) from exc
         if not math.isfinite(threshold):
             raise ValueError(f"Strategy {strategy_id} condition[{index}].threshold must be finite.")
         payload = dict(payload)
@@ -404,7 +438,9 @@ def _normalize_conditions(strategy: dict) -> list[Condition]:
         if kind in {"cross_above", "cross_below", "ratio_le", "ratio_ge"}:
             feature_b = payload.get("feature_b")
             if not isinstance(feature_b, str) or not feature_b:
-                raise ValueError(f"Strategy {strategy_id} condition[{index}].feature_b is required for {kind}.")
+                raise ValueError(
+                    f"Strategy {strategy_id} condition[{index}].feature_b is required for {kind}."
+                )
         normalized.append(Condition(**payload))
     strategy["conditions"] = [condition.__dict__ for condition in normalized]
     return normalized
@@ -504,7 +540,11 @@ class PaperTradingBot:
         self.regime_guard = bool(regime_guard)
         self.regime_mayer_top = float(regime_mayer_top)
         self.broker = broker
-        if broker is not None and bool(getattr(getattr(broker, "config", None), "live", False)) and not live_gate_approved:
+        if (
+            broker is not None
+            and bool(getattr(getattr(broker, "config", None), "live", False))
+            and not live_gate_approved
+        ):
             raise RuntimeError(
                 "Live broker injection requires the autopilot approval, preflight, and testnet rehearsal gates."
             )
@@ -575,7 +615,9 @@ class PaperTradingBot:
             if self.base_asset is not None and self.base_asset != "BTC":
                 raise ValueError("BTC accumulation strategies must use base_asset BTC.")
             if strategy["direction"] != "short":
-                raise ValueError(f"Strategy {strategy_id} must be a spot step-aside short for BTC accumulation.")
+                raise ValueError(
+                    f"Strategy {strategy_id} must be a spot step-aside short for BTC accumulation."
+                )
             pnl_unit = strategy.get("pnl_unit")
             if pnl_unit not in {None, "btc", "BTC"}:
                 raise ValueError(f"Strategy {strategy_id} BTC accumulation pnl_unit must be BTC.")
@@ -596,7 +638,9 @@ class PaperTradingBot:
             if require_performance_evidence:
                 holdout = _finite_metric(metrics, "holdout_total_return", strategy_id)
                 if holdout <= 0:
-                    raise ValueError(f"Strategy {strategy_id} holdout_total_return must be positive.")
+                    raise ValueError(
+                        f"Strategy {strategy_id} holdout_total_return must be positive."
+                    )
                 dsr_key = "dsr_deflated" if "dsr_deflated" in metrics else "dsr"
                 dsr = _finite_metric(metrics, dsr_key, strategy_id)
                 if dsr < ACTIVE_INCOME_MIN_DSR:
@@ -621,7 +665,9 @@ class PaperTradingBot:
         artifact_market = self.artifact.get("market")
         if artifact_market is not None:
             if str(artifact_market) not in {"futures", "spot"}:
-                raise ValueError(f"Strategy artifact market must be 'futures' or 'spot', got {artifact_market!r}.")
+                raise ValueError(
+                    f"Strategy artifact market must be 'futures' or 'spot', got {artifact_market!r}."
+                )
             if str(artifact_market) != self.market:
                 raise ValueError(
                     f"Strategy artifact market {artifact_market!r} does not match bot market {self.market!r}."
@@ -653,21 +699,34 @@ class PaperTradingBot:
                     f"Strategy {strategy.get('id', '<unknown>')} entry_type must be 'conditions' or 'hypothesis'."
                 )
             entry_key = "hypothesis" if entry_type == "hypothesis" else "conditions"
-            for key in ("id", "base_timeframe", "direction", "horizon_bars",
-                        "take_profit", "stop_loss", entry_key, "risk", "fees"):
+            for key in (
+                "id",
+                "base_timeframe",
+                "direction",
+                "horizon_bars",
+                "take_profit",
+                "stop_loss",
+                entry_key,
+                "risk",
+                "fees",
+            ):
                 if key not in strategy:
                     raise ValueError(f"Strategy entry is missing required key {key!r}.")
             strategy_id = strategy["id"]
             if not isinstance(strategy_id, str) or not strategy_id.strip():
                 raise ValueError("Strategy id must be a non-empty string.")
             if strategy_id in seen_strategy_ids:
-                raise ValueError(f"Duplicate strategy id {strategy_id!r} in {self.strategies_path}.")
+                raise ValueError(
+                    f"Duplicate strategy id {strategy_id!r} in {self.strategies_path}."
+                )
             seen_strategy_ids.add(strategy_id)
             if strategy["direction"] not in {"long", "short"}:
                 raise ValueError(f"Strategy {strategy['id']} direction must be long or short.")
             self._validate_product_strategy(strategy)
             if not isinstance(strategy["base_timeframe"], str) or not strategy["base_timeframe"]:
-                raise ValueError(f"Strategy {strategy['id']} base_timeframe must be a non-empty string.")
+                raise ValueError(
+                    f"Strategy {strategy['id']} base_timeframe must be a non-empty string."
+                )
             strategy_market = strategy.get("market")
             if strategy_market is not None:
                 if str(strategy_market) not in {"futures", "spot"}:
@@ -679,7 +738,9 @@ class PaperTradingBot:
                         f"Strategy {strategy['id']} market {strategy_market!r} does not match bot market {self.market!r}."
                     )
             strategy_symbol = strategy.get("symbol")
-            if strategy_symbol is not None and not _symbols_match(str(strategy_symbol), self.symbol):
+            if strategy_symbol is not None and not _symbols_match(
+                str(strategy_symbol), self.symbol
+            ):
                 raise ValueError(
                     f"Strategy {strategy['id']} symbol {strategy_symbol!r} does not match bot symbol {self.symbol!r}."
                 )
@@ -696,15 +757,20 @@ class PaperTradingBot:
                 strategy["_conditions"] = _normalize_conditions(strategy)
         LOGGER.info(
             "Loaded %s strategies from %s (search sha %s)",
-            len(self.strategies), self.strategies_path,
+            len(self.strategies),
+            self.strategies_path,
             self.artifact.get("search_git_sha", "unknown"),
         )
         for strategy in self.strategies:
             LOGGER.info(
                 "  %s: %s %s tf=%s horizon=%s TP=%s SL=%s",
-                strategy["id"], strategy["direction"], strategy.get("rule", ""),
-                strategy["base_timeframe"], strategy["horizon_bars"],
-                strategy["take_profit"], strategy["stop_loss"],
+                strategy["id"],
+                strategy["direction"],
+                strategy.get("rule", ""),
+                strategy["base_timeframe"],
+                strategy["horizon_bars"],
+                strategy["take_profit"],
+                strategy["stop_loss"],
             )
 
     def _account_risk(self) -> dict:
@@ -794,7 +860,9 @@ class PaperTradingBot:
                 raise RuntimeError(
                     f"State drawdown_halted_at must include a timezone while halted: {self.state_file}"
                 )
-            normalized_halted_at = parsed.astimezone(datetime.UTC).replace(microsecond=0).isoformat()
+            normalized_halted_at = (
+                parsed.astimezone(datetime.UTC).replace(microsecond=0).isoformat()
+            )
             if halted_at != normalized_halted_at:
                 self.state["drawdown_halted_at"] = normalized_halted_at
                 changed = True
@@ -874,7 +942,9 @@ class PaperTradingBot:
     def _normalize_daily_trade_counts(self) -> bool:
         counts = self.state["daily_trades_by_strategy"]
         if not isinstance(counts, dict):
-            raise RuntimeError(f"State daily_trades_by_strategy must be an object: {self.state_file}")
+            raise RuntimeError(
+                f"State daily_trades_by_strategy must be an object: {self.state_file}"
+            )
         changed = False
         for strategy_id, raw in list(counts.items()):
             try:
@@ -942,7 +1012,9 @@ class PaperTradingBot:
         try:
             parsed = datetime.date.fromisoformat(raw)
         except ValueError as exc:
-            raise RuntimeError(f"State {key} must be an ISO date string: {self.state_file}") from exc
+            raise RuntimeError(
+                f"State {key} must be an ISO date string: {self.state_file}"
+            ) from exc
         today = _utc_date_today()
         if parsed > today:
             raise RuntimeError(f"State {key} must not be in the future: {self.state_file}")
@@ -1010,9 +1082,7 @@ class PaperTradingBot:
     @staticmethod
     def _strategy_snapshot(strategy: dict) -> tuple[dict, str]:
         public_strategy = {
-            key: value
-            for key, value in strategy.items()
-            if not str(key).startswith("_")
+            key: value for key, value in strategy.items() if not str(key).startswith("_")
         }
         canonical = json.dumps(
             public_strategy,
@@ -1085,9 +1155,15 @@ class PaperTradingBot:
                 raise ValueError("snapshot strategy id does not match its open-position key")
             if runtime_strategy.get("direction") not in {"long", "short"}:
                 raise ValueError("snapshot direction must be long or short")
-            if position.get("direction") is not None and runtime_strategy["direction"] != position["direction"]:
+            if (
+                position.get("direction") is not None
+                and runtime_strategy["direction"] != position["direction"]
+            ):
                 raise ValueError("snapshot direction does not match the open position")
-            if not isinstance(runtime_strategy.get("base_timeframe"), str) or not runtime_strategy["base_timeframe"]:
+            if (
+                not isinstance(runtime_strategy.get("base_timeframe"), str)
+                or not runtime_strategy["base_timeframe"]
+            ):
                 raise ValueError("snapshot base_timeframe must be non-empty")
             _normalize_positive_int(runtime_strategy, "horizon_bars")
             _normalize_positive_float(runtime_strategy, "take_profit")
@@ -1097,7 +1173,9 @@ class PaperTradingBot:
             runtime_strategy["fees"] = _normalize_strategy_fees(runtime_strategy)
             entry_type = runtime_strategy.get("entry_type", "conditions")
             if entry_type == "hypothesis":
-                runtime_strategy["_hypothesis"] = Hypothesis.from_dict(runtime_strategy["hypothesis"])
+                runtime_strategy["_hypothesis"] = Hypothesis.from_dict(
+                    runtime_strategy["hypothesis"]
+                )
                 runtime_strategy["_conditions"] = []
             elif entry_type == "conditions":
                 runtime_strategy["_conditions"] = _normalize_conditions(runtime_strategy)
@@ -1127,7 +1205,9 @@ class PaperTradingBot:
                     f"State open_positions contains unknown strategy {strategy_id!r}: {self.state_file}"
                 )
             if not isinstance(position, dict):
-                raise RuntimeError(f"State open_positions[{strategy_id!r}] must be an object: {self.state_file}")
+                raise RuntimeError(
+                    f"State open_positions[{strategy_id!r}] must be an object: {self.state_file}"
+                )
             frozen_strategy = self._strategy_for_open_position(
                 current_strategy or {"id": strategy_id},
                 position,
@@ -1190,14 +1270,100 @@ class PaperTradingBot:
                 if position["entry_time"] != normalized_entry:
                     position["entry_time"] = normalized_entry
                     changed = True
+            candidate_schema = position.get("candidate_paper_execution_schema")
+            candidate_engine = position.get("candidate_paper_engine_digest")
+            if candidate_schema is not None or candidate_engine is not None:
+                if candidate_schema != CANDIDATE_PAPER_EXECUTION_SCHEMA:
+                    raise RuntimeError(
+                        f"State open_positions[{strategy_id!r}] has an unsupported candidate "
+                        f"paper execution schema: {self.state_file}"
+                    )
+                if (
+                    not isinstance(candidate_engine, str)
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", candidate_engine) is None
+                ):
+                    raise RuntimeError(
+                        f"State open_positions[{strategy_id!r}] has an invalid candidate "
+                        f"paper engine digest: {self.state_file}"
+                    )
+                evidence_eligible = position.get("candidate_paper_evidence_eligible")
+                evidence_reason = position.get("candidate_paper_evidence_reason")
+                fill_source = position.get("candidate_paper_entry_fill_source")
+                if not isinstance(evidence_eligible, bool):
+                    raise RuntimeError(
+                        f"State open_positions[{strategy_id!r}] has invalid candidate "
+                        f"paper evidence eligibility: {self.state_file}"
+                    )
+                try:
+                    observed_at = self._candidate_replay_observation_timestamp(
+                        position["candidate_paper_observed_at"]
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"State open_positions[{strategy_id!r}] has an invalid candidate "
+                        f"paper observation time: {self.state_file}"
+                    ) from exc
+                signal_close = signal_time + pd.Timedelta(
+                    seconds=TIMEFRAME_SECONDS.get(
+                        frozen_strategy["base_timeframe"],
+                        300,
+                    )
+                )
+                if observed_at < signal_close:
+                    raise RuntimeError(
+                        f"State open_positions[{strategy_id!r}] candidate observation "
+                        f"precedes signal availability: {self.state_file}"
+                    )
+                if evidence_eligible:
+                    if (
+                        evidence_reason != CANDIDATE_PAPER_FORWARD_REASON
+                        or fill_source != CANDIDATE_PAPER_FORWARD_FILL_SOURCE
+                        or observed_at != entry_time
+                    ):
+                        raise RuntimeError(
+                            f"State open_positions[{strategy_id!r}] has inconsistent "
+                            f"promotable candidate evidence: {self.state_file}"
+                        )
+                elif evidence_reason == CANDIDATE_PAPER_BACKFILL_ENTRY_REASON:
+                    if fill_source != CANDIDATE_PAPER_BACKFILL_FILL_SOURCE:
+                        raise RuntimeError(
+                            f"State open_positions[{strategy_id!r}] has inconsistent "
+                            f"backfill entry evidence: {self.state_file}"
+                        )
+                elif evidence_reason == CANDIDATE_PAPER_BACKFILL_MANAGEMENT_REASON:
+                    if fill_source not in {
+                        CANDIDATE_PAPER_FORWARD_FILL_SOURCE,
+                        CANDIDATE_PAPER_BACKFILL_FILL_SOURCE,
+                    }:
+                        raise RuntimeError(
+                            f"State open_positions[{strategy_id!r}] has inconsistent "
+                            f"backfill management evidence: {self.state_file}"
+                        )
+                else:
+                    raise RuntimeError(
+                        f"State open_positions[{strategy_id!r}] has an invalid candidate "
+                        f"paper evidence reason: {self.state_file}"
+                    )
+                normalized_observed_at = observed_at.isoformat()
+                if position["candidate_paper_observed_at"] != normalized_observed_at:
+                    position["candidate_paper_observed_at"] = normalized_observed_at
+                    changed = True
             direction = position.get("direction")
             if direction not in {"long", "short"}:
                 raise RuntimeError(
                     f"State open_positions[{strategy_id!r}].direction must be long or short: {self.state_file}"
                 )
             for key in ("entry_price", "sl_pct", "tp_pct", "sl_price", "tp_price"):
-                changed = self._normalize_position_float(position, strategy_id, key, positive=True) or changed
-            changed = self._normalize_position_float(position, strategy_id, "position_size", positive=True) or changed
+                changed = (
+                    self._normalize_position_float(position, strategy_id, key, positive=True)
+                    or changed
+                )
+            changed = (
+                self._normalize_position_float(
+                    position, strategy_id, "position_size", positive=True
+                )
+                or changed
+            )
             if position["position_size"] > 1.0:
                 raise RuntimeError(
                     f"State open_positions[{strategy_id!r}].position_size must be <= 1: {self.state_file}"
@@ -1208,14 +1374,25 @@ class PaperTradingBot:
                     f"State open_positions[{strategy_id!r}].position_size exceeds "
                     f"max_position_fraction {max_position_fraction:g}: {self.state_file}"
                 )
-            for key in ("broker_requested_qty", "broker_fill_ratio", "broker_qty", "broker_entry_price"):
-                changed = self._normalize_optional_position_float(
-                    position,
-                    strategy_id,
-                    key,
-                    positive=True,
-                ) or changed
-            if "broker_fill_ratio" in position and abs(float(position["broker_fill_ratio"]) - 1.0) > 1e-9:
+            for key in (
+                "broker_requested_qty",
+                "broker_fill_ratio",
+                "broker_qty",
+                "broker_entry_price",
+            ):
+                changed = (
+                    self._normalize_optional_position_float(
+                        position,
+                        strategy_id,
+                        key,
+                        positive=True,
+                    )
+                    or changed
+                )
+            if (
+                "broker_fill_ratio" in position
+                and abs(float(position["broker_fill_ratio"]) - 1.0) > 1e-9
+            ):
                 raise RuntimeError(
                     f"State open_positions[{strategy_id!r}].broker_fill_ratio must be 1: {self.state_file}"
                 )
@@ -1242,12 +1419,15 @@ class PaperTradingBot:
                 "broker_entry_quote_balance_after",
                 "broker_entry_quote_value",
             ):
-                changed = self._normalize_optional_position_float(
-                    position,
-                    strategy_id,
-                    key,
-                    non_negative=True,
-                ) or changed
+                changed = (
+                    self._normalize_optional_position_float(
+                        position,
+                        strategy_id,
+                        key,
+                        non_negative=True,
+                    )
+                    or changed
+                )
             quote_value_source = position.get("broker_entry_quote_value_source")
             if quote_value_source is not None and quote_value_source not in {
                 "observed_free_quote_delta",
@@ -1282,19 +1462,28 @@ class PaperTradingBot:
                             f"State open_positions[{strategy_id!r}].broker_entry_quote_value "
                             f"does not match its observed free-quote balance delta: {self.state_file}"
                         )
-            changed = self._normalize_optional_position_float(
-                position,
-                strategy_id,
-                "broker_entry_balance",
-                positive=True,
-            ) or changed
-            changed = self._normalize_optional_position_float(
-                position,
-                strategy_id,
-                "broker_stop_trigger_price",
-                positive=True,
-            ) or changed
-            if "broker_side" in position and position["broker_side"] not in {OrderSide.BUY.value, OrderSide.SELL.value}:
+            changed = (
+                self._normalize_optional_position_float(
+                    position,
+                    strategy_id,
+                    "broker_entry_balance",
+                    positive=True,
+                )
+                or changed
+            )
+            changed = (
+                self._normalize_optional_position_float(
+                    position,
+                    strategy_id,
+                    "broker_stop_trigger_price",
+                    positive=True,
+                )
+                or changed
+            )
+            if "broker_side" in position and position["broker_side"] not in {
+                OrderSide.BUY.value,
+                OrderSide.SELL.value,
+            }:
                 raise RuntimeError(
                     f"State open_positions[{strategy_id!r}].broker_side must be buy or sell: {self.state_file}"
                 )
@@ -1302,14 +1491,18 @@ class PaperTradingBot:
                 raise RuntimeError(
                     f"State open_positions[{strategy_id!r}].broker_symbol must be non-empty: {self.state_file}"
                 )
-            if "broker_stop_order_id" in position and not str(position["broker_stop_order_id"]).strip():
+            if (
+                "broker_stop_order_id" in position
+                and not str(position["broker_stop_order_id"]).strip()
+            ):
                 raise RuntimeError(
                     f"State open_positions[{strategy_id!r}].broker_stop_order_id must be non-empty: "
                     f"{self.state_file}"
                 )
             stop_client_id = position.get("broker_stop_client_id")
             if stop_client_id is not None and (
-                not isinstance(stop_client_id, str) or not CLIENT_ORDER_ID_RE.fullmatch(stop_client_id)
+                not isinstance(stop_client_id, str)
+                or not CLIENT_ORDER_ID_RE.fullmatch(stop_client_id)
             ):
                 raise RuntimeError(
                     f"State open_positions[{strategy_id!r}].broker_stop_client_id is unsafe: "
@@ -1409,10 +1602,14 @@ class PaperTradingBot:
             )
         stage = pending.get("stage")
         if not isinstance(stage, str) or stage not in {"entry", "exit"}:
-            raise RuntimeError(f"State pending_order.stage must be entry or exit: {self.state_file}")
+            raise RuntimeError(
+                f"State pending_order.stage must be entry or exit: {self.state_file}"
+            )
         intent_ref = pending.get("intent_ref")
         if not isinstance(intent_ref, str) or not intent_ref:
-            raise RuntimeError(f"State pending_order.intent_ref must be non-empty: {self.state_file}")
+            raise RuntimeError(
+                f"State pending_order.intent_ref must be non-empty: {self.state_file}"
+            )
         symbol = pending.get("symbol")
         if not isinstance(symbol, str) or symbol != self.symbol:
             raise RuntimeError(
@@ -1424,7 +1621,9 @@ class PaperTradingBot:
         try:
             side = OrderSide(side_value)
         except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"State pending_order.side must be buy or sell: {self.state_file}") from exc
+            raise RuntimeError(
+                f"State pending_order.side must be buy or sell: {self.state_file}"
+            ) from exc
         expected_side = self._expected_pending_side(strategy, stage)
         if side != expected_side:
             raise RuntimeError(
@@ -1437,21 +1636,29 @@ class PaperTradingBot:
         try:
             qty = float(qty_raw)
         except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"State pending_order.qty must be numeric: {self.state_file}") from exc
+            raise RuntimeError(
+                f"State pending_order.qty must be numeric: {self.state_file}"
+            ) from exc
         if not math.isfinite(qty) or qty <= 0:
-            raise RuntimeError(f"State pending_order.qty must be finite and positive: {self.state_file}")
+            raise RuntimeError(
+                f"State pending_order.qty must be finite and positive: {self.state_file}"
+            )
         order_type_value = pending.get("order_type")
         if not isinstance(order_type_value, str):
             raise RuntimeError(f"State pending_order.order_type is invalid: {self.state_file}")
         try:
             order_type = OrderType(order_type_value)
         except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"State pending_order.order_type is invalid: {self.state_file}") from exc
+            raise RuntimeError(
+                f"State pending_order.order_type is invalid: {self.state_file}"
+            ) from exc
         if order_type != OrderType.MARKET:
             raise RuntimeError(f"State pending_order.order_type must be market: {self.state_file}")
         reduce_only = pending.get("reduce_only")
         if not isinstance(reduce_only, bool):
-            raise RuntimeError(f"State pending_order.reduce_only must be boolean: {self.state_file}")
+            raise RuntimeError(
+                f"State pending_order.reduce_only must be boolean: {self.state_file}"
+            )
         if reduce_only != (stage == "exit"):
             raise RuntimeError(
                 f"State pending_order.reduce_only does not match {stage} semantics: {self.state_file}"
@@ -1484,7 +1691,9 @@ class PaperTradingBot:
         try:
             created_ts = float(created_ts_raw)
         except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"State pending_order.created_ts must be numeric: {self.state_file}") from exc
+            raise RuntimeError(
+                f"State pending_order.created_ts must be numeric: {self.state_file}"
+            ) from exc
         if not math.isfinite(created_ts) or created_ts < 0:
             raise RuntimeError(
                 f"State pending_order.created_ts must be finite and non-negative: {self.state_file}"
@@ -1517,13 +1726,9 @@ class PaperTradingBot:
         if marker is None:
             return None
         if not isinstance(marker, dict):
-            raise RuntimeError(
-                f"State pending_entry_recovery must be an object: {self.state_file}"
-            )
+            raise RuntimeError(f"State pending_entry_recovery must be an object: {self.state_file}")
         if marker.get("version") != 1:
-            raise RuntimeError(
-                f"State pending_entry_recovery.version must be 1: {self.state_file}"
-            )
+            raise RuntimeError(f"State pending_entry_recovery.version must be 1: {self.state_file}")
         if marker.get("original_pending_client_id") != pending.get("client_id"):
             raise RuntimeError(
                 "State pending_entry_recovery does not match the unresolved pending entry: "
@@ -1539,9 +1744,7 @@ class PaperTradingBot:
                 "State pending_entry_recovery symbol does not match the unresolved pending entry: "
                 f"{self.state_file}"
             )
-        if marker.get("broker_account_fingerprint") != pending.get(
-            "broker_account_fingerprint"
-        ):
+        if marker.get("broker_account_fingerprint") != pending.get("broker_account_fingerprint"):
             raise RuntimeError(
                 "State pending_entry_recovery account does not match the unresolved pending "
                 f"entry: {self.state_file}"
@@ -1570,9 +1773,7 @@ class PaperTradingBot:
                 "original_pending_client_id": pending["client_id"],
                 "strategy_id": pending["strategy_id"],
                 "symbol": pending["symbol"],
-                "broker_account_fingerprint": pending[
-                    "broker_account_fingerprint"
-                ],
+                "broker_account_fingerprint": pending["broker_account_fingerprint"],
                 "first_detected_at": now,
                 "attempt_count": 0,
             }
@@ -1776,9 +1977,7 @@ class PaperTradingBot:
             }
         else:
             if not isinstance(existing, dict) or existing.get("version") != 1:
-                raise RuntimeError(
-                    f"State risk_recovery_incident is invalid: {self.state_file}"
-                )
+                raise RuntimeError(f"State risk_recovery_incident is invalid: {self.state_file}")
             if existing.get("strategy_id") != strategy_id or existing.get("symbol") != self.symbol:
                 raise RuntimeError(
                     f"State risk_recovery_incident does not match current exposure: {self.state_file}"
@@ -1956,9 +2155,13 @@ class PaperTradingBot:
             return
         strategy_id = marker.get("strategy_id")
         if not isinstance(strategy_id, str) or not strategy_id:
-            raise RuntimeError(f"State risk_recovery_incident strategy id is invalid: {self.state_file}")
+            raise RuntimeError(
+                f"State risk_recovery_incident strategy id is invalid: {self.state_file}"
+            )
         position = self.state.get("open_positions", {}).get(strategy_id)
-        current = next((item for item in self.strategies if item["id"] == strategy_id), {"id": strategy_id})
+        current = next(
+            (item for item in self.strategies if item["id"] == strategy_id), {"id": strategy_id}
+        )
         strategy = (
             self._strategy_for_open_position(current, position)
             if isinstance(position, dict)
@@ -1986,23 +2189,17 @@ class PaperTradingBot:
             "entry_price": open_position.get("entry_price"),
             "direction": open_position.get("direction"),
             "strategy_fingerprint": open_position.get("strategy_fingerprint"),
-            "approval_strategy_fingerprint": open_position.get(
-                "approval_strategy_fingerprint"
-            ),
+            "approval_strategy_fingerprint": open_position.get("approval_strategy_fingerprint"),
             "artifact_digest": open_position.get("artifact_digest"),
             "broker_symbol": open_position.get("broker_symbol"),
             "broker_entry_client_id": open_position.get("broker_entry_client_id"),
-            "broker_account_fingerprint": open_position.get(
-                "broker_account_fingerprint"
-            ),
+            "broker_account_fingerprint": open_position.get("broker_account_fingerprint"),
         }
         return _canonical_json_digest(identity, label="Exit event identity")
 
     def _validated_exit_accounting_intent(self, raw: object) -> dict:
         if not isinstance(raw, dict):
-            raise RuntimeError(
-                f"State exit_accounting_intent must be an object: {self.state_file}"
-            )
+            raise RuntimeError(f"State exit_accounting_intent must be an object: {self.state_file}")
         missing = [key for key in EXIT_ACCOUNTING_INTENT_REQUIRED_KEYS if key not in raw]
         unexpected = [key for key in raw if key not in EXIT_ACCOUNTING_INTENT_REQUIRED_KEYS]
         if missing:
@@ -2016,9 +2213,7 @@ class PaperTradingBot:
                 f"{', '.join(unexpected)}: {self.state_file}"
             )
         if raw.get("version") != 1:
-            raise RuntimeError(
-                f"State exit_accounting_intent.version must be 1: {self.state_file}"
-            )
+            raise RuntimeError(f"State exit_accounting_intent.version must be 1: {self.state_file}")
         if raw.get("phase") not in {"ready_to_commit", "trade_logged"}:
             raise RuntimeError(
                 "State exit_accounting_intent.phase must be ready_to_commit or trade_logged: "
@@ -2058,13 +2253,11 @@ class PaperTradingBot:
             )
         if trade_data.get("exit_event_id") != event_id:
             raise RuntimeError(
-                "State exit_accounting_intent trade event id mismatch: "
-                f"{self.state_file}"
+                f"State exit_accounting_intent trade event id mismatch: {self.state_file}"
             )
         if trade_data.get("strategy_id") != strategy_id:
             raise RuntimeError(
-                "State exit_accounting_intent trade strategy mismatch: "
-                f"{self.state_file}"
+                f"State exit_accounting_intent trade strategy mismatch: {self.state_file}"
             )
         if "exit_accounting_intent" in state_after:
             raise RuntimeError(
@@ -2092,27 +2285,25 @@ class PaperTradingBot:
 
         state_before = copy.deepcopy(self.state)
         state_before.pop("exit_accounting_intent", None)
-        if _canonical_json_digest(state_before, label="Exit accounting pre-state") != raw[
-            "state_before_digest"
-        ]:
+        if (
+            _canonical_json_digest(state_before, label="Exit accounting pre-state")
+            != raw["state_before_digest"]
+        ):
             raise RuntimeError(
                 "State changed underneath exit_accounting_intent; refusing duplicate or "
                 f"partial accounting: {self.state_file}"
             )
         positions_before = state_before.get("open_positions")
-        position = (
-            positions_before.get(strategy_id)
-            if isinstance(positions_before, dict)
-            else None
-        )
+        position = positions_before.get(strategy_id) if isinstance(positions_before, dict) else None
         if not isinstance(position, dict):
             raise RuntimeError(
                 "State exit_accounting_intent has no matching pre-close position: "
                 f"{self.state_file}"
             )
-        if _canonical_json_digest(position, label="Exit accounting position") != raw[
-            "position_digest"
-        ]:
+        if (
+            _canonical_json_digest(position, label="Exit accounting position")
+            != raw["position_digest"]
+        ):
             raise RuntimeError(
                 "State exit_accounting_intent position failed its integrity check: "
                 f"{self.state_file}"
@@ -2143,9 +2334,7 @@ class PaperTradingBot:
                 )
             symbol = intent["trade_data"].get("broker_symbol")
             if not isinstance(symbol, str) or not symbol:
-                raise RuntimeError(
-                    "Live exit accounting intent is missing its broker symbol."
-                )
+                raise RuntimeError("Live exit accounting intent is missing its broker symbol.")
             actual = self.broker.get_position(symbol)
             if not actual.is_flat:
                 raise RuntimeError(
@@ -2200,9 +2389,7 @@ class PaperTradingBot:
         flatten_intent = self.state.get("flatten_intent")
         if flatten_intent is not None:
             client_id = (
-                flatten_intent.get("client_id")
-                if isinstance(flatten_intent, dict)
-                else None
+                flatten_intent.get("client_id") if isinstance(flatten_intent, dict) else None
             )
             raise RuntimeError(
                 "Unresolved emergency flatten intent blocks all trading cycles until "
@@ -2246,7 +2433,9 @@ class PaperTradingBot:
         if pending is None:
             return
         if not isinstance(pending, dict):  # Defensive for in-memory mutation after load.
-            raise RuntimeError(f"Unresolved pending broker order has invalid state: {self.state_file}")
+            raise RuntimeError(
+                f"Unresolved pending broker order has invalid state: {self.state_file}"
+            )
         raise RuntimeError(
             "Unresolved pending broker order blocks all trading cycles until operator reconciliation: "
             f"stage={pending.get('stage')} strategy={pending.get('strategy_id')} "
@@ -2283,7 +2472,9 @@ class PaperTradingBot:
 
     def _save_state_clearing_pending_order(self) -> None:
         if "pending_order" not in self.state:
-            raise RuntimeError("Cannot complete broker state transition without a pending order intent.")
+            raise RuntimeError(
+                "Cannot complete broker state transition without a pending order intent."
+            )
         pending = self.state.pop("pending_order")
         try:
             self._save_state()
@@ -2297,7 +2488,9 @@ class PaperTradingBot:
             try:
                 loaded = json.loads(self.state_file.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError(f"State file is unreadable or invalid: {self.state_file}: {exc}") from exc
+                raise RuntimeError(
+                    f"State file is unreadable or invalid: {self.state_file}: {exc}"
+                ) from exc
             if not isinstance(loaded, dict):
                 raise RuntimeError(f"State file must contain a JSON object: {self.state_file}")
             self.state = loaded
@@ -2305,9 +2498,7 @@ class PaperTradingBot:
                 # The intent hashes the exact pre-transition state. Do not run
                 # migration normalizers before recovery or their benign writes
                 # would look like an unsafe concurrent accounting mutation.
-                self._validated_exit_accounting_intent(
-                    self.state["exit_accounting_intent"]
-                )
+                self._validated_exit_accounting_intent(self.state["exit_accounting_intent"])
                 LOGGER.warning(
                     "Loaded unresolved exit accounting intent %s; it will be resumed "
                     "before any order or market-data work.",
@@ -2338,7 +2529,9 @@ class PaperTradingBot:
                     self.state[key] = default
                     changed = True
             if not isinstance(self.state["daily_trades_by_strategy"], dict):
-                raise RuntimeError(f"State daily_trades_by_strategy must be an object: {self.state_file}")
+                raise RuntimeError(
+                    f"State daily_trades_by_strategy must be an object: {self.state_file}"
+                )
             if not isinstance(self.state["last_entry_decision_bar_by_strategy"], dict):
                 raise RuntimeError(
                     f"State last_entry_decision_bar_by_strategy must be an object: {self.state_file}"
@@ -2357,7 +2550,10 @@ class PaperTradingBot:
             self.state.pop("strategy_active", None)
             if changed:
                 self._save_state()
-            LOGGER.info("Loaded bot state. Current Equity: %.2f USDT", self.state.get("equity", self.starting_equity))
+            LOGGER.info(
+                "Loaded bot state. Current Equity: %.2f USDT",
+                self.state.get("equity", self.starting_equity),
+            )
         else:
             self.state = {
                 "equity": self.starting_equity,
@@ -2405,21 +2601,33 @@ class PaperTradingBot:
             return
         timestamps = pd.to_datetime(df["timestamp"], utc=True)
         if timestamps.isna().any():
-            raise RuntimeError(f"Closed {timeframe} candles for {symbol} contain invalid timestamps.")
+            raise RuntimeError(
+                f"Closed {timeframe} candles for {symbol} contain invalid timestamps."
+            )
         if not timestamps.is_monotonic_increasing or timestamps.duplicated().any():
-            raise RuntimeError(f"Closed {timeframe} candles for {symbol} must have strictly increasing timestamps.")
+            raise RuntimeError(
+                f"Closed {timeframe} candles for {symbol} must have strictly increasing timestamps."
+            )
         for column in cls.POSITIVE_CANDLE_COLUMNS:
             values = df[column].to_numpy(dtype=float)
             if not np.isfinite(values).all():
-                raise RuntimeError(f"Closed {timeframe} candles for {symbol} contain non-finite {column}.")
+                raise RuntimeError(
+                    f"Closed {timeframe} candles for {symbol} contain non-finite {column}."
+                )
             if (values <= 0).any():
-                raise RuntimeError(f"Closed {timeframe} candles for {symbol} contain non-positive {column}.")
+                raise RuntimeError(
+                    f"Closed {timeframe} candles for {symbol} contain non-positive {column}."
+                )
         for column in cls.NON_NEGATIVE_CANDLE_COLUMNS:
             values = df[column].to_numpy(dtype=float)
             if not np.isfinite(values).all():
-                raise RuntimeError(f"Closed {timeframe} candles for {symbol} contain non-finite {column}.")
+                raise RuntimeError(
+                    f"Closed {timeframe} candles for {symbol} contain non-finite {column}."
+                )
             if (values < 0).any():
-                raise RuntimeError(f"Closed {timeframe} candles for {symbol} contain negative {column}.")
+                raise RuntimeError(
+                    f"Closed {timeframe} candles for {symbol} contain negative {column}."
+                )
         open_values = df["open"].to_numpy(dtype=float)
         high_values = df["high"].to_numpy(dtype=float)
         low_values = df["low"].to_numpy(dtype=float)
@@ -2427,11 +2635,17 @@ class PaperTradingBot:
         if (high_values < low_values).any():
             raise RuntimeError(f"Closed {timeframe} candles for {symbol} contain high below low.")
         if (high_values < np.maximum(open_values, close_values)).any():
-            raise RuntimeError(f"Closed {timeframe} candles for {symbol} contain high below open/close.")
+            raise RuntimeError(
+                f"Closed {timeframe} candles for {symbol} contain high below open/close."
+            )
         if (low_values > np.minimum(open_values, close_values)).any():
-            raise RuntimeError(f"Closed {timeframe} candles for {symbol} contain low above open/close.")
+            raise RuntimeError(
+                f"Closed {timeframe} candles for {symbol} contain low above open/close."
+            )
 
-    def fetch_live_candles(self, symbol: str, market: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
+    def fetch_live_candles(
+        self, symbol: str, market: str, timeframe: str, limit: int = 500
+    ) -> pd.DataFrame:
         """Fetch recent candles and DROP the still-forming last candle.
 
         Binance returns the in-progress kline as the final row; evaluating
@@ -2450,8 +2664,11 @@ class PaperTradingBot:
         remaining = int(limit)
         end_time_ms = None
         while remaining > 0:
-            params = {"symbol": _binance_rest_symbol(symbol), "interval": timeframe,
-                      "limit": min(remaining, self.KLINES_PER_REQUEST)}
+            params = {
+                "symbol": _binance_rest_symbol(symbol),
+                "interval": timeframe,
+                "limit": min(remaining, self.KLINES_PER_REQUEST),
+            }
             if end_time_ms is not None:
                 params["endTime"] = end_time_ms
             response = requests.get(url, params=params, timeout=30)
@@ -2472,7 +2689,9 @@ class PaperTradingBot:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         # Pin to nanosecond resolution: newer pandas otherwise yields ms/us
         # units that later make merge_asof refuse to join timeframes.
-        df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).astype("datetime64[ns, UTC]")
+        df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).astype(
+            "datetime64[ns, UTC]"
+        )
         df = df[bbid.CANDLE_COLUMNS]
         tf_seconds = TIMEFRAME_SECONDS.get(timeframe, 300)
         now = pd.Timestamp.now(tz="UTC")
@@ -2480,6 +2699,31 @@ class PaperTradingBot:
         df_closed = df[closed].reset_index(drop=True)
         self._validate_closed_candles(df_closed, symbol=symbol, timeframe=timeframe)
         return df_closed
+
+    def fetch_public_observation_quote(self) -> tuple[float, pd.Timestamp]:
+        """Fetch a credential-free quote at the moment a fresh signal is observed."""
+
+        if self.market == "futures":
+            url = "https://fapi.binance.com/fapi/v1/ticker/price"
+        elif self.market == "spot":
+            url = "https://api.binance.com/api/v3/ticker/price"
+        else:
+            raise RuntimeError(f"Candidate paper quote does not support market {self.market!r}.")
+        response = requests.get(
+            url,
+            params={"symbol": _binance_rest_symbol(self.data_symbol)},
+            timeout=10,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Binance public quote API error: {response.text}")
+        try:
+            payload = response.json()
+            price = float(payload["price"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("Binance public quote response has no valid price.") from exc
+        if not math.isfinite(price) or price <= 0:
+            raise RuntimeError("Binance public quote price must be finite and positive.")
+        return price, pd.Timestamp.now(tz="UTC")
 
     # Indicator warmup margin: the longest bundled indicator lookback is ~200
     # native bars (ema_200 / max_200), plus slack so the last rows are non-NaN.
@@ -2500,7 +2744,9 @@ class PaperTradingBot:
         if strategy.get("entry_type", "conditions") == "hypothesis":
             hypothesis = strategy["_hypothesis"]
             for predicate in hypothesis.all_predicates():
-                required.setdefault(predicate.timeframe, {"open", "high", "low", "close"}).add(predicate.feature)
+                required.setdefault(predicate.timeframe, {"open", "high", "low", "close"}).add(
+                    predicate.feature
+                )
                 if predicate.feature_b:
                     required[predicate.timeframe].add(predicate.feature_b)
             if hypothesis.risk.min_atr_pct or hypothesis.risk.max_atr_pct:
@@ -2525,9 +2771,9 @@ class PaperTradingBot:
         signature_target = getattr(builder, "side_effect", None) or builder
         try:
             signature = inspect.signature(signature_target)
-            supports_required = (
-                "required_features" in signature.parameters
-                or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
+            supports_required = "required_features" in signature.parameters or any(
+                param.kind == inspect.Parameter.VAR_KEYWORD
+                for param in signature.parameters.values()
             )
         except (TypeError, ValueError):
             supports_required = True
@@ -2547,16 +2793,29 @@ class PaperTradingBot:
         if strategy.get("entry_type", "conditions") == "hypothesis":
             needed = hypothesis_history_requirements(strategy["_hypothesis"])
             base_limit = max(500, needed.get(base_tf, 1) + self.INDICATOR_WARMUP_BARS)
+            replay_bars = getattr(self, "_candidate_replay_max_unseen_bars", None)
+            if replay_bars is not None:
+                base_limit = max(
+                    base_limit,
+                    int(replay_bars) + self.INDICATOR_WARMUP_BARS + 2,
+                )
             htf_limits = {
                 tf: max(200, bars + self.INDICATOR_WARMUP_BARS)
-                for tf, bars in needed.items() if tf != base_tf
+                for tf, bars in needed.items()
+                if tf != base_tf
             }
             return base_limit, htf_limits
         required_tfs = {
-            tf for tf in self._required_features_by_timeframe(strategy)
-            if tf != base_tf
+            tf for tf in self._required_features_by_timeframe(strategy) if tf != base_tf
         }
-        return 500, {tf: 200 for tf in required_tfs}
+        base_limit = 500
+        replay_bars = getattr(self, "_candidate_replay_max_unseen_bars", None)
+        if replay_bars is not None:
+            base_limit = max(
+                base_limit,
+                int(replay_bars) + self.INDICATOR_WARMUP_BARS + 2,
+            )
+        return base_limit, {tf: 200 for tf in required_tfs}
 
     def _feature_frame_cache_key(
         self,
@@ -2573,10 +2832,7 @@ class PaperTradingBot:
             int(base_limit),
             tuple(sorted((tf, int(limit)) for tf, limit in htf_limits.items())),
             tuple(
-                sorted(
-                    (tf, tuple(sorted(features)))
-                    for tf, features in required_features.items()
-                )
+                sorted((tf, tuple(sorted(features))) for tf, features in required_features.items())
             ),
         )
 
@@ -2608,10 +2864,12 @@ class PaperTradingBot:
             required_features.get(base_tf, set()),
         )
         base_prefix = f"tf_{base_tf}_"
-        df_base_ind = df_base_ind.rename(columns={
-            c: f"{base_prefix}{c}" for c in df_base_ind.columns if c != "timestamp"
-        })
-        df_base_ind["timestamp"] = pd.to_datetime(df_base_ind["timestamp"], utc=True).astype("datetime64[ns, UTC]")
+        df_base_ind = df_base_ind.rename(
+            columns={c: f"{base_prefix}{c}" for c in df_base_ind.columns if c != "timestamp"}
+        )
+        df_base_ind["timestamp"] = pd.to_datetime(df_base_ind["timestamp"], utc=True).astype(
+            "datetime64[ns, UTC]"
+        )
 
         merged = df_base_ind.copy()
         for tf in sorted(htf_limits):
@@ -2624,10 +2882,12 @@ class PaperTradingBot:
                 required_features.get(tf, set()),
             )
             tf_prefix = f"tf_{tf}_"
-            df_tf_ind = df_tf_ind.rename(columns={
-                c: f"{tf_prefix}{c}" for c in df_tf_ind.columns if c != "timestamp"
-            })
-            df_tf_ind["timestamp"] = pd.to_datetime(df_tf_ind["timestamp"], utc=True).astype("datetime64[ns, UTC]")
+            df_tf_ind = df_tf_ind.rename(
+                columns={c: f"{tf_prefix}{c}" for c in df_tf_ind.columns if c != "timestamp"}
+            )
+            df_tf_ind["timestamp"] = pd.to_datetime(df_tf_ind["timestamp"], utc=True).astype(
+                "datetime64[ns, UTC]"
+            )
             tf_shifted = df_tf_ind.copy()
             seconds = TIMEFRAME_SECONDS.get(tf, 300)
             tf_shifted["timestamp"] = (
@@ -2672,7 +2932,11 @@ class PaperTradingBot:
         z_score = (recent_win_rate - baseline_wr) / std_error if std_error > 0 else 0.0
         LOGGER.info(
             "Drift %s: trades=%d baseline WR=%.2f recent WR=%.2f z=%.2f",
-            strategy["id"], len(recent), baseline_wr, recent_win_rate, z_score,
+            strategy["id"],
+            len(recent),
+            baseline_wr,
+            recent_win_rate,
+            z_score,
         )
         if z_score < DRIFT_Z_THRESHOLD:
             LOGGER.critical(
@@ -2695,13 +2959,17 @@ class PaperTradingBot:
     def _daily_trade_count(self, strategy: dict) -> int:
         counts = self.state.setdefault("daily_trades_by_strategy", {})
         if not isinstance(counts, dict):
-            raise RuntimeError(f"State daily_trades_by_strategy must be an object: {self.state_file}")
+            raise RuntimeError(
+                f"State daily_trades_by_strategy must be an object: {self.state_file}"
+            )
         return int(counts.get(strategy["id"], 0) or 0)
 
     def _increment_daily_trade_count(self, strategy: dict) -> None:
         counts = self.state.setdefault("daily_trades_by_strategy", {})
         if not isinstance(counts, dict):
-            raise RuntimeError(f"State daily_trades_by_strategy must be an object: {self.state_file}")
+            raise RuntimeError(
+                f"State daily_trades_by_strategy must be an object: {self.state_file}"
+            )
         counts[strategy["id"]] = self._daily_trade_count(strategy) + 1
 
     def _daily_trade_limit_reached(self, strategy: dict) -> bool:
@@ -2762,10 +3030,660 @@ class PaperTradingBot:
             )
         except Exception as exc:
             LOGGER.error("Macro regime evaluation failed (%s); blocking new entries.", exc)
-            self._macro_aside, self._macro_detail = True, {
-                "error": str(exc),
-                "fail_closed": True,
+            self._macro_aside, self._macro_detail = (
+                True,
+                {
+                    "error": str(exc),
+                    "fail_closed": True,
+                },
+            )
+
+    def _normalize_candidate_replay_state(self) -> bool:
+        """Validate the paper-only event cursor and pending next-open entries."""
+
+        changed = False
+        version = self.state.get("candidate_replay_schema_version")
+        if version is None:
+            self.state["candidate_replay_schema_version"] = CANDIDATE_REPLAY_SCHEMA_VERSION
+            changed = True
+        elif version == 1 and CANDIDATE_REPLAY_SCHEMA_VERSION == 2:
+            legacy_pending = self.state.get(CANDIDATE_REPLAY_PENDING_KEY, {})
+            if not isinstance(legacy_pending, dict):
+                raise RuntimeError(f"State {CANDIDATE_REPLAY_PENDING_KEY} must be an object.")
+            if self.state.get("open_positions") or legacy_pending:
+                raise RuntimeError(
+                    "Candidate replay v1 cannot be upgraded while replay exposure or a "
+                    "pending entry exists; preserve the old environment to close it or "
+                    "explicitly abandon that isolated paper state."
+                )
+            self.state["candidate_replay_schema_version"] = CANDIDATE_REPLAY_SCHEMA_VERSION
+            self.state[CANDIDATE_REPLAY_CURSOR_KEY] = {}
+            self.state[CANDIDATE_REPLAY_PENDING_KEY] = {}
+            changed = True
+        elif version != CANDIDATE_REPLAY_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Candidate replay state has an unsupported schema version: {version!r}."
+            )
+
+        cursors = self.state.setdefault(CANDIDATE_REPLAY_CURSOR_KEY, {})
+        pending = self.state.setdefault(CANDIDATE_REPLAY_PENDING_KEY, {})
+        if not isinstance(cursors, dict):
+            raise RuntimeError(f"State {CANDIDATE_REPLAY_CURSOR_KEY} must be an object.")
+        if not isinstance(pending, dict):
+            raise RuntimeError(f"State {CANDIDATE_REPLAY_PENDING_KEY} must be an object.")
+
+        known_ids = {strategy["id"] for strategy in self.strategies}
+        unknown = (set(cursors) | set(pending)) - known_ids
+        if unknown:
+            raise RuntimeError(
+                "Candidate replay state references unknown strategies: "
+                f"{', '.join(sorted(unknown))}."
+            )
+        if len(pending) > 1:
+            raise RuntimeError(
+                "Candidate replay state cannot contain more than one pending entry "
+                "for the shared product account."
+            )
+
+        expected_schema = CANDIDATE_PAPER_EXECUTION_SCHEMA
+        expected_engine = getattr(self, "_candidate_paper_engine_digest", None)
+        if not isinstance(expected_engine, str):
+            raise RuntimeError("Candidate replay execution identity was not initialized.")
+        stored_schema = self.state.get("candidate_paper_execution_schema")
+        stored_engine = self.state.get("candidate_paper_engine_digest")
+        if stored_schema != expected_schema or stored_engine != expected_engine:
+            if self.state["open_positions"] or pending:
+                raise RuntimeError(
+                    "Candidate paper execution identity changed while replay exposure or a "
+                    "pending entry exists; preserve the old environment to close it or "
+                    "explicitly abandon that isolated paper state."
+                )
+            history = self.state.setdefault("candidate_paper_execution_history", [])
+            if not isinstance(history, list):
+                raise RuntimeError("State candidate_paper_execution_history must be a list.")
+            if stored_schema is not None or stored_engine is not None:
+                history.append(
+                    {
+                        "execution_schema": stored_schema,
+                        "engine_digest": stored_engine,
+                        "superseded_at": _utc_now_text(),
+                    }
+                )
+                del history[:-8]
+            # Execution changes start a clean forward-paper account. Historical
+            # CSV rows remain immutable and are quarantined by promotion's
+            # exact schema/engine filter.
+            self.state.update(
+                equity=self.starting_equity,
+                open_positions={},
+                inactive_strategies=[],
+                consecutive_losses=0,
+                cooldown_until_ts=0.0,
+                daily_pnl=0.0,
+                daily_trades_by_strategy={},
+                last_entry_decision_bar_by_strategy={},
+                last_pnl_reset_date=str(_utc_date_today()),
+                peak_equity=self.starting_equity,
+                drawdown_fraction=0.0,
+                drawdown_limit_fraction=self._max_equity_drawdown(),
+                drawdown_halted=False,
+                drawdown_halted_at=None,
+                drawdown_halt_reason=None,
+                candidate_paper_execution_schema=expected_schema,
+                candidate_paper_engine_digest=expected_engine,
+            )
+            cursors.clear()
+            pending.clear()
+            changed = True
+        for strategy_id, raw_cursor in list(cursors.items()):
+            normalized = self._normalized_bar_timestamp(raw_cursor)
+            if raw_cursor != normalized:
+                cursors[strategy_id] = normalized
+                changed = True
+        pending_keys = {
+            "signal_time",
+            "signal_observed_at",
+            "evidence_eligible",
+            "evidence_reason",
+            "fill_source",
+        }
+        for strategy_id, item in pending.items():
+            if not isinstance(item, dict) or set(item) != pending_keys:
+                raise RuntimeError(
+                    f"State {CANDIDATE_REPLAY_PENDING_KEY}[{strategy_id!r}] must contain "
+                    f"exactly {', '.join(sorted(pending_keys))}."
+                )
+            normalized = self._normalized_bar_timestamp(item["signal_time"])
+            if item["signal_time"] != normalized:
+                item["signal_time"] = normalized
+                changed = True
+            observed = self._normalized_bar_timestamp(item["signal_observed_at"])
+            if item["signal_observed_at"] != observed:
+                item["signal_observed_at"] = observed
+                changed = True
+            if item["evidence_eligible"] is not False:
+                raise RuntimeError(
+                    f"State {CANDIDATE_REPLAY_PENDING_KEY}[{strategy_id!r}] cannot mark "
+                    "historical next-open replay as promotable."
+                )
+            if item["evidence_reason"] != CANDIDATE_PAPER_BACKFILL_ENTRY_REASON:
+                raise RuntimeError(
+                    f"State {CANDIDATE_REPLAY_PENDING_KEY}[{strategy_id!r}] has an "
+                    "invalid evidence reason."
+                )
+            if item["fill_source"] != CANDIDATE_PAPER_BACKFILL_FILL_SOURCE:
+                raise RuntimeError(
+                    f"State {CANDIDATE_REPLAY_PENDING_KEY}[{strategy_id!r}] has an "
+                    "invalid fill source."
+                )
+        return changed
+
+    @staticmethod
+    def _candidate_replay_signal(strategy: dict, frame: pd.DataFrame) -> bool:
+        if strategy.get("entry_type", "conditions") == "hypothesis":
+            return bool(entry_mask(frame, strategy["_hypothesis"]).iloc[-1])
+        for condition in strategy["_conditions"]:
+            if not bool(condition_mask(frame, condition).fillna(False).iloc[-1]):
+                return False
+        return True
+
+    def _candidate_replay_daily_reset(self, event_close: pd.Timestamp) -> None:
+        event_date = str(event_close.date())
+        if self.state["last_pnl_reset_date"] == event_date:
+            return
+        self.state["daily_pnl"] = 0.0
+        self.state["daily_trades_by_strategy"] = {}
+        self.state["last_pnl_reset_date"] = event_date
+
+    def _candidate_replay_macro_regime(
+        self,
+        daily_candles: pd.DataFrame | None,
+        *,
+        event_close: pd.Timestamp,
+    ) -> None:
+        if not self.regime_guard:
+            self._macro_aside = False
+            self._macro_detail = {}
+            return
+        if daily_candles is None:
+            self._macro_aside, self._macro_detail = (
+                True,
+                {
+                    "error": "daily regime candles unavailable",
+                    "fail_closed": True,
+                },
+            )
+            return
+        known = daily_candles[daily_candles["timestamp"] + pd.Timedelta(days=1) <= event_close]
+        if known.empty:
+            self._macro_aside, self._macro_detail = (
+                True,
+                {
+                    "error": "no daily regime candle was closed at replay event time",
+                    "fail_closed": True,
+                },
+            )
+            return
+        self._macro_aside, self._macro_detail = compute_macro_step_aside(
+            known["close"],
+            mayer_top=self.regime_mayer_top,
+        )
+
+    def _candidate_replay_entry_allowed(
+        self,
+        strategy: dict,
+        *,
+        event_close: pd.Timestamp,
+    ) -> bool:
+        if not self.allow_entries:
+            return False
+        if self._has_other_open_position(strategy):
+            return False
+        pending = self.state[CANDIDATE_REPLAY_PENDING_KEY]
+        if any(strategy_id != strategy["id"] for strategy_id in pending):
+            return False
+        if strategy["id"] in self.state["inactive_strategies"]:
+            return False
+        if self.state["drawdown_halted"]:
+            return False
+        if event_close.timestamp() < float(self.state["cooldown_until_ts"]):
+            return False
+        if self.regime_guard and self._macro_detail.get("fail_closed"):
+            return False
+        if self.regime_guard and self._macro_aside and strategy["direction"] == "long":
+            return False
+        if self.state["daily_pnl"] <= self._account_risk()["daily_stop_loss"]:
+            return False
+        return not self._daily_trade_limit_reached(strategy)
+
+    @staticmethod
+    def _candidate_replay_observation_timestamp(value=None) -> pd.Timestamp:
+        timestamp = pd.Timestamp.now(tz="UTC") if value is None else pd.Timestamp(value)
+        if pd.isna(timestamp):
+            raise ValueError("candidate replay observation_time must be a valid timestamp.")
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+        return timestamp
+
+    @staticmethod
+    def _candidate_replay_event_is_forward_observed(
+        *,
+        event_close: pd.Timestamp,
+        frame_index: int,
+        frame_length: int,
+        observation_time: pd.Timestamp,
+        max_observation_delay_seconds: int,
+    ) -> bool:
+        delay_seconds = (observation_time - event_close).total_seconds()
+        return frame_index == frame_length - 1 and 0.0 <= delay_seconds <= float(
+            max_observation_delay_seconds
+        )
+
+    @staticmethod
+    def _quarantine_candidate_position(position: dict) -> bool:
+        if (
+            position.get("candidate_paper_evidence_eligible") is False
+            and position.get("candidate_paper_evidence_reason")
+            == CANDIDATE_PAPER_BACKFILL_MANAGEMENT_REASON
+        ):
+            return False
+        position["candidate_paper_evidence_eligible"] = False
+        position["candidate_paper_evidence_reason"] = CANDIDATE_PAPER_BACKFILL_MANAGEMENT_REASON
+        return True
+
+    def run_candidate_replay_cycle(
+        self,
+        *,
+        max_unseen_bars: int,
+        max_observation_delay_seconds: int = 90,
+        observation_time=None,
+    ) -> dict:
+        """Replay every unseen closed candle for an isolated paper candidate.
+
+        The digest-specific state file is the event log cursor. A genuinely
+        fresh latest signal enters only at a public quote observed after the
+        signal close. Historical signals retain deterministic next-open replay
+        for state recovery, but their positions and trades are permanently
+        quarantined from promotion. No broker is accepted on this path, so
+        catch-up can never submit a stale live order.
+        """
+
+        if self.broker is not None:
+            raise RuntimeError("Candidate replay is paper-only and refuses broker injection.")
+        if isinstance(max_unseen_bars, bool) or not isinstance(max_unseen_bars, int):
+            raise ValueError("max_unseen_bars must be a positive integer.")
+        if max_unseen_bars <= 0:
+            raise ValueError("max_unseen_bars must be a positive integer.")
+        if (
+            isinstance(max_observation_delay_seconds, bool)
+            or not isinstance(max_observation_delay_seconds, int)
+            or max_observation_delay_seconds <= 0
+        ):
+            raise ValueError("max_observation_delay_seconds must be a positive integer.")
+        fixed_observation_time = (
+            None
+            if observation_time is None
+            else self._candidate_replay_observation_timestamp(observation_time)
+        )
+
+        self.cycle_errors = []
+        self._feature_frame_cache = {}
+        self._candidate_replay_max_unseen_bars = max_unseen_bars
+        self._candidate_paper_engine_digest = candidate_paper_engine_digest()
+        try:
+            self._resume_exit_accounting_intent()
+            self._assert_no_pending_order()
+            self._assert_broker_open_positions_have_metadata()
+            if self._normalize_candidate_replay_state():
+                self._save_state()
+
+            frames: dict[str, pd.DataFrame] = {}
+            events: list[tuple[pd.Timestamp, int, int, pd.Timestamp, int, dict]] = []
+            initialized: list[str] = []
+            unseen_by_strategy: dict[str, int] = {}
+            cursors = self.state[CANDIDATE_REPLAY_CURSOR_KEY]
+
+            for strategy_order, strategy in enumerate(self.strategies):
+                timeframe = strategy["base_timeframe"]
+                if timeframe not in TIMEFRAME_SECONDS:
+                    raise RuntimeError(
+                        f"Candidate replay does not recognize timeframe {timeframe!r}."
+                    )
+                frame, _ = self._build_feature_frame(strategy)
+                if frame.empty:
+                    raise RuntimeError(
+                        f"Candidate replay received no closed {timeframe} bars for "
+                        f"{strategy['id']}."
+                    )
+                frame = frame.copy().reset_index(drop=True)
+                frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+                frames[strategy["id"]] = frame
+
+                raw_cursor = cursors.get(strategy["id"])
+                if raw_cursor is None:
+                    has_prior_activity = bool(
+                        self.state["open_positions"].get(strategy["id"])
+                        or self.state[CANDIDATE_REPLAY_PENDING_KEY].get(strategy["id"])
+                        or self._daily_trade_count(strategy)
+                    )
+                    if has_prior_activity:
+                        raise RuntimeError(
+                            f"Cannot safely initialize replay cursor for active legacy candidate "
+                            f"state {strategy['id']}; use a fresh digest-isolated paper state."
+                        )
+                    latest = self._normalized_bar_timestamp(frame.iloc[-1]["timestamp"])
+                    cursors[strategy["id"]] = latest
+                    self.state["last_entry_decision_bar_by_strategy"][strategy["id"]] = latest
+                    initialized.append(strategy["id"])
+                    unseen_by_strategy[strategy["id"]] = 0
+                    continue
+
+                cursor = pd.Timestamp(raw_cursor)
+                if cursor.tzinfo is None:
+                    cursor = cursor.tz_localize("UTC")
+                else:
+                    cursor = cursor.tz_convert("UTC")
+                latest = pd.Timestamp(frame.iloc[-1]["timestamp"])
+                if cursor > latest:
+                    raise RuntimeError(
+                        f"Candidate replay cursor for {strategy['id']} is ahead of market data."
+                    )
+                unseen_indices = [
+                    index
+                    for index, timestamp in enumerate(frame["timestamp"])
+                    if pd.Timestamp(timestamp) > cursor
+                ]
+                unseen_count = len(unseen_indices)
+                unseen_by_strategy[strategy["id"]] = unseen_count
+                if unseen_count > max_unseen_bars:
+                    raise RuntimeError(
+                        f"Candidate replay backlog overflow for {strategy['id']}: "
+                        f"{unseen_count} unseen {timeframe} bars exceeds configured maximum "
+                        f"{max_unseen_bars}; cursor was not advanced."
+                    )
+                if not unseen_indices:
+                    continue
+                seconds = TIMEFRAME_SECONDS[timeframe]
+                expected = cursor + pd.Timedelta(seconds=seconds)
+                first_unseen = pd.Timestamp(frame.iloc[unseen_indices[0]]["timestamp"])
+                if first_unseen != expected:
+                    raise RuntimeError(
+                        f"Candidate replay candle gap for {strategy['id']}: expected "
+                        f"{expected.isoformat()}, received {first_unseen.isoformat()}; cursor "
+                        "was not advanced."
+                    )
+                previous = cursor
+                for index in unseen_indices:
+                    timestamp = pd.Timestamp(frame.iloc[index]["timestamp"])
+                    if timestamp != previous + pd.Timedelta(seconds=seconds):
+                        raise RuntimeError(
+                            f"Candidate replay candle gap for {strategy['id']} after "
+                            f"{previous.isoformat()}; cursor was not advanced."
+                        )
+                    seconds = TIMEFRAME_SECONDS[timeframe]
+                    event_close = timestamp + pd.Timedelta(seconds=seconds)
+                    events.append(
+                        (
+                            event_close,
+                            seconds,
+                            strategy_order,
+                            timestamp,
+                            index,
+                            strategy,
+                        )
+                    )
+                    previous = timestamp
+
+            if initialized:
+                latest_initialized = max(
+                    pd.Timestamp(cursors[strategy_id])
+                    + pd.Timedelta(
+                        seconds=TIMEFRAME_SECONDS[
+                            next(
+                                strategy["base_timeframe"]
+                                for strategy in self.strategies
+                                if strategy["id"] == strategy_id
+                            )
+                        ]
+                    )
+                    for strategy_id in initialized
+                )
+                self._candidate_replay_daily_reset(latest_initialized)
+                self._save_state()
+
+            cycle_observation_time = (
+                fixed_observation_time
+                if fixed_observation_time is not None
+                else self._candidate_replay_observation_timestamp()
+            )
+
+            daily_candles = None
+            if self.regime_guard and events:
+                try:
+                    daily_candles = self.fetch_live_candles(
+                        self.data_symbol,
+                        self.market,
+                        "1d",
+                        limit=500,
+                    )
+                except Exception as exc:
+                    LOGGER.error(
+                        "Candidate replay macro data failed; entries will fail closed "
+                        "while open positions continue replaying: %s",
+                        exc,
+                    )
+                    self.cycle_errors.append(
+                        {
+                            "stage": "candidate_replay_macro_data",
+                            "error": str(exc),
+                        }
+                    )
+
+            processed = 0
+            forward_observed_events = 0
+            backfilled_events = 0
+            event_order_tail: list[dict[str, Any]] = []
+            event_order_total = 0
+            for event_close, seconds, _, event_time, frame_index, strategy in sorted(
+                events,
+                key=lambda event: (event[0], event[1], event[2], event[3]),
+            ):
+                strategy_id = strategy["id"]
+                timeframe = strategy["base_timeframe"]
+                frame = frames[strategy_id]
+                event_frame = frame.iloc[: frame_index + 1]
+                forward_observed = self._candidate_replay_event_is_forward_observed(
+                    event_close=event_close,
+                    frame_index=frame_index,
+                    frame_length=len(frame),
+                    observation_time=cycle_observation_time,
+                    max_observation_delay_seconds=max_observation_delay_seconds,
+                )
+                if forward_observed:
+                    forward_observed_events += 1
+                    observation_class = "fresh_forward_observation"
+                else:
+                    backfilled_events += 1
+                    observation_class = "downtime_backfill"
+                event_order_total += 1
+                event_order_tail.append(
+                    {
+                        "strategy_id": strategy_id,
+                        "timeframe": timeframe,
+                        "bar_open": self._normalized_bar_timestamp(event_time),
+                        "information_available_at": self._normalized_bar_timestamp(event_close),
+                        "observation_class": observation_class,
+                    }
+                )
+                del event_order_tail[:-64]
+                self._candidate_replay_daily_reset(event_close)
+
+                pending = self.state[CANDIDATE_REPLAY_PENDING_KEY].get(strategy_id)
+                open_position = self.state["open_positions"].get(strategy_id)
+                if pending is not None or open_position is not None:
+                    # A bar that starts with exposure (or its durable next-open
+                    # intent) is never reconsidered for a same-bar re-entry.
+                    self.state["last_entry_decision_bar_by_strategy"][strategy_id] = (
+                        self._normalized_bar_timestamp(event_time)
+                    )
+                    self._save_state()
+
+                    if pending is not None:
+                        signal_time = pd.Timestamp(pending["signal_time"])
+                        if signal_time.tzinfo is None:
+                            signal_time = signal_time.tz_localize("UTC")
+                        else:
+                            signal_time = signal_time.tz_convert("UTC")
+                        expected_entry = signal_time + pd.Timedelta(seconds=seconds)
+                        if event_time != expected_entry:
+                            raise RuntimeError(
+                                f"Pending candidate entry for {strategy_id} expected next-open "
+                                f"bar {expected_entry.isoformat()}, received "
+                                f"{event_time.isoformat()}."
+                            )
+                        if open_position is None:
+                            if self._has_other_open_position(strategy):
+                                raise RuntimeError(
+                                    f"Pending candidate entry for {strategy_id} cannot fill "
+                                    "while another strategy has product exposure."
+                                )
+                            matching = frame.index[frame["timestamp"] == signal_time].tolist()
+                            if len(matching) != 1:
+                                raise RuntimeError(
+                                    f"Pending candidate entry signal bar for {strategy_id} is "
+                                    "outside the bounded replay frame."
+                                )
+                            signal_frame = frame.iloc[: matching[0] + 1]
+                            entry_open = float(frame.iloc[frame_index][f"tf_{timeframe}_open"])
+                            self._enter_position(
+                                strategy,
+                                signal_frame,
+                                entry_open,
+                                paper_entry_time=event_time,
+                                candidate_paper_evidence={
+                                    "eligible": False,
+                                    "reason": pending["evidence_reason"],
+                                    "fill_source": pending["fill_source"],
+                                    "observed_at": pending["signal_observed_at"],
+                                },
+                            )
+                        elif self._normalized_bar_timestamp(
+                            open_position.get("signal_time")
+                        ) != self._normalized_bar_timestamp(signal_time):
+                            raise RuntimeError(
+                                f"Pending candidate entry for {strategy_id} does not match "
+                                "the durable open position."
+                            )
+                        self.state[CANDIDATE_REPLAY_PENDING_KEY].pop(strategy_id)
+                        self._save_state()
+                        open_position = self.state["open_positions"].get(strategy_id)
+
+                    if open_position is not None:
+                        if not forward_observed and self._quarantine_candidate_position(
+                            open_position
+                        ):
+                            self._save_state()
+                        self._candidate_replay_risk_clock_ts = event_close.timestamp()
+                        self._candidate_replay_observation_time = (
+                            cycle_observation_time if forward_observed else event_close
+                        )
+                        try:
+                            self._manage_open_position(strategy, event_frame)
+                        finally:
+                            self._candidate_replay_risk_clock_ts = None
+                            self._candidate_replay_observation_time = None
+                else:
+                    self._candidate_replay_macro_regime(
+                        daily_candles,
+                        event_close=event_close,
+                    )
+                    signal_triggered = False
+                    decision_already_processed = self._entry_decision_already_processed(
+                        strategy,
+                        event_time,
+                    )
+                    if not decision_already_processed and self._candidate_replay_entry_allowed(
+                        strategy,
+                        event_close=event_close,
+                    ):
+                        signal_triggered = self._candidate_replay_signal(
+                            strategy,
+                            event_frame,
+                        )
+                    self.state["last_entry_decision_bar_by_strategy"][strategy_id] = (
+                        self._normalized_bar_timestamp(event_time)
+                    )
+                    if signal_triggered:
+                        if forward_observed:
+                            (
+                                observation_quote,
+                                quote_observed_at,
+                            ) = self.fetch_public_observation_quote()
+                            quote_observed_at = self._candidate_replay_observation_timestamp(
+                                quote_observed_at
+                            )
+                            quote_delay_seconds = (quote_observed_at - event_close).total_seconds()
+                            if not (
+                                quote_observed_at >= cycle_observation_time
+                                and 0.0
+                                <= quote_delay_seconds
+                                <= float(max_observation_delay_seconds)
+                            ):
+                                raise RuntimeError(
+                                    f"Candidate public quote for {strategy_id} was observed "
+                                    "outside the promotable signal-delay window; cursor was "
+                                    "not advanced."
+                                )
+                            self._enter_position(
+                                strategy,
+                                event_frame,
+                                observation_quote,
+                                paper_entry_time=quote_observed_at,
+                                candidate_paper_evidence={
+                                    "eligible": True,
+                                    "reason": CANDIDATE_PAPER_FORWARD_REASON,
+                                    "fill_source": CANDIDATE_PAPER_FORWARD_FILL_SOURCE,
+                                    "observed_at": quote_observed_at,
+                                },
+                            )
+                        else:
+                            self.state[CANDIDATE_REPLAY_PENDING_KEY][strategy_id] = {
+                                "signal_time": self._normalized_bar_timestamp(event_time),
+                                "signal_observed_at": self._normalized_bar_timestamp(
+                                    cycle_observation_time
+                                ),
+                                "evidence_eligible": False,
+                                "evidence_reason": CANDIDATE_PAPER_BACKFILL_ENTRY_REASON,
+                                "fill_source": CANDIDATE_PAPER_BACKFILL_FILL_SOURCE,
+                            }
+
+                self.state[CANDIDATE_REPLAY_CURSOR_KEY][strategy_id] = (
+                    self._normalized_bar_timestamp(event_time)
+                )
+                self._save_state()
+                processed += 1
+
+            return {
+                "schema_version": CANDIDATE_REPLAY_SCHEMA_VERSION,
+                "execution_schema": CANDIDATE_PAPER_EXECUTION_SCHEMA,
+                "execution_engine_digest": self._candidate_paper_engine_digest,
+                "max_unseen_bars": max_unseen_bars,
+                "max_observation_delay_seconds": max_observation_delay_seconds,
+                "observation_time": self._normalized_bar_timestamp(cycle_observation_time),
+                "processed_events": processed,
+                "forward_observed_events": forward_observed_events,
+                "backfilled_events": backfilled_events,
+                "event_order_tail": event_order_tail,
+                "event_order_truncated": event_order_total > len(event_order_tail),
+                "unseen_bars_by_strategy": unseen_by_strategy,
+                "initialized_strategies": initialized,
+                "cursors": dict(self.state[CANDIDATE_REPLAY_CURSOR_KEY]),
+                "pending_entries": sorted(self.state[CANDIDATE_REPLAY_PENDING_KEY]),
             }
+        finally:
+            self._candidate_replay_max_unseen_bars = None
 
     def run_cycle(self):
         self.cycle_errors = []
@@ -2807,7 +3725,9 @@ class PaperTradingBot:
             )
             if open_position is None:
                 if not self.allow_entries:
-                    LOGGER.info("New entries are disabled. Skipping flat strategy %s.", strategy["id"])
+                    LOGGER.info(
+                        "New entries are disabled. Skipping flat strategy %s.", strategy["id"]
+                    )
                     continue
                 if self._has_other_open_position(strategy):
                     LOGGER.info(
@@ -2817,7 +3737,10 @@ class PaperTradingBot:
                     )
                     continue
                 if strategy["id"] in self.state["inactive_strategies"]:
-                    LOGGER.info("Strategy %s is deactivated (OOD kill switch). Skipping new entry.", strategy["id"])
+                    LOGGER.info(
+                        "Strategy %s is deactivated (OOD kill switch). Skipping new entry.",
+                        strategy["id"],
+                    )
                     continue
                 self._assert_broker_flat_before_new_entry(strategy)
                 if self.state["drawdown_halted"]:
@@ -2864,19 +3787,22 @@ class PaperTradingBot:
             if self.regime_guard and self._macro_detail.get("fail_closed"):
                 LOGGER.warning(
                     "Macro regime unavailable: skipping new entry for %s (%s).",
-                    strategy["id"], self._macro_detail,
+                    strategy["id"],
+                    self._macro_detail,
                 )
                 continue
             if self.regime_guard and self._macro_aside and strategy["direction"] == "long":
                 LOGGER.warning(
                     "Macro regime risk-off: skipping new LONG entry for %s (%s).",
-                    strategy["id"], self._macro_detail,
+                    strategy["id"],
+                    self._macro_detail,
                 )
                 continue
             if self.state["daily_pnl"] <= self._account_risk()["daily_stop_loss"]:
                 LOGGER.warning(
                     "Daily stop hit (%.4f <= %.4f). Skipping entries.",
-                    self.state["daily_pnl"], self._account_risk()["daily_stop_loss"],
+                    self.state["daily_pnl"],
+                    self._account_risk()["daily_stop_loss"],
                 )
                 continue
             if self._daily_trade_limit_reached(strategy):
@@ -2902,7 +3828,9 @@ class PaperTradingBot:
             if signal_triggered:
                 self._enter_position(strategy, df_features, base_close)
 
-    def _resolve_tp_sl(self, strategy: dict, df_features: pd.DataFrame, base_close: float) -> tuple[float, float]:
+    def _resolve_tp_sl(
+        self, strategy: dict, df_features: pd.DataFrame, base_close: float
+    ) -> tuple[float, float]:
         base_tf = strategy["base_timeframe"]
         if not strategy.get("use_atr_tp_sl"):
             return float(strategy["take_profit"]), float(strategy["stop_loss"])
@@ -2919,23 +3847,42 @@ class PaperTradingBot:
             sl_pct = 0.01
         return tp_pct, sl_pct
 
-    def _enter_position(self, strategy: dict, df_features: pd.DataFrame, base_close: float):
+    def _enter_position(
+        self,
+        strategy: dict,
+        df_features: pd.DataFrame,
+        base_close: float,
+        *,
+        paper_entry_time=None,
+        candidate_paper_evidence: dict | None = None,
+    ):
         strategy_snapshot, strategy_fingerprint = self._strategy_snapshot(strategy)
         signal_time = pd.Timestamp(df_features.iloc[-1]["timestamp"])
         if signal_time.tzinfo is None:
             signal_time = signal_time.tz_localize("UTC")
         else:
             signal_time = signal_time.tz_convert("UTC")
-        entry_time = signal_time + pd.Timedelta(
+        signal_close_time = signal_time + pd.Timedelta(
             seconds=TIMEFRAME_SECONDS.get(strategy["base_timeframe"], 300)
         )
+        entry_time = signal_close_time
+        if paper_entry_time is not None:
+            if self.broker is not None:
+                raise RuntimeError("Broker entries cannot override their fill timestamp.")
+            entry_time = self._candidate_replay_observation_timestamp(paper_entry_time)
+            if entry_time < signal_close_time:
+                raise RuntimeError(
+                    "Candidate paper entry cannot precede signal information availability."
+                )
         signal_time_text = signal_time.isoformat()
         entry_time_text = entry_time.isoformat()
         direction = strategy["direction"]
         tp_pct, sl_pct = self._resolve_tp_sl(strategy, df_features, base_close)
         risk_per_trade = strategy["risk"]["risk_per_trade"]
         max_position_fraction = strategy["risk"]["max_position_fraction"]
-        position_size = min(risk_per_trade / sl_pct, max_position_fraction, 1.0) if sl_pct > 0 else 0.0
+        position_size = (
+            min(risk_per_trade / sl_pct, max_position_fraction, 1.0) if sl_pct > 0 else 0.0
+        )
         entry_price = base_close
         broker_fill = None
         spot_sell_base_before = None
@@ -3049,11 +3996,65 @@ class PaperTradingBot:
             "position_size": position_size,
             "strategy_snapshot": strategy_snapshot,
             "strategy_fingerprint": strategy_fingerprint,
-            "approval_strategy_fingerprint": self.approval_fingerprints_by_strategy[
-                strategy["id"]
-            ],
+            "approval_strategy_fingerprint": self.approval_fingerprints_by_strategy[strategy["id"]],
             "artifact_digest": self.artifact_content_digest,
         }
+        candidate_engine_digest = getattr(
+            self,
+            "_candidate_paper_engine_digest",
+            None,
+        )
+        if candidate_engine_digest is not None:
+            if not isinstance(candidate_paper_evidence, dict) or set(candidate_paper_evidence) != {
+                "eligible",
+                "reason",
+                "fill_source",
+                "observed_at",
+            }:
+                raise RuntimeError(
+                    "Candidate paper entry requires complete forward-evidence metadata."
+                )
+            evidence_eligible = candidate_paper_evidence["eligible"]
+            evidence_reason = candidate_paper_evidence["reason"]
+            evidence_fill_source = candidate_paper_evidence["fill_source"]
+            if not isinstance(evidence_eligible, bool):
+                raise RuntimeError("Candidate paper evidence eligibility must be boolean.")
+            if candidate_paper_evidence["observed_at"] is None:
+                raise RuntimeError("Candidate paper evidence requires an observation time.")
+            observed_at = self._candidate_replay_observation_timestamp(
+                candidate_paper_evidence["observed_at"]
+            )
+            if observed_at < signal_close_time:
+                raise RuntimeError(
+                    "Candidate paper observation cannot precede signal information availability."
+                )
+            if evidence_eligible:
+                if (
+                    evidence_reason != CANDIDATE_PAPER_FORWARD_REASON
+                    or evidence_fill_source != CANDIDATE_PAPER_FORWARD_FILL_SOURCE
+                    or observed_at != entry_time
+                ):
+                    raise RuntimeError(
+                        "Promotable candidate entry must use its public observation quote "
+                        "at the recorded observation time."
+                    )
+            elif (
+                evidence_reason != CANDIDATE_PAPER_BACKFILL_ENTRY_REASON
+                or evidence_fill_source != CANDIDATE_PAPER_BACKFILL_FILL_SOURCE
+            ):
+                raise RuntimeError(
+                    "Non-promotable candidate entry must be identified as downtime backfill."
+                )
+            position.update(
+                candidate_paper_execution_schema=CANDIDATE_PAPER_EXECUTION_SCHEMA,
+                candidate_paper_engine_digest=str(candidate_engine_digest),
+                candidate_paper_evidence_eligible=evidence_eligible,
+                candidate_paper_evidence_reason=evidence_reason,
+                candidate_paper_entry_fill_source=evidence_fill_source,
+                candidate_paper_observed_at=observed_at.isoformat(),
+            )
+        elif candidate_paper_evidence is not None or paper_entry_time is not None:
+            raise RuntimeError("Candidate paper evidence was supplied outside candidate replay.")
         if broker_fill is not None:
             position.update(
                 broker_symbol=broker_fill.symbol,
@@ -3070,7 +4071,15 @@ class PaperTradingBot:
             if broker_entry_balance is not None:
                 position["broker_entry_balance"] = float(broker_entry_balance)
             if self._is_spot_broker() and broker_fill.side == OrderSide.SELL:
-                base_after = max(float(self.broker.get_position(broker_fill.symbol).qty), 0.0)
+                base_after = self._broker_spot_base_balance()
+                if self._requires_observed_spot_quote_proceeds():
+                    self._validated_live_spot_base_change(
+                        strategy["id"],
+                        side=OrderSide.SELL,
+                        fill_qty=float(broker_fill.qty),
+                        balance_before=float(spot_sell_base_before),
+                        balance_after=base_after,
+                    )
                 if spot_sell_quote_value is not None:
                     position.update(
                         broker_entry_base_qty_before=spot_sell_base_before,
@@ -3090,9 +4099,7 @@ class PaperTradingBot:
                             - float(broker_fill.fee),
                             0.0,
                         ),
-                        broker_entry_quote_value_source=(
-                            "fill_notional_less_reported_fee"
-                        ),
+                        broker_entry_quote_value_source=("fill_notional_less_reported_fee"),
                         broker_exit_sizing="quote_reinvest",
                     )
             if self._requires_native_protective_stop():
@@ -3211,7 +4218,13 @@ class PaperTradingBot:
         LOGGER.critical(
             "%s ORDER OPENED [%s]: %s %s @ %.2f | SL: %.2f | TP: %.2f | Size: %.4f",
             "BROKER" if self.broker is not None else "PAPER",
-            strategy["id"], direction.upper(), self.symbol, entry_price, sl_price, tp_price, position_size,
+            strategy["id"],
+            direction.upper(),
+            self.symbol,
+            entry_price,
+            sl_price,
+            tp_price,
+            position_size,
         )
 
     def _is_spot_broker(self) -> bool:
@@ -3229,14 +4242,10 @@ class PaperTradingBot:
         if not isinstance(fingerprint, str) or not fingerprint.startswith(
             ACCOUNT_FINGERPRINT_PREFIX
         ):
-            raise RuntimeError(
-                "Live broker is missing a valid non-secret account fingerprint."
-            )
+            raise RuntimeError("Live broker is missing a valid non-secret account fingerprint.")
         digest = fingerprint.removeprefix(ACCOUNT_FINGERPRINT_PREFIX)
         if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-            raise RuntimeError(
-                "Live broker is missing a valid non-secret account fingerprint."
-            )
+            raise RuntimeError("Live broker is missing a valid non-secret account fingerprint.")
         return fingerprint
 
     def _assert_broker_account_fingerprint(
@@ -3318,7 +4327,10 @@ class PaperTradingBot:
         if not isinstance(protective.status, ProtectiveOrderStatus):
             raise RuntimeError(f"Protective stop status is invalid for {strategy['id']}. {detail}")
         qty_tolerance = self._fill_quantity_tolerance(qty)
-        if not math.isfinite(float(protective.qty)) or abs(float(protective.qty) - qty) > qty_tolerance:
+        if (
+            not math.isfinite(float(protective.qty))
+            or abs(float(protective.qty) - qty) > qty_tolerance
+        ):
             raise RuntimeError(f"Protective stop quantity mismatch for {strategy['id']}. {detail}")
         trigger_tolerance = max(abs(trigger_price) * 1e-9, 1e-12)
         if (
@@ -3334,11 +4346,15 @@ class PaperTradingBot:
         filled_qty = float(protective.filled_qty)
         fee = float(protective.fee)
         if not math.isfinite(filled_qty) or filled_qty < 0:
-            raise RuntimeError(f"Protective stop fill quantity is invalid for {strategy['id']}. {detail}")
+            raise RuntimeError(
+                f"Protective stop fill quantity is invalid for {strategy['id']}. {detail}"
+            )
         if not math.isfinite(fee) or fee < 0:
             raise RuntimeError(f"Protective stop fee is invalid for {strategy['id']}. {detail}")
         if protective.status == ProtectiveOrderStatus.OPEN and filled_qty != 0:
-            raise RuntimeError(f"Open protective stop reports a fill for {strategy['id']}. {detail}")
+            raise RuntimeError(
+                f"Open protective stop reports a fill for {strategy['id']}. {detail}"
+            )
         if protective.status != ProtectiveOrderStatus.TRIGGERED and filled_qty != 0:
             raise RuntimeError(
                 f"Terminal untriggered protective stop reports a fill for {strategy['id']}. {detail}"
@@ -3349,7 +4365,11 @@ class PaperTradingBot:
                     f"Triggered protective stop is not fully filled for {strategy['id']}. {detail}"
                 )
             average_price = protective.average_price
-            if average_price is None or not math.isfinite(float(average_price)) or float(average_price) <= 0:
+            if (
+                average_price is None
+                or not math.isfinite(float(average_price))
+                or float(average_price) <= 0
+            ):
                 raise RuntimeError(
                     f"Triggered protective stop has no valid average fill price for {strategy['id']}. {detail}"
                 )
@@ -3503,9 +4523,7 @@ class PaperTradingBot:
                 f"Live spot quote reconciliation has invalid fill notional for {strategy_id}."
             )
         tolerance = max(gross_proceeds * 1e-6, 1e-8)
-        minimum_proceeds = gross_proceeds * (
-            1.0 - LIVE_SPOT_QUOTE_PROCEEDS_MAX_SHORTFALL_FRACTION
-        )
+        minimum_proceeds = gross_proceeds * (1.0 - LIVE_SPOT_QUOTE_PROCEEDS_MAX_SHORTFALL_FRACTION)
         maximum_proceeds = gross_proceeds + tolerance
         if (
             not math.isfinite(observed_proceeds)
@@ -3521,6 +4539,51 @@ class PaperTradingBot:
                 "reconciliation."
             )
         return observed_proceeds
+
+    @staticmethod
+    def _validated_live_spot_base_change(
+        strategy_id: str,
+        *,
+        side: OrderSide,
+        fill_qty: float,
+        balance_before: float,
+        balance_after: float,
+    ) -> float:
+        """Prove a spot fill through the actual free-BTC balance movement."""
+
+        expected = float(fill_qty)
+        before = float(balance_before)
+        after = float(balance_after)
+        if not all(math.isfinite(value) for value in (expected, before, after)):
+            raise RuntimeError(
+                f"Live spot base-balance reconciliation is non-finite for {strategy_id}."
+            )
+        if expected <= 0 or before < 0 or after < 0:
+            raise RuntimeError(
+                f"Live spot base-balance reconciliation is invalid for {strategy_id}."
+            )
+        observed = before - after if side == OrderSide.SELL else after - before
+        tolerance = max(expected * 1e-6, 1e-12)
+        minimum = expected * (1.0 - LIVE_SPOT_BASE_BALANCE_MAX_FEE_FRACTION)
+        maximum = expected * (1.0 + LIVE_SPOT_BASE_BALANCE_MAX_FEE_FRACTION)
+        if observed < minimum - tolerance or observed > maximum + tolerance:
+            raise RuntimeError(
+                "Live spot base-balance reconciliation failed for "
+                f"{strategy_id}: observed {side.value} delta {observed:g} is outside "
+                f"[{minimum:g}, {maximum:g}]. The durable order intent remains for "
+                "operator reconciliation."
+            )
+        return observed
+
+    def _broker_spot_base_balance(self) -> float:
+        if self.broker is None or not self._is_spot_broker():
+            raise RuntimeError("spot base balance requested without a spot broker")
+        balance = float(self.broker.get_position(self.symbol).qty)
+        if not math.isfinite(balance) or balance < 0:
+            raise ValueError(
+                f"Broker spot base balance must be finite and non-negative, got {balance:g}."
+            )
+        return balance
 
     def _broker_quote_balance(self, *, allow_zero: bool = False) -> float:
         if self.broker is None:
@@ -3673,20 +4736,14 @@ class PaperTradingBot:
                 )
         if self._requires_native_protective_stop():
             missing.extend(
-                key for key in BROKER_PROTECTIVE_STOP_REQUIRED_KEYS
-                if key not in position
+                key for key in BROKER_PROTECTIVE_STOP_REQUIRED_KEYS if key not in position
             )
             missing.extend(
-                key for key in BROKER_LIVE_FUTURES_ACCOUNTING_REQUIRED_KEYS
-                if key not in position
+                key for key in BROKER_LIVE_FUTURES_ACCOUNTING_REQUIRED_KEYS if key not in position
             )
-        if (
-            self._requires_observed_spot_quote_proceeds()
-            and position.get("direction") == "short"
-        ):
+        if self._requires_observed_spot_quote_proceeds() and position.get("direction") == "short":
             missing.extend(
-                key for key in BROKER_LIVE_SPOT_ACCOUNTING_REQUIRED_KEYS
-                if key not in position
+                key for key in BROKER_LIVE_SPOT_ACCOUNTING_REQUIRED_KEYS if key not in position
             )
             source = position.get("broker_entry_quote_value_source")
             if source is not None and source != "observed_free_quote_delta":
@@ -3715,7 +4772,9 @@ class PaperTradingBot:
             raise RuntimeError(f"State open_positions must be an object: {self.state_file}")
         for strategy_id, position in positions.items():
             if not isinstance(position, dict):
-                raise RuntimeError(f"State open_positions[{strategy_id!r}] must be an object: {self.state_file}")
+                raise RuntimeError(
+                    f"State open_positions[{strategy_id!r}] must be an object: {self.state_file}"
+                )
             self._assert_broker_metadata_complete(
                 str(strategy_id),
                 position,
@@ -3758,12 +4817,17 @@ class PaperTradingBot:
             and side == OrderSide.BUY
         ):
             quote_value = self._spot_step_aside_quote_value(strategy, open_position)
-            price = float(self.broker.get_price(open_position.get("broker_symbol", self.symbol)) or fallback_price)
+            price = float(
+                self.broker.get_price(open_position.get("broker_symbol", self.symbol))
+                or fallback_price
+            )
             if not math.isfinite(price) or price <= 0:
                 raise ValueError("Cannot size a spot buyback with a non-positive price.")
             qty = quote_value / price
             if not math.isfinite(qty) or qty <= 0:
-                raise ValueError(f"Spot buyback quantity is non-positive (quote_value={quote_value}, price={price}).")
+                raise ValueError(
+                    f"Spot buyback quantity is non-positive (quote_value={quote_value}, price={price})."
+                )
             return qty
         return self._broker_state_qty(strategy, open_position)
 
@@ -3853,7 +4917,9 @@ class PaperTradingBot:
                 f"filled {fill_qty:g}. Local position not opened."
             )
 
-    def _assert_broker_exit_fill_valid(self, strategy: dict, order: Order, requested_qty: float, fill: Fill) -> None:
+    def _assert_broker_exit_fill_valid(
+        self, strategy: dict, order: Order, requested_qty: float, fill: Fill
+    ) -> None:
         self._assert_broker_fill_matches_order(
             strategy,
             stage="exit",
@@ -4086,6 +5152,19 @@ class PaperTradingBot:
                 strategy["id"],
             )
             return
+        candidate_observation_time = getattr(
+            self,
+            "_candidate_replay_observation_time",
+            None,
+        )
+        if candidate_observation_time is not None and latest_open < entry_effective:
+            LOGGER.info(
+                "Candidate %s entered after the %s bar opened; excluding that partial "
+                "bar from exit evidence.",
+                strategy["id"],
+                base_tf,
+            )
+            return
         high = float(latest_bar[f"tf_{base_tf}_high"])
         low = float(latest_bar[f"tf_{base_tf}_low"])
         close = float(latest_bar[f"tf_{base_tf}_close"])
@@ -4117,9 +5196,26 @@ class PaperTradingBot:
             return
 
         broker_exit_fill = None
+        spot_base_reconciliation = None
         if self.broker is not None and "broker_qty" in open_position:
             side = OrderSide.SELL if direction == "long" else OrderSide.BUY
             broker_symbol = str(open_position.get("broker_symbol", self.symbol))
+            spot_base_before_exit = None
+            if (
+                self._requires_observed_spot_quote_proceeds()
+                and direction == "short"
+                and side == OrderSide.BUY
+            ):
+                spot_base_before_exit = self._broker_spot_base_balance()
+                expected_flat_balance = float(open_position["broker_entry_base_qty_after"])
+                tolerance = max(abs(expected_flat_balance) * 1e-9, 1e-12)
+                if abs(spot_base_before_exit - expected_flat_balance) > tolerance:
+                    raise RuntimeError(
+                        "Live spot BTC balance changed while the step-aside position was open "
+                        f"for {strategy['id']}: {spot_base_before_exit:g} != "
+                        f"{expected_flat_balance:g}. Refusing buyback until the account is "
+                        "reconciled."
+                    )
             raw_qty = self._broker_exit_order_qty(
                 strategy,
                 open_position,
@@ -4178,6 +5274,33 @@ class PaperTradingBot:
                 raise
             exit_price = float(broker_exit_fill.price)
             self._assert_broker_exit_fill_valid(strategy, exit_order, qty, broker_exit_fill)
+            if spot_base_before_exit is not None:
+                spot_base_after_exit = self._broker_spot_base_balance()
+                observed_bought = self._validated_live_spot_base_change(
+                    strategy["id"],
+                    side=OrderSide.BUY,
+                    fill_qty=float(broker_exit_fill.qty),
+                    balance_before=spot_base_before_exit,
+                    balance_after=spot_base_after_exit,
+                )
+                original_base_balance = float(open_position["broker_entry_base_qty_before"])
+                if not math.isfinite(original_base_balance) or original_base_balance <= 0:
+                    raise RuntimeError(f"Live spot BTC baseline is invalid for {strategy['id']}.")
+                observed_account_return = (
+                    spot_base_after_exit - original_base_balance
+                ) / original_base_balance
+                if not math.isfinite(observed_account_return) or observed_account_return <= -1:
+                    raise RuntimeError(
+                        f"Live spot BTC account return is invalid for {strategy['id']}."
+                    )
+                spot_base_reconciliation = {
+                    "entry_base_balance_before": original_base_balance,
+                    "entry_base_balance_after": float(open_position["broker_entry_base_qty_after"]),
+                    "exit_base_balance_before": spot_base_before_exit,
+                    "exit_base_balance_after": spot_base_after_exit,
+                    "observed_buy_qty": observed_bought,
+                    "account_return": observed_account_return,
+                }
             if not self._is_spot_broker():
                 self._assert_broker_flat_after_exit(strategy, exit_order.symbol)
             if self._requires_native_protective_stop():
@@ -4186,11 +5309,16 @@ class PaperTradingBot:
         self._complete_position_exit(
             strategy,
             open_position,
-            exit_time=latest_time,
+            exit_time=(
+                candidate_observation_time
+                if candidate_observation_time is not None
+                else latest_time
+            ),
             exit_price=exit_price,
             exit_reason=exit_reason,
             broker_exit_fill=broker_exit_fill,
             clear_pending=broker_exit_fill is not None,
+            spot_base_reconciliation=spot_base_reconciliation,
         )
 
     def _complete_position_exit(
@@ -4203,6 +5331,7 @@ class PaperTradingBot:
         exit_reason: str,
         broker_exit_fill: Fill | None,
         clear_pending: bool,
+        spot_base_reconciliation: dict[str, float] | None = None,
     ) -> None:
         """Apply one validated close to accounting, log, and durable state."""
 
@@ -4253,6 +5382,9 @@ class PaperTradingBot:
         broker_entry_balance = None
         broker_exit_balance = None
         broker_balance_return = None
+        broker_entry_base_balance = None
+        broker_exit_base_balance = None
+        broker_base_balance_return = None
 
         if broker_exit_fill is not None and self._requires_native_protective_stop():
             try:
@@ -4288,10 +5420,25 @@ class PaperTradingBot:
                 net_return = sized_return / position_size
                 accounting_return_source = "conservative_broker_balance"
 
+        if spot_base_reconciliation is not None:
+            if broker_exit_fill is None or not self._requires_observed_spot_quote_proceeds():
+                raise RuntimeError(
+                    f"Spot BTC reconciliation was supplied outside a live spot exit for "
+                    f"{strategy['id']}."
+                )
+            broker_entry_base_balance = float(spot_base_reconciliation["entry_base_balance_before"])
+            broker_exit_base_balance = float(spot_base_reconciliation["exit_base_balance_after"])
+            broker_base_balance_return = float(spot_base_reconciliation["account_return"])
+            modeled_sized_return = sized_return
+            sized_return = broker_base_balance_return
+            if position_size <= 0:
+                raise RuntimeError(f"Live spot position size is invalid for {strategy['id']}.")
+            net_return = sized_return / position_size
+            accounting_adjustment_fraction = sized_return - modeled_sized_return
+            accounting_return_source = "observed_btc_balance"
+
         if "exit_accounting_intent" in self.state:
-            raise RuntimeError(
-                "Cannot replace an unresolved exit accounting intent."
-            )
+            raise RuntimeError("Cannot replace an unresolved exit accounting intent.")
         persisted_position = self.state.get("open_positions", {}).get(strategy["id"])
         if persisted_position != open_position:
             raise RuntimeError(
@@ -4319,11 +5466,20 @@ class PaperTradingBot:
                 if self.state["consecutive_losses"] >= risk["max_consecutive_losses"]:
                     tf_seconds = TIMEFRAME_SECONDS.get(base_tf, 300)
                     cooldown_duration = risk["cooldown_bars"] * tf_seconds
-                    self.state["cooldown_until_ts"] = time.time() + cooldown_duration
+                    replay_clock = getattr(
+                        self,
+                        "_candidate_replay_risk_clock_ts",
+                        None,
+                    )
+                    cooldown_anchor = (
+                        float(replay_clock) if replay_clock is not None else time.time()
+                    )
+                    self.state["cooldown_until_ts"] = cooldown_anchor + cooldown_duration
                     self.state["consecutive_losses"] = 0
                     LOGGER.warning(
                         "Consecutive losses hit limit. Cooling down for %d %s bars.",
-                        risk["cooldown_bars"], base_tf,
+                        risk["cooldown_bars"],
+                        base_tf,
                     )
             else:
                 self.state["consecutive_losses"] = 0
@@ -4339,9 +5495,17 @@ class PaperTradingBot:
 
         exit_event_id = self._exit_event_id(strategy["id"], open_position)
         trade_data = self._build_trade_data(
-            strategy["id"], open_position["entry_time"], str(exit_time), direction,
-            entry_price, exit_price, exit_reason,
-            gross_return, net_return, sized_return, position_size,
+            strategy["id"],
+            open_position["entry_time"],
+            str(exit_time),
+            direction,
+            entry_price,
+            exit_price,
+            exit_reason,
+            gross_return,
+            net_return,
+            sized_return,
+            position_size,
             equity_after=float(state_after["equity"]),
             exit_event_id=exit_event_id,
             transaction_cost_fraction=total_cost,
@@ -4351,12 +5515,23 @@ class PaperTradingBot:
             broker_entry_balance=broker_entry_balance,
             broker_exit_balance=broker_exit_balance,
             broker_balance_return=broker_balance_return,
+            broker_entry_base_balance=broker_entry_base_balance,
+            broker_exit_base_balance=broker_exit_base_balance,
+            broker_base_balance_return=broker_base_balance_return,
             broker_entry_fee=open_position.get("broker_entry_fee"),
             broker_exit_fill=broker_exit_fill,
-            strategy_fingerprint_value=open_position.get(
-                "approval_strategy_fingerprint"
-            ),
+            strategy_fingerprint_value=open_position.get("approval_strategy_fingerprint"),
             artifact_digest_value=open_position.get("artifact_digest"),
+            candidate_paper_execution_schema=open_position.get("candidate_paper_execution_schema"),
+            candidate_paper_engine_digest_value=open_position.get("candidate_paper_engine_digest"),
+            candidate_paper_evidence_eligible=open_position.get(
+                "candidate_paper_evidence_eligible"
+            ),
+            candidate_paper_evidence_reason=open_position.get("candidate_paper_evidence_reason"),
+            candidate_paper_entry_fill_source=open_position.get(
+                "candidate_paper_entry_fill_source"
+            ),
+            candidate_paper_observed_at=open_position.get("candidate_paper_observed_at"),
         )
         intent_without_digest = {
             "version": 1,
@@ -4373,8 +5548,7 @@ class PaperTradingBot:
                 label="Exit accounting position",
             ),
             "broker_flat_proven": bool(
-                broker_exit_fill is not None
-                and self._requires_native_protective_stop()
+                broker_exit_fill is not None and self._requires_native_protective_stop()
             ),
             "trade_data": trade_data,
             "state_after": state_after,
@@ -4400,8 +5574,13 @@ class PaperTradingBot:
         LOGGER.critical(
             "%s ORDER CLOSED [%s]: %s @ %.2f | Reason: %s | Net: %.4f%% | Sized: %.4f%% | Equity: %.2f",
             "BROKER" if broker_exit_fill is not None else "PAPER",
-            strategy["id"], direction.upper(), exit_price, exit_reason,
-            net_return * 100, sized_return * 100, self.state["equity"],
+            strategy["id"],
+            direction.upper(),
+            exit_price,
+            exit_reason,
+            net_return * 100,
+            sized_return * 100,
+            self.state["equity"],
         )
         self.check_drift_and_ood(strategy)
 
@@ -4424,9 +5603,18 @@ class PaperTradingBot:
         self.state["daily_pnl"] = updated
 
     def _build_trade_data(
-        self, strategy_id: str, entry_time: str, exit_time: str, direction: str,
-        entry: float, exit: float, exit_reason: str,
-        gross_return: float, net_return: float, sized_return: float, position_size: float,
+        self,
+        strategy_id: str,
+        entry_time: str,
+        exit_time: str,
+        direction: str,
+        entry: float,
+        exit: float,
+        exit_reason: str,
+        gross_return: float,
+        net_return: float,
+        sized_return: float,
+        position_size: float,
         *,
         equity_after: float,
         exit_event_id: str,
@@ -4437,15 +5625,22 @@ class PaperTradingBot:
         broker_entry_balance=None,
         broker_exit_balance=None,
         broker_balance_return=None,
+        broker_entry_base_balance=None,
+        broker_exit_base_balance=None,
+        broker_base_balance_return=None,
         broker_entry_fee=None,
         broker_exit_fill=None,
         strategy_fingerprint_value: str | None = None,
         artifact_digest_value: str | None = None,
+        candidate_paper_execution_schema: str | None = None,
+        candidate_paper_engine_digest_value: str | None = None,
+        candidate_paper_evidence_eligible: bool | None = None,
+        candidate_paper_evidence_reason: str | None = None,
+        candidate_paper_entry_fill_source: str | None = None,
+        candidate_paper_observed_at: str | None = None,
     ) -> dict:
         if strategy_fingerprint_value is None:
-            strategy_fingerprint_value = self.approval_fingerprints_by_strategy.get(
-                strategy_id
-            )
+            strategy_fingerprint_value = self.approval_fingerprints_by_strategy.get(strategy_id)
         if artifact_digest_value is None:
             artifact_digest_value = self.artifact_content_digest
         trade_data = {
@@ -4469,6 +5664,48 @@ class PaperTradingBot:
             "position_size": position_size,
             "equity_after": equity_after,
         }
+        if (
+            candidate_paper_execution_schema is not None
+            or candidate_paper_engine_digest_value is not None
+        ):
+            if candidate_paper_execution_schema != CANDIDATE_PAPER_EXECUTION_SCHEMA:
+                raise RuntimeError("Candidate paper trade has an invalid execution schema.")
+            if not isinstance(candidate_paper_engine_digest_value, str):
+                raise RuntimeError("Candidate paper trade has no execution engine digest.")
+            if not isinstance(candidate_paper_evidence_eligible, bool):
+                raise RuntimeError("Candidate paper trade has invalid evidence eligibility.")
+            if candidate_paper_observed_at is None:
+                raise RuntimeError("Candidate paper trade has no observation time.")
+            try:
+                observed_at = self._candidate_replay_observation_timestamp(
+                    candidate_paper_observed_at
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Candidate paper trade has an invalid observation time."
+                ) from exc
+            if candidate_paper_evidence_eligible:
+                if (
+                    candidate_paper_evidence_reason != CANDIDATE_PAPER_FORWARD_REASON
+                    or candidate_paper_entry_fill_source != CANDIDATE_PAPER_FORWARD_FILL_SOURCE
+                    or observed_at != self._candidate_replay_observation_timestamp(entry_time)
+                ):
+                    raise RuntimeError(
+                        "Promotable candidate paper trade has inconsistent observation evidence."
+                    )
+            elif candidate_paper_evidence_reason not in {
+                CANDIDATE_PAPER_BACKFILL_ENTRY_REASON,
+                CANDIDATE_PAPER_BACKFILL_MANAGEMENT_REASON,
+            }:
+                raise RuntimeError("Non-promotable candidate paper trade has no backfill reason.")
+            trade_data.update(
+                candidate_paper_execution_schema=candidate_paper_execution_schema,
+                candidate_paper_engine_digest=candidate_paper_engine_digest_value,
+                candidate_paper_evidence_eligible=candidate_paper_evidence_eligible,
+                candidate_paper_evidence_reason=candidate_paper_evidence_reason,
+                candidate_paper_entry_fill_source=candidate_paper_entry_fill_source,
+                candidate_paper_observed_at=observed_at.isoformat(),
+            )
         if broker_exit_fill is not None:
             trade_data.update(
                 broker_symbol=broker_exit_fill.symbol,
@@ -4484,6 +5721,12 @@ class PaperTradingBot:
                 trade_data["broker_exit_balance"] = float(broker_exit_balance)
             if broker_balance_return is not None:
                 trade_data["broker_balance_return"] = float(broker_balance_return)
+            if broker_entry_base_balance is not None:
+                trade_data["broker_entry_base_balance"] = float(broker_entry_base_balance)
+            if broker_exit_base_balance is not None:
+                trade_data["broker_exit_base_balance"] = float(broker_exit_base_balance)
+            if broker_base_balance_return is not None:
+                trade_data["broker_base_balance_return"] = float(broker_base_balance_return)
         # The WAL is JSON, so reject NaN/Infinity before it can become a
         # non-reproducible accounting record.
         _canonical_json_digest(trade_data, label="Trade log row")
@@ -4499,9 +5742,7 @@ class PaperTradingBot:
                 if pd.isna(actual_value) or str(actual_value) == "":
                     continue
                 return False
-            if isinstance(expected_value, int | float) and not isinstance(
-                expected_value, bool
-            ):
+            if isinstance(expected_value, int | float) and not isinstance(expected_value, bool):
                 try:
                     actual_number = float(actual_value)
                 except (TypeError, ValueError):
@@ -4531,13 +5772,9 @@ class PaperTradingBot:
             except Exception as exc:
                 raise RuntimeError(f"Trade log is unreadable: {self.trade_log}") from exc
             if "exit_event_id" in df_existing.columns:
-                matches = df_existing[
-                    df_existing["exit_event_id"].astype(str) == event_id
-                ]
+                matches = df_existing[df_existing["exit_event_id"].astype(str) == event_id]
                 if len(matches) > 1:
-                    raise RuntimeError(
-                        f"Trade log contains duplicate exit_event_id {event_id}."
-                    )
+                    raise RuntimeError(f"Trade log contains duplicate exit_event_id {event_id}.")
                 if len(matches) == 1:
                     if not self._trade_row_matches(matches.iloc[0], trade_data):
                         raise RuntimeError(
@@ -4559,9 +5796,18 @@ class PaperTradingBot:
         write_text_atomic(self.trade_log, df_out.to_csv(index=False))
 
     def _log_trade(
-        self, strategy_id: str, entry_time: str, exit_time: str, direction: str,
-        entry: float, exit: float, exit_reason: str,
-        gross_return: float, net_return: float, sized_return: float, position_size: float,
+        self,
+        strategy_id: str,
+        entry_time: str,
+        exit_time: str,
+        direction: str,
+        entry: float,
+        exit: float,
+        exit_reason: str,
+        gross_return: float,
+        net_return: float,
+        sized_return: float,
+        position_size: float,
         transaction_cost_fraction: float = 0.0,
         transaction_cost_source: str = "unknown",
         accounting_return_source: str = "modeled_trade",
@@ -4569,6 +5815,9 @@ class PaperTradingBot:
         broker_entry_balance=None,
         broker_exit_balance=None,
         broker_balance_return=None,
+        broker_entry_base_balance=None,
+        broker_exit_base_balance=None,
+        broker_base_balance_return=None,
         broker_entry_fee=None,
         broker_exit_fill=None,
         strategy_fingerprint_value: str | None = None,
@@ -4612,6 +5861,9 @@ class PaperTradingBot:
             broker_entry_balance=broker_entry_balance,
             broker_exit_balance=broker_exit_balance,
             broker_balance_return=broker_balance_return,
+            broker_entry_base_balance=broker_entry_base_balance,
+            broker_exit_base_balance=broker_exit_base_balance,
+            broker_base_balance_return=broker_base_balance_return,
             broker_entry_fee=broker_entry_fee,
             broker_exit_fill=broker_exit_fill,
             strategy_fingerprint_value=strategy_fingerprint_value,
@@ -4628,16 +5880,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--starting-equity", type=float, default=DEFAULT_STARTING_EQUITY)
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--market", choices=("futures", "spot"), default="futures")
-    parser.add_argument("--objective", choices=("btc_accumulation", "active_income"),
-                        help="Optional product objective for product-specific execution guards.")
-    parser.add_argument("--base-asset", help="Optional product base asset for product-specific execution guards.")
     parser.add_argument(
-        "--regime-guard", action="store_true",
-        help="BTC accumulation overlay: block new LONG entries when the daily macro "
-             "regime is risk-off (trend break / Mayer overheat / Pi-Cycle top).",
+        "--objective",
+        choices=("btc_accumulation", "active_income"),
+        help="Optional product objective for product-specific execution guards.",
     )
-    parser.add_argument("--regime-mayer-top", type=float, default=REGIME_MAYER_TOP,
-                        help="Mayer Multiple threshold for the macro overheat gate (default 2.4).")
+    parser.add_argument(
+        "--base-asset", help="Optional product base asset for product-specific execution guards."
+    )
+    parser.add_argument(
+        "--regime-guard",
+        action="store_true",
+        help="BTC accumulation overlay: block new LONG entries when the daily macro "
+        "regime is risk-off (trend break / Mayer overheat / Pi-Cycle top).",
+    )
+    parser.add_argument(
+        "--regime-mayer-top",
+        type=float,
+        default=REGIME_MAYER_TOP,
+        help="Mayer Multiple threshold for the macro overheat gate (default 2.4).",
+    )
     return parser.parse_args()
 
 

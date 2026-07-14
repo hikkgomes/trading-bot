@@ -1,8 +1,12 @@
 import gzip
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from src.autopilot.io import append_json_line
 from src.autopilot.maintenance import (
     compact_alert_state,
     compact_jsonl,
@@ -11,6 +15,7 @@ from src.autopilot.maintenance import (
     rotate_jsonl,
     run_maintenance,
 )
+from src.autopilot.notifications import emit_alert
 
 
 def test_compact_jsonl_missing_file_is_noop(tmp_path):
@@ -96,6 +101,55 @@ def test_rotate_jsonl_archives_old_lines_and_keeps_recent(tmp_path):
     archive_path = archive_dir / report["archive_path"].split("/")[-1]
     with gzip.open(archive_path, "rt", encoding="utf-8") as handle:
         assert handle.read() == '{"n": 0}\n{"n": 1}\n{"n": 2}\n'
+
+
+def test_rotate_jsonl_serializes_with_concurrent_jsonl_append(tmp_path, monkeypatch):
+    path = tmp_path / "control_audit.jsonl"
+    archive_dir = tmp_path / "archive"
+    path.write_text("\n".join(f'{{"n": {idx}}}' for idx in range(5)) + "\n", encoding="utf-8")
+    from src.autopilot import maintenance
+
+    entered_rotation = threading.Event()
+    continue_rotation = threading.Event()
+    original_rotate = maintenance._rotate_jsonl_locked
+
+    def delayed_rotate(*args, **kwargs):
+        entered_rotation.set()
+        assert continue_rotation.wait(timeout=2.0)
+        return original_rotate(*args, **kwargs)
+
+    monkeypatch.setattr(maintenance, "_rotate_jsonl_locked", delayed_rotate)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        rotate_future = executor.submit(
+            rotate_jsonl,
+            path,
+            max_lines=2,
+            archive_dir=archive_dir,
+        )
+        assert entered_rotation.wait(timeout=2.0)
+        append_started = threading.Event()
+
+        def append_record():
+            append_started.set()
+            append_json_line(path, {"n": 99})
+
+        append_future = executor.submit(append_record)
+        assert append_started.wait(timeout=2.0)
+        time.sleep(0.05)
+        assert append_future.done() is False
+        continue_rotation.set()
+        report = rotate_future.result(timeout=2.0)
+        append_future.result(timeout=2.0)
+
+    assert report["archived_lines"] == 3
+    assert [json.loads(line)["n"] for line in path.read_text(encoding="utf-8").splitlines()] == [
+        3,
+        4,
+        99,
+    ]
+    with gzip.open(report["archive_path"], "rt", encoding="utf-8") as handle:
+        assert [json.loads(line)["n"] for line in handle.read().splitlines()] == [0, 1, 2]
 
 
 def test_rotate_jsonl_dry_run_does_not_write_archive_or_trim(tmp_path):
@@ -190,6 +244,64 @@ def test_compact_alert_state_keeps_newest_fingerprints(tmp_path):
     assert report["changed"] is True
     assert set(payload["alerts"]) == {"new", "middle"}
     assert payload["version"] == 1
+
+
+def test_alert_state_compaction_serializes_with_concurrent_alert_update(tmp_path, monkeypatch):
+    path = tmp_path / "alert_state.json"
+    alert_file = tmp_path / "alerts.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "alerts": {
+                    "old": {"last_sent_ts": 1.0, "title": "old"},
+                    "new": {"last_sent_ts": 2.0, "title": "new"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    from src.autopilot import maintenance
+
+    entered_compaction = threading.Event()
+    continue_compaction = threading.Event()
+    original_compact = maintenance._compact_alert_state_locked
+
+    def delayed_compact(*args, **kwargs):
+        entered_compaction.set()
+        assert continue_compaction.wait(timeout=2.0)
+        return original_compact(*args, **kwargs)
+
+    monkeypatch.setattr(maintenance, "_compact_alert_state_locked", delayed_compact)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        compact_future = executor.submit(compact_alert_state, path, 1)
+        assert entered_compaction.wait(timeout=2.0)
+        alert_started = threading.Event()
+
+        def send_alert():
+            alert_started.set()
+            return emit_alert(
+                alert_file=alert_file,
+                state_file=path,
+                severity="warning",
+                title="new warning",
+                detail={"scope": "test"},
+                cooldown_seconds=60,
+                now=100.0,
+            )
+
+        alert_future = executor.submit(send_alert)
+        assert alert_started.wait(timeout=2.0)
+        time.sleep(0.05)
+        assert alert_future.done() is False
+        continue_compaction.set()
+        compact_future.result(timeout=2.0)
+        alert_result = alert_future.result(timeout=2.0)
+
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert alert_result["sent"] is True
+    assert set(state["alerts"]) == {"new", alert_result["fingerprint"]}
 
 
 def test_compact_alert_state_dry_run_reports_without_writing(tmp_path):
@@ -326,7 +438,9 @@ def test_run_maintenance_rotates_control_audit_from_config(tmp_path):
         ),
         encoding="utf-8",
     )
-    control_audit.write_text("\n".join(f'{{"n": {idx}}}' for idx in range(5)) + "\n", encoding="utf-8")
+    control_audit.write_text(
+        "\n".join(f'{{"n": {idx}}}' for idx in range(5)) + "\n", encoding="utf-8"
+    )
     experiment_log.write_text('{"n": 1}\n', encoding="utf-8")
 
     report = run_maintenance(
@@ -374,8 +488,12 @@ def test_run_maintenance_continues_after_task_failure(tmp_path):
     alert_file.write_text('{"n": 1}\n{"n": 2}\n{"n": 3}\n', encoding="utf-8")
     alert_state_target.write_text(json.dumps({"version": 1, "alerts": {}}), encoding="utf-8")
     alert_state_link.symlink_to(alert_state_target)
-    control_audit.write_text("\n".join(f'{{"n": {idx}}}' for idx in range(4)) + "\n", encoding="utf-8")
-    experiment_log.write_text("\n".join(f'{{"n": {idx}}}' for idx in range(3)) + "\n", encoding="utf-8")
+    control_audit.write_text(
+        "\n".join(f'{{"n": {idx}}}' for idx in range(4)) + "\n", encoding="utf-8"
+    )
+    experiment_log.write_text(
+        "\n".join(f'{{"n": {idx}}}' for idx in range(3)) + "\n", encoding="utf-8"
+    )
 
     report = run_maintenance(
         config,
@@ -401,7 +519,10 @@ def test_run_maintenance_continues_after_task_failure(tmp_path):
     assert report["experiment_log"]["archived_lines"] == 2
     assert report["control_audit"]["archived_lines"] == 2
     assert control_audit.read_text(encoding="utf-8") == '{"n": 2}\n{"n": 3}\n'
-    assert json.loads(alert_state_target.read_text(encoding="utf-8")) == {"version": 1, "alerts": {}}
+    assert json.loads(alert_state_target.read_text(encoding="utf-8")) == {
+        "version": 1,
+        "alerts": {},
+    }
 
 
 def test_maintenance_cli_exits_nonzero_for_structured_task_failure(monkeypatch, tmp_path, capsys):

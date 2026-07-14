@@ -4,10 +4,19 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans
 
 from src.config import DEFAULT_SYMBOL, PROCESSED_DATA_DIR, indicator_data_dir
 from src.parquet_io import write_parquet_atomic
+
+REGIME_LABELS = {
+    -1: "unknown",
+    0: "range",
+    1: "bull_trend",
+    2: "bear_trend",
+    3: "high_volatility",
+}
+REGIME_LOOKBACK_DAYS = 21
+REGIME_MIN_HISTORY_DAYS = 20
 
 
 def _timestamped(data: pd.DataFrame) -> pd.DataFrame:
@@ -24,33 +33,64 @@ def _timestamped(data: pd.DataFrame) -> pd.DataFrame:
 
 
 def _regime_frame(data: pd.DataFrame, price_column: str) -> pd.DataFrame:
+    """Build causal, prefix-invariant daily regimes with stable semantics.
+
+    Every row depends only on prices available at or before that row.  Numeric
+    IDs have fixed meanings from :data:`REGIME_LABELS`; unlike full-sample
+    clustering, appending future data cannot relabel history.
+    """
+
     if price_column not in data.columns:
         raise ValueError(f"Missing {price_column}")
     daily = _timestamped(data)[["timestamp", price_column]].copy()
-    daily = daily.dropna(subset=[price_column])
-    daily = daily.loc[daily[price_column].ne(daily[price_column].shift())].copy()
-    returns = daily[price_column].astype(float).pct_change()
-    features = pd.DataFrame(
-        {
-            "realized_vol_21d": returns.rolling(21, min_periods=5).std(),
-            "abs_return_21d": returns.rolling(21, min_periods=5).mean().abs(),
-        },
+    daily[price_column] = pd.to_numeric(daily[price_column], errors="coerce")
+    daily = daily.replace([np.inf, -np.inf], np.nan).dropna(subset=[price_column])
+    daily = daily.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    # ``add_regime_column`` also accepts an intraday frame carrying a repeated
+    # already-closed daily feature. Collapse that input to the first available
+    # value per UTC day, while retaining genuine unchanged closes in daily data.
+    deltas = daily["timestamp"].diff().dropna()
+    if not deltas.empty and deltas.median() < pd.Timedelta(hours=12):
+        daily["_utc_day"] = daily["timestamp"].dt.floor("D")
+        daily = daily.drop_duplicates("_utc_day", keep="first").drop(columns="_utc_day")
+    prices = daily[price_column].astype(float)
+    returns = prices.pct_change()
+    realized_vol = returns.rolling(
+        REGIME_LOOKBACK_DAYS,
+        min_periods=REGIME_LOOKBACK_DAYS,
+    ).std()
+    trailing_return = prices.pct_change(REGIME_LOOKBACK_DAYS)
+    # Compare current volatility with a threshold learned strictly from prior
+    # observations. The expanding quantile is causal and prefix-invariant.
+    high_vol_threshold = (
+        realized_vol.expanding(min_periods=REGIME_MIN_HISTORY_DAYS).quantile(0.75).shift(1)
+    )
+    trend_band = pd.Series(
+        np.maximum(0.02, realized_vol.to_numpy() * np.sqrt(REGIME_LOOKBACK_DAYS)),
         index=daily.index,
-    ).replace([np.inf, -np.inf], np.nan)
-    valid = features.dropna()
+    )
     daily["tf_1d_regime_id"] = -1
-    if len(valid) < 4:
-        return daily[["timestamp", "tf_1d_regime_id"]]
-    n_clusters = min(4, len(valid))
-    model = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto")
-    daily.loc[valid.index, "tf_1d_regime_id"] = model.fit_predict(valid)
-    daily["tf_1d_regime_id"] = daily["tf_1d_regime_id"].ffill().fillna(-1).astype(int)
+    valid = realized_vol.notna() & trailing_return.notna() & high_vol_threshold.notna()
+    daily.loc[valid, "tf_1d_regime_id"] = 0
+    high_volatility = valid & (realized_vol > high_vol_threshold)
+    daily.loc[high_volatility, "tf_1d_regime_id"] = 3
+    daily.loc[valid & ~high_volatility & (trailing_return > trend_band), "tf_1d_regime_id"] = 1
+    daily.loc[valid & ~high_volatility & (trailing_return < -trend_band), "tf_1d_regime_id"] = 2
+    daily["tf_1d_regime_id"] = daily["tf_1d_regime_id"].astype(int)
     return daily[["timestamp", "tf_1d_regime_id"]]
 
 
 def add_regime_column(data: pd.DataFrame, price_column: str = "tf_1d_close") -> pd.DataFrame:
     out = _timestamped(data)
     regimes = _regime_frame(out, price_column)
+    source_deltas = out["timestamp"].sort_values().diff().dropna()
+    if (
+        price_column == "close"
+        and not source_deltas.empty
+        and source_deltas.median() >= pd.Timedelta(hours=12)
+    ):
+        # A direct daily ``close`` is known only after its timestamped candle.
+        regimes["timestamp"] = regimes["timestamp"] + pd.Timedelta(days=1)
     out = out.drop(columns=["tf_1d_regime_id"], errors="ignore")
     out = pd.merge_asof(
         out.sort_values("timestamp"),
@@ -70,6 +110,9 @@ def add_regime_column_from_daily(
 ) -> pd.DataFrame:
     out = _timestamped(data).drop(columns=["tf_1d_regime_id"], errors="ignore")
     regimes = _regime_frame(daily_data, daily_price_column)
+    # Daily candle timestamps denote candle opens. A label using that candle's
+    # close becomes available to intraday consumers only when the day has closed.
+    regimes["timestamp"] = regimes["timestamp"] + pd.Timedelta(days=1)
     out = pd.merge_asof(
         out.sort_values("timestamp"),
         regimes.sort_values("timestamp"),
@@ -81,7 +124,10 @@ def add_regime_column_from_daily(
 
 
 def _indicator_path(symbol: str, market: str, timeframe: str) -> Path:
-    return indicator_data_dir(symbol, market, legacy_fallback=True) / f"{symbol}_{timeframe}_all_indicators.parquet"
+    return (
+        indicator_data_dir(symbol, market, legacy_fallback=True)
+        / f"{symbol}_{timeframe}_all_indicators.parquet"
+    )
 
 
 def tag_regime_file(
@@ -136,7 +182,10 @@ def tag_regime_file(
         "output": str(output_path),
         "compact": compact,
         "rows": int(len(out)),
-        "regime_counts": {str(int(k)): int(v) for k, v in regimes.value_counts().sort_index().items()},
+        "regime_labels": {str(key): value for key, value in REGIME_LABELS.items()},
+        "regime_counts": {
+            str(int(k)): int(v) for k, v in regimes.value_counts().sort_index().items()
+        },
     }
 
 

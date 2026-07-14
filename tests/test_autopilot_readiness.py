@@ -6,8 +6,14 @@ from pathlib import Path
 import pytest
 
 import src.autopilot.readiness as readiness
+from research_exploration.dsr import DSR_METHOD
 from src.autopilot.approvals import ApprovalLedger, artifact_digest, strategy_fingerprint
-from src.autopilot.config import AutopilotConfig, JobConfig, ProductConfig
+from src.autopilot.config import (
+    AutopilotConfig,
+    JobConfig,
+    ProductConfig,
+    canonical_product_config,
+)
 from src.autopilot.execution_identity import execution_engine_digest
 from src.autopilot.experiment_memory import ExperimentMemory
 from src.autopilot.readiness import build_readiness_report, main, render_readiness_markdown
@@ -103,7 +109,16 @@ def strategy_artifact(path):
             "max_trades_per_day": 4,
         },
         "fees": {"fee_bps": 5.0, "slippage_bps": 2.0},
-        "metrics": {"holdout_total_return": 0.03, "dsr_deflated": 0.72},
+        "metrics": {
+            "holdout_total_return": 0.03,
+            "dsr_deflated": 0.72,
+            "dsr_method": DSR_METHOD,
+            "n_trials": 8,
+            "sr_std_trials": 0.20,
+            "trial_sharpe_count": 8,
+            "trial_sharpe_observed_std": 0.15,
+            "trial_sharpe_conservative_floor": 0.10,
+        },
     }
     path.write_text(
         json.dumps(
@@ -123,9 +138,7 @@ def strategy_artifact(path):
     return strategy
 
 
-def test_research_factory_readiness_validates_goals_horizons_and_path_wiring(
-    tmp_path, monkeypatch
-):
+def test_research_factory_readiness_validates_goals_horizons_and_path_wiring(tmp_path, monkeypatch):
     factory_path = write_research_factory_config(tmp_path, monkeypatch)
     cfg = AutopilotConfig(
         research_factory_config_file=factory_path,
@@ -147,9 +160,7 @@ def test_research_factory_readiness_validates_goals_horizons_and_path_wiring(
     assert all(status["path_contract"].values())
 
 
-def test_research_factory_readiness_rejects_autopilot_memory_path_mismatch(
-    tmp_path, monkeypatch
-):
+def test_research_factory_readiness_rejects_autopilot_memory_path_mismatch(tmp_path, monkeypatch):
     factory_path = write_research_factory_config(tmp_path, monkeypatch)
     cfg = AutopilotConfig(
         research_factory_config_file=factory_path,
@@ -212,9 +223,7 @@ def test_generated_batch_readiness_accepts_only_canonical_safe_factory_output(
     assert unsafe["reason"] == "failed_safety_contract"
 
 
-def test_generated_batch_readiness_warns_without_creating_a_first_boot_batch(
-    tmp_path, monkeypatch
-):
+def test_generated_batch_readiness_warns_without_creating_a_first_boot_batch(tmp_path, monkeypatch):
     factory_path = write_research_factory_config(tmp_path, monkeypatch)
     factory = load_factory_config(factory_path)
 
@@ -396,7 +405,6 @@ def passing_preflight_checks(product_config):
         {"name": "strategy_artifact_exists", "ok": True},
         {"name": "strategy_fingerprints", "ok": True},
         {"name": "strategy_policy", "ok": True},
-        {"name": "approval_gate", "ok": True},
         {"name": "exchange_environment", "ok": True, "detail": exchange_detail},
         {"name": "broker_constructed", "ok": True},
         {
@@ -431,13 +439,25 @@ def passing_preflight_checks(product_config):
                 "name": "broker_open_orders_empty",
                 "ok": True,
                 "detail": {
-                    "symbol": product_config.symbol,
+                    "scope": "whole_account",
+                    "configured_symbol": product_config.symbol,
                     "regular": {"count": 0, "orders": []},
                     "conditional": {"count": 0, "orders": []},
                 },
             }
         )
-        checks.append({"name": "broker_position_flat", "ok": True})
+        checks.append(
+            {
+                "name": "broker_position_flat",
+                "ok": True,
+                "detail": {
+                    "scope": "whole_account",
+                    "configured_symbol": product_config.symbol,
+                    "count": 0,
+                    "positions": [],
+                },
+            }
+        )
     if product_config.objective == "btc_accumulation" and product_config.market == "spot":
         checks.append({"name": "broker_spot_position_non_negative", "ok": True})
     return checks
@@ -500,18 +520,7 @@ def write_preflight(path, product_config, *, generated_ts=None):
                         "artifact_digest": artifact_digest(artifact),
                         "execution_engine_digest": execution_engine_digest(),
                         "ok": True,
-                        "product": {
-                            "name": product_config.name,
-                            "objective": product_config.objective,
-                            "base_asset": product_config.base_asset,
-                            "market": product_config.market,
-                            "symbol": product_config.symbol,
-                            "execution_mode": product_config.execution_mode,
-                            "starting_equity": product_config.starting_equity,
-                            "regime_guard": product_config.regime_guard,
-                            "regime_mayer_top": product_config.regime_mayer_top,
-                            "strategies_path": str(product_config.strategies_path),
-                        },
+                        "product": canonical_product_config(product_config),
                         "checks": passing_preflight_checks(product_config),
                         "errors": [],
                     }
@@ -535,11 +544,7 @@ def write_testnet_rehearsal(path, *, generated_ts=None, preflight=None):
         if isinstance(products, list) and products and isinstance(products[0], dict):
             embedded = products[0].get("product")
             if isinstance(embedded, dict):
-                product_payload = {
-                    key: embedded[key]
-                    for key in ("name", "objective", "base_asset", "market", "symbol")
-                    if key in embedded
-                }
+                product_payload = dict(embedded)
     payload = {
         "ok": True,
         "generated_at": "2026-01-01T00:00:00+00:00",
@@ -1454,10 +1459,13 @@ def test_readiness_blocks_stale_live_preflight_report(tmp_path):
         preflight_report=preflight,
         preflight_max_age_seconds=60,
     )
-    write_preflight(preflight, live_product, generated_ts=time.time() - 120)
+    write_preflight(preflight, live_product)
     ApprovalLedger(ledger).approve(
         strategy, artifact_path=artifact, approved_by="test", product=live_product
     )
+    stale_report = json.loads(preflight.read_text(encoding="utf-8"))
+    stale_report["generated_ts"] = time.time() - 120
+    preflight.write_text(json.dumps(stale_report), encoding="utf-8")
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",
         status_file=tmp_path / "status.json",
@@ -1500,10 +1508,11 @@ def test_readiness_blocks_malformed_live_preflight_report(tmp_path):
         strategies_path=artifact,
         preflight_report=preflight,
     )
-    preflight.write_text("[]", encoding="utf-8")
+    write_preflight(preflight, live_product)
     ApprovalLedger(ledger).approve(
         strategy, artifact_path=artifact, approved_by="test", product=live_product
     )
+    preflight.write_text("[]", encoding="utf-8")
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",
         status_file=tmp_path / "status.json",

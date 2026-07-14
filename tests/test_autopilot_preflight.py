@@ -3,10 +3,11 @@ import sys
 
 import pytest
 
+from research_exploration.dsr import DSR_METHOD
 from src.autopilot.approvals import ApprovalLedger, artifact_digest
 from src.autopilot.config import AutopilotConfig, ProductConfig
 from src.autopilot.preflight import main, run_preflight
-from src.execution.broker import OpenOrderIdentity, Position
+from src.execution.broker import FuturesPositionIdentity, OpenOrderIdentity, Position
 from src.execution.config import ExchangeConfig
 
 
@@ -64,7 +65,16 @@ def strategy_artifact(path):
             "max_trades_per_day": 4,
         },
         "fees": {"fee_bps": 5.0, "slippage_bps": 2.0},
-        "metrics": {"holdout_total_return": 0.03, "dsr_deflated": 0.72},
+        "metrics": {
+            "holdout_total_return": 0.03,
+            "dsr_deflated": 0.72,
+            "dsr_method": DSR_METHOD,
+            "n_trials": 8,
+            "sr_std_trials": 0.20,
+            "trial_sharpe_count": 8,
+            "trial_sharpe_observed_std": 0.15,
+            "trial_sharpe_conservative_floor": 0.10,
+        },
     }
     path.write_text(
         json.dumps(
@@ -94,6 +104,13 @@ def btc_strategy_artifact(path):
     strategy["metrics"] = {
         "holdout_total_return": 0.03,
         "holdout_excess_return_vs_buy_hold": 0.01,
+        "dsr_deflated": 0.72,
+        "dsr_method": DSR_METHOD,
+        "n_trials": 8,
+        "sr_std_trials": 0.20,
+        "trial_sharpe_count": 8,
+        "trial_sharpe_observed_std": 0.15,
+        "trial_sharpe_conservative_floor": 0.10,
     }
     path.write_text(
         json.dumps(
@@ -150,6 +167,20 @@ class FakeBroker:
     def list_open_orders(self, symbol, *, conditional):
         return ()
 
+    def list_account_open_orders(self, *, conditional):
+        return self.list_open_orders("BTCUSDT", conditional=conditional)
+
+    def list_account_futures_positions(self):
+        if not self.position_qty:
+            return ()
+        return (
+            FuturesPositionIdentity(
+                symbol="BTC/USDT:USDT",
+                qty=self.position_qty,
+                avg_price=90.0,
+            ),
+        )
+
 
 def test_preflight_no_products_selected(tmp_path):
     report = run_preflight(AutopilotConfig(products=[]))
@@ -158,25 +189,19 @@ def test_preflight_no_products_selected(tmp_path):
     assert "No products selected" in report["errors"][0]
 
 
-def test_preflight_requires_approval(monkeypatch, tmp_path):
+def test_read_only_preflight_can_succeed_before_final_approval(monkeypatch, tmp_path):
     set_live_env(monkeypatch)
     strategy_artifact(tmp_path / "active.json")
     cfg = AutopilotConfig(approval_ledger=tmp_path / "approvals.json", products=[product(tmp_path)])
 
-    def fail_broker(_product):
-        raise AssertionError("broker should not be built when approval is missing")
-
-    monkeypatch.setattr("src.autopilot.preflight.build_live_broker", fail_broker)
+    monkeypatch.setattr("src.autopilot.preflight.build_live_broker", lambda _product: FakeBroker())
 
     report = run_preflight(cfg, product_name="active_income", assume_live=True)
 
-    assert report["ok"] is False
+    assert report["ok"] is True
     checks = {item["name"]: item for item in report["products"][0]["checks"]}
-    assert checks["approval_gate"]["ok"] is False
-    assert checks["broker_constructed"]["detail"] == {
-        "skipped": True,
-        "reason": "prerequisite_checks_failed",
-    }
+    assert "approval_gate" not in checks
+    assert checks["broker_constructed"]["ok"] is True
 
 
 def test_preflight_rejects_malformed_strategy_artifact_before_broker(monkeypatch, tmp_path):
@@ -196,8 +221,6 @@ def test_preflight_rejects_malformed_strategy_artifact_before_broker(monkeypatch
     checks = {item["name"]: item for item in report["products"][0]["checks"]}
     assert checks["strategy_fingerprints"]["ok"] is False
     assert "must be a JSON object" in checks["strategy_fingerprints"]["error"]
-    assert checks["approval_gate"]["ok"] is False
-    assert "must be a JSON object" in checks["approval_gate"]["error"]
     assert checks["broker_constructed"]["detail"] == {
         "skipped": True,
         "reason": "prerequisite_checks_failed",
@@ -223,8 +246,6 @@ def test_preflight_rejects_invalid_json_strategy_artifact_before_broker(monkeypa
     assert "must be valid JSON" in checks["strategy_fingerprints"]["error"]
     assert checks["strategy_policy"]["ok"] is False
     assert "must be valid JSON" in checks["strategy_policy"]["error"]
-    assert checks["approval_gate"]["ok"] is False
-    assert "must be valid JSON" in checks["approval_gate"]["error"]
     assert checks["broker_constructed"]["detail"] == {
         "skipped": True,
         "reason": "prerequisite_checks_failed",
@@ -583,12 +604,22 @@ def test_preflight_connect_reads_exchange(monkeypatch, tmp_path):
         "name": "broker_open_orders_empty",
         "ok": True,
         "detail": {
-            "symbol": "BTCUSDT",
+            "scope": "whole_account",
+            "configured_symbol": "BTCUSDT",
             "regular": {"count": 0, "orders": []},
             "conditional": {"count": 0, "orders": []},
         },
     }
-    assert checks["broker_position_flat"]["ok"] is True
+    assert checks["broker_position_flat"] == {
+        "name": "broker_position_flat",
+        "ok": True,
+        "detail": {
+            "scope": "whole_account",
+            "configured_symbol": "BTCUSDT",
+            "count": 0,
+            "positions": [],
+        },
+    }
 
 
 def test_preflight_connect_rejects_hedge_position_mode(monkeypatch, tmp_path):
@@ -719,6 +750,74 @@ def test_preflight_connect_fails_closed_when_open_order_query_is_unavailable(
     assert "inventory endpoint unavailable" in checks["broker_open_orders_empty"]["error"]
 
 
+def test_preflight_blocks_other_symbol_account_exposure_and_orders(monkeypatch, tmp_path):
+    set_live_env(monkeypatch)
+    artifact = tmp_path / "active.json"
+    strategy_artifact(artifact)
+    active_product = product(tmp_path)
+    cfg = AutopilotConfig(products=[active_product])
+    broker = FakeBroker()
+    broker.list_account_open_orders = (
+        lambda *, conditional: (
+            OpenOrderIdentity(
+                symbol="ETH/USDT:USDT",
+                order_id="eth-order-1",
+                client_id="manual-eth-1",
+                status="open",
+                conditional=conditional,
+            ),
+        )
+        if not conditional
+        else ()
+    )
+    broker.list_account_futures_positions = lambda: (
+        FuturesPositionIdentity(
+            symbol="ETH/USDT:USDT",
+            qty=-1.0,
+            avg_price=2500.0,
+        ),
+    )
+
+    report = run_preflight(
+        cfg,
+        product_name="active_income",
+        assume_live=True,
+        connect=True,
+        broker_builder=lambda product: broker,
+    )
+
+    checks = {item["name"]: item for item in report["products"][0]["checks"]}
+    assert report["ok"] is False
+    assert (
+        checks["broker_open_orders_empty"]["detail"]["regular"]["orders"][0]["symbol"]
+        == "ETH/USDT:USDT"
+    )
+    assert checks["broker_position_flat"]["detail"]["positions"][0]["symbol"] == ("ETH/USDT:USDT")
+
+
+def test_preflight_fails_closed_on_malformed_account_position_inventory(monkeypatch, tmp_path):
+    set_live_env(monkeypatch)
+    artifact = tmp_path / "active.json"
+    strategy_artifact(artifact)
+    active_product = product(tmp_path)
+    broker = FakeBroker()
+    broker.list_account_futures_positions = lambda: ({"symbol": "ETHUSDT", "qty": 1},)
+
+    report = run_preflight(
+        AutopilotConfig(products=[active_product]),
+        product_name="active_income",
+        assume_live=True,
+        connect=True,
+        broker_builder=lambda product: broker,
+    )
+
+    check = next(
+        item for item in report["products"][0]["checks"] if item["name"] == "broker_position_flat"
+    )
+    assert check["ok"] is False
+    assert "FuturesPositionIdentity" in check["error"]
+
+
 def test_preflight_connect_rejects_active_income_broker_without_native_stops(
     monkeypatch,
     tmp_path,
@@ -773,8 +872,10 @@ def test_preflight_connect_rejects_non_flat_active_income_position(monkeypatch, 
     assert report["ok"] is False
     assert checks["exchange_read_connectivity"]["ok"] is True
     assert checks["broker_position_flat"]["ok"] is False
-    assert checks["broker_position_flat"]["detail"]["position_qty"] == pytest.approx(0.5)
-    assert "must be flat" in checks["broker_position_flat"]["error"]
+    detail = checks["broker_position_flat"]["detail"]
+    assert detail["scope"] == "whole_account"
+    assert detail["positions"][0]["qty"] == pytest.approx(0.5)
+    assert "non-flat position" in checks["broker_position_flat"]["error"]
 
 
 def test_preflight_connect_allows_existing_btc_accumulation_spot_position(monkeypatch, tmp_path):

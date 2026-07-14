@@ -69,7 +69,10 @@ def test_fresh_generation_is_typed_bounded_and_diverse() -> None:
         len(idea.hypothesis.all_predicates()) <= GrammarLimits().max_total_predicates
         for idea in ideas
     )
-    assert len({frozenset(structural_tokens(idea.hypothesis, include_values=True)) for idea in ideas}) >= 25
+    assert (
+        len({frozenset(structural_tokens(idea.hypothesis, include_values=True)) for idea in ideas})
+        >= 25
+    )
     assert {idea.hypothesis.direction for idea in ideas} == {"long", "short"}
 
 
@@ -97,7 +100,10 @@ def test_recursive_mutation_changes_behavior_and_retains_parent() -> None:
         for seed in range(20, 40)
     ]
 
-    assert any(structural_tokens(item.hypothesis, include_values=True) != parent_tokens for item in descendants)
+    assert any(
+        structural_tokens(item.hypothesis, include_values=True) != parent_tokens
+        for item in descendants
+    )
     assert all(item.parent_hashes == ("sha256:parent",) for item in descendants)
     assert all(item.generation_method == "recursive_mutation" for item in descendants)
 

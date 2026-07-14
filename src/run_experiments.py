@@ -1,12 +1,12 @@
 import argparse
 import json
 import logging
-import os
 from collections.abc import Iterable
 from pathlib import Path
 
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/trading-bot-matplotlib")
-os.environ.setdefault("XDG_CACHE_HOME", "/tmp/trading-bot-cache")
+from src.cache_env import configure_private_process_cache
+
+configure_private_process_cache()
 
 import matplotlib
 
@@ -450,9 +450,7 @@ def write_summary_markdown(all_metrics: list[dict[str, object]], path: Path) -> 
     ]
     for metrics in all_metrics:
         lines.append(
-            "| "
-            + " | ".join(_format_metric(metrics.get(header)) for header in headers)
-            + " |"
+            "| " + " | ".join(_format_metric(metrics.get(header)) for header in headers) + " |"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

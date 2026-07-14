@@ -16,6 +16,7 @@ Safety rails — a live order is only sent when **all** of these hold:
 * futures reduce-only orders are <= the current broker position on the matching side
 * futures margin mode is explicitly set to isolated
 * futures leverage is explicitly set to ``config.max_futures_leverage``
+* futures margin mode, leverage, and position mode are read back before every entry
 Otherwise placing an order raises, so a misconfigured run can't trade real size.
 Set ``EXCHANGE_TESTNET=1`` to route everything to the exchange sandbox where the
 exchange supports one.
@@ -30,6 +31,7 @@ import re
 from src.execution.broker import (
     Broker,
     Fill,
+    FuturesPositionIdentity,
     OpenOrderIdentity,
     Order,
     OrderSide,
@@ -44,6 +46,10 @@ LOGGER = logging.getLogger(__name__)
 QUOTE_ASSETS = ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH")
 CLIENT_ORDER_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,36}$")
 NATIVE_STOP_CCXT_VERSION = "4.5.64"
+BINANCE_MARGIN_MODE_ALREADY_SET_CODE = -4046
+BINANCE_MARGIN_MODE_ALREADY_SET_MESSAGE = "No need to change margin type."
+BINANCE_POSITION_MODE_ALREADY_SET_CODE = -4059
+BINANCE_POSITION_MODE_ALREADY_SET_MESSAGE = "No need to change position side."
 
 
 class CcxtBroker(Broker):
@@ -55,9 +61,6 @@ class CcxtBroker(Broker):
         )
         self._client = self._build_client()
         self._precision_markets: dict[str, dict] = {}
-        self._leverage_set_symbols: set[str] = set()
-        self._margin_mode_set_symbols: set[str] = set()
-        self._one_way_mode_set_symbols: set[str] = set()
 
     @property
     def account_fingerprint(self) -> str:
@@ -128,10 +131,15 @@ class CcxtBroker(Broker):
                     "Live Binance USD-M client lacks required position-mode method(s): "
                     f"{', '.join(missing_position_mode_methods)}."
                 )
-            if not callable(getattr(client, "fetch_open_orders", None)):
+            missing_inventory_methods = [
+                name
+                for name in ("fetch_open_orders", "fetch_positions")
+                if not callable(getattr(client, name, None))
+            ]
+            if missing_inventory_methods:
                 raise RuntimeError(
-                    "Live Binance USD-M client lacks fetch_open_orders; open-order "
-                    "inventory cannot be verified."
+                    "Live Binance USD-M client lacks whole-account inventory method(s): "
+                    f"{', '.join(missing_inventory_methods)}."
                 )
         return client
 
@@ -344,10 +352,7 @@ class CcxtBroker(Broker):
         margin_mode = str(self.config.futures_margin_mode).lower()
         if margin_mode != "isolated":
             raise ValueError("FUTURES_MARGIN_MODE must be 'isolated' for live futures entries.")
-        configured = getattr(self, "_margin_mode_set_symbols", set())
-        if client_symbol in configured:
-            return
-        if not hasattr(self._client, "set_margin_mode"):
+        if not callable(getattr(self._client, "set_margin_mode", None)):
             raise RuntimeError(
                 "Refusing futures order: ccxt client cannot set isolated margin mode, "
                 "so account margin risk cannot be bounded."
@@ -355,14 +360,14 @@ class CcxtBroker(Broker):
         try:
             self._client.set_margin_mode(margin_mode, client_symbol)
         except Exception as exc:
-            message = str(exc).lower()
-            already_set = "no need to change margin type" in message or "already" in message
-            if not already_set:
+            if not self._is_exact_binance_already_set_error(
+                exc,
+                code=BINANCE_MARGIN_MODE_ALREADY_SET_CODE,
+                message=BINANCE_MARGIN_MODE_ALREADY_SET_MESSAGE,
+            ):
                 raise RuntimeError(
                     f"Refusing futures order: could not set isolated margin mode: {exc}"
                 ) from exc
-        configured.add(client_symbol)
-        self._margin_mode_set_symbols = configured
 
     def _ensure_futures_position_mode(self, symbol: str) -> None:
         if (
@@ -371,9 +376,6 @@ class CcxtBroker(Broker):
         ):
             return
         client_symbol = self._ccxt_symbol(symbol)
-        configured = getattr(self, "_one_way_mode_set_symbols", set())
-        if client_symbol in configured:
-            return
         if not callable(getattr(self._client, "set_position_mode", None)):
             raise RuntimeError(
                 "Refusing Binance USD-M entry: ccxt client cannot set one-way position mode."
@@ -381,9 +383,11 @@ class CcxtBroker(Broker):
         try:
             self._client.set_position_mode(False, client_symbol)
         except Exception as exc:
-            message = str(exc).lower()
-            already_set = "no need to change position side" in message or "already" in message
-            if not already_set:
+            if not self._is_exact_binance_already_set_error(
+                exc,
+                code=BINANCE_POSITION_MODE_ALREADY_SET_CODE,
+                message=BINANCE_POSITION_MODE_ALREADY_SET_MESSAGE,
+            ):
                 raise RuntimeError(
                     f"Refusing Binance USD-M entry: could not set one-way position mode: {exc}"
                 ) from exc
@@ -391,8 +395,32 @@ class CcxtBroker(Broker):
             raise RuntimeError(
                 "Refusing Binance USD-M entry: exchange did not confirm one-way position mode."
             )
-        configured.add(client_symbol)
-        self._one_way_mode_set_symbols = configured
+
+    def _is_exact_binance_already_set_error(
+        self,
+        exc: Exception,
+        *,
+        code: int,
+        message: str,
+    ) -> bool:
+        """Accept only Binance's documented idempotent-setting responses."""
+
+        if str(self.config.exchange).strip().lower() != "binanceusdm":
+            return False
+        exception_code = getattr(exc, "code", None)
+        try:
+            if exception_code is not None and int(exception_code) == code:
+                return True
+        except (TypeError, ValueError):
+            pass
+        raw = str(exc).strip()
+        code_match = re.search(r'["\']?code["\']?\s*[:=]\s*["\']?(-?\d+)', raw)
+        if code_match is not None and int(code_match.group(1)) == code:
+            return True
+        if raw == message:
+            return True
+        message_match = re.search(r'["\']msg["\']\s*:\s*["\']([^"\']*)["\']', raw)
+        return message_match is not None and message_match.group(1) == message
 
     def verify_one_way_position_mode(self, symbol: str) -> bool:
         """Read Binance USD-M position mode without changing account settings."""
@@ -427,17 +455,76 @@ class CcxtBroker(Broker):
         leverage = int(self.config.max_futures_leverage)
         if not (1 <= leverage <= 3):
             raise ValueError("MAX_FUTURES_LEVERAGE must be between 1 and 3.")
-        configured = getattr(self, "_leverage_set_symbols", set())
-        if client_symbol in configured:
-            return
-        if not hasattr(self._client, "set_leverage"):
+        if not callable(getattr(self._client, "set_leverage", None)):
             raise RuntimeError(
                 "Refusing futures order: ccxt client cannot set leverage, "
                 "so account leverage cannot be bounded."
             )
         self._client.set_leverage(leverage, client_symbol)
-        configured.add(client_symbol)
-        self._leverage_set_symbols = configured
+
+    def _verify_futures_risk_settings(self, symbol: str) -> None:
+        """Read back the per-symbol isolated-margin and leverage settings."""
+
+        if self.config.market_type != "futures":
+            return
+        fetch_positions = getattr(self._client, "fetch_positions", None)
+        if not callable(fetch_positions):
+            raise RuntimeError(
+                "Refusing futures entry: ccxt client cannot read back margin and leverage settings."
+            )
+        client_symbol = self._ccxt_symbol(symbol)
+        try:
+            positions = fetch_positions([client_symbol])
+        except Exception as exc:
+            raise RuntimeError(
+                f"Refusing futures entry: could not read back margin and leverage settings: {exc}"
+            ) from exc
+        if not isinstance(positions, list):
+            raise RuntimeError("Refusing futures entry: position-settings response must be a list.")
+        matches: list[dict] = []
+        for position in positions:
+            if not isinstance(position, dict):
+                continue
+            info = position.get("info") if isinstance(position.get("info"), dict) else {}
+            reported_symbol = position.get("symbol") or info.get("symbol")
+            if (
+                reported_symbol == client_symbol
+                or str(reported_symbol or "").upper() == symbol.upper()
+            ):
+                matches.append(position)
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Refusing futures entry: exchange did not return exactly one matching "
+                f"position-settings record for {client_symbol}."
+            )
+        position = matches[0]
+        info = position.get("info") if isinstance(position.get("info"), dict) else {}
+        margin_mode = str(position.get("marginMode") or info.get("marginType") or "").lower()
+        if margin_mode != "isolated":
+            raise RuntimeError(
+                "Refusing futures entry: exchange did not confirm isolated margin mode."
+            )
+        raw_leverage = position.get("leverage")
+        if raw_leverage is None:
+            raw_leverage = info.get("leverage")
+        if isinstance(raw_leverage, bool):
+            raise RuntimeError("Refusing futures entry: exchange leverage readback is not numeric.")
+        try:
+            leverage = self._finite_number(
+                raw_leverage,
+                "Futures leverage readback",
+                positive=True,
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Refusing futures entry: exchange leverage readback is invalid: {exc}"
+            ) from exc
+        expected_leverage = int(self.config.max_futures_leverage)
+        if leverage != expected_leverage:
+            raise RuntimeError(
+                "Refusing futures entry: exchange leverage readback "
+                f"{leverage:g} does not match configured leverage {expected_leverage}."
+            )
 
     def place_order(self, order: Order) -> Fill:
         if not math.isfinite(float(order.qty)) or order.qty <= 0:
@@ -484,6 +571,7 @@ class CcxtBroker(Broker):
             self._ensure_futures_margin_mode(normalized_order.symbol)
             self._ensure_futures_leverage(normalized_order.symbol)
             self._ensure_futures_position_mode(normalized_order.symbol)
+            self._verify_futures_risk_settings(normalized_order.symbol)
 
         client_symbol = self._ccxt_symbol(normalized_order.symbol)
         params = {}
@@ -572,6 +660,23 @@ class CcxtBroker(Broker):
         This method is read-only and never cancels an order.
         """
 
+        return self._list_open_orders(symbol=symbol, conditional=conditional)
+
+    def list_account_open_orders(
+        self,
+        *,
+        conditional: bool,
+    ) -> tuple[OpenOrderIdentity, ...]:
+        """Read every regular or conditional order in the USD-M account."""
+
+        return self._list_open_orders(symbol=None, conditional=conditional)
+
+    def _list_open_orders(
+        self,
+        *,
+        symbol: str | None,
+        conditional: bool,
+    ) -> tuple[OpenOrderIdentity, ...]:
         if (
             self.config.market_type != "futures"
             or str(self.config.exchange).lower() != "binanceusdm"
@@ -584,14 +689,15 @@ class CcxtBroker(Broker):
             raise RuntimeError(
                 "ccxt client cannot fetch open orders; refusing to assume the inventory is empty."
             )
-        client_symbol = self._ccxt_symbol(symbol)
+        client_symbol = self._ccxt_symbol(symbol) if symbol is not None else None
         params = {"trigger": True} if conditional else {}
         try:
             payload = fetch_open_orders(client_symbol, params=params)
         except Exception as exc:
             order_kind = "conditional" if conditional else "regular"
             raise RuntimeError(
-                f"Could not query {order_kind} open orders for {client_symbol}: {exc}"
+                f"Could not query {order_kind} open orders for "
+                f"{client_symbol or 'the whole account'}: {exc}"
             ) from exc
         if not isinstance(payload, list):
             raise ValueError(
@@ -600,7 +706,7 @@ class CcxtBroker(Broker):
             )
 
         orders: list[OpenOrderIdentity] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, str]] = set()
         for index, item in enumerate(payload):
             order = self._parse_open_order_identity(
                 item,
@@ -608,14 +714,110 @@ class CcxtBroker(Broker):
                 conditional=conditional,
                 index=index,
             )
-            identity = (order.order_id, order.client_id)
+            identity = (order.symbol, order.order_id, order.client_id)
             if identity in seen:
                 raise ValueError(
                     f"ccxt open-order response contains duplicate identity {identity!r}. Refusing."
                 )
             seen.add(identity)
             orders.append(order)
-        return tuple(sorted(orders, key=lambda order: (order.order_id, order.client_id)))
+        return tuple(
+            sorted(orders, key=lambda order: (order.symbol, order.order_id, order.client_id))
+        )
+
+    def list_account_futures_positions(self) -> tuple[FuturesPositionIdentity, ...]:
+        """Read and sanitize every non-flat Binance USD-M account position."""
+
+        if (
+            self.config.market_type != "futures"
+            or str(self.config.exchange).lower() != "binanceusdm"
+        ):
+            raise RuntimeError(
+                "Whole-account position verification is only validated for Binance USD-M futures."
+            )
+        fetch_positions = getattr(self._client, "fetch_positions", None)
+        if not callable(fetch_positions):
+            raise RuntimeError(
+                "ccxt client cannot fetch account positions; refusing to assume the account is flat."
+            )
+        try:
+            # ``None`` is the CCXT sentinel for an unfiltered account read.
+            # Passing it explicitly also avoids adapters/test doubles silently
+            # interpreting an omitted argument as a configured-symbol query.
+            payload = fetch_positions(None)
+        except Exception as exc:
+            raise RuntimeError(f"Could not query whole-account futures positions: {exc}") from exc
+        if not isinstance(payload, list):
+            raise ValueError(
+                "ccxt fetch_positions response must be a list. Refusing to assume "
+                "the account is flat."
+            )
+
+        positions: list[FuturesPositionIdentity] = []
+        seen_symbols: set[str] = set()
+        for index, item in enumerate(payload):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"ccxt position response item {index} must be an object. Refusing."
+                )
+            info_value = item.get("info")
+            if info_value is not None and not isinstance(info_value, dict):
+                raise ValueError(
+                    f"ccxt position response item {index} info must be an object. Refusing."
+                )
+            info = info_value or {}
+            raw_symbol = self._payload_value(item, info, "symbol")
+            symbol = self._canonical_inventory_symbol(
+                raw_symbol,
+                label=f"Position item {index} symbol",
+            )
+            if symbol in seen_symbols:
+                raise ValueError(
+                    f"ccxt position response contains duplicate symbol {symbol!r}. Refusing."
+                )
+            seen_symbols.add(symbol)
+            raw_contracts = self._payload_value(item, info, "contracts", "positionAmt")
+            contracts = self._finite_number(
+                raw_contracts,
+                f"Position item {index} contracts",
+                non_negative=True,
+            )
+            if contracts == 0:
+                continue
+            raw_side = self._sanitized_open_order_field(
+                self._payload_value(item, info, "side", "positionSide"),
+                label=f"Position item {index} side",
+            ).lower()
+            if raw_side == "long":
+                qty = contracts
+            elif raw_side == "short":
+                qty = -contracts
+            elif raw_side == "both":
+                signed_amount = self._finite_number(
+                    info.get("positionAmt"),
+                    f"Position item {index} signed amount",
+                )
+                quantity_tolerance = max(contracts * 1e-9, 1e-12)
+                if signed_amount == 0 or abs(abs(signed_amount) - contracts) > quantity_tolerance:
+                    raise ValueError(
+                        f"Position item {index} one-way quantity evidence is inconsistent. Refusing."
+                    )
+                qty = signed_amount
+            else:
+                raise ValueError(f"Position item {index} side {raw_side!r} is invalid. Refusing.")
+            entry_price = self._finite_number(
+                self._payload_value(item, info, "entryPrice"),
+                f"Position item {index} entry price",
+                positive=True,
+            )
+            positions.append(
+                FuturesPositionIdentity(
+                    symbol=symbol,
+                    qty=qty,
+                    avg_price=entry_price,
+                )
+            )
+        return tuple(sorted(positions, key=lambda position: position.symbol))
 
     @staticmethod
     def _sanitized_open_order_field(value, *, label: str) -> str:
@@ -630,7 +832,7 @@ class CcxtBroker(Broker):
         self,
         payload,
         *,
-        requested_symbol: str,
+        requested_symbol: str | None,
         conditional: bool,
         index: int,
     ) -> OpenOrderIdentity:
@@ -643,7 +845,13 @@ class CcxtBroker(Broker):
             )
         info = info_value or {}
         symbol_value = self._payload_value(payload, info, "symbol")
-        if symbol_value is None or not self._symbols_match(str(symbol_value), requested_symbol):
+        parsed_symbol = self._canonical_inventory_symbol(
+            symbol_value,
+            label=f"Open order item {index} symbol",
+        )
+        if requested_symbol is not None and not self._symbols_match(
+            parsed_symbol, requested_symbol
+        ):
             raise ValueError(
                 f"Open order symbol {symbol_value!r} does not match {requested_symbol!r}. Refusing."
             )
@@ -672,7 +880,7 @@ class CcxtBroker(Broker):
         else:
             raise ValueError(f"Open order status {raw_status!r} is not an active status. Refusing.")
         return OpenOrderIdentity(
-            symbol=requested_symbol,
+            symbol=requested_symbol or parsed_symbol,
             order_id=order_id,
             client_id=client_id,
             status=status,
@@ -685,11 +893,11 @@ class CcxtBroker(Broker):
             or str(self.config.exchange).lower() != "binanceusdm"
         ):
             return
-        regular = self.list_open_orders(symbol, conditional=False)
-        conditional = self.list_open_orders(symbol, conditional=True)
+        regular = self.list_account_open_orders(conditional=False)
+        conditional = self.list_account_open_orders(conditional=True)
         if regular or conditional:
             raise RuntimeError(
-                f"Refusing Binance USD-M entry: account has outstanding {symbol} "
+                "Refusing Binance USD-M entry: dedicated account has outstanding "
                 f"orders (regular={len(regular)}, conditional={len(conditional)})."
             )
 
@@ -698,11 +906,13 @@ class CcxtBroker(Broker):
 
         if self.config.market_type != "futures":
             return
-        position = self.get_position(symbol)
-        if not position.is_flat:
+        positions = self.list_account_futures_positions()
+        if positions:
+            detail = ", ".join(f"{position.symbol}={position.qty:g}" for position in positions)
+            signed_qty = f" signed qty {positions[0].qty:g};" if len(positions) == 1 else ""
             raise RuntimeError(
-                f"Refusing futures entry: account is no longer flat for {symbol}; "
-                f"broker reports signed qty {float(position.qty):g}."
+                f"Refusing futures entry: dedicated account is not flat;{signed_qty} "
+                f"broker reports {detail}."
             )
 
     def place_protective_stop(
@@ -1265,6 +1475,14 @@ class CcxtBroker(Broker):
         if left_settlement is not None and right_settlement is not None:
             return left_settlement == right_settlement
         return True
+
+    def _canonical_inventory_symbol(self, value, *, label: str) -> str:
+        raw = self._sanitized_open_order_field(value, label=label)
+        try:
+            base, quote, settlement = self._split_symbol(raw)
+        except ValueError as exc:
+            raise ValueError(f"{label} is invalid: {exc} Refusing.") from exc
+        return f"{base}/{quote}:{settlement or quote}"
 
     def _ccxt_symbol(self, symbol: str) -> str:
         base, quote, settlement = self._split_symbol(symbol)

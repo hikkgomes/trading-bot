@@ -41,6 +41,7 @@ BROKER_ACCOUNT_RECONCILIATION_FIELDS = (
     "broker_exit_balance",
     "broker_balance_return",
 )
+_CANDIDATE_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 def utc_now() -> str:
@@ -93,6 +94,13 @@ def _experiment_memory_status(path: Path) -> dict[str, Any]:
     }
     if not path.exists():
         return status
+    if path.is_symlink():
+        status.update(
+            status="error",
+            ok=False,
+            error=f"experiment memory must not be a symlink: {path}",
+        )
+        return status
     try:
         initial_stat = path.stat()
         cache_key = (
@@ -105,10 +113,7 @@ def _experiment_memory_status(path: Path) -> dict[str, Any]:
         status.update(status="error", ok=False, error=f"{type(exc).__name__}: {exc}")
         return status
     global _EXPERIMENT_MEMORY_CACHE_KEY, _EXPERIMENT_MEMORY_CACHE_VALUE
-    if (
-        cache_key == _EXPERIMENT_MEMORY_CACHE_KEY
-        and _EXPERIMENT_MEMORY_CACHE_VALUE is not None
-    ):
+    if cache_key == _EXPERIMENT_MEMORY_CACHE_KEY and _EXPERIMENT_MEMORY_CACHE_VALUE is not None:
         return copy.deepcopy(_EXPERIMENT_MEMORY_CACHE_VALUE)
     try:
         with ExperimentMemory(path, timeout_seconds=2.0, deep_on_open=False) as memory:
@@ -176,7 +181,9 @@ def _runtime_shape_errors(
 ) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []
 
-    def add_collection_errors(name: str, path: Path, payload: dict[str, Any], key: str, expected: type) -> None:
+    def add_collection_errors(
+        name: str, path: Path, payload: dict[str, Any], key: str, expected: type
+    ) -> None:
         if payload.get("_load_error") or key not in payload:
             return
         value = payload.get(key)
@@ -211,7 +218,9 @@ def _runtime_shape_errors(
     add_collection_errors("status", config.status_file, status, "products", list)
     add_collection_errors("status", config.status_file, status, "jobs", list)
     add_collection_errors("job_state", config.job_state_file, job_state, "jobs", dict)
-    add_collection_errors("approval_ledger", config.approval_ledger, approval_ledger, "approvals", dict)
+    add_collection_errors(
+        "approval_ledger", config.approval_ledger, approval_ledger, "approvals", dict
+    )
     return errors
 
 
@@ -234,7 +243,9 @@ def _parse_timestamp(value: Any) -> float | None:
     return parsed.timestamp()
 
 
-def _status_heartbeat(status: dict[str, Any], config: AutopilotConfig, now_ts: float | None = None) -> dict[str, Any]:
+def _status_heartbeat(
+    status: dict[str, Any], config: AutopilotConfig, now_ts: float | None = None
+) -> dict[str, Any]:
     generated_at = status.get("generated_at")
     generated_ts = _parse_timestamp(generated_at)
     now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.UTC).timestamp()
@@ -296,9 +307,15 @@ def _trade_summary(path: Path) -> dict[str, Any]:
                     )
                 else:
                     seen_exit_event_ids.add(exit_event_id)
-            net_return = _trade_float(row, "net_return", line_number, summary, invalid_lines, required=True)
-            sized_return = _trade_float(row, "sized_return", line_number, summary, invalid_lines, required=True)
-            broker_fields_present = any((row.get(field) or "") != "" for field in BROKER_EXIT_NUMERIC_FIELDS)
+            net_return = _trade_float(
+                row, "net_return", line_number, summary, invalid_lines, required=True
+            )
+            sized_return = _trade_float(
+                row, "sized_return", line_number, summary, invalid_lines, required=True
+            )
+            broker_fields_present = any(
+                (row.get(field) or "") != "" for field in BROKER_EXIT_NUMERIC_FIELDS
+            )
             if broker_fields_present:
                 _trade_float(
                     row,
@@ -328,8 +345,7 @@ def _trade_summary(path: Path) -> dict[str, Any]:
                     non_negative=True,
                 )
             account_reconciliation_present = any(
-                (row.get(field) or "") != ""
-                for field in BROKER_ACCOUNT_RECONCILIATION_FIELDS
+                (row.get(field) or "") != "" for field in BROKER_ACCOUNT_RECONCILIATION_FIELDS
             )
             if account_reconciliation_present:
                 _trade_float(
@@ -413,11 +429,7 @@ def _trade_float(
             }
         )
         return 0.0
-    if (
-        not math.isfinite(parsed)
-        or (positive and parsed <= 0)
-        or (non_negative and parsed < 0)
-    ):
+    if not math.isfinite(parsed) or (positive and parsed <= 0) or (non_negative and parsed < 0):
         invalid_lines.add(line_number)
         summary["numeric_errors"].append(
             {
@@ -460,7 +472,9 @@ def _float_report_value(value: Any, *, field: str, invalid_reasons: list[str]) -
     return parsed
 
 
-def _int_report_value(value: Any, *, field: str, invalid_reasons: list[str], default: int = 0) -> int:
+def _int_report_value(
+    value: Any, *, field: str, invalid_reasons: list[str], default: int = 0
+) -> int:
     if value is None:
         return default
     try:
@@ -501,12 +515,18 @@ def _scheduled_job_summary(
             try:
                 parsed_started_ts = float(last_started_ts)
             except (TypeError, ValueError):
-                invalid_state_reasons.append(f"invalid job state last_started_ts: {last_started_ts!r}")
+                invalid_state_reasons.append(
+                    f"invalid job state last_started_ts: {last_started_ts!r}"
+                )
             else:
                 if not math.isfinite(parsed_started_ts) or parsed_started_ts < 0:
-                    invalid_state_reasons.append(f"invalid job state last_started_ts: {last_started_ts!r}")
+                    invalid_state_reasons.append(
+                        f"invalid job state last_started_ts: {last_started_ts!r}"
+                    )
                 elif parsed_started_ts > now_ts:
-                    invalid_state_reasons.append(f"invalid job state future last_started_ts: {last_started_ts!r}")
+                    invalid_state_reasons.append(
+                        f"invalid job state future last_started_ts: {last_started_ts!r}"
+                    )
                 else:
                     age_seconds = now_ts - parsed_started_ts
         last_duration_seconds = _float_report_value(
@@ -541,7 +561,9 @@ def _scheduled_job_summary(
             structured_errors = []
         if not job.enabled:
             status = "disabled"
-        elif entry.get("last_deferred_reason") == "cycle_job_limit" and job_due(job, state, now=now_ts):
+        elif entry.get("last_deferred_reason") == "cycle_job_limit" and job_due(
+            job, state, now=now_ts
+        ):
             status = "deferred"
         elif not entry:
             status = "never_run"
@@ -601,7 +623,7 @@ def _command_value(command: list[str], flag: str) -> str | None:
     prefix = f"{flag}="
     for part in command:
         if part.startswith(prefix):
-            value = part[len(prefix):]
+            value = part[len(prefix) :]
             return value or None
     try:
         index = command.index(flag)
@@ -614,7 +636,316 @@ def _command_value(command: list[str], flag: str) -> str | None:
     return None if value.startswith("--") else value
 
 
-def _promotion_review_summaries(config: AutopilotConfig, *, now_ts: float | None = None) -> list[dict[str, Any]]:
+def _candidate_paper_status(
+    config: AutopilotConfig,
+    *,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Return a bounded status view for isolated staged-candidate paper trading."""
+
+    now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.UTC).timestamp()
+    candidate_jobs = [
+        job
+        for job in config.jobs
+        if job.name == "candidate_paper_cycle" or "src.autopilot.candidate_paper" in job.command
+    ]
+    if not candidate_jobs and not config.candidate_paper_enabled:
+        return {
+            "configured": False,
+            "enabled": False,
+            "status": "not_configured",
+            "ok": None,
+            "path": None,
+            "exists": False,
+            "fresh": None,
+            "products": [],
+            "open_positions": 0,
+            "activation_ready_products": [],
+            "drawdown_halted_products": [],
+            "errors": [],
+        }
+
+    job = (
+        next((item for item in candidate_jobs if item.enabled), candidate_jobs[0])
+        if candidate_jobs
+        else None
+    )
+    if job is not None:
+        output = _command_value(job.command, "--output") or str(config.candidate_paper_status_file)
+        path = Path(output)
+        if not path.is_absolute():
+            path = job.working_dir / path
+        enabled = job.enabled
+        job_name = job.name
+        cadence_seconds = float(job.cadence_seconds)
+        timeout_seconds = float(job.timeout_seconds)
+    else:
+        path = config.candidate_paper_status_file
+        enabled = config.candidate_paper_enabled
+        job_name = "candidate_paper_timer"
+        cadence_seconds = float(config.candidate_paper_cadence_seconds)
+        timeout_seconds = float(config.candidate_paper_timeout_seconds)
+    max_age_seconds = max(
+        cadence_seconds * 2.0,
+        cadence_seconds + timeout_seconds,
+        120.0,
+    )
+    status: dict[str, Any] = {
+        "configured": True,
+        "enabled": enabled,
+        "job": job_name,
+        "path": str(path),
+        "exists": path.exists(),
+        "status": "missing",
+        "ok": None,
+        "generated_at": None,
+        "age_seconds": None,
+        "max_age_seconds": round(max_age_seconds, 3),
+        "fresh": None,
+        "reason": "status_file_missing",
+        "products": [],
+        "open_positions": 0,
+        "activation_ready_products": [],
+        "drawdown_halted_products": [],
+        "errors": [],
+    }
+    if not path.exists():
+        return status
+    if path.is_symlink():
+        status.update(
+            status="read_error",
+            ok=False,
+            reason="status_file_symlink",
+            error="candidate paper status must not be a symlink",
+            errors=[
+                {
+                    "scope": "status_file",
+                    "path": str(path),
+                    "reason": "symlink",
+                }
+            ],
+        )
+        return status
+
+    payload = _load_json(path)
+    load_error = payload.get("_load_error")
+    if isinstance(load_error, dict):
+        status.update(
+            status="read_error",
+            ok=False,
+            reason="status_file_unreadable",
+            error=load_error.get("error"),
+            errors=[{"scope": "status_file", **load_error}],
+        )
+        return status
+
+    errors: list[dict[str, Any]] = []
+    generated_at = payload.get("generated_at")
+    generated_ts = _parse_timestamp(generated_at)
+    age_seconds = None
+    fresh = False
+    freshness_reason = None
+    if generated_ts is None:
+        freshness_reason = "invalid_generated_at"
+        errors.append(
+            {
+                "scope": "status_file",
+                "field": "generated_at",
+                "reason": freshness_reason,
+            }
+        )
+    elif generated_ts > now_ts:
+        freshness_reason = "future_generated_at"
+        errors.append(
+            {
+                "scope": "status_file",
+                "field": "generated_at",
+                "reason": freshness_reason,
+            }
+        )
+    else:
+        age_seconds = now_ts - generated_ts
+        fresh = age_seconds <= max_age_seconds
+        if not fresh:
+            freshness_reason = "stale"
+
+    raw_products = payload.get("products")
+    if not isinstance(raw_products, list):
+        errors.append(
+            {
+                "scope": "status_file",
+                "field": "products",
+                "reason": f"expected list, got {type(raw_products).__name__}",
+            }
+        )
+        raw_products = []
+    products = []
+    open_positions_total = 0
+    activation_ready_products = []
+    drawdown_halted_products = []
+    for index, raw_item in enumerate(raw_products):
+        if not isinstance(raw_item, dict):
+            errors.append(
+                {
+                    "scope": "product",
+                    "index": index,
+                    "reason": f"expected object, got {type(raw_item).__name__}",
+                }
+            )
+            continue
+        product_name = raw_item.get("product")
+        digest = raw_item.get("candidate_digest")
+        digest_valid = None
+        candidate_was_tested = raw_item.get("skipped") is not True
+        if digest is not None:
+            digest_valid = bool(
+                isinstance(digest, str) and _CANDIDATE_DIGEST_PATTERN.fullmatch(digest)
+            )
+            if not digest_valid:
+                errors.append(
+                    {
+                        "scope": "product",
+                        "index": index,
+                        "product": product_name,
+                        "field": "candidate_digest",
+                        "reason": "invalid_sha256_digest",
+                    }
+                )
+        elif candidate_was_tested:
+            digest_valid = False
+            errors.append(
+                {
+                    "scope": "product",
+                    "index": index,
+                    "product": product_name,
+                    "field": "candidate_digest",
+                    "reason": "missing",
+                }
+            )
+
+        raw_open_positions = raw_item.get("open_positions")
+        open_positions = None
+        if raw_open_positions is not None:
+            try:
+                open_positions_float = float(raw_open_positions)
+            except (TypeError, ValueError):
+                open_positions_float = float("nan")
+            if (
+                not math.isfinite(open_positions_float)
+                or open_positions_float < 0
+                or not open_positions_float.is_integer()
+            ):
+                errors.append(
+                    {
+                        "scope": "product",
+                        "index": index,
+                        "product": product_name,
+                        "field": "open_positions",
+                        "reason": "expected_non_negative_integer",
+                    }
+                )
+            else:
+                open_positions = int(open_positions_float)
+                open_positions_total += open_positions
+        elif candidate_was_tested:
+            errors.append(
+                {
+                    "scope": "product",
+                    "index": index,
+                    "product": product_name,
+                    "field": "open_positions",
+                    "reason": "missing",
+                }
+            )
+
+        activation_ready = raw_item.get("candidate_activation_ready") is True
+        if activation_ready and digest_valid is not True:
+            errors.append(
+                {
+                    "scope": "product",
+                    "index": index,
+                    "product": product_name,
+                    "field": "candidate_activation_ready",
+                    "reason": "ready_without_valid_digest",
+                }
+            )
+            activation_ready = False
+        if activation_ready and isinstance(product_name, str):
+            activation_ready_products.append(product_name)
+        drawdown_halted = raw_item.get("drawdown_halted") is True
+        if drawdown_halted and isinstance(product_name, str):
+            drawdown_halted_products.append(product_name)
+        products.append(
+            {
+                "product": product_name,
+                "ok": raw_item.get("ok"),
+                "skipped": raw_item.get("skipped") is True,
+                "reason": raw_item.get("reason"),
+                "error": raw_item.get("error"),
+                "candidate": raw_item.get("candidate"),
+                "candidate_digest": digest,
+                "candidate_digest_valid": digest_valid,
+                "candidate_activation_ready": activation_ready,
+                "open_positions": open_positions,
+                "drawdown_halted": drawdown_halted,
+            }
+        )
+
+    payload_ok = payload.get("ok") is True
+    if payload.get("ok") is not True:
+        errors.append(
+            {
+                "scope": "status_file",
+                "field": "ok",
+                "reason": (
+                    "candidate_paper_cycle_failed"
+                    if payload.get("ok") is False
+                    else "expected_true"
+                ),
+                "error": payload.get("error"),
+            }
+        )
+    product_errors = [
+        {
+            "scope": "product",
+            "index": index,
+            "product": item.get("product"),
+            "reason": "candidate_paper_product_failed",
+            "error": item.get("error"),
+        }
+        for index, item in enumerate(products)
+        if item.get("ok") is not True and item.get("skipped") is not True
+    ]
+    errors.extend(product_errors)
+    status_name = "ready"
+    reason = None
+    if freshness_reason:
+        status_name = "stale" if freshness_reason == "stale" else "invalid"
+        reason = freshness_reason
+    if errors:
+        status_name = "error"
+        reason = "invalid_candidate_paper_status"
+    status.update(
+        status=status_name,
+        ok=payload_ok and fresh and not errors,
+        generated_at=generated_at,
+        age_seconds=round(age_seconds, 3) if age_seconds is not None else None,
+        fresh=fresh,
+        reason=reason,
+        products=products,
+        open_positions=open_positions_total,
+        activation_ready_products=activation_ready_products,
+        drawdown_halted_products=drawdown_halted_products,
+        errors=errors[:20],
+    )
+    if payload.get("error"):
+        status["error"] = payload.get("error")
+    return status
+
+
+def _promotion_review_summaries(
+    config: AutopilotConfig, *, now_ts: float | None = None
+) -> list[dict[str, Any]]:
     now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.UTC).timestamp()
     summaries = []
     for job in config.jobs:
@@ -641,7 +972,9 @@ def _promotion_review_summaries(config: AutopilotConfig, *, now_ts: float | None
                 fresh = age_seconds <= max_age_seconds
                 if not fresh and not reason:
                     reason = "stale"
-        strategies = payload.get("strategies") if isinstance(payload.get("strategies"), list) else []
+        strategies = (
+            payload.get("strategies") if isinstance(payload.get("strategies"), list) else []
+        )
         recommendations: dict[str, int] = {}
         approval_commands = []
         for item in strategies:
@@ -760,7 +1093,9 @@ def _approval_summary(ledger: dict[str, Any]) -> dict[str, Any]:
                 actor=actor,
             )
         )
-        for history_item in entry.get("history", []) if isinstance(entry.get("history"), list) else []:
+        for history_item in (
+            entry.get("history", []) if isinstance(entry.get("history"), list) else []
+        ):
             if not isinstance(history_item, dict):
                 continue
             history_event = str(history_item.get("event") or "changed")
@@ -834,7 +1169,9 @@ def _compact_artifact_payload(
     return compacted
 
 
-def _testnet_rehearsal_status(config: AutopilotConfig, *, now_ts: float | None = None) -> dict[str, Any]:
+def _testnet_rehearsal_status(
+    config: AutopilotConfig, *, now_ts: float | None = None
+) -> dict[str, Any]:
     required_products = [
         product
         for product in config.products
@@ -860,7 +1197,9 @@ def _testnet_rehearsal_status(config: AutopilotConfig, *, now_ts: float | None =
     return status
 
 
-def build_operator_report(config: AutopilotConfig, *, now_ts: float | None = None) -> dict[str, Any]:
+def build_operator_report(
+    config: AutopilotConfig, *, now_ts: float | None = None
+) -> dict[str, Any]:
     status = _load_json(config.status_file)
     approval_ledger = _load_json(config.approval_ledger)
     approval_summary = _approval_summary(approval_ledger)
@@ -875,6 +1214,7 @@ def build_operator_report(config: AutopilotConfig, *, now_ts: float | None = Non
     artifact_hygiene = _load_json(config.artifact_hygiene_file)
     backup_report = _load_json(config.backup_report_file)
     job_state = _load_json(config.job_state_file)
+    candidate_paper = _candidate_paper_status(config, now_ts=now_ts)
     loaded_payloads = {
         "status": status,
         "job_state": job_state,
@@ -891,8 +1231,7 @@ def build_operator_report(config: AutopilotConfig, *, now_ts: float | None = Non
     }
     testnet_rehearsal = _testnet_rehearsal_status(config, now_ts=now_ts)
     product_statuses = {
-        item.get("product", {}).get("name"): item
-        for item in _dict_entries(status.get("products"))
+        item.get("product", {}).get("name"): item for item in _dict_entries(status.get("products"))
     }
     products = []
     for product in config.products:
@@ -950,7 +1289,9 @@ def build_operator_report(config: AutopilotConfig, *, now_ts: float | None = Non
     market_data_by_market = build_market_data_statuses(markets)
     indicator_features_by_market = build_indicator_feature_statuses(
         markets,
-        required_features_by_market=required_indicator_features_by_market(markets, jobs=config.jobs),
+        required_features_by_market=required_indicator_features_by_market(
+            markets, jobs=config.jobs
+        ),
     )
     aggregate_market_data = {
         "ok": all(item.get("ok") for item in market_data_by_market.values()),
@@ -1061,7 +1402,8 @@ def build_operator_report(config: AutopilotConfig, *, now_ts: float | None = Non
         ),
         "ok": status.get("ok"),
         "control": status.get("control", {}),
-        "control_error": status.get("control_error") or (status.get("control") or {}).get("control_error"),
+        "control_error": status.get("control_error")
+        or (status.get("control") or {}).get("control_error"),
         "control_clear": status.get("control_clear", []),
         "unknown_control_selectors": status.get("unknown_control_selectors"),
         "approval_count": approval_summary["total"],
@@ -1085,6 +1427,13 @@ def build_operator_report(config: AutopilotConfig, *, now_ts: float | None = Non
         "promotion_reviews": _promotion_review_summaries(config, now_ts=now_ts),
         "artifact_hygiene": artifact_hygiene,
         "backup_report": backup_report,
+        "backup_schedule": {
+            "enabled": config.backup_enabled,
+            "name": "runtime_backup_timer",
+            "cadence_seconds": config.backup_cadence_seconds,
+            "timeout_seconds": config.backup_timeout_seconds,
+        },
+        "candidate_paper": candidate_paper,
         "testnet_rehearsal": testnet_rehearsal,
         "products": products,
         "scheduled_jobs": _scheduled_job_summary(
@@ -1172,7 +1521,11 @@ def _scheduled_job_structured_errors_detail(job: dict[str, Any]) -> str:
     if not details:
         return ""
     shown_count = len(details)
-    label = str(parsed_count) if parsed_count == shown_count else f"{parsed_count} total, {shown_count} shown"
+    label = (
+        str(parsed_count)
+        if parsed_count == shown_count
+        else f"{parsed_count} total, {shown_count} shown"
+    )
     return f"structured errors ({label}): {'; '.join(details)}"
 
 
@@ -1299,13 +1652,51 @@ def _promotion_reviews_detail(reviews: list[dict[str, Any]]) -> str:
         needs_approval = int(review.get("needs_approval") or 0)
         action = " approval command available" if needs_approval else ""
         if recommendations:
-            rec_detail = ", ".join(f"{key} {value}" for key, value in sorted(recommendations.items()))
+            rec_detail = ", ".join(
+                f"{key} {value}" for key, value in sorted(recommendations.items())
+            )
             parts.append(f"{product}: {status} ({rec_detail}{action})")
         elif review.get("reason"):
             parts.append(f"{product}: {status} ({_truncate(str(review['reason']), 80)})")
         else:
             parts.append(f"{product}: {status}")
     return "; ".join(parts)
+
+
+def _candidate_paper_detail(status: dict[str, Any]) -> str:
+    if status.get("configured") is not True:
+        return "not configured"
+    parts = [
+        f"fresh {_fmt_bool(status.get('fresh'))}",
+        f"age {_fmt_age(status.get('age_seconds'))}",
+        f"open positions {int(status.get('open_positions') or 0)}",
+    ]
+    ready = status.get("activation_ready_products") or []
+    parts.append(f"activation ready {', '.join(map(str, ready)) or 'none'}")
+    halted = status.get("drawdown_halted_products") or []
+    if halted:
+        parts.append(f"drawdown halted {', '.join(map(str, halted))}")
+    products = status.get("products") if isinstance(status.get("products"), list) else []
+    digests = []
+    for product in products:
+        if not isinstance(product, dict) or not product.get("candidate_digest"):
+            continue
+        digest = str(product["candidate_digest"])
+        digest_label = digest.removeprefix("sha256:")[:12]
+        validity = "valid" if product.get("candidate_digest_valid") is True else "invalid"
+        digests.append(f"{product.get('product') or 'unknown'} {digest_label} {validity}")
+    if digests:
+        parts.append("digests " + ", ".join(digests))
+    errors = status.get("errors") if isinstance(status.get("errors"), list) else []
+    if errors:
+        first_error = errors[0] if isinstance(errors[0], dict) else {"reason": str(errors[0])}
+        parts.append(
+            f"errors {len(errors)}, first "
+            f"{_truncate(str(first_error.get('reason') or first_error.get('error') or 'unknown'), 80)}"
+        )
+    if status.get("reason"):
+        parts.append(f"reason {status['reason']}")
+    return ", ".join(parts)
 
 
 def _testnet_rehearsal_detail(status: dict[str, Any] | None) -> str:
@@ -1395,7 +1786,10 @@ def _backup_report_detail(backup: dict[str, Any]) -> str:
         parts.append(
             f"included {int(manifest.get('included_files') or 0)}, "
             f"missing {int(manifest.get('missing_files') or 0)}, "
-            f"skipped {int(manifest.get('skipped_files') or 0)}"
+            f"skipped {int(manifest.get('skipped_files') or 0)}, "
+            f"optional missing {int(manifest.get('optional_missing_files') or 0)}, "
+            f"critical skipped {int(manifest.get('critical_skipped_files') or 0)}, "
+            f"required roles {int(manifest.get('required_recovery_files') or 0)}"
         )
     if verification:
         parts.append(
@@ -1500,8 +1894,7 @@ def _approval_detail(summary: dict[str, Any] | None, fallback_count: int) -> str
         event_at = latest.get("event_at") or "unknown"
         event = latest.get("event") or "changed"
         latest_detail = (
-            f"{event} {strategy_id} {fingerprint} for {product} "
-            f"by {actor} at {event_at}"
+            f"{event} {strategy_id} {fingerprint} for {product} by {actor} at {event_at}"
         )
         reason = latest.get("revocation_reason")
         if reason:
@@ -1677,8 +2070,12 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
         missing = entry.get("missing_features") or []
         if missing:
             missing_feature_details.append(f"{label}: {', '.join(missing)}")
-    feature_detail = "ready" if not missing_feature_details else "missing " + "; ".join(missing_feature_details)
-    lines.append(f"- Indicator features: `{_fmt_bool(indicator_features.get('ok'))}` ({feature_detail})")
+    feature_detail = (
+        "ready" if not missing_feature_details else "missing " + "; ".join(missing_feature_details)
+    )
+    lines.append(
+        f"- Indicator features: `{_fmt_bool(indicator_features.get('ok'))}` ({feature_detail})"
+    )
     regime_data = report.get("regime_data") or {}
     if regime_data.get("datasets"):
         lines.append(
@@ -1705,7 +2102,9 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
     research_cycle = report.get("research_cycle") or {}
     if research_cycle:
         scenario_count = len(research_cycle.get("scenarios") or [])
-        export_count = sum(1 for item in research_cycle.get("exports") or [] if item.get("exported"))
+        export_count = sum(
+            1 for item in research_cycle.get("exports") or [] if item.get("exported")
+        )
         skipped = research_cycle.get("skipped", False)
         summary = research_cycle.get("summary") or {}
         if skipped:
@@ -1724,9 +2123,8 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
             )
             if int(summary.get("coverage_failures") or 0):
                 failed_names = ", ".join(summary.get("coverage_failed_scenarios") or [])
-                detail += (
-                    f", history blockers {summary.get('coverage_failures')}"
-                    + (f" ({_truncate(failed_names, 100)})" if failed_names else "")
+                detail += f", history blockers {summary.get('coverage_failures')}" + (
+                    f" ({_truncate(failed_names, 100)})" if failed_names else ""
                 )
             mutation_effectiveness = summary.get("mutation_effectiveness")
             if isinstance(mutation_effectiveness, dict):
@@ -1752,20 +2150,21 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
             if coverage_detail:
                 detail += f", coverage {coverage_detail}"
         history_coverage = research_cycle.get("history_coverage") or {}
-        if (
-            int(history_coverage.get("failure_count") or 0)
-            and not int(summary.get("coverage_failures") or 0)
+        if int(history_coverage.get("failure_count") or 0) and not int(
+            summary.get("coverage_failures") or 0
         ):
             failed_names = ", ".join(history_coverage.get("failed_scenarios") or [])
-            detail += (
-                f", history blockers {history_coverage.get('failure_count')}"
-                + (f" ({_truncate(failed_names, 100)})" if failed_names else "")
+            detail += f", history blockers {history_coverage.get('failure_count')}" + (
+                f" ({_truncate(failed_names, 100)})" if failed_names else ""
             )
         recovery_notes = []
         if research_cycle.get("state_recovered"):
             recovery_notes.append("state recovered")
         cycle_mutation_batch = research_cycle.get("mutation_batch")
-        if isinstance(cycle_mutation_batch, dict) and cycle_mutation_batch.get("status") == "read_error":
+        if (
+            isinstance(cycle_mutation_batch, dict)
+            and cycle_mutation_batch.get("status") == "read_error"
+        ):
             recovery_notes.append("mutation batch read_error")
         cycle_generated_batch = research_cycle.get("generated_batch")
         if isinstance(cycle_generated_batch, dict) and cycle_generated_batch.get("status") in {
@@ -1773,9 +2172,7 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
             "invalid",
             "ignored",
         }:
-            recovery_notes.append(
-                f"generated batch {cycle_generated_batch.get('status')}"
-            )
+            recovery_notes.append(f"generated batch {cycle_generated_batch.get('status')}")
         if recovery_notes:
             detail += f", {'; '.join(recovery_notes)}"
         lines.append(
@@ -1795,9 +2192,7 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
         method_detail = ", ".join(
             f"{method} {count}" for method, count in sorted(by_method.items())
         )
-        hypotheses = generated_batch.get(
-            "hypotheses_count", summary.get("hypotheses", 0)
-        )
+        hypotheses = generated_batch.get("hypotheses_count", summary.get("hypotheses", 0))
         safety = (
             f"research_only `{bool(generated_batch.get('research_only', False))}`, "
             f"executable `{bool(generated_batch.get('executable', True))}`, "
@@ -1818,8 +2213,7 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
         if generated_batch.get("error"):
             detail += f", error {_truncate(str(generated_batch.get('error')), 120)}"
         lines.append(
-            f"- Generative research batch: `{_fmt_bool(generated_batch.get('ok'))}` "
-            f"({detail})"
+            f"- Generative research batch: `{_fmt_bool(generated_batch.get('ok'))}` ({detail})"
         )
     else:
         lines.append("- Generative research batch: `unknown` (missing report)")
@@ -1829,12 +2223,13 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
         totals = feedback.get("totals") or {}
         outcomes = feedback.get("outcomes") or {}
         rejection_reasons = feedback.get("rejection_reasons") or {}
-        outcome_detail = ", ".join(
-            f"{name} {count}" for name, count in list(outcomes.items())[:5]
-        ) or "none"
-        reason_detail = ", ".join(
-            f"{name} {count}" for name, count in list(rejection_reasons.items())[:5]
-        ) or "none"
+        outcome_detail = (
+            ", ".join(f"{name} {count}" for name, count in list(outcomes.items())[:5]) or "none"
+        )
+        reason_detail = (
+            ", ".join(f"{name} {count}" for name, count in list(rejection_reasons.items())[:5])
+            or "none"
+        )
         if experiment_memory.get("status") == "ready":
             detail = (
                 f"unique behaviors {totals.get('strategies', 0)}, "
@@ -1849,10 +2244,7 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
             detail = f"not created yet at {experiment_memory.get('path', 'unknown')}"
         else:
             detail = _truncate(str(experiment_memory.get("error") or "unavailable"), 160)
-        lines.append(
-            f"- Experiment memory: `{_fmt_bool(experiment_memory.get('ok'))}` "
-            f"({detail})"
-        )
+        lines.append(f"- Experiment memory: `{_fmt_bool(experiment_memory.get('ok'))}` ({detail})")
     incubation_candidates = report.get("incubation_candidates") or {}
     if incubation_candidates:
         summary = incubation_candidates.get("summary") or {}
@@ -1890,18 +2282,24 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
         suppressed_reason_detail = ", ".join(
             f"{reason} {count}" for reason, count in sorted(suppressed_by_reason.items())
         )
-        suppressed_detail = f"suppressed repeats {mutation_summary.get('suppressed_repeated_sources', 0)}"
+        suppressed_detail = (
+            f"suppressed repeats {mutation_summary.get('suppressed_repeated_sources', 0)}"
+        )
         if suppressed_product_detail:
             suppressed_detail += f" ({suppressed_product_detail})"
         if suppressed_reason_detail:
             suppressed_detail += f", suppressed reasons {suppressed_reason_detail}"
-        source_detail = _source_freshness_detail(
-            child=mutation_plan,
-            parent=research_cycle,
-            source_key="research_generated_at",
-            child_label="plan",
-            parent_label="research",
-        ) if research_cycle else "source unknown"
+        source_detail = (
+            _source_freshness_detail(
+                child=mutation_plan,
+                parent=research_cycle,
+                source_key="research_generated_at",
+                child_label="plan",
+                parent_label="research",
+            )
+            if research_cycle
+            else "source unknown"
+        )
         lines.append(
             f"- Mutation plan: `{_fmt_bool(mutation_plan.get('ok'))}` "
             f"({mutation_summary.get('proposals', 0)} research-only proposals"
@@ -1946,7 +2344,14 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
         lines.append(f"- Mutation batch: `{_fmt_bool(mutation_batch.get('ok'))}` ({status_detail})")
     else:
         lines.append("- Mutation batch: `unknown` (missing report)")
-    lines.append(f"- Promotion reviews: `{_promotion_reviews_detail(report.get('promotion_reviews') or [])}`")
+    lines.append(
+        f"- Promotion reviews: `{_promotion_reviews_detail(report.get('promotion_reviews') or [])}`"
+    )
+    candidate_paper = report.get("candidate_paper") or {}
+    lines.append(
+        f"- Candidate paper: `{candidate_paper.get('status') or 'unknown'}` "
+        f"({_candidate_paper_detail(candidate_paper)})"
+    )
     hygiene = report.get("artifact_hygiene") or {}
     if hygiene:
         summary = hygiene.get("summary") or {}
@@ -1969,18 +2374,16 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
         lines.append("- Artifact hygiene: `unknown` (missing report)")
     backup_report = report.get("backup_report") or {}
     if backup_report:
-        backup_ok = bool(backup_report.get("ok")) and bool((backup_report.get("verification") or {}).get("ok"))
-        lines.append(
-            f"- Backup: `{_fmt_bool(backup_ok)}` "
-            f"({_backup_report_detail(backup_report)})"
+        backup_ok = bool(backup_report.get("ok")) and bool(
+            (backup_report.get("verification") or {}).get("ok")
         )
+        lines.append(f"- Backup: `{_fmt_bool(backup_ok)}` ({_backup_report_detail(backup_report)})")
     else:
         lines.append("- Backup: `unknown` (missing report)")
     testnet_rehearsal = report.get("testnet_rehearsal") or {}
     testnet_label = testnet_rehearsal.get("status") or _fmt_bool(testnet_rehearsal.get("ok"))
     lines.append(
-        f"- Testnet rehearsal: `{testnet_label}` "
-        f"({_testnet_rehearsal_detail(testnet_rehearsal)})"
+        f"- Testnet rehearsal: `{testnet_label}` ({_testnet_rehearsal_detail(testnet_rehearsal)})"
     )
     control = report.get("control") or {}
     lines.extend(
@@ -2008,11 +2411,25 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
     )
     for product in report["products"]:
         trades = product["trade_summary"]
-        issue = product.get("error") or product.get("close_error") or product.get("detail") or product.get("reason") or ""
-        if not product.get("error") and product.get("close_error") and product.get("position_after_attempt"):
+        issue = (
+            product.get("error")
+            or product.get("close_error")
+            or product.get("detail")
+            or product.get("reason")
+            or ""
+        )
+        if (
+            not product.get("error")
+            and product.get("close_error")
+            and product.get("position_after_attempt")
+        ):
             position = product["position_after_attempt"]
             issue = f"{issue}; after attempt qty {position.get('qty')}"
-        if not product.get("error") and product.get("position_after") and product.get("cycle_ok") is False:
+        if (
+            not product.get("error")
+            and product.get("position_after")
+            and product.get("cycle_ok") is False
+        ):
             position = product["position_after"]
             issue = issue or f"position after qty {position.get('qty')}"
         if not issue and product.get("cycle_errors"):
@@ -2072,7 +2489,9 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
                 open_positions=product.get("open_positions")
                 if product.get("open_positions") is not None
                 else "n/a",
-                equity=f"{product['equity']:.4f}" if isinstance(product.get("equity"), int | float) else "n/a",
+                equity=f"{product['equity']:.4f}"
+                if isinstance(product.get("equity"), int | float)
+                else "n/a",
                 peak_equity=(
                     f"{product['peak_equity']:.4f}"
                     if isinstance(product.get("peak_equity"), int | float)
@@ -2105,10 +2524,17 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
     lines.extend(["", "## Jobs", ""])
     scheduled_jobs = report.get("scheduled_jobs") or []
     if scheduled_jobs:
-        lines.extend(["| Job | Enabled | State | Due | Last Run | Issue |", "|---|---:|---:|---:|---|---|"])
+        lines.extend(
+            ["| Job | Enabled | State | Due | Last Run | Issue |", "|---|---:|---:|---:|---|---|"]
+        )
         for job in scheduled_jobs:
             last_run = job.get("last_started_at") or "never"
-            issue = job.get("last_error") or job.get("last_reason") or job.get("last_deferred_reason") or ""
+            issue = (
+                job.get("last_error")
+                or job.get("last_reason")
+                or job.get("last_deferred_reason")
+                or ""
+            )
             output_warnings = []
             structured_errors = _scheduled_job_structured_errors_detail(job)
             if structured_errors:
@@ -2134,11 +2560,12 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
             detail = job.get("error") or job.get("stderr_tail") or job.get("stdout_tail") or ""
             detail_text = str(detail).strip().replace("|", "\\|")[:160]
             lines.append(
-                f"| {job.get('name', 'unknown')} | `{_fmt_bool(job.get('ok'))}` | "
-                f"{detail_text} |"
+                f"| {job.get('name', 'unknown')} | `{_fmt_bool(job.get('ok'))}` | {detail_text} |"
             )
     if report.get("alert"):
-        lines.extend(["", "## Last Alert", "", f"```json\n{json.dumps(report['alert'], indent=2)}\n```"])
+        lines.extend(
+            ["", "## Last Alert", "", f"```json\n{json.dumps(report['alert'], indent=2)}\n```"]
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -2166,6 +2593,7 @@ def _operator_failure_report(config_path: Path, exc: Exception) -> dict[str, Any
         "generated_batch": {},
         "experiment_memory": {},
         "artifact_hygiene": {},
+        "candidate_paper": {},
         "testnet_rehearsal": {},
         "control": {},
         "products": [],
@@ -2174,8 +2602,12 @@ def _operator_failure_report(config_path: Path, exc: Exception) -> dict[str, Any
     }
 
 
-def _append_report_error(report: dict[str, Any], code: str, message: str, detail: dict[str, Any]) -> None:
-    report.setdefault("report_errors", []).append({"code": code, "message": message, "detail": detail})
+def _append_report_error(
+    report: dict[str, Any], code: str, message: str, detail: dict[str, Any]
+) -> None:
+    report.setdefault("report_errors", []).append(
+        {"code": code, "message": message, "detail": detail}
+    )
     report["ok"] = False
 
 
@@ -2183,7 +2615,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build a compact autopilot operator report.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--output", type=Path, default=Path("runtime/operator_report.md"))
-    parser.add_argument("--json-output", type=Path, help="Optional path for the structured report JSON.")
+    parser.add_argument(
+        "--json-output", type=Path, help="Optional path for the structured report JSON."
+    )
     return parser.parse_args()
 
 

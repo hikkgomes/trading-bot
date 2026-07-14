@@ -330,10 +330,7 @@ def _experiment_memory_status(
         status.update(reason="memory_stat_failed", error=f"{type(exc).__name__}: {exc}")
         return status
     global _MEMORY_READINESS_CACHE_KEY, _MEMORY_READINESS_CACHE_VALUE
-    if (
-        cache_key == _MEMORY_READINESS_CACHE_KEY
-        and _MEMORY_READINESS_CACHE_VALUE is not None
-    ):
+    if cache_key == _MEMORY_READINESS_CACHE_KEY and _MEMORY_READINESS_CACHE_VALUE is not None:
         cached = copy.deepcopy(_MEMORY_READINESS_CACHE_VALUE)
         cached["backup_path_writable"] = backup_writable
         return cached

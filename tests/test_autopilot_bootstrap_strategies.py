@@ -72,7 +72,9 @@ def test_write_bootstrap_artifacts_skips_existing_and_overwrites_when_requested(
 
     skipped = write_bootstrap_artifacts(cfg)
     assert skipped["artifacts"][0]["action"] == "skipped_existing"
-    assert json.loads(active_product.strategies_path.read_text(encoding="utf-8")) == {"existing": True}
+    assert json.loads(active_product.strategies_path.read_text(encoding="utf-8")) == {
+        "existing": True
+    }
 
     written = write_bootstrap_artifacts(cfg, overwrite=True)
     payload = json.loads(active_product.strategies_path.read_text(encoding="utf-8"))

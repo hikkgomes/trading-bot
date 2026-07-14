@@ -44,7 +44,9 @@ def run(
 ) -> Path:
     rules = pd.read_csv(rules_path).head(top_k)
     if "conditions_json" not in rules.columns:
-        raise ValueError("rules file must include conditions_json; use ranked_strategies.csv or scored_strategies_all.csv")
+        raise ValueError(
+            "rules file must include conditions_json; use ranked_strategies.csv or scored_strategies_all.csv"
+        )
     data = pd.read_parquet(labels_path).sort_values("timestamp").reset_index(drop=True)
     features = numeric_feature_columns(data, base_prefix=f"tf_{base_timeframe}_")
     fee_cost = 2 * ((fee_bps + slippage_bps) / 10_000)
@@ -60,7 +62,9 @@ def run(
             LOGGER.warning(
                 "Skipping rule %s: label column %s not in %s. Make sure the rules "
                 "file and the labels table come from the SAME base timeframe.",
-                rule_id, label_column, labels_path,
+                rule_id,
+                label_column,
+                labels_path,
             )
             continue
         masked = data.loc[combined_mask(data, _conditions(row))].copy()
@@ -86,8 +90,10 @@ def run(
         signals["accept"] = signals["signal"].astype(bool)
         parts.append(signals)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    out = pd.concat(parts, axis=0).reset_index(drop=True) if parts else pd.DataFrame(
-        columns=["rule_id", "timestamp", "prob", "ev", "accept"]
+    out = (
+        pd.concat(parts, axis=0).reset_index(drop=True)
+        if parts
+        else pd.DataFrame(columns=["rule_id", "timestamp", "prob", "ev", "accept"])
     )
     out.to_parquet(output_path, index=False)
     return output_path
@@ -96,12 +102,19 @@ def run(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train meta-label filters for top strategy rules.")
     parser.add_argument(
-        "--rules", type=Path,
+        "--rules",
+        type=Path,
         default=PROJECT_ROOT / "outputs" / "day_trade_search" / "ranked_strategies.csv",
         help="Ranked rules CSV. Must come from the same base timeframe as --labels.",
     )
-    parser.add_argument("--labels", type=Path, default=PROCESSED_DATA_DIR / "train_5m_indicators_labels.parquet")
-    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "outputs" / "meta_labeling" / "meta_signals.parquet")
+    parser.add_argument(
+        "--labels", type=Path, default=PROCESSED_DATA_DIR / "train_5m_indicators_labels.parquet"
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=PROJECT_ROOT / "outputs" / "meta_labeling" / "meta_signals.parquet",
+    )
     parser.add_argument("--base-timeframe", default="5m")
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--fee-bps", type=float, default=5.0)

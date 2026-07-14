@@ -62,7 +62,9 @@ def execution_engine_digest(*, root: Path = PROJECT_ROOT) -> str:
     if not paths:
         raise RuntimeError(f"execution identity found no source files under {root}")
     digest = hashlib.sha256()
-    digest.update(f"python={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\n".encode())
+    digest.update(
+        f"python={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\n".encode()
+    )
     for distribution, installed_version in _installed_distribution_versions():
         digest.update(f"dependency={distribution}=={installed_version}\n".encode())
     for path in paths:

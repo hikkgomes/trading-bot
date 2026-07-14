@@ -5,8 +5,12 @@ from src.trade_utils import gross_return_for_pnl_unit, scan_tp_sl
 
 
 def test_product_aware_short_returns_distinguish_linear_usdt_from_btc_step_aside():
-    assert gross_return_for_pnl_unit(100.0, 90.0, is_long=False, pnl_unit="usdt") == pytest.approx(0.10)
-    assert gross_return_for_pnl_unit(100.0, 90.0, is_long=False, pnl_unit="btc") == pytest.approx(1 / 9)
+    assert gross_return_for_pnl_unit(100.0, 90.0, is_long=False, pnl_unit="usdt") == pytest.approx(
+        0.10
+    )
+    assert gross_return_for_pnl_unit(100.0, 90.0, is_long=False, pnl_unit="btc") == pytest.approx(
+        1 / 9
+    )
 
 
 def test_product_aware_return_rejects_unknown_pnl_unit():

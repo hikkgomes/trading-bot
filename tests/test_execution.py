@@ -9,6 +9,7 @@ import pytest
 
 from src.execution import (
     ExchangeConfig,
+    FuturesPositionIdentity,
     OpenOrderIdentity,
     Order,
     OrderSide,
@@ -27,6 +28,24 @@ class _Px:
 
     def __call__(self, symbol):
         return self.price
+
+
+def _futures_settings_position(
+    *,
+    leverage=1,
+    margin_mode="isolated",
+    contracts=0.0,
+    side=None,
+    entry_price=None,
+):
+    return {
+        "symbol": "BTC/USDT:USDT",
+        "contracts": contracts,
+        "side": side,
+        "entryPrice": entry_price,
+        "marginMode": margin_mode,
+        "leverage": leverage,
+    }
 
 
 def test_paper_broker_long_profit_cycle():
@@ -1603,14 +1622,12 @@ def test_ccxt_futures_open_order_still_rejects_notional_above_cap():
     )
     broker.name = "fake"
     broker._client = FakeClient()
-    broker._leverage_set_symbols = set()
-    broker._margin_mode_set_symbols = set()
 
     with pytest.raises(ValueError, match="Order notional"):
         broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=1.0))
 
 
-def test_ccxt_futures_open_order_sets_configured_leverage_once():
+def test_ccxt_futures_entry_reapplies_and_reads_back_risk_settings_every_time():
     from src.execution.ccxt_broker import CcxtBroker
 
     class FakeClient:
@@ -1641,7 +1658,7 @@ def test_ccxt_futures_open_order_sets_configured_leverage_once():
             return []
 
         def fetch_positions(self, symbols):
-            return []
+            return [_futures_settings_position(leverage=2)]
 
         def create_order(self, **kwargs):
             self.created.append(kwargs)
@@ -1657,20 +1674,26 @@ def test_ccxt_futures_open_order_sets_configured_leverage_once():
     )
     broker.name = "fake"
     broker._client = FakeClient()
-    broker._leverage_set_symbols = set()
-    broker._margin_mode_set_symbols = set()
-
     broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=0.1))
     broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=0.1))
 
-    assert broker._client.margin_calls == [("isolated", "BTC/USDT:USDT")]
-    assert broker._client.leverage_calls == [(2, "BTC/USDT:USDT")]
-    assert broker._client.position_mode_calls == [(False, "BTC/USDT:USDT")]
+    assert broker._client.margin_calls == [
+        ("isolated", "BTC/USDT:USDT"),
+        ("isolated", "BTC/USDT:USDT"),
+    ]
+    assert broker._client.leverage_calls == [
+        (2, "BTC/USDT:USDT"),
+        (2, "BTC/USDT:USDT"),
+    ]
+    assert broker._client.position_mode_calls == [
+        (False, "BTC/USDT:USDT"),
+        (False, "BTC/USDT:USDT"),
+    ]
     assert broker._client.open_order_calls == [
-        ("BTC/USDT:USDT", {}),
-        ("BTC/USDT:USDT", {"trigger": True}),
-        ("BTC/USDT:USDT", {}),
-        ("BTC/USDT:USDT", {"trigger": True}),
+        (None, {}),
+        (None, {"trigger": True}),
+        (None, {}),
+        (None, {"trigger": True}),
     ]
     assert broker._client.created[0]["symbol"] == "BTC/USDT:USDT"
     assert broker._client.created[0]["params"] == {}
@@ -1693,8 +1716,6 @@ def test_ccxt_futures_open_order_refuses_when_margin_mode_cannot_be_set():
     )
     broker.name = "fake"
     broker._client = FakeClient()
-    broker._leverage_set_symbols = set()
-    broker._margin_mode_set_symbols = set()
 
     with pytest.raises(RuntimeError, match="cannot set isolated margin mode"):
         broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=0.1))
@@ -1727,7 +1748,7 @@ def test_ccxt_futures_open_order_allows_already_isolated_margin_message():
             return []
 
         def fetch_positions(self, symbols):
-            return []
+            return [_futures_settings_position()]
 
         def create_order(self, **kwargs):
             self.created.append(kwargs)
@@ -1743,14 +1764,93 @@ def test_ccxt_futures_open_order_allows_already_isolated_margin_message():
     )
     broker.name = "fake"
     broker._client = FakeClient()
-    broker._leverage_set_symbols = set()
-    broker._margin_mode_set_symbols = set()
-
     broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=0.1))
 
     assert broker._client.leverage_calls == [(1, "BTC/USDT:USDT")]
     assert broker._client.created[0]["symbol"] == "BTC/USDT:USDT"
     assert len(broker._client.created) == 1
+
+
+def test_ccxt_futures_margin_mode_rejects_unrelated_already_message():
+    from src.execution.ccxt_broker import CcxtBroker
+
+    class FakeClient:
+        def set_margin_mode(self, margin_mode, symbol):
+            raise RuntimeError("Account is already locked for maintenance")
+
+    broker = CcxtBroker.__new__(CcxtBroker)
+    broker.config = ExchangeConfig(exchange="binanceusdm", market_type="futures")
+    broker._client = FakeClient()
+
+    with pytest.raises(RuntimeError, match="could not set isolated margin mode"):
+        broker._ensure_futures_margin_mode("BTCUSDT")
+
+
+def test_ccxt_futures_position_mode_accepts_exact_binance_already_set_code():
+    from src.execution.ccxt_broker import CcxtBroker
+
+    class FakeClient:
+        def set_position_mode(self, hedged, symbol):
+            raise RuntimeError(
+                'binanceusdm {"code":-4059,"msg":"No need to change position side."}'
+            )
+
+        def fetch_position_mode(self, symbol):
+            return {"hedged": False}
+
+    broker = CcxtBroker.__new__(CcxtBroker)
+    broker.config = ExchangeConfig(exchange="binanceusdm", market_type="futures")
+    broker._client = FakeClient()
+
+    broker._ensure_futures_position_mode("BTCUSDT")
+
+
+@pytest.mark.parametrize(
+    ("position_payload", "message"),
+    [
+        (_futures_settings_position(margin_mode="cross"), "isolated margin mode"),
+        (_futures_settings_position(leverage=2), "does not match configured leverage"),
+        ([], "exactly one matching position-settings record"),
+    ],
+)
+def test_ccxt_futures_entry_rejects_unconfirmed_risk_settings(position_payload, message):
+    from src.execution.ccxt_broker import CcxtBroker
+
+    class FakeClient:
+        def fetch_ticker(self, symbol):
+            return {"last": 100.0}
+
+        def set_margin_mode(self, margin_mode, symbol):
+            return None
+
+        def set_leverage(self, leverage, symbol):
+            return None
+
+        def set_position_mode(self, hedged, symbol):
+            return None
+
+        def fetch_position_mode(self, symbol):
+            return {"hedged": False}
+
+        def fetch_positions(self, symbols):
+            return position_payload if isinstance(position_payload, list) else [position_payload]
+
+        def create_order(self, **kwargs):
+            raise AssertionError("entry must not be submitted without verified risk settings")
+
+    broker = CcxtBroker.__new__(CcxtBroker)
+    broker.config = ExchangeConfig(
+        exchange="binanceusdm",
+        market_type="futures",
+        live=True,
+        max_notional_usd=1000,
+        max_futures_leverage=1,
+    )
+    broker.name = "fake"
+    broker._client = FakeClient()
+
+    with pytest.raises(RuntimeError, match=message):
+        broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=0.1))
 
 
 @pytest.mark.parametrize(
@@ -1786,7 +1886,13 @@ def test_ccxt_futures_entry_rechecks_flatness_immediately_before_create_order(
             return []
 
         def fetch_positions(self, symbols):
-            return [{"contracts": 0.25, "side": position_side, "entryPrice": 100.0}]
+            return [
+                _futures_settings_position(
+                    contracts=0.25,
+                    side=position_side,
+                    entry_price=100.0,
+                )
+            ]
 
         def create_order(self, **kwargs):
             self.created.append(kwargs)
@@ -1802,10 +1908,6 @@ def test_ccxt_futures_entry_rechecks_flatness_immediately_before_create_order(
     )
     broker.name = "fake"
     broker._client = FakeClient()
-    broker._leverage_set_symbols = set()
-    broker._margin_mode_set_symbols = set()
-    broker._one_way_mode_set_symbols = set()
-
     with pytest.raises(RuntimeError, match=rf"signed qty {expected_signed_qty}"):
         broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=0.1))
 
@@ -1832,8 +1934,6 @@ def test_ccxt_futures_open_order_refuses_when_leverage_cannot_be_set():
     )
     broker.name = "fake"
     broker._client = FakeClient()
-    broker._leverage_set_symbols = set()
-    broker._margin_mode_set_symbols = set()
 
     with pytest.raises(RuntimeError, match="cannot set leverage"):
         broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=0.1))
@@ -1862,8 +1962,6 @@ def test_ccxt_futures_open_order_rejects_unsafe_leverage_value():
     )
     broker.name = "fake"
     broker._client = FakeClient()
-    broker._leverage_set_symbols = set()
-    broker._margin_mode_set_symbols = set()
 
     with pytest.raises(ValueError, match="MAX_FUTURES_LEVERAGE"):
         broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=0.1))
@@ -1890,8 +1988,6 @@ def test_ccxt_futures_open_order_rejects_non_isolated_margin_mode_before_exchang
     )
     broker.name = "fake"
     broker._client = FakeClient()
-    broker._leverage_set_symbols = set()
-    broker._margin_mode_set_symbols = set()
 
     with pytest.raises(ValueError, match="FUTURES_MARGIN_MODE"):
         broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=0.1))
@@ -1993,6 +2089,71 @@ def test_ccxt_open_order_inventory_queries_regular_and_conditional_paths():
     ]
 
 
+def test_ccxt_account_inventory_returns_other_symbol_orders_and_positions():
+    class FakeClient:
+        def fetch_open_orders(self, symbol, params):
+            assert symbol is None
+            return [
+                {
+                    "id": "eth-order-1",
+                    "clientOrderId": "manual-eth-1",
+                    "symbol": "ETH/USDT:USDT",
+                    "status": "open",
+                }
+            ]
+
+        def fetch_positions(self, symbols):
+            assert symbols is None
+            return [
+                _futures_settings_position(),
+                {
+                    "symbol": "ETH/USDT:USDT",
+                    "contracts": 2.0,
+                    "side": "short",
+                    "entryPrice": 2500.0,
+                },
+            ]
+
+    broker = _ccxt_protective_broker(FakeClient())
+
+    assert broker.list_account_open_orders(conditional=False) == (
+        OpenOrderIdentity(
+            symbol="ETH/USDT:USDT",
+            order_id="eth-order-1",
+            client_id="manual-eth-1",
+            status="open",
+            conditional=False,
+        ),
+    )
+    assert broker.list_account_futures_positions() == (
+        FuturesPositionIdentity(
+            symbol="ETH/USDT:USDT",
+            qty=-2.0,
+            avg_price=2500.0,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [None],
+        [{"symbol": "ETHUSDT", "contracts": "nan", "side": "long", "entryPrice": 1}],
+        [{"symbol": "ETHUSDT", "contracts": 1, "side": "mystery", "entryPrice": 1}],
+    ],
+)
+def test_ccxt_account_position_inventory_fails_closed_on_malformed_payload(payload):
+    class FakeClient:
+        def fetch_positions(self, symbols):
+            return payload
+
+    broker = _ccxt_protective_broker(FakeClient())
+
+    with pytest.raises(ValueError):
+        broker.list_account_futures_positions()
+
+
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
@@ -2070,10 +2231,13 @@ def test_ccxt_futures_entry_refuses_outstanding_orders_immediately_before_submit
                 {
                     "id": "123",
                     "clientOrderId": "manual-order-1",
-                    "symbol": symbol,
+                    "symbol": "ETH/USDT:USDT",
                     "status": "open",
                 }
             ]
+
+        def fetch_positions(self, symbols):
+            return [_futures_settings_position()]
 
         def create_order(self, **kwargs):
             self.created.append(kwargs)
@@ -2088,8 +2252,8 @@ def test_ccxt_futures_entry_refuses_outstanding_orders_immediately_before_submit
 
     assert client.created == []
     assert client.open_order_calls == [
-        ("BTC/USDT:USDT", {}),
-        ("BTC/USDT:USDT", {"trigger": True}),
+        (None, {}),
+        (None, {"trigger": True}),
     ]
 
 

@@ -119,7 +119,9 @@ def _retired_reason(candidate: dict[str, Any]) -> str | None:
     return next((reason for reason in RETIRED_REASONS if reason in reasons), None)
 
 
-def _retired_candidate(scenario: dict[str, Any], candidate: dict[str, Any], reason: str) -> dict[str, Any]:
+def _retired_candidate(
+    scenario: dict[str, Any], candidate: dict[str, Any], reason: str
+) -> dict[str, Any]:
     return {
         "source_scenario": scenario.get("name"),
         "product": scenario.get("product"),
@@ -178,7 +180,9 @@ def _source_key(scenario_name: Any, candidate_id: Any, reason: Any) -> tuple[str
     return (str(scenario_name), str(candidate_id), str(reason))
 
 
-def _recent_failed_mutation_sources(research_cycle: dict[str, Any]) -> dict[tuple[str, str, str], dict[str, Any]]:
+def _recent_failed_mutation_sources(
+    research_cycle: dict[str, Any],
+) -> dict[tuple[str, str, str], dict[str, Any]]:
     suppressed: dict[tuple[str, str, str], dict[str, Any]] = {}
     for scenario in research_cycle.get("scenarios") or []:
         if not isinstance(scenario, dict):
@@ -268,9 +272,15 @@ def build_mutation_plan(
     )[:max_total]
     by_product = Counter(str(item.get("product") or "unknown") for item in proposals)
     by_reason = Counter(str(item.get("reason") or "unknown") for item in proposals)
-    suppressed_by_product = Counter(str(item.get("product") or "unknown") for item in suppressed_repeated_sources)
-    suppressed_by_reason = Counter(str(item.get("reason") or "unknown") for item in suppressed_repeated_sources)
-    retired_by_product = Counter(str(item.get("product") or "unknown") for item in retired_candidates)
+    suppressed_by_product = Counter(
+        str(item.get("product") or "unknown") for item in suppressed_repeated_sources
+    )
+    suppressed_by_reason = Counter(
+        str(item.get("reason") or "unknown") for item in suppressed_repeated_sources
+    )
+    retired_by_product = Counter(
+        str(item.get("product") or "unknown") for item in retired_candidates
+    )
     retired_by_reason = Counter(str(item.get("reason") or "unknown") for item in retired_candidates)
     return {
         "ok": True,

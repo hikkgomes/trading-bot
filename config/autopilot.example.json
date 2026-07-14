@@ -2,13 +2,21 @@
   "approval_ledger": "runtime/approvals.json",
   "artifact_hygiene_file": "runtime/artifact_hygiene.json",
   "backup_report_file": "runtime/backup_report.json",
+  "backup_enabled": true,
+  "backup_cadence_seconds": 86400,
+  "backup_timeout_seconds": 60,
   "auto_report_enabled": true,
   "alert_cooldown_seconds": 900,
   "alert_file": "runtime/alerts.jsonl",
   "alert_state_file": "runtime/alert_state.json",
   "alerts_enabled": true,
-  "control_file": "runtime/control.json",
-  "control_audit_file": "runtime/control_audit.jsonl",
+  "control_file": "runtime/operator-control/control.json",
+  "control_audit_file": "runtime/operator-control/control_audit.jsonl",
+  "candidate_paper_enabled": true,
+  "candidate_paper_status_file": "runtime/candidate_paper_status.json",
+  "candidate_paper_cadence_seconds": 45,
+  "candidate_paper_max_unseen_bars": 240,
+  "candidate_paper_timeout_seconds": 240,
   "job_state_file": "runtime/job_state.json",
   "lock_file": "runtime/autopilot.lock",
   "incubation_candidates_file": "runtime/incubation_candidates.json",
@@ -129,17 +137,6 @@
       "timeout_seconds": 1800
     },
     {
-      "name": "candidate_paper_cycle",
-      "enabled": true,
-      "command": [
-        ".venv/bin/python", "-m", "src.autopilot.candidate_paper",
-        "--config", "config/autopilot.json",
-        "--output", "runtime/candidate_paper_status.json"
-      ],
-      "cadence_seconds": 300,
-      "timeout_seconds": 240
-    },
-    {
       "name": "synthetic_strategy_sweep",
       "enabled": false,
       "command": [".venv/bin/python", "-m", "src.sweep", "--all", "--synthetic", "8000"],
@@ -211,19 +208,6 @@
         "--max-experiment-lines", "5000",
         "--max-control-audit-lines", "5000",
         "--max-quarantine-bytes", "268435456"
-      ],
-      "cadence_seconds": 86400,
-      "timeout_seconds": 60
-    },
-    {
-      "name": "runtime_backup",
-      "enabled": true,
-      "command": [
-        ".venv/bin/python", "-m", "src.autopilot.backup",
-        "--config", "config/autopilot.json",
-        "--report", "runtime/backup_report.json",
-        "--max-file-bytes", "52428800",
-        "--max-backups", "30"
       ],
       "cadence_seconds": 86400,
       "timeout_seconds": 60

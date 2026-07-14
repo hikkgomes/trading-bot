@@ -1,3 +1,4 @@
+import json
 import os
 import pwd
 import shutil
@@ -20,12 +21,15 @@ def test_telegram_service_uses_telegram_only_environment_and_pause_edge():
     )
     assert (
         "ExecStart=$PYTHON_UNIT -m src.autopilot.telegram_edge --config $CONFIG_UNIT "
-        "--settings-file $TELEGRAM_ENV_UNIT --send-status"
-        in script
+        "--settings-file $TELEGRAM_ENV_UNIT --send-status" in script
     )
     assert "OnUnitActiveSec=$REPORT_INTERVAL" in script
     assert "InaccessiblePaths=$TRADING_ENV_UNIT" in script
     assert "InaccessiblePaths=-$APPROVALS_UNIT" in script
+    assert "ReadOnlyPaths=$TELEGRAM_ENV_UNIT" in script
+    assert "ReadWritePaths=$CONTROL_STATE_DIR_UNIT" in script
+    assert "ReadWritePaths=$TELEGRAM_STATE_DIR_UNIT" in script
+    assert "ReadWritePaths=$RUNTIME_UNIT" not in script
     assert "NoNewPrivileges=true" in script
     assert "MemoryMax=192M" in script
 
@@ -98,9 +102,7 @@ def test_openclaw_shared_user_dry_run_generates_group_unit_without_changing_chec
 
 
 @pytest.mark.skipif(
-    sys.platform != "linux"
-    or shutil.which("setfacl") is None
-    or shutil.which("getfacl") is None,
+    sys.platform != "linux" or shutil.which("setfacl") is None or shutil.which("getfacl") is None,
     reason="requires Linux POSIX ACL tools",
 )
 def test_openclaw_shared_user_install_applies_narrow_acl_boundary(tmp_path):
@@ -163,13 +165,9 @@ exec {real_id} "$@"
 
     assert result.returncode == 0, result.stderr
     data_acl = subprocess.check_output(["getfacl", "-cp", private_data], text=True)
-    runtime_acl = subprocess.check_output(
-        ["getfacl", "-cp", test_repo / "runtime"], text=True
-    )
+    runtime_acl = subprocess.check_output(["getfacl", "-cp", test_repo / "runtime"], text=True)
     context_acl = subprocess.check_output(["getfacl", "-cp", context], text=True)
-    incoming_acl = subprocess.check_output(
-        ["getfacl", "-cp", inbox_root / "incoming"], text=True
-    )
+    incoming_acl = subprocess.check_output(["getfacl", "-cp", inbox_root / "incoming"], text=True)
     assert "user:nobody:---" in data_acl
     assert "default:user:nobody:---" in runtime_acl
     assert "user:nobody:r--" in context_acl
@@ -221,9 +219,19 @@ def test_communications_installers_generate_hardened_units_in_dry_run(tmp_path):
     assert "ProtectSystem=strict" in telegram_unit
     assert str(repo / ".env") in telegram_unit
     assert "EnvironmentFile=" not in telegram_unit
-    assert f"--settings-file \"{telegram_env}\"" in telegram_unit
+    assert f'--settings-file "{telegram_env}"' in telegram_unit
     assert "--validate-settings" in telegram_unit
+    assert f'ReadOnlyPaths="{telegram_env}"' in telegram_unit
+    assert f'ReadWritePaths="{repo / "runtime" / "operator-control"}"' in telegram_unit
+    assert f'ReadWritePaths="{repo / "runtime" / "telegram"}"' in telegram_unit
+    assert f'ReadWritePaths="{runtime}"' not in telegram_unit
+    assert (
+        f'--poll-state "{repo / "runtime" / "telegram" / "telegram_poll_state.json"}"'
+        in telegram_unit
+    )
     assert "--send-status" in report_unit
+    assert f'ReadOnlyPaths="{telegram_env}"' in report_unit
+    assert "ReadWritePaths=" not in report_unit
     assert "OnUnitActiveSec=24h" in report_timer
     assert "EnvironmentFile=" not in bridge_unit
     assert "Environment=OPENCLAW_SHARED_GROUP=0" in bridge_unit
@@ -281,3 +289,76 @@ def test_telegram_installer_rejects_unknown_duplicate_and_malformed_settings(tmp
         assert result.returncode != 0
         assert forbidden not in rendered
         assert not list(unit_dir.glob("*.service"))
+
+
+def test_telegram_installer_copies_legacy_state_into_dedicated_directories(tmp_path):
+    source_repo = Path.cwd()
+    repo = tmp_path / "repo"
+    runtime = repo / "runtime"
+    config_dir = repo / "config"
+    runtime.mkdir(parents=True)
+    config_dir.mkdir()
+    control_dir = runtime / "operator-control"
+    config = config_dir / "autopilot.json"
+    config.write_text(
+        json.dumps(
+            {
+                "control_file": str(control_dir / "control.json"),
+                "control_audit_file": str(control_dir / "control_audit.jsonl"),
+                "status_file": str(runtime / "status.json"),
+                "jobs": [],
+                "products": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    legacy_control = runtime / "control.json"
+    legacy_audit = runtime / "control_audit.jsonl"
+    legacy_poll = runtime / "telegram_poll_state.json"
+    legacy_control.write_text('{"paused": true, "reason": "legacy pause"}\n', encoding="utf-8")
+    legacy_audit.write_text('{"command": "pause"}\n', encoding="utf-8")
+    legacy_poll.write_text('{"next_update_id": 42}\n', encoding="utf-8")
+    telegram_env = runtime / "telegram.env"
+    telegram_env.write_text(
+        "AUTOPILOT_TELEGRAM_BOT_TOKEN=fake\nAUTOPILOT_TELEGRAM_CHAT_ID=123\n",
+        encoding="utf-8",
+    )
+    telegram_env.chmod(0o600)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    systemctl.chmod(0o700)
+
+    result = subprocess.run(
+        ["bash", str(source_repo / "scripts" / "install_communications_service.sh")],
+        cwd=source_repo,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+            "REPO": str(repo),
+            "PYTHON": str(source_repo / ".venv" / "bin" / "python"),
+            "CONFIG": str(config),
+            "TELEGRAM_ENV": str(telegram_env),
+            "UNIT_DIR": str(tmp_path / "units"),
+            "DRY_RUN": "0",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (control_dir / "control.json").read_text(encoding="utf-8") == legacy_control.read_text(
+        encoding="utf-8"
+    )
+    assert (control_dir / "control_audit.jsonl").read_text(
+        encoding="utf-8"
+    ) == legacy_audit.read_text(encoding="utf-8")
+    assert (runtime / "telegram" / "telegram_poll_state.json").read_text(
+        encoding="utf-8"
+    ) == legacy_poll.read_text(encoding="utf-8")
+    assert legacy_control.exists()
+    assert legacy_audit.exists()
+    assert legacy_poll.exists()

@@ -32,7 +32,12 @@ def candle_data_dir(
     selected_market = normalize_market(market)
     canonical = canonical_candle_data_dir(symbol, selected_market)
     legacy = legacy_candle_data_dir(symbol)
-    if legacy_fallback and selected_market == "futures" and legacy.exists() and not canonical.exists():
+    if (
+        legacy_fallback
+        and selected_market == "futures"
+        and legacy.exists()
+        and not canonical.exists()
+    ):
         return legacy
     return canonical
 

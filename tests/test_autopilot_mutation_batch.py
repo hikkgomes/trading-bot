@@ -91,7 +91,9 @@ def test_mutation_batch_waits_when_plan_missing(tmp_path):
     assert batch["ok"] is True
     assert batch["status"] == "waiting_for_mutation_plan"
     assert batch["count"] == 0
-    assert json.loads(output_path.read_text(encoding="utf-8"))["status"] == "waiting_for_mutation_plan"
+    assert (
+        json.loads(output_path.read_text(encoding="utf-8"))["status"] == "waiting_for_mutation_plan"
+    )
 
 
 def test_mutation_batch_skips_unknown_source_candidate():
@@ -140,7 +142,10 @@ def test_mutation_batch_skips_proposal_with_explicit_live_safety_flag():
             "unsafe_flags": ["safety.live_allowed"],
         }
     ]
-    assert batch["mutation_metadata"][0]["source_candidate_id"] == plan["proposals"][1]["source_candidate_id"]
+    assert (
+        batch["mutation_metadata"][0]["source_candidate_id"]
+        == plan["proposals"][1]["source_candidate_id"]
+    )
 
 
 def test_mutation_batch_does_not_remutate_mutation_candidate_set():

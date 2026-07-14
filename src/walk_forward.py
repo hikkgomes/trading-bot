@@ -160,7 +160,10 @@ def candidate_feature_columns(candidates) -> set:
 
 def condition_cache_key(condition: Condition) -> tuple:
     refittable = condition.threshold_source in (
-        "quantile", "delta_quantile", "slope_quantile", "ratio_quantile",
+        "quantile",
+        "delta_quantile",
+        "slope_quantile",
+        "ratio_quantile",
     )
     return (
         condition.feature,

@@ -12,7 +12,12 @@ import pytest
 
 from research_exploration.hypothesis_schema import ExitRule, Hypothesis, Predicate, RiskRule
 from research_exploration.strategy_grammar import SearchSpace, build_fresh_hypothesis
-from src.autopilot.experiment_memory import ExperimentMemory, canonical_strategy_hash
+from research_exploration.validation import _segment_bounds, split_frame
+from src.autopilot import research_cycle as research_cycle_module
+from src.autopilot.experiment_memory import (
+    ExperimentMemory,
+    canonical_strategy_hash,
+)
 from src.autopilot.research_cycle import (
     ResearchScenario,
     _dataset_snapshot,
@@ -67,9 +72,7 @@ def _generated_batch(hypothesis: Hypothesis, space: SearchSpace) -> dict:
         "generation_metadata": [
             {
                 "id": hypothesis.id,
-                "strategy_hash": canonical_strategy_hash(
-                    strategy_behavior_spec(hypothesis, space)
-                ),
+                "strategy_hash": canonical_strategy_hash(strategy_behavior_spec(hypothesis, space)),
                 "search_space": space.name,
                 "product": space.product,
                 "market": space.market,
@@ -256,6 +259,7 @@ def test_crash_after_holdout_claim_cannot_reuse_protected_snapshot(monkeypatch, 
     )
 
     def crash_after_claim(_frame, hypotheses, _config, *, before_holdout, **_kwargs):
+        holdout_window = _segment_bounds(split_frame(_frame, _config)["holdout"])
         partial = {
             "hypothesis_id": hypotheses[0].id,
             "family": hypotheses[0].family,
@@ -268,7 +272,7 @@ def test_crash_after_holdout_claim_cannot_reuse_protected_snapshot(monkeypatch, 
             "oos": {"pass_rate": 0.75},
             "sensitivity": {"pass_fraction": 0.75},
             "dsr_deflated": 0.7,
-            "splits": {"holdout": {"start": "2024-01-02", "end": "2024-01-03", "rows": 40}},
+            "splits": {"holdout": holdout_window},
         }
         assert before_holdout(hypotheses[0], partial) is True
         raise RuntimeError("simulated process death")
@@ -296,6 +300,115 @@ def test_crash_after_holdout_claim_cannot_reuse_protected_snapshot(monkeypatch, 
         )
 
     assert resumed["reason"] == "already_evaluated_on_snapshot"
+
+
+def test_grown_snapshot_selects_disjoint_epoch_before_evaluator_reads_frame(monkeypatch, tmp_path):
+    hypothesis = _rising_hypothesis()
+    scenario = _memory_scenario()
+    first_hundred = _sawtooth_frame(rows=100)
+    grown_to_125 = _sawtooth_frame(rows=125)
+    monkeypatch.setattr(
+        "src.autopilot.research_cycle._missing_columns_for_hypothesis",
+        lambda _hypothesis, _directory: {},
+    )
+    monkeypatch.setattr(
+        "src.autopilot.research_cycle.build_aligned_frame",
+        lambda *_args, **_kwargs: grown_to_125,
+    )
+    monkeypatch.setattr(
+        "src.autopilot.research_cycle._dataset_snapshot",
+        lambda *_args, frame, **_kwargs: {
+            "snapshot_id": f"rows-{len(frame)}",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "base_timeframe": "5m",
+            "rows": len(frame),
+            "content_digest": "sha256:" + ("1" if len(frame) == 100 else "2") * 64,
+        },
+    )
+    evaluator_rows = None
+    evaluator_config = None
+    sealed_protocol = None
+
+    real_memory_protocol = research_cycle_module._memory_protocol
+
+    def capture_memory_protocol(scenario_arg, validation_config, eval_config):
+        nonlocal sealed_protocol
+        sealed_protocol = real_memory_protocol(
+            scenario_arg,
+            validation_config,
+            eval_config,
+        )
+        return sealed_protocol
+
+    monkeypatch.setattr(
+        research_cycle_module,
+        "_memory_protocol",
+        capture_memory_protocol,
+    )
+
+    def protected_safe_evaluator(selected_frame, hypotheses, _config, **_kwargs):
+        nonlocal evaluator_config, evaluator_rows
+        evaluator_rows = len(selected_frame)
+        evaluator_config = _config
+        assert selected_frame["timestamp"].max() < first_hundred["timestamp"].iloc[80]
+        return [
+            {
+                "hypothesis_id": hypotheses[0].id,
+                "verdict": "reject",
+                "reasons": ["no_train_edge"],
+            }
+        ]
+
+    monkeypatch.setattr(
+        "src.autopilot.research_cycle.validate_batch",
+        protected_safe_evaluator,
+    )
+
+    with ExperimentMemory(tmp_path / "memory.sqlite3") as memory:
+        behavior_hash = _register(memory, hypothesis)
+        cfg = research_cycle_module._validation_config(scenario)
+        protected_window = _segment_bounds(split_frame(first_hundred, cfg)["holdout"])
+        memory.register_holdout_cohort(
+            [behavior_hash],
+            dataset={
+                "snapshot_id": "rows-100",
+                "market": "futures",
+                "symbol": "BTCUSDT",
+                "base_timeframe": "5m",
+                "rows": 100,
+                "content_digest": "sha256:" + "1" * 64,
+            },
+            window=protected_window,
+            protocol={"market": "futures", "base_timeframe": "5m"},
+        )
+
+        report = run_validation_scenario(
+            scenario,
+            hypotheses=[hypothesis],
+            selection={"cumulative_trials": 25},
+            hypothesis_metadata={hypothesis.id: {"strategy_hash": behavior_hash}},
+            log_path=tmp_path / "experiments.jsonl",
+            experiment_memory=memory,
+        )
+
+    assert evaluator_rows == 80
+    assert report["protected_epoch_selection"]["selected_rows"] == 80
+    assert report["protected_epoch_selection"]["excluded_rows"] == 45
+    assert report["protected_epoch_selection"]["feature_dependency_embargo_rows_excluded"] == 25
+    assert evaluator_config is not None
+    assert sealed_protocol is not None
+    assert sealed_protocol["schema"] == "autopilot.staged_validation/v3"
+    assert sealed_protocol["dsr"] == {
+        "method": "autopilot.dsr.expected_max_trial_dispersion/v2",
+        "n_trials": evaluator_config.n_trials,
+        "sr_std_trials": evaluator_config.sr_std_trials,
+        "trial_sharpe_count": evaluator_config.trial_sharpe_count,
+        "trial_sharpe_observed_std": evaluator_config.trial_sharpe_observed_std,
+        "trial_sharpe_conservative_floor": (evaluator_config.trial_sharpe_conservative_floor),
+    }
+    assert sealed_protocol["dsr"]["n_trials"] == 25
+    assert sealed_protocol["dsr"]["sr_std_trials"] > 0
 
 
 def test_unsupported_generated_candidate_is_retired_from_restart_queue(tmp_path):

@@ -40,7 +40,9 @@ class PaperBroker(Broker):
     def get_price(self, symbol: str) -> float:
         price = float(self._price_source(symbol))
         if not math.isfinite(price) or price <= 0:
-            raise ValueError(f"Paper price for {symbol} must be finite and positive, got {price:g}.")
+            raise ValueError(
+                f"Paper price for {symbol} must be finite and positive, got {price:g}."
+            )
         return price
 
     def get_balance(self) -> float:
@@ -142,7 +144,11 @@ def binance_mark_price(symbol: str = "BTCUSDT", market: str = "futures") -> floa
     """
     import requests
 
-    base = "https://fapi.binance.com/fapi/v1" if market == "futures" else "https://api.binance.com/api/v3"
+    base = (
+        "https://fapi.binance.com/fapi/v1"
+        if market == "futures"
+        else "https://api.binance.com/api/v3"
+    )
     path = "/premiumIndex" if market == "futures" else "/ticker/price"
     resp = requests.get(f"{base}{path}", params={"symbol": symbol}, timeout=10)
     resp.raise_for_status()

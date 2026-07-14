@@ -68,6 +68,9 @@ Copy `.env.example` to `.env` for exchange credentials and run `chmod 600 .env`.
 Readiness and the Linux installer reject symlinked, non-regular, wrong-owner, or
 group/world-accessible environment files. Keep `TRADING_LIVE=0` until the
 approval ledger and live adapter path are deliberately enabled.
+Copy `config/alerts.env.example` to `runtime/alerts.env` and make it mode `0600`
+when webhook or Telegram alerts are wanted; it must never contain exchange
+credentials.
 
 ## Autopilot
 
@@ -95,9 +98,11 @@ constants such as `NaN` and `Infinity` are also rejected.
 Production runtime and readiness validation also require both core products,
 `btc_accumulation` and `active_income`, to be present and enabled, and require
 the core autonomous jobs for data updates, regime tagging, generative research,
-candidate paper testing, promotion review, maintenance, backup, and artifact hygiene to be
-present, enabled, pointed at their expected Python modules, and wired with the
-expected market/product/reporting arguments.
+promotion review, maintenance, and artifact hygiene to be present, enabled,
+pointed at their expected Python modules, and wired with the expected
+market/product/reporting arguments. Candidate paper testing and verified backup
+use separately configured, dedicated systemd timers rather than the generic job
+worker.
 The Linux deployment isolates product supervision and emergency flattening from
 scheduled work: the trading service runs the runtime with `--skip-jobs`, while a
 separate job-worker service executes
@@ -157,9 +162,11 @@ and broker gates. It installs a separate
 healthcheck service/timer, which runs the machine-readable healthcheck every five
 minutes. Blocking healthcheck issues emit the configured
 critical alert through the same JSONL/webhook channel as runtime alerts, with
-cooldown applied. The units load `$REPO/.env`, write stdout/stderr to the user
-journal, restart the supervisor after any process exit, rate-limit restart
-storms, and use a restrictive umask plus lightweight sandboxing options. They
+cooldown applied. Only the trading supervisor loads `$REPO/.env`; the watchdog
+reads the strictly allowlisted operations-only `runtime/alerts.env`, and scheduled research,
+candidate-paper, and backup units load neither. All units write stdout/stderr to
+the user journal, restart or rerun according to their service type, use bounded
+timers, and apply a restrictive umask plus lightweight sandboxing options. They
 also cap common BLAS/OpenMP/joblib thread pools to
 `AUTOPILOT_THREADS=2` by default; override that environment variable when
 installing if the server has more or fewer cores available. The generated
@@ -193,8 +200,9 @@ The runtime writes status to `runtime/status.json` and takes an exclusive
 `runtime/autopilot.lock` while running so accidental duplicate supervisors cannot
 evaluate or trade the same products concurrently. Duplicate startup attempts do
 not release the existing holder's lock; the file content is only holder metadata
-for inspection. Pause control is a tiny JSON file at `runtime/control.json`, with
-an atomic CLI wrapper for safer operation:
+for inspection. Pause control is a tiny JSON file at
+`runtime/operator-control/control.json`, with an atomic CLI wrapper for safer
+operation:
 
 ```bash
 make control ARGS="status"
@@ -203,7 +211,7 @@ make control ARGS="resume --reason done"
 ```
 
 Mutating default control commands append durable JSONL audit events to
-`runtime/control_audit.jsonl`, including the command, reason, operator, and
+`runtime/operator-control/control_audit.jsonl`, including the command, reason, operator, and
 before/after control payload. For alternate control files, pass
 `--audit path/to/control_audit.jsonl` before the command. If the audit append
 fails after the control file is written, the command still prints the applied
@@ -254,9 +262,10 @@ make control ARGS="resume-jobs --reason done"
 ```
 
 To emergency-close live exposure for a product, request flatten. Futures flatten
-runs even while paused, uses the broker reduce-only close path, and clears local
-open-position state only after the broker is flat and every tracked native stop
-is proved terminal. Unreadable or corrupt futures state is not reconstructed:
+runs even while paused, writes a deterministic reduce-only order intent before
+submission, and clears local open-position state only after the broker is flat,
+every tracked native stop is proved terminal, and the keyed trade/equity/daily-
+PnL/cooldown accounting commit succeeds. Unreadable or corrupt futures state is not reconstructed:
 the request fails closed for exchange/state reconciliation. BTC spot
 accumulation is never flattened by selling the BTC base stack; when local state
 contains one tracked spot step-aside position, flatten buys BTC back with the
@@ -277,7 +286,10 @@ does not contain a quote-reinvest step-aside position. A spot product with no
 local step-aside position is reported as skipped and left untouched.
 
 After a successful flatten the runtime atomically clears the corresponding
-flatten request; the affected product remains paused. Do not manually
+flatten request; the affected product remains paused. If a crash occurs between
+accounting and that control update, the next pass verifies account-wide flatness,
+the durable `last_flatten` identity, and the unique trade row without sending
+another order, then clears the stale request. Do not manually
 `clear-flatten` while a close or reconciliation is unresolved. Reconcile the
 exchange, local state, native-stop inventory, fees, funding, and accounting,
 then explicitly resume.
@@ -346,9 +358,11 @@ position sizes, and broker metadata.
 Malformed strategy artifacts, including non-object JSON or non-object strategy
 entries, are blocked by policy, approval, preflight, and live gates.
 
-Autonomous data, maintenance, backup, and research jobs live in the same config
+Autonomous data, maintenance, promotion-review, hygiene, and research jobs live
 under `jobs`. They are command arrays, not shell strings, and each has a cadence
-and timeout. The native history bootstrap loads the same strict
+and timeout. Candidate papering and backup have separate top-level cadence and
+timeout settings because they run in isolated units. The native history
+bootstrap loads the same strict
 `config/research_factory.json` used by generation, downloads only the Binance
 timeframes declared by its search-space roles, builds the grammar's feature
 inventory, writes atomic parquet replacements, and resumes interrupted pagination
@@ -370,8 +384,9 @@ timeframe lists. They keep history current without truncating multi-year files. 
 research cycle checks minimum start/end/span/row coverage before consuming a
 holdout. Candle timestamp/cadence, OHLCV, duplicate, and future-timestamp checks
 fail closed before data replaces the last good parquet. Routine jobs also cover
-candidate shadow paper, regime tagging, bounded generation/validation, promotion
-review, maintenance, verified backup, and artifact hygiene.
+regime tagging, bounded generation/validation, promotion review, maintenance,
+and artifact hygiene. The independent timers cover forward candidate papering
+and verified backup while the job worker continues research.
 
 Job state is persisted in `runtime/job_state.json` and recent stdout/stderr tails
 are included in `runtime/status.json`. Malformed job state is surfaced in
@@ -442,9 +457,14 @@ are the slow path. If reports show missing 1m scalping flow features such as
 
 Alerts are enabled by default and written to `runtime/alerts.jsonl` with a
 fingerprint cooldown stored in `runtime/alert_state.json`. Set
-`AUTOPILOT_WEBHOOK_URL` to send the same alert payload to an HTTP webhook.
-Webhook delivery is best-effort: failures are recorded in the local alert JSONL
-but do not crash trading supervision or bypass the alert cooldown. If local alert
+`AUTOPILOT_WEBHOOK_URL` to send the sanitized payload to an HTTPS webhook
+(plain HTTP is accepted only for an explicit loopback test endpoint). The local
+alert and cooldown are made durable first; webhook and Telegram delivery then
+run on a bounded background queue, so a slow network endpoint cannot stall
+trading supervision. Delivery outcomes are appended as
+`autopilot.alert_delivery/v1` records with the same fingerprint. Delivery is
+best-effort: failures are recorded in the local alert JSONL but do not crash
+trading supervision or bypass the alert cooldown. If local alert
 file or cooldown writes fail after readiness has passed, the runtime records that
 alert error in status and keeps supervising products. If the JSONL alert is
 written but cooldown-state persistence fails, the alert result still reports
@@ -467,7 +487,7 @@ free-byte counters, while the full detail is still written to
 to the most recent 1000 records, prunes `runtime/alert_state.json` to the most
 recent 1000 cooldown fingerprints, and rotates older
 `outputs/research_exploration/experiment_log.jsonl` and
-`runtime/control_audit.jsonl` lines into compressed archives while keeping each
+`runtime/operator-control/control_audit.jsonl` lines into compressed archives while keeping each
 hot log at 5000 records. It does not touch trade logs, approvals, strategy
 artifacts, or `data/`, and it refuses symlinked log/state inputs instead of
 following them during unattended compaction. Independent maintenance tasks keep
@@ -522,7 +542,7 @@ Durable broker recovery/accounting state is visible too:
 operator report. Healthcheck treats any of them on a live product as blocking
 (paper as warning). Native futures stop IDs, trigger/quantity evidence, and
 staleness metadata remain attached to each open-position detail.
-Backup staleness defaults to twice the enabled backup job cadence, and verified
+Backup staleness defaults to twice the enabled dedicated-backup cadence, and verified
 backup reports timestamped in the future also fail healthcheck instead of being
 treated as fresh. Use `--max-backup-age-hours` for stricter external watchdogs. Use
 `--ignore-job-overdue` only when an external scheduler intentionally owns job
@@ -555,10 +575,21 @@ nonzero and skips retention pruning. Symlink sources are skipped instead of
 followed, so a linked
 runtime path cannot pull unintended target contents into the archive, and
 symlink backup output paths are refused before writing. It does not include
-`.env` or API credentials. The default scheduled backup job keeps the
+`.env` or API credentials. A separate credential-free daily backup timer can
+read the approval ledger only through a read-only mount while writing bounded
+runtime backup outputs; generic research jobs cannot read it. It keeps the
 latest 30 generated backup zips. Backup archives are always mode `0600`, and
 staged restore directories/files are forced to `0700`/`0600` regardless of the
 caller's umask (including overwrite restores).
+Manifest entries distinguish optional files that have not been created yet from
+existing recovery files that could not be archived. Missing optional state is
+counted as `optional_missing_files` and documented without failing verification;
+any existing configured recovery file skipped because it is too large, a
+symlink, or not a regular file increments `critical_skipped_files`, fails backup
+verification, and makes healthcheck fail.
+`backup_enabled`, `backup_cadence_seconds`, and `backup_timeout_seconds` in the
+autopilot config keep operator-report/health freshness expectations aligned with
+the dedicated timer (24 hours by default).
 `make backup-verify` validates the latest backup zip against its manifest; pass
 `BACKUP=runtime/backups/name.zip` to verify a specific archive. Verification
 fails closed for unsupported manifest versions, so restore will not accept a
@@ -568,9 +599,13 @@ extracts it into a separate directory without overwriting existing files, so you
 can rehearse recovery before copying state back into a live runtime directory.
 Restore refuses archive path traversal, symlink restore roots, and symlink
 escapes from the restore directory, including when overwrite mode is enabled.
-The operator report summarizes the latest backup report, and `make healthcheck`
-fails if an existing backup report says creation or verification failed, or if
-the last verified backup is older than the configured freshness window.
+The operator report summarizes the latest backup report and staged-candidate
+paper status, including exact candidate digests, freshness, open-position count,
+errors, drawdown halts, and activation readiness. `make healthcheck` fails if an
+existing backup report says creation or verification failed, if an existing
+recovery file was skipped, if the last verified backup is older than the
+configured freshness window, or if an enabled candidate-paper status is stale,
+invalid, or failed.
 When `auto_report_enabled` is true, every runtime cycle refreshes
 `runtime/operator_report.md/json` and `runtime/readiness_report.md/json` after
 writing the latest status. Report-rendering errors are recorded in status but do
@@ -611,17 +646,29 @@ trade logs.
 
 An autonomous research cycle cannot change a live product's active strategy.
 For a product already configured `live`, research stages
-`runtime/candidates/<product>.json`; the five-minute `candidate_paper_cycle`
-runs that candidate through a separate paper bot. State is isolated by candidate
+`runtime/candidates/<product>.json`; the dedicated 45-second candidate-paper
+timer runs that candidate through a separate paper bot. State is isolated by candidate
 digest, while the trade log and review use stable paths:
 
 - `runtime/candidates/<product>_paper_state_<digest-prefix>.json`
 - `runtime/candidates/<product>_paper_trades.csv`
 - `runtime/candidates/<product>_promotion_review.md`
 
-Only rows with the exact current strategy fingerprint count. By default every
-strategy needs at least 20 valid forward-paper trades spanning at least seven
-days, positive sized return, and the configured drawdown/loss-streak limits.
+Every unseen closed base-timeframe bar is consumed once from a durable cursor,
+ordered by bar close/information availability with deterministic shorter-
+timeframe ties. Only a fresh latest signal observed within two timer cadences
+can enter promotable paper evidence, using a credential-free public quote and
+its post-response observation timestamp. The partially elapsed entry bar is
+excluded from OHLC exit checks. Bounded downtime replay still advances state
+and manages positions, but historical next-open entries and any trade touched
+by catch-up are explicitly quarantined from promotion. Only genuine-forward
+rows matching the exact strategy fingerprint, candidate artifact digest,
+observation schema, and current candidate-paper engine digest count. By default
+every strategy needs at least 20 such trades spanning at least seven days,
+positive sized return, and the configured drawdown/loss-streak limits. The
+45-second timer adds public market data, CPU, and disk activity; the dedicated
+unit retains configured CPU, memory, task, timeout, non-overlap-lock, and
+bounded catch-up limits.
 Check `candidate_activation_ready: true` before maintenance; activation
 recomputes these gates and rejects stale or different-fingerprint evidence.
 
@@ -633,7 +680,8 @@ make candidate-paper-once
 jq '.products[] | select(.product == "active_income")' runtime/candidate_paper_status.json
 make control ARGS="pause-product active_income --reason 'candidate activation review'"
 make control ARGS="pause-jobs --reason 'candidate activation review'"
-systemctl --user stop trading-bot-autopilot.service trading-bot-autopilot-jobs.service
+systemctl --user stop trading-bot-autopilot.service trading-bot-autopilot-jobs.service \
+  trading-bot-candidate-paper.timer trading-bot-candidate-paper.service
 CANDIDATE_DIGEST=$(jq -r '.products[] | select(.product == "active_income" and .candidate_activation_ready == true) | .candidate_digest' runtime/candidate_paper_status.json)
 make activate-candidate PRODUCT=active_income CANDIDATE_DIGEST="$CANDIDATE_DIGEST" CONFIRM=1 OPERATOR=henrique
 ```
@@ -669,8 +717,12 @@ make promotion-review PRODUCT=active_income \
   TRADE_LOG=runtime/candidates/active_income_paper_trades.csv
 ```
 
-After human approval, run a fresh testnet preflight/rehearsal when required,
-then a fresh production preflight with `EXCHANGE_TESTNET=0`. Start both services
+With the product configured `live` but still paused, run the connected production
+preflight first. Final human approval pins its stable account/venue/risk-cap
+manifest. Run the required testnet rehearsal using the separate testnet-preflight
+output, then switch back to production credentials and refresh the production
+preflight. An equivalent refresh keeps approval valid; account, venue, routing,
+notional/slippage, leverage, or margin drift invalidates it. Start both services
 while still paused, confirm reports and exchange state, resume the product, and
 finally `resume-jobs`. A staged candidate remains available for audit.
 
@@ -687,11 +739,14 @@ found in an existing ledger. Revocation reasons are free-form required text:
 
 ```bash
 ARTIFACT_DIGEST=$(jq -r '.artifact_digest' runtime/promotion_review.json)
+make preflight PRODUCT=active_income
+PREFLIGHT_DIGEST="sha256:$(sha256sum runtime/active_income_preflight_report.json | awk '{print $1}')"
 python -m src.autopilot.approvals approve \
   --config config/autopilot.json \
   --product active_income \
   --artifact outputs/active_strategies_flow.json \
   --expected-artifact-digest "$ARTIFACT_DIGEST" \
+  --expected-preflight-digest "$PREFLIGHT_DIGEST" \
   --all \
   --approved-by henrique \
   --confirm-live \
@@ -720,9 +775,13 @@ also closes the review-to-approval replacement window. Strategy-level `leverage`
 `margin_mode`, when present, are also behavior fields; policy rejects leverage
 above `1`, spot margin metadata, and non-isolated futures margin. Metrics-only
 changes do not affect the fingerprint. Live checks also require the approval to
-match the entire current artifact digest/path and product identity (including
-objective, market, symbol, base asset, starting equity, and regime settings),
-and then re-apply product policy. Approval also records an execution-engine
+match the entire current artifact digest/path and every canonical `ProductConfig`
+field, including execution mode, all state/evidence paths, gate switches and age
+limits, starting equity, and regime settings, and then re-apply product policy.
+Approval pins the stable production account/venue/risk-cap manifest from the
+reviewed successful connected preflight. A timestamp-only refresh does not
+require human reapproval, but operational manifest drift does. Approval also
+records an execution-engine
 digest over Python, pinned installed dependency versions, and execution-capable
 source. A code, Python, or dependency change invalidates approval, preflight,
 and rehearsal evidence until the operator reviews and repeats the sequence.
@@ -740,11 +799,12 @@ Before enabling a product, run a connected preflight. It never places orders.
 Production preflight requires `TRADING_LIVE=1` and `EXCHANGE_TESTNET=0`; the
 separate sandbox preflight uses `REQUIRE_TESTNET=1` and
 `EXCHANGE_TESTNET=1`. It checks product config, artifact and engine identity,
-approval, environment, broker construction, and read-only exchange access.
+environment, broker construction, and read-only exchange access. Because it is
+read-only, production preflight intentionally precedes final human approval.
 Config validation and normal live execution both require `require_preflight=true`,
 a configured `preflight_report`, and a fresh passing report that points at the
 current product and strategy artifact. The saved report must include successful
-check entries for config, strategy artifact, policy, approval, exchange
+check entries for config, strategy artifact, policy, exchange
 environment, broker construction, read-only connectivity, and the product-specific
 position check (`broker_position_flat` for active-income futures or
 `broker_spot_position_non_negative` for BTC accumulation spot).
@@ -792,7 +852,9 @@ holdings because the product starts from the BTC base stack. Use testnet keys
 first, with `TRADING_LIVE=1`, `EXCHANGE_TESTNET=1`, and a tiny
 `MAX_NOTIONAL_USD`. Keep `MAX_FILL_SLIPPAGE_BPS` tight enough to catch bad
 fills, and keep `MAX_FUTURES_LEVERAGE=1`; active-income autopilot gates reject
-higher leverage.
+higher leverage. `REQUIRE_TESTNET=1` writes a separate
+`runtime/<product>_testnet_preflight_report.json` and cannot overwrite the
+approved production report.
 
 After an `active_income` artifact has been explicitly approved and its
 `REQUIRE_TESTNET=1` sandbox preflight is green, the next exchange-facing step is

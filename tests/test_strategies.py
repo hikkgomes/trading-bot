@@ -27,19 +27,37 @@ def _synth(n=4000, seed=3):
 
 # All rule (non-fittable, non-bridge) strategies: signal-only, need just OHLCV.
 _RULE_STRATEGIES = [
-    "sma_cross", "rsi_reversion", "donchian_breakout", "multi_tf_trend",
-    "macd_trend", "supertrend", "adx_trend", "bollinger_reversion",
-    "zscore_reversion", "stochastic_reversion", "keltner_breakout",
-    "atr_channel_breakout", "bollinger_squeeze", "momentum_roc",
-    "candlestick_reversal", "swing_structure", "btc_cycle_guard",
-    "rsi_divergence", "regression_channel",
+    "sma_cross",
+    "rsi_reversion",
+    "donchian_breakout",
+    "multi_tf_trend",
+    "macd_trend",
+    "supertrend",
+    "adx_trend",
+    "bollinger_reversion",
+    "zscore_reversion",
+    "stochastic_reversion",
+    "keltner_breakout",
+    "atr_channel_breakout",
+    "bollinger_squeeze",
+    "momentum_roc",
+    "candlestick_reversal",
+    "swing_structure",
+    "btc_cycle_guard",
+    "rsi_divergence",
+    "regression_channel",
 ]
 
 
 # --------------------------------------------------------------------------- registry
 def test_registry_contains_library():
     names = available()
-    for expected in _RULE_STRATEGIES + ["ml_classifier", "ml_regressor", "condition_grid", "regime_filter"]:
+    for expected in _RULE_STRATEGIES + [
+        "ml_classifier",
+        "ml_regressor",
+        "condition_grid",
+        "regime_filter",
+    ]:
         assert expected in names
 
 
@@ -78,10 +96,19 @@ def test_backtester_matches_search_engine():
     rng = np.random.default_rng(0)
     mask = pd.Series(rng.random(len(df)) < 0.05, index=df.index)
 
-    cfg = BacktestConfig(fee_bps=10, slippage_bps=2, take_profit=0.05, stop_loss=0.03, horizon_bars=96)
+    cfg = BacktestConfig(
+        fee_bps=10, slippage_bps=2, take_profit=0.05, stop_loss=0.03, horizon_bars=96
+    )
     search_trades = simulate_trades(
-        tf, mask.reset_index(drop=True), direction="long", horizon_bars=96,
-        fee_bps=10, slippage_bps=2, take_profit=0.05, stop_loss=0.03, pnl_unit="usdt",
+        tf,
+        mask.reset_index(drop=True),
+        direction="long",
+        horizon_bars=96,
+        fee_bps=10,
+        slippage_bps=2,
+        take_profit=0.05,
+        stop_loss=0.03,
+        pnl_unit="usdt",
     )
 
     o = extract_ohlcv(df)
@@ -90,7 +117,9 @@ def test_backtester_matches_search_engine():
 
     assert len(ours) == len(search_trades)
     ours_net = np.array([t["net_return"] for t in ours])
-    np.testing.assert_allclose(ours_net, search_trades["net_return"].to_numpy(), rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(
+        ours_net, search_trades["net_return"].to_numpy(), rtol=1e-9, atol=1e-12
+    )
 
 
 def test_btc_pnl_unit_only_shorts_realise():
@@ -204,9 +233,7 @@ def test_swing_levels_no_lookahead():
     # Compare the region that is fully confirmed in both (exclude the last `pivot`
     # bars of the truncated series, whose pivots can't be confirmed yet).
     safe = cut - pivot
-    pd.testing.assert_series_equal(
-        full.iloc[:safe], trunc.iloc[:safe], check_freq=False
-    )
+    pd.testing.assert_series_equal(full.iloc[:safe], trunc.iloc[:safe], check_freq=False)
 
 
 def test_candlestick_patterns_detect():
@@ -261,7 +288,9 @@ def test_ml_classifier_triple_barrier_target():
             "feat": [1, 2, 3, 4, 5, 6],
         }
     )
-    strat = get("ml_classifier")(horizon=2, label_mode="triple_barrier", label_tp=0.05, label_sl=0.03)
+    strat = get("ml_classifier")(
+        horizon=2, label_mode="triple_barrier", label_tp=0.05, label_sl=0.03
+    )
 
     target = strat._target(df)
 
@@ -300,7 +329,9 @@ def test_ml_regressor_triple_barrier_target():
             "feat": [1, 2, 3, 4, 5, 6],
         }
     )
-    strat = get("ml_regressor")(horizon=2, target_mode="triple_barrier", label_tp=0.05, label_sl=0.03)
+    strat = get("ml_regressor")(
+        horizon=2, target_mode="triple_barrier", label_tp=0.05, label_sl=0.03
+    )
 
     target = strat._target(df)
 
@@ -335,8 +366,12 @@ def test_condition_grid_from_dict():
 
     df = _synth(1000)
     df["tf_15m_close"] = df["close"]
-    cond = Condition(feature="tf_15m_close", kind="value_ge", threshold=float(df["close"].median()),
-                     description="close >= median")
+    cond = Condition(
+        feature="tf_15m_close",
+        kind="value_ge",
+        threshold=float(df["close"].median()),
+        description="close >= median",
+    )
     strat = get("condition_grid")(conditions=[cond], direction="long")
     sig = strat.generate_signals(df)
     assert set(pd.unique(sig.dropna())).issubset({0, 1})
@@ -363,7 +398,10 @@ def test_regime_filter_masks_child_signals():
 def test_regime_filter_uses_child_default_config():
     wrapped = get("regime_filter")(strategy="sma_cross", regime_ids="1")
 
-    assert wrapped.resolved_default_config().horizon_bars == get("sma_cross").default_config().horizon_bars
+    assert (
+        wrapped.resolved_default_config().horizon_bars
+        == get("sma_cross").default_config().horizon_bars
+    )
 
 
 def test_regime_filter_requires_regime_column():

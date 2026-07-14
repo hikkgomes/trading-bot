@@ -20,12 +20,12 @@ trading/research operation, and neither is an approval or execution channel.
   requires an eligible artifact, a matching human approval, fresh connected
   preflight evidence, and, for active income, a matching testnet rehearsal.
 - Approval is bound to the exact artifact digest/path, strategy fingerprints,
-  product identity, and an execution-engine digest covering Python, installed
-  pinned dependencies, and execution-capable source. Changing any of those
-  invalidates approval and downstream evidence. Account credentials, venue,
-  market/testnet routing, quote asset, notional/slippage caps, leverage, and
-  margin mode are bound by preflight; changing them requires fresh connected
-  evidence.
+  every canonical product field/path, an execution-engine digest covering
+  Python, installed pinned dependencies and execution-capable source, and the
+  stable account/venue/risk-cap manifest from a reviewed successful production
+  preflight. Equivalent timestamp refreshes preserve approval; account, venue,
+  market/testnet routing, quote asset, notional/slippage, leverage, or margin
+  drift invalidates it. Runtime separately requires fresh connected evidence.
 - Live positions and durable recovery/flatten intents retain that non-secret
   account fingerprint. Exit/recovery/flatten refuses a different configured
   account instead of sending a risk-reducing order to the wrong account.
@@ -83,7 +83,7 @@ heavy research packages are intentionally omitted.
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install pip==26.0.1
+.venv/bin/python -m pip install pip==26.1.2
 .venv/bin/pip install -r requirements-bot.txt
 .venv/bin/pip check
 .venv/bin/python -c 'import ccxt, numpy, pandas, pyarrow, scipy, sklearn, talib; print("dependencies OK")'
@@ -106,6 +106,8 @@ cp .env.example .env
 chmod 600 .env
 test ! -L .env
 test "$(stat -c '%a' .env)" = "600"
+cp config/alerts.env.example runtime/alerts.env
+chmod 600 runtime/alerts.env
 ```
 
 Edit `.env` with one assignment per line and comments on their own lines. For
@@ -126,6 +128,8 @@ ignored by git, must be owned by the trading-service user with no group/world
 permissions, must not be a symlink, and is intentionally absent from runtime
 backups. `make readiness` and the service installer reject an existing `.env`
 that is not a regular, readable, owner-matched `0600` file.
+`runtime/alerts.env` contains only optional webhook routing and the path to the
+separate Telegram settings file. Never put exchange credentials in it.
 
 ## 3. Bootstrap and verify paper operation
 
@@ -197,7 +201,8 @@ requests but never launches data/research jobs. `make jobs-once` executes at
 most one due job under the separate job-worker lock. The enabled history jobs
 refresh futures coarse data every six hours, futures 1m daily, and spot every
 six hours; other bounded jobs handle typed hypothesis generation, real-data
-validation, candidate shadow paper, review, maintenance, backup, and hygiene.
+validation, review, maintenance, and hygiene. Dedicated credential-free timers
+run forward candidate papering and verified backup independently.
 
 ## 4. Install the user-systemd deployment
 
@@ -210,22 +215,35 @@ make readiness
 REPO="$PWD" bash scripts/install_autopilot_service.sh
 ```
 
-The installer creates four user units:
+The installer creates eight user units:
 
 | Unit | Role |
 |---|---|
 | `trading-bot-autopilot.service` | Trading supervision and emergency flattening. It runs `src.autopilot.runtime --skip-jobs`, so a slow research/data task cannot block a position-management cycle. |
 | `trading-bot-autopilot-jobs.service` | Independent bounded scheduled-job loop (`src.autopilot.job_worker`). |
-| `trading-bot-autopilot-healthcheck.service` | One-shot machine-readable healthcheck. |
+| `trading-bot-candidate-paper.service` | Credential-free, approval-ledger-inaccessible, resource-limited one-shot candidate paper cycle with a nonblocking process lock. |
+| `trading-bot-candidate-paper.timer` | Starts candidate papering every 45 seconds. A digest-specific closed-bar cursor recovers every unseen bar, while downtime/backfill rows are quarantined from promotion evidence. |
+| `trading-bot-autopilot-backup.service` | Credential-free daily backup with the live approval ledger mounted read-only and bounded runtime writes. |
+| `trading-bot-autopilot-backup.timer` | Starts the verified backup workflow every 24 hours. |
+| `trading-bot-autopilot-healthcheck.service` | One-shot machine-readable watchdog. It reads `runtime/alerts.env` through a strict two-key owner-private parser (never as a systemd `EnvironmentFile`), strips inherited exchange/operations variables, skips credential-aware readiness, and performs a bounded drain of queued webhook/Telegram alerts before exit. |
 | `trading-bot-autopilot-healthcheck.timer` | Starts the healthcheck every five minutes by default. |
 
 The installer validates config and full readiness before initial enablement,
 writes restrictive units with resource limits, enables both long-running
-services and the timer, and verifies user lingering. Later supervisor restarts
+services and all three timers, and verifies user lingering. The 45-second candidate
+cadence adds public market-data requests plus bounded CPU/disk activity; its
+separate unit retains the configured memory, CPU, task and 240-second timeout
+limits. The backup timer is represented by `backup_enabled`,
+`backup_cadence_seconds`, and `backup_timeout_seconds` in the autopilot config so
+healthcheck uses the same daily freshness contract even though backup is no
+longer a generic job. Later supervisor restarts
 repeat strict product/config validation but do not use stale research/data
 readiness as a start gate: the process must be able to resume management of
 existing exposure and report the readiness fault. Independent live-entry gates
-still fail closed. If lingering cannot be enabled without administrator access:
+still fail closed. The installed watchdog evaluates durable runtime, research,
+candidate, backup, and job health without reading `.env`; run `make readiness`
+or `make healthcheck` manually for a full credential-aware readiness check. If
+lingering cannot be enabled without administrator access:
 
 ```bash
 sudo loginctl enable-linger "$(id -un)"
@@ -233,11 +251,12 @@ loginctl show-user "$(id -un)" --property=Linger
 REPO="$PWD" bash scripts/install_autopilot_service.sh
 ```
 
-Inspect all four roles and their outputs:
+Inspect every installed role and its outputs:
 
 ```bash
 systemctl --user status trading-bot-autopilot.service trading-bot-autopilot-jobs.service --no-pager
-systemctl --user list-timers trading-bot-autopilot-healthcheck.timer --all --no-pager
+systemctl --user list-timers trading-bot-candidate-paper.timer \
+  trading-bot-autopilot-backup.timer trading-bot-autopilot-healthcheck.timer --all --no-pager
 journalctl --user -u trading-bot-autopilot.service -n 100 --no-pager
 journalctl --user -u trading-bot-autopilot-jobs.service -n 100 --no-pager
 journalctl --user -u trading-bot-autopilot-healthcheck.service -n 100 --no-pager
@@ -267,6 +286,17 @@ REPO="$PWD" bash scripts/install_communications_service.sh
 REPO="$PWD" OPENCLAW_GROUP=trading-research-bridge OPENCLAW_USER=openclaw \
   bash scripts/install_openclaw_bridge_timer.sh
 ```
+
+The Telegram polling unit sees the checkout read-only and receives write access
+only to `runtime/operator-control/` (atomic control/audit updates and their
+sibling locks) and `runtime/telegram/` (atomic poll-offset state). Its
+`runtime/telegram.env` settings file is explicitly mounted read-only. On an
+upgrade from the older flat paths, the real installer copies existing
+`runtime/control.json`, `runtime/control_audit.jsonl`, and
+`runtime/telegram_poll_state.json` into those dedicated directories without
+deleting the originals. The control and poll readers also retain a one-time
+legacy fallback until the narrowed files are created. Stop or pause the core
+services and compare both copies before removing any legacy file.
 
 See [COMMUNICATIONS.md](COMMUNICATIONS.md) before running either installer;
 neither channel can approve, activate, resume, alter risk, or place orders.
@@ -314,15 +344,16 @@ Important files are:
 - `runtime/research/experiment_memory.sqlite3`: canonical identities, lineage, evaluation context, and holdout claims;
 - `runtime/healthcheck.json`: watchdog result;
 - `runtime/alerts.jsonl`: durable local alerts;
-- `runtime/control_audit.jsonl`: operator control audit.
+- `runtime/operator-control/control_audit.jsonl`: operator control audit.
 
 The product rows expose native-stop identity/trigger evidence plus every durable blocker:
 `pending_order`, `pending_entry_recovery`, `risk_recovery_incident`,
 `flatten_intent`, and `exit_accounting_intent`. Healthcheck treats these as
 blocking on live products. Do not clear one merely to quiet the watchdog.
 
-Set `AUTOPILOT_WEBHOOK_URL` in `.env` and restart the units to deliver alerts to
-a lightweight external channel. Local alert writes remain the audit source.
+Set `AUTOPILOT_WEBHOOK_URL` in owner-private `runtime/alerts.env` (not `.env`)
+and restart the supervisor and watchdog units to deliver alerts to a lightweight
+external channel. Local alert writes remain the audit source.
 
 Pause new entries and jobs for maintenance:
 
@@ -369,7 +400,7 @@ complete; do not use `clear-flatten` to force it away.
 
 ## 7. Backups and off-host copies
 
-The scheduled job keeps 30 small local archives. These include config, approval
+The dedicated backup timer keeps 30 small local archives. These include config, approval
 and control audit, runtime state/trades/reports, active/staged strategy artifacts,
 candidate-paper state/log/review files, the research-factory config/latest batch,
 and a transactionally consistent SQLite experiment-memory snapshot. The live
@@ -385,6 +416,12 @@ Archive creation verifies its own manifest and contents before reporting success
 failed verification returns nonzero and skips retention pruning. The separate
 verify command remains an operator check before transfer or restore. Archive
 files are forced to `0600` regardless of the invoking shell's umask.
+The manifest records configured-but-not-yet-created state as optional missing
+files. That is expected on a new deployment. By contrast, every configured
+recovery file that exists at backup time is required: if it is too large, a
+symlink, or not a regular file, `critical_skipped_files` is nonzero, verification
+fails, and healthcheck reports `backup_incomplete`. Do not transfer or rely on
+that archive; correct the path/size problem and create a new verified backup.
 
 Create, verify, and copy a backup over an authenticated channel:
 
@@ -457,11 +494,46 @@ evidence for a decision, not approval.
 
 For a new candidate beside an already-live product, research never touches the
 active artifact. It stages `runtime/candidates/<product>.json`; the scheduled
-five-minute `candidate_paper_cycle` uses digest-isolated paper state and writes:
+dedicated 45-second candidate-paper timer uses digest-isolated paper state and writes:
 
 - `runtime/candidates/<product>_paper_trades.csv`;
 - `runtime/candidates/<product>_promotion_review.md`;
 - `runtime/candidate_paper_status.json`.
+
+The state contains one event-time cursor per strategy plus durable historical
+next-open recovery entries. Events are ordered by when their bar closes and
+becomes knowable; exact-close ties process the shorter timeframe first, then
+artifact order. Thus a `10:00` one-hour bar cannot influence any five-minute bar
+that opened from `10:05` through `10:55`.
+
+Only the newest closed signal observed within two candidate-timer cadences can
+produce promotable evidence. It enters at the credential-free public quote and
+the timestamp captured after that quote response—not at a historical price or
+an earlier cycle timestamp. Because that observation can occur inside the next
+forming bar, the entry-overlapping bar is excluded from exit evaluation; the
+first eligible OHLC exit bar must start at or after the recorded entry time.
+
+Within the bounded outage window, unseen bars still advance the cursor and
+manage existing positions so state can recover safely. Historical signals may
+use deterministic next-open replay, but those entries are tagged
+non-promotable. Any catch-up event while a position is open permanently
+quarantines the eventual trade, even if the entry was originally observed
+forward. `candidate_paper_max_unseen_bars` (240 by default) remains a hard
+limit: exceeding it, or detecting a candle gap, leaves the cursor unchanged and
+makes `runtime/candidate_paper_status.json` unhealthy. Raise the limit only
+after sizing public API, memory, CPU, and service timeout capacity for the
+longest enabled base timeframe. This unit never loads exchange credentials or
+constructs a broker.
+
+Every trade row and digest-isolated state records
+`autopilot.candidate_paper.forward_observation/v2`, a candidate-paper engine
+digest, observation/fill provenance, and explicit promotion eligibility.
+Promotion and activation count only genuine forward rows matching the current
+schema, engine digest, candidate artifact digest, and strategy fingerprint.
+Legacy, different-engine, invalid-provenance, and downtime/backfill rows remain
+visible as quarantined audit evidence. A code or dependency change starts a
+clean flat candidate-paper account; an execution identity change while a paper
+position is open fails closed for explicit operator reconciliation.
 
 Wait until the exact candidate digest reports `candidate_activation_ready: true`.
 Then pause the product and all jobs, verify the same flat/reconciled state, stop
@@ -472,7 +544,8 @@ make candidate-paper-once
 jq '.products[] | select(.product == "active_income")' runtime/candidate_paper_status.json
 make control ARGS="pause-product active_income --reason 'candidate activation review'"
 make control ARGS="pause-jobs --reason 'candidate activation review'"
-systemctl --user stop trading-bot-autopilot.service trading-bot-autopilot-jobs.service
+systemctl --user stop trading-bot-autopilot.service trading-bot-autopilot-jobs.service \
+  trading-bot-candidate-paper.timer trading-bot-candidate-paper.service
 CANDIDATE_DIGEST=$(jq -r '.products[] | select(.product == "active_income" and .candidate_activation_ready == true) | .candidate_digest' runtime/candidate_paper_status.json)
 make activate-candidate PRODUCT=active_income CANDIDATE_DIGEST="$CANDIDATE_DIGEST" CONFIRM=1 OPERATOR="$USER"
 ```
@@ -492,13 +565,19 @@ make promotion-review \
 
 ### 8.2 Record explicit human approval
 
-Only the human operator runs the exact command printed by the final packet. Its
-mandatory expected digest prevents approving a file replaced after review. The
-equivalent explicit form is:
+Keep the product configured `live` and paused. First use production credentials
+with `EXCHANGE_TESTNET=0` to create the final connected read-only production
+preflight. Only the human operator then runs the approval command. If the earlier
+packet still contains the preflight-digest placeholder, rebuild it after this
+preflight or use the explicit form below. The two
+mandatory expected digests prevent approving either a replaced artifact or an
+unreviewed preflight environment manifest. The equivalent explicit form is:
 
 ```bash
 HUMAN_OPERATOR="your-name"
 ARTIFACT_DIGEST=$(jq -r '.artifact_digest' runtime/promotion_review.json)
+make preflight PRODUCT=active_income
+PREFLIGHT_DIGEST="sha256:$(sha256sum runtime/active_income_preflight_report.json | awk '{print $1}')"
 .venv/bin/python -m src.autopilot.approvals \
   --ledger runtime/approvals.json \
   approve \
@@ -506,6 +585,7 @@ ARTIFACT_DIGEST=$(jq -r '.artifact_digest' runtime/promotion_review.json)
   --product active_income \
   --artifact outputs/active_strategies_flow.json \
   --expected-artifact-digest "$ARTIFACT_DIGEST" \
+  --expected-preflight-digest "$PREFLIGHT_DIGEST" \
   --all \
   --approved-by "$HUMAN_OPERATOR" \
   --confirm-live \
@@ -528,9 +608,12 @@ every strategy in that artifact was reviewed; do not use it as a shortcut.
 
 Do not approve an automation identity. Approval captures product identity and
 the execution-engine digest (Python, installed pinned packages, source, and
-`requirements-bot.txt`). Any artifact/product/code/Python/dependency change
-blocks live entry until review and approval are repeated. Do not deploy code
-between approval and first live entry.
+`requirements-bot.txt`) plus the stable production exchange/account/risk-cap
+manifest. A later equivalent preflight refresh changes its report timestamp and
+file digest without invalidating approval; manifest drift does invalidate it.
+Any artifact/product/code/Python/dependency change blocks live entry until
+review and approval are repeated. Do not deploy code between approval and first
+live entry.
 
 ### 8.3 Active-income testnet rehearsal
 
@@ -551,18 +634,21 @@ notional minimum. If Binance changes those filters, raise the rehearsal amount
 and `MAX_NOTIONAL_USD` only enough to clear the reported minimum; do not bypass
 the check.
 
-The rehearsal intentionally places and closes a testnet order. Verify the
+The `REQUIRE_TESTNET=1` preflight writes
+`runtime/active_income_testnet_preflight_report.json`, leaving the approved
+production report untouched. The rehearsal intentionally places and closes a
+testnet order. Verify the
 report proves the native stop place/read/cancel lifecycle and says the ending
 futures position is flat; the embedded preflight must also show empty starting
 regular/conditional order inventories. If not, reconcile the testnet account
 before proceeding.
 
-### 8.4 Fresh production preflight
+### 8.4 Refresh production preflight
 
 Use the production trading key, keep withdrawals disabled, set
 `EXCHANGE_TESTNET=0`, retain `TRADING_LIVE=1`, isolated margin and 1x leverage,
 and set a deliberately tiny `MAX_NOTIONAL_USD`. Do not restart the trading
-service yet. Run a connected, read-only preflight against the real venue:
+service yet. Refresh the connected, read-only preflight against the real venue:
 
 ```bash
 make preflight PRODUCT=active_income
@@ -574,10 +660,12 @@ For BTC accumulation use:
 make preflight PRODUCT=btc_accumulation
 ```
 
-The active-income preflight requires the real futures position to be flat. BTC
+The active-income preflight requires the entire dedicated USD-M account to be
+flat, including positions in symbols other than the configured BTC product. BTC
 spot preflight permits the existing BTC base balance. Futures also proves
-one-way mode (`positionSide=BOTH`), native-stop capability, and empty regular and
-conditional order inventories. The report binds the non-secret account
+one-way mode (`positionSide=BOTH`), native-stop capability, and empty account-wide
+regular and conditional order inventories across every symbol. An unsupported or
+malformed inventory response fails closed. The report binds the non-secret account
 fingerprint and exact current venue/market/testnet/quote/notional/slippage/
 leverage/margin settings. Live runtime requires an exact match and requires the
 production report to record `EXCHANGE_TESTNET=0`. Preflight expires after one
@@ -585,8 +673,9 @@ hour by default, so perform the remaining steps promptly.
 
 ### 8.5 Enable exactly one product, verify, then resume
 
-For an initial promotion, edit only the target product in
-`config/autopilot.json` (a changed-candidate activation is already live-mode):
+The target product must already have been set to `live` while paused before the
+production preflight and final approval (a changed-candidate activation is
+already live-mode). Confirm the intended setting in `config/autopilot.json`:
 
 ```json
 "execution_mode": "live"
@@ -784,10 +873,10 @@ state commit succeeds.
 
 If a submission response, fill, balance read, or local commit is ambiguous, the
 runtime reports `unresolved_flatten_intent`. Every later flatten pass validates
-that record and refuses to submit another buy. It can only auto-finalize local
-state when the current BTC balance proves the full intended increase within the
-small fee tolerance. This recovery read never recalculates quantity or price and
-never places a replacement order.
+that record and refuses to submit another buy. A later BTC balance increase alone
+does not contain the missing execution price and fee, so it is not sufficient to
+silently clear or account the position. Recovery never recalculates quantity or
+price and never places a replacement order.
 
 1. Leave `btc_accumulation` and jobs paused and keep the flatten request active.
 2. Stop manual trading on the account. Back up the state file, then copy the
@@ -797,11 +886,10 @@ never places a replacement order.
    every fill or partial fill, whether an accepted order can still execute, and
    the current BTC and USDT balances. Account for deposits, withdrawals, fees,
    conversions, and any other balance-changing activity after `created_ts`.
-4. If the order filled in full and the BTC balance still proves the recorded
-   increase, do not edit the state file. Let the next supervisor pass run (or run
-   `make autopilot-once` while still paused). It will clear `flatten_intent` and
-   the tracked position without sending a duplicate order. Confirm the report
-   reason is `flatten_intent_auto_finalized` and verify the exchange balance.
+4. If the order filled, preserve the exact exchange order/fill price, quantity,
+   commission asset/amount, and BTC/USDT balance history. The runtime will not
+   guess these missing accounting fields from the balance delta; complete a
+   reviewed state/trade-ledger reconciliation while the request remains paused.
 5. If the order is open, partial, absent, rejected, or the balance history is
    ambiguous, keep the state and flatten request intact. Cancel any still-open
    order only after recording its history, then resolve the remaining BTC/USDT

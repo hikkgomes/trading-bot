@@ -33,7 +33,7 @@ native market history -> indicator inventory -> typed strategy factory
                                                 |
                                       generated research batch
                                                 |
-                            train -> validation -> robustness checks
+                     train -> validation -> robustness and execution/data stress
                                                 |
                                   durable holdout claim -> final holdout
                                                 |                X
@@ -44,10 +44,13 @@ native market history -> indicator inventory -> typed strategy factory
                                       explicit human live gate
 ```
 
-The installed job worker performs this loop 24/7. By default, data refreshes
+The installed job worker performs the research loop 24/7. By default, data refreshes
 run every six hours (with futures 1m refreshed daily), the strategy factory and
 real-data research run daily, and staged candidates for already-live products
-receive an isolated paper cycle every five minutes. A newly generated batch
+receive an isolated paper cycle from a separate systemd timer every 45 seconds.
+That sub-minute cadence covers 1m scalping candidates at the cost of additional
+public market-data requests and bounded CPU/disk activity; the dedicated unit
+enforces resource limits, timeout, and a nonblocking overlap lock. A newly generated batch
 also makes the research cycle due, so it does not wait for a second full daily
 interval. Jobs run separately from trading supervision and only one due job is
 started per worker cycle, preventing research from delaying position
@@ -119,7 +122,8 @@ It records:
 - immutable evaluation context: data-snapshot manifest, chronological window,
   protocol, and phase;
 - development outcomes and rejection reasons;
-- durable protected-holdout claims and retirement state.
+- frozen holdout cohorts, a permanent `(market, symbol, UTC interval)`
+  protection ledger, durable protected-holdout claims, and retirement state.
 
 Canonical identity ignores display IDs, prose, tags, research-horizon labels,
 search-space names, and ordering of commutative conditions while retaining
@@ -204,18 +208,51 @@ Candidates then pass these chronological stages in order:
 2. Validation (next 20%): enough trades and positive out-of-sample behavior.
 3. OOS windows: the result must not depend on one lucky subperiod.
 4. Sensitivity: nearby entry thresholds, exits, and horizons must remain viable.
-5. Final holdout (last 20%): enough trades and positive return.
+5. Execution/data stress on pre-holdout data: higher costs, delayed adverse
+   entry and exit fills, conservative futures funding debits, and deterministic
+   missing-bar gaps must remain viable.
+6. Final holdout (last 20%): enough trades and positive return.
 
 Fees and slippage are included, entry uses the next bar, higher-timeframe joins
-use closed candles, and stop handling is conservative. Deflated Sharpe Ratio
-accounts for the tested population; active-income export currently requires a
-minimum deflated score in addition to a positive holdout.
+use closed candles, and stop handling is conservative. Research returns use the
+same product risk envelope, stop-based position sizing, daily trade cap, daily
+loss stop, and loss-streak cooldown exported to paper/live execution. Deflated
+Sharpe uses the versioned
+`autopilot.dsr.expected_max_trial_dispersion/v2` method. It estimates the
+cross-trial Sharpe dispersion only from pre-holdout returns and applies a
+positive conservative dispersion floor whenever more than one cumulative trial
+has been searched. The method, cumulative trial count, observed dispersion,
+floor, and effective dispersion are stored with every result and export. Both
+active-income and BTC-accumulation live exports require current evidence and a
+deflated score of at least `0.60`, in addition to their objective-specific
+positive holdout gates.
 
-Immediately before any final-holdout read, the cycle first records that the
-candidate passed development, then commits a claim for that data snapshot and
-every root of the candidate's lineage. Only after that transaction succeeds may
-the validator read the holdout. If the process crashes one instruction later,
-the claim remains consumed and a retry fails closed with
+Before the evaluator receives a frame, the cycle removes every sealed interval
+and selects the largest remaining contiguous chronological epoch, preferring
+the newest run on a tie. It then verifies that the epoch's train and validation
+timestamps do not overlap protection. Fast, short-history scenarios receive the
+newest epoch first; other timeframes consume disjoint older epochs instead of
+silently sharing final data. Protection is by market, symbol, and normalized
+UTC wall-clock interval, not by snapshot name or timeframe. Appending rows,
+rebuilding a snapshot, or resampling the same candles therefore cannot move old
+holdout timestamps back into adaptive research. Each protected interval also
+embargoes the following feature-dependency window: the grammar's maximum
+supported rolling dependency of 240 native bars, measured on the slowest
+timeframe used by the candidate cohort. This prevents an immediate
+post-holdout row whose rolling or higher-timeframe feature still contains
+protected prices from re-entering adaptive research. The selected-epoch report
+records the policy, timeframes, duration, and protected-versus-embargoed row
+counts. When no epoch still meets the scenario history contract, that scenario
+waits for enough genuinely new data.
+
+The cycle freezes the exact candidate cohort and immutable dataset evidence
+before evaluation. Immediately before any final-holdout read, it records that
+the candidate passed development, then commits a claim for that data snapshot
+and every root of the candidate's lineage. Only preregistered cohort members
+with the exact sealed protocol and non-conflicting evidence may resume. New
+members, altered evidence, or a new protected interval that overlaps an
+existing one fail closed. If the process crashes one instruction later, the
+claim remains consumed and a retry fails closed with
 `holdout_already_consumed`. Do not clear such a claim to get another look.
 
 The protected result is stored for audit and export gating, but
@@ -281,10 +318,36 @@ evidence again.
 For a product already configured `live`, research never changes the active
 artifact. It writes a separate candidate to
 `runtime/candidates/<product>.json`, and `candidate_paper_cycle` runs that exact
-digest in isolated paper state. Wait until
+digest in isolated paper state through the dedicated 45-second timer, independent
+of long research jobs. Wait until
 `runtime/candidate_paper_status.json` reports
 `candidate_activation_ready: true` after the configured trade-count, time-span,
 return, drawdown, and loss-streak requirements.
+
+Candidate papering is closed-bar and restart-safe. A digest-isolated cursor is
+stored for every strategy, and mixed-timeframe events are processed at their
+information-availability time (bar close), with shorter timeframes winning an
+exact-close tie. A fresh latest signal observed within two 45-second cadences
+enters at a credential-free public quote timestamped after the response. Its
+partially elapsed entry bar is never used for OHLC exit evidence.
+
+The bounded `candidate_paper_max_unseen_bars` window still replays every unseen
+bar for cursor and position recovery. Historical next-open entries and any
+position managed during that downtime catch-up are explicitly non-promotable;
+they remain in the log for audit but cannot satisfy promotion thresholds. An
+outage beyond the bound or a market-data gap fails unhealthy without advancing
+the cursor. This path is paper-only and rejects broker injection, so replay can
+never submit a stale live order.
+
+Forward evidence is bound to an explicit observation schema and a
+candidate-paper engine digest that includes both these causality rules and the
+complete runtime execution identity. Promotion and activation additionally
+require a valid public-quote fill source, equal entry/observation timestamps,
+and an explicit eligible flag. Pre-schema rows, blank or invalid bindings,
+downtime/backfill rows, and rows produced by another engine remain in the
+append-only log for audit but are quarantined from all threshold calculations.
+After code or dependency changes, only newly generated genuine-forward rows
+under the current engine can qualify.
 
 Activation is itself an explicit local maintenance action and grants no live
 approval. The product and jobs must be paused, state must be flat and

@@ -33,7 +33,9 @@ def test_divergence_is_lookahead_safe():
     bull_full, bear_full = ind.regular_divergence(df["high"], df["low"], rsi, pivot=5)
     cut = 500
     rsi_t = ind.rsi(df["close"].iloc[:cut], 14)
-    bull_t, bear_t = ind.regular_divergence(df["high"].iloc[:cut], df["low"].iloc[:cut], rsi_t, pivot=5)
+    bull_t, bear_t = ind.regular_divergence(
+        df["high"].iloc[:cut], df["low"].iloc[:cut], rsi_t, pivot=5
+    )
     safe = cut - 5  # last `pivot` bars can't be confirmed yet in the truncated run
     np.testing.assert_array_equal(bull_full.iloc[:safe].to_numpy(), bull_t.iloc[:safe].to_numpy())
     np.testing.assert_array_equal(bear_full.iloc[:safe].to_numpy(), bear_t.iloc[:safe].to_numpy())

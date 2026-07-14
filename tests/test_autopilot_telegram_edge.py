@@ -3,7 +3,7 @@ import json
 import pytest
 
 from src.autopilot.control import load_control
-from src.autopilot.notifications import emit_alert
+from src.autopilot.notifications import emit_alert, wait_for_remote_alerts
 from src.autopilot.telegram_edge import (
     TelegramError,
     TelegramSettings,
@@ -54,8 +54,7 @@ def test_settings_require_complete_pair_and_explicit_pause_allowlist():
 def test_settings_file_is_explicit_private_and_strictly_allowlisted(monkeypatch, tmp_path):
     settings_file = tmp_path / "telegram.env"
     settings_file.write_text(
-        "AUTOPILOT_TELEGRAM_BOT_TOKEN=file-token\n"
-        "AUTOPILOT_TELEGRAM_CHAT_ID=123\n",
+        "AUTOPILOT_TELEGRAM_BOT_TOKEN=file-token\nAUTOPILOT_TELEGRAM_CHAT_ID=123\n",
         encoding="utf-8",
     )
     settings_file.chmod(0o600)
@@ -268,9 +267,10 @@ def test_alert_rendering_omits_protected_results_and_redacts_secret_patterns():
 
 
 def test_existing_alert_path_adds_telegram_without_replacing_webhook(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUTOPILOT_TELEGRAM_BOT_TOKEN", "configured-for-test")
     monkeypatch.setattr(
         "src.autopilot.notifications.send_alert_from_environment",
-        lambda payload: {"ok": True, "message_id": 12},
+        lambda payload, **_kwargs: {"ok": True, "message_id": 12},
     )
 
     result = emit_alert(
@@ -284,9 +284,11 @@ def test_existing_alert_path_adds_telegram_without_replacing_webhook(monkeypatch
     )
 
     assert result["sent"] is True
-    assert result["telegram"] == {"ok": True, "message_id": 12}
-    saved = json.loads((tmp_path / "alerts.jsonl").read_text().splitlines()[0])
-    assert saved["telegram"] == {"ok": True, "message_id": 12}
+    assert result["remote_delivery"] == {"status": "queued"}
+    assert wait_for_remote_alerts()
+    records = [json.loads(line) for line in (tmp_path / "alerts.jsonl").read_text().splitlines()]
+    assert records[0]["schema"] == "autopilot.alert/v1"
+    assert records[1]["telegram"] == {"ok": True, "message_id": 12}
 
 
 def test_status_snapshot_is_allowlisted_and_excludes_raw_errors_and_secrets(tmp_path):
@@ -346,9 +348,7 @@ def test_status_snapshot_is_allowlisted_and_excludes_raw_errors_and_secrets(tmp_
     assert snapshot["products"][0]["name"] == "active_income"
     assert snapshot["products"][0]["open_positions"] == 1
     assert snapshot["research"]["summary"]["keepers"] == 1
-    assert snapshot["research"]["summary"]["top_reasons"] == {
-        "no_train_edge": 3
-    }
+    assert snapshot["research"]["summary"]["top_reasons"] == {"no_train_edge": 3}
     assert "never-export" not in rendered
     assert "holdout" not in rendered.lower()
     assert "final_test" not in rendered.lower()
@@ -390,7 +390,10 @@ def test_authorized_pause_product_is_audited_and_no_resume_command_exists(tmp_pa
     assert load_control(control)["paused_products"] == ["active_income"]
 
 
-@pytest.mark.parametrize("command", ["/approve active_income", "/activate x", "/resume", "/panic", "/flatten active_income"])
+@pytest.mark.parametrize(
+    "command",
+    ["/approve active_income", "/activate x", "/resume", "/panic", "/flatten active_income"],
+)
 def test_dangerous_or_privilege_increasing_commands_are_always_refused(command, tmp_path):
     control = tmp_path / "control.json"
 
@@ -451,6 +454,37 @@ def test_poll_once_advances_offset_and_applies_idempotent_pause(tmp_path):
     assert json.loads(state.read_text())["next_update_id"] == 16
     assert load_control(control)["paused"] is True
     assert calls[0][1]["offset"] == 0
+
+
+def test_poll_once_reads_legacy_offset_before_writing_narrowed_state_path(tmp_path, monkeypatch):
+    from src.autopilot import telegram_edge
+
+    legacy = tmp_path / "telegram_poll_state.json"
+    narrowed = tmp_path / "telegram" / "telegram_poll_state.json"
+    legacy.write_text('{"next_update_id": 42}\n', encoding="utf-8")
+    monkeypatch.setattr(telegram_edge, "DEFAULT_POLL_STATE", narrowed)
+    monkeypatch.setattr(telegram_edge, "LEGACY_POLL_STATE", legacy)
+    requests = []
+
+    def post(url, *, json, timeout):
+        requests.append((url, json, timeout))
+        return FakeResponse({"ok": True, "result": []})
+
+    report = poll_once(
+        settings=settings(),
+        status_path=tmp_path / "status.json",
+        control_path=tmp_path / "control.json",
+        control_audit_path=tmp_path / "audit.jsonl",
+        poll_state_path=narrowed,
+        product_names=set(),
+        long_poll_seconds=0,
+        post=post,
+    )
+
+    assert report["next_update_id"] == 42
+    assert requests[0][1]["offset"] == 42
+    assert json.loads(narrowed.read_text(encoding="utf-8"))["next_update_id"] == 42
+    assert json.loads(legacy.read_text(encoding="utf-8"))["next_update_id"] == 42
 
 
 def test_poll_once_does_not_acknowledge_failed_control_update(monkeypatch, tmp_path):

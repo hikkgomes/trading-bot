@@ -83,16 +83,16 @@ def rank_features_blended(
     direction: str | None = None,
 ) -> list[str]:
     importance_ranked = rank_features_by_importance(
-        train, features, target_column, max_features=len(features), direction=direction,
+        train,
+        features,
+        target_column,
+        max_features=len(features),
+        direction=direction,
     )
     spearman_scores = _spearman_ranks(train, features, target_column, direction=direction)
 
-    importance_rank = pd.Series(
-        {f: i for i, f in enumerate(importance_ranked)}, dtype=float
-    )
-    spearman_rank = pd.Series(
-        {f: i for i, f in enumerate(spearman_scores.index)}, dtype=float
-    )
+    importance_rank = pd.Series({f: i for i, f in enumerate(importance_ranked)}, dtype=float)
+    spearman_rank = pd.Series({f: i for i, f in enumerate(spearman_scores.index)}, dtype=float)
 
     all_features = set(importance_rank.index) | set(spearman_rank.index)
     worst = float(len(all_features))
@@ -117,7 +117,10 @@ def suggest_feature_pairs(
     sample_rows: int = 5000,
 ) -> list[tuple[str, str]]:
     top_features = rank_features_by_importance(
-        train, features, target_column, max_features=top_features_for_shap,
+        train,
+        features,
+        target_column,
+        max_features=top_features_for_shap,
     )
     x = train[top_features]
     y = train[target_column]
@@ -185,7 +188,7 @@ def _importance_based_pairs(
 
     pairs: list[tuple[str, str]] = []
     for i_pos, i in enumerate(ranked_indices):
-        for j in ranked_indices[i_pos + 1:]:
+        for j in ranked_indices[i_pos + 1 :]:
             pairs.append((features[i], features[j]))
             if len(pairs) >= max_pairs:
                 return pairs

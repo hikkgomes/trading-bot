@@ -62,13 +62,13 @@ def numeric_feature_columns(data: pd.DataFrame) -> list[str]:
     excluded = {"timestamp", "tf_15m_close"} | set(TARGET_COLUMNS)
     excluded.update(column for column in data.columns if column.startswith("future_return_"))
     return [
-        column
-        for column in data.select_dtypes(include="number").columns
-        if column not in excluded
+        column for column in data.select_dtypes(include="number").columns if column not in excluded
     ]
 
 
-def split_train_test(data: pd.DataFrame, train_fraction: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+def split_train_test(
+    data: pd.DataFrame, train_fraction: float
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     if not 0 < train_fraction < 1:
         raise ValueError("train_fraction must be between 0 and 1")
     split_index = int(len(data) * train_fraction)
@@ -320,7 +320,7 @@ def detect_cross_feature_pairs(features: Sequence[str]) -> list[tuple[str, str]]
             continue
         members_sorted = sorted(members)
         for i, a in enumerate(members_sorted):
-            for b in members_sorted[i + 1:]:
+            for b in members_sorted[i + 1 :]:
                 pairs.append((a, b))
     return pairs
 
@@ -448,14 +448,14 @@ def condition_mask(data: pd.DataFrame, condition: Condition) -> pd.Series:
     if div_match:
         direction = div_match.group(1)
         window = int(div_match.group(2))
-        
+
         # Determine the timeframe for this feature to get the correct close price
         tf = "15m"
         if condition.feature.startswith("tf_"):
             parts = condition.feature.split("_", 3)
             if len(parts) >= 3:
                 tf = parts[1]
-        
+
         close_col = f"tf_{tf}_close"
         if close_col in data.columns:
             price = data[close_col]
@@ -464,16 +464,16 @@ def condition_mask(data: pd.DataFrame, condition: Condition) -> pd.Series:
             if close_cols:
                 price = data[close_cols[0]]
             else:
-                raise KeyError(f"Could not find close column (tried {close_col} and others) in DataFrame.")
+                raise KeyError(
+                    f"Could not find close column (tried {close_col} and others) in DataFrame."
+                )
 
         if direction == "bull":
-            return (
-                (price == price.rolling(window, min_periods=window).min())
-                & (series > series.rolling(window, min_periods=window).min())
+            return (price == price.rolling(window, min_periods=window).min()) & (
+                series > series.rolling(window, min_periods=window).min()
             )
-        return (
-            (price == price.rolling(window, min_periods=window).max())
-            & (series < series.rolling(window, min_periods=window).max())
+        return (price == price.rolling(window, min_periods=window).max()) & (
+            series < series.rolling(window, min_periods=window).max()
         )
 
     raise ValueError(f"Unknown condition kind: {condition.kind}")
@@ -592,9 +592,7 @@ def add_validation_metrics(
         if row["conditions"] == 1:
             rule_conditions = [conditions[int(row["condition_index"])]]
         else:
-            rule_conditions = [
-                conditions[index] for index in json.loads(row["condition_indices"])
-            ]
+            rule_conditions = [conditions[index] for index in json.loads(row["condition_indices"])]
         test_metrics = evaluate_rule(test, rule_conditions, target_column)
         rows.append(
             {
@@ -636,9 +634,7 @@ def add_year_metrics(
         if row["conditions"] == 1:
             rule_conditions = [conditions[int(row["condition_index"])]]
         else:
-            rule_conditions = [
-                conditions[index] for index in json.loads(row["condition_indices"])
-            ]
+            rule_conditions = [conditions[index] for index in json.loads(row["condition_indices"])]
         for year, year_data in dated.groupby("year"):
             metrics = evaluate_rule(year_data, rule_conditions, target_column)
             rows.append(

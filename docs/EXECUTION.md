@@ -59,9 +59,10 @@ credentials. A real order is sent **only when all** of these hold:
   must successfully set it before an entry
 * Binance USD-M must report one-way position mode (`positionSide=BOTH`); hedge
   mode is refused
-* immediately before a non-reduce futures `create_order`, the broker re-fetches
-  the signed position and requires it to be flat; concurrent external exposure
-  cannot be stacked or offset
+* immediately before a non-reduce futures `create_order`, the broker performs
+  unfiltered USD-M account reads and requires every position plus every regular
+  and conditional order across all symbols to be empty; concurrent or manual
+  exposure cannot be hidden outside the configured BTC symbol
 
 Otherwise `place_order` raises, so a misconfigured run cannot trade real size.
 Set `EXCHANGE_TESTNET=1` only for the exchange sandbox rehearsal. Production
@@ -337,22 +338,25 @@ and the observed free-USDT delta available for buyback. BTC accumulation never r
 the futures broker, so it cannot use leverage.
 
 Emergency control is file-based. Adding a live futures product to
-`flatten_products` in `runtime/control.json` asks the runtime to close the broker
-position with a reduce-only market order and clear local open-position state
-only after the broker reports flat and every tracked native stop is proved
-terminal. A BTC-accumulation flatten buys back exactly one fully tracked spot
+`flatten_products` in `runtime/operator-control/control.json` asks the runtime to close the broker
+position with a deterministic-client-ID reduce-only market order. Before
+submission it writes `flatten_intent`; after the fill it durably records the
+fill, before/after broker position, before/after quote balance, and realized
+account delta. It clears local open-position state only after the broker reports
+flat, every tracked native stop is proved terminal, and the keyed trade/equity/
+daily-PnL/cooldown accounting transition commits exactly once. A BTC-accumulation flatten buys back exactly one fully tracked spot
 step-aside position; it never sells the base BTC stack. Its normalized buyback
 is protected by a durable `flatten_intent`, so an ambiguous restart cannot send
 the same buy twice. Invalid or insufficient state fails closed.
 
 An emergency runtime flatten is an operator recovery path, not a normal bot exit.
 The runtime atomically clears a successful flatten request while leaving the
-affected product (or all products for `flatten_all`) paused. For futures,
-it does not currently append a trade row or apply the realized fill/funding delta
-to `daily_pnl`, equity, or the consecutive-loss cooldown. Keep that pause in
-place after the broker is flat; reconcile the
-exchange balance, fill fees, funding history, local state, and trade ledger before
-explicitly resuming. Resuming immediately can understate that day's loss limit.
+affected product (or all products for `flatten_all`) paused. A crash after the
+accounting commit but before that control update is idempotent: the next pass
+proves the same account is flat account-wide, verifies the keyed trade row and
+`last_flatten` evidence, sends no order, and clears the stale request. Any
+ambiguous submit, missing fill/fee evidence, malformed inventory, or incomplete
+accounting keeps the request and product paused for reconciliation.
 
 Preflight never places orders. Sandbox and production evidence are distinct.
 For a testnet rehearsal use:
@@ -371,7 +375,7 @@ For the saved production gate, switch to production credentials and
 `EXCHANGE_TESTNET=0`, then run `make preflight PRODUCT=active_income` (or
 `PRODUCT=btc_accumulation`). Production preflight refuses testnet routing.
 
-The check validates approval, artifact/product identity, the execution-engine
+The read-only check validates artifact/product identity, the execution-engine
 digest (Python, pinned installed versions, and source), environment, broker
 construction, and read-only ticker/balance/position access. Futures also proves
 one-way position mode, native-stop capability, empty regular/conditional order
@@ -380,8 +384,11 @@ bound to the exact artifact digest/fingerprints, engine, and a non-secret accoun
 fingerprint derived from API key plus venue/market/testnet routing. Current
 exchange, market, account, testnet flag, quote asset, notional/slippage caps,
 leverage, and margin mode must exactly match the production report; any change
-requires a new connected preflight. Product starting equity/regime settings and
-execution-capable code/dependency changes also invalidate prior evidence.
+requires new connected evidence. Final human approval pins that stable
+account/venue/risk-cap manifest plus every canonical product field/path. A fresh
+equivalent preflight renews the runtime age gate without requiring reapproval;
+manifest drift does require it. Product settings and execution-capable
+code/dependency changes also invalidate prior evidence.
 
 The live runtime independently enforces
 `TRADING_LIVE=1`, exchange credentials, a positive

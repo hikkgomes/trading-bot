@@ -1242,7 +1242,8 @@ def build_generation(
                 if method == "recursive_mutation" and usable:
                     parent = _choose_parent(usable, feedback=feedback, rng=rng)
                     parent_hypothesis = _parent_hypothesis(parent)
-                    assert parent_hypothesis is not None
+                    if parent_hypothesis is None:
+                        raise ValueError("selected mutation parent has no valid hypothesis")
                     latest = parent.get("latest_evaluation")
                     failure_reasons = (
                         tuple(str(item) for item in latest.get("rejection_reasons") or [])
@@ -1278,7 +1279,8 @@ def build_generation(
                     first, second = rng.choices(compatible_pairs, weights=pair_weights, k=1)[0]
                     first_hypothesis = _parent_hypothesis(first)
                     second_hypothesis = _parent_hypothesis(second)
-                    assert first_hypothesis is not None and second_hypothesis is not None
+                    if first_hypothesis is None or second_hypothesis is None:
+                        raise ValueError("selected crossover parent has no valid hypothesis")
                     idea = crossover_hypotheses(
                         first_hypothesis,
                         second_hypothesis,
