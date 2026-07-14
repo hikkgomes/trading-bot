@@ -28,7 +28,11 @@ def _timestamped(data: pd.DataFrame) -> pd.DataFrame:
             out = out.rename(columns={first: "timestamp"})
     if "timestamp" not in out.columns:
         raise ValueError("Missing timestamp column")
-    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
+    # pandas preserves the source datetime resolution (for example, Parquet
+    # inputs may decode as milliseconds or microseconds). ``merge_asof``
+    # requires both keys to have the exact same dtype, so normalise every
+    # regime timestamp before independently loaded frames are merged.
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True).astype("datetime64[ns, UTC]")
     return out
 
 

@@ -64,6 +64,29 @@ def test_add_regime_column_from_daily_merges_to_intraday_rows():
     assert (out["tf_1d_regime_id"] != -1).sum() > 96
 
 
+def test_add_regime_column_from_daily_normalizes_mixed_timestamp_resolutions():
+    intraday = pd.DataFrame(
+        {
+            "timestamp": pd.date_range(
+                "2024-01-01", periods=96 * 80, freq="15min", tz="UTC"
+            ).as_unit("ms"),
+            "close": range(96 * 80),
+        }
+    )
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=80, freq="D", tz="UTC").as_unit("us"),
+            "close": [100 + i + (10 if i % 9 == 0 else 0) for i in range(80)],
+        }
+    )
+
+    out = add_regime_column_from_daily(intraday, daily)
+
+    assert len(out) == len(intraday)
+    assert str(out["timestamp"].dtype) == "datetime64[ns, UTC]"
+    assert (out["tf_1d_regime_id"] != -1).sum() > 96
+
+
 def test_regime_labels_are_causal_prefix_invariant_and_semantically_stable():
     rng = pd.Series(range(600), dtype=float)
     returns = pd.concat(
