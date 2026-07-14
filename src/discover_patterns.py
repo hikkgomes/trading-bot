@@ -2,17 +2,16 @@ import argparse
 import json
 import logging
 import re
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
 
 from src.build_dataset import TARGET_COLUMNS
-from src.config import PROJECT_ROOT, PROCESSED_DATA_DIR
+from src.config import PROCESSED_DATA_DIR, PROJECT_ROOT
 from src.load_data import configure_logging
-
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_INPUT_PATH = PROCESSED_DATA_DIR / "train_15m_indicators.parquet"
@@ -28,13 +27,13 @@ class Condition:
     kind: str
     threshold: float
     description: str
-    feature_b: Optional[str] = None
-    threshold_source: Optional[str] = None
-    quantile: Optional[float] = None
-    lookback: Optional[int] = None
-    cross_feature: Optional[str] = None
+    feature_b: str | None = None
+    threshold_source: str | None = None
+    quantile: float | None = None
+    lookback: int | None = None
+    cross_feature: str | None = None
 
-    def signature(self) -> Tuple[str, str, float, Optional[str]]:
+    def signature(self) -> tuple[str, str, float, str | None]:
         return (self.feature, self.kind, round(float(self.threshold), 6), self.feature_b)
 
 
@@ -59,17 +58,17 @@ def load_dataset(path: Path, horizon_bars: int) -> pd.DataFrame:
     return data
 
 
-def numeric_feature_columns(data: pd.DataFrame) -> List[str]:
+def numeric_feature_columns(data: pd.DataFrame) -> list[str]:
     excluded = {"timestamp", "tf_15m_close"} | set(TARGET_COLUMNS)
     excluded.update(column for column in data.columns if column.startswith("future_return_"))
     return [
-        column
-        for column in data.select_dtypes(include="number").columns
-        if column not in excluded
+        column for column in data.select_dtypes(include="number").columns if column not in excluded
     ]
 
 
-def split_train_test(data: pd.DataFrame, train_fraction: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def split_train_test(
+    data: pd.DataFrame, train_fraction: float
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     if not 0 < train_fraction < 1:
         raise ValueError("train_fraction must be between 0 and 1")
     split_index = int(len(data) * train_fraction)
@@ -83,7 +82,7 @@ def rank_features(
     feature_columns: Iterable[str],
     target_column: str,
     max_features: int,
-) -> List[str]:
+) -> list[str]:
     target = train[target_column]
     scored = []
     for column in feature_columns:
@@ -99,7 +98,7 @@ def rank_features(
     return [column for column, _, _ in scored[:max_features]]
 
 
-def _finite_quantiles(series: pd.Series, quantiles: Sequence[float]) -> Dict[float, float]:
+def _finite_quantiles(series: pd.Series, quantiles: Sequence[float]) -> dict[float, float]:
     clean = series.replace([np.inf, -np.inf], np.nan).dropna()
     if clean.empty:
         return {}
@@ -107,8 +106,8 @@ def _finite_quantiles(series: pd.Series, quantiles: Sequence[float]) -> Dict[flo
     return {float(key): float(value) for key, value in values.items() if pd.notna(value)}
 
 
-def build_conditions(train: pd.DataFrame, features: Sequence[str]) -> List[Condition]:
-    conditions: List[Condition] = []
+def build_conditions(train: pd.DataFrame, features: Sequence[str]) -> list[Condition]:
+    conditions: list[Condition] = []
     for feature in features:
         quantiles = _finite_quantiles(train[feature], [0.1, 0.2, 0.8, 0.9])
         for quantile, threshold in quantiles.items():
@@ -165,7 +164,7 @@ def build_conditions(train: pd.DataFrame, features: Sequence[str]) -> List[Condi
     return conditions
 
 
-DEFAULT_ENABLED_KINDS: Set[str] = {
+DEFAULT_ENABLED_KINDS: set[str] = {
     "value",
     "delta",
     "slope",
@@ -177,8 +176,8 @@ DEFAULT_ENABLED_KINDS: Set[str] = {
 
 def build_slope_conditions(
     train: pd.DataFrame, feature: str, windows: Sequence[int] = (3, 5, 10)
-) -> List[Condition]:
-    conditions: List[Condition] = []
+) -> list[Condition]:
+    conditions: list[Condition] = []
     for window in windows:
         slope = (train[feature] - train[feature].shift(window)) / window
         for quantile, threshold in _finite_quantiles(slope, [0.1, 0.9]).items():
@@ -210,9 +209,9 @@ def build_slope_conditions(
 
 
 def build_cross_conditions(
-    train: pd.DataFrame, feature_pairs: Sequence[Tuple[str, str]]
-) -> List[Condition]:
-    conditions: List[Condition] = []
+    train: pd.DataFrame, feature_pairs: Sequence[tuple[str, str]]
+) -> list[Condition]:
+    conditions: list[Condition] = []
     for feature_a, feature_b in feature_pairs:
         if feature_a not in train.columns or feature_b not in train.columns:
             continue
@@ -240,9 +239,9 @@ def build_cross_conditions(
 
 
 def build_ratio_conditions(
-    train: pd.DataFrame, feature_pairs: Sequence[Tuple[str, str]]
-) -> List[Condition]:
-    conditions: List[Condition] = []
+    train: pd.DataFrame, feature_pairs: Sequence[tuple[str, str]]
+) -> list[Condition]:
+    conditions: list[Condition] = []
     for feature_a, feature_b in feature_pairs:
         if feature_a not in train.columns or feature_b not in train.columns:
             continue
@@ -280,8 +279,8 @@ def build_divergence_conditions(
     train: pd.DataFrame,
     features: Sequence[str],
     windows: Sequence[int] = (10, 20),
-) -> List[Condition]:
-    conditions: List[Condition] = []
+) -> list[Condition]:
+    conditions: list[Condition] = []
     if "tf_15m_close" not in train.columns:
         return conditions
     for feature in features:
@@ -307,21 +306,21 @@ def build_divergence_conditions(
     return conditions
 
 
-def detect_cross_feature_pairs(features: Sequence[str]) -> List[Tuple[str, str]]:
-    by_base: Dict[str, List[str]] = {}
+def detect_cross_feature_pairs(features: Sequence[str]) -> list[tuple[str, str]]:
+    by_base: dict[str, list[str]] = {}
     for feature in features:
         parts = feature.split("_", 2)
         if len(parts) >= 3 and parts[0] == "tf":
             base = parts[2]
             by_base.setdefault(base, []).append(feature)
 
-    pairs: List[Tuple[str, str]] = []
-    for base, members in by_base.items():
+    pairs: list[tuple[str, str]] = []
+    for _base, members in by_base.items():
         if len(members) < 2:
             continue
         members_sorted = sorted(members)
         for i, a in enumerate(members_sorted):
-            for b in members_sorted[i + 1:]:
+            for b in members_sorted[i + 1 :]:
                 pairs.append((a, b))
     return pairs
 
@@ -329,10 +328,10 @@ def detect_cross_feature_pairs(features: Sequence[str]) -> List[Tuple[str, str]]
 def build_all_conditions(
     train: pd.DataFrame,
     features: Sequence[str],
-    enabled_kinds: Set[str] = DEFAULT_ENABLED_KINDS,
-    cross_feature_pairs: Optional[Sequence[Tuple[str, str]]] = None,
-) -> List[Condition]:
-    conditions: List[Condition] = []
+    enabled_kinds: set[str] = DEFAULT_ENABLED_KINDS,
+    cross_feature_pairs: Sequence[tuple[str, str]] | None = None,
+) -> list[Condition]:
+    conditions: list[Condition] = []
 
     for feature in features:
         if "value" in enabled_kinds:
@@ -449,14 +448,14 @@ def condition_mask(data: pd.DataFrame, condition: Condition) -> pd.Series:
     if div_match:
         direction = div_match.group(1)
         window = int(div_match.group(2))
-        
+
         # Determine the timeframe for this feature to get the correct close price
         tf = "15m"
         if condition.feature.startswith("tf_"):
             parts = condition.feature.split("_", 3)
             if len(parts) >= 3:
                 tf = parts[1]
-        
+
         close_col = f"tf_{tf}_close"
         if close_col in data.columns:
             price = data[close_col]
@@ -465,22 +464,22 @@ def condition_mask(data: pd.DataFrame, condition: Condition) -> pd.Series:
             if close_cols:
                 price = data[close_cols[0]]
             else:
-                raise KeyError(f"Could not find close column (tried {close_col} and others) in DataFrame.")
+                raise KeyError(
+                    f"Could not find close column (tried {close_col} and others) in DataFrame."
+                )
 
         if direction == "bull":
-            return (
-                (price == price.rolling(window, min_periods=window).min())
-                & (series > series.rolling(window, min_periods=window).min())
+            return (price == price.rolling(window, min_periods=window).min()) & (
+                series > series.rolling(window, min_periods=window).min()
             )
-        return (
-            (price == price.rolling(window, min_periods=window).max())
-            & (series < series.rolling(window, min_periods=window).max())
+        return (price == price.rolling(window, min_periods=window).max()) & (
+            series < series.rolling(window, min_periods=window).max()
         )
 
     raise ValueError(f"Unknown condition kind: {condition.kind}")
 
 
-def evaluate_mask(mask: pd.Series, returns: pd.Series, baseline_mean: float) -> Dict[str, float]:
+def evaluate_mask(mask: pd.Series, returns: pd.Series, baseline_mean: float) -> dict[str, float]:
     selected = returns.loc[mask.fillna(False)]
     support = int(len(selected))
     if support == 0:
@@ -505,7 +504,7 @@ def evaluate_rule(
     data: pd.DataFrame,
     conditions: Sequence[Condition],
     target_column: str,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     mask = pd.Series(True, index=data.index)
     for condition in conditions:
         mask &= condition_mask(data, condition).fillna(False)
@@ -593,9 +592,7 @@ def add_validation_metrics(
         if row["conditions"] == 1:
             rule_conditions = [conditions[int(row["condition_index"])]]
         else:
-            rule_conditions = [
-                conditions[index] for index in json.loads(row["condition_indices"])
-            ]
+            rule_conditions = [conditions[index] for index in json.loads(row["condition_indices"])]
         test_metrics = evaluate_rule(test, rule_conditions, target_column)
         rows.append(
             {
@@ -637,9 +634,7 @@ def add_year_metrics(
         if row["conditions"] == 1:
             rule_conditions = [conditions[int(row["condition_index"])]]
         else:
-            rule_conditions = [
-                conditions[index] for index in json.loads(row["condition_indices"])
-            ]
+            rule_conditions = [conditions[index] for index in json.loads(row["condition_indices"])]
         for year, year_data in dated.groupby("year"):
             metrics = evaluate_rule(year_data, rule_conditions, target_column)
             rows.append(
@@ -667,7 +662,7 @@ def write_markdown_report(
     lines = [
         "# Pattern Discovery Report",
         "",
-        f"Base timeframe: 15m",
+        "Base timeframe: 15m",
         f"Future return horizon: {horizon_bars} bars ({horizon_bars * 15} minutes)",
         f"Train period: {train['timestamp'].min()} to {train['timestamp'].max()}",
         f"Test period: {test['timestamp'].min()} to {test['timestamp'].max()}",

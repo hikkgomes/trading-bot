@@ -24,7 +24,9 @@ class BollingerReversionStrategy(Strategy):
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         close = pd.Series(self.ohlcv(df).close, index=df.index)
-        lower, _, upper = ind.bollinger_bands(close, int(self.params["window"]), float(self.params["num_std"]))
+        lower, _, upper = ind.bollinger_bands(
+            close, int(self.params["window"]), float(self.params["num_std"])
+        )
         prev = close.shift(1)
         sig = self._empty_signals(df)
         # Trigger on the bar that crosses *into* the extreme (not every bar beyond).

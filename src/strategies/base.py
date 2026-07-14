@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -38,11 +37,11 @@ class OHLCV:
     high: np.ndarray
     low: np.ndarray
     close: np.ndarray
-    volume: Optional[np.ndarray]
+    volume: np.ndarray | None
     index: pd.Index
 
 
-def _find_column(df: pd.DataFrame, field_name: str, base_tf: Optional[str]) -> Optional[str]:
+def _find_column(df: pd.DataFrame, field_name: str, base_tf: str | None) -> str | None:
     candidates = []
     if base_tf:
         candidates.append(f"tf_{base_tf}_{field_name}")
@@ -58,7 +57,7 @@ def _find_column(df: pd.DataFrame, field_name: str, base_tf: Optional[str]) -> O
     return None
 
 
-def extract_ohlcv(df: pd.DataFrame, base_tf: Optional[str] = None) -> OHLCV:
+def extract_ohlcv(df: pd.DataFrame, base_tf: str | None = None) -> OHLCV:
     """Pull OHLCV arrays from ``df`` supporting plain and ``tf_{tf}_`` schemas.
 
     ``volume`` is optional (set to None when absent). Raises if OHLC are missing.
@@ -116,13 +115,13 @@ class Strategy(ABC):
     description: str = ""
 
     def __init__(self, **params):
-        self.params: Dict = {**self.default_params(), **params}
+        self.params: dict = {**self.default_params(), **params}
         # Set by the backtester/runner so generate_signals can resolve the
         # right tf_{tf}_ OHLCV columns when several timeframes are present.
-        self.base_tf: Optional[str] = None
+        self.base_tf: str | None = None
 
     @classmethod
-    def default_params(cls) -> Dict:
+    def default_params(cls) -> dict:
         """Tunable parameters and their defaults. Override in subclasses."""
         return {}
 
@@ -132,7 +131,7 @@ class Strategy(ABC):
         any field. Override to ship sensible TP/SL/horizon defaults."""
         return BacktestConfig()
 
-    def fit(self, df: pd.DataFrame) -> "Strategy":
+    def fit(self, df: pd.DataFrame) -> Strategy:
         """Optional training hook (ML strategies). No-op for rule strategies."""
         return self
 

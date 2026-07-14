@@ -27,19 +27,37 @@ def _synth(n=4000, seed=3):
 
 # All rule (non-fittable, non-bridge) strategies: signal-only, need just OHLCV.
 _RULE_STRATEGIES = [
-    "sma_cross", "rsi_reversion", "donchian_breakout", "multi_tf_trend",
-    "macd_trend", "supertrend", "adx_trend", "bollinger_reversion",
-    "zscore_reversion", "stochastic_reversion", "keltner_breakout",
-    "atr_channel_breakout", "bollinger_squeeze", "momentum_roc",
-    "candlestick_reversal", "swing_structure", "btc_cycle_guard",
-    "rsi_divergence", "regression_channel",
+    "sma_cross",
+    "rsi_reversion",
+    "donchian_breakout",
+    "multi_tf_trend",
+    "macd_trend",
+    "supertrend",
+    "adx_trend",
+    "bollinger_reversion",
+    "zscore_reversion",
+    "stochastic_reversion",
+    "keltner_breakout",
+    "atr_channel_breakout",
+    "bollinger_squeeze",
+    "momentum_roc",
+    "candlestick_reversal",
+    "swing_structure",
+    "btc_cycle_guard",
+    "rsi_divergence",
+    "regression_channel",
 ]
 
 
 # --------------------------------------------------------------------------- registry
 def test_registry_contains_library():
     names = available()
-    for expected in _RULE_STRATEGIES + ["ml_classifier", "ml_regressor", "condition_grid"]:
+    for expected in _RULE_STRATEGIES + [
+        "ml_classifier",
+        "ml_regressor",
+        "condition_grid",
+        "regime_filter",
+    ]:
         assert expected in names
 
 
@@ -78,10 +96,19 @@ def test_backtester_matches_search_engine():
     rng = np.random.default_rng(0)
     mask = pd.Series(rng.random(len(df)) < 0.05, index=df.index)
 
-    cfg = BacktestConfig(fee_bps=10, slippage_bps=2, take_profit=0.05, stop_loss=0.03, horizon_bars=96)
+    cfg = BacktestConfig(
+        fee_bps=10, slippage_bps=2, take_profit=0.05, stop_loss=0.03, horizon_bars=96
+    )
     search_trades = simulate_trades(
-        tf, mask.reset_index(drop=True), direction="long", horizon_bars=96,
-        fee_bps=10, slippage_bps=2, take_profit=0.05, stop_loss=0.03, pnl_unit="usdt",
+        tf,
+        mask.reset_index(drop=True),
+        direction="long",
+        horizon_bars=96,
+        fee_bps=10,
+        slippage_bps=2,
+        take_profit=0.05,
+        stop_loss=0.03,
+        pnl_unit="usdt",
     )
 
     o = extract_ohlcv(df)
@@ -90,7 +117,9 @@ def test_backtester_matches_search_engine():
 
     assert len(ours) == len(search_trades)
     ours_net = np.array([t["net_return"] for t in ours])
-    np.testing.assert_allclose(ours_net, search_trades["net_return"].to_numpy(), rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(
+        ours_net, search_trades["net_return"].to_numpy(), rtol=1e-9, atol=1e-12
+    )
 
 
 def test_btc_pnl_unit_only_shorts_realise():
@@ -102,6 +131,51 @@ def test_btc_pnl_unit_only_shorts_realise():
     trades = _simulate(o.open, o.high, o.low, o.close, direction, df.index, cfg)
     # In BTC mode longs realise gross 0 -> net == -cost for every trade.
     assert all(abs(t["gross_return"]) < 1e-12 for t in trades)
+
+
+def test_canonical_backtester_uses_product_specific_short_return_math():
+    open_ = np.array([100.0, 100.0, 90.0])
+    high = np.array([100.0, 100.0, 100.0])
+    low = np.array([100.0, 100.0, 90.0])
+    close = np.array([100.0, 100.0, 90.0])
+    direction = np.array([-1, 0, 0])
+    index = pd.RangeIndex(3)
+
+    usdt_trade = _simulate(
+        open_,
+        high,
+        low,
+        close,
+        direction,
+        index,
+        BacktestConfig(
+            fee_bps=0,
+            slippage_bps=0,
+            take_profit=0.5,
+            stop_loss=0.5,
+            horizon_bars=1,
+            pnl_unit="usdt",
+        ),
+    )[0]
+    btc_trade = _simulate(
+        open_,
+        high,
+        low,
+        close,
+        direction,
+        index,
+        BacktestConfig(
+            fee_bps=0,
+            slippage_bps=0,
+            take_profit=0.5,
+            stop_loss=0.5,
+            horizon_bars=1,
+            pnl_unit="btc",
+        ),
+    )[0]
+
+    assert usdt_trade["gross_return"] == pytest.approx(0.10)
+    assert btc_trade["gross_return"] == pytest.approx(1 / 9)
 
 
 # --------------------------------------------------------------------------- indicators
@@ -159,9 +233,7 @@ def test_swing_levels_no_lookahead():
     # Compare the region that is fully confirmed in both (exclude the last `pivot`
     # bars of the truncated series, whose pivots can't be confirmed yet).
     safe = cut - pivot
-    pd.testing.assert_series_equal(
-        full.iloc[:safe], trunc.iloc[:safe], check_freq=False
-    )
+    pd.testing.assert_series_equal(full.iloc[:safe], trunc.iloc[:safe], check_freq=False)
 
 
 def test_candlestick_patterns_detect():
@@ -206,15 +278,135 @@ def test_ml_classifier_fit_predict():
     assert set(pd.unique(sig.dropna())).issubset({-1, 0, 1})
 
 
+def test_ml_classifier_triple_barrier_target():
+    df = pd.DataFrame(
+        {
+            "open": [100, 100, 100, 100, 100, 100],
+            "high": [100, 106, 101, 101, 101, 101],
+            "low": [100, 99, 96, 99, 99, 99],
+            "close": [100, 105, 97, 100, 100, 100],
+            "feat": [1, 2, 3, 4, 5, 6],
+        }
+    )
+    strat = get("ml_classifier")(
+        horizon=2, label_mode="triple_barrier", label_tp=0.05, label_sl=0.03
+    )
+
+    target = strat._target(df)
+
+    assert target.iloc[0] == 1.0
+    assert target.iloc[1] == 0.0
+
+
+def test_ml_classifier_triple_barrier_fit_predict_with_screening():
+    df = _synth_with_features(n=1800, seed=22)
+    split = int(len(df) * 0.7)
+    strat = get("ml_classifier")(
+        horizon=16,
+        label_mode="triple_barrier",
+        label_tp=0.01,
+        label_sl=0.01,
+        feature_screen="spearman",
+        max_features=2,
+        model="sklearn",
+    )
+
+    strat.fit(df.iloc[:split])
+    sig = strat.generate_signals(df.iloc[split:])
+
+    assert strat._features is not None
+    assert len(strat._features) <= 2
+    assert set(pd.unique(sig.dropna())).issubset({-1, 0, 1})
+
+
+def test_ml_regressor_triple_barrier_target():
+    df = pd.DataFrame(
+        {
+            "open": [100, 100, 100, 100, 100, 100],
+            "high": [100, 106, 101, 101, 101, 101],
+            "low": [100, 99, 96, 99, 99, 99],
+            "close": [100, 105, 97, 100, 100, 100],
+            "feat": [1, 2, 3, 4, 5, 6],
+        }
+    )
+    strat = get("ml_regressor")(
+        horizon=2, target_mode="triple_barrier", label_tp=0.05, label_sl=0.03
+    )
+
+    target = strat._target(df)
+
+    assert target.iloc[0] == 0.05
+    assert target.iloc[1] == -0.03
+
+
+def test_ml_regressor_triple_barrier_fit_predict_with_screening():
+    df = _synth_with_features(n=1800, seed=23)
+    split = int(len(df) * 0.7)
+    strat = get("ml_regressor")(
+        horizon=16,
+        target_mode="triple_barrier",
+        label_tp=0.01,
+        label_sl=0.01,
+        feature_screen="spearman",
+        max_features=2,
+        model="sklearn",
+    )
+
+    strat.fit(df.iloc[:split])
+    sig = strat.generate_signals(df.iloc[split:])
+
+    assert strat._features is not None
+    assert len(strat._features) <= 2
+    assert set(pd.unique(sig.dropna())).issubset({-1, 0, 1})
+
+
 # --------------------------------------------------------------------------- condition grid bridge
 def test_condition_grid_from_dict():
     from src.discover_patterns import Condition
 
     df = _synth(1000)
     df["tf_15m_close"] = df["close"]
-    cond = Condition(feature="tf_15m_close", kind="value_ge", threshold=float(df["close"].median()),
-                     description="close >= median")
+    cond = Condition(
+        feature="tf_15m_close",
+        kind="value_ge",
+        threshold=float(df["close"].median()),
+        description="close >= median",
+    )
     strat = get("condition_grid")(conditions=[cond], direction="long")
     sig = strat.generate_signals(df)
     assert set(pd.unique(sig.dropna())).issubset({0, 1})
     assert (sig == 1).sum() >= 1
+
+
+def test_regime_filter_masks_child_signals():
+    df = _synth(800)
+    df["tf_1d_regime_id"] = [0] * 400 + [1] * 400
+    base = get("sma_cross")(fast=5, slow=20)
+    wrapped = get("regime_filter")(
+        strategy="sma_cross",
+        regime_ids="1",
+        child_params={"fast": 5, "slow": 20},
+    )
+
+    base_sig = base.generate_signals(df)
+    filtered = wrapped.generate_signals(df)
+
+    assert (filtered.iloc[:400] == 0).all()
+    assert filtered.iloc[400:].equals(base_sig.iloc[400:])
+
+
+def test_regime_filter_uses_child_default_config():
+    wrapped = get("regime_filter")(strategy="sma_cross", regime_ids="1")
+
+    assert (
+        wrapped.resolved_default_config().horizon_bars
+        == get("sma_cross").default_config().horizon_bars
+    )
+
+
+def test_regime_filter_requires_regime_column():
+    df = _synth(300)
+    strat = get("regime_filter")(strategy="sma_cross", regime_ids="0")
+
+    with pytest.raises(ValueError, match="Missing regime column"):
+        strat.generate_signals(df)

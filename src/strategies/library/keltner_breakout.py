@@ -28,7 +28,12 @@ class KeltnerBreakoutStrategy(Strategy):
         low = pd.Series(o.low, index=df.index)
         close = pd.Series(o.close, index=df.index)
         lower, _, upper = ind.keltner_channels(
-            high, low, close, int(self.params["window"]), float(self.params["mult"]), int(self.params["atr_period"])
+            high,
+            low,
+            close,
+            int(self.params["window"]),
+            float(self.params["mult"]),
+            int(self.params["atr_period"]),
         )
         prev = close.shift(1)
         sig = self._empty_signals(df)

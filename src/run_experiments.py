@@ -1,12 +1,12 @@
 import argparse
 import json
 import logging
-import os
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
 
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/trading-bot-matplotlib")
-os.environ.setdefault("XDG_CACHE_HOME", "/tmp/trading-bot-cache")
+from src.cache_env import configure_private_process_cache
+
+configure_private_process_cache()
 
 import matplotlib
 
@@ -23,10 +23,14 @@ from sklearn.metrics import (
 )
 
 from src.build_dataset import TARGET_COLUMNS
-from src.config import PROJECT_ROOT, PROCESSED_DATA_DIR
+from src.config import PROCESSED_DATA_DIR, PROJECT_ROOT
 from src.load_data import configure_logging
-from src.train_model import get_feature_matrix, time_ordered_split, train_model
-
+from src.train_model import (
+    get_feature_matrix,
+    target_horizon_bars,
+    time_ordered_split,
+    train_model,
+)
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_INPUT_PATH = PROCESSED_DATA_DIR / "train_15m_indicators.parquet"
@@ -63,7 +67,7 @@ def _evaluate_regression(
     y_train: pd.Series,
     x_test: pd.DataFrame,
     y_test: pd.Series,
-) -> Dict[str, object]:
+) -> dict[str, object]:
     train_predictions = model.predict(x_train)
     test_predictions = model.predict(x_test)
     return {
@@ -96,7 +100,7 @@ def _evaluate_classification(
     y_train: pd.Series,
     x_test: pd.DataFrame,
     y_test: pd.Series,
-) -> Dict[str, object]:
+) -> dict[str, object]:
     y_train_int = y_train.astype(int)
     y_test_int = y_test.astype(int)
     train_probabilities = _classification_probabilities(model, x_train)
@@ -104,7 +108,7 @@ def _evaluate_classification(
     train_predictions = (train_probabilities >= 0.5).astype(int)
     test_predictions = (test_probabilities >= 0.5).astype(int)
     try:
-        test_roc_auc: Optional[float] = float(roc_auc_score(y_test_int, test_probabilities))
+        test_roc_auc: float | None = float(roc_auc_score(y_test_int, test_probabilities))
     except ValueError:
         test_roc_auc = None
 
@@ -135,7 +139,7 @@ def _get_feature_importance(model) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def _save_json(payload: Dict[str, object], path: Path) -> None:
+def _save_json(payload: dict[str, object], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     LOGGER.info("Wrote %s", path)
@@ -225,19 +229,33 @@ def run_experiment(
     train_fraction: float,
     output_base: Path,
     compute_shap: bool = False,
-) -> Dict[str, object]:
+) -> dict[str, object]:
     LOGGER.info("Running experiment for %s", target)
     features, labels = get_feature_matrix(data, target_column=target)
+    horizon_bars = target_horizon_bars(target)
     x_train, x_test, y_train, y_test = time_ordered_split(
-        features, labels, train_fraction
+        features,
+        labels,
+        train_fraction,
+        target_horizon_bars=horizon_bars,
     )
     objective = _objective_for_target(target)
-    model = train_model(x_train, y_train, objective=objective)
+    model = train_model(
+        x_train,
+        y_train,
+        objective=objective,
+        target_horizon_bars=horizon_bars,
+    )
 
     if _experiment_type(target) == "classification":
         metrics = _evaluate_classification(model, target, x_train, y_train, x_test, y_test)
     else:
         metrics = _evaluate_regression(model, target, x_train, y_train, x_test, y_test)
+    metrics.update(
+        target_horizon_bars=horizon_bars,
+        train_test_purge_rows=horizon_bars,
+        early_stopping_purge_rows=horizon_bars,
+    )
 
     metrics_dir = output_base / "metrics"
     charts_dir = output_base / "charts"
@@ -268,24 +286,28 @@ def walk_forward_splits(
     train_rows: int = DEFAULT_WALK_FORWARD_TRAIN_BARS,
     test_rows: int = DEFAULT_WALK_FORWARD_TEST_BARS,
     n_splits: int = DEFAULT_WALK_FORWARD_SPLITS,
-) -> List[Tuple[int, int, int, int]]:
+    target_horizon_bars: int = 0,
+) -> list[tuple[int, int, int, int]]:
     if train_rows <= 0 or test_rows <= 0 or n_splits <= 0:
         raise ValueError("Walk-forward train rows, test rows, and splits must be positive")
-    if row_count < train_rows + test_rows:
+    if target_horizon_bars < 0:
+        raise ValueError("target_horizon_bars must be non-negative")
+    if row_count < train_rows + target_horizon_bars + test_rows:
         raise ValueError(
             "Not enough rows for walk-forward validation: "
-            f"rows={row_count} train_rows={train_rows} test_rows={test_rows}"
+            f"rows={row_count} train_rows={train_rows} purge_rows={target_horizon_bars} "
+            f"test_rows={test_rows}"
         )
 
-    max_splits = (row_count - train_rows) // test_rows
+    max_splits = (row_count - train_rows - target_horizon_bars) // test_rows
     actual_splits = min(n_splits, max_splits)
     first_test_start = row_count - (actual_splits * test_rows)
     splits = []
     for split_number in range(actual_splits):
         test_start = first_test_start + split_number * test_rows
         test_end = test_start + test_rows
-        train_start = test_start - train_rows
-        train_end = test_start
+        train_end = test_start - target_horizon_bars
+        train_start = train_end - train_rows
         splits.append((train_start, train_end, test_start, test_end))
     return splits
 
@@ -293,8 +315,8 @@ def walk_forward_splits(
 def _split_by_bounds(
     features: pd.DataFrame,
     labels: pd.Series,
-    bounds: Tuple[int, int, int, int],
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    bounds: tuple[int, int, int, int],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
     train_start, train_end, test_start, test_end = bounds
     return (
         features.iloc[train_start:train_end],
@@ -311,20 +333,37 @@ def run_walk_forward_experiment(
     train_rows: int,
     test_rows: int,
     n_splits: int,
-) -> List[Dict[str, object]]:
+) -> list[dict[str, object]]:
     LOGGER.info("Running walk-forward experiment for %s", target)
     features, labels = get_feature_matrix(data, target_column=target)
-    bounds_list = walk_forward_splits(len(features), train_rows, test_rows, n_splits)
+    horizon_bars = target_horizon_bars(target)
+    bounds_list = walk_forward_splits(
+        len(features),
+        train_rows,
+        test_rows,
+        n_splits,
+        target_horizon_bars=horizon_bars,
+    )
     objective = _objective_for_target(target)
     metrics_rows = []
 
     for fold_index, bounds in enumerate(bounds_list, start=1):
         x_train, x_test, y_train, y_test = _split_by_bounds(features, labels, bounds)
-        model = train_model(x_train, y_train, objective=objective)
+        model = train_model(
+            x_train,
+            y_train,
+            objective=objective,
+            target_horizon_bars=horizon_bars,
+        )
         if _experiment_type(target) == "classification":
             metrics = _evaluate_classification(model, target, x_train, y_train, x_test, y_test)
         else:
             metrics = _evaluate_regression(model, target, x_train, y_train, x_test, y_test)
+        metrics.update(
+            target_horizon_bars=horizon_bars,
+            train_test_purge_rows=horizon_bars,
+            early_stopping_purge_rows=horizon_bars,
+        )
 
         train_start, train_end, test_start, test_end = bounds
         metrics.update(
@@ -347,7 +386,7 @@ def run_walk_forward_experiment(
     return metrics_rows
 
 
-def summarize_walk_forward(all_metrics: Iterable[Dict[str, object]], path: Path) -> None:
+def summarize_walk_forward(all_metrics: Iterable[dict[str, object]], path: Path) -> None:
     frame = pd.DataFrame(list(all_metrics))
     path.parent.mkdir(parents=True, exist_ok=True)
     if frame.empty:
@@ -386,7 +425,7 @@ def _format_metric(value: object) -> str:
     return str(value)
 
 
-def write_summary_markdown(all_metrics: List[Dict[str, object]], path: Path) -> None:
+def write_summary_markdown(all_metrics: list[dict[str, object]], path: Path) -> None:
     headers = [
         "target",
         "type",
@@ -411,9 +450,7 @@ def write_summary_markdown(all_metrics: List[Dict[str, object]], path: Path) -> 
     ]
     for metrics in all_metrics:
         lines.append(
-            "| "
-            + " | ".join(_format_metric(metrics.get(header)) for header in headers)
-            + " |"
+            "| " + " | ".join(_format_metric(metrics.get(header)) for header in headers) + " |"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -445,7 +482,7 @@ def run(
         write_summary_markdown(all_metrics, output_base / "metrics" / "summary.md")
 
     if validation_mode in {"walk-forward", "both"}:
-        all_walk_forward_metrics: List[Dict[str, object]] = []
+        all_walk_forward_metrics: list[dict[str, object]] = []
         for target in TARGET_COLUMNS:
             all_walk_forward_metrics.extend(
                 run_walk_forward_experiment(

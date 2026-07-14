@@ -17,11 +17,19 @@ from src.strategies.registry import register
 @register
 class MomentumRocStrategy(Strategy):
     name = "momentum_roc"
-    description = "Long when N-bar ROC exceeds +threshold; short below -threshold (optional trend gate)."
+    description = (
+        "Long when N-bar ROC exceeds +threshold; short below -threshold (optional trend gate)."
+    )
 
     @classmethod
     def default_params(cls):
-        return {"period": 24, "threshold": 3.0, "trend_ema": 200, "use_trend_gate": True, "allow_short": True}
+        return {
+            "period": 24,
+            "threshold": 3.0,
+            "trend_ema": 200,
+            "use_trend_gate": True,
+            "allow_short": True,
+        }
 
     @classmethod
     def default_config(cls) -> BacktestConfig:

@@ -19,7 +19,9 @@ from src.strategies.registry import register
 @register
 class SwingStructureStrategy(Strategy):
     name = "swing_structure"
-    description = "Long on a break above the last swing high; short on a break below the last swing low."
+    description = (
+        "Long on a break above the last swing high; short on a break below the last swing low."
+    )
 
     @classmethod
     def default_params(cls):

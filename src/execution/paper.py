@@ -9,7 +9,8 @@ trip (here applied per fill).
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional
+import math
+from collections.abc import Callable
 
 from src.execution.broker import Broker, Fill, Order, OrderSide, OrderType, Position
 
@@ -27,15 +28,22 @@ class PaperBroker(Broker):
         slippage_bps: float = 2.0,
     ):
         self._price_source = price_source
-        self._balance = float(starting_balance)
-        self.fee_bps = float(fee_bps)
-        self.slippage_bps = float(slippage_bps)
-        self._positions: Dict[str, Position] = {}
-        self.fills: List[Fill] = []
+        self._balance = _finite_non_negative("starting_balance", starting_balance)
+        self.fee_bps = _finite_non_negative("fee_bps", fee_bps)
+        self.slippage_bps = _finite_non_negative("slippage_bps", slippage_bps)
+        if self.slippage_bps >= 10_000:
+            raise ValueError("slippage_bps must be less than 10000.")
+        self._positions: dict[str, Position] = {}
+        self.fills: list[Fill] = []
 
     # -- market data --------------------------------------------------------
     def get_price(self, symbol: str) -> float:
-        return float(self._price_source(symbol))
+        price = float(self._price_source(symbol))
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError(
+                f"Paper price for {symbol} must be finite and positive, got {price:g}."
+            )
+        return price
 
     def get_balance(self) -> float:
         return self._balance
@@ -58,10 +66,21 @@ class PaperBroker(Broker):
         return ref * (1 + slip) if side == OrderSide.BUY else ref * (1 - slip)
 
     def place_order(self, order: Order) -> Fill:
-        if order.qty <= 0:
+        if not math.isfinite(float(order.qty)) or order.qty <= 0:
             raise ValueError("Order qty must be positive.")
-        ref = order.price if (order.type == OrderType.LIMIT and order.price) else self.get_price(order.symbol)
+        if order.type == OrderType.LIMIT:
+            if order.price is None:
+                raise ValueError("Limit order price is required.")
+            ref = float(order.price)
+        else:
+            ref = self.get_price(order.symbol)
+        if not math.isfinite(ref) or ref <= 0:
+            raise ValueError(f"Order price must be finite and positive, got {ref:g}.")
         fill_price = self._fill_price(order.side, ref)
+        if not math.isfinite(fill_price) or fill_price <= 0:
+            raise ValueError(f"Fill price must be finite and positive, got {fill_price:g}.")
+        if self._enforces_reduce_only() and order.reduce_only:
+            self._assert_reduce_only_order(order)
         fee = fill_price * order.qty * (self.fee_bps / 10_000.0)
         self._balance -= fee
 
@@ -91,6 +110,32 @@ class PaperBroker(Broker):
         self.fills.append(fill)
         return fill
 
+    def _enforces_reduce_only(self) -> bool:
+        return getattr(getattr(self, "config", None), "market_type", "futures") == "futures"
+
+    def _assert_reduce_only_order(self, order: Order) -> None:
+        pos = self.get_position(order.symbol)
+        if pos.is_flat:
+            raise ValueError("Reduce-only paper order requires an open position.")
+        if pos.qty > 0 and order.side != OrderSide.SELL:
+            raise ValueError("Reduce-only paper order side must reduce the current long position.")
+        if pos.qty < 0 and order.side != OrderSide.BUY:
+            raise ValueError("Reduce-only paper order side must reduce the current short position.")
+        if order.qty > abs(pos.qty) + 1e-12:
+            raise ValueError(
+                f"Reduce-only paper order quantity {order.qty:g} exceeds open position {abs(pos.qty):g}."
+            )
+
+
+def _finite_non_negative(name: str, value: float) -> float:
+    try:
+        clean = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be numeric.") from exc
+    if not math.isfinite(clean) or clean < 0:
+        raise ValueError(f"{name} must be finite and non-negative.")
+    return clean
+
 
 def binance_mark_price(symbol: str = "BTCUSDT", market: str = "futures") -> float:
     """Public mark price (no API key). Lazy ``requests`` import.
@@ -99,7 +144,11 @@ def binance_mark_price(symbol: str = "BTCUSDT", market: str = "futures") -> floa
     """
     import requests
 
-    base = "https://fapi.binance.com/fapi/v1" if market == "futures" else "https://api.binance.com/api/v3"
+    base = (
+        "https://fapi.binance.com/fapi/v1"
+        if market == "futures"
+        else "https://api.binance.com/api/v3"
+    )
     path = "/premiumIndex" if market == "futures" else "/ticker/price"
     resp = requests.get(f"{base}{path}", params={"symbol": symbol}, timeout=10)
     resp.raise_for_status()

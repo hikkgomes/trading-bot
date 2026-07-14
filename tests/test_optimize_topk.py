@@ -23,15 +23,17 @@ def test_optimize_topk_writes_output(tmp_path):
     )
     data.to_parquet(data_path, index=False)
     candidate = StrategyCandidate("long", 4, (Condition("signal", "value_ge", 1, "signal >= 1"),))
-    pd.DataFrame([
-        {
-            "direction": "long",
-            "take_profit": 0.003,
-            "stop_loss": 0.002,
-            "horizon_bars": 4,
-            "conditions_json": _conditions_payload(candidate),
-        }
-    ]).to_csv(rules, index=False)
+    pd.DataFrame(
+        [
+            {
+                "direction": "long",
+                "take_profit": 0.003,
+                "stop_loss": 0.002,
+                "horizon_bars": 4,
+                "conditions_json": _conditions_payload(candidate),
+            }
+        ]
+    ).to_csv(rules, index=False)
     run(rules, out, top_k=1, trials=2, input_path=data_path)
     assert out.exists()
     result = pd.read_csv(out)

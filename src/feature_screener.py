@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Sequence, Tuple
+from collections.abc import Sequence
 
 import lightgbm as lgb
 import numpy as np
@@ -8,7 +8,9 @@ import pandas as pd
 LOGGER = logging.getLogger(__name__)
 
 
-def _fit_classifier(train_data: pd.DataFrame, feature_columns: Sequence[str], label_column: str) -> lgb.LGBMClassifier:
+def _fit_classifier(
+    train_data: pd.DataFrame, feature_columns: Sequence[str], label_column: str
+) -> lgb.LGBMClassifier:
     x = train_data.loc[:, list(feature_columns)].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     y = train_data[label_column].astype(int)
     val_split = int(len(x) * 0.9)
@@ -39,12 +41,13 @@ def screen_features(
     feature_columns: Sequence[str],
     max_features: int,
     method: str = "shap",
-) -> List[str]:
+) -> list[str]:
     model = _fit_classifier(train_data, feature_columns, label_column)
     features = list(feature_columns)
     if method == "shap":
         try:
             import shap
+
             x = train_data.loc[:, features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
             if len(x) > 3000:
                 idx = np.linspace(0, len(x) - 1, 3000).astype(int)
@@ -58,19 +61,21 @@ def screen_features(
         except ImportError:
             LOGGER.warning("SHAP not available, falling back to gain-based importance")
     booster = model.booster_
-    imp = pd.Series(booster.feature_importance(importance_type="gain"), index=booster.feature_name())
+    imp = pd.Series(
+        booster.feature_importance(importance_type="gain"), index=booster.feature_name()
+    )
     return imp.sort_values(ascending=False).head(max_features).index.tolist()
 
 
 def screen_features_per_scenario(
     train_data: pd.DataFrame,
-    tp_sl_pairs: Sequence[Tuple[float, float]],
+    tp_sl_pairs: Sequence[tuple[float, float]],
     horizons: Sequence[int],
     directions: Sequence[str],
     feature_columns: Sequence[str],
     max_features: int,
-) -> Dict[str, List[str]]:
-    result: Dict[str, List[str]] = {}
+) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
     for direction in directions:
         for horizon in horizons:
             for tp, sl in tp_sl_pairs:
@@ -80,5 +85,7 @@ def screen_features_per_scenario(
                 if label_column not in train_data.columns:
                     continue
                 key = f"{direction}|h{horizon}|tp{tp_bps}|sl{sl_bps}"
-                result[key] = screen_features(train_data, label_column, feature_columns, max_features)
+                result[key] = screen_features(
+                    train_data, label_column, feature_columns, max_features
+                )
     return result

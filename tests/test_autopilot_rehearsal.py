@@ -1,0 +1,93 @@
+import json
+from pathlib import Path
+
+from research_exploration.dsr import DSR_METHOD
+from src.autopilot.rehearsal import run_rehearsal
+
+
+def test_run_rehearsal_writes_end_to_end_artifacts(tmp_path):
+    report = run_rehearsal(tmp_path)
+
+    assert report["ok"] is True
+    assert report["before_recommendation"] == "needs_approval"
+    assert report["after_recommendation"] == "already_approved"
+    assert report["preflight_ok"] is True
+    assert set(report["products"]) == {"active_income", "btc_accumulation"}
+    assert set(report["preflight_products"]) == {"active_income", "btc_accumulation"}
+    research = report["research_rehearsal"]
+    assert research["ok"] is True
+    assert research["synthetic_only"] is True
+    assert research["first_generation"] > 0
+    assert research["new_behavioral_specs_after_feedback"] == research["second_generation"]
+    assert set(research["products"]) == {"active_income", "btc_accumulation"}
+    assert set(research["opportunity_types"]) >= {
+        "scalping",
+        "day_trading",
+        "swing_trading",
+        "btc_accumulation",
+    }
+    assert Path(research["experiment_memory"]).exists()
+    assert Path(research["generated_batch"]).exists()
+
+    for key in (
+        "artifact",
+        "trade_log",
+        "promotion_review_json",
+        "promotion_review_md",
+        "preflight_report",
+    ):
+        assert Path(report[key]).exists()
+
+    preflight = json.loads((tmp_path / "preflight_report.json").read_text(encoding="utf-8"))
+    assert preflight["ok"] is True
+    assert len(preflight["products"]) == 2
+    checks = {item["name"]: item for item in preflight["products"][0]["checks"]}
+    assert "approval_gate" not in checks
+    assert checks["exchange_read_connectivity"]["detail"]["price"] == 100.0
+    assert checks["broker_native_protective_stops"] == {
+        "name": "broker_native_protective_stops",
+        "ok": True,
+        "detail": {"supported": True},
+    }
+    assert checks["broker_open_orders_empty"] == {
+        "name": "broker_open_orders_empty",
+        "ok": True,
+        "detail": {
+            "scope": "whole_account",
+            "configured_symbol": "BTCUSDT",
+            "regular": {"count": 0, "orders": []},
+            "conditional": {"count": 0, "orders": []},
+        },
+    }
+    for product_name, product_report in report["products"].items():
+        assert product_report["before_recommendation"] == "needs_approval"
+        assert product_report["after_recommendation"] == "already_approved"
+        for key in ("artifact", "trade_log", "promotion_review_json", "promotion_review_md"):
+            assert Path(product_report[key]).exists(), product_name
+        product_artifact = json.loads(Path(product_report["artifact"]).read_text(encoding="utf-8"))
+        metrics = product_artifact["strategies"][0]["metrics"]
+        assert metrics["dsr_method"] == DSR_METHOD
+        assert metrics["n_trials"] == 8
+        assert metrics["sr_std_trials"] > 0
+        assert metrics["trial_sharpe_count"] == 8
+        assert metrics["trial_sharpe_observed_std"] >= 0
+        assert metrics["trial_sharpe_conservative_floor"] > 0
+
+    btc_artifact = json.loads(
+        Path(report["products"]["btc_accumulation"]["artifact"]).read_text(encoding="utf-8")
+    )
+    btc_strategy = btc_artifact["strategies"][0]
+    assert btc_artifact["market"] == "spot"
+    assert btc_strategy["pnl_unit"] == "btc"
+    assert btc_strategy["metrics"]["holdout_excess_return_vs_buy_hold"] > 0
+
+
+def test_run_rehearsal_is_repeatable(tmp_path):
+    first = run_rehearsal(tmp_path)
+    second = run_rehearsal(tmp_path)
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert second["before_recommendation"] == "needs_approval"
+    assert second["after_recommendation"] == "already_approved"
+    assert set(second["products"]) == {"active_income", "btc_accumulation"}

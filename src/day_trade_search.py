@@ -7,16 +7,15 @@ import logging
 import re
 import subprocess
 from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
 
 from src.build_dataset import TARGET_COLUMNS
 from src.config import (
-    DAY_TRADE_HIGHER_TFS,
     INDICATOR_DATA_DIR,
     PROCESSED_DATA_DIR,
     PROJECT_ROOT,
@@ -38,7 +37,13 @@ from src.metrics import (
     probability_backtest_overfitting,
     sharpe_ratio,
 )
-from src.trade_utils import scan_tp_sl, scan_tp_sl_numba
+from src.strategy_search import _config_hash, _flush_rows, _load_checkpoint
+from src.trade_utils import (
+    gross_return_numba,
+    linear_usdt_futures_return,
+    scan_tp_sl,
+    scan_tp_sl_numba,
+)
 from src.walk_forward import (
     WalkForwardConfig,
     WindowConditionCache,
@@ -47,8 +52,6 @@ from src.walk_forward import (
     generate_windows,
     with_threshold,
 )
-from src.strategy_search import _config_hash, _flush_rows, _load_checkpoint
-
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "day_trade_search"
@@ -62,6 +65,7 @@ class DayTradeConfig:
     slippage_bps: float
     horizon_bars: int
     risk_per_trade: float = 0.003
+    max_position_fraction: float = 0.25
     daily_stop_loss: float = -0.02
     max_consecutive_losses: int = 3
     cooldown_bars: int = 24
@@ -72,14 +76,14 @@ class DayTradeConfig:
 class StrategyCandidate:
     direction: str
     horizon_bars: int
-    conditions: Tuple[Condition, ...]
+    conditions: tuple[Condition, ...]
 
     @property
     def rule(self) -> str:
         return " AND ".join(c.description for c in self.conditions)
 
     @property
-    def timeframes(self) -> Tuple[str, ...]:
+    def timeframes(self) -> tuple[str, ...]:
         values = set()
         for c in self.conditions:
             values.add(timeframe_for_feature(c.feature))
@@ -103,7 +107,7 @@ def get_git_sha() -> str:
 
 @dataclass
 class FeatureScreenCache:
-    values: Dict[Tuple[object, ...], Set[str]]
+    values: dict[tuple[object, ...], set[str]]
     hits: int = 0
     misses: int = 0
 
@@ -131,13 +135,19 @@ def cache_key_for_screening(
     feature_columns: Sequence[str],
     max_features: int,
     method: str,
-) -> Tuple[object, ...]:
+) -> tuple[object, ...]:
     if train.empty:
         start = None
         stop = None
     else:
-        start = str(train["timestamp"].iloc[0]) if "timestamp" in train.columns else int(train.index[0])
-        stop = str(train["timestamp"].iloc[-1]) if "timestamp" in train.columns else int(train.index[-1])
+        start = (
+            str(train["timestamp"].iloc[0]) if "timestamp" in train.columns else int(train.index[0])
+        )
+        stop = (
+            str(train["timestamp"].iloc[-1])
+            if "timestamp" in train.columns
+            else int(train.index[-1])
+        )
     return (
         start,
         stop,
@@ -163,24 +173,33 @@ def get_screened_features_cached(
     max_features: int,
     cache: FeatureScreenCache,
     method: str = "shap",
-) -> Set[str]:
+) -> set[str]:
     key = cache_key_for_screening(
-        train, label_column, direction, horizon_bars,
-        take_profit, stop_loss, feature_columns,
-        max_features, method,
+        train,
+        label_column,
+        direction,
+        horizon_bars,
+        take_profit,
+        stop_loss,
+        feature_columns,
+        max_features,
+        method,
     )
     if key in cache.values:
         cache.hits += 1
         return cache.values[key]
     from src.feature_screener import screen_features
+
     cache.misses += 1
-    screened = set(screen_features(
-        train,
-        label_column,
-        feature_columns,
-        max_features=max_features,
-        method=method,
-    ))
+    screened = set(
+        screen_features(
+            train,
+            label_column,
+            feature_columns,
+            max_features=max_features,
+            method=method,
+        )
+    )
     cache.values[key] = screened
     return screened
 
@@ -190,6 +209,7 @@ def _ensure_dataset(path: Path, base_timeframe: str) -> None:
         return
     LOGGER.info("Dataset %s not found — building it now", path)
     from src.build_dataset import run as build_run
+
     build_run(
         indicator_dir=INDICATOR_DATA_DIR,
         input_kind="indicators",
@@ -205,7 +225,7 @@ def load_dataset(
     horizons: Sequence[int],
     base_prefix: str = "tf_5m_",
     base_timeframe: str = "5m",
-    columns: Optional[Sequence[str]] = None,
+    columns: Sequence[str] | None = None,
 ) -> pd.DataFrame:
     _ensure_dataset(path, base_timeframe)
     if not path.exists():
@@ -220,7 +240,9 @@ def load_dataset(
     read_columns = None
     if columns is not None:
         read_columns = sorted(set(columns) | base_columns)
-    data = pd.read_parquet(path, columns=read_columns).sort_values("timestamp").reset_index(drop=True)
+    data = (
+        pd.read_parquet(path, columns=read_columns).sort_values("timestamp").reset_index(drop=True)
+    )
     required = base_columns
     missing = required - set(data.columns)
     if missing:
@@ -230,15 +252,13 @@ def load_dataset(
         data[f"future_return_{horizon}_bars"] = (
             data[close_col].shift(-horizon) / data[close_col] - 1
         )
-    return data.dropna(
-        subset=[f"future_return_{h}_bars" for h in horizons]
-    ).reset_index(drop=True)
+    return data.dropna(subset=[f"future_return_{h}_bars" for h in horizons]).reset_index(drop=True)
 
 
 def numeric_feature_columns(
     data: pd.DataFrame,
     base_prefix: str = "tf_5m_",
-) -> List[str]:
+) -> list[str]:
     excluded = {
         "timestamp",
         f"{base_prefix}open",
@@ -248,7 +268,8 @@ def numeric_feature_columns(
     } | set(TARGET_COLUMNS)
     excluded.update(c for c in data.columns if c.startswith("future_return_"))
     return [
-        c for c in data.select_dtypes(include="number").columns
+        c
+        for c in data.select_dtypes(include="number").columns
         if c not in excluded and c.startswith("tf_")
     ]
 
@@ -274,13 +295,22 @@ class PrecomputedArrays:
         unique_dates = sorted(set(ts_dates))
         date_to_id = {d: i for i, d in enumerate(unique_dates)}
         day_ids = np.array([date_to_id[d] for d in ts_dates], dtype=np.int64)
-        atr_col = f"{base_prefix}atr" if f"{base_prefix}atr" in data.columns else f"{base_prefix}atr_14"
+        atr_col = (
+            f"{base_prefix}atr" if f"{base_prefix}atr" in data.columns else f"{base_prefix}atr_14"
+        )
         if atr_col not in data.columns:
             atr_cols = [c for c in data.columns if c.endswith("_atr") or c.endswith("_atr_14")]
             atr_col = atr_cols[0] if atr_cols else None
         atr = data[atr_col].astype(float).to_numpy() if atr_col else np.zeros(len(data))
-        return cls(open_=open_, high=high, low=low, close=close,
-                   timestamps=timestamps, day_ids=day_ids, atr=atr)
+        return cls(
+            open_=open_,
+            high=high,
+            low=low,
+            close=close,
+            timestamps=timestamps,
+            day_ids=day_ids,
+            atr=atr,
+        )
 
 
 try:
@@ -288,11 +318,25 @@ try:
 
     @njit(cache=True)
     def _simulate_inner(
-        open_, high, low, close, day_ids, signal,
-        is_long, horizon_bars, take_profit, stop_loss,
-        total_cost, position_size, daily_stop_loss,
-        max_consecutive_losses, cooldown_bars,
-        atr, use_atr_tp_sl, risk_per_trade,
+        open_,
+        high,
+        low,
+        close,
+        day_ids,
+        signal,
+        is_long,
+        horizon_bars,
+        take_profit,
+        stop_loss,
+        total_cost,
+        position_size,
+        daily_stop_loss,
+        max_consecutive_losses,
+        cooldown_bars,
+        atr,
+        use_atr_tp_sl,
+        risk_per_trade,
+        max_position_fraction,
     ):
         n = len(signal)
         max_entry_index = n - horizon_bars - 1
@@ -356,14 +400,11 @@ try:
             else:
                 xp = close[xi]
 
-            if is_long:
-                gr = xp / entry - 1.0
-            else:
-                gr = entry / xp - 1.0
+            gr = gross_return_numba(entry, xp, is_long, False)
             nr = gr - total_cost
 
             if use_atr_tp_sl:
-                trade_position_size = min(risk_per_trade / sl_pct, 1.0)
+                trade_position_size = min(risk_per_trade / sl_pct, max_position_fraction, 1.0)
             else:
                 trade_position_size = position_size
 
@@ -430,7 +471,7 @@ def _simulate_day_trades_python(
     direction: str,
     config: DayTradeConfig,
     base_prefix: str = "tf_5m_",
-    precomputed: Optional[PrecomputedArrays] = None,
+    precomputed: PrecomputedArrays | None = None,
 ) -> pd.DataFrame:
     if precomputed is not None:
         open_ = precomputed.open_
@@ -445,7 +486,9 @@ def _simulate_day_trades_python(
         low = data[f"{base_prefix}low"].astype(float).to_numpy()
         close = data[f"{base_prefix}close"].astype(float).to_numpy()
         timestamps = data["timestamp"].to_numpy()
-        atr_col = f"{base_prefix}atr" if f"{base_prefix}atr" in data.columns else f"{base_prefix}atr_14"
+        atr_col = (
+            f"{base_prefix}atr" if f"{base_prefix}atr" in data.columns else f"{base_prefix}atr_14"
+        )
         if atr_col not in data.columns:
             atr_cols = [c for c in data.columns if c.endswith("_atr") or c.endswith("_atr_14")]
             atr_col = atr_cols[0] if atr_cols else None
@@ -453,7 +496,11 @@ def _simulate_day_trades_python(
     signal = signal_mask.fillna(False).to_numpy()
 
     total_cost = 2 * ((config.fee_bps + config.slippage_bps) / 10_000)
-    position_size = min(config.risk_per_trade / config.stop_loss, 1.0) if config.stop_loss > 0 else 1.0
+    position_size = (
+        min(config.risk_per_trade / config.stop_loss, config.max_position_fraction, 1.0)
+        if config.stop_loss > 0
+        else config.max_position_fraction
+    )
 
     trades = []
     next_allowed_entry = 0
@@ -469,11 +516,7 @@ def _simulate_day_trades_python(
 
     for signal_index, should_enter in enumerate(signal):
         entry_index = signal_index + 1
-        if (
-            not should_enter
-            or entry_index < next_allowed_entry
-            or entry_index > max_entry_index
-        ):
+        if not should_enter or entry_index < next_allowed_entry or entry_index > max_entry_index:
             continue
 
         day = pd.Timestamp(timestamps[signal_index]).date()
@@ -502,13 +545,21 @@ def _simulate_day_trades_python(
             sl_pct = 0.01
 
         if config.use_atr_tp_sl:
-            trade_position_size = min(config.risk_per_trade / sl_pct, 1.0)
+            trade_position_size = min(
+                config.risk_per_trade / sl_pct, config.max_position_fraction, 1.0
+            )
         else:
             trade_position_size = position_size
 
         exit_index, reason_code = scan_tp_sl(
-            high, low, entry, direction == "long",
-            tp_pct, sl_pct, entry_index, entry_index + config.horizon_bars,
+            high,
+            low,
+            entry,
+            direction == "long",
+            tp_pct,
+            sl_pct,
+            entry_index,
+            entry_index + config.horizon_bars,
         )
         if reason_code == 1:
             exit_price = entry * (1 - sl_pct) if direction == "long" else entry * (1 + sl_pct)
@@ -520,10 +571,10 @@ def _simulate_day_trades_python(
             exit_price = close[exit_index]
             exit_reason = "time"
 
-        gross_return = (
-            exit_price / entry - 1
-            if direction == "long"
-            else entry / exit_price - 1
+        gross_return = linear_usdt_futures_return(
+            entry,
+            exit_price,
+            is_long=direction == "long",
         )
         net_return = gross_return - total_cost
         sized_return = net_return * trade_position_size
@@ -571,7 +622,7 @@ def _simulate_day_trades_numba(
     direction: str,
     config: DayTradeConfig,
     base_prefix: str = "tf_5m_",
-    precomputed: Optional[PrecomputedArrays] = None,
+    precomputed: PrecomputedArrays | None = None,
 ) -> pd.DataFrame:
     if precomputed is not None:
         open_ = precomputed.open_
@@ -591,7 +642,9 @@ def _simulate_day_trades_numba(
         unique_dates = sorted(set(ts_dates))
         date_to_id = {d: i for i, d in enumerate(unique_dates)}
         day_ids = np.array([date_to_id[d] for d in ts_dates], dtype=np.int64)
-        atr_col = f"{base_prefix}atr" if f"{base_prefix}atr" in data.columns else f"{base_prefix}atr_14"
+        atr_col = (
+            f"{base_prefix}atr" if f"{base_prefix}atr" in data.columns else f"{base_prefix}atr_14"
+        )
         if atr_col not in data.columns:
             atr_cols = [c for c in data.columns if c.endswith("_atr") or c.endswith("_atr_14")]
             atr_col = atr_cols[0] if atr_cols else None
@@ -600,46 +653,88 @@ def _simulate_day_trades_numba(
     signal = signal_mask.fillna(False).to_numpy()
 
     total_cost = 2 * ((config.fee_bps + config.slippage_bps) / 10_000)
-    position_size = min(config.risk_per_trade / config.stop_loss, 1.0) if config.stop_loss > 0 else 1.0
+    position_size = (
+        min(config.risk_per_trade / config.stop_loss, config.max_position_fraction, 1.0)
+        if config.stop_loss > 0
+        else config.max_position_fraction
+    )
 
     (
-        signal_indices, entry_indices, exit_indices, exit_reasons,
-        entries, exits, gross_returns, net_returns, sized_returns,
-        equities, position_sizes, daily_stop_hits, cooldown_triggers,
+        signal_indices,
+        entry_indices,
+        exit_indices,
+        exit_reasons,
+        entries,
+        exits,
+        gross_returns,
+        net_returns,
+        sized_returns,
+        equities,
+        position_sizes,
+        daily_stop_hits,
+        cooldown_triggers,
     ) = _simulate_inner(
-        open_, high, low, close, day_ids, signal,
-        direction == "long", config.horizon_bars, config.take_profit,
-        config.stop_loss, total_cost, position_size, config.daily_stop_loss,
-        config.max_consecutive_losses, config.cooldown_bars,
-        atr, config.use_atr_tp_sl, config.risk_per_trade,
+        open_,
+        high,
+        low,
+        close,
+        day_ids,
+        signal,
+        direction == "long",
+        config.horizon_bars,
+        config.take_profit,
+        config.stop_loss,
+        total_cost,
+        position_size,
+        config.daily_stop_loss,
+        config.max_consecutive_losses,
+        config.cooldown_bars,
+        atr,
+        config.use_atr_tp_sl,
+        config.risk_per_trade,
+        config.max_position_fraction,
     )
 
     if len(signal_indices) == 0:
-        result = pd.DataFrame(columns=[
-            "signal_time", "entry_time", "exit_time", "direction",
-            "entry", "exit", "exit_reason", "gross_return", "net_return",
-            "sized_return", "position_size", "holding_bars", "equity_after",
-        ])
+        result = pd.DataFrame(
+            columns=[
+                "signal_time",
+                "entry_time",
+                "exit_time",
+                "direction",
+                "entry",
+                "exit",
+                "exit_reason",
+                "gross_return",
+                "net_return",
+                "sized_return",
+                "position_size",
+                "holding_bars",
+                "equity_after",
+            ]
+        )
         result.attrs["daily_stop_hits"] = int(daily_stop_hits)
         result.attrs["cooldown_triggers"] = int(cooldown_triggers)
         return result
 
     reason_map = {0: "time", 1: "stop", 2: "take_profit"}
-    result = pd.DataFrame({
-        "signal_time": timestamps[signal_indices],
-        "entry_time": timestamps[entry_indices],
-        "exit_time": timestamps[exit_indices],
-        "direction": direction,
-        "entry": entries,
-        "exit": exits,
-        "exit_reason": [reason_map[r] for r in exit_reasons],
-        "gross_return": gross_returns,
-        "net_return": net_returns,
-        "sized_return": sized_returns,
-        "position_size": position_sizes,
-        "holding_bars": exit_indices - entry_indices,
-        "equity_after": equities,
-    })
+    result = pd.DataFrame(
+        {
+            "signal_time": timestamps[signal_indices],
+            "entry_time": timestamps[entry_indices],
+            "exit_time": timestamps[exit_indices],
+            "direction": direction,
+            "entry": entries,
+            "exit": exits,
+            "exit_reason": [reason_map[r] for r in exit_reasons],
+            "gross_return": gross_returns,
+            "net_return": net_returns,
+            "sized_return": sized_returns,
+            "position_size": position_sizes,
+            "holding_bars": exit_indices - entry_indices,
+            "equity_after": equities,
+        }
+    )
     result.attrs["daily_stop_hits"] = int(daily_stop_hits)
     result.attrs["cooldown_triggers"] = int(cooldown_triggers)
     return result
@@ -651,14 +746,18 @@ def simulate_day_trades(
     direction: str,
     config: DayTradeConfig,
     base_prefix: str = "tf_5m_",
-    precomputed: Optional[PrecomputedArrays] = None,
+    precomputed: PrecomputedArrays | None = None,
 ) -> pd.DataFrame:
     if _HAS_NUMBA:
-        return _simulate_day_trades_numba(data, signal_mask, direction, config, base_prefix, precomputed)
-    return _simulate_day_trades_python(data, signal_mask, direction, config, base_prefix, precomputed)
+        return _simulate_day_trades_numba(
+            data, signal_mask, direction, config, base_prefix, precomputed
+        )
+    return _simulate_day_trades_python(
+        data, signal_mask, direction, config, base_prefix, precomputed
+    )
 
 
-def day_trade_metrics(trades: pd.DataFrame) -> Dict[str, float]:
+def day_trade_metrics(trades: pd.DataFrame) -> dict[str, float]:
     if trades.empty:
         return {
             "trades": 0,
@@ -689,9 +788,7 @@ def day_trade_metrics(trades: pd.DataFrame) -> Dict[str, float]:
     daily_returns = sized_returns.groupby(entry_times.dt.date).sum()
     sharpe = np.nan
     if len(daily_returns) > 1 and daily_returns.std() > 0:
-        sharpe = float(
-            daily_returns.mean() / daily_returns.std() * np.sqrt(365)
-        )
+        sharpe = float(daily_returns.mean() / daily_returns.std() * np.sqrt(365))
 
     return {
         "trades": int(len(trades)),
@@ -716,20 +813,30 @@ def score_candidate(
     candidate: StrategyCandidate,
     config: DayTradeConfig,
     base_prefix: str = "tf_5m_",
-    train_mask: Optional[pd.Series] = None,
-    test_mask: Optional[pd.Series] = None,
-    train_arrays: Optional[PrecomputedArrays] = None,
-    test_arrays: Optional[PrecomputedArrays] = None,
-) -> Dict[str, object]:
+    train_mask: pd.Series | None = None,
+    test_mask: pd.Series | None = None,
+    train_arrays: PrecomputedArrays | None = None,
+    test_arrays: PrecomputedArrays | None = None,
+) -> dict[str, object]:
     if train_mask is None:
         train_mask = combined_mask(train, candidate.conditions)
     if test_mask is None:
         test_mask = combined_mask(test, candidate.conditions)
     train_trades = simulate_day_trades(
-        train, train_mask, candidate.direction, config, base_prefix, train_arrays,
+        train,
+        train_mask,
+        candidate.direction,
+        config,
+        base_prefix,
+        train_arrays,
     )
     test_trades = simulate_day_trades(
-        test, test_mask, candidate.direction, config, base_prefix, test_arrays,
+        test,
+        test_mask,
+        candidate.direction,
+        config,
+        base_prefix,
+        test_arrays,
     )
     train_m = day_trade_metrics(train_trades)
     test_m = day_trade_metrics(test_trades)
@@ -742,8 +849,12 @@ def score_candidate(
         "timeframe_count": len(candidate.timeframes),
         "conditions": len(candidate.conditions),
         "rule": candidate.rule,
-        "train_returns": train_trades["net_return"].astype(float).to_numpy() if not train_trades.empty else np.array([], dtype=float),
-        "test_returns": test_trades["net_return"].astype(float).to_numpy() if not test_trades.empty else np.array([], dtype=float),
+        "train_returns": train_trades["net_return"].astype(float).to_numpy()
+        if not train_trades.empty
+        else np.array([], dtype=float),
+        "test_returns": test_trades["net_return"].astype(float).to_numpy()
+        if not test_trades.empty
+        else np.array([], dtype=float),
         **{f"train_{k}": v for k, v in train_m.items()},
         **{f"test_{k}": v for k, v in test_m.items()},
     }
@@ -751,7 +862,7 @@ def score_candidate(
 
 def _attach_statistical_metrics(
     strategies: pd.DataFrame,
-    return_rows: Optional[Sequence[Dict[str, object]]] = None,
+    return_rows: Sequence[dict[str, object]] | None = None,
     walk_forward: bool = False,
 ) -> pd.DataFrame:
     if strategies.empty:
@@ -774,21 +885,20 @@ def _attach_statistical_metrics(
                 n_obs=max(1, int(n) if np.isfinite(n) else 1),
                 sr_std_trials=sr_std_trials,
             )
-            for s, sk, ku, n in zip(sr, skew, kurt, n_obs)
+            for s, sk, ku, n in zip(sr, skew, kurt, n_obs, strict=False)
         ]
         return out
     out = strategies.copy()
     n_trials = max(1, len(out))
     train_srs = [
-        sharpe_ratio(np.asarray(row.get("train_returns", []), dtype=float))
-        for row in return_rows
+        sharpe_ratio(np.asarray(row.get("train_returns", []), dtype=float)) for row in return_rows
     ]
     finite_srs = np.asarray([sr for sr in train_srs if np.isfinite(sr)], dtype=float)
     sr_std_trials = float(np.std(finite_srs, ddof=1)) if finite_srs.size > 1 else 0.0
     dsr_values = []
     ci_low = []
     ci_high = []
-    for row, train_sr in zip(return_rows, train_srs):
+    for row, train_sr in zip(return_rows, train_srs, strict=False):
         train_returns = np.asarray(row.get("train_returns", []), dtype=float)
         test_returns = np.asarray(row.get("test_returns", []), dtype=float)
         dsr_values.append(
@@ -815,10 +925,10 @@ def regime_breakdown(
     candidate: StrategyCandidate,
     config: DayTradeConfig,
     base_prefix: str = "tf_5m_",
-) -> Dict[str, Dict[str, float]]:
+) -> dict[str, dict[str, float]]:
     if "tf_1d_regime_id" not in data.columns:
         return {}
-    breakdown: Dict[str, Dict[str, float]] = {}
+    breakdown: dict[str, dict[str, float]] = {}
     for regime_id, regime_data in data.groupby("tf_1d_regime_id"):
         trades = simulate_day_trades(
             regime_data,
@@ -828,7 +938,11 @@ def regime_breakdown(
             base_prefix,
         )
         metrics = day_trade_metrics(trades)
-        returns = trades["net_return"].astype(float).to_numpy() if not trades.empty else np.array([], dtype=float)
+        returns = (
+            trades["net_return"].astype(float).to_numpy()
+            if not trades.empty
+            else np.array([], dtype=float)
+        )
         breakdown[str(int(regime_id))] = {
             "trades": int(metrics["trades"]),
             "total_return": float(metrics["total_return"]),
@@ -844,7 +958,9 @@ def regime_breakdown(
     return breakdown
 
 
-def cluster_ranked_strategies(data: pd.DataFrame, strategies: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
+def cluster_ranked_strategies(
+    data: pd.DataFrame, strategies: pd.DataFrame, threshold: float = 0.8
+) -> pd.DataFrame:
     out = strategies.copy()
     if out.empty or "conditions_json" not in out.columns:
         out["cluster_id"] = pd.Series(dtype=int)
@@ -859,11 +975,23 @@ def cluster_ranked_strategies(data: pd.DataFrame, strategies: pd.DataFrame, thre
         member_indices = [int(member) for member in members]
         cluster_rows = out.loc[member_indices].copy()
         cluster_rows["cluster_id"] = int(cluster_id)
-        sort_cols = [col for col in ["dsr", "test_total_return", "test_avg_net_return", "test_trades"] if col in cluster_rows.columns]
+        sort_cols = [
+            col
+            for col in ["dsr", "test_total_return", "test_avg_net_return", "test_trades"]
+            if col in cluster_rows.columns
+        ]
         cluster_rows = cluster_rows.sort_values(sort_cols, ascending=[False] * len(sort_cols))
         representatives.append(cluster_rows.iloc[0])
-    sort_cols = [col for col in ["dsr", "test_total_return", "test_avg_net_return", "test_trades"] if col in representatives[0].index]
-    return pd.DataFrame(representatives).sort_values(sort_cols, ascending=[False] * len(sort_cols)).reset_index(drop=True)
+    sort_cols = [
+        col
+        for col in ["dsr", "test_total_return", "test_avg_net_return", "test_trades"]
+        if col in representatives[0].index
+    ]
+    return (
+        pd.DataFrame(representatives)
+        .sort_values(sort_cols, ascending=[False] * len(sort_cols))
+        .reset_index(drop=True)
+    )
 
 
 def rank_features_by_direction(
@@ -873,7 +1001,7 @@ def rank_features_by_direction(
     direction: str,
     max_features: int,
     sample_rows: int = 50_000,
-) -> List[str]:
+) -> list[str]:
     feature_list = list(features)
     target = train[f"future_return_{horizon}_bars"]
     if direction == "short":
@@ -892,31 +1020,43 @@ def rank_features_by_direction(
 
 def _rank_features(
     train: pd.DataFrame,
-    all_features: List[str],
+    all_features: list[str],
     horizon: int,
     direction: str,
     max_features: int,
     ranking_method: str,
     rank_sample_rows: int,
-) -> List[str]:
+) -> list[str]:
     if ranking_method == "spearman":
         return rank_features_by_direction(
-            train, all_features, horizon, direction,
-            max_features=max_features, sample_rows=rank_sample_rows,
+            train,
+            all_features,
+            horizon,
+            direction,
+            max_features=max_features,
+            sample_rows=rank_sample_rows,
         )
     from src.feature_ranking import rank_features_blended, rank_features_by_importance
 
     target_column = f"future_return_{horizon}_bars"
     if ranking_method == "importance":
         return rank_features_by_importance(
-            train, all_features, target_column, max_features, direction=direction,
+            train,
+            all_features,
+            target_column,
+            max_features,
+            direction=direction,
         )
     return rank_features_blended(
-        train, all_features, target_column, max_features, direction=direction,
+        train,
+        all_features,
+        target_column,
+        max_features,
+        direction=direction,
     )
 
 
-def build_feature_conditions(train: pd.DataFrame, feature: str) -> List[Condition]:
+def build_feature_conditions(train: pd.DataFrame, feature: str) -> list[Condition]:
     conditions = []
     clean = train[feature].replace([np.inf, -np.inf], np.nan).dropna()
     if clean.empty:
@@ -927,15 +1067,25 @@ def build_feature_conditions(train: pd.DataFrame, feature: str) -> List[Conditio
             continue
         if q < 0.5:
             conditions.append(
-                Condition(feature, "value_le", threshold,
-                          f"{feature} <= train q{int(q * 100)} ({threshold:.6g})",
-                          threshold_source="quantile", quantile=float(q))
+                Condition(
+                    feature,
+                    "value_le",
+                    threshold,
+                    f"{feature} <= train q{int(q * 100)} ({threshold:.6g})",
+                    threshold_source="quantile",
+                    quantile=float(q),
+                )
             )
         else:
             conditions.append(
-                Condition(feature, "value_ge", threshold,
-                          f"{feature} >= train q{int(q * 100)} ({threshold:.6g})",
-                          threshold_source="quantile", quantile=float(q))
+                Condition(
+                    feature,
+                    "value_ge",
+                    threshold,
+                    f"{feature} >= train q{int(q * 100)} ({threshold:.6g})",
+                    threshold_source="quantile",
+                    quantile=float(q),
+                )
             )
     delta = train[feature].diff()
     delta_clean = delta.replace([np.inf, -np.inf], np.nan).dropna()
@@ -946,44 +1096,53 @@ def build_feature_conditions(train: pd.DataFrame, feature: str) -> List[Conditio
                 continue
             if q < 0.5:
                 conditions.append(
-                    Condition(feature, "delta_le", threshold,
-                              f"{feature} falling fast: 1-bar change <= train q10 ({threshold:.6g})",
-                              threshold_source="delta_quantile", quantile=float(q))
+                    Condition(
+                        feature,
+                        "delta_le",
+                        threshold,
+                        f"{feature} falling fast: 1-bar change <= train q10 ({threshold:.6g})",
+                        threshold_source="delta_quantile",
+                        quantile=float(q),
+                    )
                 )
             else:
                 conditions.append(
-                    Condition(feature, "delta_ge", threshold,
-                              f"{feature} rising fast: 1-bar change >= train q90 ({threshold:.6g})",
-                              threshold_source="delta_quantile", quantile=float(q))
+                    Condition(
+                        feature,
+                        "delta_ge",
+                        threshold,
+                        f"{feature} rising fast: 1-bar change >= train q90 ({threshold:.6g})",
+                        threshold_source="delta_quantile",
+                        quantile=float(q),
+                    )
                 )
     return conditions
 
 
 def _build_conditions_for_features(
     train: pd.DataFrame,
-    ranked_features: List[str],
-    enabled_kinds: Set[str],
-    cross_feature_pairs: Optional[Sequence[Tuple[str, str]]],
-) -> List[Condition]:
+    ranked_features: list[str],
+    enabled_kinds: set[str],
+    cross_feature_pairs: Sequence[tuple[str, str]] | None,
+) -> list[Condition]:
     if enabled_kinds == {"value", "delta"}:
-        return [
-            c for feature in ranked_features
-            for c in build_feature_conditions(train, feature)
-        ]
+        return [c for feature in ranked_features for c in build_feature_conditions(train, feature)]
     return build_all_conditions(
-        train, ranked_features, enabled_kinds=enabled_kinds,
+        train,
+        ranked_features,
+        enabled_kinds=enabled_kinds,
         cross_feature_pairs=cross_feature_pairs,
     )
 
 
 def _score_and_select_conditions(
     train: pd.DataFrame,
-    conditions: List[Condition],
+    conditions: list[Condition],
     horizon: int,
     direction: str,
     top_conditions: int,
     min_support: int = 500,
-) -> List[int]:
+) -> list[int]:
     target = train[f"future_return_{horizon}_bars"]
     if direction == "short":
         target = -target
@@ -999,13 +1158,13 @@ def _score_and_select_conditions(
 
 
 def _generate_pairs_flat(
-    conditions: List[Condition],
-    selected_indices: List[int],
+    conditions: list[Condition],
+    selected_indices: list[int],
     max_pairs: int,
-) -> List[Tuple[int, int]]:
+) -> list[tuple[int, int]]:
     pairs = []
     for left_pos, left_idx in enumerate(selected_indices):
-        for right_idx in selected_indices[left_pos + 1:]:
+        for right_idx in selected_indices[left_pos + 1 :]:
             if conditions[left_idx].feature == conditions[right_idx].feature:
                 continue
             pairs.append((left_idx, right_idx))
@@ -1015,24 +1174,22 @@ def _generate_pairs_flat(
 
 
 def _generate_pairs_pool(
-    conditions: List[Condition],
-    selected_indices: List[int],
+    conditions: list[Condition],
+    selected_indices: list[int],
     max_pairs: int,
-) -> List[Tuple[int, int]]:
-    pools: Dict[str, List[int]] = defaultdict(list)
+) -> list[tuple[int, int]]:
+    pools: dict[str, list[int]] = defaultdict(list)
     for idx in selected_indices:
         tf = timeframe_for_feature(conditions[idx].feature)
         pools[tf].append(idx)
     tf_keys = sorted(pools.keys())
     tf_combos = [
-        (tf_keys[i], tf_keys[j])
-        for i in range(len(tf_keys))
-        for j in range(i + 1, len(tf_keys))
+        (tf_keys[i], tf_keys[j]) for i in range(len(tf_keys)) for j in range(i + 1, len(tf_keys))
     ]
     if not tf_combos:
         return _generate_pairs_flat(conditions, selected_indices, max_pairs)
     pairs_per_combo = max(1, max_pairs // len(tf_combos))
-    pairs: List[Tuple[int, int]] = []
+    pairs: list[tuple[int, int]] = []
     for tf_a, tf_b in tf_combos:
         count = 0
         for left_idx in pools[tf_a]:
@@ -1062,27 +1219,38 @@ def make_candidates(
     condition_depths: Sequence[int],
     ranking_method: str = "blended",
     cross_tf_mode: str = "pool",
-    enabled_kinds: Set[str] = DEFAULT_ENABLED_KINDS,
+    enabled_kinds: set[str] = DEFAULT_ENABLED_KINDS,
     base_prefix: str = "tf_5m_",
-    feature_pattern: Optional[str] = None,
-) -> List[StrategyCandidate]:
+    feature_pattern: str | None = None,
+) -> list[StrategyCandidate]:
     all_features = numeric_feature_columns(train, base_prefix)
     if feature_pattern:
         compiled = re.compile(feature_pattern)
         all_features = [column for column in all_features if compiled.search(column)]
         if not all_features:
             raise ValueError(f"feature_pattern {feature_pattern!r} matches no feature columns")
-        LOGGER.info("Feature pattern %r restricts the universe to %s columns", feature_pattern, len(all_features))
-    candidates: List[StrategyCandidate] = []
+        LOGGER.info(
+            "Feature pattern %r restricts the universe to %s columns",
+            feature_pattern,
+            len(all_features),
+        )
+    candidates: list[StrategyCandidate] = []
     for horizon in horizons:
         for direction in directions:
             LOGGER.info(
                 "Ranking features for direction=%s horizon=%s method=%s",
-                direction, horizon, ranking_method,
+                direction,
+                horizon,
+                ranking_method,
             )
             ranked = _rank_features(
-                train, all_features, horizon, direction,
-                max_features, ranking_method, rank_sample_rows,
+                train,
+                all_features,
+                horizon,
+                direction,
+                max_features,
+                ranking_method,
+                rank_sample_rows,
             )
             cross_pairs = (
                 detect_cross_feature_pairs(ranked)
@@ -1090,21 +1258,28 @@ def make_candidates(
                 else None
             )
             conditions = _build_conditions_for_features(
-                train, ranked, enabled_kinds, cross_pairs,
+                train,
+                ranked,
+                enabled_kinds,
+                cross_pairs,
             )
             selected = _score_and_select_conditions(
-                train, conditions, horizon, direction, top_conditions,
+                train,
+                conditions,
+                horizon,
+                direction,
+                top_conditions,
             )
             LOGGER.info(
                 "Selected %s base conditions for direction=%s horizon=%s",
-                len(selected), direction, horizon,
+                len(selected),
+                direction,
+                horizon,
             )
 
             if 1 in condition_depths:
                 for idx in selected:
-                    candidates.append(
-                        StrategyCandidate(direction, horizon, (conditions[idx],))
-                    )
+                    candidates.append(StrategyCandidate(direction, horizon, (conditions[idx],)))
 
             if 2 in condition_depths or 3 in condition_depths:
                 if cross_tf_mode == "pool":
@@ -1116,7 +1291,8 @@ def make_candidates(
                     for l_idx, r_idx in pairs:
                         candidates.append(
                             StrategyCandidate(
-                                direction, horizon,
+                                direction,
+                                horizon,
                                 (conditions[l_idx], conditions[r_idx]),
                             )
                         )
@@ -1137,7 +1313,8 @@ def make_candidates(
                             seen.add(triple)
                             candidates.append(
                                 StrategyCandidate(
-                                    direction, horizon,
+                                    direction,
+                                    horizon,
                                     tuple(conditions[i] for i in triple),
                                 )
                             )
@@ -1147,7 +1324,7 @@ def make_candidates(
                         if triple_count >= max_triples:
                             break
     seen_signatures = set()
-    deduped: List[StrategyCandidate] = []
+    deduped: list[StrategyCandidate] = []
     for candidate in candidates:
         signature = (
             candidate.direction,
@@ -1172,11 +1349,11 @@ def add_year_metrics(
         return pd.DataFrame()
     rows = []
     for rank, (_, strategy) in enumerate(strategies.head(top_n).iterrows(), start=1):
-        conditions = tuple(
-            Condition(**c) for c in json.loads(strategy["conditions_json"])
-        )
+        conditions = tuple(Condition(**c) for c in json.loads(strategy["conditions_json"]))
         candidate = StrategyCandidate(
-            strategy["direction"], int(strategy["horizon_bars"]), conditions,
+            strategy["direction"],
+            int(strategy["horizon_bars"]),
+            conditions,
         )
         config = DayTradeConfig(
             take_profit=strategy["take_profit"],
@@ -1185,6 +1362,7 @@ def add_year_metrics(
             slippage_bps=config_template.slippage_bps,
             horizon_bars=int(strategy["horizon_bars"]),
             risk_per_trade=config_template.risk_per_trade,
+            max_position_fraction=config_template.max_position_fraction,
             daily_stop_loss=config_template.daily_stop_loss,
             max_consecutive_losses=config_template.max_consecutive_losses,
             cooldown_bars=config_template.cooldown_bars,
@@ -1192,23 +1370,29 @@ def add_year_metrics(
         )
         mask = combined_mask(data, candidate.conditions)
         trades = simulate_day_trades(
-            data, mask, candidate.direction, config, base_prefix,
+            data,
+            mask,
+            candidate.direction,
+            config,
+            base_prefix,
         )
         if trades.empty:
             continue
         entry_times = pd.to_datetime(trades["entry_time"])
         for year, group in trades.groupby(entry_times.dt.year):
             m = day_trade_metrics(group)
-            rows.append({
-                "strategy_rank": rank,
-                "year": year,
-                "direction": candidate.direction,
-                "horizon_bars": config.horizon_bars,
-                "take_profit": config.take_profit,
-                "stop_loss": config.stop_loss,
-                **m,
-                "rule": candidate.rule,
-            })
+            rows.append(
+                {
+                    "strategy_rank": rank,
+                    "year": year,
+                    "direction": candidate.direction,
+                    "horizon_bars": config.horizon_bars,
+                    "take_profit": config.take_profit,
+                    "stop_loss": config.stop_loss,
+                    **m,
+                    "rule": candidate.rule,
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -1218,7 +1402,7 @@ def summarize_filter_rejections(
     min_test_trades: int,
     require_multitimeframe: bool,
     walk_forward: bool = False,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     if walk_forward:
         if scored.empty:
             return {
@@ -1276,8 +1460,12 @@ _WF_ZEROED_COLUMNS = {
     f"{split}_{metric}": 0.0
     for split in ("train", "test")
     for metric in (
-        "trades", "total_return", "win_rate", "avg_net_return",
-        "profit_factor", "max_drawdown",
+        "trades",
+        "total_return",
+        "win_rate",
+        "avg_net_return",
+        "profit_factor",
+        "max_drawdown",
     )
 }
 
@@ -1292,39 +1480,42 @@ _SCREENED_OUT_STATS = {
 
 
 def _conditions_payload_day(candidate: StrategyCandidate) -> str:
-    return json.dumps([
-        {
-            "feature": c.feature,
-            "kind": c.kind,
-            "threshold": c.threshold,
-            "description": c.description,
-            **({"feature_b": c.feature_b} if c.feature_b else {}),
-            **({"threshold_source": c.threshold_source} if c.threshold_source else {}),
-            **({"quantile": c.quantile} if c.quantile is not None else {}),
-            **({"lookback": c.lookback} if c.lookback is not None else {}),
-            **({"cross_feature": c.cross_feature} if c.cross_feature else {}),
-        }
-        for c in candidate.conditions
-    ])
+    return json.dumps(
+        [
+            {
+                "feature": c.feature,
+                "kind": c.kind,
+                "threshold": c.threshold,
+                "description": c.description,
+                **({"feature_b": c.feature_b} if c.feature_b else {}),
+                **({"threshold_source": c.threshold_source} if c.threshold_source else {}),
+                **({"quantile": c.quantile} if c.quantile is not None else {}),
+                **({"lookback": c.lookback} if c.lookback is not None else {}),
+                **({"cross_feature": c.cross_feature} if c.cross_feature else {}),
+            }
+            for c in candidate.conditions
+        ]
+    )
 
 
 def _score_candidate_walk_forward_day(
     engine: DayTradeWindowEngine,
     candidate: StrategyCandidate,
-    scenarios: Sequence[Tuple[float, float]],
+    scenarios: Sequence[tuple[float, float]],
     fee_bps: float,
     slippage_bps: float,
     risk_per_trade: float,
+    max_position_fraction: float,
     daily_stop_loss: float,
     max_consecutive_losses: int,
     cooldown_bars: int,
     use_atr_tp_sl: bool,
     wf_pass_rate: float,
     feature_screening: str = "none",
-    screen_cache: Optional[FeatureScreenCache] = None,
+    screen_cache: FeatureScreenCache | None = None,
     max_features: int = 60,
-) -> List[Dict[str, object]]:
-    per_scenario_stats: List[List[Dict[str, float]]] = [[] for _ in scenarios]
+) -> list[dict[str, object]]:
+    per_scenario_stats: list[list[dict[str, float]]] = [[] for _ in scenarios]
     for window_index in range(len(engine.windows)):
         mask = engine.candidate_test_mask(window_index, candidate)
         test_frame = engine.test_frames[window_index]
@@ -1341,10 +1532,16 @@ def _score_candidate_walk_forward_day(
                 if label_column in train_frame.columns:
                     feature_columns = numeric_feature_columns(train_frame, engine.base_prefix)
                     screened = get_screened_features_cached(
-                        train_frame, label_column,
-                        candidate.direction, candidate.horizon_bars,
-                        take_profit, stop_loss,
-                        feature_columns, max_features, screen_cache, method="shap",
+                        train_frame,
+                        label_column,
+                        candidate.direction,
+                        candidate.horizon_bars,
+                        take_profit,
+                        stop_loss,
+                        feature_columns,
+                        max_features,
+                        screen_cache,
+                        method="shap",
                     )
                     if any(c.feature not in screened for c in candidate.conditions):
                         per_scenario_stats[scenario_index].append(dict(_SCREENED_OUT_STATS))
@@ -1356,33 +1553,43 @@ def _score_candidate_walk_forward_day(
                 slippage_bps=slippage_bps,
                 horizon_bars=candidate.horizon_bars,
                 risk_per_trade=risk_per_trade,
+                max_position_fraction=max_position_fraction,
                 daily_stop_loss=daily_stop_loss,
                 max_consecutive_losses=max_consecutive_losses,
                 cooldown_bars=cooldown_bars,
                 use_atr_tp_sl=use_atr_tp_sl,
             )
             trades = simulate_day_trades(
-                test_frame, signal, candidate.direction, config, engine.base_prefix, arrays,
+                test_frame,
+                signal,
+                candidate.direction,
+                config,
+                engine.base_prefix,
+                arrays,
             )
             metrics = day_trade_metrics(trades)
             per_scenario_stats[scenario_index].append(
                 {
                     "test_total_return": metrics["total_return"],
-                    "test_avg_net_return": metrics["avg_net_return"] if metrics["trades"] > 0 else 0.0,
-                    "test_profit_factor": metrics["profit_factor"] if np.isfinite(metrics["profit_factor"]) else 0.0,
+                    "test_avg_net_return": metrics["avg_net_return"]
+                    if metrics["trades"] > 0
+                    else 0.0,
+                    "test_profit_factor": metrics["profit_factor"]
+                    if np.isfinite(metrics["profit_factor"])
+                    else 0.0,
                     "test_max_drawdown": metrics["max_drawdown"],
                     "test_trades": metrics["trades"],
                     "screened_out": False,
                 }
             )
-    rows: List[Dict[str, object]] = []
+    rows: list[dict[str, object]] = []
     for scenario_index, (take_profit, stop_loss) in enumerate(scenarios):
         stats = per_scenario_stats[scenario_index]
         summary = aggregate_walk_forward_results(stats, wf_pass_rate)
         window_returns = np.array([s["test_avg_net_return"] for s in stats], dtype=float)
         returns_series = pd.Series(window_returns)
         ci_low, ci_high = bootstrap_sharpe_ci(window_returns, n_boot=200)
-        row: Dict[str, object] = {
+        row: dict[str, object] = {
             "direction": candidate.direction,
             "horizon_bars": candidate.horizon_bars,
             "take_profit": take_profit,
@@ -1399,7 +1606,9 @@ def _score_candidate_walk_forward_day(
             {
                 "wf_returns_sharpe": sharpe_ratio(window_returns),
                 "wf_returns_skew": float(returns_series.skew()) if len(window_returns) > 2 else 0.0,
-                "wf_returns_kurt": float(returns_series.kurt() + 3.0) if len(window_returns) > 3 else 3.0,
+                "wf_returns_kurt": float(returns_series.kurt() + 3.0)
+                if len(window_returns) > 3
+                else 3.0,
                 "test_sharpe_ci_low": ci_low,
                 "test_sharpe_ci_high": ci_high,
                 "wf_window_returns_json": json.dumps([round(float(r), 8) for r in window_returns]),
@@ -1417,6 +1626,7 @@ def _evaluate_holdout_day(
     fee_bps: float,
     slippage_bps: float,
     risk_per_trade: float,
+    max_position_fraction: float,
     daily_stop_loss: float,
     max_consecutive_losses: int,
     cooldown_bars: int,
@@ -1428,7 +1638,12 @@ def _evaluate_holdout_day(
     from src.walk_forward import _compute_threshold
 
     out = strategies.copy()
-    for column in ("holdout_trades", "holdout_total_return", "holdout_win_rate", "holdout_avg_net_return"):
+    for column in (
+        "holdout_trades",
+        "holdout_total_return",
+        "holdout_win_rate",
+        "holdout_avg_net_return",
+    ):
         out[column] = np.nan
     if out.empty or holdout.empty:
         return out
@@ -1448,6 +1663,7 @@ def _evaluate_holdout_day(
             slippage_bps=slippage_bps,
             horizon_bars=int(row["horizon_bars"]),
             risk_per_trade=risk_per_trade,
+            max_position_fraction=max_position_fraction,
             daily_stop_loss=daily_stop_loss,
             max_consecutive_losses=max_consecutive_losses,
             cooldown_bars=cooldown_bars,
@@ -1463,13 +1679,16 @@ def _evaluate_holdout_day(
     return out
 
 
-_DT_WORKER: Dict[str, object] = {}
+_DT_WORKER: dict[str, object] = {}
 
 
-def _dt_worker_init(payload: Dict[str, object]) -> None:
+def _dt_worker_init(payload: dict[str, object]) -> None:
     base_prefix = f"tf_{payload['base_timeframe']}_"
     data = load_dataset(
-        Path(payload["input_path"]), payload["horizons"], base_prefix, payload["base_timeframe"],
+        Path(payload["input_path"]),
+        payload["horizons"],
+        base_prefix,
+        payload["base_timeframe"],
         columns=payload.get("columns"),
     )
     _DT_WORKER.update(payload)
@@ -1480,17 +1699,20 @@ def _dt_worker_init(payload: Dict[str, object]) -> None:
     _DT_WORKER["screen_cache"] = FeatureScreenCache.create()
 
 
-def _dt_score_chunk(indices: Sequence[int]) -> List[Dict[str, object]]:
-    candidates: List[StrategyCandidate] = _DT_WORKER["candidates"]
-    scenarios: List[Tuple[float, float]] = _DT_WORKER["scenarios"]
-    rows: List[Dict[str, object]] = []
+def _dt_score_chunk(indices: Sequence[int]) -> list[dict[str, object]]:
+    candidates: list[StrategyCandidate] = _DT_WORKER["candidates"]
+    scenarios: list[tuple[float, float]] = _DT_WORKER["scenarios"]
+    rows: list[dict[str, object]] = []
     for index in indices:
         candidate = candidates[index]
         candidate_rows = _score_candidate_walk_forward_day(
-            _DT_WORKER["engine"], candidate, scenarios,
+            _DT_WORKER["engine"],
+            candidate,
+            scenarios,
             fee_bps=_DT_WORKER["fee_bps"],
             slippage_bps=_DT_WORKER["slippage_bps"],
             risk_per_trade=_DT_WORKER["risk_per_trade"],
+            max_position_fraction=_DT_WORKER["max_position_fraction"],
             daily_stop_loss=_DT_WORKER["daily_stop_loss"],
             max_consecutive_losses=_DT_WORKER["max_consecutive_losses"],
             cooldown_bars=_DT_WORKER["cooldown_bars"],
@@ -1512,7 +1734,7 @@ def write_report(
     strategies: pd.DataFrame,
     yearly: pd.DataFrame,
     diagnostics: pd.DataFrame,
-    rejection_summary: Dict[str, int],
+    rejection_summary: dict[str, int],
     path: Path,
     base_timeframe: str = "5m",
     walk_forward: bool = False,
@@ -1540,19 +1762,40 @@ def write_report(
     else:
         if walk_forward:
             columns = [
-                "direction", "horizon_bars", "take_profit", "stop_loss",
-                "timeframes", "wf_pass_rate", "wf_expectancy",
-                "wf_profit_factor_median", "wf_max_drawdown_worst",
-                "wf_avg_trades", "wf_total_windows",
-                "wf_scored_windows", "wf_screened_out_windows", "dsr", "rule",
+                "direction",
+                "horizon_bars",
+                "take_profit",
+                "stop_loss",
+                "timeframes",
+                "wf_pass_rate",
+                "wf_expectancy",
+                "wf_profit_factor_median",
+                "wf_max_drawdown_worst",
+                "wf_avg_trades",
+                "wf_total_windows",
+                "wf_scored_windows",
+                "wf_screened_out_windows",
+                "dsr",
+                "rule",
             ]
         else:
             columns = [
-                "direction", "horizon_bars", "take_profit", "stop_loss",
-                "timeframes", "train_trades", "train_total_return",
-                "test_trades", "test_total_return", "test_win_rate",
-                "test_avg_net_return", "test_max_drawdown",
-                "test_avg_trades_per_day", "test_sharpe_ratio", "dsr", "rule",
+                "direction",
+                "horizon_bars",
+                "take_profit",
+                "stop_loss",
+                "timeframes",
+                "train_trades",
+                "train_total_return",
+                "test_trades",
+                "test_total_return",
+                "test_win_rate",
+                "test_avg_net_return",
+                "test_max_drawdown",
+                "test_avg_trades_per_day",
+                "test_sharpe_ratio",
+                "dsr",
+                "rule",
             ]
         available = [c for c in columns if c in strategies.columns]
         lines.append("```text")
@@ -1565,20 +1808,40 @@ def write_report(
     else:
         if walk_forward:
             columns = [
-                "direction", "horizon_bars", "take_profit", "stop_loss",
-                "timeframes", "wf_pass_rate", "wf_expectancy",
-                "wf_profit_factor_median", "wf_max_drawdown_worst",
-                "wf_avg_trades", "wf_total_windows",
-                "wf_scored_windows", "wf_screened_out_windows",
-                "dsr", "passes_filters", "rule",
+                "direction",
+                "horizon_bars",
+                "take_profit",
+                "stop_loss",
+                "timeframes",
+                "wf_pass_rate",
+                "wf_expectancy",
+                "wf_profit_factor_median",
+                "wf_max_drawdown_worst",
+                "wf_avg_trades",
+                "wf_total_windows",
+                "wf_scored_windows",
+                "wf_screened_out_windows",
+                "dsr",
+                "passes_filters",
+                "rule",
             ]
         else:
             columns = [
-                "direction", "horizon_bars", "take_profit", "stop_loss",
-                "timeframes", "train_trades", "train_total_return",
-                "test_trades", "test_total_return", "test_win_rate",
-                "test_avg_net_return", "test_max_drawdown",
-                "dsr", "passes_filters", "rule",
+                "direction",
+                "horizon_bars",
+                "take_profit",
+                "stop_loss",
+                "timeframes",
+                "train_trades",
+                "train_total_return",
+                "test_trades",
+                "test_total_return",
+                "test_win_rate",
+                "test_avg_net_return",
+                "test_max_drawdown",
+                "dsr",
+                "passes_filters",
+                "rule",
             ]
         available = [c for c in columns if c in diagnostics.columns]
         lines.append("```text")
@@ -1586,14 +1849,30 @@ def write_report(
         lines.append("```")
 
     if walk_forward:
-        lines.extend(["", "## Year Breakdown", "", "Walk-forward mode: year metrics disabled to avoid stale-threshold reporting."])
+        lines.extend(
+            [
+                "",
+                "## Year Breakdown",
+                "",
+                "Walk-forward mode: year metrics disabled to avoid stale-threshold reporting.",
+            ]
+        )
     elif not yearly.empty:
         lines.extend(["", "## Year Breakdown", "", "```text"])
         year_cols = [
-            "strategy_rank", "year", "direction", "horizon_bars",
-            "take_profit", "stop_loss", "trades", "total_return",
-            "win_rate", "avg_net_return", "max_drawdown",
-            "avg_trades_per_day", "sharpe_ratio",
+            "strategy_rank",
+            "year",
+            "direction",
+            "horizon_bars",
+            "take_profit",
+            "stop_loss",
+            "trades",
+            "total_return",
+            "win_rate",
+            "avg_net_return",
+            "max_drawdown",
+            "avg_trades_per_day",
+            "sharpe_ratio",
         ]
         available = [c for c in year_cols if c in yearly.columns]
         lines.append(yearly[available].to_string(index=False))
@@ -1623,18 +1902,19 @@ def run(
     require_multitimeframe: bool = True,
     ranking_method: str = "blended",
     cross_tf_mode: str = "pool",
-    enabled_kinds: Set[str] = DEFAULT_ENABLED_KINDS,
+    enabled_kinds: set[str] = DEFAULT_ENABLED_KINDS,
     risk_per_trade: float = 0.003,
+    max_position_fraction: float = 0.25,
     daily_stop_loss: float = -0.02,
     max_consecutive_losses: int = 3,
     cooldown_bars: int = 24,
     walk_forward: bool = False,
-    wf_train_bars: Optional[int] = None,
-    wf_test_bars: Optional[int] = None,
-    wf_step_bars: Optional[int] = None,
+    wf_train_bars: int | None = None,
+    wf_test_bars: int | None = None,
+    wf_step_bars: int | None = None,
     wf_pass_rate: float = 0.8,
     wf_min_windows: int = 6,
-    wf_embargo_bars: Optional[int] = None,
+    wf_embargo_bars: int | None = None,
     feature_screening: str = "none",
     dsr_threshold: float = 0.0,
     regime_conditional: bool = False,
@@ -1645,29 +1925,35 @@ def run(
     n_jobs: int = 1,
     checkpoint_every: int = 25,
     resume: bool = False,
-    feature_pattern: Optional[str] = None,
+    feature_pattern: str | None = None,
 ) -> pd.DataFrame:
     base_prefix = f"tf_{base_timeframe}_"
     data = load_dataset(input_path, horizons, base_prefix, base_timeframe)
     if regime_conditional and "tf_1d_regime_id" not in data.columns:
-        LOGGER.warning("--regime-conditional requested but tf_1d_regime_id is missing; skipping regime breakdown")
+        LOGGER.warning(
+            "--regime-conditional requested but tf_1d_regime_id is missing; skipping regime breakdown"
+        )
         regime_conditional = False
     directions = ("long", "short")
     scenarios = list(itertools.product(take_profits, stop_losses))
-    rows: List[Dict[str, object]] = []
-    return_rows: List[Dict[str, object]] = []
+    rows: list[dict[str, object]] = []
+    return_rows: list[dict[str, object]] = []
     screen_cache = FeatureScreenCache.create()
     holdout = data.iloc[0:0]
     core = data
-    windows: List[Tuple[slice, slice]] = []
+    windows: list[tuple[slice, slice]] = []
     checkpoint_path = output_dir / "checkpoint.csv"
     meta_path = output_dir / "checkpoint_meta.json"
     if not walk_forward:
         train, test = split_train_test(data, train_fraction)
         candidates = make_candidates(
-            train, horizons, directions=directions,
-            max_features=max_features, top_conditions=top_conditions,
-            max_pairs=max_pairs, max_triples=max_triples,
+            train,
+            horizons,
+            directions=directions,
+            max_features=max_features,
+            top_conditions=top_conditions,
+            max_pairs=max_pairs,
+            max_triples=max_triples,
             rank_sample_rows=rank_sample_rows,
             condition_depths=condition_depths,
             ranking_method=ranking_method,
@@ -1678,7 +1964,8 @@ def run(
         )
         LOGGER.info(
             "Scoring %s strategy candidates across %s TP/SL scenarios",
-            len(candidates), len(scenarios),
+            len(candidates),
+            len(scenarios),
         )
         LOGGER.info("Pre-computing OHLC arrays for train/test splits...")
         train_arrays = PrecomputedArrays.from_dataframe(train, base_prefix)
@@ -1697,15 +1984,22 @@ def run(
                     slippage_bps=slippage_bps,
                     horizon_bars=candidate.horizon_bars,
                     risk_per_trade=risk_per_trade,
+                    max_position_fraction=max_position_fraction,
                     daily_stop_loss=daily_stop_loss,
                     max_consecutive_losses=max_consecutive_losses,
                     cooldown_bars=cooldown_bars,
                     use_atr_tp_sl=use_atr_tp_sl,
                 )
                 row = score_candidate(
-                    train, test, candidate, config, base_prefix,
-                    train_mask=train_mask, test_mask=test_mask,
-                    train_arrays=train_arrays, test_arrays=test_arrays,
+                    train,
+                    test,
+                    candidate,
+                    config,
+                    base_prefix,
+                    train_mask=train_mask,
+                    test_mask=test_mask,
+                    train_arrays=train_arrays,
+                    test_arrays=test_arrays,
                 )
                 if regime_conditional:
                     row["regime_breakdown_json"] = json.dumps(
@@ -1735,7 +2029,9 @@ def run(
             pass_rate=wf_pass_rate,
             embargo_bars=wf_embargo_bars if wf_embargo_bars is not None else max(horizons),
         )
-        core_rows = len(data) - int(len(data) * holdout_fraction) if holdout_fraction > 0 else len(data)
+        core_rows = (
+            len(data) - int(len(data) * holdout_fraction) if holdout_fraction > 0 else len(data)
+        )
         core = data.iloc[:core_rows]
         holdout = data.iloc[core_rows:]
         windows = generate_windows(len(core), wf_cfg)
@@ -1743,9 +2039,13 @@ def run(
         # window (nor the holdout) influences candidate selection.
         first_train = core.iloc[windows[0][0]].copy()
         candidates = make_candidates(
-            first_train, horizons, directions=directions,
-            max_features=max_features, top_conditions=top_conditions,
-            max_pairs=max_pairs, max_triples=max_triples,
+            first_train,
+            horizons,
+            directions=directions,
+            max_features=max_features,
+            top_conditions=top_conditions,
+            max_pairs=max_pairs,
+            max_triples=max_triples,
             rank_sample_rows=rank_sample_rows,
             condition_depths=condition_depths,
             ranking_method=ranking_method,
@@ -1756,7 +2056,10 @@ def run(
         )
         LOGGER.info(
             "Walk-forward: %s windows over %s core rows, %s holdout rows reserved, %s candidates",
-            len(windows), len(core), len(holdout), len(candidates),
+            len(windows),
+            len(core),
+            len(holdout),
+            len(candidates),
         )
         # Prune to the columns scoring actually touches. The 5m training table
         # is ~3k columns (~16 GB as float64); loading it whole in every worker
@@ -1772,13 +2075,12 @@ def run(
         else:
             base_columns = {
                 "timestamp",
-                f"{base_prefix}open", f"{base_prefix}high",
-                f"{base_prefix}low", f"{base_prefix}close",
+                f"{base_prefix}open",
+                f"{base_prefix}high",
+                f"{base_prefix}low",
+                f"{base_prefix}close",
             }
-            atr_columns = {
-                c for c in data.columns
-                if c.endswith("_atr") or c.endswith("_atr_14")
-            }
+            atr_columns = {c for c in data.columns if c.endswith("_atr") or c.endswith("_atr_14")}
             worker_columns = sorted(
                 (candidate_feature_columns(candidates) & set(data.columns)) | atr_columns
             )
@@ -1807,6 +2109,7 @@ def run(
             "cross_tf_mode": cross_tf_mode,
             "enabled_kinds": sorted(enabled_kinds),
             "risk_per_trade": risk_per_trade,
+            "max_position_fraction": max_position_fraction,
             "daily_stop_loss": daily_stop_loss,
             "max_consecutive_losses": max_consecutive_losses,
             "cooldown_bars": cooldown_bars,
@@ -1823,7 +2126,7 @@ def run(
         }
         config_hash = _config_hash(hash_config)
         output_dir.mkdir(parents=True, exist_ok=True)
-        done: Set[int] = set()
+        done: set[int] = set()
         if resume:
             rows, done = _load_checkpoint(checkpoint_path, meta_path, config_hash, len(scenarios))
         elif checkpoint_path.exists():
@@ -1832,14 +2135,18 @@ def run(
                 meta_path.unlink()
         meta_path.write_text(
             json.dumps(
-                {"config_hash": config_hash, "n_candidates": len(candidates), "n_scenarios": len(scenarios)},
+                {
+                    "config_hash": config_hash,
+                    "n_candidates": len(candidates),
+                    "n_scenarios": len(scenarios),
+                },
                 indent=2,
             ),
             encoding="utf-8",
         )
         pending = [index for index in range(len(candidates)) if index not in done]
         chunks = [
-            pending[start: start + checkpoint_every]
+            pending[start : start + checkpoint_every]
             for start in range(0, len(pending), checkpoint_every)
         ]
         worker_payload = {
@@ -1861,6 +2168,7 @@ def run(
             "fee_bps": fee_bps,
             "slippage_bps": slippage_bps,
             "risk_per_trade": risk_per_trade,
+            "max_position_fraction": max_position_fraction,
             "daily_stop_loss": daily_stop_loss,
             "max_consecutive_losses": max_consecutive_losses,
             "cooldown_bars": cooldown_bars,
@@ -1874,7 +2182,9 @@ def run(
             from concurrent.futures import ProcessPoolExecutor, as_completed
 
             with ProcessPoolExecutor(
-                max_workers=n_jobs, initializer=_dt_worker_init, initargs=(worker_payload,),
+                max_workers=n_jobs,
+                initializer=_dt_worker_init,
+                initargs=(worker_payload,),
             ) as pool:
                 futures = [pool.submit(_dt_score_chunk, chunk) for chunk in chunks]
                 for future in as_completed(futures):
@@ -1912,23 +2222,18 @@ def run(
     if not diagnostics.empty:
         if walk_forward:
             diagnostics["passes_trade_count"] = diagnostics["wf_avg_trades"] >= min_test_trades
-            diagnostics["passes_profitability"] = (
-                (diagnostics["wf_pass_rate"] >= wf_pass_rate)
-                & (diagnostics["wf_expectancy"] > 0)
+            diagnostics["passes_profitability"] = (diagnostics["wf_pass_rate"] >= wf_pass_rate) & (
+                diagnostics["wf_expectancy"] > 0
             )
         else:
             diagnostics["passes_trade_count"] = (
-                (diagnostics["train_trades"] >= min_train_trades)
-                & (diagnostics["test_trades"] >= min_test_trades)
-            )
-            diagnostics["passes_profitability"] = (
-                (diagnostics["train_total_return"] > 0)
-                & (diagnostics["test_total_return"] > 0)
+                diagnostics["train_trades"] >= min_train_trades
+            ) & (diagnostics["test_trades"] >= min_test_trades)
+            diagnostics["passes_profitability"] = (diagnostics["train_total_return"] > 0) & (
+                diagnostics["test_total_return"] > 0
             )
         diagnostics["passes_multitimeframe"] = (
-            diagnostics["timeframe_count"] >= 2
-            if require_multitimeframe
-            else True
+            diagnostics["timeframe_count"] >= 2 if require_multitimeframe else True
         )
         diagnostics["passes_dsr"] = diagnostics["dsr"] >= dsr_threshold
         diagnostics["passes_filters"] = (
@@ -1941,8 +2246,12 @@ def run(
             diagnostics["passes_filters"] = diagnostics["passes_filters"] & diagnostics["wf_passes"]
         if walk_forward:
             sort_cols = [
-                "dsr", "wf_pass_rate", "wf_expectancy", "wf_profit_factor_median",
-                "wf_max_drawdown_worst", "wf_avg_trades",
+                "dsr",
+                "wf_pass_rate",
+                "wf_expectancy",
+                "wf_profit_factor_median",
+                "wf_max_drawdown_worst",
+                "wf_avg_trades",
             ]
             sort_asc = [False, False, False, False, False, False]
         else:
@@ -1957,13 +2266,25 @@ def run(
     if walk_forward and not holdout.empty and not strategies.empty:
         refit_frame = core.iloc[windows[-1][0]]
         strategies = _evaluate_holdout_day(
-            holdout, refit_frame, strategies, base_prefix,
-            fee_bps, slippage_bps, risk_per_trade, daily_stop_loss,
-            max_consecutive_losses, cooldown_bars, use_atr_tp_sl,
+            holdout,
+            refit_frame,
+            strategies,
+            base_prefix,
+            fee_bps,
+            slippage_bps,
+            risk_per_trade,
+            max_position_fraction,
+            daily_stop_loss,
+            max_consecutive_losses,
+            cooldown_bars,
+            use_atr_tp_sl,
         )
 
     rejection_summary = summarize_filter_rejections(
-        diagnostics, min_train_trades, min_test_trades, require_multitimeframe,
+        diagnostics,
+        min_train_trades,
+        min_test_trades,
+        require_multitimeframe,
         walk_forward=walk_forward,
     )
 
@@ -1974,6 +2295,7 @@ def run(
         slippage_bps=slippage_bps,
         horizon_bars=horizons[0],
         risk_per_trade=risk_per_trade,
+        max_position_fraction=max_position_fraction,
         daily_stop_loss=daily_stop_loss,
         max_consecutive_losses=max_consecutive_losses,
         cooldown_bars=cooldown_bars,
@@ -1983,13 +2305,17 @@ def run(
         yearly = pd.DataFrame()
     else:
         yearly = add_year_metrics(
-            data, strategies, config_template, base_prefix, top_n=10,
+            data,
+            strategies,
+            config_template,
+            base_prefix,
+            top_n=10,
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     config_dict = {
         "git_sha": get_git_sha(),
-        "search_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "search_timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         "input_path": str(input_path),
         "base_timeframe": base_timeframe,
         "horizons": list(horizons),
@@ -2012,6 +2338,7 @@ def run(
         "cross_tf_mode": cross_tf_mode,
         "enabled_kinds": sorted(enabled_kinds),
         "risk_per_trade": risk_per_trade,
+        "max_position_fraction": max_position_fraction,
         "daily_stop_loss": daily_stop_loss,
         "max_consecutive_losses": max_consecutive_losses,
         "cooldown_bars": cooldown_bars,
@@ -2050,14 +2377,17 @@ def run(
         "report": report,
     }
     (output_dir / "config.json").write_text(
-        json.dumps(config_dict, indent=2, sort_keys=True), encoding="utf-8",
+        json.dumps(config_dict, indent=2, sort_keys=True),
+        encoding="utf-8",
     )
     heavy_columns = ["wf_window_returns_json"]
     diagnostics.drop(columns=heavy_columns, errors="ignore").to_csv(
-        output_dir / "scored_strategies_all.csv", index=False,
+        output_dir / "scored_strategies_all.csv",
+        index=False,
     )
     (output_dir / "filter_summary.json").write_text(
-        json.dumps(rejection_summary, indent=2, sort_keys=True), encoding="utf-8",
+        json.dumps(rejection_summary, indent=2, sort_keys=True),
+        encoding="utf-8",
     )
     strategies = strategies.drop(columns=heavy_columns, errors="ignore")
     strategies.to_csv(output_dir / "ranked_strategies.csv", index=False)
@@ -2065,8 +2395,13 @@ def run(
     clustered.to_csv(output_dir / "ranked_strategies_clustered.csv", index=False)
     yearly.to_csv(output_dir / "ranked_strategies_by_year.csv", index=False)
     write_report(
-        strategies, yearly, diagnostics, rejection_summary,
-        output_dir / "report.md", base_timeframe, walk_forward=walk_forward,
+        strategies,
+        yearly,
+        diagnostics,
+        rejection_summary,
+        output_dir / "report.md",
+        base_timeframe,
+        walk_forward=walk_forward,
     )
     if checkpoint_path.exists():
         checkpoint_path.unlink()
@@ -2080,7 +2415,8 @@ def parse_args() -> argparse.Namespace:
         description="Search for day trading strategies with risk management."
     )
     parser.add_argument(
-        "--input-path", type=Path,
+        "--input-path",
+        type=Path,
         default=PROCESSED_DATA_DIR / "train_5m_indicators.parquet",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -2093,7 +2429,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-triples", type=int, default=2500)
     parser.add_argument("--rank-sample-rows", type=int, default=50_000)
     parser.add_argument(
-        "--condition-depth", action="append", type=int, choices=(1, 2, 3),
+        "--condition-depth",
+        action="append",
+        type=int,
+        choices=(1, 2, 3),
     )
     parser.add_argument("--min-train-trades", type=int, default=100)
     parser.add_argument("--min-test-trades", type=int, default=50)
@@ -2101,18 +2440,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slippage-bps", type=float, default=2.0)
     parser.add_argument("--take-profit", action="append", type=float)
     parser.add_argument("--stop-loss", action="append", type=float)
-    parser.add_argument("--use-atr-tp-sl", action="store_true", help="Use ATR-based dynamic stop loss and take profit.")
-    parser.add_argument("--require-multitimeframe", action="store_true", default=True)
-    parser.add_argument("--no-require-multitimeframe", dest="require_multitimeframe", action="store_false")
     parser.add_argument(
-        "--ranking-method", choices=("spearman", "importance", "blended"),
+        "--use-atr-tp-sl",
+        action="store_true",
+        help="Use ATR-based dynamic stop loss and take profit.",
+    )
+    parser.add_argument("--require-multitimeframe", action="store_true", default=True)
+    parser.add_argument(
+        "--no-require-multitimeframe", dest="require_multitimeframe", action="store_false"
+    )
+    parser.add_argument(
+        "--ranking-method",
+        choices=("spearman", "importance", "blended"),
         default="blended",
     )
     parser.add_argument(
-        "--cross-tf-mode", choices=("none", "pool"), default="pool",
+        "--cross-tf-mode",
+        choices=("none", "pool"),
+        default="pool",
     )
     parser.add_argument("--enabled-kinds", nargs="+", default=None)
     parser.add_argument("--risk-per-trade", type=float, default=0.003)
+    parser.add_argument("--max-position-fraction", type=float, default=0.25)
     parser.add_argument("--daily-stop-loss", type=float, default=-0.02)
     parser.add_argument("--max-consecutive-losses", type=int, default=3)
     parser.add_argument("--cooldown-bars", type=int, default=24)
@@ -2129,25 +2478,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cluster-jaccard", type=float, default=0.8)
     parser.add_argument("--report", action="store_true")
     parser.add_argument(
-        "--holdout-fraction", type=float, default=0.2,
+        "--holdout-fraction",
+        type=float,
+        default=0.2,
         help="Final fraction of data excluded from walk-forward; scored report-only.",
     )
     parser.add_argument(
-        "--n-jobs", type=int, default=1,
+        "--n-jobs",
+        type=int,
+        default=1,
         help="Worker processes for walk-forward candidate scoring. 1 = sequential.",
     )
     parser.add_argument(
-        "--checkpoint-every", type=int, default=25,
+        "--checkpoint-every",
+        type=int,
+        default=25,
         help="Flush scored candidates to the checkpoint file every N candidates (walk-forward mode).",
     )
     parser.add_argument(
-        "--resume", action="store_true",
+        "--resume",
+        action="store_true",
         help="Resume a walk-forward run from an existing checkpoint in --output-dir.",
     )
     parser.add_argument(
-        "--feature-pattern", default=None,
+        "--feature-pattern",
+        default=None,
         help="Regex restricting the candidate feature universe (e.g. 'cvd_|taker_' "
-             "to mine only order-flow features).",
+        "to mine only order-flow features).",
     )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
@@ -2196,6 +2553,7 @@ def main() -> None:
         cross_tf_mode=args.cross_tf_mode,
         enabled_kinds=enabled_kinds,
         risk_per_trade=args.risk_per_trade,
+        max_position_fraction=args.max_position_fraction,
         daily_stop_loss=args.daily_stop_loss,
         max_consecutive_losses=args.max_consecutive_losses,
         cooldown_bars=args.cooldown_bars,

@@ -1,0 +1,267 @@
+{
+  "approval_ledger": "runtime/approvals.json",
+  "artifact_hygiene_file": "runtime/artifact_hygiene.json",
+  "backup_report_file": "runtime/backup_report.json",
+  "backup_enabled": true,
+  "backup_cadence_seconds": 86400,
+  "backup_timeout_seconds": 60,
+  "auto_report_enabled": true,
+  "alert_cooldown_seconds": 900,
+  "alert_file": "runtime/alerts.jsonl",
+  "alert_state_file": "runtime/alert_state.json",
+  "alerts_enabled": true,
+  "control_file": "runtime/operator-control/control.json",
+  "control_audit_file": "runtime/operator-control/control_audit.jsonl",
+  "candidate_paper_enabled": true,
+  "candidate_paper_status_file": "runtime/candidate_paper_status.json",
+  "candidate_paper_cadence_seconds": 45,
+  "candidate_paper_max_unseen_bars": 240,
+  "candidate_paper_timeout_seconds": 240,
+  "job_state_file": "runtime/job_state.json",
+  "lock_file": "runtime/autopilot.lock",
+  "incubation_candidates_file": "runtime/incubation_candidates.json",
+  "min_runtime_free_bytes": 536870912,
+  "max_jobs_per_cycle": 1,
+  "max_consecutive_job_deferrals": 16,
+  "loop_sleep_seconds": 60,
+  "operator_report_file": "runtime/operator_report.md",
+  "operator_report_json_file": "runtime/operator_report.json",
+  "readiness_report_file": "runtime/readiness_report.md",
+  "readiness_report_json_file": "runtime/readiness_report.json",
+  "research_cycle_file": "runtime/research_cycle.json",
+  "research_factory_config_file": "config/research_factory.json",
+  "generated_batch_file": "runtime/research/generated_hypotheses.json",
+  "experiment_memory_file": "runtime/research/experiment_memory.sqlite3",
+  "experiment_memory_backup_file": "runtime/research/experiment_memory.backup.sqlite3",
+  "research_smoke_file": "runtime/research_smoke.json",
+  "strategy_smoke_file": "runtime/strategy_framework_smoke.json",
+  "run_data_update": false,
+  "status_file": "runtime/status.json",
+  "webhook_url_env": "AUTOPILOT_WEBHOOK_URL",
+  "jobs": [
+    {
+      "name": "market_data_update_futures",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.history_bootstrap",
+        "--config", "config/research_factory.json",
+        "--market", "futures",
+        "--exclude-timeframes", "1m",
+        "--report", "runtime/history_bootstrap_futures.json"
+      ],
+      "cadence_seconds": 21600,
+      "timeout_seconds": 1800
+    },
+    {
+      "name": "regime_tag_futures_15m",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.regime",
+        "--market", "futures",
+        "--timeframe", "15m",
+        "--daily-timeframe", "1d",
+        "--output", "runtime/regime/futures_15m_regime.parquet",
+        "--report", "runtime/regime_tag_futures_15m.json",
+        "--compact",
+        "--skip-if-missing"
+      ],
+      "cadence_seconds": 21600,
+      "timeout_seconds": 300
+    },
+    {
+      "name": "market_data_update_futures_1m",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.history_bootstrap",
+        "--config", "config/research_factory.json",
+        "--market", "futures",
+        "--timeframes", "1m",
+        "--report", "runtime/history_bootstrap_futures_1m.json"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 1800
+    },
+    {
+      "name": "market_data_update_spot",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.history_bootstrap",
+        "--config", "config/research_factory.json",
+        "--market", "spot",
+        "--report", "runtime/history_bootstrap_spot.json"
+      ],
+      "cadence_seconds": 21600,
+      "timeout_seconds": 1800
+    },
+    {
+      "name": "strategy_catalog_smoke",
+      "enabled": false,
+      "command": [".venv/bin/python", "-m", "src.run_backtest", "--list"],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 120
+    },
+    {
+      "name": "research_synthetic_smoke",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.research_smoke",
+        "--output", "runtime/research_smoke.json"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 300
+    },
+    {
+      "name": "research_factory",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.research_factory",
+        "--config", "config/research_factory.json",
+        "--output", "runtime/research/generated_hypotheses.json"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 120
+    },
+    {
+      "name": "research_cycle",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.research_cycle",
+        "--output", "runtime/research_cycle.json",
+        "--state", "runtime/research_cycle_state.json",
+        "--include-generated",
+        "--generated-only",
+        "--generated-batch", "runtime/research/generated_hypotheses.json",
+        "--research-factory-config", "config/research_factory.json"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 1800
+    },
+    {
+      "name": "synthetic_strategy_sweep",
+      "enabled": false,
+      "command": [".venv/bin/python", "-m", "src.sweep", "--all", "--synthetic", "8000"],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 900
+    },
+    {
+      "name": "strategy_framework_smoke",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.strategy_smoke",
+        "--output", "runtime/strategy_framework_smoke.json",
+        "--regime-input", "runtime/regime/futures_15m_regime.parquet",
+        "--max-regime-rows", "50000"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 600
+    },
+    {
+      "name": "active_income_promotion_review",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.promotion",
+        "--config", "config/autopilot.json",
+        "--product", "active_income",
+        "--artifact", "outputs/active_strategies_flow.json",
+        "--trade-log", "runtime/active_income_trades.csv",
+        "--output-json", "runtime/active_income_promotion_review.json",
+        "--output-md", "runtime/active_income_promotion_review.md"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 120
+    },
+    {
+      "name": "btc_accumulation_promotion_review",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.promotion",
+        "--config", "config/autopilot.json",
+        "--product", "btc_accumulation",
+        "--artifact", "outputs/active_strategies_position.json",
+        "--trade-log", "runtime/btc_accumulation_trades.csv",
+        "--output-json", "runtime/btc_accumulation_promotion_review.json",
+        "--output-md", "runtime/btc_accumulation_promotion_review.md"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 120
+    },
+    {
+      "name": "operator_report",
+      "enabled": false,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.reporting",
+        "--config", "config/autopilot.json",
+        "--output", "runtime/operator_report.md",
+        "--json-output", "runtime/operator_report.json"
+      ],
+      "cadence_seconds": 3600,
+      "timeout_seconds": 60
+    },
+    {
+      "name": "runtime_maintenance",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.maintenance",
+        "--config", "config/autopilot.json",
+        "--max-alert-lines", "1000",
+        "--max-alert-fingerprints", "1000",
+        "--max-experiment-lines", "5000",
+        "--max-control-audit-lines", "5000",
+        "--max-quarantine-bytes", "268435456"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 60
+    },
+    {
+      "name": "artifact_hygiene",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.artifact_hygiene",
+        "--config", "config/autopilot.json",
+        "--output", "runtime/artifact_hygiene.json"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 120
+    }
+  ],
+  "products": [
+    {
+      "name": "btc_accumulation",
+      "enabled": true,
+      "objective": "btc_accumulation",
+      "base_asset": "BTC",
+      "market": "spot",
+      "execution_mode": "paper",
+      "symbol": "BTCUSDT",
+      "strategies_path": "outputs/active_strategies_position.json",
+      "state_file": "runtime/btc_accumulation_state.json",
+      "trade_log": "runtime/btc_accumulation_trades.csv",
+      "require_preflight": true,
+      "preflight_report": "runtime/btc_accumulation_preflight_report.json",
+      "preflight_max_age_seconds": 3600,
+      "starting_equity": 1.0,
+      "regime_guard": true,
+      "regime_mayer_top": 2.4
+    },
+    {
+      "name": "active_income",
+      "enabled": true,
+      "objective": "active_income",
+      "base_asset": "USDT",
+      "market": "futures",
+      "execution_mode": "paper",
+      "symbol": "BTCUSDT",
+      "strategies_path": "outputs/active_strategies_flow.json",
+      "state_file": "runtime/active_income_state.json",
+      "trade_log": "runtime/active_income_trades.csv",
+      "require_preflight": true,
+      "preflight_report": "runtime/active_income_preflight_report.json",
+      "preflight_max_age_seconds": 3600,
+      "require_testnet_rehearsal": true,
+      "testnet_rehearsal_report": "runtime/testnet_rehearsal_report.json",
+      "testnet_rehearsal_max_age_seconds": 2592000,
+      "starting_equity": 1000.0,
+      "regime_guard": false
+    }
+  ]
+}

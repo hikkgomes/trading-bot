@@ -11,12 +11,11 @@ condition-grid). Importing this package registers the bundled library so
     print(result.summary())
 """
 
+# Import the library for its registration side effects.
+from src.strategies import library  # noqa: E402,F401
 from src.strategies.backtester import BacktestResult, run_backtest
 from src.strategies.base import BacktestConfig, Strategy, extract_ohlcv
 from src.strategies.registry import available, describe, get, register
-
-# Import the library for its registration side effects.
-from src.strategies import library  # noqa: E402,F401
 
 __all__ = [
     "Strategy",

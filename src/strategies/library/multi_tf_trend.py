@@ -23,7 +23,7 @@ class MultiTimeframeTrendStrategy(Strategy):
     @classmethod
     def default_params(cls):
         return {
-            "higher_tf": "4h",      # tf_4h_close used as the trend filter if present
+            "higher_tf": "4h",  # tf_4h_close used as the trend filter if present
             "higher_ema": 50,
             "fast": 12,
             "slow": 26,

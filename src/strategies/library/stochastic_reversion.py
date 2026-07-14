@@ -16,7 +16,13 @@ class StochasticReversionStrategy(Strategy):
 
     @classmethod
     def default_params(cls):
-        return {"k_period": 14, "d_period": 3, "oversold": 20.0, "overbought": 80.0, "allow_short": True}
+        return {
+            "k_period": 14,
+            "d_period": 3,
+            "oversold": 20.0,
+            "overbought": 80.0,
+            "allow_short": True,
+        }
 
     @classmethod
     def default_config(cls) -> BacktestConfig:
@@ -27,7 +33,9 @@ class StochasticReversionStrategy(Strategy):
         high = pd.Series(o.high, index=df.index)
         low = pd.Series(o.low, index=df.index)
         close = pd.Series(o.close, index=df.index)
-        k, d = ind.stochastic(high, low, close, int(self.params["k_period"]), int(self.params["d_period"]))
+        k, d = ind.stochastic(
+            high, low, close, int(self.params["k_period"]), int(self.params["d_period"])
+        )
         sig = self._empty_signals(df)
         sig[ind.crossover(k, d) & (d < float(self.params["oversold"]))] = 1
         if self.params["allow_short"]:

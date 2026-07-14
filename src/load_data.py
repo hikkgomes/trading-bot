@@ -1,13 +1,12 @@
 import argparse
 import logging
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable, List, Optional
 
 import pandas as pd
 
 from src.config import PROCESSED_DATA_DIR, RAW_DATA_DIR, TIMEFRAMES
-
 
 LOGGER = logging.getLogger(__name__)
 TIMESTAMP_CANDIDATES = (
@@ -38,7 +37,7 @@ def standardize_column_name(column: object) -> str:
     return name.strip("_") or "unnamed"
 
 
-def make_unique_columns(columns: Iterable[object]) -> List[str]:
+def make_unique_columns(columns: Iterable[object]) -> list[str]:
     seen = {}
     unique = []
     for column in columns:
@@ -124,9 +123,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     exact_duplicates = before - len(cleaned)
 
     before = len(cleaned)
-    cleaned = cleaned.sort_values("timestamp").drop_duplicates(
-        subset=["timestamp"], keep="last"
-    )
+    cleaned = cleaned.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
     timestamp_duplicates = before - len(cleaned)
 
     if exact_duplicates or timestamp_duplicates:
@@ -139,7 +136,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return cleaned.sort_values("timestamp").reset_index(drop=True)
 
 
-def find_raw_file(raw_dir: Path, timeframe: str) -> Optional[Path]:
+def find_raw_file(raw_dir: Path, timeframe: str) -> Path | None:
     expected = raw_dir / f"btcusdt_{timeframe}.csv"
     if expected.exists():
         return expected

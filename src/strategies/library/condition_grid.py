@@ -11,8 +11,8 @@ the bar where the combined mask flips from False to True.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
-from typing import List, Sequence
 
 import pandas as pd
 
@@ -33,7 +33,7 @@ class ConditionGridStrategy(Strategy):
     def __init__(self, conditions: Sequence | None = None, direction: str = "long", **params):
         super().__init__(**params)
         conds = conditions if conditions is not None else self.params.get("conditions", [])
-        self.conditions: List[Condition] = [
+        self.conditions: list[Condition] = [
             c if isinstance(c, Condition) else Condition(**c) for c in conds
         ]
         self.direction = direction or self.params.get("direction", "long")

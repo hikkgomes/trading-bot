@@ -10,8 +10,20 @@ def test_cluster_ranked_strategies_keeps_best_representative():
     b = StrategyCandidate("long", 4, (Condition("other", "value_ge", 1, "other"),))
     strategies = pd.DataFrame(
         [
-            {"conditions_json": _conditions_payload(a), "dsr": 0.4, "test_total_return": 0.1, "test_avg_net_return": 0.01, "test_trades": 2},
-            {"conditions_json": _conditions_payload(b), "dsr": 0.9, "test_total_return": 0.2, "test_avg_net_return": 0.02, "test_trades": 2},
+            {
+                "conditions_json": _conditions_payload(a),
+                "dsr": 0.4,
+                "test_total_return": 0.1,
+                "test_avg_net_return": 0.01,
+                "test_trades": 2,
+            },
+            {
+                "conditions_json": _conditions_payload(b),
+                "dsr": 0.9,
+                "test_total_return": 0.2,
+                "test_avg_net_return": 0.02,
+                "test_trades": 2,
+            },
         ]
     )
     clustered = cluster_ranked_strategies(data, strategies, threshold=0.8)

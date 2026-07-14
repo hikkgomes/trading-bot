@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 import src.strategy_search as ss
+from src.discover_patterns import Condition
 from src.strategy_search import (
     SimArrays,
     StrategyCandidate,
@@ -13,7 +14,6 @@ from src.strategy_search import (
     simulate_net_returns,
     simulate_trades,
 )
-from src.discover_patterns import Condition
 
 
 def make_ohlc(n=400, seed=7):
@@ -41,12 +41,28 @@ def test_numba_python_parity():
     for direction in ("long", "short"):
         for pnl_unit in ("usdt", "btc"):
             fast = simulate_net_returns(
-                arrays, signal, direction, 8, 5.0, 1.0, 0.01, 0.005, pnl_unit,
+                arrays,
+                signal,
+                direction,
+                8,
+                5.0,
+                1.0,
+                0.01,
+                0.005,
+                pnl_unit,
             )
             slow = _simulate_net_returns_python(
-                arrays.open_, arrays.high, arrays.low, arrays.close,
-                signal, direction == "long", 8, 0.01, 0.005,
-                2 * ((5.0 + 1.0) / 10_000), pnl_unit == "btc",
+                arrays.open_,
+                arrays.high,
+                arrays.low,
+                arrays.close,
+                signal,
+                direction == "long",
+                8,
+                0.01,
+                0.005,
+                2 * ((5.0 + 1.0) / 10_000),
+                pnl_unit == "btc",
             )
             np.testing.assert_array_equal(fast, slow)
 
@@ -62,12 +78,26 @@ def test_fast_path_matches_legacy_simulate_trades():
     for direction in ("long", "short"):
         for pnl_unit in ("usdt", "btc"):
             legacy = simulate_trades(
-                data, signal, direction, 6,
-                fee_bps=5.0, slippage_bps=1.0,
-                take_profit=0.008, stop_loss=0.004, pnl_unit=pnl_unit,
+                data,
+                signal,
+                direction,
+                6,
+                fee_bps=5.0,
+                slippage_bps=1.0,
+                take_profit=0.008,
+                stop_loss=0.004,
+                pnl_unit=pnl_unit,
             )
             fast = simulate_net_returns(
-                arrays, signal_values, direction, 6, 5.0, 1.0, 0.008, 0.004, pnl_unit,
+                arrays,
+                signal_values,
+                direction,
+                6,
+                5.0,
+                1.0,
+                0.008,
+                0.004,
+                pnl_unit,
             )
             legacy_returns = legacy["net_return"].to_numpy() if not legacy.empty else np.array([])
             np.testing.assert_allclose(fast, legacy_returns, rtol=0, atol=1e-12)
@@ -161,7 +191,8 @@ def test_run_single_split_ranks_without_test_metrics(tmp_path):
     sort_columns = ["dsr", "train_total_return", "train_avg_net_return", "train_trades"]
     resorted = scored.sort_values(sort_columns, ascending=[False] * 4).reset_index(drop=True)
     pd.testing.assert_frame_equal(
-        scored[sort_columns].reset_index(drop=True), resorted[sort_columns],
+        scored[sort_columns].reset_index(drop=True),
+        resorted[sort_columns],
     )
 
 
@@ -169,18 +200,31 @@ def test_candidate_feature_columns_collects_all_references():
     from src.walk_forward import candidate_feature_columns
 
     candidates = [
-        StrategyCandidate("long", 4, (
-            Condition("tf_15m_rsi_14", "value_le", 30.0, "a"),
-            Condition("tf_1h_ema_20", "ratio_ge", 1.0, "b", feature_b="tf_1h_close"),
-        )),
-        StrategyCandidate("short", 4, (
-            Condition("tf_15m_macd", "cross_above", 0.0, "c", cross_feature="tf_15m_macd_signal"),
-        )),
+        StrategyCandidate(
+            "long",
+            4,
+            (
+                Condition("tf_15m_rsi_14", "value_le", 30.0, "a"),
+                Condition("tf_1h_ema_20", "ratio_ge", 1.0, "b", feature_b="tf_1h_close"),
+            ),
+        ),
+        StrategyCandidate(
+            "short",
+            4,
+            (
+                Condition(
+                    "tf_15m_macd", "cross_above", 0.0, "c", cross_feature="tf_15m_macd_signal"
+                ),
+            ),
+        ),
     ]
     needed = candidate_feature_columns(candidates)
     assert needed == {
-        "tf_15m_rsi_14", "tf_1h_ema_20", "tf_1h_close",
-        "tf_15m_macd", "tf_15m_macd_signal",
+        "tf_15m_rsi_14",
+        "tf_1h_ema_20",
+        "tf_1h_close",
+        "tf_15m_macd",
+        "tf_15m_macd_signal",
     }
 
 
@@ -199,7 +243,8 @@ def test_load_dataset_column_projection_matches_full_load(tmp_path):
     for column in ("timestamp", "tf_15m_open", "tf_15m_high", "tf_15m_low", "tf_15m_close"):
         assert column in pruned.columns
     np.testing.assert_array_equal(
-        pruned["future_return_4_bars"].to_numpy(), full["future_return_4_bars"].to_numpy(),
+        pruned["future_return_4_bars"].to_numpy(),
+        full["future_return_4_bars"].to_numpy(),
     )
 
 
@@ -235,8 +280,12 @@ def test_walk_forward_engine_caches_masks_across_candidates():
     windows = [(slice(0, 1_000), slice(1_000, 1_500)), (slice(500, 1_500), slice(1_500, 2_000))]
     engine = ss.WalkForwardEngine(data, windows)
     condition = Condition(
-        "tf_15m_rsi_14", "value_le", 0.0, "rsi low",
-        threshold_source="quantile", quantile=0.2,
+        "tf_15m_rsi_14",
+        "value_le",
+        0.0,
+        "rsi low",
+        threshold_source="quantile",
+        quantile=0.2,
     )
     candidate_a = StrategyCandidate("long", 4, (condition,))
     candidate_b = StrategyCandidate("short", 4, (condition,))

@@ -36,13 +36,17 @@ class CandlestickReversalStrategy(Strategy):
         close = pd.Series(o.close, index=df.index)
         wr = float(self.params["wick_ratio"])
 
-        bull = ind.bullish_engulfing(open_, high, low, close) | ind.hammer(open_, high, low, close, wr)
-        bear = ind.bearish_engulfing(open_, high, low, close) | ind.shooting_star(open_, high, low, close, wr)
+        bull = ind.bullish_engulfing(open_, high, low, close) | ind.hammer(
+            open_, high, low, close, wr
+        )
+        bear = ind.bearish_engulfing(open_, high, low, close) | ind.shooting_star(
+            open_, high, low, close, wr
+        )
 
         if self.params["use_trend_filter"]:
             ma = ind.sma(close, int(self.params["trend_sma"]))
-            bull &= close < ma   # bullish reversal only when pulled back below the mean
-            bear &= close > ma   # bearish reversal only when stretched above it
+            bull &= close < ma  # bullish reversal only when pulled back below the mean
+            bear &= close > ma  # bearish reversal only when stretched above it
 
         sig = self._empty_signals(df)
         sig[bull] = 1

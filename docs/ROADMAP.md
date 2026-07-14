@@ -1,68 +1,58 @@
-# Roadmap
+# Roadmap and honest status
 
-Two products, each with its own search, contract file, and bot:
+The repository now implements the autonomous research platform; it does not
+claim to contain a profitable strategy. The two independent objectives are:
 
-1. **Position / BTC-accumulation bot** — BTC-denominated; beat buy-and-hold by
-   dodging pullbacks. Source: `outputs/search_v4_btc` → `active_strategies.json`.
-2. **Day-trade / algo bot** — USDT income on any automatable futures venue.
-   Source: flow searches → `active_strategies_flow.json`, executed via
-   `src/execution`.
+1. BTC-denominated accumulation through bounded BTC/USDT spot step-aside and
+   rebuy behavior, without leverage.
+2. USDT-denominated active-income research for Binance futures across scalping,
+   day, and swing horizons, with strict risk limits.
 
-## Where things stand (2026-06-22)
+## Implemented
 
-The research instrumentation is solid (walk-forward, Deflated Sharpe, CSCV PBO,
-untouched holdout, clustering). The honest result so far: **no search has
-produced a deployable edge** — top strategies score DSR ≈ 0 and lose on the
-holdout. The live paper bots run strategies that lost on their own holdout
-because the export step never gated on it.
+- Resumable native-timeframe Binance history, atomic parquet publication,
+  feature contracts, coverage/freshness checks, and regime data.
+- A typed compositional strategy grammar that emits data specifications rather
+  than code, with fresh generation, recursive failure-aware mutation, crossover,
+  dynamic safe features, and hard complexity/risk/time/resource limits.
+- Persistent SQLite experiment memory with canonical behavioral identity,
+  global deduplication, lineage, novelty, pending-work recovery, engine-scoped
+  development evidence, dataset/protocol identity, and consistent backups.
+- Chronological train/validation/OOS/sensitivity/final-holdout validation with
+  cumulative multiple-testing penalties and per-candidate crash checkpoints.
+- Durable lineage-scoped holdout claims committed before protected data is
+  read. Protected outcomes cannot influence generation or OpenClaw.
+- Continuous development-only adaptation of primitive weights, method mix,
+  parent selection, and mutation choices while preserving fresh exploration.
+- Paper-by-default execution for both products, isolated paper evidence for a
+  staged replacement of an already-live product, and explicit candidate
+  activation.
+- Exact artifact/strategy/product/engine-bound human approval, production
+  preflight, futures testnet rehearsal, native protective stops, reconciliation,
+  circuit breakers, pause/panic/flatten controls, and recovery intents.
+- Separate lightweight systemd services for position supervision, bounded jobs,
+  and healthchecks; resource limits, monitoring, alerts, maintenance, verified
+  backups, offline rehearsal, and recovery documentation.
+- Optional Telegram status/alerts/pause-only control and an isolated OpenClaw
+  development-research proposal bridge. Neither can approve or execute.
 
-## Now shipped (this setup pass)
+## Still required from the operator
 
-- Unified **strategy framework** (`src/strategies`): one `Strategy` contract +
-  vectorized backtester (matches the search trade model) + registry + CLI
-  (`python -m src.run_backtest`). See [STRATEGIES.md](STRATEGIES.md).
-- **17 bundled strategies across every paradigm** — trend (`sma_cross`,
-  `macd_trend`, `supertrend`, `adx_trend`, `multi_tf_trend`), momentum
-  (`momentum_roc`), breakout/volatility (`donchian_breakout`, `keltner_breakout`,
-  `atr_channel_breakout`, `bollinger_squeeze`), mean-reversion (`rsi_reversion`,
-  `bollinger_reversion`, `zscore_reversion`, `stochastic_reversion`), ML
-  (`ml_classifier` direction, `ml_regressor` magnitude), and the `condition_grid`
-  bridge — on a pure-pandas indicator toolkit (no TA-Lib).
-- **Sweep/compare harness** (`python -m src.sweep`): ranks any set of strategies
-  on the same leakage-free holdout with a buy-and-hold benchmark + param grids.
-- **Execution layer** (`src/execution`): `PaperBroker` + ccxt live/testnet
-  adapter with notional + live-mode safety rails. See [EXECUTION.md](EXECUTION.md).
-- Repo hygiene: real code under version control, `.venv`/caches untracked,
-  `pyproject.toml` (ruff + pytest), `Makefile`, split requirements.
+- Deploy on the target Linux server and let the initial history bootstrap
+  complete; this can take time and network bandwidth.
+- Verify continuous paper operation, restart/reboot recovery, alert delivery,
+  resource use, daily backups, and an off-host restore rehearsal.
+- Supply Telegram/OpenClaw configuration only if those optional edges are
+  wanted, using the isolation instructions in `COMMUNICATIONS.md`.
+- Evaluate whatever evidence the system produces. "No keeper" is a valid and
+  expected research result; do not weaken gates to force a strategy.
+- Before risking money, accumulate adequate exact-fingerprint forward-paper
+  evidence, run the connected futures testnet rehearsal where applicable,
+  inspect the promotion packet, and explicitly approve the exact active
+  artifact. Start with one product and tiny caps.
 
-## Next — research integrity (do these before trusting any live signal)
+## Not promised
 
-- [ ] **Make the holdout a hard export gate.** Require `holdout_total_return > 0`
-      and a meaningful `--min-dsr` (≥ 0.9). Expect this to export *nothing* today
-      — that's the correct, honest outcome.
-- [ ] Benchmark the position bot in **BTC terms vs. buy-and-hold**, not USDT P&L.
-- [ ] Treat the flow edge as unproven: 3,199 "passing" candidates at DSR ≈ 0 is
-      a false-positive symptom, not edge. Reduce the trial count, don't add features.
-
-## Next — new strategy generation (the framework makes these cheap)
-
-- [x] Broad strategy library across paradigms + a sweep/compare harness
-      (`src.sweep`) that benchmarks them on a holdout vs buy-and-hold.
-- [ ] Wire `src.sweep` into walk-forward + DSR (it currently uses a single
-      chronological holdout); keep only what clears a real holdout gate.
-- [ ] Expand `ml_classifier`/`ml_regressor`: triple-barrier labels, meta-labeling
-      (`src/meta_labeling.py`), purged/embargoed CV, feature screening.
-- [ ] Add regime-conditional variants (`src/regime.py`) — bull/bear/range.
-- [ ] Portfolio layer: combine low-correlation surviving strategies (Jaccard
-      clustering already exists in `src/metrics.py`).
-
-## Next — execution
-
-- [ ] **Position-state regime overlay for the BTC bot.** `btc_cycle_guard`
-      (Mayer/Pi-Cycle/trend-break, daily-scaled) catches the real cycle tops
-      (Dec'21, May'22) but the fixed-TP/SL short model whipsaws and trails hold.
-      Re-express macro "step aside" as a held-vs-flat state in `run_bot`, not a
-      backtester short — that's the natural fit for accumulation.
-- [ ] Route `src/run_bot.py` fills through a `Broker` so paper/live is a swap.
-- [ ] Wire `CcxtBroker` to a testnet end-to-end (sandbox keys, tiny notional).
-- [ ] Add position reconciliation + a kill switch on the live path.
+Backtests, holdouts, paper trading, and adaptive search reduce avoidable errors;
+they do not establish future profitability. The platform is ready to conduct
+research and enforce governance, not to guarantee an edge.

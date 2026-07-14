@@ -1,7 +1,47 @@
-# Minimal dependencies for the EXECUTION side only (run_bot + update_candles).
-# The research stack (lightgbm, shap, numba, optuna, ...) stays on the Mac.
-numpy
-pandas
-pyarrow
-requests
-TA-Lib
+# Fully pinned lightweight runtime lock for Python 3.11+ Linux.  It includes
+# the transitive networking/crypto/scientific dependencies used by execution
+# and every enabled default job; optional heavy research tooling stays off the
+# server.  Upgrade this file as one reviewed unit because installed package
+# versions are part of the live approval identity.
+
+# Direct runtime dependencies.
+# Native Binance USD-M stop reconciliation depends on this ccxt release's
+# conditional Algo Order routing (`trigger`, `clientAlgoId`, stopLossPrice).
+ccxt==4.5.64
+numpy==2.4.4
+pandas==3.0.2
+pyarrow==24.0.0
+requests==2.33.1
+scipy==1.17.1
+scikit-learn==1.8.0
+TA-Lib==0.6.8
+
+# Locked transitive runtime dependencies.
+aiodns==4.0.4
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.1
+aiosignal==1.4.0
+attrs==26.1.0
+build==1.4.4
+certifi==2026.4.22
+cffi==2.1.0
+charset-normalizer==3.4.7
+coincurve==21.0.0; python_version < "3.14"
+cryptography==49.0.0
+frozenlist==1.8.0
+idna==3.15
+joblib==1.5.3
+multidict==6.7.1
+packaging==26.2
+pip==26.1.2
+propcache==0.5.2
+pycares==5.0.1
+pycparser==3.0
+pyproject_hooks==1.2.0
+python-dateutil==2.9.0.post0
+setuptools==83.0.0
+six==1.17.0
+threadpoolctl==3.6.0
+typing_extensions==4.15.0
+urllib3==2.7.0
+yarl==1.24.2

@@ -21,7 +21,12 @@ class FearGreedContrarianStrategy(Strategy):
 
     @classmethod
     def default_params(cls):
-        return {"extreme_fear": 25, "extreme_greed": 75, "column": "fear_greed", "allow_short": True}
+        return {
+            "extreme_fear": 25,
+            "extreme_greed": 75,
+            "column": "fear_greed",
+            "allow_short": True,
+        }
 
     @classmethod
     def default_config(cls) -> BacktestConfig:

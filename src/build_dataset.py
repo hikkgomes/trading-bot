@@ -2,7 +2,6 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List
 
 import pandas as pd
 
@@ -15,7 +14,6 @@ from src.config import (
     TIMEFRAMES,
 )
 from src.load_data import configure_logging
-
 
 LOGGER = logging.getLogger(__name__)
 TIMEFRAME_PREFIXES = {
@@ -60,20 +58,21 @@ TARGET_COLUMNS = (
     "target_return_next_4_bars",
     "target_direction_next_4_bars",
 )
+TARGET_HORIZON_BARS = {
+    "target_return_next_1_bar": 1,
+    "target_return_next_4_bars": 4,
+    "target_direction_next_4_bars": 4,
+}
 DEFAULT_MOSTLY_EMPTY_THRESHOLD = 0.95
 
 
 def prefix_columns(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     prefix = TIMEFRAME_PREFIXES.get(timeframe, f"tf_{timeframe}_")
-    renamed = {
-        column: f"{prefix}{column}"
-        for column in df.columns
-        if column != "timestamp"
-    }
+    renamed = {column: f"{prefix}{column}" for column in df.columns if column != "timestamp"}
     return df.rename(columns=renamed)
 
 
-def read_processed_timeframes(processed_dir: Path) -> Dict[str, pd.DataFrame]:
+def read_processed_timeframes(processed_dir: Path) -> dict[str, pd.DataFrame]:
     frames = {}
     for timeframe in TIMEFRAMES:
         path = processed_dir / f"btcusdt_{timeframe}.parquet"
@@ -94,16 +93,14 @@ def normalize_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
             raise ValueError("Dataframe is missing a timestamp column or timestamp index")
 
     df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).astype(
-        "datetime64[ns, UTC]"
-    )
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).astype("datetime64[ns, UTC]")
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
 def read_indicator_timeframes(
     indicator_dir: Path,
     timeframes: tuple = INDICATOR_TIMEFRAMES,
-) -> Dict[str, pd.DataFrame]:
+) -> dict[str, pd.DataFrame]:
     frames = {}
     for timeframe in timeframes:
         path = indicator_dir / f"BTCUSDT_{timeframe}_all_indicators.parquet"
@@ -117,7 +114,7 @@ def read_indicator_timeframes(
 
 
 def build_multitimeframe_dataset(
-    frames: Dict[str, pd.DataFrame], base_timeframe: str = BASE_TIMEFRAME
+    frames: dict[str, pd.DataFrame], base_timeframe: str = BASE_TIMEFRAME
 ) -> pd.DataFrame:
     if base_timeframe not in frames:
         raise ValueError(
@@ -139,9 +136,9 @@ def build_multitimeframe_dataset(
     dataset["target_return_next_1_bar"] = base_close.shift(-1) / base_close - 1
     dataset["target_return_next_4_bars"] = base_close.shift(-4) / base_close - 1
     dataset["target_direction_next_4_bars"] = (
-        dataset["target_return_next_4_bars"].map(
-            lambda value: float(value > 0) if pd.notna(value) else pd.NA
-        ).astype("Float64")
+        dataset["target_return_next_4_bars"]
+        .map(lambda value: float(value > 0) if pd.notna(value) else pd.NA)
+        .astype("Float64")
     )
 
     for timeframe in TIMEFRAME_JOIN_ORDER:
@@ -178,7 +175,7 @@ def keep_numeric_columns(dataset: pd.DataFrame) -> pd.DataFrame:
     return dataset.loc[:, keep_columns]
 
 
-def find_constant_columns(dataset: pd.DataFrame) -> List[str]:
+def find_constant_columns(dataset: pd.DataFrame) -> list[str]:
     constant_columns = []
     for column in dataset.columns:
         if column == "timestamp":
@@ -190,7 +187,7 @@ def find_constant_columns(dataset: pd.DataFrame) -> List[str]:
 
 def find_mostly_empty_columns(
     dataset: pd.DataFrame, threshold: float = DEFAULT_MOSTLY_EMPTY_THRESHOLD
-) -> List[str]:
+) -> list[str]:
     empty_ratio = dataset.isna().mean()
     return [
         column
@@ -199,7 +196,7 @@ def find_mostly_empty_columns(
     ]
 
 
-def find_duplicate_columns(dataset: pd.DataFrame) -> List[List[str]]:
+def find_duplicate_columns(dataset: pd.DataFrame) -> list[list[str]]:
     comparable = dataset.drop(columns=["timestamp"], errors="ignore")
     duplicate_groups = []
     visited = set()
@@ -224,7 +221,7 @@ def build_feature_report(
     dataset: pd.DataFrame,
     mostly_empty_threshold: float = DEFAULT_MOSTLY_EMPTY_THRESHOLD,
     include_duplicate_scan: bool = True,
-) -> Dict[str, object]:
+) -> dict[str, object]:
     return {
         "number_of_rows": int(dataset.shape[0]),
         "number_of_columns": int(dataset.shape[1]),
@@ -247,20 +244,22 @@ def drop_problem_columns(
     base_timeframe: str = BASE_TIMEFRAME,
 ) -> pd.DataFrame:
     prefix = TIMEFRAME_PREFIXES.get(base_timeframe, f"tf_{base_timeframe}_")
-    protected_columns = {"timestamp"} | set(TARGET_COLUMNS) | {
-        f"{prefix}open",
-        f"{prefix}high",
-        f"{prefix}low",
-        f"{prefix}close",
-        f"{prefix}volume",
-        f"{prefix}atr",
-        f"{prefix}atr_14",
-    }
+    protected_columns = (
+        {"timestamp"}
+        | set(TARGET_COLUMNS)
+        | {
+            f"{prefix}open",
+            f"{prefix}high",
+            f"{prefix}low",
+            f"{prefix}close",
+            f"{prefix}volume",
+            f"{prefix}atr",
+            f"{prefix}atr_14",
+        }
+    )
     cols_to_drop = set()
     cols_to_drop.update(find_constant_columns(dataset))
-    cols_to_drop.update(
-        find_mostly_empty_columns(dataset, threshold=mostly_empty_threshold)
-    )
+    cols_to_drop.update(find_mostly_empty_columns(dataset, threshold=mostly_empty_threshold))
     if include_duplicate_scan:
         for group in find_duplicate_columns(dataset):
             cols_to_drop.update(group[1:])
@@ -279,7 +278,7 @@ def write_dataset(dataset: pd.DataFrame, output_path: Path) -> None:
     LOGGER.info("Wrote %s rows and %s columns to %s", *dataset.shape, output_path)
 
 
-def write_feature_report(report: Dict[str, object], output_path: Path) -> None:
+def write_feature_report(report: dict[str, object], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     LOGGER.info("Wrote feature report to %s", output_path)

@@ -20,7 +20,7 @@ import json
 import logging
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from urllib.parse import urlsplit
 
 import pandas as pd
 
@@ -29,6 +29,8 @@ from src.config import PROCESSED_DATA_DIR
 LOGGER = logging.getLogger(__name__)
 
 _API_URL = "https://api.alternative.me/fng/?limit=0&format=json"
+_API_HOST = "api.alternative.me"
+_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _CACHE = Path(PROCESSED_DATA_DIR) / "fear_greed.parquet"
 
 
@@ -42,26 +44,55 @@ def fetch_fear_greed(use_cache: bool = True, timeout: float = 20.0) -> pd.DataFr
         return pd.read_parquet(_CACHE)
 
     LOGGER.info("Fetching Fear & Greed Index from %s", _API_URL)
-    with urllib.request.urlopen(_API_URL, timeout=timeout) as resp:  # noqa: S310 (trusted URL)
-        payload = json.loads(resp.read().decode("utf-8"))
+    request = urllib.request.Request(
+        _API_URL,
+        headers={"Accept": "application/json", "User-Agent": "trading-bot-research/1"},
+        method="GET",
+    )
+    # The URL is fixed HTTPS and the post-redirect host is revalidated.
+    with urllib.request.urlopen(  # nosec B310
+        request,
+        timeout=timeout,
+    ) as resp:
+        final_url = urlsplit(str(resp.geturl()))
+        if final_url.scheme != "https" or final_url.hostname != _API_HOST:
+            raise RuntimeError("Fear & Greed API redirected outside its approved HTTPS host.")
+        content_length = resp.headers.get("Content-Length")
+        if content_length is not None and int(content_length) > _MAX_RESPONSE_BYTES:
+            raise RuntimeError("Fear & Greed API response exceeds the size limit.")
+        body = resp.read(_MAX_RESPONSE_BYTES + 1)
+        if len(body) > _MAX_RESPONSE_BYTES:
+            raise RuntimeError("Fear & Greed API response exceeds the size limit.")
+        payload = json.loads(body.decode("utf-8"))
 
     rows = payload.get("data", [])
     if not rows:
         raise RuntimeError("Fear & Greed API returned no data.")
-    df = pd.DataFrame(
-        {
-            "date": pd.to_datetime([int(r["timestamp"]) for r in rows], unit="s", utc=True).normalize(),
-            "fear_greed": [int(r["value"]) for r in rows],
-            "fear_greed_label": [r.get("value_classification", "") for r in rows],
-        }
-    ).sort_values("date").set_index("date")
+    df = (
+        pd.DataFrame(
+            {
+                "date": pd.to_datetime(
+                    [int(r["timestamp"]) for r in rows], unit="s", utc=True
+                ).normalize(),
+                "fear_greed": [int(r["value"]) for r in rows],
+                "fear_greed_label": [r.get("value_classification", "") for r in rows],
+            }
+        )
+        .sort_values("date")
+        .set_index("date")
+    )
     _CACHE.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(_CACHE)
-    LOGGER.info("Fetched %d daily Fear & Greed values (%s -> %s)", len(df), df.index[0].date(), df.index[-1].date())
+    LOGGER.info(
+        "Fetched %d daily Fear & Greed values (%s -> %s)",
+        len(df),
+        df.index[0].date(),
+        df.index[-1].date(),
+    )
     return df
 
 
-def add_fear_greed_column(df: pd.DataFrame, fng: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def add_fear_greed_column(df: pd.DataFrame, fng: pd.DataFrame | None = None) -> pd.DataFrame:
     """Merge a daily ``fear_greed`` column onto ``df`` by calendar date (as-of).
 
     ``df`` must have a DatetimeIndex (any intraday resolution). Each row gets the
@@ -74,7 +105,9 @@ def add_fear_greed_column(df: pd.DataFrame, fng: Optional[pd.DataFrame] = None) 
         raise TypeError("add_fear_greed_column requires a DatetimeIndex on df.")
 
     idx = df.index
-    dates = idx.tz_localize("UTC").normalize() if idx.tz is None else idx.tz_convert("UTC").normalize()
+    dates = (
+        idx.tz_localize("UTC").normalize() if idx.tz is None else idx.tz_convert("UTC").normalize()
+    )
     daily = fng["fear_greed"].reindex(fng.index.union(dates.unique())).ffill()
     out = df.copy()
     out["fear_greed"] = daily.reindex(dates).to_numpy()

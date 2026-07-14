@@ -1,15 +1,14 @@
 import argparse
 import json
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
 from sklearn.tree import DecisionTreeClassifier, _tree
 
 from src.build_dataset import TARGET_COLUMNS
-from src.config import PROJECT_ROOT, PROCESSED_DATA_DIR
-
+from src.config import PROCESSED_DATA_DIR, PROJECT_ROOT
 
 DEFAULT_INPUT_PATH = PROCESSED_DATA_DIR / "train_15m_indicators.parquet"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "patterns"
@@ -46,7 +45,7 @@ def rank_univariate_features(
     feature_columns: Iterable[str],
     target_column: str,
     max_features: int,
-) -> List[str]:
+) -> list[str]:
     target = data[target_column]
     scores = []
     for column in feature_columns:
@@ -80,7 +79,7 @@ def train_rule_tree(
     min_abs_return: float,
     max_depth: int,
     min_samples_leaf: int,
-) -> Tuple[DecisionTreeClassifier, pd.DataFrame, pd.Series]:
+) -> tuple[DecisionTreeClassifier, pd.DataFrame, pd.Series]:
     labels = make_direction_labels(data[target_column], min_abs_return)
     feature_columns = [
         column
@@ -107,13 +106,13 @@ def extract_rules(
     features: pd.DataFrame,
     labels: pd.Series,
     returns: pd.Series,
-) -> List[Dict[str, object]]:
+) -> list[dict[str, object]]:
     tree = model.tree_
     feature_names = features.columns.to_numpy()
     baseline_up_rate = float(labels.mean())
     rules = []
 
-    def walk(node: int, conditions: List[str]) -> None:
+    def walk(node: int, conditions: list[str]) -> None:
         if tree.feature[node] != _tree.TREE_UNDEFINED:
             feature = feature_names[tree.feature[node]]
             threshold = tree.threshold[node]
@@ -150,10 +149,7 @@ def extract_rules(
                 "lift_up": up_rate / baseline_up_rate if baseline_up_rate else np.nan,
                 "avg_future_return": avg_return,
                 "used_features": sorted(
-                    {
-                        condition.split(" <= ")[0].split(" > ")[0]
-                        for condition in conditions
-                    }
+                    {condition.split(" <= ")[0].split(" > ")[0] for condition in conditions}
                 ),
             }
         )
@@ -162,7 +158,7 @@ def extract_rules(
     return rules
 
 
-def write_outputs(rules: List[Dict[str, object]], output_dir: Path) -> None:
+def write_outputs(rules: list[dict[str, object]], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     frame = pd.DataFrame(rules)
     if frame.empty:

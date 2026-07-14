@@ -8,12 +8,10 @@ executor can discover any strategy regardless of which paradigm it belongs to
 
 from __future__ import annotations
 
-from typing import Dict, List, Type
-
-_REGISTRY: Dict[str, Type] = {}
+_REGISTRY: dict[str, type] = {}
 
 
-def register(cls: Type) -> Type:
+def register(cls: type) -> type:
     """Class decorator: register a Strategy subclass under its ``name``."""
     name = getattr(cls, "name", None)
     if not name or name == "base":
@@ -24,7 +22,7 @@ def register(cls: Type) -> Type:
     return cls
 
 
-def get(name: str) -> Type:
+def get(name: str) -> type:
     """Return the Strategy class registered under ``name``."""
     if name not in _REGISTRY:
         raise KeyError(
@@ -33,11 +31,11 @@ def get(name: str) -> Type:
     return _REGISTRY[name]
 
 
-def available() -> List[str]:
+def available() -> list[str]:
     """Sorted list of registered strategy names."""
     return sorted(_REGISTRY)
 
 
-def describe() -> Dict[str, str]:
+def describe() -> dict[str, str]:
     """Map of name -> one-line description for every registered strategy."""
     return {name: getattr(cls, "description", "") for name, cls in sorted(_REGISTRY.items())}

@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Sequence, Tuple
+from collections.abc import Sequence
 
 import lightgbm as lgb
 import numpy as np
@@ -13,8 +13,8 @@ def rank_features_by_importance(
     features: Sequence[str],
     target_column: str,
     max_features: int,
-    direction: Optional[str] = None,
-) -> List[str]:
+    direction: str | None = None,
+) -> list[str]:
     feature_list = list(features)
     x = train[feature_list]
     y = train[target_column]
@@ -57,7 +57,7 @@ def _spearman_ranks(
     train: pd.DataFrame,
     features: Sequence[str],
     target_column: str,
-    direction: Optional[str] = None,
+    direction: str | None = None,
 ) -> pd.Series:
     target = train[target_column]
     if direction == "short":
@@ -80,19 +80,19 @@ def rank_features_blended(
     target_column: str,
     max_features: int,
     spearman_weight: float = 0.5,
-    direction: Optional[str] = None,
-) -> List[str]:
+    direction: str | None = None,
+) -> list[str]:
     importance_ranked = rank_features_by_importance(
-        train, features, target_column, max_features=len(features), direction=direction,
+        train,
+        features,
+        target_column,
+        max_features=len(features),
+        direction=direction,
     )
     spearman_scores = _spearman_ranks(train, features, target_column, direction=direction)
 
-    importance_rank = pd.Series(
-        {f: i for i, f in enumerate(importance_ranked)}, dtype=float
-    )
-    spearman_rank = pd.Series(
-        {f: i for i, f in enumerate(spearman_scores.index)}, dtype=float
-    )
+    importance_rank = pd.Series({f: i for i, f in enumerate(importance_ranked)}, dtype=float)
+    spearman_rank = pd.Series({f: i for i, f in enumerate(spearman_scores.index)}, dtype=float)
 
     all_features = set(importance_rank.index) | set(spearman_rank.index)
     worst = float(len(all_features))
@@ -115,9 +115,12 @@ def suggest_feature_pairs(
     max_pairs: int,
     top_features_for_shap: int = 100,
     sample_rows: int = 5000,
-) -> List[Tuple[str, str]]:
+) -> list[tuple[str, str]]:
     top_features = rank_features_by_importance(
-        train, features, target_column, max_features=top_features_for_shap,
+        train,
+        features,
+        target_column,
+        max_features=top_features_for_shap,
     )
     x = train[top_features]
     y = train[target_column]
@@ -176,16 +179,16 @@ def suggest_feature_pairs(
 
 def _importance_based_pairs(
     model: lgb.LGBMRegressor,
-    features: List[str],
+    features: list[str],
     max_pairs: int,
-) -> List[Tuple[str, str]]:
+) -> list[tuple[str, str]]:
     booster = model.booster_
     gains = booster.feature_importance(importance_type="gain")
     ranked_indices = np.argsort(gains)[::-1]
 
-    pairs: List[Tuple[str, str]] = []
+    pairs: list[tuple[str, str]] = []
     for i_pos, i in enumerate(ranked_indices):
-        for j in ranked_indices[i_pos + 1:]:
+        for j in ranked_indices[i_pos + 1 :]:
             pairs.append((features[i], features[j]))
             if len(pairs) >= max_pairs:
                 return pairs

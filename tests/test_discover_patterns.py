@@ -119,10 +119,12 @@ def test_slope_condition_mask():
 
 
 def test_cross_above_condition_mask():
-    data = pd.DataFrame({
-        "a": [1.0, 2.0, 3.0, 2.0],
-        "b": [2.0, 2.0, 2.0, 3.0],
-    })
+    data = pd.DataFrame(
+        {
+            "a": [1.0, 2.0, 3.0, 2.0],
+            "b": [2.0, 2.0, 2.0, 3.0],
+        }
+    )
     condition = Condition("a", "cross_above", 0.0, "a crosses above b", feature_b="b")
 
     mask = condition_mask(data, condition)
@@ -131,10 +133,12 @@ def test_cross_above_condition_mask():
 
 
 def test_cross_below_condition_mask():
-    data = pd.DataFrame({
-        "a": [3.0, 2.0, 1.0, 2.0],
-        "b": [2.0, 2.0, 2.0, 1.0],
-    })
+    data = pd.DataFrame(
+        {
+            "a": [3.0, 2.0, 1.0, 2.0],
+            "b": [2.0, 2.0, 2.0, 1.0],
+        }
+    )
     condition = Condition("a", "cross_below", 0.0, "a crosses below b", feature_b="b")
 
     mask = condition_mask(data, condition)
@@ -143,10 +147,12 @@ def test_cross_below_condition_mask():
 
 
 def test_ratio_condition_mask():
-    data = pd.DataFrame({
-        "a": [10.0, 20.0, 30.0],
-        "b": [5.0, 10.0, 5.0],
-    })
+    data = pd.DataFrame(
+        {
+            "a": [10.0, 20.0, 30.0],
+            "b": [5.0, 10.0, 5.0],
+        }
+    )
     condition = Condition("a", "ratio_ge", 4.0, "a/b >= 4", feature_b="b")
 
     mask = condition_mask(data, condition)
@@ -155,10 +161,12 @@ def test_ratio_condition_mask():
 
 
 def test_divergence_bull_condition_mask():
-    data = pd.DataFrame({
-        "tf_15m_close": [100, 98, 97, 96, 95],
-        "indicator": [50, 48, 49, 47, 48],
-    })
+    data = pd.DataFrame(
+        {
+            "tf_15m_close": [100, 98, 97, 96, 95],
+            "indicator": [50, 48, 49, 47, 48],
+        }
+    )
     condition = Condition("indicator", "divergence_bull_3", 0.0, "bull divergence")
 
     mask = condition_mask(data, condition)
@@ -167,10 +175,12 @@ def test_divergence_bull_condition_mask():
 
 
 def test_divergence_bear_condition_mask():
-    data = pd.DataFrame({
-        "tf_15m_close": [90, 92, 93, 94, 95],
-        "indicator": [50, 52, 51, 53, 52],
-    })
+    data = pd.DataFrame(
+        {
+            "tf_15m_close": [90, 92, 93, 94, 95],
+            "indicator": [50, 52, 51, 53, 52],
+        }
+    )
     condition = Condition("indicator", "divergence_bear_3", 0.0, "bear divergence")
 
     mask = condition_mask(data, condition)
@@ -207,10 +217,12 @@ def test_build_ratio_conditions_generates_conditions():
 
 
 def test_build_divergence_conditions_generates_conditions():
-    train = pd.DataFrame({
-        "tf_15m_close": np.random.randn(100).cumsum() + 100,
-        "feat": np.random.randn(100).cumsum(),
-    })
+    train = pd.DataFrame(
+        {
+            "tf_15m_close": np.random.randn(100).cumsum() + 100,
+            "feat": np.random.randn(100).cumsum(),
+        }
+    )
     conditions = build_divergence_conditions(train, ["feat"], windows=(10,))
 
     assert len(conditions) == 2
@@ -229,11 +241,13 @@ def test_detect_cross_feature_pairs_finds_same_indicator_across_timeframes():
 def test_build_all_conditions_includes_all_kinds():
     np.random.seed(42)
     n = 300
-    train = pd.DataFrame({
-        "tf_15m_rsi_14": np.random.randn(n).cumsum() + 50,
-        "tf_4h_rsi_14": np.random.randn(n).cumsum() + 50,
-        "tf_15m_close": np.random.randn(n).cumsum() + 100,
-    })
+    train = pd.DataFrame(
+        {
+            "tf_15m_rsi_14": np.random.randn(n).cumsum() + 50,
+            "tf_4h_rsi_14": np.random.randn(n).cumsum() + 50,
+            "tf_15m_close": np.random.randn(n).cumsum() + 100,
+        }
+    )
     conditions = build_all_conditions(train, ["tf_15m_rsi_14", "tf_4h_rsi_14"])
 
     kinds = {c.kind for c in conditions}
@@ -247,12 +261,16 @@ def test_build_all_conditions_includes_all_kinds():
 
 def test_build_all_conditions_respects_enabled_kinds():
     np.random.seed(42)
-    train = pd.DataFrame({
-        "tf_15m_rsi_14": np.random.randn(200) + 50,
-        "tf_15m_close": np.random.randn(200) + 100,
-    })
+    train = pd.DataFrame(
+        {
+            "tf_15m_rsi_14": np.random.randn(200) + 50,
+            "tf_15m_close": np.random.randn(200) + 100,
+        }
+    )
     conditions = build_all_conditions(
-        train, ["tf_15m_rsi_14"], enabled_kinds={"value"},
+        train,
+        ["tf_15m_rsi_14"],
+        enabled_kinds={"value"},
     )
 
     kinds = {c.kind for c in conditions}

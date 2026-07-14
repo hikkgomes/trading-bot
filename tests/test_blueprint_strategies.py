@@ -33,7 +33,9 @@ def test_divergence_is_lookahead_safe():
     bull_full, bear_full = ind.regular_divergence(df["high"], df["low"], rsi, pivot=5)
     cut = 500
     rsi_t = ind.rsi(df["close"].iloc[:cut], 14)
-    bull_t, bear_t = ind.regular_divergence(df["high"].iloc[:cut], df["low"].iloc[:cut], rsi_t, pivot=5)
+    bull_t, bear_t = ind.regular_divergence(
+        df["high"].iloc[:cut], df["low"].iloc[:cut], rsi_t, pivot=5
+    )
     safe = cut - 5  # last `pivot` bars can't be confirmed yet in the truncated run
     np.testing.assert_array_equal(bull_full.iloc[:safe].to_numpy(), bull_t.iloc[:safe].to_numpy())
     np.testing.assert_array_equal(bear_full.iloc[:safe].to_numpy(), bear_t.iloc[:safe].to_numpy())
@@ -111,12 +113,69 @@ def test_dca_buy_plan_spends_budget_lower_heavy():
     assert cheapest.fraction == max(leg.fraction for leg in legs)
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"quote_budget": float("nan"), "low": 80.0, "high": 120.0},
+        {"quote_budget": 0.0, "low": 80.0, "high": 120.0},
+        {"quote_budget": 1000.0, "low": float("inf"), "high": 120.0},
+        {"quote_budget": 1000.0, "low": 80.0, "high": float("nan")},
+        {"quote_budget": 1000.0, "low": 120.0, "high": 80.0},
+        {"quote_budget": 1000.0, "low": 80.0, "high": 120.0, "levels": 0},
+    ],
+)
+def test_dca_buy_plan_rejects_invalid_sizing_inputs(kwargs):
+    from src.execution.position_plan import dca_buy_plan
+
+    with pytest.raises(ValueError):
+        dca_buy_plan(**kwargs)
+
+
 def test_stink_bid_plan_prices_below_ref():
     from src.execution.position_plan import stink_bid_plan
 
     legs = stink_bid_plan(quote_budget=600.0, ref_price=100.0, depths=(0.1, 0.25, 0.4))
     assert all(leg.price < 100.0 for leg in legs)
     assert abs(sum(leg.qty * leg.price for leg in legs) - 600.0) < 1e-6
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"quote_budget": float("nan"), "ref_price": 100.0},
+        {"quote_budget": 600.0, "ref_price": 0.0},
+        {"quote_budget": 600.0, "ref_price": 100.0, "depths": ()},
+        {"quote_budget": 600.0, "ref_price": 100.0, "depths": (0.0,)},
+        {"quote_budget": 600.0, "ref_price": 100.0, "depths": (1.0,)},
+        {"quote_budget": 600.0, "ref_price": 100.0, "depths": (float("nan"),)},
+        {"quote_budget": 600.0, "ref_price": 100.0, "depths": (0.1, 0.2), "weights": (1.0,)},
+        {"quote_budget": 600.0, "ref_price": 100.0, "depths": (0.1, 0.2), "weights": (1.0, -0.5)},
+    ],
+)
+def test_stink_bid_plan_rejects_invalid_sizing_inputs(kwargs):
+    from src.execution.position_plan import stink_bid_plan
+
+    with pytest.raises(ValueError):
+        stink_bid_plan(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"qty": 0.0, "range_high": 100.0},
+        {"qty": 1.0, "range_high": float("nan")},
+        {"qty": 1.0, "range_high": 100.0, "fractions": ()},
+        {"qty": 1.0, "range_high": 100.0, "fractions": (0.5, 0.5), "offsets": (0.0,)},
+        {"qty": 1.0, "range_high": 100.0, "fractions": (0.5, -0.5), "offsets": (0.0, 0.1)},
+        {"qty": 1.0, "range_high": 100.0, "fractions": (0.5, 0.5), "offsets": (0.0, float("nan"))},
+        {"qty": 1.0, "range_high": 100.0, "fractions": (0.4, 0.4), "offsets": (0.0, 0.1)},
+    ],
+)
+def test_scaled_exit_plan_rejects_invalid_sizing_inputs(kwargs):
+    from src.execution.position_plan import scaled_exit_plan
+
+    with pytest.raises(ValueError):
+        scaled_exit_plan(**kwargs)
 
 
 def test_plan_leg_to_order():

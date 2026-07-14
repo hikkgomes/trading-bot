@@ -19,13 +19,13 @@ curve, and a summary dict that reuses ``src.metrics`` for Sharpe / DSR inputs.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 
 from src import metrics
 from src.strategies.base import BacktestConfig, Strategy, extract_ohlcv
+from src.trade_utils import gross_return_for_pnl_unit
 
 
 @dataclass
@@ -41,7 +41,7 @@ class BacktestResult:
             return np.array([], dtype=float)
         return self.trades["net_return"].to_numpy(dtype=float)
 
-    def summary(self) -> Dict[str, float]:
+    def summary(self) -> dict[str, float]:
         r = self.returns
         n = int(r.size)
         if n == 0:
@@ -86,12 +86,12 @@ def _simulate(
     direction: np.ndarray,  # int in {-1, 0, +1} per bar
     index: pd.Index,
     cfg: BacktestConfig,
-) -> List[dict]:
+) -> list[dict]:
     n = len(close)
     horizon = int(cfg.horizon_bars)
     tp, sl = float(cfg.take_profit), float(cfg.stop_loss)
     cost = cfg.round_trip_cost
-    trades: List[dict] = []
+    trades: list[dict] = []
     next_allowed_entry = 0
     max_entry_index = n - horizon - 1
 
@@ -124,11 +124,12 @@ def _simulate(
                     exit_index, exit_price, exit_reason = j, entry * (1 - tp), "take_profit"
                     break
 
-        if cfg.pnl_unit == "btc":
-            # BTC-accumulation: only shorts realise a return; longs == holding.
-            gross = (entry / exit_price - 1.0) if not is_long else 0.0
-        else:
-            gross = (exit_price / entry - 1.0) if is_long else (entry / exit_price - 1.0)
+        gross = gross_return_for_pnl_unit(
+            entry,
+            exit_price,
+            is_long=is_long,
+            pnl_unit=cfg.pnl_unit,
+        )
         net = gross - cost
         trades.append(
             {
@@ -165,9 +166,7 @@ def run_backtest(
         signals = pd.Series(signals, index=df.index)
     direction = signals.reindex(df.index).fillna(0).clip(-1, 1).round().to_numpy(dtype=int)
 
-    trades = _simulate(
-        ohlcv.open, ohlcv.high, ohlcv.low, ohlcv.close, direction, df.index, cfg
-    )
+    trades = _simulate(ohlcv.open, ohlcv.high, ohlcv.low, ohlcv.close, direction, df.index, cfg)
     trades_df = pd.DataFrame(trades)
     if trades_df.empty:
         equity = pd.Series([cfg.initial_equity], index=df.index[:1] if len(df.index) else None)

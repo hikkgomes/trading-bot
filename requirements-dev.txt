@@ -1,4 +1,4 @@
 # Developer tooling (linting / formatting). Install on the research machine on
 # top of requirements.txt:  pip install -r requirements.txt -r requirements-dev.txt
 ruff==0.9.6
-pytest==8.3.4
+pytest==9.0.3

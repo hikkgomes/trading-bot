@@ -15,8 +15,12 @@ def test_sharpe_ratio_handles_short_or_flat_series():
 
 
 def test_deflated_sharpe_penalizes_more_trials():
-    low_trials = deflated_sharpe_ratio(0.3, n_trials=1, skew=0.0, kurt=3.0, n_obs=100, sr_std_trials=0.1)
-    high_trials = deflated_sharpe_ratio(0.3, n_trials=10_000, skew=0.0, kurt=3.0, n_obs=100, sr_std_trials=0.1)
+    low_trials = deflated_sharpe_ratio(
+        0.3, n_trials=1, skew=0.0, kurt=3.0, n_obs=100, sr_std_trials=0.1
+    )
+    high_trials = deflated_sharpe_ratio(
+        0.3, n_trials=10_000, skew=0.0, kurt=3.0, n_obs=100, sr_std_trials=0.1
+    )
     assert 0.0 <= high_trials < low_trials <= 1.0
 
 
@@ -32,9 +36,13 @@ def test_deflated_sharpe_without_dispersion_is_probabilistic_sr():
 def test_deflated_sharpe_is_a_probability_not_degenerate():
     # The old implementation collapsed to ~0 for every realistic per-trade SR.
     # A strong SR with modest trial dispersion must keep a meaningful value.
-    value = deflated_sharpe_ratio(0.4, n_trials=150_000, skew=0.0, kurt=3.0, n_obs=500, sr_std_trials=0.05)
+    value = deflated_sharpe_ratio(
+        0.4, n_trials=150_000, skew=0.0, kurt=3.0, n_obs=500, sr_std_trials=0.05
+    )
     assert value > 0.5
-    weak = deflated_sharpe_ratio(0.05, n_trials=150_000, skew=0.0, kurt=3.0, n_obs=500, sr_std_trials=0.05)
+    weak = deflated_sharpe_ratio(
+        0.05, n_trials=150_000, skew=0.0, kurt=3.0, n_obs=500, sr_std_trials=0.05
+    )
     assert weak < value
 
 
