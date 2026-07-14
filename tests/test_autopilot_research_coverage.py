@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -109,6 +110,144 @@ def test_validation_skips_before_holdout_when_history_is_shallow(monkeypatch, tm
         "--report",
         "runtime/history_bootstrap_futures.json",
     ]
+
+
+def test_protected_epoch_may_end_before_full_source_freshness_threshold(monkeypatch):
+    scenario = coverage_scenario()
+    hypothesis = next(hyp for hyp in generate_batch() if hyp.base_timeframe == "5m")
+    full_frame = pd.DataFrame(
+        {"timestamp": pd.date_range("2026-01-01", periods=10, freq="1D", tz="UTC")}
+    )
+    protected = (
+        {
+            "interval_key": "sealed",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "start": "2026-01-08T00:00:00+00:00",
+            "end": "2026-01-10T00:00:00+00:00",
+        },
+    )
+    captured = {}
+
+    class FakeExperimentMemory:
+        def __init__(self):
+            self.strategies = {}
+
+        def protected_intervals(self, **_kwargs):
+            return protected
+
+        def register_strategy(self, spec, **_kwargs):
+            self.strategies[rc.canonical_strategy_hash(spec)] = spec
+
+        def get_strategy(self, behavior_hash):
+            return {
+                "submitted_spec": self.strategies[behavior_hash],
+                "holdout_exposed_at": None,
+            }
+
+        def is_tested(self, *_args, **_kwargs):
+            return False
+
+        def assert_adaptive_window_allowed(self, **kwargs):
+            captured["adaptive_window"] = kwargs["window"]
+
+        def register_holdout_cohort(self, behavior_hashes, **_kwargs):
+            return SimpleNamespace(
+                member_hashes=tuple(behavior_hashes),
+                created=True,
+                scope_key="protected-test-cohort",
+            )
+
+    monkeypatch.setattr(
+        rc,
+        "_scenario_indicator_coverage_status",
+        lambda *args, **kwargs: {"ok": True},
+    )
+    monkeypatch.setattr(rc, "_missing_columns_for_hypothesis", lambda *args, **kwargs: {})
+    monkeypatch.setattr(rc, "build_aligned_frame", lambda *args, **kwargs: full_frame.copy())
+    monkeypatch.setattr(
+        rc,
+        "with_trial_sharpe_dispersion",
+        lambda _frame, _hypotheses, cfg, _eval_cfg: cfg,
+    )
+    monkeypatch.setattr(
+        rc,
+        "_dataset_snapshot",
+        lambda *args, **kwargs: {"snapshot_id": "sha256:" + "a" * 64},
+    )
+
+    def fake_validate(frame, hypotheses, _config, **_kwargs):
+        captured["validation_latest"] = pd.Timestamp(frame["timestamp"].iloc[-1])
+        return [
+            {
+                "hypothesis_id": hypotheses[0].id,
+                "family": hypotheses[0].family,
+                "direction": hypotheses[0].direction,
+                "verdict": "reject",
+                "reasons": ["no_train_edge"],
+                "train": {"trades": 0, "total_return": 0.0},
+            }
+        ]
+
+    monkeypatch.setattr(rc, "validate_batch", fake_validate)
+
+    report = rc.run_validation_scenario(
+        scenario,
+        hypotheses=[hypothesis],
+        coverage_now="2026-01-10T00:00:00Z",
+        experiment_memory=FakeExperimentMemory(),
+        log_path=None,
+    )
+
+    assert report["ok"] is True
+    assert report["coverage"]["ok"] is True
+    assert report["coverage"]["actual"]["latest"] == "2026-01-10T00:00:00+00:00"
+    assert report["rows"] == 7
+    assert report["protected_epoch_selection"]["end"] == "2026-01-07 00:00:00+00:00"
+    assert captured["validation_latest"] == pd.Timestamp("2026-01-07T00:00:00Z")
+    assert pd.Timestamp(captured["adaptive_window"]["validation"]["end"]) < pd.Timestamp(
+        "2026-01-08T00:00:00Z"
+    )
+
+
+def test_stale_full_aligned_source_fails_before_protected_epoch_selection(monkeypatch):
+    scenario = coverage_scenario()
+    hypothesis = next(hyp for hyp in generate_batch() if hyp.base_timeframe == "5m")
+    stale_frame = pd.DataFrame(
+        {"timestamp": pd.date_range("2026-01-01", periods=8, freq="1D", tz="UTC")}
+    )
+
+    class SelectionMustNotRun:
+        def protected_intervals(self, **_kwargs):
+            raise AssertionError("protected epoch selection must follow full-source coverage")
+
+    monkeypatch.setattr(
+        rc,
+        "_scenario_indicator_coverage_status",
+        lambda *args, **kwargs: {"ok": True},
+    )
+    monkeypatch.setattr(rc, "_missing_columns_for_hypothesis", lambda *args, **kwargs: {})
+    monkeypatch.setattr(rc, "build_aligned_frame", lambda *args, **kwargs: stale_frame.copy())
+    monkeypatch.setattr(
+        rc,
+        "validate_batch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("stale aligned history must not reach validation")
+        ),
+    )
+
+    report = rc.run_validation_scenario(
+        scenario,
+        hypotheses=[hypothesis],
+        coverage_now="2026-01-10T00:00:00Z",
+        experiment_memory=SelectionMustNotRun(),
+        log_path=None,
+    )
+
+    assert report["ok"] is False
+    assert report["reason"] == "insufficient_history_coverage"
+    assert report["coverage"]["failed_checks"] == ["latest"]
+    assert report["coverage"]["actual"]["latest"] == "2026-01-08T00:00:00+00:00"
 
 
 def test_coverage_failure_blocks_exports_and_is_visible_in_summary():

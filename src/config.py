@@ -32,12 +32,16 @@ def candle_data_dir(
     selected_market = normalize_market(market)
     canonical = canonical_candle_data_dir(symbol, selected_market)
     legacy = legacy_candle_data_dir(symbol)
-    if (
-        legacy_fallback
-        and selected_market == "futures"
-        and legacy.exists()
-        and not canonical.exists()
-    ):
+    use_legacy = False
+    if legacy_fallback and selected_market == "futures":
+        try:
+            use_legacy = legacy.exists() and not canonical.exists()
+        except OSError:
+            # Least-privilege services deliberately make market data
+            # inaccessible. Treat an unprobeable compatibility path as absent
+            # so importing configuration does not require data permissions.
+            use_legacy = False
+    if use_legacy:
         return legacy
     return canonical
 

@@ -1998,16 +1998,9 @@ def run_validation_scenario(
         end=scenario.end,
         indicator_dir=selected_indicator_dir,
     )
-    epoch_selection = None
-    if experiment_memory is not None:
-        frame, epoch_selection = _select_unprotected_epoch(
-            frame,
-            experiment_memory.protected_intervals(
-                market=scenario.market,
-                symbol="BTCUSDT",
-            ),
-            feature_timeframes=_hypothesis_feature_timeframes(supported_hypotheses),
-        )
+    # Freshness belongs to the complete aligned source. A protected-safe epoch
+    # may intentionally end well before wall-clock recency after newer rows
+    # have been sealed as final evaluation data.
     coverage = _scenario_coverage_status(
         frame,
         scenario,
@@ -2021,6 +2014,16 @@ def run_validation_scenario(
             selection=selection,
             unsupported_hypotheses=unsupported_hypotheses,
             research_factory_config_path=research_factory_config_path,
+        )
+    epoch_selection = None
+    if experiment_memory is not None:
+        frame, epoch_selection = _select_unprotected_epoch(
+            frame,
+            experiment_memory.protected_intervals(
+                market=scenario.market,
+                symbol="BTCUSDT",
+            ),
+            feature_timeframes=_hypothesis_feature_timeframes(supported_hypotheses),
         )
     eval_cfg = EvalConfig(pnl_unit=scenario.pnl_unit, market=scenario.market)
     validation_cfg = _validation_config(
