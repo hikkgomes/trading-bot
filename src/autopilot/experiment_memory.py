@@ -146,6 +146,16 @@ class EvaluationConflictError(ExperimentMemoryError):
     """An immutable evaluation was completed with conflicting evidence."""
 
 
+class HoldoutSealBudgetError(EvaluationConflictError):
+    """Sealing another protected interval would exceed the configured rate.
+
+    Every sealed interval permanently removes its rows (plus a feature
+    embargo) from adaptive research, so an unbounded seal rate can consume
+    the entire chronological history. Callers treat this as a deferral, not
+    a failure: the candidate simply stops before the holdout stage.
+    """
+
+
 @dataclass(frozen=True)
 class StrategyRegistration:
     strategy_id: str
@@ -1654,6 +1664,7 @@ class ExperimentMemory:
         window: Mapping[str, Any],
         protocol: Mapping[str, Any] | None = None,
         phase: str = "holdout",
+        min_seconds_since_last_seal: float | None = None,
     ) -> HoldoutCohort:
         """Freeze the candidate universe allowed to inspect a protected slice.
 
@@ -1661,10 +1672,22 @@ class ExperimentMemory:
         of already-registered behaviors. Later callers may resume members of
         that set, but cannot add freshly generated candidates to the same final
         evaluation data.
+
+        ``min_seconds_since_last_seal`` bounds how often a *new* interval may
+        be sealed for this market and symbol. Resuming an already sealed
+        cohort/interval never consumes budget. The check runs inside the same
+        write transaction as the insert, so concurrent scenario runs cannot
+        both pass it.
         """
 
         if phase not in PROTECTED_PHASES:
             raise ValueError(f"holdout phase must be one of {sorted(PROTECTED_PHASES)}")
+        if min_seconds_since_last_seal is not None and (
+            isinstance(min_seconds_since_last_seal, bool)
+            or not isinstance(min_seconds_since_last_seal, int | float)
+            or not math.isfinite(float(min_seconds_since_last_seal))
+        ):
+            raise ValueError("min_seconds_since_last_seal must be a finite number or None")
         members = tuple(
             sorted(
                 {
@@ -1780,6 +1803,12 @@ class ExperimentMemory:
                         "legacy protected cohort has no trustworthy wall-clock interval evidence: "
                         f"snapshot={snapshot_id}"
                     )
+                self._assert_seal_budget_available(
+                    connection,
+                    market=market,
+                    symbol=symbol,
+                    min_seconds_since_last_seal=min_seconds_since_last_seal,
+                )
                 connection.execute(
                     """
                     INSERT INTO protected_intervals(
@@ -1816,6 +1845,55 @@ class ExperimentMemory:
                 protocol_hashes=stored_protocols,
                 member_hashes=stored_members,
                 created=cohort_created,
+            )
+
+    @staticmethod
+    def _assert_seal_budget_available(
+        connection: sqlite3.Connection,
+        *,
+        market: str,
+        symbol: str,
+        min_seconds_since_last_seal: float | None,
+    ) -> None:
+        if min_seconds_since_last_seal is None or float(min_seconds_since_last_seal) <= 0:
+            return
+        row = connection.execute(
+            """
+            SELECT MAX(created_at) AS latest_created_at FROM protected_intervals
+            WHERE (market = ? OR market = ? OR ? = ?)
+              AND (symbol = ? OR symbol = ? OR ? = ?)
+            """,
+            (
+                market,
+                UNKNOWN_MARKET,
+                market,
+                UNKNOWN_MARKET,
+                symbol,
+                UNKNOWN_SYMBOL,
+                symbol,
+                UNKNOWN_SYMBOL,
+            ),
+        ).fetchone()
+        latest_created_at = row["latest_created_at"] if row is not None else None
+        if latest_created_at is None:
+            return
+        try:
+            latest = datetime.fromisoformat(str(latest_created_at))
+        except ValueError as exc:
+            raise ExperimentMemoryCorruptionError(
+                f"protected interval has invalid created_at: {latest_created_at!r}"
+            ) from exc
+        if latest.tzinfo is None:
+            raise ExperimentMemoryCorruptionError(
+                f"protected interval created_at must be timezone-aware: {latest_created_at!r}"
+            )
+        elapsed = (datetime.now(UTC) - latest).total_seconds()
+        if elapsed < float(min_seconds_since_last_seal):
+            raise HoldoutSealBudgetError(
+                "protected-holdout seal budget: a protected interval for "
+                f"market={market} symbol={symbol} was already sealed at {latest_created_at} "
+                f"({elapsed:.0f}s ago, minimum spacing {float(min_seconds_since_last_seal):.0f}s); "
+                "deferring this holdout instead of consuming more chronological history"
             )
 
     @staticmethod

@@ -280,6 +280,11 @@ chmod 600 runtime/telegram.env
 # edit runtime/telegram.env, then:
 REPO="$PWD" bash scripts/install_communications_service.sh
 
+# If OpenClaw already polls the same bot token, keep trading notifications and
+# daily reports but leave inbound polling exclusively with OpenClaw:
+REPO="$PWD" TELEGRAM_POLLING_ENABLED=0 \
+  bash scripts/install_communications_service.sh
+
 # If OpenClaw runs under a dedicated Unix user, first create the shared bridge
 # group exactly as documented in COMMUNICATIONS.md. The real install applies
 # exact-user deny ACLs around the two narrow bridge paths:

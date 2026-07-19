@@ -45,6 +45,22 @@ Protect the file and never put exchange credentials in it:
 chmod 600 runtime/telegram.env
 ```
 
+Only one process may poll `getUpdates` for a Telegram bot token. If OpenClaw (or
+another service) already receives inbound messages for this bot, install the
+trading integration in outbound-only mode. Alerts and daily status reports will
+still be sent, while OpenClaw remains the sole inbound poller:
+
+```bash
+REPO="$PWD" TELEGRAM_POLLING_ENABLED=0 \
+  bash scripts/install_communications_service.sh
+```
+
+To use this edge's `/status` and restricted pause commands, create a separate
+BotFather bot/token and run the installer with its default
+`TELEGRAM_POLLING_ENABLED=1`. Never run the trading edge and OpenClaw as pollers
+for the same token; Telegram will continuously terminate one of them with an
+HTTP 409 conflict.
+
 Create the separate alert-routing settings file as well. It contains no
 exchange credentials and is the only operations settings file read by the
 watchdog:

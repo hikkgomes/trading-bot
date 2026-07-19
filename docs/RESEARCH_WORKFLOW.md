@@ -245,14 +245,24 @@ records the policy, timeframes, duration, and protected-versus-embargoed row
 counts. When no epoch still meets the scenario history contract, that scenario
 waits for enough genuinely new data.
 
-The cycle freezes the exact candidate cohort and immutable dataset evidence
-before evaluation. Immediately before any final-holdout read, it records that
-the candidate passed development, then commits a claim for that data snapshot
-and every root of the candidate's lineage. Only preregistered cohort members
-with the exact sealed protocol and non-conflicting evidence may resume. New
-members, altered evidence, or a new protected interval that overlaps an
-existing one fail closed. If the process crashes one instruction later, the
-claim remains consumed and a retry fails closed with
+Cohort and interval sealing is lazy: a scenario pass where no candidate
+survives every development stage seals nothing, so repeated cycles cannot
+consume chronological history without earning a holdout read. Immediately
+before the first final-holdout read of a run, the cycle records that the
+candidate passed development, freezes the run's exact candidate cohort and
+immutable dataset evidence, and commits a claim for that data snapshot and
+every root of the candidate's lineage. Sealing a *new* protected interval is
+additionally rate-limited per market and symbol
+(`HOLDOUT_SEAL_MIN_INTERVAL_SECONDS`, seven days by default, enforced inside
+the same database transaction as the seal). A candidate that reaches the gate
+sooner keeps its durable development outcome and defers with
+`holdout_seal_budget_exhausted` instead of spending more final-evaluation
+data; resuming an already sealed cohort never consumes budget. Only
+preregistered cohort members with the exact sealed protocol and
+non-conflicting evidence may resume. New members, altered evidence, or a new
+protected interval that overlaps an existing one fail closed with
+`holdout_cohort_seal_conflict`. If the process crashes one instruction after a
+claim, the claim remains consumed and a retry fails closed with
 `holdout_already_consumed`. Do not clear such a claim to get another look.
 
 The protected result is stored for audit and export gating, but

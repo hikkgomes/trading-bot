@@ -19,6 +19,7 @@ SERVICE_NAME="${SERVICE_NAME:-trading-bot-telegram.service}"
 REPORT_SERVICE_NAME="${REPORT_SERVICE_NAME:-trading-bot-telegram-report.service}"
 REPORT_TIMER_NAME="${REPORT_TIMER_NAME:-trading-bot-telegram-report.timer}"
 REPORT_INTERVAL="${REPORT_INTERVAL:-24h}"
+TELEGRAM_POLLING_ENABLED="${TELEGRAM_POLLING_ENABLED:-1}"
 UNIT_DIR="${UNIT_DIR:-$HOME/.config/systemd/user}"
 DRY_RUN="${DRY_RUN:-0}"
 TARGET_UNIT_DIR="$UNIT_DIR"
@@ -43,6 +44,10 @@ if [[ "$REPORT_TIMER_NAME" == */* || "$REPORT_TIMER_NAME" != *.timer ]]; then
 fi
 if [[ "$DRY_RUN" != "0" && "$DRY_RUN" != "1" ]]; then
   echo "DRY_RUN must be 0 or 1" >&2
+  exit 1
+fi
+if [[ "$TELEGRAM_POLLING_ENABLED" != "0" && "$TELEGRAM_POLLING_ENABLED" != "1" ]]; then
+  echo "TELEGRAM_POLLING_ENABLED must be 0 or 1" >&2
   exit 1
 fi
 if [ ! -x "$PYTHON" ]; then
@@ -323,6 +328,18 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 
 systemctl --user daemon-reload
-systemctl --user enable --now "$SERVICE_NAME"
+if [ "$TELEGRAM_POLLING_ENABLED" = "1" ]; then
+  systemctl --user enable --now "$SERVICE_NAME"
+else
+  # Telegram permits only one getUpdates consumer per bot token. Outbound-only
+  # mode keeps alerts and scheduled reports without competing with an existing
+  # OpenClaw (or other) poller that owns inbound messages for the same bot.
+  systemctl --user disable --now "$SERVICE_NAME"
+  echo "Telegram inbound polling disabled; outbound alerts and reports remain enabled."
+fi
 systemctl --user enable --now "$REPORT_TIMER_NAME"
-systemctl --user status "$SERVICE_NAME" "$REPORT_TIMER_NAME" --no-pager
+if [ "$TELEGRAM_POLLING_ENABLED" = "1" ]; then
+  systemctl --user status "$SERVICE_NAME" "$REPORT_TIMER_NAME" --no-pager
+else
+  systemctl --user status "$REPORT_TIMER_NAME" --no-pager
+fi

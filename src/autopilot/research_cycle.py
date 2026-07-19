@@ -57,6 +57,7 @@ from src.autopilot.execution_identity import execution_engine_digest
 from src.autopilot.experiment_memory import (
     EvaluationConflictError,
     ExperimentMemory,
+    HoldoutSealBudgetError,
     canonical_strategy_hash,
 )
 from src.autopilot.io import write_json_atomic
@@ -89,6 +90,22 @@ DEFAULT_PRODUCT_STATE_FILES = {
     "btc_accumulation": Path("runtime/btc_accumulation_state.json"),
 }
 FEATURE_DEPENDENCY_MAX_NATIVE_BARS = 240
+# Every sealed protected interval permanently removes its window (plus the
+# feature-dependency embargo) from adaptive research. Sealing is therefore
+# rate-limited per market+symbol: a candidate that reaches the holdout gate
+# sooner is deferred with a durable development outcome instead of consuming
+# more chronological history. 7 days matches the paper-soak floor, so at most
+# one final-evaluation window can be spent per market per soak period.
+HOLDOUT_SEAL_MIN_INTERVAL_SECONDS = 7 * 24 * 3600
+# ``before_holdout`` deferrals that already recorded a development outcome;
+# the checkpoint must not downgrade that durable record with a second write.
+HOLDOUT_GATE_DEFERRAL_REASONS = frozenset(
+    {
+        "holdout_already_consumed",
+        "holdout_seal_budget_exhausted",
+        "holdout_cohort_seal_conflict",
+    }
+)
 
 
 class UnprotectedResearchEpochUnavailableError(EvaluationConflictError):
@@ -2075,6 +2092,7 @@ def run_validation_scenario(
     coverage_now: str | pd.Timestamp | None = None,
     experiment_memory: ExperimentMemory | None = None,
     research_factory_config_path: Path = DEFAULT_RESEARCH_FACTORY_CONFIG,
+    holdout_seal_min_interval_seconds: float = HOLDOUT_SEAL_MIN_INTERVAL_SECONDS,
 ) -> dict[str, Any]:
     hypotheses = _hypotheses_for(scenario) if hypotheses is None else hypotheses
     if not hypotheses:
@@ -2290,26 +2308,44 @@ def run_validation_scenario(
             }
 
     holdout_claims: dict[str, str] = {}
-    holdout_cohort_members: set[str] = set()
-    holdout_cohort_created: bool | None = None
-    holdout_cohort_scope: str | None = None
+    holdout_window: dict[str, Any] | None = None
+    # Cohort/interval sealing is deliberately lazy. Registering it here would
+    # permanently seal this frame's holdout window on every scenario pass,
+    # even when no candidate ever earns a holdout read — a runaway loop can
+    # then consume the entire chronological history as protected evidence.
+    # The seal happens at first exposure risk instead: when the first
+    # candidate passes every pre-holdout stage.
+    holdout_cohort: dict[str, Any] = {"members": set(), "created": None, "scope": None}
     if experiment_memory is not None:
         if dataset_snapshot is None or protocol is None:
             raise RuntimeError(
                 f"{scenario.name}: experiment-memory holdout context was not initialized"
             )
         holdout_window = _segment_bounds(split_frame(frame, validation_cfg)["holdout"])
-        cohort = experiment_memory.register_holdout_cohort(
-            [memory_hashes[hypothesis.id] for hypothesis in supported_hypotheses],
-            dataset=dataset_snapshot,
-            window=holdout_window,
-            protocol=protocol,
-        )
-        holdout_cohort_members = set(cohort.member_hashes)
-        holdout_cohort_created = cohort.created
-        holdout_cohort_scope = cohort.scope_key
 
-    def before_holdout(hypothesis: Hypothesis, partial_result: dict[str, Any]) -> bool:
+    def _ensure_holdout_cohort_sealed() -> str | None:
+        """Seal cohort+interval on first need; return a deferral reason if blocked."""
+
+        if holdout_cohort["scope"] is not None:
+            return None
+        try:
+            cohort = experiment_memory.register_holdout_cohort(
+                [memory_hashes[hypothesis.id] for hypothesis in supported_hypotheses],
+                dataset=dataset_snapshot,
+                window=holdout_window,
+                protocol=protocol,
+                min_seconds_since_last_seal=holdout_seal_min_interval_seconds,
+            )
+        except HoldoutSealBudgetError:
+            return "holdout_seal_budget_exhausted"
+        except EvaluationConflictError:
+            return "holdout_cohort_seal_conflict"
+        holdout_cohort["members"] = set(cohort.member_hashes)
+        holdout_cohort["created"] = cohort.created
+        holdout_cohort["scope"] = cohort.scope_key
+        return None
+
+    def before_holdout(hypothesis: Hypothesis, partial_result: dict[str, Any]) -> bool | str:
         if experiment_memory is None:
             return True
         if dataset_snapshot is None or development_window is None or protocol is None:
@@ -2327,7 +2363,10 @@ def run_validation_scenario(
             metrics=_development_metrics(partial_result),
             details={"stage_reached": "sensitivity", "holdout_feedback_allowed": False},
         )
-        if behavior_hash not in holdout_cohort_members:
+        deferral_reason = _ensure_holdout_cohort_sealed()
+        if deferral_reason is not None:
+            return deferral_reason
+        if behavior_hash not in holdout_cohort["members"]:
             return False
         snapshot_id = str(dataset_snapshot["snapshot_id"])
         if experiment_memory.holdout_claimed(behavior_hash, snapshot_id=snapshot_id):
@@ -2368,7 +2407,7 @@ def run_validation_scenario(
                 metrics={"holdout": _segment_summary(result, "holdout") or {}},
                 details={"protected_feedback": True},
             )
-        elif "holdout_already_consumed" not in set(result.get("reasons") or []):
+        elif not (set(result.get("reasons") or []) & HOLDOUT_GATE_DEFERRAL_REASONS):
             experiment_memory.record_outcome(
                 behavior_hash,
                 dataset=dataset_snapshot,
@@ -2432,11 +2471,11 @@ def run_validation_scenario(
         ),
         **(
             {
-                "holdout_cohort_scope": holdout_cohort_scope,
-                "holdout_cohort_created": holdout_cohort_created,
-                "holdout_cohort_members": len(holdout_cohort_members),
+                "holdout_cohort_scope": holdout_cohort["scope"],
+                "holdout_cohort_created": holdout_cohort["created"],
+                "holdout_cohort_members": len(holdout_cohort["members"]),
             }
-            if holdout_cohort_scope is not None
+            if holdout_cohort["scope"] is not None
             else {}
         ),
         "trial_count": validation_cfg.n_trials,

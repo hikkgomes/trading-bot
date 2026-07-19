@@ -2132,6 +2132,200 @@ def test_validation_scenario_defers_when_protected_epochs_cover_all_rows(monkeyp
     assert report["remediation"]["action"] == "wait_for_unprotected_history"
 
 
+def _memory_scenario_setup(monkeypatch, *, rows=40):
+    import pandas as pd
+
+    scenario = rc.ResearchScenario(
+        name="active_income_5m_guarded",
+        product="active_income",
+        base_tf="5m",
+        pnl_unit="usdt",
+        market="futures",
+        position=False,
+        start="2026-01-01",
+    )
+    hypothesis = next(hyp for hyp in generate_batch() if hyp.base_timeframe == "5m")
+    frame = pd.DataFrame(
+        {"timestamp": pd.date_range("2026-01-01T00:00:00Z", periods=rows, freq="5min")}
+    )
+    monkeypatch.setattr(rc, "_scenario_indicator_coverage_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        rc,
+        "_partition_supported_hypotheses",
+        lambda hypotheses, **_kwargs: (hypotheses, []),
+    )
+    monkeypatch.setattr(rc, "build_aligned_frame", lambda *args, **kwargs: frame.copy())
+    monkeypatch.setattr(
+        rc,
+        "with_trial_sharpe_dispersion",
+        lambda _frame, _hypotheses, cfg, _eval_cfg: cfg,
+    )
+    monkeypatch.setattr(
+        rc,
+        "_dataset_snapshot",
+        lambda scenario_arg, hyps, *, frame, indicator_dir: {
+            "snapshot_id": "scenario-snapshot-v1",
+            "symbol": "BTCUSDT",
+            "market": scenario_arg.market,
+            "timeframe": scenario_arg.base_tf,
+        },
+    )
+    return scenario, hypothesis, frame
+
+
+def test_validation_scenario_does_not_seal_holdout_without_a_gated_candidate(monkeypatch, tmp_path):
+    """Regression: eager per-run sealing burned the whole history as protected.
+
+    A scenario pass where no candidate earns a holdout read must not seal the
+    frame's holdout window into ``protected_intervals``.
+    """
+    from src.autopilot.experiment_memory import ExperimentMemory
+
+    scenario, hypothesis, _frame = _memory_scenario_setup(monkeypatch)
+
+    def fake_validate_batch(
+        frame_arg, hyps, cfg, *, eval_cfg, log_path, before_holdout, after_candidate
+    ):
+        results = []
+        for hyp in hyps:
+            result = {
+                "hypothesis_id": hyp.id,
+                "family": hyp.family,
+                "direction": hyp.direction,
+                "verdict": "reject",
+                "reasons": ["no_train_edge"],
+                "holdout": None,
+            }
+            after_candidate(hyp, result)
+            results.append(result)
+        return results
+
+    monkeypatch.setattr(rc, "validate_batch", fake_validate_batch)
+    with ExperimentMemory(tmp_path / "memory.sqlite3") as memory:
+        report = rc.run_validation_scenario(
+            scenario,
+            hypotheses=[hypothesis],
+            selection={"offset": 0, "next_offset": 1, "selected": 1},
+            experiment_memory=memory,
+            log_path=None,
+        )
+        assert report["ok"] is True
+        assert "holdout_cohort_scope" not in report
+        assert report["holdout_exposed_ids"] == []
+        assert memory.protected_intervals(market="futures", symbol="BTCUSDT") == ()
+
+
+def test_validation_scenario_seals_and_claims_lazily_at_first_holdout_need(monkeypatch, tmp_path):
+    from src.autopilot.experiment_memory import ExperimentMemory
+
+    scenario, hypothesis, _frame = _memory_scenario_setup(monkeypatch)
+    gate_results = []
+
+    def fake_validate_batch(
+        frame_arg, hyps, cfg, *, eval_cfg, log_path, before_holdout, after_candidate
+    ):
+        results = []
+        for hyp in hyps:
+            segs = rc.split_frame(frame_arg, cfg)
+            partial = {
+                "hypothesis_id": hyp.id,
+                "family": hyp.family,
+                "direction": hyp.direction,
+                "splits": {name: rc._segment_bounds(seg) for name, seg in segs.items()},
+            }
+            gate = before_holdout(hyp, partial)
+            gate_results.append(gate)
+            result = {
+                **partial,
+                "verdict": "reject",
+                "reasons": ["failed_holdout"],
+                "holdout": {"trades": 5, "total_return": -0.01},
+            }
+            after_candidate(hyp, result)
+            results.append(result)
+        return results
+
+    monkeypatch.setattr(rc, "validate_batch", fake_validate_batch)
+    with ExperimentMemory(tmp_path / "memory.sqlite3") as memory:
+        report = rc.run_validation_scenario(
+            scenario,
+            hypotheses=[hypothesis],
+            selection={"offset": 0, "next_offset": 1, "selected": 1},
+            experiment_memory=memory,
+            log_path=None,
+        )
+        assert gate_results == [True]
+        assert report["holdout_cohort_scope"] is not None
+        assert report["holdout_cohort_created"] is True
+        assert report["holdout_cohort_members"] == 1
+        assert report["holdout_exposed_ids"] == [hypothesis.id]
+        assert len(memory.protected_intervals(market="futures", symbol="BTCUSDT")) == 1
+
+
+def test_validation_scenario_defers_holdout_when_seal_budget_is_exhausted(monkeypatch, tmp_path):
+    from src.autopilot.experiment_memory import ExperimentMemory
+
+    scenario, hypothesis, _frame = _memory_scenario_setup(monkeypatch)
+    gate_results = []
+
+    def fake_validate_batch(
+        frame_arg, hyps, cfg, *, eval_cfg, log_path, before_holdout, after_candidate
+    ):
+        results = []
+        for hyp in hyps:
+            segs = rc.split_frame(frame_arg, cfg)
+            partial = {
+                "hypothesis_id": hyp.id,
+                "family": hyp.family,
+                "direction": hyp.direction,
+                "splits": {name: rc._segment_bounds(seg) for name, seg in segs.items()},
+            }
+            gate = before_holdout(hyp, partial)
+            gate_results.append(gate)
+            result = {
+                **partial,
+                "verdict": "inconclusive",
+                "reasons": [gate],
+                "holdout": None,
+            }
+            after_candidate(hyp, result)
+            results.append(result)
+        return results
+
+    monkeypatch.setattr(rc, "validate_batch", fake_validate_batch)
+    with ExperimentMemory(tmp_path / "memory.sqlite3") as memory:
+        prior = memory.register_strategy(
+            {"id": "prior", "kind": "budget-anchor"},
+            strategy_id="prior",
+            generation_method="grammar_sample",
+            metadata={"family": "anchor", "product": "active_income"},
+        )
+        # A far-past window keeps epoch selection and its feature embargo away
+        # from the 2026 scenario frame while still consuming today's budget.
+        memory.register_holdout_cohort(
+            [prior.behavior_hash],
+            dataset={
+                "snapshot_id": "prior-snapshot",
+                "symbol": "BTCUSDT",
+                "market": "futures",
+                "timeframe": "5m",
+            },
+            window={"start": "2024-01-01", "end": "2024-06-01"},
+            protocol={"fees_bps": 10},
+        )
+        report = rc.run_validation_scenario(
+            scenario,
+            hypotheses=[hypothesis],
+            selection={"offset": 0, "next_offset": 1, "selected": 1},
+            experiment_memory=memory,
+            log_path=None,
+        )
+        assert gate_results == ["holdout_seal_budget_exhausted"]
+        assert "holdout_cohort_scope" not in report
+        assert report["holdout_exposed_ids"] == []
+        assert len(memory.protected_intervals(market="futures", symbol="BTCUSDT")) == 1
+
+
 def test_research_epoch_selection_embargoes_cross_timeframe_feature_dependencies():
     import pandas as pd
 

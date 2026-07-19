@@ -841,6 +841,20 @@ def test_holdout_must_be_durably_claimed_before_evaluation():
     assert len(claims) == 2
 
 
+def test_holdout_gate_reason_string_defers_without_reading_holdout():
+    """A string from the gate defers with that exact reason (e.g. seal budget)."""
+    frame = _ts_frame(_sawtooth(3000, 0.015, 0.005))
+    res = validate_hypothesis(
+        frame,
+        _rising_hypothesis(),
+        _RELAXED,
+        before_holdout=lambda hypothesis, partial_result: "holdout_seal_budget_exhausted",
+    )
+    assert res["verdict"] == "inconclusive"
+    assert res["reasons"] == ["holdout_seal_budget_exhausted"]
+    assert res["holdout"] is None
+
+
 def test_negative_holdout_gates_admission():
     """Edge in train+val, crash in the untouched holdout -> REJECT (the old
     pipeline's report-only holdout would have shipped this)."""

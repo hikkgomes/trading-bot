@@ -13,6 +13,8 @@ def test_telegram_service_uses_telegram_only_environment_and_pause_edge():
     script = Path("scripts/install_communications_service.sh").read_text(encoding="utf-8")
 
     assert 'TELEGRAM_ENV="${TELEGRAM_ENV:-$REPO/runtime/telegram.env}"' in script
+    assert 'TELEGRAM_POLLING_ENABLED="${TELEGRAM_POLLING_ENABLED:-1}"' in script
+    assert "TELEGRAM_POLLING_ENABLED must be 0 or 1" in script
     assert "EnvironmentFile=" not in script
     assert "--settings-file $TELEGRAM_ENV_UNIT --validate-settings" in script
     assert (
@@ -39,6 +41,8 @@ def test_telegram_service_uses_telegram_only_environment_and_pause_edge():
     )
     assert verify_call < script.index('if [ "$DRY_RUN" = "1" ]', verify_call)
     assert verify_call < script.index('systemctl --user enable --now "$SERVICE_NAME"')
+    assert 'systemctl --user disable --now "$SERVICE_NAME"' in script
+    assert 'systemctl --user enable --now "$REPORT_TIMER_NAME"' in script
     assert "prepare_unit_staging()" in script
     assert "publish_unit_files()" in script
     assert verify_call < script.index("publish_unit_files", verify_call)

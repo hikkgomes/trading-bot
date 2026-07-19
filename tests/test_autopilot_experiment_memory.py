@@ -10,6 +10,7 @@ from src.autopilot.experiment_memory import (
     ExperimentMemory,
     ExperimentMemoryClosedError,
     ExperimentMemoryCorruptionError,
+    HoldoutSealBudgetError,
     StrategyIdentityConflictError,
     canonical_strategy_hash,
     canonical_test_hash,
@@ -400,6 +401,82 @@ def test_holdout_cohort_seals_snapshot_against_later_independent_roots(tmp_path)
                 window=final_window,
                 protocol=final_protocol,
             )
+
+
+def test_holdout_seal_budget_defers_rapid_new_interval_sealing(tmp_path):
+    with ExperimentMemory(tmp_path / "memory.sqlite3") as memory:
+        first = memory.register_strategy(
+            strategy_spec("first"),
+            strategy_id="first",
+            generation_method="grammar_sample",
+            metadata=metadata(),
+        )
+        second = memory.register_strategy(
+            strategy_spec("second", reference=60),
+            strategy_id="second",
+            generation_method="grammar_sample",
+            metadata=metadata(),
+        )
+        sealed = memory.register_holdout_cohort(
+            [first.behavior_hash],
+            dataset=dataset("snapshot-one"),
+            window=window("2025-06-01", "2025-09-01"),
+            protocol={"fees_bps": 10},
+            min_seconds_since_last_seal=3600.0,
+        )
+        assert sealed.created is True
+
+        # Resuming the already sealed cohort never consumes budget.
+        resumed = memory.register_holdout_cohort(
+            [first.behavior_hash],
+            dataset=dataset("snapshot-one"),
+            window=window("2025-06-01", "2025-09-01"),
+            protocol={"fees_bps": 10},
+            min_seconds_since_last_seal=3600.0,
+        )
+        assert resumed.created is False
+
+        # A second disjoint interval inside the spacing window is deferred,
+        # and the refused attempt leaves no cohort or interval behind.
+        with pytest.raises(HoldoutSealBudgetError, match="seal budget"):
+            memory.register_holdout_cohort(
+                [second.behavior_hash],
+                dataset=dataset("snapshot-two"),
+                window=window("2024-01-01", "2024-06-01"),
+                protocol={"fees_bps": 10},
+                min_seconds_since_last_seal=3600.0,
+            )
+        assert len(memory.protected_intervals(market="futures", symbol="BTCUSDT")) == 1
+
+        # With the budget disabled the same seal is accepted.
+        allowed = memory.register_holdout_cohort(
+            [second.behavior_hash],
+            dataset=dataset("snapshot-two"),
+            window=window("2024-01-01", "2024-06-01"),
+            protocol={"fees_bps": 10},
+            min_seconds_since_last_seal=0,
+        )
+        assert allowed.created is True
+        assert len(memory.protected_intervals(market="futures", symbol="BTCUSDT")) == 2
+
+
+def test_holdout_seal_budget_rejects_invalid_values(tmp_path):
+    with ExperimentMemory(tmp_path / "memory.sqlite3") as memory:
+        registered = memory.register_strategy(
+            strategy_spec("first"),
+            strategy_id="first",
+            generation_method="grammar_sample",
+            metadata=metadata(),
+        )
+        for invalid in (True, float("nan"), "3600"):
+            with pytest.raises(ValueError, match="min_seconds_since_last_seal"):
+                memory.register_holdout_cohort(
+                    [registered.behavior_hash],
+                    dataset=dataset(),
+                    window=window(),
+                    protocol={"fees_bps": 10},
+                    min_seconds_since_last_seal=invalid,
+                )
 
 
 def test_protected_interval_blocks_grown_snapshot_adaptive_overlap(tmp_path):

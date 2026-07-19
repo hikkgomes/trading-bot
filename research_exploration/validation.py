@@ -622,7 +622,7 @@ def validate_hypothesis(
     hyp: Hypothesis,
     cfg: ValidationConfig | None = None,
     eval_cfg: EvalConfig | None = None,
-    before_holdout: Callable[[Hypothesis, dict], bool | None] | None = None,
+    before_holdout: Callable[[Hypothesis, dict], bool | str | None] | None = None,
 ) -> dict:
     """Run the full staged pipeline. The holdout is only ever *touched* after
     every earlier stage passes, and a negative holdout rejects — it gates."""
@@ -705,8 +705,14 @@ def validate_hypothesis(
     # this hook to durably claim the canonical behavior+snapshot before a read.
     # Returning False means an earlier attempt (including a killed process)
     # already consumed this holdout; fail closed rather than looking again.
-    if before_holdout is not None and before_holdout(hyp, result) is False:
-        return finish("inconclusive", "holdout_already_consumed")
+    # Returning a string defers with that reason (e.g. a seal-budget gate)
+    # without reading a single protected row.
+    if before_holdout is not None:
+        gate = before_holdout(hyp, result)
+        if gate is False:
+            return finish("inconclusive", "holdout_already_consumed")
+        if isinstance(gate, str):
+            return finish("inconclusive", gate)
     holdout = evaluate_hypothesis(segs["holdout"], hyp, eval_cfg)
     result["holdout"] = holdout
     if holdout["trades"] < cfg.min_trades_holdout:
@@ -725,7 +731,7 @@ def validate_batch(
     cfg: ValidationConfig | None = None,
     eval_cfg: EvalConfig | None = None,
     log_path: Path | None = None,
-    before_holdout: Callable[[Hypothesis, dict], bool | None] | None = None,
+    before_holdout: Callable[[Hypothesis, dict], bool | str | None] | None = None,
     after_candidate: Callable[[Hypothesis, dict], None] | None = None,
 ) -> list[dict]:
     """Validate a batch with DSR deflated by at least the batch size.
