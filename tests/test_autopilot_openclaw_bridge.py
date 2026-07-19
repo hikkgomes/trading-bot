@@ -13,8 +13,28 @@ from src.autopilot.openclaw_bridge import (
     canonical_proposal_digest,
     export_research_context,
     ingest_inbox,
+    record_review,
     validate_proposal,
 )
+
+
+def test_record_review_logs_zero_proposal_receipt(tmp_path):
+    context = tmp_path / "research_context.json"
+    context.write_text('{"schema":"autopilot.openclaw_research_context/v1"}\n')
+    audit = tmp_path / "review_audit.jsonl"
+
+    receipt = record_review(
+        audit_path=audit,
+        context_path=context,
+        run_id="daily-2026-07-19",
+        model="openclaw-default",
+        summary="No novel hypothesis met the bar today.",
+        proposal_count=0,
+    )
+
+    assert receipt["proposal_count"] == 0
+    assert receipt["context_digest"].startswith("sha256:")
+    assert json.loads(audit.read_text())["run_id"] == "daily-2026-07-19"
 
 
 def proposal(**overrides):

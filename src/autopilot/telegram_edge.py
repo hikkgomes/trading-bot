@@ -34,6 +34,8 @@ DEFAULT_POLL_STATE = Path("runtime/telegram/telegram_poll_state.json")
 LEGACY_POLL_STATE = Path("runtime/telegram_poll_state.json")
 DEFAULT_JOB_WORKER_STATUS = Path("runtime/job_worker_status.json")
 DEFAULT_RESEARCH_CYCLE = Path("runtime/research_cycle.json")
+DEFAULT_MARKET_UNIVERSE = Path("runtime/market_universe.json")
+DEFAULT_OPENCLAW_REVIEW_AUDIT = Path("runtime/openclaw/review_audit.jsonl")
 DEFAULT_SETTINGS_FILE = PROJECT_ROOT / "runtime" / "telegram.env"
 ALLOWED_API_METHODS = frozenset({"getUpdates", "sendMessage"})
 ALLOWED_UPDATE_TYPES = ["message", "channel_post"]
@@ -474,8 +476,30 @@ def format_alert_message(payload: dict[str, Any]) -> str:
     title = str(safe.get("title") or "Autopilot notification")[:200]
     generated_at = str(safe.get("generated_at") or "unknown")[:80]
     detail = safe.get("detail") if isinstance(safe.get("detail"), dict) else {}
-    detail_text = json.dumps(detail, indent=2, sort_keys=True, ensure_ascii=False)
-    return f"[{severity}] {title}\nAt: {generated_at}\n\n{detail_text}"
+    lines = [f"{severity}: {title}", f"Time: {generated_at}"]
+    if detail:
+        lines.append("Details:")
+        for key, value in sorted(detail.items()):
+            label = str(key).replace("_", " ").strip().capitalize()
+            if isinstance(value, bool):
+                rendered = "yes" if value else "no"
+            elif isinstance(value, str | int | float) or value is None:
+                rendered = "none" if value is None else str(value)
+            else:
+                rendered = json.dumps(value, sort_keys=True, ensure_ascii=False)
+            lines.append(f"- {label}: {rendered}")
+    return "\n".join(lines)
+
+
+def _read_last_json_line(path: Path, *, max_bytes: int = 2 * 1024 * 1024) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > max_bytes:
+        return {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        payload = json.loads(lines[-1]) if lines else {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def send_alert_from_environment(
@@ -517,10 +541,14 @@ def build_status_snapshot(
     control_path: Path,
     job_worker_status_path: Path = DEFAULT_JOB_WORKER_STATUS,
     research_cycle_path: Path = DEFAULT_RESEARCH_CYCLE,
+    market_universe_path: Path = DEFAULT_MARKET_UNIVERSE,
+    openclaw_review_audit_path: Path = DEFAULT_OPENCLAW_REVIEW_AUDIT,
 ) -> dict[str, Any]:
     status = _read_json_object(status_path)
     worker = _read_json_object(job_worker_status_path)
     research = _read_json_object(research_cycle_path)
+    universe = _read_json_object(market_universe_path)
+    openclaw_review = _read_last_json_line(openclaw_review_audit_path)
     control = load_control(control_path)
 
     products: list[dict[str, Any]] = []
@@ -586,6 +614,19 @@ def build_status_snapshot(
             "reason": _safe_scalar_tree(research.get("reason")),
             "summary": safe_summary,
         },
+        "universe": {
+            "ok": universe.get("ok"),
+            "generated_at": universe.get("generated_at"),
+            "research_symbols": _safe_scalar_tree(universe.get("research_symbols")) or [],
+            "eligible_research_symbols": (
+                _safe_scalar_tree(universe.get("eligible_research_symbols")) or []
+            ),
+        },
+        "openclaw_review": {
+            "recorded_at": openclaw_review.get("recorded_at"),
+            "proposal_count": openclaw_review.get("proposal_count"),
+            "summary": _safe_scalar_tree(openclaw_review.get("summary")),
+        },
     }
 
 
@@ -594,31 +635,49 @@ def format_status_message(snapshot: dict[str, Any]) -> str:
     control = snapshot.get("control") or {}
     worker = snapshot.get("job_worker") or {}
     research = snapshot.get("research") or {}
+    universe = snapshot.get("universe") or {}
+    review = snapshot.get("openclaw_review") or {}
+    paused = bool(control.get("paused") or control.get("pause_jobs"))
+    overall = "Attention needed" if supervisor.get("ok") is False or paused else "Healthy"
     lines = [
-        "Trading autopilot status",
-        f"Supervisor: {_status_word(supervisor.get('ok'))} ({supervisor.get('generated_at') or 'no heartbeat'})",
-        (
-            "Control: "
-            f"paused={bool(control.get('paused'))}, "
-            f"jobs_paused={bool(control.get('pause_jobs'))}, "
-            f"products={','.join(control.get('paused_products') or []) or 'none'}"
-        ),
+        "Trading research update",
+        f"Overall: {overall}. Supervisor is {_status_word(supervisor.get('ok'))}.",
     ]
+    if paused:
+        lines.append(f"Automation is paused ({control.get('reason') or 'no reason recorded'}).")
+    lines.append("")
+    lines.append("Products")
     for product in snapshot.get("products") or []:
         lines.append(
-            f"Product {product.get('name') or 'unknown'}: {_status_word(product.get('ok'))}, "
-            f"mode={product.get('mode') or 'unknown'}, open={product.get('open_positions') or 0}, "
-            f"state={product.get('reason') or product.get('action') or 'running'}"
+            f"- {str(product.get('name') or 'unknown').replace('_', ' ').title()}: "
+            f"{_status_word(product.get('ok'))}; {product.get('mode') or 'unknown'} mode; "
+            f"{product.get('open_positions') or 0} open positions."
         )
-    lines.append(
-        f"Job worker: {_status_word(worker.get('ok'))} ({worker.get('generated_at') or 'no heartbeat'})"
-    )
     summary = research.get("summary") or {}
+    lines.extend(["", "Research"])
     lines.append(
-        "Research: "
-        f"{_status_word(research.get('ok'))}, "
-        f"hypotheses={summary.get('hypotheses', 0)}, "
-        f"keepers={summary.get('keepers', 0)}, staged={summary.get('staged', 0)}"
+        f"- Latest cycle is {_status_word(research.get('ok'))}: "
+        f"{summary.get('hypotheses', 0)} hypotheses checked, "
+        f"{summary.get('keepers', 0)} keepers, {summary.get('staged', 0)} staged."
+    )
+    configured = universe.get("research_symbols") or []
+    eligible = universe.get("eligible_research_symbols") or []
+    if configured:
+        lines.append(
+            f"- Futures universe: {', '.join(configured)}. "
+            f"Currently eligible: {', '.join(eligible) or 'none'}."
+        )
+    if review.get("recorded_at"):
+        lines.append(
+            f"- OpenClaw reviewed the queue and submitted "
+            f"{review.get('proposal_count') or 0} new proposals."
+        )
+    lines.extend(
+        [
+            "",
+            f"Operations: job worker is {_status_word(worker.get('ok'))}. "
+            f"Last supervisor heartbeat: {supervisor.get('generated_at') or 'unknown'}.",
+        ]
     )
     return "\n".join(lines)
 

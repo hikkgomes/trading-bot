@@ -34,8 +34,10 @@ DEFAULT_REJECTED = INBOX_ROOT / "rejected"
 DEFAULT_ARCHIVE = INBOX_ROOT / "archive"
 DEFAULT_INDEX = INBOX_ROOT / "index.json"
 DEFAULT_CONTEXT = Path("runtime/openclaw/research_context.json")
+DEFAULT_REVIEW_AUDIT = Path("runtime/openclaw/review_audit.jsonl")
 DEFAULT_RESEARCH_CYCLE = Path("runtime/research_cycle.json")
 DEFAULT_GENERATED_BATCH = Path("runtime/research/generated_hypotheses.json")
+DEFAULT_MARKET_UNIVERSE = Path("runtime/market_universe.json")
 PROPOSAL_SCHEMA = "research_proposal/v1"
 ACCEPTED_SCHEMA = "autopilot.openclaw_research_proposal/v1"
 CONTEXT_SCHEMA = "autopilot.openclaw_research_context/v1"
@@ -57,6 +59,7 @@ INPUT_KEYS = frozenset(
         "source_proposal_id",
         "suggested_primitives",
         "suggested_spec",
+        "symbol",
         "thesis",
     }
 )
@@ -336,6 +339,11 @@ def validate_proposal(payload: dict[str, Any]) -> dict[str, Any]:
         raise ProposalValidationError(f"base_timeframe must be one of {sorted(TIMEFRAMES)}")
     created_at = _validate_created_at(_required_string(payload, "created_at", maximum=80))
     thesis = _required_string(payload, "thesis", minimum=20, maximum=4000)
+    symbol = str(payload.get("symbol") or "BTCUSDT").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{3,20}USDT", symbol):
+        raise ProposalValidationError("symbol must be an uppercase USDT pair")
+    if objective == "btc_accumulation" and symbol != "BTCUSDT":
+        raise ProposalValidationError("btc_accumulation proposals must target BTCUSDT")
     source_proposal_id = payload.get("source_proposal_id")
     if source_proposal_id is not None:
         if not isinstance(source_proposal_id, str) or not re.fullmatch(
@@ -357,6 +365,7 @@ def validate_proposal(payload: dict[str, Any]) -> dict[str, Any]:
         "opportunity_type": opportunity_type,
         "base_timeframe": base_timeframe,
         "thesis": thesis,
+        "symbol": symbol,
         "suggested_primitives": _bounded_string_list(payload, "suggested_primitives"),
         "constraints": _bounded_string_list(payload, "constraints"),
         "untrusted_suggested_spec": suggested_spec,
@@ -376,6 +385,7 @@ def canonical_proposal_digest(proposal: dict[str, Any]) -> str:
             "objective",
             "opportunity_type",
             "suggested_primitives",
+            "symbol",
             "thesis",
             "untrusted_suggested_spec",
         )
@@ -1144,11 +1154,13 @@ def build_research_context(
     *,
     research_cycle_path: Path = DEFAULT_RESEARCH_CYCLE,
     generated_batch_path: Path = DEFAULT_GENERATED_BATCH,
+    market_universe_path: Path = DEFAULT_MARKET_UNIVERSE,
 ) -> dict[str, Any]:
     """Build allowlisted research feedback with no final-holdout information."""
 
     research = _read_json_object(research_cycle_path)
     batch = _read_json_object(generated_batch_path)
+    universe = _read_json_object(market_universe_path)
     research_summary = research.get("summary") if isinstance(research.get("summary"), dict) else {}
     batch_summary = batch.get("summary") if isinstance(batch.get("summary"), dict) else {}
     memory = batch.get("memory") if isinstance(batch.get("memory"), dict) else {}
@@ -1200,6 +1212,14 @@ def build_research_context(
                 "constraints": ["strict risk controls", "scalp/day/swing opportunities"],
             },
         ],
+        "active_income_universe": {
+            "source_generated_at": universe.get("generated_at"),
+            "research_symbols": _safe_scalar(universe.get("research_symbols", [])),
+            "eligible_research_symbols": _safe_scalar(
+                universe.get("eligible_research_symbols", [])
+            ),
+            "criteria": _safe_scalar(universe.get("criteria", {})),
+        },
         "research_progress": {
             "source_generated_at": research.get("generated_at"),
             **progress,
@@ -1243,6 +1263,7 @@ def build_research_context(
                 "suggested_primitives",
                 "constraints",
                 "suggested_spec",
+                "symbol",
                 "provenance",
                 "source_proposal_id",
             ],
@@ -1265,10 +1286,12 @@ def export_research_context(
     *,
     research_cycle_path: Path = DEFAULT_RESEARCH_CYCLE,
     generated_batch_path: Path = DEFAULT_GENERATED_BATCH,
+    market_universe_path: Path = DEFAULT_MARKET_UNIVERSE,
 ) -> dict[str, Any]:
     context = build_research_context(
         research_cycle_path=research_cycle_path,
         generated_batch_path=generated_batch_path,
+        market_universe_path=market_universe_path,
     )
     if output_path.is_symlink():
         raise ValueError(f"OpenClaw context output must not be a symlink: {output_path}")
@@ -1277,6 +1300,49 @@ def export_research_context(
     write_json_atomic(output_path, context)
     output_path.chmod(0o640 if _shared_group_enabled() else 0o600)
     return context
+
+
+def record_review(
+    *,
+    audit_path: Path = DEFAULT_REVIEW_AUDIT,
+    context_path: Path = DEFAULT_CONTEXT,
+    run_id: str,
+    model: str,
+    summary: str,
+    proposal_count: int,
+) -> dict[str, Any]:
+    """Append a bounded receipt for every OpenClaw review, including no-op reviews."""
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", run_id):
+        raise ProposalValidationError("run_id contains unsupported characters")
+    if not 1 <= len(model.strip()) <= 120:
+        raise ProposalValidationError("model must be 1-120 characters")
+    if not 1 <= len(summary.strip()) <= 1000:
+        raise ProposalValidationError("summary must be 1-1000 characters")
+    if not 0 <= proposal_count <= MAX_BATCH:
+        raise ProposalValidationError(f"proposal_count must be between 0 and {MAX_BATCH}")
+    if context_path.is_symlink() or not context_path.is_file():
+        raise ProposalValidationError("research context must be a regular file")
+    context_digest = "sha256:" + hashlib.sha256(context_path.read_bytes()).hexdigest()
+    receipt = {
+        "schema": "autopilot.openclaw_daily_review/v1",
+        "recorded_at": utc_now(),
+        "run_id": run_id,
+        "model": model.strip(),
+        "summary": summary.strip(),
+        "proposal_count": proposal_count,
+        "context_digest": context_digest,
+        "research_only": True,
+        "live_allowed": False,
+    }
+    audit_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    encoded = json.dumps(receipt, sort_keys=True, ensure_ascii=False) + "\n"
+    with audit_path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return receipt
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1288,6 +1354,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     export.add_argument("--output", type=Path, default=DEFAULT_CONTEXT)
     export.add_argument("--research-cycle", type=Path, default=DEFAULT_RESEARCH_CYCLE)
     export.add_argument("--generated-batch", type=Path, default=DEFAULT_GENERATED_BATCH)
+    export.add_argument("--market-universe", type=Path, default=DEFAULT_MARKET_UNIVERSE)
     ingest = subparsers.add_parser("ingest", help="Validate and archive untrusted proposal files.")
     ingest.add_argument("--incoming", type=Path, default=DEFAULT_INCOMING)
     ingest.add_argument("--accepted", type=Path, default=DEFAULT_ACCEPTED)
@@ -1295,6 +1362,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ingest.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
     ingest.add_argument("--index", type=Path, default=DEFAULT_INDEX)
     ingest.add_argument("--max-batch", type=int, default=MAX_BATCH)
+    review = subparsers.add_parser(
+        "record-review", help="Append an auditable receipt for an OpenClaw daily review."
+    )
+    review.add_argument("--audit", type=Path, default=DEFAULT_REVIEW_AUDIT)
+    review.add_argument("--context", type=Path, default=DEFAULT_CONTEXT)
+    review.add_argument("--run-id", required=True)
+    review.add_argument("--model", required=True)
+    review.add_argument("--summary", required=True)
+    review.add_argument("--proposal-count", type=int, required=True)
     return parser.parse_args(argv)
 
 
@@ -1305,8 +1381,9 @@ def main(argv: list[str] | None = None) -> None:
             args.output,
             research_cycle_path=args.research_cycle,
             generated_batch_path=args.generated_batch,
+            market_universe_path=args.market_universe,
         )
-    else:
+    elif args.command == "ingest":
         payload = ingest_inbox(
             incoming_dir=args.incoming,
             accepted_dir=args.accepted,
@@ -1314,6 +1391,15 @@ def main(argv: list[str] | None = None) -> None:
             archive_dir=args.archive,
             index_path=args.index,
             max_batch=args.max_batch,
+        )
+    else:
+        payload = record_review(
+            audit_path=args.audit,
+            context_path=args.context,
+            run_id=args.run_id,
+            model=args.model,
+            summary=args.summary,
+            proposal_count=args.proposal_count,
         )
     print(json.dumps(payload, indent=2, sort_keys=True))
 

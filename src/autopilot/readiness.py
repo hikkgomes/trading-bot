@@ -454,11 +454,22 @@ def _generated_batch_status(
             if problems:
                 raise ValueError(f"grammar contract failed: {', '.join(problems)}")
             expected_hash = canonical_strategy_hash(strategy_behavior_spec(hypothesis, space))
-            if metadata.get("strategy_hash") != expected_hash:
+            legacy_hash = canonical_strategy_hash(
+                {
+                    key: value
+                    for key, value in strategy_behavior_spec(hypothesis, space).items()
+                    if key != "_symbol"
+                }
+            )
+            accepted_hashes = {expected_hash}
+            if space.symbol == "BTCUSDT":
+                accepted_hashes.add(legacy_hash)
+            observed_hash = metadata.get("strategy_hash")
+            if observed_hash not in accepted_hashes:
                 raise ValueError("strategy behavior hash mismatch")
-            if expected_hash in hashes:
+            if observed_hash in hashes:
                 raise ValueError("duplicate strategy behavior")
-            hashes.add(expected_hash)
+            hashes.add(str(observed_hash))
             products.add(space.product)
         if metadata_by_id:
             raise ValueError("orphan generation metadata")

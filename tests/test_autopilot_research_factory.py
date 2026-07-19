@@ -11,6 +11,7 @@ from research_exploration.strategy_grammar import SearchSpace, build_fresh_hypot
 from src.autopilot.experiment_memory import ExperimentMemory
 from src.autopilot.openclaw_bridge import build_accepted_proposal
 from src.autopilot.research_factory import (
+    DEFAULT_CONFIG,
     FactoryBudgets,
     ResearchFactoryConfig,
     _candidate_is_near_duplicate,
@@ -20,6 +21,25 @@ from src.autopilot.research_factory import (
     load_factory_config,
     strategy_behavior_spec,
 )
+
+
+def test_default_factory_expands_symbol_scoped_active_income_universe():
+    config = load_factory_config(DEFAULT_CONFIG)
+    active = [space for space in config.search_spaces if space.product == "active_income"]
+
+    assert {space.symbol for space in active} == {
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "XRPUSDT",
+        "BNBUSDT",
+    }
+    assert len(active) == 15
+    assert all(
+        space.symbol == "BTCUSDT"
+        for space in config.search_spaces
+        if space.product == "btc_accumulation"
+    )
 
 
 def _spaces() -> tuple[SearchSpace, ...]:

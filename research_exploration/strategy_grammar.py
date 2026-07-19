@@ -51,6 +51,7 @@ class SearchSpace:
     risk_per_trade_range: tuple[float, float]
     max_position_fraction: float
     max_trades_per_day: int | None
+    symbol: str = "BTCUSDT"
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> SearchSpace:
@@ -108,11 +109,14 @@ class SearchSpace:
             ),
             max_position_fraction=max_position_fraction,
             max_trades_per_day=max_trades_per_day,
+            symbol=str(payload.get("symbol", "BTCUSDT")).strip().upper(),
         )
 
     def __post_init__(self) -> None:
         if not self.name or not self.product or not self.opportunity_type:
             raise ValueError("search-space identity fields cannot be empty")
+        if not self.symbol or not self.symbol.isalnum() or not self.symbol.endswith("USDT"):
+            raise ValueError("search-space symbol must be an uppercase USDT pair")
         if self.market not in {"spot", "futures"}:
             raise ValueError("search-space market must be spot or futures")
         if self.pnl_unit not in {"btc", "usdt"}:

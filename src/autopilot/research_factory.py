@@ -52,6 +52,7 @@ from src.config import PROJECT_ROOT, indicator_data_dir
 
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "research_factory.json"
 DEFAULT_PROPOSAL_STATE = PROJECT_ROOT / "runtime" / "research" / "openclaw_proposal_state.json"
+DEFAULT_MARKET_UNIVERSE_REPORT = PROJECT_ROOT / "runtime" / "market_universe.json"
 BATCH_SCHEMA = "autopilot.generative_strategy_batch/v1"
 REPORT_SCHEMA = "autopilot.research_factory_report/v1"
 MAX_CONFIG_BYTES = 256 * 1024
@@ -80,9 +81,11 @@ SEARCH_SPACE_FIELDS = frozenset(
         "risk_per_trade_range",
         "max_position_fraction",
         "max_trades_per_day",
+        "symbol",
     }
 )
-REQUIRED_SEARCH_SPACE_FIELDS = SEARCH_SPACE_FIELDS - {"max_trades_per_day"}
+SEARCH_SPACE_CONFIG_FIELDS = SEARCH_SPACE_FIELDS | {"symbols"}
+REQUIRED_SEARCH_SPACE_FIELDS = SEARCH_SPACE_FIELDS - {"max_trades_per_day", "symbol"}
 
 SAFETY = {
     "research_only": True,
@@ -345,7 +348,7 @@ def load_factory_config(path: Path = DEFAULT_CONFIG) -> ResearchFactoryConfig:
     for index, item in enumerate(spaces_payload):
         if not isinstance(item, Mapping):
             raise ResearchFactoryConfigError(f"search_spaces[{index}] must be an object")
-        unknown_space_fields = sorted(set(item) - SEARCH_SPACE_FIELDS)
+        unknown_space_fields = sorted(set(item) - SEARCH_SPACE_CONFIG_FIELDS)
         if unknown_space_fields:
             raise ResearchFactoryConfigError(
                 f"search_spaces[{index}] has unknown fields: {', '.join(unknown_space_fields)}"
@@ -355,8 +358,30 @@ def load_factory_config(path: Path = DEFAULT_CONFIG) -> ResearchFactoryConfig:
             raise ResearchFactoryConfigError(
                 f"search_spaces[{index}] is missing fields: {', '.join(missing_space_fields)}"
             )
+        raw_symbols = item.get("symbols")
+        if raw_symbols is not None and "symbol" in item:
+            raise ResearchFactoryConfigError(
+                f"search_spaces[{index}] cannot define both symbol and symbols"
+            )
+        if raw_symbols is None:
+            symbols = [item.get("symbol", "BTCUSDT")]
+        elif (
+            not isinstance(raw_symbols, list)
+            or not raw_symbols
+            or any(not isinstance(value, str) or not value.strip() for value in raw_symbols)
+        ):
+            raise ResearchFactoryConfigError(
+                f"search_spaces[{index}].symbols must be a non-empty list of strings"
+            )
+        else:
+            symbols = raw_symbols
         try:
-            spaces_list.append(SearchSpace.from_dict(item))
+            for raw_symbol in symbols:
+                expanded = {key: value for key, value in item.items() if key != "symbols"}
+                expanded["symbol"] = str(raw_symbol).strip().upper()
+                if len(symbols) > 1 and expanded["symbol"] != "BTCUSDT":
+                    expanded["name"] = f"{item['name']}_{expanded['symbol'].lower()}"
+                spaces_list.append(SearchSpace.from_dict(expanded))
         except (KeyError, TypeError, ValueError) as exc:
             raise ResearchFactoryConfigError(f"search_spaces[{index}] is invalid: {exc}") from exc
     spaces = tuple(spaces_list)
@@ -379,6 +404,7 @@ def load_factory_config(path: Path = DEFAULT_CONFIG) -> ResearchFactoryConfig:
         if space.product == "btc_accumulation" and (
             space.market != "spot"
             or space.pnl_unit != "btc"
+            or space.symbol != "BTCUSDT"
             or space.opportunity_type != "btc_accumulation"
             or set(space.directions) != {"short"}
         ):
@@ -391,19 +417,23 @@ def load_factory_config(path: Path = DEFAULT_CONFIG) -> ResearchFactoryConfig:
         "swing_trading": "1h",
     }
     active_spaces = [space for space in spaces if space.product == "active_income"]
-    opportunities = {space.opportunity_type for space in active_spaces}
-    if opportunities != set(required_active_horizons):
-        raise ResearchFactoryConfigError(
-            "active-income spaces must cover exactly scalp, day, and swing research"
-        )
-    for opportunity, expected_base in required_active_horizons.items():
-        configured_bases = {
-            space.base_timeframe for space in active_spaces if space.opportunity_type == opportunity
-        }
-        if configured_bases != {expected_base}:
+    for symbol in sorted({space.symbol for space in active_spaces}):
+        symbol_spaces = [space for space in active_spaces if space.symbol == symbol]
+        opportunities = {space.opportunity_type for space in symbol_spaces}
+        if opportunities != set(required_active_horizons):
             raise ResearchFactoryConfigError(
-                f"{opportunity} search spaces must use base_timeframe {expected_base}"
+                f"{symbol} active-income spaces must cover exactly scalp, day, and swing research"
             )
+        for opportunity, expected_base in required_active_horizons.items():
+            configured_bases = {
+                space.base_timeframe
+                for space in symbol_spaces
+                if space.opportunity_type == opportunity
+            }
+            if configured_bases != {expected_base}:
+                raise ResearchFactoryConfigError(
+                    f"{symbol} {opportunity} search spaces must use base_timeframe {expected_base}"
+                )
     btc_bases = {space.base_timeframe for space in spaces if space.product == "btc_accumulation"}
     if btc_bases != {"1h", "4h"}:
         raise ResearchFactoryConfigError(
@@ -434,6 +464,46 @@ def _utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
+def _search_spaces_for_cycle(
+    config: ResearchFactoryConfig,
+    *,
+    generated_at: str,
+    report_path: Path = DEFAULT_MARKET_UNIVERSE_REPORT,
+) -> tuple[SearchSpace, ...]:
+    """Gate non-BTC research on a fresh daily liquidity screen."""
+
+    eligible = {"BTCUSDT"}
+    try:
+        report = (
+            _strict_json_file(
+                report_path,
+                maximum_bytes=2 * 1024 * 1024,
+                label="market universe report",
+            )
+            if report_path.exists()
+            else {}
+        )
+    except ResearchFactoryConfigError:
+        report = {}
+    if report.get("ok") is True:
+        try:
+            report_at = datetime.fromisoformat(str(report["generated_at"]).replace("Z", "+00:00"))
+            cycle_at = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+            if abs((cycle_at - report_at).total_seconds()) <= 48 * 3600:
+                eligible.update(
+                    str(symbol)
+                    for symbol in report.get("eligible_research_symbols") or []
+                    if isinstance(symbol, str)
+                )
+        except (KeyError, TypeError, ValueError):
+            pass
+    return tuple(
+        space
+        for space in config.search_spaces
+        if space.product == "btc_accumulation" or space.symbol in eligible
+    )
+
+
 def _seed_for_cycle(config: ResearchFactoryConfig, now: str, explicit_seed: int | None) -> int:
     if explicit_seed is not None:
         return int(explicit_seed)
@@ -453,6 +523,7 @@ def strategy_behavior_spec(hypothesis: Hypothesis, space: SearchSpace) -> dict[s
         "_pnl_unit": space.pnl_unit,
         "_opportunity_type": space.opportunity_type,
         "_search_space": space.name,
+        "_symbol": space.symbol,
     }
 
 
@@ -463,7 +534,7 @@ def _hypothesis_from_submitted_spec(payload: Mapping[str, Any]) -> Hypothesis:
 
 
 def _feature_inventory_for_space(space: SearchSpace) -> dict[str, set[str]] | None:
-    directory = indicator_data_dir("BTCUSDT", space.market, legacy_fallback=True)
+    directory = indicator_data_dir(space.symbol, space.market, legacy_fallback=True)
     inventory: dict[str, set[str]] = {}
     for timeframe in {
         space.base_timeframe,
@@ -471,7 +542,7 @@ def _feature_inventory_for_space(space: SearchSpace) -> dict[str, set[str]] | No
         space.setup_timeframe,
         space.trigger_timeframe,
     }:
-        path = directory / f"BTCUSDT_{timeframe}_all_indicators.parquet"
+        path = directory / f"{space.symbol}_{timeframe}_all_indicators.parquet"
         if not path.exists() or path.is_symlink():
             return None
         try:
@@ -615,12 +686,14 @@ def _space_for_proposal(
     product = proposal.get("objective")
     opportunity = OPPORTUNITY_ALIASES.get(str(proposal.get("opportunity_type")))
     base = proposal.get("base_timeframe")
+    symbol = str(proposal.get("symbol") or "BTCUSDT")
     matches = [
         space
         for space in spaces
         if space.product == product
         and space.opportunity_type == opportunity
         and space.base_timeframe == base
+        and space.symbol == symbol
     ]
     return matches[0] if len(matches) == 1 else None
 
@@ -941,6 +1014,7 @@ def _try_register(
         "pnl_unit": space.pnl_unit,
         "opportunity_type": space.opportunity_type,
         "search_space": space.name,
+        "symbol": space.symbol,
         "base_timeframe": space.base_timeframe,
         "generation_method": idea.generation_method,
         "grammar_keys": list(idea.grammar_keys),
@@ -991,7 +1065,7 @@ def _pending_for_space(
 ) -> list[dict[str, Any]]:
     pending_method = getattr(memory, "pending_strategies", None)
     if callable(pending_method):
-        return list(
+        pending = list(
             pending_method(
                 product=space.product,
                 opportunity_type=space.opportunity_type,
@@ -999,12 +1073,22 @@ def _pending_for_space(
                 research_engine_digest=research_engine_digest,
             )
         )
+        return [
+            item
+            for item in pending
+            if (item.get("metadata") or {}).get("symbol", "BTCUSDT") == space.symbol
+        ]
     candidates = memory.candidate_parents(
         product=space.product,
         opportunity_type=space.opportunity_type,
         limit=limit,
     )
-    return [item for item in candidates if item.get("latest_evaluation") is None]
+    return [
+        item
+        for item in candidates
+        if item.get("latest_evaluation") is None
+        and (item.get("metadata") or {}).get("symbol", "BTCUSDT") == space.symbol
+    ]
 
 
 def _candidate_payload_from_pending(
@@ -1021,6 +1105,7 @@ def _candidate_payload_from_pending(
         or submitted.get("_product") != space.product
         or submitted.get("_market") != space.market
         or submitted.get("_pnl_unit") != space.pnl_unit
+        or submitted.get("_symbol", "BTCUSDT") != space.symbol
     ):
         return None
     try:
@@ -1054,6 +1139,7 @@ def build_generation(
 ) -> dict[str, Any]:
     generated_at = now or _utc_now()
     cycle_seed = _seed_for_cycle(config, generated_at, seed)
+    cycle_spaces = _search_spaces_for_cycle(config, generated_at=generated_at)
     rng = random.Random(cycle_seed)
     budgets = config.budgets
     limits = GrammarLimits(max_total_predicates=budgets.max_total_predicates)
@@ -1097,28 +1183,36 @@ def build_generation(
         feedback = memory.generator_feedback(research_engine_digest=research_engine_digest)
         weights = _feedback_weights(feedback)
         features_by_space = {
-            space.name: _feature_inventory_for_space(space) for space in config.search_spaces
+            space.name: _feature_inventory_for_space(space) for space in cycle_spaces
         }
-        dedup_by_product = {
-            product: memory.dedup_population(product=product)
-            for product in sorted({space.product for space in config.search_spaces})
+        dedup_by_space = {
+            space.name: [
+                item
+                for item in memory.dedup_population(product=space.product)
+                if (item.get("metadata") or {}).get("symbol", "BTCUSDT") == space.symbol
+            ]
+            for space in cycle_spaces
         }
         parents_by_space = {
-            space.name: memory.candidate_parents(
-                product=space.product,
-                opportunity_type=space.opportunity_type,
-                limit=budgets.max_parent_pool,
-                exclude_holdout_exposed=True,
-                exclude_retired=True,
-                latest_outcomes=("reject", "inconclusive", "pre_holdout_pass"),
-                research_engine_digest=research_engine_digest,
-            )
-            for space in config.search_spaces
+            space.name: [
+                item
+                for item in memory.candidate_parents(
+                    product=space.product,
+                    opportunity_type=space.opportunity_type,
+                    limit=budgets.max_parent_pool,
+                    exclude_holdout_exposed=True,
+                    exclude_retired=True,
+                    latest_outcomes=("reject", "inconclusive", "pre_holdout_pass"),
+                    research_engine_digest=research_engine_digest,
+                )
+                if (item.get("metadata") or {}).get("symbol", "BTCUSDT") == space.symbol
+            ]
+            for space in cycle_spaces
         }
 
         # Backpressure first: a candidate registered before a crash/restart is
         # resumed before creating more work.
-        for space in config.search_spaces:
+        for space in cycle_spaces:
             revalidations_for_space = 0
             for item in _pending_for_space(
                 memory,
@@ -1155,7 +1249,7 @@ def build_generation(
         for proposal in proposals:
             proposal_id = str(proposal["proposal_id"])
             disposition: dict[str, Any] = {"processed_at": generated_at}
-            space = _space_for_proposal(proposal, config.search_spaces)
+            space = _space_for_proposal(proposal, cycle_spaces)
             if space is None:
                 disposition.update(status="rejected", reason="no_matching_search_space")
                 processed[proposal_id] = disposition
@@ -1183,7 +1277,7 @@ def build_generation(
                     idea,
                     space,
                     parents=parents_by_space[space.name],
-                    dedup_population=dedup_by_product[space.product],
+                    dedup_population=dedup_by_space[space.name],
                     budgets=budgets,
                     extra_metadata={
                         "proposal_id": proposal_id,
@@ -1225,7 +1319,7 @@ def build_generation(
             and time.monotonic() < deadline
         ):
             attempts += 1
-            space = config.search_spaces[space_cursor % len(config.search_spaces)]
+            space = cycle_spaces[space_cursor % len(cycle_spaces)]
             space_cursor += 1
             if by_space[space.name] >= budgets.max_candidates_per_space:
                 continue
@@ -1308,7 +1402,7 @@ def build_generation(
                     idea,
                     space,
                     parents=parents,
-                    dedup_population=dedup_by_product[space.product],
+                    dedup_population=dedup_by_space[space.name],
                     budgets=budgets,
                 )
             except Exception as exc:
@@ -1360,6 +1454,7 @@ def build_generation(
             "memory": str(config.memory_path),
             "research_engine_digest": research_engine_digest,
             "openclaw_optional": True,
+            "eligible_search_spaces": [space.name for space in cycle_spaces],
         },
         "budget": {
             "candidate_limit": budgets.max_candidates_per_cycle,

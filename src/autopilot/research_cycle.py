@@ -147,6 +147,7 @@ class ResearchScenario:
     coverage_max_latest_age_hours: float | None = None
     coverage_min_span_days: float | None = None
     coverage_min_rows: int | None = None
+    symbol: str = "BTCUSDT"
 
 
 DEFAULT_SCENARIOS = (
@@ -701,9 +702,12 @@ def _load_generated_scenarios(
                 "pnl_unit": space.pnl_unit,
                 "opportunity_type": space.opportunity_type,
                 "base_timeframe": space.base_timeframe,
+                "symbol": space.symbol,
             }
             mismatches = [
-                key for key, expected in expected_context.items() if metadata.get(key) != expected
+                key
+                for key, expected in expected_context.items()
+                if metadata.get(key, "BTCUSDT" if key == "symbol" else None) != expected
             ]
             if mismatches:
                 raise ValueError(f"metadata mismatch: {', '.join(mismatches)}")
@@ -711,7 +715,17 @@ def _load_generated_scenarios(
             if problems:
                 raise ValueError(f"grammar contract failed: {', '.join(problems)}")
             expected_hash = canonical_strategy_hash(strategy_behavior_spec(hypothesis, space))
-            if metadata.get("strategy_hash") != expected_hash:
+            legacy_hash = canonical_strategy_hash(
+                {
+                    key: value
+                    for key, value in strategy_behavior_spec(hypothesis, space).items()
+                    if key != "_symbol"
+                }
+            )
+            accepted_hashes = {expected_hash}
+            if space.symbol == "BTCUSDT":
+                accepted_hashes.add(legacy_hash)
+            if metadata.get("strategy_hash") not in accepted_hashes:
                 raise ValueError("strategy_hash does not match canonical behavior")
         except Exception as exc:
             if len(skipped_errors) < 10:
@@ -739,6 +753,7 @@ def _load_generated_scenarios(
                 opportunity_type=space.opportunity_type,
                 candidate_set="generated",
                 max_hypotheses=len(hypotheses),
+                symbol=space.symbol,
                 **contract,
             )
         )
@@ -1335,9 +1350,10 @@ def build_incubation_review(
 
 
 def _missing_columns_for_hypothesis(hypothesis, indicator_dir: Path) -> dict[str, list[str]]:
+    symbol = indicator_dir.name if indicator_dir.name.endswith("USDT") else "BTCUSDT"
     missing: dict[str, list[str]] = {}
     for timeframe, columns in _needed_columns([hypothesis]).items():
-        path = indicator_dir / f"BTCUSDT_{timeframe}_all_indicators.parquet"
+        path = indicator_dir / f"{symbol}_{timeframe}_all_indicators.parquet"
         if not path.exists():
             missing[timeframe] = sorted(columns)
             continue
@@ -1516,7 +1532,12 @@ def _scenario_coverage_status(
                 "--market",
                 scenario.market,
                 "--report",
-                f"runtime/history_bootstrap_{scenario.market}.json",
+                (
+                    f"runtime/history_bootstrap_{scenario.market}.json"
+                    if scenario.symbol == "BTCUSDT"
+                    else f"runtime/history_bootstrap_{scenario.symbol}_{scenario.market}.json"
+                ),
+                *([] if scenario.symbol == "BTCUSDT" else ["--symbol", scenario.symbol]),
             ],
             "note": (
                 "Fetch the direct Binance timeframe history, then rerun the research cycle. "
@@ -1582,7 +1603,7 @@ def _scenario_indicator_coverage_status(
     """Check base-timeframe depth even when every candidate lacks a feature."""
     if _scenario_coverage_requirements(scenario, now=now) is None:
         return None
-    path = indicator_dir / f"BTCUSDT_{scenario.base_tf}_all_indicators.parquet"
+    path = indicator_dir / f"{scenario.symbol}_{scenario.base_tf}_all_indicators.parquet"
     try:
         filters: list[tuple[str, str, pd.Timestamp]] = [
             ("timestamp", ">=", _utc_timestamp_for_coverage(scenario.start)),
@@ -1825,7 +1846,7 @@ def _dataset_snapshot(
     )
     files: list[dict[str, Any]] = []
     for timeframe in timeframes:
-        path = indicator_dir / f"BTCUSDT_{timeframe}_all_indicators.parquet"
+        path = indicator_dir / f"{scenario.symbol}_{timeframe}_all_indicators.parquet"
         stat_result = path.stat()
         parquet = pq.ParquetFile(path)
         files.append(
@@ -1841,7 +1862,7 @@ def _dataset_snapshot(
             }
         )
     manifest: dict[str, Any] = {
-        "symbol": "BTCUSDT",
+        "symbol": scenario.symbol,
         "market": scenario.market,
         "base_timeframe": scenario.base_tf,
         "scenario_window": {"start": scenario.start, "end": scenario.end},
@@ -2035,6 +2056,7 @@ def _memory_protocol(
         "scenario": scenario.name,
         "product": scenario.product,
         "market": scenario.market,
+        "symbol": scenario.symbol,
         "pnl_unit": scenario.pnl_unit,
         "base_timeframe": scenario.base_tf,
         "validation": dataclasses.asdict(validation_config),
@@ -2059,6 +2081,7 @@ def _register_legacy_memory_strategy(
         **hypothesis.to_dict(),
         "_product": scenario.product,
         "_market": scenario.market,
+        "_symbol": scenario.symbol,
         "_pnl_unit": scenario.pnl_unit,
         "_opportunity_type": scenario.opportunity_type,
         "_search_space": scenario.name,
@@ -2072,6 +2095,7 @@ def _register_legacy_memory_strategy(
             "family": hypothesis.family,
             "product": scenario.product,
             "market": scenario.market,
+            "symbol": scenario.symbol,
             "pnl_unit": scenario.pnl_unit,
             "opportunity_type": scenario.opportunity_type,
             "search_space": scenario.name,
@@ -2097,7 +2121,9 @@ def run_validation_scenario(
     hypotheses = _hypotheses_for(scenario) if hypotheses is None else hypotheses
     if not hypotheses:
         raise ValueError(f"{scenario.name}: no hypotheses for base timeframe {scenario.base_tf}")
-    selected_indicator_dir = indicator_data_dir("BTCUSDT", scenario.market, legacy_fallback=True)
+    selected_indicator_dir = indicator_data_dir(
+        scenario.symbol, scenario.market, legacy_fallback=True
+    )
     coverage = _scenario_indicator_coverage_status(
         scenario,
         indicator_dir=selected_indicator_dir,
@@ -2147,13 +2173,15 @@ def run_validation_scenario(
             "verdicts": {},
             "top_reasons": {"unsupported_features": len(unsupported_hypotheses)},
         }
-    frame = build_aligned_frame(
-        supported_hypotheses,
-        base_tf=scenario.base_tf,
-        start=scenario.start,
-        end=scenario.end,
-        indicator_dir=selected_indicator_dir,
-    )
+    frame_kwargs: dict[str, Any] = {
+        "base_tf": scenario.base_tf,
+        "start": scenario.start,
+        "end": scenario.end,
+        "indicator_dir": selected_indicator_dir,
+    }
+    if scenario.symbol != "BTCUSDT":
+        frame_kwargs["symbol"] = scenario.symbol
+    frame = build_aligned_frame(supported_hypotheses, **frame_kwargs)
     # Freshness belongs to the complete aligned source. A protected-safe epoch
     # may intentionally end well before wall-clock recency after newer rows
     # have been sealed as final evaluation data.
@@ -2179,7 +2207,7 @@ def run_validation_scenario(
                 frame,
                 experiment_memory.protected_intervals(
                     market=scenario.market,
-                    symbol="BTCUSDT",
+                    symbol=scenario.symbol,
                 ),
                 feature_timeframes=_hypothesis_feature_timeframes(supported_hypotheses),
                 capacity_requirements=epoch_capacity_requirements,
@@ -2451,6 +2479,7 @@ def run_validation_scenario(
         "base_tf": scenario.base_tf,
         "pnl_unit": scenario.pnl_unit,
         "market": scenario.market,
+        "symbol": scenario.symbol,
         "position": scenario.position,
         "opportunity_type": scenario.opportunity_type,
         "with_guards": scenario.with_guards,
@@ -2778,10 +2807,15 @@ def _current_keeper_ids(
     *,
     product: str,
     market: str,
+    symbol: str,
 ) -> list[str]:
     ids: list[str] = []
     for scenario in scenario_reports:
-        if scenario.get("product") != product or scenario.get("market") != market:
+        if (
+            scenario.get("product") != product
+            or scenario.get("market") != market
+            or scenario.get("symbol", "BTCUSDT") != symbol
+        ):
             continue
         if scenario.get("skipped") or not scenario.get("ok"):
             continue
@@ -2857,7 +2891,9 @@ def run_research_cycle(
         history_coverage[scenario.name] = (
             _scenario_indicator_coverage_status(
                 scenario,
-                indicator_dir=indicator_data_dir("BTCUSDT", scenario.market, legacy_fallback=True),
+                indicator_dir=indicator_data_dir(
+                    scenario.symbol, scenario.market, legacy_fallback=True
+                ),
                 now=generated_at,
                 research_factory_config_path=research_factory_config_path,
             )
@@ -3161,6 +3197,7 @@ def run_research_cycle(
                 scenario_reports,
                 product=product,
                 market=product_market,
+                symbol=product_config.symbol,
             )
             if not keeper_ids:
                 min_dsr = (

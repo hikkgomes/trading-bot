@@ -2369,3 +2369,26 @@ def test_research_epoch_selection_embargoes_cross_timeframe_feature_dependencies
         "max_timeframe": "1d",
         "duration_seconds": 240 * 86_400,
     }
+
+
+def test_keeper_export_filter_never_mixes_symbols():
+    reports = [
+        {
+            "ok": True,
+            "product": "active_income",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "keeper_ids": ["btc-keeper"],
+        },
+        {
+            "ok": True,
+            "product": "active_income",
+            "market": "futures",
+            "symbol": "ETHUSDT",
+            "keeper_ids": ["eth-keeper"],
+        },
+    ]
+
+    assert rc._current_keeper_ids(
+        reports, product="active_income", market="futures", symbol="BTCUSDT"
+    ) == ["btc-keeper"]

@@ -40,6 +40,41 @@
   "webhook_url_env": "AUTOPILOT_WEBHOOK_URL",
   "jobs": [
     {
+      "name": "market_universe_screen",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.market_universe",
+        "--config", "config/market_universe.json",
+        "--output", "runtime/market_universe.json"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 120
+    },
+    {
+      "name": "market_data_update_universe",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.universe_history",
+        "--config", "config/research_factory.json",
+        "--exclude-timeframes", "1m",
+        "--output", "runtime/universe_history.json"
+      ],
+      "cadence_seconds": 21600,
+      "timeout_seconds": 1800
+    },
+    {
+      "name": "market_data_update_universe_1m",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.universe_history",
+        "--config", "config/research_factory.json",
+        "--timeframes", "1m",
+        "--output", "runtime/universe_history_1m.json"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 1800
+    },
+    {
       "name": "market_data_update_futures",
       "enabled": true,
       "command": [

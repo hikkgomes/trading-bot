@@ -504,6 +504,7 @@ def build_aligned_frame(
     start: str | None = None,
     end: str | None = None,
     indicator_dir: Path = INDICATOR_DATA_DIR,
+    symbol: str = "BTCUSDT",
 ) -> pd.DataFrame:
     """Load only the needed columns/window and align HTFs onto ``base_tf``.
 
@@ -519,7 +520,7 @@ def build_aligned_frame(
 
     def load_prefixed(tf: str) -> pd.DataFrame:
         cols = ["timestamp"] + sorted(needed.get(tf, set()))
-        path = indicator_dir / f"BTCUSDT_{tf}_all_indicators.parquet"
+        path = indicator_dir / f"{symbol}_{tf}_all_indicators.parquet"
         df = pd.read_parquet(path, columns=cols, filters=ts_filter or None)
         # These parquets store timestamp as a named index, not a data column.
         if "timestamp" not in df.columns:

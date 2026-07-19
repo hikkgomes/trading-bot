@@ -88,7 +88,12 @@ def run_research_smoke(
         raise ValueError("synthetic_rows must be at least 500")
     scenarios: list[dict[str, Any]] = []
     config = load_factory_config(factory_config_path)
-    for index, space in enumerate(config.search_spaces, start=1):
+    smoke_spaces = [
+        space
+        for space in config.search_spaces
+        if space.product == "btc_accumulation" or space.symbol == "BTCUSDT"
+    ]
+    for index, space in enumerate(smoke_spaces, start=1):
         try:
             scenarios.append(
                 _run_scenario(

@@ -110,6 +110,7 @@ def build_default_requirements(
     timeframes: Iterable[str] | None = None,
     exclude_timeframes: Iterable[str] | None = None,
     now: str | pd.Timestamp | None = None,
+    symbol: str = SYMBOL,
 ) -> tuple[HistoryRequirement, ...]:
     """Derive native datasets from the authoritative factory search spaces."""
 
@@ -138,6 +139,8 @@ def build_default_requirements(
     features: dict[tuple[str, str], set[str]] = defaultdict(set)
     scenario_names: dict[tuple[str, str], set[str]] = defaultdict(set)
     for space in factory_config.search_spaces:
+        if space.symbol != symbol:
+            continue
         if space.market not in selected_markets:
             continue
         configured_timeframes = {
@@ -824,6 +827,7 @@ def run_history_bootstrap(
             timeframes=timeframes,
             exclude_timeframes=exclude_timeframes,
             now=now,
+            symbol=symbol,
         )
     except (OSError, ValueError) as exc:
         report = {
@@ -955,6 +959,7 @@ def main() -> None:
                     markets=args.markets,
                     timeframes=args.timeframes,
                     exclude_timeframes=args.exclude_timeframes,
+                    symbol=args.symbol,
                 ),
                 config_path=args.config,
             )

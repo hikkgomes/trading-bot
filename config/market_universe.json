@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "market": "futures",
+  "quote_asset": "USDT",
+  "research_symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"],
+  "watchlist_symbols": [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
+    "DOGEUSDT", "LINKUSDT", "ADAUSDT", "BCHUSDT"
+  ],
+  "criteria": {
+    "minimum_listing_days": 1000,
+    "minimum_24h_quote_volume_usdt": 50000000,
+    "minimum_24h_trades": 50000,
+    "maximum_spread_bps": 5.0,
+    "minimum_open_interest_usdt": 25000000,
+    "maximum_absolute_funding_rate": 0.001
+  }
+}
