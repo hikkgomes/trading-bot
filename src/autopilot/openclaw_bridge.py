@@ -33,6 +33,7 @@ DEFAULT_ACCEPTED = INBOX_ROOT / "accepted"
 DEFAULT_REJECTED = INBOX_ROOT / "rejected"
 DEFAULT_ARCHIVE = INBOX_ROOT / "archive"
 DEFAULT_INDEX = INBOX_ROOT / "index.json"
+DEFAULT_INGEST_STATUS = INBOX_ROOT / "ingest_status.json"
 DEFAULT_CONTEXT = Path("runtime/openclaw/research_context.json")
 DEFAULT_REVIEW_AUDIT = Path("runtime/openclaw/review_audit.jsonl")
 DEFAULT_RESEARCH_CYCLE = Path("runtime/research_cycle.json")
@@ -1066,6 +1067,19 @@ def ingest_inbox(
             len(known_ids) >= MAX_DEDUP_INDEX_ITEMS or len(known_digests) >= MAX_DEDUP_INDEX_ITEMS
         )
         degraded_reasons: list[str] = []
+        operational_rejections = [
+            item
+            for item in rejected
+            if str(item.get("reason") or "").startswith(
+                (
+                    "archive_failed:",
+                    "ProposalValidationError: cannot safely open proposal file:",
+                    "ProposalValidationError: cannot remove consumed proposal",
+                )
+            )
+        ]
+        if operational_rejections:
+            degraded_reasons.append("inbox_io_error")
         if dedup_at_capacity or dedup_capacity_rejections:
             degraded_reasons.append("dedup_index_capacity")
         if accepted_spool_capacity_rejections or not retention["accepted"]["limits_satisfied"]:
@@ -1079,7 +1093,7 @@ def ingest_inbox(
         if not retention["incoming"]["limits_satisfied"]:
             degraded_reasons.append("incoming_retention_backlog")
     return {
-        "ok": not any(item.get("reason", "").startswith("archive_failed") for item in rejected),
+        "ok": not operational_rejections,
         "degraded": bool(degraded_reasons),
         "degraded_reasons": list(dict.fromkeys(degraded_reasons)),
         "native_generation_unaffected": True,
@@ -1361,6 +1375,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ingest.add_argument("--rejected", type=Path, default=DEFAULT_REJECTED)
     ingest.add_argument("--archive", type=Path, default=DEFAULT_ARCHIVE)
     ingest.add_argument("--index", type=Path, default=DEFAULT_INDEX)
+    ingest.add_argument("--status", type=Path, default=DEFAULT_INGEST_STATUS)
     ingest.add_argument("--max-batch", type=int, default=MAX_BATCH)
     review = subparsers.add_parser(
         "record-review", help="Append an auditable receipt for an OpenClaw daily review."
@@ -1392,6 +1407,8 @@ def main(argv: list[str] | None = None) -> None:
             index_path=args.index,
             max_batch=args.max_batch,
         )
+        write_json_atomic(args.status, payload)
+        args.status.chmod(0o600)
     else:
         payload = record_review(
             audit_path=args.audit,
@@ -1402,6 +1419,8 @@ def main(argv: list[str] | None = None) -> None:
             proposal_count=args.proposal_count,
         )
     print(json.dumps(payload, indent=2, sort_keys=True))
+    if args.command == "ingest" and not payload.get("ok"):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

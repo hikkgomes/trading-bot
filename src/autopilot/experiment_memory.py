@@ -2696,6 +2696,35 @@ class ExperimentMemory:
                 (_utc_now(), reason, behavior_hash),
             )
 
+    def reinstate_false_unsupported_strategy(self, behavior_hash: str) -> bool:
+        """Requeue only a safely identified false feature-contract retirement.
+
+        This deliberately cannot reinstate general research rejections or any
+        strategy whose lineage has touched protected holdout data.
+        """
+
+        behavior_hash = _validate_hash(behavior_hash, label="behavior_hash")
+        with self._database(write=True) as connection:
+            row = self._strategy_row(connection, behavior_hash)
+            if row["retired_at"] is None:
+                return False
+            if row["holdout_exposed_at"] is not None:
+                raise EvaluationConflictError("holdout-exposed strategy cannot be reinstated")
+            reason = str(row["retirement_reason"] or "")
+            if not reason.startswith("unsupported_feature_contract:"):
+                raise EvaluationConflictError(
+                    "only false unsupported-feature retirements can be reinstated"
+                )
+            connection.execute(
+                """
+                UPDATE strategies
+                SET retired_at = NULL, retirement_reason = NULL
+                WHERE behavior_hash = ?
+                """,
+                (behavior_hash,),
+            )
+        return True
+
     def candidate_parents(
         self,
         *,

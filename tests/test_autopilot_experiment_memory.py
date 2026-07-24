@@ -766,6 +766,37 @@ def test_pending_candidates_and_adaptive_feedback_are_bounded_and_actionable(tmp
             memory.candidate_parents(limit=501)
 
 
+def test_only_false_unsupported_retirement_can_be_reinstated(tmp_path):
+    with ExperimentMemory(tmp_path / "memory.sqlite3") as memory:
+        registered = memory.register_strategy(
+            strategy_spec("false-unsupported"),
+            strategy_id="false-unsupported",
+            generation_method="sample",
+            metadata=metadata(),
+        )
+        memory.retire_strategy(
+            registered.behavior_hash,
+            reason='unsupported_feature_contract:{"5m":["close"]}',
+        )
+
+        assert memory.pending_strategies(product="active_income") == []
+        assert memory.reinstate_false_unsupported_strategy(registered.behavior_hash) is True
+        assert memory.reinstate_false_unsupported_strategy(registered.behavior_hash) is False
+        assert [
+            item["behavior_hash"] for item in memory.pending_strategies(product="active_income")
+        ] == [registered.behavior_hash]
+
+        memory.retire_strategy(
+            registered.behavior_hash,
+            reason="search branch exhausted",
+        )
+        with pytest.raises(
+            EvaluationConflictError,
+            match="only false unsupported-feature retirements",
+        ):
+            memory.reinstate_false_unsupported_strategy(registered.behavior_hash)
+
+
 def test_concurrent_writers_preserve_every_strategy(tmp_path):
     path = tmp_path / "memory.sqlite3"
 

@@ -1749,7 +1749,11 @@ def test_validation_scenario_deflates_by_available_rotation_universe(monkeypatch
     )
     hypotheses, selection = rc._select_hypotheses(scenario, {"version": 1})
     captured = {}
-    monkeypatch.setattr(rc, "_missing_columns_for_hypothesis", lambda hypothesis, indicator_dir: {})
+    monkeypatch.setattr(
+        rc,
+        "_missing_columns_for_hypothesis",
+        lambda hypothesis, indicator_dir, *, symbol: {},
+    )
     monkeypatch.setattr(
         rc,
         "with_trial_sharpe_dispersion",
@@ -1807,7 +1811,7 @@ def test_validation_scenario_records_only_hypotheses_that_touch_holdout(monkeypa
     monkeypatch.setattr(
         rc,
         "_missing_columns_for_hypothesis",
-        lambda hypothesis, indicator_dir: {},
+        lambda hypothesis, indicator_dir, *, symbol: {},
     )
     monkeypatch.setattr(
         rc,
@@ -1854,6 +1858,37 @@ def test_validation_scenario_records_only_hypotheses_that_touch_holdout(monkeypa
     assert report["holdout_exposed_ids"] == [hypotheses[0].id]
 
 
+def test_missing_column_check_uses_explicit_non_btc_symbol(tmp_path):
+    import pandas as pd
+
+    hypothesis = next(hyp for hyp in generate_batch() if hyp.base_timeframe == "5m")
+    indicator_dir = tmp_path / "ETHUSDT" / "indicators"
+    indicator_dir.mkdir(parents=True)
+    for timeframe, columns in rc._needed_columns([hypothesis]).items():
+        payload = {
+            column: [pd.Timestamp("2026-01-01T00:00:00Z")] if column == "timestamp" else [1.0]
+            for column in columns
+        }
+        pd.DataFrame(payload).to_parquet(
+            indicator_dir / f"ETHUSDT_{timeframe}_all_indicators.parquet",
+            index=False,
+        )
+
+    assert (
+        rc._missing_columns_for_hypothesis(
+            hypothesis,
+            indicator_dir,
+            symbol="ETHUSDT",
+        )
+        == {}
+    )
+    assert rc._missing_columns_for_hypothesis(
+        hypothesis,
+        indicator_dir,
+        symbol="BTCUSDT",
+    )
+
+
 def test_validation_scenario_skips_only_unsupported_hypotheses(monkeypatch):
     scenario = rc.ResearchScenario(
         name="active_income_5m_guarded",
@@ -1872,7 +1907,7 @@ def test_validation_scenario_skips_only_unsupported_hypotheses(monkeypatch):
     monkeypatch.setattr(
         rc,
         "_missing_columns_for_hypothesis",
-        lambda hypothesis, indicator_dir: {"5m": ["volume_z_20"]}
+        lambda hypothesis, indicator_dir, *, symbol: {"5m": ["volume_z_20"]}
         if hypothesis.id == unsupported_id
         else {},
     )

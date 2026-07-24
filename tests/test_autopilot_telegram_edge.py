@@ -9,6 +9,7 @@ from src.autopilot.telegram_edge import (
     TelegramSettings,
     build_status_snapshot,
     format_alert_message,
+    format_status_message,
     handle_update,
     load_settings_file,
     poll_once,
@@ -365,6 +366,70 @@ def telegram_update(command, *, chat_id=-100123, sender_id=42, update_id=7):
             "text": command,
         },
     }
+
+
+def test_status_message_surfaces_research_and_openclaw_failures():
+    message = format_status_message(
+        {
+            "supervisor": {
+                "ok": True,
+                "generated_at": "2026-07-24T12:00:00+00:00",
+            },
+            "control": {},
+            "products": [
+                {
+                    "name": "active_income",
+                    "ok": True,
+                    "mode": "paper",
+                    "open_positions": 0,
+                }
+            ],
+            "job_worker": {"ok": True},
+            "research": {
+                "ok": True,
+                "summary": {
+                    "hypotheses": 6,
+                    "keepers": 0,
+                    "staged": 0,
+                    "unsupported_hypotheses": 8,
+                    "verdicts": {"inconclusive": 4, "reject": 2},
+                    "top_reasons": {"unsupported_features": 8},
+                    "generative_search": {
+                        "batch_hypotheses": 17,
+                        "new_hypotheses": 10,
+                        "resumed_pending": 2,
+                        "revalidation_pending": 5,
+                        "openclaw_proposals_seen": 0,
+                    },
+                },
+            },
+            "universe": {
+                "ok": True,
+                "research_symbols": ["BTCUSDT", "ETHUSDT"],
+                "eligible_research_symbols": ["BTCUSDT", "ETHUSDT"],
+            },
+            "openclaw_review": {
+                "recorded_at": "2026-07-24T07:00:00+00:00",
+                "proposal_count": 3,
+            },
+            "openclaw_ingest": {
+                "ok": False,
+                "degraded": True,
+                "degraded_reasons": ["inbox_io_error"],
+                "generated_at": "2026-07-24T12:05:00+00:00",
+                "accepted": 0,
+                "rejected": 3,
+                "remaining": 38,
+            },
+        }
+    )
+
+    assert "Overall: Attention needed." in message
+    assert "Selected 17: 10 new, 2 resumed, 5 revalidations." in message
+    assert "4 inconclusive, 2 reject" in message
+    assert "OpenClaw proposed 3 ideas" in message
+    assert "0 accepted, 3 rejected, 38 awaiting ingestion" in message
+    assert "factory consumed 0 OpenClaw proposals" in message
 
 
 def test_authorized_pause_product_is_audited_and_no_resume_command_exists(tmp_path):

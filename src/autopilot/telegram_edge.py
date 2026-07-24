@@ -36,6 +36,7 @@ DEFAULT_JOB_WORKER_STATUS = Path("runtime/job_worker_status.json")
 DEFAULT_RESEARCH_CYCLE = Path("runtime/research_cycle.json")
 DEFAULT_MARKET_UNIVERSE = Path("runtime/market_universe.json")
 DEFAULT_OPENCLAW_REVIEW_AUDIT = Path("runtime/openclaw/review_audit.jsonl")
+DEFAULT_OPENCLAW_INGEST_STATUS = Path("runtime/research_inbox/openclaw/ingest_status.json")
 DEFAULT_SETTINGS_FILE = PROJECT_ROOT / "runtime" / "telegram.env"
 ALLOWED_API_METHODS = frozenset({"getUpdates", "sendMessage"})
 ALLOWED_UPDATE_TYPES = ["message", "channel_post"]
@@ -129,8 +130,11 @@ SAFE_CONTROL_KEYS = (
 )
 SAFE_RESEARCH_SUMMARY_KEYS = (
     "active_exports",
+    "available_hypotheses",
+    "coverage_failures",
     "export_reasons",
     "exported",
+    "generative_search",
     "hypotheses",
     "incubation_candidates",
     "keepers",
@@ -139,8 +143,12 @@ SAFE_RESEARCH_SUMMARY_KEYS = (
     "opportunity_types_by_product",
     "scenarios",
     "selected_hypotheses",
+    "scenario_errors",
     "staged",
     "top_reasons",
+    "unprotected_epoch_deferrals",
+    "unsupported_hypotheses",
+    "verdicts",
 )
 
 
@@ -543,12 +551,14 @@ def build_status_snapshot(
     research_cycle_path: Path = DEFAULT_RESEARCH_CYCLE,
     market_universe_path: Path = DEFAULT_MARKET_UNIVERSE,
     openclaw_review_audit_path: Path = DEFAULT_OPENCLAW_REVIEW_AUDIT,
+    openclaw_ingest_status_path: Path = DEFAULT_OPENCLAW_INGEST_STATUS,
 ) -> dict[str, Any]:
     status = _read_json_object(status_path)
     worker = _read_json_object(job_worker_status_path)
     research = _read_json_object(research_cycle_path)
     universe = _read_json_object(market_universe_path)
     openclaw_review = _read_last_json_line(openclaw_review_audit_path)
+    openclaw_ingest = _read_json_object(openclaw_ingest_status_path)
     control = load_control(control_path)
 
     products: list[dict[str, Any]] = []
@@ -627,6 +637,15 @@ def build_status_snapshot(
             "proposal_count": openclaw_review.get("proposal_count"),
             "summary": _safe_scalar_tree(openclaw_review.get("summary")),
         },
+        "openclaw_ingest": {
+            "ok": openclaw_ingest.get("ok"),
+            "degraded": bool(openclaw_ingest.get("degraded", False)),
+            "degraded_reasons": _safe_scalar_tree(openclaw_ingest.get("degraded_reasons")) or [],
+            "generated_at": openclaw_ingest.get("generated_at"),
+            "accepted": len(openclaw_ingest.get("accepted") or []),
+            "rejected": len(openclaw_ingest.get("rejected") or []),
+            "remaining": openclaw_ingest.get("remaining"),
+        },
     }
 
 
@@ -637,11 +656,31 @@ def format_status_message(snapshot: dict[str, Any]) -> str:
     research = snapshot.get("research") or {}
     universe = snapshot.get("universe") or {}
     review = snapshot.get("openclaw_review") or {}
+    ingest = snapshot.get("openclaw_ingest") or {}
     paused = bool(control.get("paused") or control.get("pause_jobs"))
-    overall = "Attention needed" if supervisor.get("ok") is False or paused else "Healthy"
+    summary = research.get("summary") or {}
+    research_blocked = any(
+        int(summary.get(key) or 0) > 0
+        for key in (
+            "coverage_failures",
+            "scenario_errors",
+            "unsupported_hypotheses",
+        )
+    )
+    attention = (
+        paused
+        or supervisor.get("ok") is False
+        or worker.get("ok") is False
+        or research.get("ok") is False
+        or universe.get("ok") is False
+        or ingest.get("ok") is False
+        or bool(ingest.get("degraded"))
+        or research_blocked
+    )
+    overall = "Attention needed" if attention else "Healthy"
     lines = [
         "Trading research update",
-        f"Overall: {overall}. Supervisor is {_status_word(supervisor.get('ok'))}.",
+        f"Overall: {overall}.",
     ]
     if paused:
         lines.append(f"Automation is paused ({control.get('reason') or 'no reason recorded'}).")
@@ -653,13 +692,35 @@ def format_status_message(snapshot: dict[str, Any]) -> str:
             f"{_status_word(product.get('ok'))}; {product.get('mode') or 'unknown'} mode; "
             f"{product.get('open_positions') or 0} open positions."
         )
-    summary = research.get("summary") or {}
     lines.extend(["", "Research"])
+    generation = summary.get("generative_search") or {}
+    if generation:
+        lines.append(
+            f"- Selected {generation.get('batch_hypotheses') or 0}: "
+            f"{generation.get('new_hypotheses') or 0} new, "
+            f"{generation.get('resumed_pending') or 0} resumed, "
+            f"{generation.get('revalidation_pending') or 0} revalidations."
+        )
+    verdicts = summary.get("verdicts") or {}
+    verdict_text = ", ".join(
+        f"{count} {str(verdict).replace('_', ' ')}"
+        for verdict, count in sorted(verdicts.items())
+        if count
+    )
     lines.append(
-        f"- Latest cycle is {_status_word(research.get('ok'))}: "
-        f"{summary.get('hypotheses', 0)} hypotheses checked, "
+        f"- Evaluated {summary.get('hypotheses', 0)} hypotheses: "
+        f"{verdict_text or 'no completed verdicts'}; "
         f"{summary.get('keepers', 0)} keepers, {summary.get('staged', 0)} staged."
     )
+    top_reasons = summary.get("top_reasons") or {}
+    if top_reasons:
+        reason_text = ", ".join(
+            f"{str(reason).replace('_', ' ')} ({count})"
+            for reason, count in list(top_reasons.items())[:4]
+            if count
+        )
+        if reason_text:
+            lines.append(f"- Main outcomes: {reason_text}.")
     configured = universe.get("research_symbols") or []
     eligible = universe.get("eligible_research_symbols") or []
     if configured:
@@ -669,13 +730,29 @@ def format_status_message(snapshot: dict[str, Any]) -> str:
         )
     if review.get("recorded_at"):
         lines.append(
-            f"- OpenClaw reviewed the queue and submitted "
-            f"{review.get('proposal_count') or 0} new proposals."
+            f"- OpenClaw proposed {review.get('proposal_count') or 0} ideas in its latest review."
+        )
+    if ingest.get("generated_at"):
+        lines.append(
+            f"- Bridge pass: {ingest.get('accepted') or 0} accepted, "
+            f"{ingest.get('rejected') or 0} rejected, "
+            f"{ingest.get('remaining') or 0} awaiting ingestion."
+        )
+        if ingest.get("ok") is False or ingest.get("degraded"):
+            reasons = ", ".join(
+                str(reason).replace("_", " ") for reason in ingest.get("degraded_reasons") or []
+            )
+            lines.append(f"- Bridge needs attention: {reasons or 'operational failure'}.")
+    if generation:
+        lines.append(
+            f"- Strategy factory consumed "
+            f"{generation.get('openclaw_proposals_seen') or 0} OpenClaw proposals."
         )
     lines.extend(
         [
             "",
-            f"Operations: job worker is {_status_word(worker.get('ok'))}. "
+            f"Operations: supervisor is {_status_word(supervisor.get('ok'))}; "
+            f"job worker is {_status_word(worker.get('ok'))}. "
             f"Last supervisor heartbeat: {supervisor.get('generated_at') or 'unknown'}.",
         ]
     )

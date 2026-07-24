@@ -765,6 +765,7 @@ def _load_generated_scenarios(
             }
             for hypothesis in hypotheses
         }
+    factory_summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
     summary = {
         "status": "loaded",
         "path": str(path),
@@ -774,6 +775,10 @@ def _load_generated_scenarios(
         "skipped": len(skipped_errors),
         "skipped_errors": skipped_errors,
         "cumulative_trials": cumulative_trials,
+        "new_hypotheses": _int_count(factory_summary.get("new_hypotheses")),
+        "resumed_pending": _int_count(factory_summary.get("resumed_pending")),
+        "revalidation_pending": _int_count(factory_summary.get("revalidation_pending")),
+        "openclaw_proposals_seen": _int_count(factory_summary.get("openclaw_proposals_seen")),
         "research_only": True,
         "executable": False,
     }
@@ -1151,6 +1156,10 @@ def _generated_effectiveness_summary(
         "status": batch.get("status") or ("evaluated" if generated else "not_loaded"),
         "generated_at": batch.get("generated_at"),
         "batch_hypotheses": batch.get("hypotheses"),
+        "new_hypotheses": _int_count(batch.get("new_hypotheses")),
+        "resumed_pending": _int_count(batch.get("resumed_pending")),
+        "revalidation_pending": _int_count(batch.get("revalidation_pending")),
+        "openclaw_proposals_seen": _int_count(batch.get("openclaw_proposals_seen")),
         "cumulative_trials": _int_count(batch.get("cumulative_trials")),
         "evaluated_scenarios": len(generated),
         "evaluated_hypotheses": evaluated,
@@ -1349,8 +1358,12 @@ def build_incubation_review(
     }
 
 
-def _missing_columns_for_hypothesis(hypothesis, indicator_dir: Path) -> dict[str, list[str]]:
-    symbol = indicator_dir.name if indicator_dir.name.endswith("USDT") else "BTCUSDT"
+def _missing_columns_for_hypothesis(
+    hypothesis,
+    indicator_dir: Path,
+    *,
+    symbol: str,
+) -> dict[str, list[str]]:
     missing: dict[str, list[str]] = {}
     for timeframe, columns in _needed_columns([hypothesis]).items():
         path = indicator_dir / f"{symbol}_{timeframe}_all_indicators.parquet"
@@ -1369,11 +1382,16 @@ def _partition_supported_hypotheses(
     hypotheses: list[Any],
     *,
     indicator_dir: Path,
+    symbol: str,
 ) -> tuple[list[Any], list[dict[str, Any]]]:
     supported = []
     unsupported = []
     for hypothesis in hypotheses:
-        missing = _missing_columns_for_hypothesis(hypothesis, indicator_dir)
+        missing = _missing_columns_for_hypothesis(
+            hypothesis,
+            indicator_dir,
+            symbol=symbol,
+        )
         if missing:
             unsupported.append(
                 {
@@ -1654,6 +1672,7 @@ def _coverage_failure_report(
         "base_tf": scenario.base_tf,
         "pnl_unit": scenario.pnl_unit,
         "market": scenario.market,
+        "symbol": scenario.symbol,
         "position": scenario.position,
         "opportunity_type": scenario.opportunity_type,
         "with_guards": scenario.with_guards,
@@ -1704,6 +1723,7 @@ def _unprotected_epoch_deferral_report(
         "base_tf": scenario.base_tf,
         "pnl_unit": scenario.pnl_unit,
         "market": scenario.market,
+        "symbol": scenario.symbol,
         "position": scenario.position,
         "opportunity_type": scenario.opportunity_type,
         "with_guards": scenario.with_guards,
@@ -1757,6 +1777,7 @@ def _peer_coverage_gate_report(
         "base_tf": scenario.base_tf,
         "pnl_unit": scenario.pnl_unit,
         "market": scenario.market,
+        "symbol": scenario.symbol,
         "position": scenario.position,
         "opportunity_type": scenario.opportunity_type,
         "with_guards": scenario.with_guards,
@@ -2141,6 +2162,7 @@ def run_validation_scenario(
     supported_hypotheses, unsupported_hypotheses = _partition_supported_hypotheses(
         hypotheses,
         indicator_dir=selected_indicator_dir,
+        symbol=scenario.symbol,
     )
     retired_unsupported_ids = _retire_unsupported_generated_hypotheses(
         unsupported_hypotheses,
@@ -2157,6 +2179,7 @@ def run_validation_scenario(
             "base_tf": scenario.base_tf,
             "pnl_unit": scenario.pnl_unit,
             "market": scenario.market,
+            "symbol": scenario.symbol,
             "position": scenario.position,
             "opportunity_type": scenario.opportunity_type,
             "with_guards": scenario.with_guards,
@@ -2315,6 +2338,7 @@ def run_validation_scenario(
                 "base_tf": scenario.base_tf,
                 "pnl_unit": scenario.pnl_unit,
                 "market": scenario.market,
+                "symbol": scenario.symbol,
                 "position": scenario.position,
                 "opportunity_type": scenario.opportunity_type,
                 "with_guards": scenario.with_guards,
@@ -3042,6 +3066,7 @@ def run_research_cycle(
                         "base_tf": scenario.base_tf,
                         "pnl_unit": scenario.pnl_unit,
                         "market": scenario.market,
+                        "symbol": scenario.symbol,
                         "position": scenario.position,
                         "opportunity_type": scenario.opportunity_type,
                         "with_guards": scenario.with_guards,
@@ -3095,6 +3120,7 @@ def run_research_cycle(
                         "base_tf": scenario.base_tf,
                         "pnl_unit": scenario.pnl_unit,
                         "market": scenario.market,
+                        "symbol": scenario.symbol,
                         "position": scenario.position,
                         "opportunity_type": scenario.opportunity_type,
                         "with_guards": scenario.with_guards,

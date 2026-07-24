@@ -195,6 +195,7 @@ exec {real_id} "$@"
     assert "default:user:nobody:---" in runtime_acl
     assert "user:nobody:r--" in context_acl
     assert "user:nobody:rwx" in incoming_acl
+    assert f"default:user:{current_user}:rwx" in incoming_acl
     assert (private_data / "candles.parquet").stat().st_mode & 0o777 == 0o644
 
 

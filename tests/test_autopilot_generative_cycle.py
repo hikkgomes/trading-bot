@@ -196,7 +196,7 @@ def test_validation_persists_development_and_hides_holdout_from_feedback(monkeyp
     frame = _sawtooth_frame()
     monkeypatch.setattr(
         "src.autopilot.research_cycle._missing_columns_for_hypothesis",
-        lambda _hypothesis, _directory: {},
+        lambda _hypothesis, _directory, *, symbol: {},
     )
     monkeypatch.setattr(
         "src.autopilot.research_cycle.build_aligned_frame",
@@ -247,7 +247,7 @@ def test_crash_after_holdout_claim_cannot_reuse_protected_snapshot(monkeypatch, 
     frame = _sawtooth_frame(rows=200)
     monkeypatch.setattr(
         "src.autopilot.research_cycle._missing_columns_for_hypothesis",
-        lambda _hypothesis, _directory: {},
+        lambda _hypothesis, _directory, *, symbol: {},
     )
     monkeypatch.setattr(
         "src.autopilot.research_cycle.build_aligned_frame",
@@ -309,7 +309,7 @@ def test_grown_snapshot_selects_disjoint_epoch_before_evaluator_reads_frame(monk
     grown_to_125 = _sawtooth_frame(rows=125)
     monkeypatch.setattr(
         "src.autopilot.research_cycle._missing_columns_for_hypothesis",
-        lambda _hypothesis, _directory: {},
+        lambda _hypothesis, _directory, *, symbol: {},
     )
     monkeypatch.setattr(
         "src.autopilot.research_cycle.build_aligned_frame",

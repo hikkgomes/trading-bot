@@ -241,6 +241,21 @@ def test_ingest_rejects_malformed_and_duplicate_key_json_then_archives_raw(tmp_p
     assert len(list(paths["archive_dir"].glob("*.json"))) == 1
 
 
+def test_ingest_marks_unreadable_incoming_file_as_operational_failure(tmp_path):
+    paths = inbox_paths(tmp_path)
+    paths["incoming_dir"].mkdir(parents=True)
+    source = paths["incoming_dir"] / "unreadable.json"
+    source.write_text(json.dumps(proposal()), encoding="utf-8")
+    source.chmod(0)
+
+    report = ingest_inbox(**paths)
+
+    assert report["ok"] is False
+    assert report["degraded"] is True
+    assert "inbox_io_error" in report["degraded_reasons"]
+    assert report["remaining"] == 1
+
+
 def test_ingest_does_not_follow_symlinked_proposal(tmp_path):
     paths = inbox_paths(tmp_path)
     paths["incoming_dir"].mkdir(parents=True)

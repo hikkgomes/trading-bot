@@ -292,6 +292,11 @@ if [[ -n "$OPENCLAW_GROUP" ]]; then
     fi
     setfacl -m "u:$OPENCLAW_USER:rwx" -- \
       "$REPO/runtime/research_inbox/openclaw/incoming"
+    # Do not rely on a long-running user-systemd manager refreshing its
+    # supplementary groups after account provisioning. Files created by the
+    # separate OpenClaw identity inherit an explicit ACL for the bridge user.
+    setfacl -m "d:u:$CURRENT_USER:rwx" -- \
+      "$REPO/runtime/research_inbox/openclaw/incoming"
     setfacl -m 'd:g::r-x,d:m::r-x,d:o::---' -- "$REPO/runtime/openclaw"
     setfacl -m 'd:g::rwx,d:m::rwx,d:o::---' -- \
       "$REPO/runtime/research_inbox/openclaw/incoming"
