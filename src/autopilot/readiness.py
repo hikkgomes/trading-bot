@@ -59,6 +59,7 @@ from src.autopilot.research_factory import (
 from src.autopilot.research_factory import (
     ResearchFactoryConfig,
     load_factory_config,
+    resolve_search_space,
     strategy_behavior_spec,
 )
 from src.autopilot.runtime import (
@@ -556,7 +557,6 @@ def _generated_batch_status(
         status.update(reason="candidate_budget_exceeded", hypotheses=len(hypotheses))
         return status
 
-    spaces = {space.name: space for space in factory.search_spaces}
     metadata_by_id: dict[str, dict[str, Any]] = {}
     for item in metadata_items:
         if not isinstance(item, dict) or not isinstance(item.get("id"), str):
@@ -576,7 +576,7 @@ def _generated_batch_status(
                 raise ValueError("hypothesis must be an object")
             hypothesis = Hypothesis.from_dict(raw_hypothesis)
             metadata = metadata_by_id.pop(hypothesis.id)
-            space = spaces[str(metadata["search_space"])]
+            space = resolve_search_space(factory, metadata)
             expected_context = {
                 "product": space.product,
                 "market": space.market,

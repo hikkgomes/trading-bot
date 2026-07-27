@@ -1,12 +1,14 @@
 import json
 import time
 from collections import namedtuple
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 import src.autopilot.readiness as readiness
 from research_exploration.dsr import DSR_METHOD
+from research_exploration.hypothesis_schema import Hypothesis
 from src.autopilot.approvals import ApprovalLedger, artifact_digest, strategy_fingerprint
 from src.autopilot.config import (
     AutopilotConfig,
@@ -15,9 +17,13 @@ from src.autopilot.config import (
     canonical_product_config,
 )
 from src.autopilot.execution_identity import execution_engine_digest
-from src.autopilot.experiment_memory import ExperimentMemory
+from src.autopilot.experiment_memory import ExperimentMemory, canonical_strategy_hash
 from src.autopilot.readiness import build_readiness_report, main, render_readiness_markdown
-from src.autopilot.research_factory import build_generation, load_factory_config
+from src.autopilot.research_factory import (
+    build_generation,
+    load_factory_config,
+    strategy_behavior_spec,
+)
 from src.execution.config import ExchangeConfig
 
 VALID_SERVICE_INSTALLER = """#!/bin/bash
@@ -273,6 +279,39 @@ def test_generated_batch_readiness_accepts_only_canonical_safe_factory_output(
     assert unsafe["ok"] is False
     assert unsafe["level"] == "error"
     assert unsafe["reason"] == "failed_safety_contract"
+
+
+def test_generated_batch_readiness_resolves_dynamic_symbol_search_spaces(tmp_path, monkeypatch):
+    factory_path = write_research_factory_config(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "src.autopilot.research_factory._feature_inventory_for_space", lambda _space: None
+    )
+    factory = load_factory_config(factory_path)
+    payload = build_generation(factory, seed=42, now="2026-07-10T00:00:00+00:00")
+    metadata = next(
+        item for item in payload["generation_metadata"] if item["product"] == "active_income"
+    )
+    raw_hypothesis = next(item for item in payload["hypotheses"] if item["id"] == metadata["id"])
+    template = next(
+        space for space in factory.search_spaces if space.name == metadata["search_space"]
+    )
+    expanded = replace(template, name=f"{template.name}_ethusdt", symbol="ETHUSDT")
+    metadata.update(
+        {
+            "search_space": expanded.name,
+            "symbol": expanded.symbol,
+            "strategy_hash": canonical_strategy_hash(
+                strategy_behavior_spec(Hypothesis.from_dict(raw_hypothesis), expanded)
+            ),
+        }
+    )
+    factory.generated_batch_path.parent.mkdir(parents=True, exist_ok=True)
+    factory.generated_batch_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    status = readiness._generated_batch_status(factory.generated_batch_path, factory=factory)
+
+    assert status["ok"] is True
+    assert status["hypotheses"] == 5
 
 
 def test_generated_batch_readiness_warns_without_creating_a_first_boot_batch(tmp_path, monkeypatch):
