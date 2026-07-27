@@ -241,6 +241,25 @@ def _stale_research_handoff_due(job: JobConfig) -> bool:
     return False
 
 
+def _stale_universe_history_due(job: JobConfig) -> bool:
+    command = list(job.command)
+    if "src.autopilot.universe_history" not in command:
+        return False
+    universe_path = _command_path_value(job, "--market-universe-report")
+    output_path = _command_path_value(job, "--output")
+    if universe_path is None or output_path is None:
+        return False
+    universe = _load_json_object(universe_path)
+    snapshot = universe.get("snapshot")
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("id"), str):
+        return False
+    output = _load_json_object(output_path)
+    output_universe = output.get("market_universe")
+    return not isinstance(output_universe, dict) or (
+        output_universe.get("snapshot_id") != snapshot["id"]
+    )
+
+
 def _mutation_batch_marker(payload: dict[str, Any]) -> dict[str, Any] | None:
     generated_at = payload.get("generated_at")
     if not generated_at:
@@ -406,9 +425,19 @@ def job_due(job: JobConfig, job_state: dict[str, Any], now: float | None = None)
     entry = job_state.get("jobs", {}).get(job.name, {})
     if job_definition_changed(job, entry):
         return True
+    if entry.get("last_ok") is False:
+        last_started = _float_or_none(entry.get("last_started_ts"))
+        if (
+            last_started is not None
+            and last_started <= now
+            and now - last_started < effective_job_cadence_seconds(job, entry)
+        ):
+            return False
     if _missing_bootstrap_seed_due(job, entry):
         return True
     if _stale_research_handoff_due(job):
+        return True
+    if _stale_universe_history_due(job):
         return True
     if _mutation_batch_awaiting_research_due(job, job_state):
         return True

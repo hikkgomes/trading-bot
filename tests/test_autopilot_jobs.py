@@ -575,6 +575,106 @@ def test_research_cycle_due_exactly_once_for_new_generated_population(tmp_path):
     assert not job_due(cfg, state, now=120.0)
 
 
+def test_failed_research_cycle_respects_backoff_for_pending_generated_population(tmp_path):
+    research_state = tmp_path / "research_cycle_state.json"
+    generated_batch = tmp_path / "generated_hypotheses.json"
+    generated_batch.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "generated_at": "2026-07-10T00:00:00+00:00",
+                "summary": {
+                    "hypotheses": 12,
+                    "by_space": {"active_day": 12},
+                    "cumulative_trials": 240,
+                },
+                "hypotheses": [{}] * 12,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = job(
+        tmp_path,
+        name="research_cycle",
+        command=[
+            sys.executable,
+            "-m",
+            "src.autopilot.research_cycle",
+            "--state",
+            str(research_state),
+            "--include-generated",
+            "--generated-only",
+            "--generated-batch",
+            str(generated_batch),
+        ],
+        cadence_seconds=86400,
+    )
+    state = {
+        "version": 1,
+        "jobs": {
+            "research_cycle": {
+                "last_started_ts": 100.0,
+                "last_ok": False,
+                "consecutive_failures": 1,
+            }
+        },
+    }
+
+    assert not job_due(cfg, state, now=120.0)
+    assert job_due(cfg, state, now=1000.0)
+
+
+def test_universe_history_due_when_market_snapshot_has_not_been_bootstrapped(tmp_path):
+    universe = tmp_path / "market_universe.json"
+    output = tmp_path / "universe_history.json"
+    universe.write_text(
+        json.dumps({"snapshot": {"id": "sha256:" + "1" * 64}}),
+        encoding="utf-8",
+    )
+    cfg = job(
+        tmp_path,
+        name="market_data_update_universe",
+        command=[
+            sys.executable,
+            "-m",
+            "src.autopilot.universe_history",
+            "--market-universe-report",
+            str(universe),
+            "--output",
+            str(output),
+        ],
+        cadence_seconds=86400,
+    )
+    state = {
+        "version": 1,
+        "jobs": {
+            cfg.name: {
+                "last_started_ts": 100.0,
+                "last_ok": True,
+            }
+        },
+    }
+
+    assert job_due(cfg, state, now=120.0)
+
+    output.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "market_universe": {"snapshot_id": "sha256:" + "1" * 64},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert not job_due(cfg, state, now=120.0)
+
+    universe.write_text(
+        json.dumps({"snapshot": {"id": "sha256:" + "2" * 64}}),
+        encoding="utf-8",
+    )
+    assert job_due(cfg, state, now=120.0)
+
+
 def test_research_cycle_waits_when_scheduler_created_next_mutation_batch(tmp_path):
     research_state = tmp_path / "research_cycle_state.json"
     mutation_batch = tmp_path / "mutation_hypotheses.json"
