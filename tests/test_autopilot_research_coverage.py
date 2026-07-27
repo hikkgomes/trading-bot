@@ -450,7 +450,7 @@ def test_history_coverage_marker_prevents_legacy_timestamp_skip(tmp_path, monkey
     assert second["skipped"] is True
 
 
-def test_one_history_failure_blocks_every_scenario_before_holdout(tmp_path, monkeypatch):
+def test_one_history_failure_is_isolated_to_its_scenario(tmp_path, monkeypatch):
     futures = coverage_scenario(name="futures_ready")
     spot = coverage_scenario(
         name="spot_shallow",
@@ -492,13 +492,20 @@ def test_one_history_failure_blocks_every_scenario_before_holdout(tmp_path, monk
         "_scenario_indicator_coverage_status",
         lambda scenario, **kwargs: failing if scenario.name == spot.name else passing,
     )
-    monkeypatch.setattr(
-        rc,
-        "run_validation_scenario",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("no scenario may spend holdout while the history gate is blocked")
-        ),
-    )
+    validated = []
+
+    def validate(scenario, **kwargs):
+        validated.append(scenario.name)
+        return {
+            "ok": True,
+            "name": scenario.name,
+            "product": scenario.product,
+            "market": scenario.market,
+            "symbol": scenario.symbol,
+            "keeper_ids": [],
+        }
+
+    monkeypatch.setattr(rc, "run_validation_scenario", validate)
 
     report = rc.run_research_cycle(
         scenarios=(futures, spot),
@@ -509,7 +516,6 @@ def test_one_history_failure_blocks_every_scenario_before_holdout(tmp_path, monk
 
     by_name = {item["name"]: item for item in report["scenarios"]}
     assert report["ok"] is False
-    assert report["exports"] == []
     assert by_name["spot_shallow"]["reason"] == "insufficient_history_coverage"
-    assert by_name["futures_ready"]["reason"] == "history_coverage_gate_blocked"
-    assert by_name["futures_ready"]["blocked_by_scenarios"] == ["spot_shallow"]
+    assert by_name["futures_ready"]["ok"] is True
+    assert validated == ["futures_ready"]

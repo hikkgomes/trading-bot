@@ -5,6 +5,11 @@ repository defaults to paper trading. Keep it that way until the promotion
 sequence below has completed for one specific strategy artifact and a human has
 approved it.
 
+The installer permits missing dynamic-universe datasets only during its
+readiness pass so it can install the history workers that create them.
+Standalone `make readiness` remains blocked after a universe snapshot exists
+until every selected symbol has its required candle and indicator data.
+
 For the optional isolated Telegram and OpenClaw edges, follow
 [`COMMUNICATIONS.md`](COMMUNICATIONS.md). Neither integration is required for
 trading/research operation, and neither is an approval or execution channel.
@@ -13,9 +18,12 @@ trading/research operation, and neither is an approval or execution channel.
 
 - `btc_accumulation` trades BTC/USDT spot, uses BTC as its accounting asset, and
   never uses leverage.
-- `active_income` trades BTC/USDT on Binance USDT-margined futures, uses USDT as
-  its accounting asset, and is restricted to the `binanceusdm` API, isolated
-  margin, one-way position mode (`positionSide=BOTH`), and 1x leverage.
+- `active_income` trades an explicitly configured USDT-quoted perpetual on
+  Binance USDT-margined futures, uses USDT as its accounting asset, and is
+  restricted to the `binanceusdm` API, isolated margin, one-way position mode
+  (`positionSide=BOTH`), and 1x leverage. The checked-in executable product is
+  BTCUSDT; researched altcoins remain isolated candidates until separately
+  configured and promoted.
 - Environment variables alone cannot authorize live trading. Live entry also
   requires an eligible artifact, a matching human approval, fresh connected
   preflight evidence, and, for active income, a matching testnet rehearsal.

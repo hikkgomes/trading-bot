@@ -12,7 +12,13 @@ from src.autopilot.candidate_evidence import (
     CANDIDATE_PAPER_FORWARD_FILL_SOURCE,
     CANDIDATE_PAPER_FORWARD_REASON,
 )
-from src.autopilot.candidate_paper import candidate_paper_paths, main, run_candidate_paper
+from src.autopilot.candidate_paper import (
+    _candidate_portfolio_status,
+    _discovered_symbol_products,
+    candidate_paper_paths,
+    main,
+    run_candidate_paper,
+)
 from src.autopilot.config import AutopilotConfig, ProductConfig
 from src.autopilot.locking import acquire_runtime_lock
 from src.run_bot import PaperTradingBot
@@ -175,6 +181,54 @@ def test_candidate_paper_skips_non_live_product_without_candidate(tmp_path):
 
     assert report["ok"] is True
     assert report["products"][0]["reason"] == "product_not_live"
+
+
+def test_candidate_paper_discovers_symbol_isolated_altcoin_candidate(tmp_path):
+    base = _product(tmp_path)
+    candidate_dir = tmp_path / "candidates"
+    candidate_dir.mkdir()
+    alt = ProductConfig(
+        **{
+            **base.__dict__,
+            "name": "active_income__dogeusdt",
+            "symbol": "DOGEUSDT",
+            "strategies_path": candidate_dir / "active_income__dogeusdt.json",
+            "state_file": candidate_dir / "active_income__dogeusdt_state.json",
+            "trade_log": candidate_dir / "active_income__dogeusdt_paper_trades.csv",
+            "preflight_report": candidate_dir / "active_income__dogeusdt_preflight_report.json",
+            "testnet_rehearsal_report": (
+                candidate_dir / "active_income__dogeusdt_testnet_rehearsal_report.json"
+            ),
+        }
+    )
+    candidate = _candidate(alt)
+    candidate["symbol"] = "DOGEUSDT"
+    candidate["strategies"][0]["symbol"] = "DOGEUSDT"
+    alt.strategies_path.write_text(json.dumps(candidate), encoding="utf-8")
+
+    discovered = _discovered_symbol_products(
+        AutopilotConfig(products=[base]),
+        candidate_dir=candidate_dir,
+    )
+
+    assert [(product.name, product.symbol) for product in discovered] == [
+        ("active_income__dogeusdt", "DOGEUSDT")
+    ]
+
+
+def test_candidate_paper_portfolio_cap_blocks_new_entries(tmp_path):
+    candidate_dir = tmp_path / "candidates"
+    candidate_dir.mkdir()
+    (candidate_dir / "alt_paper_state_digest.json").write_text(
+        json.dumps({"open_positions": {"strategy": {"symbol": "DOGEUSDT"}}}),
+        encoding="utf-8",
+    )
+
+    status = _candidate_portfolio_status(candidate_dir, max_open_positions=1)
+
+    assert status["ok"] is True
+    assert status["open_positions"] == 1
+    assert status["entry_capacity_available"] is False
 
 
 def test_candidate_paper_fails_closed_on_wrong_product_identity(tmp_path):

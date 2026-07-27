@@ -44,9 +44,9 @@ def validate_product_symbol_policy(product: ProductConfig) -> list[str]:
                 f"{product.name}: BTC accumulation spot symbol must not include a settlement asset."
             )
     if product.objective == "active_income":
-        if (base, quote) != ("BTC", "USDT"):
+        if not base or quote != "USDT":
             errors.append(
-                f"{product.name}: active income symbol must be BTC/USDT; got {product.symbol!r}."
+                f"{product.name}: active income symbol must be a USDT pair; got {product.symbol!r}."
             )
         if settlement is not None and settlement != "USDT":
             errors.append(

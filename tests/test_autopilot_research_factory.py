@@ -17,29 +17,61 @@ from src.autopilot.research_factory import (
     _candidate_is_near_duplicate,
     _load_accepted_proposals,
     _method_schedule,
+    _search_spaces_for_cycle,
     build_generation,
     load_factory_config,
     strategy_behavior_spec,
 )
 
 
-def test_default_factory_expands_symbol_scoped_active_income_universe():
+def test_default_factory_uses_dynamic_symbol_scoped_active_income_templates():
     config = load_factory_config(DEFAULT_CONFIG)
     active = [space for space in config.search_spaces if space.product == "active_income"]
 
-    assert {space.symbol for space in active} == {
-        "BTCUSDT",
-        "ETHUSDT",
-        "SOLUSDT",
-        "XRPUSDT",
-        "BNBUSDT",
-    }
-    assert len(active) == 15
+    assert config.dynamic_active_income_universe is True
+    assert {space.symbol for space in active} == {"BTCUSDT"}
+    assert len(active) == 3
     assert all(
         space.symbol == "BTCUSDT"
         for space in config.search_spaces
         if space.product == "btc_accumulation"
     )
+
+
+def test_factory_expands_fresh_market_universe_across_all_active_horizons(tmp_path):
+    config = load_factory_config(DEFAULT_CONFIG)
+    report = tmp_path / "market_universe.json"
+    report.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "schema": "autopilot.market_universe/v2",
+                "generated_at": "2026-07-27T00:00:00+00:00",
+                "eligible_research_symbols": ["BTCUSDT", "ETHUSDT", "DOGEUSDT"],
+                "snapshot": {"id": "sha256:" + "3" * 64},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    spaces = _search_spaces_for_cycle(
+        config,
+        generated_at="2026-07-27T12:00:00+00:00",
+        report_path=report,
+    )
+    active = [space for space in spaces if space.product == "active_income"]
+
+    assert {space.symbol for space in active} == {
+        "BTCUSDT",
+        "ETHUSDT",
+        "DOGEUSDT",
+    }
+    assert len(active) == 9
+    assert {space.opportunity_type for space in active if space.symbol == "DOGEUSDT"} == {
+        "scalping",
+        "day_trading",
+        "swing_trading",
+    }
 
 
 def _spaces() -> tuple[SearchSpace, ...]:

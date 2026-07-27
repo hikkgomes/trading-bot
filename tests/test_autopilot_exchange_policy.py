@@ -42,7 +42,7 @@ def test_product_symbol_policy_rejects_wrong_active_income_quote(tmp_path):
 
     errors = validate_product_symbol_policy(active_product)
 
-    assert errors == ["active_income: active income symbol must be BTC/USDT; got 'BTCUSDC'."]
+    assert errors == ["active_income: active income symbol must be a USDT pair; got 'BTCUSDC'."]
 
 
 def test_product_symbol_policy_rejects_spot_btc_accumulation_settlement(tmp_path):

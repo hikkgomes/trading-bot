@@ -110,6 +110,9 @@ def set_live_env(monkeypatch):
 
 
 CORE_AUTOPILOT_JOBS = {
+    "market_universe_screen",
+    "market_data_update_universe",
+    "market_data_update_universe_1m",
     "market_data_update_futures",
     "market_data_update_futures_1m",
     "market_data_update_spot",
@@ -1038,7 +1041,7 @@ def test_validate_config_accepts_btc_usdt_symbol_forms(tmp_path, symbol):
     assert validate_config(cfg) == []
 
 
-@pytest.mark.parametrize("symbol", ["ETHUSDT", "BTCUSDC", "ETH/BTC", "BTC/USDT:USDC"])
+@pytest.mark.parametrize("symbol", ["BTCUSDC", "ETH/BTC", "BTC/USDT:USDC"])
 def test_validate_config_rejects_active_income_wrong_symbol(tmp_path, symbol):
     cfg = AutopilotConfig(products=[product(tmp_path, symbol=symbol)])
 
@@ -1046,9 +1049,16 @@ def test_validate_config_rejects_active_income_wrong_symbol(tmp_path, symbol):
 
     assert any(
         "active income" in error
-        and ("symbol must be BTC/USDT" in error or "settlement must be USDT" in error)
+        and ("symbol must be a USDT pair" in error or "settlement must be USDT" in error)
         for error in errors
     )
+
+
+@pytest.mark.parametrize("symbol", ["ETHUSDT", "DOGE/USDT", "SOL/USDT:USDT"])
+def test_validate_config_accepts_active_income_altcoin_usdt_symbols(tmp_path, symbol):
+    cfg = AutopilotConfig(products=[product(tmp_path, symbol=symbol)])
+
+    assert validate_config(cfg) == []
 
 
 @pytest.mark.parametrize("symbol", ["ETHUSDT", "BTCUSDC", "BTC/USDT:USDT"])
@@ -1800,6 +1810,62 @@ def test_run_once_waits_for_missing_paper_artifact(tmp_path):
     assert status["products"][0]["reason"] == "waiting_for_strategy_artifact"
     assert "Strategy artifact not found" in status["products"][0]["detail"]
     assert "alert" not in status
+
+
+def test_run_once_blocks_all_active_income_entries_at_portfolio_cap(
+    monkeypatch,
+    tmp_path,
+):
+    btc = product(
+        tmp_path,
+        name="active_income",
+        symbol="BTCUSDT",
+        strategies_path=tmp_path / "btc.json",
+        state_file=tmp_path / "btc_state.json",
+        trade_log=tmp_path / "btc_trades.csv",
+        preflight_report=tmp_path / "btc_preflight.json",
+        testnet_rehearsal_report=tmp_path / "btc_testnet.json",
+    )
+    eth = product(
+        tmp_path,
+        name="active_income__ethusdt",
+        symbol="ETHUSDT",
+        strategies_path=tmp_path / "eth.json",
+        state_file=tmp_path / "eth_state.json",
+        trade_log=tmp_path / "eth_trades.csv",
+        preflight_report=tmp_path / "eth_preflight.json",
+        testnet_rehearsal_report=tmp_path / "eth_testnet.json",
+    )
+    btc.state_file.write_text(
+        json.dumps({"open_positions": {"btc": {"direction": "long"}}}),
+        encoding="utf-8",
+    )
+    seen = {}
+
+    def supervise(product_config, **kwargs):
+        seen[product_config.name] = kwargs.get("allow_entries", True)
+        return {"product": {"name": product_config.name}, "ok": True}
+
+    monkeypatch.setattr("src.autopilot.runtime.run_product_once", supervise)
+    cfg = AutopilotConfig(
+        control_file=tmp_path / "control.json",
+        status_file=tmp_path / "status.json",
+        approval_ledger=tmp_path / "approvals.json",
+        alert_file=tmp_path / "alerts.jsonl",
+        alert_state_file=tmp_path / "alert_state.json",
+        products=[btc, eth],
+        active_income_max_open_positions=1,
+    )
+
+    report = run_once(cfg, run_jobs=False)
+
+    assert report["ok"] is True
+    assert seen == {
+        "active_income": False,
+        "active_income__ethusdt": False,
+    }
+    assert report["active_income_portfolio"]["open_positions"] == 1
+    assert report["active_income_portfolio"]["entry_capacity_available"] is False
 
 
 def test_run_once_supervises_products_before_scheduled_jobs(monkeypatch, tmp_path):

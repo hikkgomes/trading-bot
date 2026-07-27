@@ -309,12 +309,13 @@ artifacts for missing paper products. These probes are marked
 order flow while research looks for validated edges, but the approval and live
 policy paths reject them.
 
-Product symbols are policy-checked at startup. The current system is scoped to
-BTC/USDT data and execution: `btc_accumulation` must be spot BTC/USDT, while
-`active_income` must be BTC/USDT on USDT-margined futures. Binance compact
-symbols (`BTCUSDT`) and ccxt forms (`BTC/USDT`, `BTC/USDT:USDT`) are accepted
-where they describe the same instrument; data fetches use compact Binance REST
-symbols and ccxt broker calls are normalized internally.
+Product symbols are policy-checked at startup. `btc_accumulation` remains
+strictly spot BTC/USDT. `active_income` may use a USDT-quoted perpetual selected
+by the liquidity universe, but every executable symbol is a separate configured
+product with separate state/evidence and live approval. Binance compact symbols
+(`ETHUSDT`) and ccxt forms (`ETH/USDT`, `ETH/USDT:USDT`) are accepted where they
+describe the same instrument; data fetches use compact Binance REST symbols and
+ccxt broker calls are normalized internally.
 
 Before any artifact is executed, the runtime also applies a product-aware
 strategy policy: positive finite holdout evidence, bounded finite risk per
@@ -418,6 +419,15 @@ autopilot as `strategy_framework_smoke`.
 creates or resumes behaviorally unique active-income and BTC-accumulation ideas,
 then the research cycle validates them, checkpoints every candidate in SQLite,
 and exports only candidates that passed the protected holdout gate.
+The daily universe screen evaluates all currently trading Binance USDT
+perpetuals, applies maturity, volume, activity, spread, open-interest, and
+funding gates, selects at most 25 markets, and writes an append-only snapshot
+under `runtime/market_universe_snapshots/`. The snapshot ID is carried into
+every generated hypothesis. Eligible markets expand across scalping, day, and
+swing templates; the 50-candidate daily budget covers about 16 symbols across
+all three horizons and rotates deterministically when more qualify. History and
+validation failures are isolated per symbol, so one unavailable altcoin cannot
+block healthy markets.
 Paper products continue to receive successful exports at their configured
 `strategies_path`. Live products are different by design: research writes only
 to `runtime/candidates/<product>.json` and never replaces the configured active
@@ -646,9 +656,12 @@ trade logs.
 
 An autonomous research cycle cannot change a live product's active strategy.
 For a product already configured `live`, research stages
-`runtime/candidates/<product>.json`; the dedicated 45-second candidate-paper
-timer runs that candidate through a separate paper bot. State is isolated by candidate
-digest, while the trade log and review use stable paths:
+`runtime/candidates/<product>.json`. A keeper for another eligible symbol is
+staged as `runtime/candidates/active_income__<symbol>.json`; it cannot be
+activated until that exact product/symbol is explicitly added to configuration.
+The dedicated 45-second candidate-paper timer discovers these artifacts and
+runs each through a separate paper bot. State is isolated by candidate digest,
+while the trade log and review use stable paths:
 
 - `runtime/candidates/<product>_paper_state_<digest-prefix>.json`
 - `runtime/candidates/<product>_paper_trades.csv`
@@ -666,6 +679,9 @@ rows matching the exact strategy fingerprint, candidate artifact digest,
 observation schema, and current candidate-paper engine digest count. By default
 every strategy needs at least 20 such trades spanning at least seven days,
 positive sized return, and the configured drawdown/loss-streak limits. The
+cross-symbol candidate and configured-product portfolio allows at most
+`active_income_max_open_positions` open positions (3 by default); at the cap,
+all bots keep managing exits but new entries are disabled. The
 45-second timer adds public market data, CPU, and disk activity; the dedicated
 unit retains configured CPU, memory, task, timeout, non-overlap-lock, and
 bounded catch-up limits.

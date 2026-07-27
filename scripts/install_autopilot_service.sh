@@ -234,6 +234,7 @@ echo "Validating operations-only alert settings..."
 "$PYTHON" -m src.autopilot.alert_settings --file "$ALERT_ENV_FILE"
 echo "Checking autopilot readiness..."
 "$PYTHON" -m src.autopilot.readiness --config "$CONFIG" \
+  --allow-data-bootstrap \
   --output "$REPO/runtime/readiness_report.md" \
   --json-output "$REPO/runtime/readiness_report.json"
 APPROVAL_LEDGER="$(configured_project_path "approval_ledger" "runtime/approvals.json")"

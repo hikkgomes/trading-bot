@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,7 @@ def _paper_result(
     config: AutopilotConfig,
     *,
     candidate_dir: Path,
+    allow_entries: bool = True,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"product": product.name, "ok": True}
     if product.execution_mode != "live":
@@ -90,7 +92,7 @@ def _paper_result(
         market=product.market,
         objective=product.objective,
         base_asset=product.base_asset,
-        allow_entries=True,
+        allow_entries=allow_entries,
         artifact_payload=candidate,
     )
     replay = bot.run_candidate_replay_cycle(
@@ -143,7 +145,88 @@ def _paper_result(
         "equity": state.get("equity"),
         "open_positions": len(state.get("open_positions", {})),
         "drawdown_halted": state.get("drawdown_halted"),
+        "portfolio_entries_allowed": allow_entries,
     }
+
+
+def _candidate_portfolio_status(
+    candidate_dir: Path,
+    *,
+    max_open_positions: int,
+) -> dict[str, Any]:
+    states: dict[str, Any] = {}
+    total = 0
+    ok = True
+    for path in sorted(candidate_dir.glob("*_paper_state_*.json")):
+        item: dict[str, Any] = {"ok": False, "open_positions": 0}
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("candidate paper state must be a regular non-symlink file")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            positions = payload.get("open_positions") if isinstance(payload, dict) else None
+            if not isinstance(positions, dict):
+                raise ValueError("candidate paper state open_positions must be an object")
+            item.update(ok=True, open_positions=len(positions))
+            total += len(positions)
+        except Exception as exc:
+            item["error"] = f"{type(exc).__name__}: {exc}"
+            ok = False
+        states[str(path)] = item
+    return {
+        "ok": ok,
+        "open_positions": total,
+        "max_open_positions": max_open_positions,
+        "entry_capacity_available": ok and total < max_open_positions,
+        "states": states,
+    }
+
+
+def _discovered_symbol_products(
+    config: AutopilotConfig,
+    *,
+    candidate_dir: Path,
+) -> list[ProductConfig]:
+    base = next(
+        (product for product in config.products if product.name == "active_income"),
+        None,
+    )
+    if base is None:
+        return []
+    products: list[ProductConfig] = []
+    for path in sorted(candidate_dir.glob(f"{base.name}__*usdt.json")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        candidate = load_artifact(path)
+        identity = candidate.get("product")
+        if not isinstance(identity, dict):
+            raise ValueError(f"{path}: staged symbol candidate has no product identity")
+        name = str(identity.get("name") or "")
+        symbol = str(identity.get("symbol") or "").upper()
+        expected_name = f"{base.name}__{symbol.lower()}"
+        if (
+            name != expected_name
+            or path != candidate_path_for_product(name, candidate_dir=candidate_dir)
+            or identity.get("objective") != "active_income"
+            or identity.get("market") != "futures"
+            or not symbol.endswith("USDT")
+            or symbol == base.symbol.upper()
+        ):
+            raise ValueError(f"{path}: invalid staged symbol candidate identity")
+        product = dataclasses.replace(
+            base,
+            name=name,
+            execution_mode="live",
+            symbol=symbol,
+            strategies_path=path,
+            state_file=candidate_dir / f"{name}_state.json",
+            trade_log=candidate_dir / f"{name}_paper_trades.csv",
+            preflight_report=candidate_dir / f"{name}_preflight_report.json",
+            testnet_rehearsal_report=(candidate_dir / f"{name}_testnet_rehearsal_report.json"),
+        )
+        if candidate.get("product") != product_identity(product):
+            raise ValueError(f"{path}: staged symbol candidate product identity mismatch")
+        products.append(product)
+    return products
 
 
 def run_candidate_paper(
@@ -155,13 +238,26 @@ def run_candidate_paper(
         "generated_at": utc_now(),
         "ok": True,
         "products": [],
+        "portfolio": _candidate_portfolio_status(
+            candidate_dir,
+            max_open_positions=config.active_income_max_open_positions,
+        ),
     }
     candidate_dir.mkdir(parents=True, exist_ok=True)
     if candidate_dir.is_symlink():
         raise ValueError(f"candidate paper directory must not be a symlink: {candidate_dir}")
     for product in config.products:
         try:
-            item = _paper_result(product, config, candidate_dir=candidate_dir)
+            portfolio = _candidate_portfolio_status(
+                candidate_dir,
+                max_open_positions=config.active_income_max_open_positions,
+            )
+            item = _paper_result(
+                product,
+                config,
+                candidate_dir=candidate_dir,
+                allow_entries=bool(portfolio["entry_capacity_available"]),
+            )
         except Exception as exc:
             item = {
                 "product": product.name,
@@ -170,6 +266,48 @@ def run_candidate_paper(
             }
         report["products"].append(item)
         report["ok"] = report["ok"] and bool(item.get("ok"))
+    try:
+        discovered = _discovered_symbol_products(config, candidate_dir=candidate_dir)
+    except Exception as exc:
+        report["products"].append(
+            {
+                "product": "active_income_symbol_discovery",
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        report["ok"] = False
+        discovered = []
+    configured_names = {product.name for product in config.products}
+    for product in discovered:
+        if product.name in configured_names:
+            continue
+        try:
+            portfolio = _candidate_portfolio_status(
+                candidate_dir,
+                max_open_positions=config.active_income_max_open_positions,
+            )
+            item = _paper_result(
+                product,
+                config,
+                candidate_dir=candidate_dir,
+                allow_entries=bool(portfolio["entry_capacity_available"]),
+            )
+            item["configured_for_execution"] = False
+            item["activation_blocked_until_product_configured"] = True
+        except Exception as exc:
+            item = {
+                "product": product.name,
+                "ok": False,
+                "configured_for_execution": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        report["products"].append(item)
+        report["ok"] = report["ok"] and bool(item.get("ok"))
+    report["portfolio"] = _candidate_portfolio_status(
+        candidate_dir,
+        max_open_positions=config.active_income_max_open_positions,
+    )
     return report
 
 

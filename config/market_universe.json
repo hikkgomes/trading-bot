@@ -2,11 +2,12 @@
   "version": 1,
   "market": "futures",
   "quote_asset": "USDT",
-  "research_symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"],
-  "watchlist_symbols": [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
-    "DOGEUSDT", "LINKUSDT", "ADAUSDT", "BCHUSDT"
-  ],
+  "discovery": {
+    "mode": "all_trading_usdt_perpetuals",
+    "maximum_research_symbols": 25,
+    "always_include": ["BTCUSDT"],
+    "exclude": []
+  },
   "criteria": {
     "minimum_listing_days": 1000,
     "minimum_24h_quote_volume_usdt": 50000000,

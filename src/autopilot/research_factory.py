@@ -308,6 +308,7 @@ class ResearchFactoryConfig:
     proposal_state_path: Path
     budgets: FactoryBudgets
     search_spaces: tuple[SearchSpace, ...]
+    dynamic_active_income_universe: bool = False
 
 
 def load_factory_config(path: Path = DEFAULT_CONFIG) -> ResearchFactoryConfig:
@@ -322,6 +323,7 @@ def load_factory_config(path: Path = DEFAULT_CONFIG) -> ResearchFactoryConfig:
         "budgets",
         "holdout_policy",
         "search_spaces",
+        "dynamic_active_income_universe",
     }
     unknown = sorted(set(payload) - allowed)
     if unknown:
@@ -330,6 +332,9 @@ def load_factory_config(path: Path = DEFAULT_CONFIG) -> ResearchFactoryConfig:
         )
     if payload.get("version") != 1:
         raise ResearchFactoryConfigError("research config version must be 1")
+    dynamic_universe = payload.get("dynamic_active_income_universe", False)
+    if not isinstance(dynamic_universe, bool):
+        raise ResearchFactoryConfigError("dynamic_active_income_universe must be a boolean")
     holdout = payload.get("holdout_policy")
     required_holdout = {
         "canonical_behavior_claims": True,
@@ -457,6 +462,7 @@ def load_factory_config(path: Path = DEFAULT_CONFIG) -> ResearchFactoryConfig:
         ),
         budgets=FactoryBudgets.from_dict(payload.get("budgets") or {}),
         search_spaces=spaces,
+        dynamic_active_income_universe=dynamic_universe,
     )
 
 
@@ -464,15 +470,20 @@ def _utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
-def _search_spaces_for_cycle(
-    config: ResearchFactoryConfig,
+def _market_universe_context(
     *,
     generated_at: str,
     report_path: Path = DEFAULT_MARKET_UNIVERSE_REPORT,
-) -> tuple[SearchSpace, ...]:
-    """Gate non-BTC research on a fresh daily liquidity screen."""
+) -> dict[str, Any]:
+    """Return a fresh, immutable research-universe selection or the BTC fallback."""
 
-    eligible = {"BTCUSDT"}
+    context: dict[str, Any] = {
+        "eligible_symbols": ["BTCUSDT"],
+        "snapshot_id": None,
+        "generated_at": None,
+        "selection_mode": "btc_fallback",
+        "fresh": False,
+    }
     try:
         report = (
             _strict_json_file(
@@ -485,18 +496,89 @@ def _search_spaces_for_cycle(
         )
     except ResearchFactoryConfigError:
         report = {}
-    if report.get("ok") is True:
+    snapshot = report.get("snapshot")
+    if (
+        report.get("ok") is True
+        and report.get("schema") == "autopilot.market_universe/v2"
+        and isinstance(snapshot, Mapping)
+        and isinstance(snapshot.get("id"), str)
+        and str(snapshot["id"]).startswith("sha256:")
+    ):
         try:
             report_at = datetime.fromisoformat(str(report["generated_at"]).replace("Z", "+00:00"))
             cycle_at = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
             if abs((cycle_at - report_at).total_seconds()) <= 48 * 3600:
-                eligible.update(
-                    str(symbol)
+                eligible = {
+                    str(symbol).upper()
                     for symbol in report.get("eligible_research_symbols") or []
-                    if isinstance(symbol, str)
-                )
+                    if isinstance(symbol, str) and symbol.upper().endswith("USDT")
+                }
+                context = {
+                    "eligible_symbols": sorted(eligible),
+                    "snapshot_id": snapshot.get("id"),
+                    "generated_at": report.get("generated_at"),
+                    "selection_mode": report.get("selection_mode") or "screened",
+                    "fresh": True,
+                }
         except (KeyError, TypeError, ValueError):
             pass
+    return context
+
+
+def _symbol_space(template: SearchSpace, symbol: str) -> SearchSpace:
+    symbol = symbol.upper()
+    name = template.name if symbol == template.symbol else f"{template.name}_{symbol.lower()}"
+    return dataclasses.replace(template, name=name, symbol=symbol)
+
+
+def resolve_search_space(
+    config: ResearchFactoryConfig,
+    metadata: Mapping[str, Any],
+) -> SearchSpace:
+    """Resolve a batch search space, including a dynamically expanded symbol."""
+
+    requested_name = str(metadata.get("search_space") or "")
+    exact = next((space for space in config.search_spaces if space.name == requested_name), None)
+    if exact is not None:
+        return exact
+    if not config.dynamic_active_income_universe:
+        raise KeyError(requested_name)
+    symbol = str(metadata.get("symbol") or "").upper()
+    matches = [
+        space
+        for space in config.search_spaces
+        if space.product == "active_income"
+        and space.opportunity_type == metadata.get("opportunity_type")
+        and space.base_timeframe == metadata.get("base_timeframe")
+    ]
+    if len(matches) != 1:
+        raise KeyError(requested_name)
+    expanded = _symbol_space(matches[0], symbol)
+    if expanded.name != requested_name:
+        raise KeyError(requested_name)
+    return expanded
+
+
+def _search_spaces_for_cycle(
+    config: ResearchFactoryConfig,
+    *,
+    generated_at: str,
+    report_path: Path = DEFAULT_MARKET_UNIVERSE_REPORT,
+) -> tuple[SearchSpace, ...]:
+    """Gate and optionally expand active-income research from the daily screen."""
+
+    context = _market_universe_context(generated_at=generated_at, report_path=report_path)
+    eligible = set(context["eligible_symbols"])
+    if config.dynamic_active_income_universe:
+        templates = [space for space in config.search_spaces if space.product == "active_income"]
+        expanded = [
+            _symbol_space(template, symbol) for symbol in sorted(eligible) for template in templates
+        ]
+        return (
+            *(space for space in config.search_spaces if space.product == "btc_accumulation"),
+            *expanded,
+        )
+    eligible = eligible or {"BTCUSDT"}
     return tuple(
         space
         for space in config.search_spaces
@@ -1140,7 +1222,13 @@ def build_generation(
     generated_at = now or _utc_now()
     cycle_seed = _seed_for_cycle(config, generated_at, seed)
     cycle_spaces = _search_spaces_for_cycle(config, generated_at=generated_at)
+    universe_context = _market_universe_context(generated_at=generated_at)
     rng = random.Random(cycle_seed)
+    if config.dynamic_active_income_universe:
+        btc_spaces = [space for space in cycle_spaces if space.product == "btc_accumulation"]
+        active_spaces = [space for space in cycle_spaces if space.product == "active_income"]
+        rng.shuffle(active_spaces)
+        cycle_spaces = (*btc_spaces, *active_spaces)
     budgets = config.budgets
     limits = GrammarLimits(max_total_predicates=budgets.max_total_predicates)
     deadline = time.monotonic() + budgets.max_generation_seconds
@@ -1440,7 +1528,15 @@ def build_generation(
         set(proposal_state.get("processed") or {}),
     )
     hypotheses = [item["hypothesis"].to_dict() for item in accepted]
-    metadata = [item["metadata"] for item in accepted]
+    metadata = [
+        {
+            **item["metadata"],
+            "universe_snapshot_id": universe_context["snapshot_id"],
+            "universe_generated_at": universe_context["generated_at"],
+            "universe_selection_mode": universe_context["selection_mode"],
+        }
+        for item in accepted
+    ]
     elapsed = max(0.0, budgets.max_generation_seconds - max(0.0, deadline - time.monotonic()))
     timed_out = time.monotonic() >= deadline
     return {
@@ -1455,6 +1551,7 @@ def build_generation(
             "research_engine_digest": research_engine_digest,
             "openclaw_optional": True,
             "eligible_search_spaces": [space.name for space in cycle_spaces],
+            "market_universe": universe_context,
         },
         "budget": {
             "candidate_limit": budgets.max_candidates_per_cycle,

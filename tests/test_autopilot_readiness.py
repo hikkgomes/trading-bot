@@ -34,6 +34,58 @@ systemctl --user enable --now "$HEALTHCHECK_TIMER_NAME"
 """
 
 
+def test_dynamic_universe_readiness_checks_every_selected_symbol(tmp_path, monkeypatch):
+    universe = tmp_path / "market_universe.json"
+    snapshot = tmp_path / "snapshot.json"
+    payload = {
+        "ok": True,
+        "schema": "autopilot.market_universe/v2",
+        "generated_at": readiness.datetime.now(readiness.UTC).isoformat(),
+        "eligible_research_symbols": ["BTCUSDT", "ETHUSDT"],
+        "snapshot": {
+            "id": "sha256:" + "1" * 64,
+            "append_only": True,
+        },
+    }
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    payload["snapshot"]["path"] = str(snapshot)
+    universe.write_text(json.dumps(payload), encoding="utf-8")
+    job = JobConfig(
+        name="market_universe_screen",
+        enabled=True,
+        command=[
+            ".venv/bin/python",
+            "-m",
+            "src.autopilot.market_universe",
+            "--output",
+            "market_universe.json",
+        ],
+        cadence_seconds=86400,
+        working_dir=tmp_path,
+    )
+    cfg = AutopilotConfig(jobs=[job])
+    monkeypatch.setattr(
+        readiness,
+        "build_market_data_status",
+        lambda *, market, symbol: {"ok": symbol == "BTCUSDT"},
+    )
+    monkeypatch.setattr(
+        readiness,
+        "build_indicator_feature_status",
+        lambda required, *, market, symbol: {"ok": True},
+    )
+
+    status = readiness._dynamic_universe_readiness(
+        cfg,
+        load_factory_config(),
+    )
+
+    assert status is not None
+    assert status["ok"] is False
+    assert status["symbols"]["BTCUSDT"]["ok"] is True
+    assert status["symbols"]["ETHUSDT"]["ok"] is False
+
+
 def product(tmp_path, **overrides):
     payload = {
         "name": "active_income",

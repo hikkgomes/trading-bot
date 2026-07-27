@@ -222,6 +222,9 @@ REQUIRED_CORE_PRODUCTS = {
     "active_income": "active_income",
 }
 REQUIRED_CORE_JOBS = (
+    "market_universe_screen",
+    "market_data_update_universe",
+    "market_data_update_universe_1m",
     "market_data_update_futures",
     "market_data_update_futures_1m",
     "market_data_update_spot",
@@ -236,6 +239,9 @@ REQUIRED_CORE_JOBS = (
     "artifact_hygiene",
 )
 REQUIRED_CORE_JOB_MODULES = {
+    "market_universe_screen": "src.autopilot.market_universe",
+    "market_data_update_universe": "src.autopilot.universe_history",
+    "market_data_update_universe_1m": "src.autopilot.universe_history",
     "market_data_update_futures": "src.autopilot.history_bootstrap",
     "market_data_update_futures_1m": "src.autopilot.history_bootstrap",
     "market_data_update_spot": "src.autopilot.history_bootstrap",
@@ -250,6 +256,23 @@ REQUIRED_CORE_JOB_MODULES = {
     "artifact_hygiene": "src.autopilot.artifact_hygiene",
 }
 REQUIRED_CORE_JOB_FLAG_VALUES = {
+    "market_universe_screen": {
+        "--config": ("config/market_universe.json",),
+        "--output": ("runtime/market_universe.json",),
+        "--snapshot-dir": ("runtime/market_universe_snapshots",),
+    },
+    "market_data_update_universe": {
+        "--config": ("config/research_factory.json",),
+        "--market-universe-report": ("runtime/market_universe.json",),
+        "--exclude-timeframes": ("1m",),
+        "--output": ("runtime/universe_history.json",),
+    },
+    "market_data_update_universe_1m": {
+        "--config": ("config/research_factory.json",),
+        "--market-universe-report": ("runtime/market_universe.json",),
+        "--timeframes": ("1m",),
+        "--output": ("runtime/universe_history_1m.json",),
+    },
     "market_data_update_futures": {
         "--config": ("config/research_factory.json",),
         "--market": ("futures",),
@@ -321,6 +344,8 @@ REQUIRED_CORE_JOB_PRESENCE_FLAGS = {
     "research_cycle": ("--include-generated", "--generated-only"),
 }
 REQUIRED_CORE_JOB_FORBIDDEN_FLAGS = {
+    "market_data_update_universe": ("--timeframes",),
+    "market_data_update_universe_1m": ("--exclude-timeframes",),
     "market_data_update_futures": ("--timeframes",),
     "market_data_update_futures_1m": ("--exclude-timeframes",),
     "market_data_update_spot": ("--timeframes", "--exclude-timeframes"),
@@ -747,6 +772,12 @@ def validate_config(
             errors.extend(_validate_python_module_dependencies(job))
     if config.alert_cooldown_seconds < 0:
         errors.append("alert_cooldown_seconds must be non-negative")
+    if (
+        isinstance(config.active_income_max_open_positions, bool)
+        or not isinstance(config.active_income_max_open_positions, int)
+        or not 1 <= config.active_income_max_open_positions <= 20
+    ):
+        errors.append("active_income_max_open_positions must be an integer in [1, 20]")
     if require_core_products:
         errors.extend(_core_product_errors(config.products))
     if validate_jobs and require_core_jobs:
@@ -1692,6 +1723,38 @@ def _local_open_position_count(product: ProductConfig) -> int | None:
     if not isinstance(positions, dict):
         return None
     return len(positions)
+
+
+def _active_income_portfolio_status(config: AutopilotConfig) -> dict[str, Any]:
+    products: dict[str, Any] = {}
+    total = 0
+    ok = True
+    for product in config.products:
+        if not product.enabled or product.objective != "active_income":
+            continue
+        item: dict[str, Any] = {
+            "state_file": str(product.state_file),
+            "open_positions": 0,
+            "ok": True,
+        }
+        if product.state_file.is_symlink():
+            item.update(ok=False, reason="state_file_symlink")
+        elif product.state_file.exists():
+            count = _local_open_position_count(product)
+            if count is None:
+                item.update(ok=False, reason="state_file_unreadable")
+            else:
+                item["open_positions"] = count
+                total += count
+        products[product.name] = item
+        ok = ok and bool(item["ok"])
+    return {
+        "ok": ok,
+        "open_positions": total,
+        "max_open_positions": config.active_income_max_open_positions,
+        "entry_capacity_available": ok and total < config.active_income_max_open_positions,
+        "products": products,
+    }
 
 
 def _local_state_requires_management(product: ProductConfig) -> bool:
@@ -4528,6 +4591,7 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
         "data_update": None,
         "jobs": [],
         "products": [],
+        "active_income_portfolio": _active_income_portfolio_status(config),
     }
     if config.job_config_errors:
         # Continue product management, but make the isolated job failure loud
@@ -4614,9 +4678,16 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
             product_kwargs: dict[str, Any] = {
                 "approval_ledger": config.approval_ledger,
             }
+            portfolio_gate: dict[str, Any] | None = None
+            if product.objective == "active_income":
+                portfolio_gate = _active_income_portfolio_status(config)
+                if not portfolio_gate["entry_capacity_available"]:
+                    product_kwargs["allow_entries"] = False
             if product.execution_mode == "live":
                 product_kwargs["config"] = config
             product_status = run_product_once(product, **product_kwargs)
+            if portfolio_gate is not None:
+                product_status["portfolio_entry_gate"] = portfolio_gate
         except (
             ApprovalError,
             FileNotFoundError,
@@ -4632,6 +4703,8 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
             }
         report["products"].append(product_status)
         report["ok"] = report["ok"] and bool(product_status.get("ok"))
+        if product.objective == "active_income":
+            report["active_income_portfolio"] = _active_income_portfolio_status(config)
 
     # Product supervision and emergency flattening always run before bounded
     # maintenance/research work.  A slow data job must never postpone the first

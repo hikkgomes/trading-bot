@@ -16,6 +16,7 @@ import os
 import shutil
 import stat
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +43,9 @@ from src.autopilot.experiment_memory import (
 )
 from src.autopilot.io import write_json_atomic, write_text_atomic
 from src.autopilot.market_data import (
+    build_indicator_feature_status,
     build_indicator_feature_statuses,
+    build_market_data_status,
     build_market_data_statuses,
     required_indicator_features_by_market,
 )
@@ -71,6 +74,142 @@ LOGGER = logging.getLogger("autopilot.readiness")
 MAX_READINESS_BATCH_BYTES = 8 * 1024 * 1024
 _MEMORY_READINESS_CACHE_KEY: tuple[str, int, int, int] | None = None
 _MEMORY_READINESS_CACHE_VALUE: dict[str, Any] | None = None
+
+
+def _job_flag_value(command: list[str], flag: str) -> str | None:
+    try:
+        index = command.index(flag)
+    except ValueError:
+        return None
+    if index + 1 >= len(command) or command[index + 1].startswith("--"):
+        return None
+    return command[index + 1]
+
+
+def _dynamic_universe_readiness(
+    config: AutopilotConfig,
+    factory: ResearchFactoryConfig | None,
+) -> dict[str, Any] | None:
+    if factory is None or not factory.dynamic_active_income_universe:
+        return None
+    job = next(
+        (
+            item
+            for item in config.jobs
+            if item.enabled and "src.autopilot.market_universe" in " ".join(item.command)
+        ),
+        None,
+    )
+    if job is None:
+        return None
+    output_value = _job_flag_value(job.command, "--output")
+    if output_value is None:
+        return {
+            "ok": False,
+            "reason": "market_universe_output_missing",
+            "symbols": {},
+        }
+    report_path = Path(output_value)
+    if not report_path.is_absolute():
+        report_path = job.working_dir / report_path
+    status: dict[str, Any] = {
+        "ok": False,
+        "path": str(report_path),
+        "symbols": {},
+    }
+    if report_path.is_symlink() or not report_path.exists():
+        status["reason"] = "market_universe_report_missing"
+        return status
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        generated_at = datetime.fromisoformat(
+            str(payload["generated_at"]).replace("Z", "+00:00")
+        ).astimezone(UTC)
+    except Exception as exc:
+        status.update(
+            reason="market_universe_report_invalid",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return status
+    snapshot = payload.get("snapshot")
+    snapshot_id = snapshot.get("id") if isinstance(snapshot, dict) else None
+    snapshot_value = snapshot.get("path") if isinstance(snapshot, dict) else None
+    snapshot_valid = False
+    if isinstance(snapshot_value, str) and snapshot_value:
+        snapshot_path = Path(snapshot_value)
+        if not snapshot_path.is_absolute():
+            snapshot_path = job.working_dir / snapshot_path
+        try:
+            snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            snapshot_valid = bool(
+                not snapshot_path.is_symlink()
+                and isinstance(snapshot_payload, dict)
+                and (snapshot_payload.get("snapshot") or {}).get("id") == snapshot_id
+                and snapshot_payload.get("generated_at") == payload.get("generated_at")
+                and snapshot_payload.get("eligible_research_symbols")
+                == payload.get("eligible_research_symbols")
+            )
+        except Exception:
+            snapshot_valid = False
+    symbols = [
+        str(symbol).upper()
+        for symbol in payload.get("eligible_research_symbols") or []
+        if isinstance(symbol, str)
+    ]
+    age_seconds = (datetime.now(UTC) - generated_at).total_seconds()
+    report_ok = bool(
+        payload.get("ok") is True
+        and payload.get("schema") == "autopilot.market_universe/v2"
+        and isinstance(snapshot_id, str)
+        and snapshot_id.startswith("sha256:")
+        and snapshot.get("append_only") is True
+        and snapshot_valid
+        and 0 <= age_seconds <= 48 * 3600
+        and symbols
+    )
+    required = required_indicator_features_by_market(
+        ["futures"],
+        jobs=config.jobs,
+    )["futures"]
+    symbol_statuses: dict[str, Any] = {}
+    for symbol in symbols:
+        market_data = build_market_data_status(
+            market="futures",
+            symbol=symbol,
+        )
+        indicators = build_indicator_feature_status(
+            required,
+            market="futures",
+            symbol=symbol,
+        )
+        symbol_statuses[symbol] = {
+            "ok": bool(market_data.get("ok") and indicators.get("ok")),
+            "market_data": market_data,
+            "indicator_features": indicators,
+        }
+    symbols_ready = bool(symbol_statuses) and all(item["ok"] for item in symbol_statuses.values())
+    status.update(
+        {
+            "ok": report_ok and symbols_ready,
+            "reason": (
+                "ready"
+                if report_ok and symbols_ready
+                else (
+                    "symbol_data_not_ready"
+                    if report_ok
+                    else "market_universe_report_not_fresh_or_snapshotted"
+                )
+            ),
+            "generated_at": payload.get("generated_at"),
+            "age_seconds": round(age_seconds, 3),
+            "snapshot_id": snapshot_id,
+            "snapshot_path": snapshot_value,
+            "snapshot_valid": snapshot_valid,
+            "eligible_symbols": symbols,
+            "symbols": symbol_statuses,
+        }
+    )
+    return status
 
 
 def _check(name: str, ok: bool, *, level: str = "error", detail: Any = None) -> dict[str, Any]:
@@ -1004,6 +1143,7 @@ def build_readiness_report(
     ccxt_available: bool | None = None,
     require_core_products: bool = False,
     require_core_jobs: bool = False,
+    allow_data_bootstrap: bool = False,
 ) -> dict[str, Any]:
     env = _readiness_env() if env is None else env
     checks: list[dict[str, Any]] = []
@@ -1204,6 +1344,23 @@ def build_readiness_report(
             detail=indicator_features,
         )
     )
+    dynamic_universe = _dynamic_universe_readiness(config, loaded_factory)
+    if dynamic_universe is not None:
+        dynamic_level = (
+            "warning"
+            if allow_data_bootstrap
+            or dynamic_universe.get("reason")
+            in {"market_universe_report_missing", "market_universe_output_missing"}
+            else "error"
+        )
+        checks.append(
+            _check(
+                "dynamic altcoin universe data readiness",
+                bool(dynamic_universe["ok"]),
+                level=dynamic_level,
+                detail=dynamic_universe,
+            )
+        )
     regime_data = build_regime_data_statuses(config.jobs)
     if regime_data:
         checks.append(
@@ -1323,6 +1480,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--output", type=Path, default=Path("runtime/readiness_report.md"))
     parser.add_argument("--json-output", type=Path, default=Path("runtime/readiness_report.json"))
+    parser.add_argument(
+        "--allow-data-bootstrap",
+        action="store_true",
+        help=(
+            "Keep missing dynamic-universe datasets nonblocking during service "
+            "installation so the installed history jobs can seed them."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1334,6 +1499,7 @@ def main() -> None:
             load_config(args.config),
             require_core_products=True,
             require_core_jobs=True,
+            allow_data_bootstrap=args.allow_data_bootstrap,
         )
     except Exception as exc:
         LOGGER.exception("Failed to build readiness report")

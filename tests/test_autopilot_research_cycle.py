@@ -909,6 +909,57 @@ def test_live_candidate_is_policy_checked_and_staged_without_touching_active(tmp
     assert report["artifact_digest"] == artifact_digest(candidate)
 
 
+def test_altcoin_keeper_stages_symbol_isolated_candidate(tmp_path, monkeypatch):
+    base = ProductConfig(
+        name="active_income",
+        enabled=True,
+        objective="active_income",
+        base_asset="USDT",
+        market="futures",
+        execution_mode="paper",
+        symbol="BTCUSDT",
+        strategies_path=tmp_path / "active.json",
+        state_file=tmp_path / "state.json",
+        trade_log=tmp_path / "trades.csv",
+        starting_equity=1000.0,
+    )
+    captured = {}
+
+    def stage(product, **kwargs):
+        captured["product"] = product
+        captured["kwargs"] = kwargs
+        return {
+            "ok": True,
+            "product": product.name,
+            "artifact": str(kwargs["out"]),
+            "exported": True,
+        }
+
+    monkeypatch.setattr(rc, "stage_live_product_candidate", stage)
+    reports = rc._stage_active_income_symbol_candidates(
+        [
+            {
+                "ok": True,
+                "name": "generated_active_income_day_dogeusdt",
+                "product": "active_income",
+                "market": "futures",
+                "symbol": "DOGEUSDT",
+                "keeper_ids": ["DOGE_KEEPER"],
+            }
+        ],
+        base_product=base,
+        export_cfg=rc.DEFAULT_EXPORTS["active_income"],
+        candidate_dir=tmp_path / "candidates",
+        log_path=tmp_path / "experiments.jsonl",
+    )
+
+    assert captured["product"].name == "active_income__dogeusdt"
+    assert captured["product"].symbol == "DOGEUSDT"
+    assert captured["kwargs"]["ids"] == ["DOGE_KEEPER"]
+    assert reports[0]["configured_for_execution"] is False
+    assert reports[0]["activation_blocked_until_product_configured"] is True
+
+
 def test_live_candidate_restage_preserves_exact_candidate_paper_state(tmp_path, monkeypatch):
     active = tmp_path / "active.json"
     active.write_text('{"sentinel": "approved-live-artifact"}', encoding="utf-8")

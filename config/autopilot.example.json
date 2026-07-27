@@ -17,6 +17,7 @@
   "candidate_paper_cadence_seconds": 45,
   "candidate_paper_max_unseen_bars": 240,
   "candidate_paper_timeout_seconds": 240,
+  "active_income_max_open_positions": 3,
   "job_state_file": "runtime/job_state.json",
   "lock_file": "runtime/autopilot.lock",
   "incubation_candidates_file": "runtime/incubation_candidates.json",
@@ -39,6 +40,44 @@
   "status_file": "runtime/status.json",
   "webhook_url_env": "AUTOPILOT_WEBHOOK_URL",
   "jobs": [
+    {
+      "name": "market_universe_screen",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.market_universe",
+        "--config", "config/market_universe.json",
+        "--output", "runtime/market_universe.json",
+        "--snapshot-dir", "runtime/market_universe_snapshots"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 180
+    },
+    {
+      "name": "market_data_update_universe",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.universe_history",
+        "--config", "config/research_factory.json",
+        "--market-universe-report", "runtime/market_universe.json",
+        "--exclude-timeframes", "1m",
+        "--output", "runtime/universe_history.json"
+      ],
+      "cadence_seconds": 21600,
+      "timeout_seconds": 1800
+    },
+    {
+      "name": "market_data_update_universe_1m",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.universe_history",
+        "--config", "config/research_factory.json",
+        "--market-universe-report", "runtime/market_universe.json",
+        "--timeframes", "1m",
+        "--output", "runtime/universe_history_1m.json"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 1800
+    },
     {
       "name": "market_data_update_futures",
       "enabled": true,

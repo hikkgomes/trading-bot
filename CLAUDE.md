@@ -13,8 +13,11 @@ Products:
 - `btc_accumulation`: BTC base asset, spot `BTCUSDT`, conservative BTC
   accumulation, no leverage. Strategy artifacts must use BTC PnL and beat
   buy-and-hold on holdout.
-- `active_income`: USDT base asset, Binance futures `BTCUSDT`, active
-  day/swing/scalp income with tight risk limits.
+- `active_income`: USDT base asset, Binance USDT futures, active
+  day/swing/scalp income with tight per-symbol and portfolio risk limits. The
+  checked-in executable product is `BTCUSDT`; a dynamic liquidity screen
+  researches eligible altcoins into symbol-isolated candidate artifacts that
+  cannot activate until the exact product/symbol is explicitly configured.
 
 The mandatory live gate is enforced in code: no new or changed strategy may run
 live unless its behavior fingerprint is explicitly approved in

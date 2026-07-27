@@ -45,6 +45,7 @@ def bootstrap_command_for_market(
     *,
     timeframes: Sequence[str] | None = None,
     config_path: str = DEFAULT_RESEARCH_FACTORY_CONFIG,
+    symbol: str | None = None,
 ) -> list[str]:
     command = [
         ".venv/bin/python",
@@ -55,6 +56,8 @@ def bootstrap_command_for_market(
         "--market",
         market,
     ]
+    if symbol is not None:
+        command.extend(["--symbol", symbol])
     if timeframes:
         command.extend(["--timeframes", *timeframes])
     command.extend(["--report", f"runtime/history_bootstrap_{market}.json"])
@@ -123,6 +126,7 @@ def build_market_data_status(
     path: Path | None = None,
     *,
     market: str | None = None,
+    symbol: str | None = None,
     now: dt.datetime | None = None,
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
 ) -> dict[str, Any]:
@@ -130,13 +134,14 @@ def build_market_data_status(
         raise ValueError("max_age_seconds must be positive")
 
     selected_market = market or bbid.MARKET
-    path = default_1m_candle_path(market=market) if path is None else path
+    selected_symbol = symbol or bbid.SYMBOL
+    path = default_1m_candle_path(market=market, symbol=selected_symbol) if path is None else path
     now = utc_now() if now is None else now.astimezone(dt.UTC)
     status: dict[str, Any] = {
         "ok": False,
         "path": str(path),
         "exists": path.exists(),
-        "symbol": bbid.SYMBOL,
+        "symbol": selected_symbol,
         "market": selected_market,
         "max_age_seconds": max_age_seconds,
     }
@@ -144,7 +149,10 @@ def build_market_data_status(
         status["reason"] = "missing_seed_dataset"
         status["remediation"] = {
             "action": "bootstrap_market_data",
-            "command": bootstrap_command_for_market(selected_market),
+            "command": bootstrap_command_for_market(
+                selected_market,
+                symbol=symbol,
+            ),
             "note": "Run once on the server with network access to create resumable native-timeframe history and pruned indicators.",
         }
         return status
@@ -206,8 +214,8 @@ def build_market_data_statuses(
     }
 
 
-def _indicator_path(indicator_dir: Path, timeframe: str) -> Path:
-    return indicator_dir / f"{bbid.SYMBOL}_{timeframe}_all_indicators.parquet"
+def _indicator_path(indicator_dir: Path, timeframe: str, *, symbol: str) -> Path:
+    return indicator_dir / f"{symbol}_{timeframe}_all_indicators.parquet"
 
 
 def _command_value(command: Sequence[str], flag: str) -> str | None:
@@ -313,21 +321,27 @@ def build_indicator_feature_status(
     required_features: dict[str, list[str]] | None = None,
     *,
     market: str | None = None,
+    symbol: str | None = None,
     indicator_dir: Path | None = None,
 ) -> dict[str, Any]:
     required_features = required_features or DEFAULT_REQUIRED_INDICATOR_FEATURES
     selected_market = market or bbid.MARKET
-    indicator_dir = default_indicator_dir(market=market) if indicator_dir is None else indicator_dir
+    selected_symbol = symbol or bbid.SYMBOL
+    indicator_dir = (
+        default_indicator_dir(market=market, symbol=selected_symbol)
+        if indicator_dir is None
+        else indicator_dir
+    )
 
     status: dict[str, Any] = {
         "ok": True,
         "indicator_dir": str(indicator_dir),
-        "symbol": bbid.SYMBOL,
+        "symbol": selected_symbol,
         "market": selected_market,
         "timeframes": {},
     }
     for timeframe, required in required_features.items():
-        path = _indicator_path(indicator_dir, timeframe)
+        path = _indicator_path(indicator_dir, timeframe, symbol=selected_symbol)
         entry: dict[str, Any] = {
             "ok": False,
             "path": str(path),

@@ -71,6 +71,7 @@ from src.autopilot.research_factory import (
 )
 from src.autopilot.research_factory import (
     load_factory_config,
+    resolve_search_space,
     strategy_behavior_spec,
 )
 from src.autopilot.research_history_contract import generated_history_contract
@@ -677,7 +678,6 @@ def _load_generated_scenarios(
             },
         )
     factory_config = load_factory_config(factory_config_path)
-    spaces = {space.name: space for space in factory_config.search_spaces}
     metadata_by_id = {
         str(item.get("id")): item
         for item in payload.get("generation_metadata") or []
@@ -695,7 +695,7 @@ def _load_generated_scenarios(
             hypothesis = Hypothesis.from_dict(item)
             metadata = metadata_by_id[hypothesis.id]
             space_name = str(metadata["search_space"])
-            space = spaces[space_name]
+            space = resolve_search_space(factory_config, metadata)
             expected_context = {
                 "product": space.product,
                 "market": space.market,
@@ -739,7 +739,8 @@ def _load_generated_scenarios(
     metadata_by_scenario: dict[str, dict[str, dict[str, Any]]] = {}
     cumulative_trials = _int_count((payload.get("summary") or {}).get("cumulative_trials"))
     for space_name, hypotheses in sorted(grouped.items()):
-        space = spaces[space_name]
+        exemplar_metadata = grouped_metadata[space_name][hypotheses[0].id]
+        space = resolve_search_space(factory_config, exemplar_metadata)
         contract = generated_history_contract(space)
         name = f"generated_{space.name}"
         scenarios.append(
@@ -2847,6 +2848,95 @@ def _current_keeper_ids(
     return sorted(set(ids))
 
 
+def _active_income_candidate_product(
+    base_product: ProductConfig,
+    symbol: str,
+    *,
+    candidate_dir: Path,
+) -> ProductConfig:
+    symbol = symbol.upper()
+    name = f"{base_product.name}__{symbol.lower()}"
+    return dataclasses.replace(
+        base_product,
+        name=name,
+        execution_mode="live",
+        symbol=symbol,
+        strategies_path=candidate_path_for_product(name, candidate_dir=candidate_dir),
+        state_file=candidate_dir / f"{name}_state.json",
+        trade_log=candidate_dir / f"{name}_paper_trades.csv",
+        preflight_report=candidate_dir / f"{name}_preflight_report.json",
+        testnet_rehearsal_report=candidate_dir / f"{name}_testnet_rehearsal_report.json",
+    )
+
+
+def _stage_active_income_symbol_candidates(
+    scenario_reports: list[dict[str, Any]],
+    *,
+    base_product: ProductConfig,
+    export_cfg: dict[str, Any],
+    candidate_dir: Path,
+    log_path: Path,
+) -> list[dict[str, Any]]:
+    symbols = sorted(
+        {
+            str(scenario.get("symbol") or "BTCUSDT").upper()
+            for scenario in scenario_reports
+            if scenario.get("product") == "active_income"
+            and scenario.get("market") == export_cfg["market"]
+            and scenario.get("ok")
+            and not scenario.get("skipped")
+            and scenario.get("keeper_ids")
+        }
+        - {base_product.symbol.upper()}
+    )
+    reports: list[dict[str, Any]] = []
+    for symbol in symbols:
+        product = _active_income_candidate_product(
+            base_product,
+            symbol,
+            candidate_dir=candidate_dir,
+        )
+        keeper_ids = _current_keeper_ids(
+            scenario_reports,
+            product="active_income",
+            market=str(export_cfg["market"]),
+            symbol=symbol,
+        )
+        try:
+            report = stage_live_product_candidate(
+                product,
+                pnl_unit=str(export_cfg["pnl_unit"]),
+                market=str(export_cfg["market"]),
+                out=product.strategies_path,
+                top_k=int(export_cfg["top_k"]),
+                ids=keeper_ids,
+                min_dsr=(
+                    float(export_cfg["min_dsr"]) if export_cfg.get("min_dsr") is not None else None
+                ),
+                log_path=log_path,
+            )
+            report.update(
+                research_product="active_income",
+                symbol=symbol,
+                configured_for_execution=False,
+                activation_blocked_until_product_configured=True,
+            )
+        except Exception as exc:
+            report = {
+                "ok": False,
+                "product": product.name,
+                "research_product": "active_income",
+                "symbol": symbol,
+                "exported": False,
+                "artifact": str(product.strategies_path),
+                "configured_for_execution": False,
+                "activation_blocked_until_product_configured": True,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        reports.append(report)
+    return reports
+
+
 def run_research_cycle(
     *,
     config_path: Path = DEFAULT_CONFIG_PATH,
@@ -3021,41 +3111,19 @@ def run_research_cycle(
     )
     for scenario in scenarios:
         try:
-            if history_failed_scenarios:
-                coverage = history_coverage.get(scenario.name)
-                if coverage is not None and not coverage.get("ok"):
-                    scenario_reports.append(
-                        _coverage_failure_report(
-                            scenario,
-                            coverage,
-                            selection=None,
-                            unsupported_hypotheses=[],
-                            research_factory_config_path=research_factory_config_path,
-                        )
+            coverage = history_coverage.get(scenario.name)
+            if coverage is not None and not coverage.get("ok"):
+                scenario_reports.append(
+                    _coverage_failure_report(
+                        scenario,
+                        coverage,
+                        selection=None,
+                        unsupported_hypotheses=[],
+                        research_factory_config_path=research_factory_config_path,
                     )
-                else:
-                    scenario_reports.append(
-                        _peer_coverage_gate_report(
-                            scenario,
-                            failed_scenarios=history_failed_scenarios,
-                            coverage=coverage,
-                            research_factory_config_path=research_factory_config_path,
-                        )
-                    )
+                )
                 continue
             if scenario.market not in ready_markets:
-                coverage = history_coverage.get(scenario.name)
-                if coverage is not None and not coverage.get("ok"):
-                    scenario_reports.append(
-                        _coverage_failure_report(
-                            scenario,
-                            coverage,
-                            selection=None,
-                            unsupported_hypotheses=[],
-                            research_factory_config_path=research_factory_config_path,
-                        )
-                    )
-                    continue
                 scenario_reports.append(
                     {
                         "ok": coverage is None,
@@ -3184,121 +3252,132 @@ def run_research_cycle(
     report["scenarios"] = scenario_reports
 
     export_reports: list[dict[str, Any]] = []
-    if all(bool(item.get("ok")) for item in scenario_reports):
-        for product, export_cfg in DEFAULT_EXPORTS.items():
-            product_config = configured_products.get(product)
-            if product_config is None:
-                export_reports.append(
-                    {
-                        "ok": False,
-                        "product": product,
-                        "exported": False,
-                        "reason": "product_not_configured",
-                        "detail": f"{product}: no matching product in {config_path}",
-                    }
-                )
-                continue
-            if product_config.execution_mode not in {"paper", "live"}:
-                export_reports.append(
-                    {
-                        "ok": False,
-                        "product": product,
-                        "exported": False,
-                        "reason": "unsupported_execution_mode",
-                        "detail": (
-                            f"{product}: execution_mode must be paper or live, got "
-                            f"{product_config.execution_mode!r}"
-                        ),
-                    }
-                )
-                continue
-            product_market = str(export_cfg["market"])
-            is_live = product_config.execution_mode == "live"
-            target_path = (
-                candidate_path_for_product(product, candidate_dir=candidate_dir)
-                if is_live
-                else product_config.strategies_path
+    has_healthy_scenario = any(bool(item.get("ok")) for item in scenario_reports)
+    for product, export_cfg in DEFAULT_EXPORTS.items() if has_healthy_scenario else ():
+        product_config = configured_products.get(product)
+        if product_config is None:
+            export_reports.append(
+                {
+                    "ok": False,
+                    "product": product,
+                    "exported": False,
+                    "reason": "product_not_configured",
+                    "detail": f"{product}: no matching product in {config_path}",
+                }
             )
-            keeper_ids = _current_keeper_ids(
+            continue
+        if product_config.execution_mode not in {"paper", "live"}:
+            export_reports.append(
+                {
+                    "ok": False,
+                    "product": product,
+                    "exported": False,
+                    "reason": "unsupported_execution_mode",
+                    "detail": (
+                        f"{product}: execution_mode must be paper or live, got "
+                        f"{product_config.execution_mode!r}"
+                    ),
+                }
+            )
+            continue
+        product_market = str(export_cfg["market"])
+        is_live = product_config.execution_mode == "live"
+        target_path = (
+            candidate_path_for_product(product, candidate_dir=candidate_dir)
+            if is_live
+            else product_config.strategies_path
+        )
+        keeper_ids = _current_keeper_ids(
+            scenario_reports,
+            product=product,
+            market=product_market,
+            symbol=product_config.symbol,
+        )
+        if not keeper_ids:
+            min_dsr = (
+                float(export_cfg["min_dsr"]) if export_cfg.get("min_dsr") is not None else None
+            )
+            export_reports.append(
+                {
+                    "ok": True,
+                    "product": product,
+                    "pnl_unit": str(export_cfg["pnl_unit"]),
+                    "market": product_market,
+                    "exported": False,
+                    "reason": "no_current_cycle_keepers",
+                    "artifact": str(target_path),
+                    "active_artifact": str(product_config.strategies_path),
+                    "destination": "staging" if is_live else "active",
+                    "staged": False,
+                    "activation_required": is_live,
+                    "ids": [],
+                    "min_dsr": min_dsr,
+                }
+            )
+            continue
+        try:
+            if is_live:
+                export_report = stage_live_product_candidate(
+                    product_config,
+                    pnl_unit=str(export_cfg["pnl_unit"]),
+                    market=product_market,
+                    out=target_path,
+                    top_k=int(export_cfg["top_k"]),
+                    ids=keeper_ids,
+                    min_dsr=(
+                        float(export_cfg["min_dsr"])
+                        if export_cfg.get("min_dsr") is not None
+                        else None
+                    ),
+                    log_path=log_path,
+                )
+            else:
+                export_report = export_product(
+                    product,
+                    pnl_unit=str(export_cfg["pnl_unit"]),
+                    market=product_market,
+                    out=target_path,
+                    top_k=int(export_cfg["top_k"]),
+                    ids=keeper_ids,
+                    min_dsr=(
+                        float(export_cfg["min_dsr"])
+                        if export_cfg.get("min_dsr") is not None
+                        else None
+                    ),
+                    log_path=log_path,
+                    state_file=product_config.state_file,
+                )
+                export_report.update(
+                    active_artifact=str(product_config.strategies_path),
+                    destination="active",
+                    staged=False,
+                    activation_required=False,
+                )
+            export_reports.append(export_report)
+        except Exception as exc:
+            export_reports.append(
+                {
+                    "ok": False,
+                    "product": product,
+                    "exported": False,
+                    "artifact": str(target_path),
+                    "active_artifact": str(product_config.strategies_path),
+                    "destination": "staging" if is_live else "active",
+                    "activation_required": is_live,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    active_income_product = configured_products.get("active_income")
+    if has_healthy_scenario and active_income_product is not None:
+        export_reports.extend(
+            _stage_active_income_symbol_candidates(
                 scenario_reports,
-                product=product,
-                market=product_market,
-                symbol=product_config.symbol,
+                base_product=active_income_product,
+                export_cfg=DEFAULT_EXPORTS["active_income"],
+                candidate_dir=candidate_dir,
+                log_path=log_path,
             )
-            if not keeper_ids:
-                min_dsr = (
-                    float(export_cfg["min_dsr"]) if export_cfg.get("min_dsr") is not None else None
-                )
-                export_reports.append(
-                    {
-                        "ok": True,
-                        "product": product,
-                        "pnl_unit": str(export_cfg["pnl_unit"]),
-                        "market": product_market,
-                        "exported": False,
-                        "reason": "no_current_cycle_keepers",
-                        "artifact": str(target_path),
-                        "active_artifact": str(product_config.strategies_path),
-                        "destination": "staging" if is_live else "active",
-                        "staged": False,
-                        "activation_required": is_live,
-                        "ids": [],
-                        "min_dsr": min_dsr,
-                    }
-                )
-                continue
-            try:
-                if is_live:
-                    export_report = stage_live_product_candidate(
-                        product_config,
-                        pnl_unit=str(export_cfg["pnl_unit"]),
-                        market=product_market,
-                        out=target_path,
-                        top_k=int(export_cfg["top_k"]),
-                        ids=keeper_ids,
-                        min_dsr=(
-                            float(export_cfg["min_dsr"])
-                            if export_cfg.get("min_dsr") is not None
-                            else None
-                        ),
-                        log_path=log_path,
-                    )
-                else:
-                    export_report = export_product(
-                        product,
-                        pnl_unit=str(export_cfg["pnl_unit"]),
-                        market=product_market,
-                        out=target_path,
-                        top_k=int(export_cfg["top_k"]),
-                        ids=keeper_ids,
-                        min_dsr=(
-                            float(export_cfg["min_dsr"])
-                            if export_cfg.get("min_dsr") is not None
-                            else None
-                        ),
-                        log_path=log_path,
-                        state_file=product_config.state_file,
-                    )
-                    export_report.update(
-                        active_artifact=str(product_config.strategies_path),
-                        destination="active",
-                        staged=False,
-                        activation_required=False,
-                    )
-                export_reports.append(export_report)
-            except Exception as exc:
-                export_reports.append(
-                    {
-                        "ok": False,
-                        "product": product,
-                        "exported": False,
-                        "artifact": str(target_path),
-                        "active_artifact": str(product_config.strategies_path),
-                        "destination": "staging" if is_live else "active",
-                        "activation_required": is_live,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
+        )
     report["exports"] = export_reports
     incubation_review = build_incubation_review(
         scenario_reports,

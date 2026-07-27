@@ -79,6 +79,7 @@ PRODUCT_CONFIG_KEYS = {
 }
 AUTOPILOT_CONFIG_KEYS = {
     "alert_cooldown_seconds",
+    "active_income_max_open_positions",
     "alert_file",
     "alert_state_file",
     "alerts_enabled",
@@ -323,6 +324,7 @@ class AutopilotConfig:
     candidate_paper_cadence_seconds: int = 45
     candidate_paper_max_unseen_bars: int = 240
     candidate_paper_timeout_seconds: int = 240
+    active_income_max_open_positions: int = 3
     auto_report_enabled: bool = False
     alerts_enabled: bool = True
     alert_cooldown_seconds: int = 900
@@ -408,6 +410,12 @@ class AutopilotConfig:
             payload.get("candidate_paper_timeout_seconds", 240),
             "candidate_paper_timeout_seconds",
         )
+        active_income_max_open_positions = _positive_int(
+            payload.get("active_income_max_open_positions", 3),
+            "active_income_max_open_positions",
+        )
+        if active_income_max_open_positions > 20:
+            raise ValueError("active_income_max_open_positions must be at most 20")
         backup_cadence_seconds = _positive_int(
             payload.get("backup_cadence_seconds", 86400),
             "backup_cadence_seconds",
@@ -606,6 +614,7 @@ class AutopilotConfig:
             candidate_paper_cadence_seconds=candidate_paper_cadence_seconds,
             candidate_paper_max_unseen_bars=candidate_paper_max_unseen_bars,
             candidate_paper_timeout_seconds=candidate_paper_timeout_seconds,
+            active_income_max_open_positions=active_income_max_open_positions,
             auto_report_enabled=_json_bool(
                 payload,
                 "auto_report_enabled",

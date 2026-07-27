@@ -3,11 +3,12 @@
   "memory_path": "runtime/research/experiment_memory.sqlite3",
   "generated_batch_path": "runtime/research/generated_hypotheses.json",
   "openclaw_accepted_dir": "runtime/research_inbox/openclaw/accepted",
+  "dynamic_active_income_universe": true,
   "budgets": {
-    "max_candidates_per_cycle": 17,
-    "max_candidates_per_space": 3,
-    "max_generation_attempts": 800,
-    "max_generation_seconds": 25,
+    "max_candidates_per_cycle": 50,
+    "max_candidates_per_space": 1,
+    "max_generation_attempts": 5000,
+    "max_generation_seconds": 60,
     "max_parent_pool": 200,
     "max_lineage_depth": 8,
     "max_total_predicates": 7,
@@ -26,7 +27,7 @@
   "search_spaces": [
     {
       "name": "active_income_scalping",
-      "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"],
+      "symbol": "BTCUSDT",
       "product": "active_income",
       "market": "futures",
       "pnl_unit": "usdt",
@@ -45,7 +46,7 @@
     },
     {
       "name": "active_income_day",
-      "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"],
+      "symbol": "BTCUSDT",
       "product": "active_income",
       "market": "futures",
       "pnl_unit": "usdt",
@@ -64,7 +65,7 @@
     },
     {
       "name": "active_income_swing",
-      "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"],
+      "symbol": "BTCUSDT",
       "product": "active_income",
       "market": "futures",
       "pnl_unit": "usdt",

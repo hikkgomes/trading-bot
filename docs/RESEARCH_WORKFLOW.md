@@ -11,10 +11,10 @@ The two research objectives are:
 - `btc_accumulation`: BTC/USDT spot, performance measured in BTC, no leverage.
   A generated `short` signal means stepping aside from BTC into USDT and later
   re-entering; it is not a borrowed or leveraged spot short.
-- `active_income`: BTC/USDT USDT-margined futures, performance measured in
-  USDT, with scalp, day-trade, and swing search spaces. The deployment policy
-  applies isolated margin, one-way mode, strict position/risk limits, and at
-  most 1x leverage.
+- `active_income`: liquidity-screened USDT-margined perpetuals, performance
+  measured in USDT, with scalp, day-trade, and swing search spaces. The
+  deployment policy applies isolated margin, one-way mode, per-symbol and
+  portfolio risk limits, and at most 1x leverage.
 
 The default configuration keeps both products in paper mode. A new or changed
 strategy cannot become live through this research workflow. Live use requires
@@ -56,14 +56,24 @@ interval. Jobs run separately from trading supervision and only one due job is
 started per worker cycle, preventing research from delaying position
 management.
 
+Before history refresh, the universe screen evaluates every currently trading
+Binance USDT perpetual and retains at most 25 contracts that pass maturity,
+volume, trade-count, spread, open-interest, and funding gates. Each result is
+written both as the latest report and as an append-only snapshot; the snapshot
+ID is included in generated-batch metadata. This creates point-in-time universe
+lineage from the first deployed snapshot onward. It does not manufacture
+historical membership evidence for dates before snapshots existed.
+
 History downloads are also bounded: Binance requests use 1,000-candle pages, a
 0.2-second inter-page delay, a 5,000-page per-dataset ceiling, periodic atomic
 checkpoints, and the job's system timeout. Re-running after a page-budget or
 network stop resumes the checkpoint instead of restarting the download.
 
 Each generation is deliberately bounded for a light server. The checked-in
-defaults emit at most 15 candidates, at most 3 per search space, stop after 800
-attempts or 25 seconds, and cap parent-pool and lineage sizes. At 80% of the
+defaults emit at most 50 candidates, at most 1 per symbol/horizon search space,
+stop after 5,000 attempts or 60 seconds, and cap parent-pool and lineage sizes.
+That normally covers about 16 eligible symbols across scalp, day, and swing in
+one daily batch; a deterministic daily rotation covers larger sets. At 80% of the
 explicit 48 MiB SQLite budget, the factory performs at most 5,000 rows of
 evidence-preserving compaction and an integrity-checked vacuum. Repeated cycles
 provide the ongoing exploration; one process is never allowed to consume the
@@ -334,6 +344,15 @@ of long research jobs. Wait until
 `candidate_activation_ready: true` after the configured trade-count, time-span,
 return, drawdown, and loss-streak requirements.
 
+For an eligible symbol that is not yet a configured product, research uses
+`runtime/candidates/active_income__<symbol>.json`. Candidate paper discovers it
+and produces digest-isolated forward evidence, but activation fails closed
+until an operator adds that exact product name and symbol with unique runtime
+paths. Cross-symbol candidate entries stop at
+`active_income_max_open_positions` while existing positions continue to be
+managed. A history or coverage failure is recorded only against its own symbol;
+healthy symbols continue through evaluation and export.
+
 Candidate papering is closed-bar and restart-safe. A digest-isolated cursor is
 stored for every strategy, and mixed-timeframe events are processed at their
 information-availability time (bar close), with shorter timeframes winning an
@@ -408,13 +427,15 @@ cutover checklist.
 | `config/research_factory.json` | Trusted search spaces, budgets, and immutable holdout policy. |
 | `runtime/research/experiment_memory.sqlite3` | Canonical strategy, lineage, evaluation, and holdout-claim memory. |
 | `runtime/research/generated_hypotheses.json` | Latest bounded, research-only generated batch and safe development feedback. |
+| `runtime/market_universe.json` | Latest all-USDT-perpetual liquidity selection. |
+| `runtime/market_universe_snapshots/*.json` | Append-only point-in-time selection lineage. |
 | `runtime/research_cycle.json` | Latest real-data validation, export, coverage, and generative-search summary. |
 | `runtime/research_cycle_state.json` | Market/batch markers and cycle cursor/recovery state; not a substitute for SQLite memory. |
 | `outputs/research_exploration/experiment_log.jsonl` | Detailed append-only validation audit, including protected results. Never expose it to OpenClaw. |
 | `runtime/incubation_candidates.json` | Ranked research-attention queue; explicitly non-executable and non-promotable. |
 | `outputs/active_strategies_position.json` | BTC-accumulation active paper/live artifact, according to product mode. |
 | `outputs/active_strategies_flow.json` | Active-income active paper/live artifact, according to product mode. |
-| `runtime/candidates/<product>.json` | Inert staged replacement for a product already configured live. |
+| `runtime/candidates/<product>.json` | Inert staged replacement or symbol-specific `active_income__<symbol>` candidate. |
 | `runtime/candidate_paper_status.json` | Isolated staged-candidate paper and activation readiness. |
 | `runtime/operator_report.json` | Compact generated-batch, development-memory, research, product, and job status. |
 | `runtime/healthcheck.json` | Machine-readable blockers and warnings for the external watchdog. |
