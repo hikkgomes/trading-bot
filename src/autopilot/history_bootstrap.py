@@ -27,7 +27,7 @@ import build_binance_indicator_dataset as bbid
 from research_exploration.strategy_grammar import DEFAULT_FEATURES
 from src.autopilot.io import write_json_atomic
 from src.autopilot.research_factory import DEFAULT_CONFIG as DEFAULT_FACTORY_CONFIG
-from src.autopilot.research_factory import load_factory_config
+from src.autopilot.research_factory import load_factory_config, search_spaces_for_symbol
 from src.autopilot.research_history_contract import generated_history_contract
 from src.config import candle_data_dir, indicator_data_dir
 from src.parquet_io import write_parquet_atomic
@@ -138,9 +138,7 @@ def build_default_requirements(
     starts: dict[tuple[str, str], pd.Timestamp] = {}
     features: dict[tuple[str, str], set[str]] = defaultdict(set)
     scenario_names: dict[tuple[str, str], set[str]] = defaultdict(set)
-    for space in factory_config.search_spaces:
-        if space.symbol != symbol:
-            continue
+    for space in search_spaces_for_symbol(factory_config, symbol):
         if space.market not in selected_markets:
             continue
         configured_timeframes = {

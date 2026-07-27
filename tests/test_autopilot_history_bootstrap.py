@@ -113,6 +113,29 @@ def test_default_plan_uses_configured_search_space_timeframes_and_short_spot_1m_
     assert spot_seed.start == now - pd.Timedelta(days=hb.OPERATIONAL_SEED_DAYS)
 
 
+def test_dynamic_altcoin_plan_inherits_active_income_template_timeframes():
+    requirements = hb.build_default_requirements(
+        markets=["futures"],
+        symbol="ETHUSDT",
+        now="2026-07-09T12:00:00Z",
+    )
+    by_key = {(item.market, item.timeframe): item for item in requirements}
+
+    assert set(by_key) == {
+        ("futures", "1m"),
+        ("futures", "5m"),
+        ("futures", "15m"),
+        ("futures", "1h"),
+        ("futures", "4h"),
+        ("futures", "1d"),
+    }
+    assert by_key[("futures", "1m")].scenario_names == ("active_income_scalping_ethusdt",)
+    assert by_key[("futures", "1h")].scenario_names == (
+        "active_income_day_ethusdt",
+        "active_income_swing_ethusdt",
+    )
+
+
 def test_factory_timeframe_change_is_reflected_in_plan(tmp_path):
     def use_30m_setup(payload):
         space = next(

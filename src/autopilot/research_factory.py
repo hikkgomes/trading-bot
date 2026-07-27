@@ -531,6 +531,22 @@ def _symbol_space(template: SearchSpace, symbol: str) -> SearchSpace:
     return dataclasses.replace(template, name=name, symbol=symbol)
 
 
+def search_spaces_for_symbol(
+    config: ResearchFactoryConfig,
+    symbol: str,
+) -> tuple[SearchSpace, ...]:
+    """Resolve the configured research templates applicable to one symbol."""
+
+    symbol = symbol.upper()
+    if config.dynamic_active_income_universe and symbol != "BTCUSDT":
+        return tuple(
+            _symbol_space(space, symbol)
+            for space in config.search_spaces
+            if space.product == "active_income"
+        )
+    return tuple(space for space in config.search_spaces if space.symbol == symbol)
+
+
 def resolve_search_space(
     config: ResearchFactoryConfig,
     metadata: Mapping[str, Any],
