@@ -112,6 +112,9 @@ AUTOPILOT_CONFIG_KEYS = {
     "mutation_plan_file",
     "operator_report_file",
     "operator_report_json_file",
+    "daily_digest_cadence_seconds",
+    "daily_digest_enabled",
+    "position_change_alerts_enabled",
     "products",
     "readiness_report_file",
     "readiness_report_json_file",
@@ -328,6 +331,9 @@ class AutopilotConfig:
     auto_report_enabled: bool = False
     alerts_enabled: bool = True
     alert_cooldown_seconds: int = 900
+    position_change_alerts_enabled: bool = False
+    daily_digest_enabled: bool = False
+    daily_digest_cadence_seconds: int = 86400
     webhook_url_env: str = "AUTOPILOT_WEBHOOK_URL"
     min_runtime_free_bytes: int = DEFAULT_MIN_RUNTIME_FREE_BYTES
     loop_sleep_seconds: int = 60
@@ -390,6 +396,10 @@ class AutopilotConfig:
         alert_cooldown_seconds = _non_negative_int(
             payload.get("alert_cooldown_seconds", 900),
             "alert_cooldown_seconds",
+        )
+        daily_digest_cadence_seconds = _positive_int(
+            payload.get("daily_digest_cadence_seconds", 86400),
+            "daily_digest_cadence_seconds",
         )
         min_runtime_free_bytes = _positive_int(
             payload.get("min_runtime_free_bytes", DEFAULT_MIN_RUNTIME_FREE_BYTES),
@@ -625,6 +635,19 @@ class AutopilotConfig:
                 payload, "alerts_enabled", default=True, field="alerts_enabled"
             ),
             alert_cooldown_seconds=alert_cooldown_seconds,
+            position_change_alerts_enabled=_json_bool(
+                payload,
+                "position_change_alerts_enabled",
+                default=False,
+                field="position_change_alerts_enabled",
+            ),
+            daily_digest_enabled=_json_bool(
+                payload,
+                "daily_digest_enabled",
+                default=False,
+                field="daily_digest_enabled",
+            ),
+            daily_digest_cadence_seconds=daily_digest_cadence_seconds,
             webhook_url_env=_optional_non_empty_str(
                 payload,
                 "webhook_url_env",

@@ -144,6 +144,7 @@ def emit_alert(
     title: str,
     detail: dict[str, Any],
     cooldown_seconds: int = 900,
+    dedupe_key: str | None = None,
     webhook_url_env: str = "AUTOPILOT_WEBHOOK_URL",
     now: float | None = None,
 ) -> dict[str, Any]:
@@ -160,7 +161,15 @@ def emit_alert(
         raise ValueError("alert cooldown_seconds must be numeric") from exc
     if not math.isfinite(cooldown_seconds) or cooldown_seconds < 0:
         raise ValueError("alert cooldown_seconds must be finite and non-negative")
-    fingerprint = alert_fingerprint(severity, title, detail)
+    if dedupe_key is not None:
+        if not isinstance(dedupe_key, str) or not dedupe_key.strip():
+            raise ValueError("alert dedupe_key must be a non-empty string")
+        if len(dedupe_key) > 512:
+            raise ValueError("alert dedupe_key must be at most 512 characters")
+        fingerprint_detail = {"dedupe_key": dedupe_key.strip()}
+    else:
+        fingerprint_detail = detail
+    fingerprint = alert_fingerprint(severity, title, fingerprint_detail)
     with acquire_file_update_lock(state_file, label="alert cooldown state"):
         result, payload = _emit_alert_locked(
             alert_file=alert_file,
@@ -291,15 +300,26 @@ def _deliver_remote_alert(
             delivery["webhook"] = _post_webhook(webhook_url, remote_payload)
         except Exception as exc:
             delivery["webhook"] = {"ok": False, "error": str(exc)}
-    try:
-        telegram = send_alert_from_environment(payload, environ=operations_environment)
-        if telegram is not None:
-            delivery["telegram"] = telegram
-    except Exception as exc:
-        delivery["telegram"] = {
-            "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+    telegram_configured = bool(
+        operations_environment.get("AUTOPILOT_TELEGRAM_BOT_TOKEN", "").strip()
+        or operations_environment.get("AUTOPILOT_TELEGRAM_SETTINGS_FILE", "").strip()
+    )
+    if telegram_configured:
+        try:
+            telegram = send_alert_from_environment(payload, environ=operations_environment)
+            delivery["telegram"] = (
+                telegram
+                if telegram is not None
+                else {
+                    "ok": False,
+                    "error": "configured Telegram settings resolved to no delivery client",
+                }
+            )
+        except Exception as exc:
+            delivery["telegram"] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
     if "webhook" not in delivery and "telegram" not in delivery:
         return
     _write_jsonl(alert_file, delivery)

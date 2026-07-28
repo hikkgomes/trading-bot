@@ -2233,6 +2233,111 @@ def test_run_once_emits_readiness_warning_alert_after_reports(monkeypatch, tmp_p
     assert alert["detail"]["warnings"][0]["markets"]["spot"]["reason"] == "missing_seed_dataset"
 
 
+def test_run_once_emits_informational_alert_after_autonomous_position_change(
+    monkeypatch,
+    tmp_path,
+):
+    cfg = AutopilotConfig(
+        control_file=tmp_path / "control.json",
+        status_file=tmp_path / "status.json",
+        approval_ledger=tmp_path / "approvals.json",
+        alert_file=tmp_path / "alerts.jsonl",
+        alert_state_file=tmp_path / "alert_state.json",
+        auto_report_enabled=False,
+        position_change_alerts_enabled=True,
+        products=[product(tmp_path)],
+    )
+    event = {
+        "schema": "autopilot.position_event/v1",
+        "event_id": "entry-event-1",
+        "event_type": "opened",
+        "strategy_id": "scalp-1m-long",
+        "symbol": "BTCUSDT",
+        "market": "futures",
+        "execution": "paper",
+        "entry_price": 100.0,
+    }
+    monkeypatch.setattr(
+        "src.autopilot.runtime.run_product_once",
+        lambda *_args, **_kwargs: {
+            "product": {
+                "name": "active_income",
+                "objective": "active_income",
+                "execution_mode": "paper",
+            },
+            "ok": True,
+            "position_events": [event],
+        },
+    )
+
+    report = run_once(cfg)
+
+    assert report["ok"] is True
+    assert report["position_alerts"][0]["sent"] is True
+    alert = json.loads(cfg.alert_file.read_text(encoding="utf-8").splitlines()[0])
+    assert alert["severity"] == "info"
+    assert alert["title"] == "autonomous position opened"
+    assert alert["detail"]["autonomous"] is True
+    assert alert["detail"]["operator_action_required"] is False
+
+
+def test_run_once_emits_daily_digest_once_per_configured_period(monkeypatch, tmp_path):
+    cfg = AutopilotConfig(
+        control_file=tmp_path / "control.json",
+        status_file=tmp_path / "status.json",
+        approval_ledger=tmp_path / "approvals.json",
+        alert_file=tmp_path / "alerts.jsonl",
+        alert_state_file=tmp_path / "alert_state.json",
+        operator_report_file=tmp_path / "operator.md",
+        operator_report_json_file=tmp_path / "operator.json",
+        readiness_report_file=tmp_path / "readiness.md",
+        readiness_report_json_file=tmp_path / "readiness.json",
+        auto_report_enabled=True,
+        daily_digest_enabled=True,
+        daily_digest_cadence_seconds=86400,
+        products=[],
+    )
+    monkeypatch.setattr("src.autopilot.runtime.time.time", lambda: 500_000.0)
+
+    def write_reports(config):
+        config.operator_report_json_file.write_text(
+            json.dumps(
+                {
+                    "ok": True,
+                    "products": [],
+                    "scheduled_jobs": [],
+                    "research_cycle": {
+                        "ok": True,
+                        "summary": {"hypotheses": 12, "keepers": 2},
+                    },
+                    "candidate_paper": {"ok": True, "open_positions": 0},
+                }
+            ),
+            encoding="utf-8",
+        )
+        config.readiness_report_json_file.write_text(
+            json.dumps({"ok": True, "checks": []}),
+            encoding="utf-8",
+        )
+        return {"ok": True}
+
+    monkeypatch.setattr("src.autopilot.runtime.write_cycle_reports", write_reports)
+
+    first = run_once(cfg)
+    second = run_once(cfg)
+
+    assert first["daily_digest_alert"]["sent"] is True
+    assert second["daily_digest_alert"]["sent"] is False
+    assert second["daily_digest_alert"]["reason"] == "cooldown"
+    alerts = [
+        json.loads(line)
+        for line in cfg.alert_file.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(alerts) == 1
+    assert alerts[0]["title"] == "autopilot daily digest"
+    assert alerts[0]["detail"]["research"]["cycle_summary"]["keepers"] == 2
+
+
 def test_run_once_records_readiness_alert_failure_without_failing_cycle(monkeypatch, tmp_path):
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",

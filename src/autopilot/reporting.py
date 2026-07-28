@@ -1451,6 +1451,8 @@ def build_operator_report(
         "research_progress_alert": status.get("research_progress_alert"),
         "testnet_rehearsal_alert": status.get("testnet_rehearsal_alert"),
         "promotion_alert": status.get("promotion_alert"),
+        "position_alerts": status.get("position_alerts", []),
+        "daily_digest_alert": status.get("daily_digest_alert"),
     }
 
 

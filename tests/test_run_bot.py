@@ -131,6 +131,28 @@ def make_bot(env, starting_equity=10_000.0):
     )
 
 
+def test_position_events_are_recorded_only_after_durable_entry(bot_env):
+    bot = make_bot(bot_env)
+    strategy = bot.strategies[0]
+    frame = pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2026-01-01T00:00:00Z")],
+        }
+    )
+
+    bot._enter_position(strategy, frame, 100.0)
+
+    assert len(bot.position_events) == 1
+    event = bot.position_events[0]
+    assert event["event_type"] == "opened"
+    assert event["strategy_id"] == strategy["id"]
+    assert event["execution"] == "paper"
+    assert event["entry_price"] == 100.0
+    assert json.loads(bot.state_file.read_text(encoding="utf-8"))["open_positions"][
+        strategy["id"]
+    ]["entry_price"] == 100.0
+
+
 class PriceSource:
     def __init__(self, price):
         self.price = float(price)
@@ -3181,6 +3203,9 @@ def test_run_cycle_exit_take_profit(mock_build_ind, mock_get, bot_env):
     bot.run_cycle()
 
     assert bot.state["open_positions"] == {}
+    assert len(bot.position_events) == 1
+    assert bot.position_events[0]["event_type"] == "closed"
+    assert bot.position_events[0]["exit_reason"] == "take_profit"
     # gross 4%, costs 6 bps round trip -> net 3.94%
     assert abs(bot.state["equity"] - 10_394.0) < 1e-6
     assert abs(bot.state["daily_pnl"] - 0.0394) < 1e-6

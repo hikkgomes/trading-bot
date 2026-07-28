@@ -281,6 +281,69 @@ def test_emit_alert_cooldown_uses_stable_fingerprint_but_persists_full_detail(tm
     assert json.loads(lines[0])["detail"] == first_detail
 
 
+def test_emit_alert_explicit_dedupe_key_ignores_changing_detail(tmp_path):
+    alert_file = tmp_path / "alerts.jsonl"
+    state_file = tmp_path / "alert_state.json"
+
+    first = emit_alert(
+        alert_file=alert_file,
+        state_file=state_file,
+        severity="critical",
+        title="healthcheck failed",
+        detail={"issues": [{"code": "job_failed", "attempt": 1}]},
+        dedupe_key="healthcheck-failed:job_failed",
+        cooldown_seconds=60,
+        now=100.0,
+    )
+    second = emit_alert(
+        alert_file=alert_file,
+        state_file=state_file,
+        severity="critical",
+        title="healthcheck failed",
+        detail={"issues": [{"code": "job_failed", "attempt": 2}]},
+        dedupe_key="healthcheck-failed:job_failed",
+        cooldown_seconds=60,
+        now=120.0,
+    )
+
+    assert first["sent"] is True
+    assert second == {
+        "sent": False,
+        "reason": "cooldown",
+        "fingerprint": first["fingerprint"],
+    }
+    assert len(alert_file.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_emit_alert_audits_configured_telegram_that_resolves_to_no_client(
+    tmp_path,
+    monkeypatch,
+):
+    alert_file = tmp_path / "alerts.jsonl"
+    state_file = tmp_path / "alert_state.json"
+    monkeypatch.setenv("AUTOPILOT_TELEGRAM_BOT_TOKEN", "configured-token")
+    monkeypatch.setattr(
+        "src.autopilot.notifications.send_alert_from_environment",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = emit_alert(
+        alert_file=alert_file,
+        state_file=state_file,
+        severity="info",
+        title="position changed",
+        detail={"event_id": "event-1"},
+        now=1_000.0,
+    )
+
+    assert result["remote_delivery"] == {"status": "queued"}
+    assert wait_for_remote_alerts()
+    delivery = json.loads(alert_file.read_text(encoding="utf-8").splitlines()[1])
+    assert delivery["schema"] == "autopilot.alert_delivery/v1"
+    assert delivery["telegram"]["ok"] is False
+    assert "resolved to no delivery client" in delivery["telegram"]["error"]
+
+
 def test_emit_alert_records_webhook_failure_without_raising(tmp_path, monkeypatch):
     alert_file = tmp_path / "alerts.jsonl"
     state_file = tmp_path / "alert_state.json"

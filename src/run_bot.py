@@ -591,6 +591,10 @@ class PaperTradingBot:
         self.approval_fingerprints_by_strategy: dict[str, str] = {}
         self.state: dict = {}
         self.cycle_errors: list[dict] = []
+        # Ephemeral notifications emitted only after the corresponding state
+        # transition is durable. The autopilot consumes these after each cycle;
+        # they never authorize, delay, or alter order execution.
+        self.position_events: list[dict] = []
         # Per-cycle macro regime evaluation (held-vs-flat overlay for the BTC bot).
         self._macro_aside: bool = False
         self._macro_detail: dict = {}
@@ -2377,6 +2381,33 @@ class PaperTradingBot:
             # in-process retry follows the same idempotent recovery path.
             raise
         self.state = target_state
+        trade_data = intent["trade_data"]
+        self.position_events.append(
+            {
+                "schema": "autopilot.position_event/v1",
+                "event_id": intent["exit_event_id"],
+                "event_type": "closed",
+                "strategy_id": intent["strategy_id"],
+                "symbol": trade_data.get("broker_symbol") or self.symbol,
+                "market": self.market,
+                "execution": "broker" if self.broker is not None else "paper",
+                **{
+                    key: trade_data.get(key)
+                    for key in (
+                        "direction",
+                        "entry_time",
+                        "exit_time",
+                        "entry_price",
+                        "exit_price",
+                        "exit_reason",
+                        "net_return",
+                        "sized_return",
+                        "position_size",
+                        "equity_after",
+                    )
+                },
+            }
+        )
         LOGGER.critical(
             "EXIT ACCOUNTING COMMITTED [%s]: event=%s equity=%.8f",
             intent["strategy_id"],
@@ -3329,6 +3360,7 @@ class PaperTradingBot:
         )
 
         self.cycle_errors = []
+        self.position_events = []
         self._feature_frame_cache = {}
         self._candidate_replay_max_unseen_bars = max_unseen_bars
         self._candidate_paper_engine_digest = candidate_paper_engine_digest()
@@ -3687,6 +3719,7 @@ class PaperTradingBot:
 
     def run_cycle(self):
         self.cycle_errors = []
+        self.position_events = []
         self._feature_frame_cache = {}
         self._resume_exit_accounting_intent()
         self._recover_live_futures_pending_entry()
@@ -4215,6 +4248,34 @@ class PaperTradingBot:
             self._save_state_clearing_pending_order()
         else:
             self._save_state()
+        entry_event_id = _canonical_json_digest(
+            {
+                "event_type": "opened",
+                "strategy_id": strategy["id"],
+                "symbol": self.symbol,
+                "signal_time": signal_time_text,
+                "entry_time": entry_time_text,
+                "direction": direction,
+            },
+            label="Position entry event",
+        )
+        self.position_events.append(
+            {
+                "schema": "autopilot.position_event/v1",
+                "event_id": entry_event_id,
+                "event_type": "opened",
+                "strategy_id": strategy["id"],
+                "symbol": self.symbol,
+                "market": self.market,
+                "execution": "broker" if broker_fill is not None else "paper",
+                "direction": direction,
+                "entry_time": entry_time_text,
+                "entry_price": entry_price,
+                "position_size": position_size,
+                "sl_price": sl_price,
+                "tp_price": tp_price,
+            }
+        )
         LOGGER.critical(
             "%s ORDER OPENED [%s]: %s %s @ %.2f | SL: %.2f | TP: %.2f | Size: %.4f",
             "BROKER" if self.broker is not None else "PAPER",

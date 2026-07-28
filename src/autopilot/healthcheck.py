@@ -33,23 +33,24 @@ def _drain_oneshot_remote_alert(health: dict[str, Any]) -> None:
     time to finish and records a timeout without hiding the health result.
     """
 
-    alert = health.get("healthcheck_alert")
-    if not isinstance(alert, dict):
-        return
-    remote = alert.get("remote_delivery")
-    if not isinstance(remote, dict) or remote.get("status") != "queued":
-        return
-    try:
-        drained = wait_for_remote_alerts(REMOTE_ALERT_DRAIN_SECONDS)
-    except Exception as exc:  # alert delivery must not suppress watchdog output
-        LOGGER.exception("Failed while draining the healthcheck remote-alert queue")
-        remote.update(drained=False, drain_error=f"{type(exc).__name__}: {exc}")
-        return
-    remote["drained"] = bool(drained)
-    if not drained:
-        remote["drain_error"] = (
-            f"remote alert queue did not drain within {REMOTE_ALERT_DRAIN_SECONDS:g} seconds"
-        )
+    for alert_key in ("healthcheck_alert", "healthcheck_recovery_alert"):
+        alert = health.get(alert_key)
+        if not isinstance(alert, dict):
+            continue
+        remote = alert.get("remote_delivery")
+        if not isinstance(remote, dict) or remote.get("status") != "queued":
+            continue
+        try:
+            drained = wait_for_remote_alerts(REMOTE_ALERT_DRAIN_SECONDS)
+        except Exception as exc:  # alert delivery must not suppress watchdog output
+            LOGGER.exception("Failed while draining the healthcheck remote-alert queue")
+            remote.update(drained=False, drain_error=f"{type(exc).__name__}: {exc}")
+            continue
+        remote["drained"] = bool(drained)
+        if not drained:
+            remote["drain_error"] = (
+                f"remote alert queue did not drain within {REMOTE_ALERT_DRAIN_SECONDS:g} seconds"
+            )
 
 
 def _issue(code: str, message: str, *, detail: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2015,6 +2016,7 @@ def build_healthcheck(
     fail_on_job_overdue: bool = True,
     max_backup_age_seconds: float | None = None,
     emit_failure_alert: bool = False,
+    previous_health: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     operator_report = build_operator_report(config)
     readiness_report = (
@@ -2031,6 +2033,13 @@ def build_healthcheck(
         max_consecutive_job_deferrals=config.max_consecutive_job_deferrals,
     )
     if emit_failure_alert and health.get("issues"):
+        issue_codes = sorted(
+            {
+                str(issue.get("code") or "unknown")
+                for issue in health.get("issues", [])
+                if isinstance(issue, dict)
+            }
+        )
         try:
             health["healthcheck_alert"] = emit_alert(
                 alert_file=config.alert_file,
@@ -2044,10 +2053,58 @@ def build_healthcheck(
                     "operator_report_generated_at": health.get("operator_report_generated_at"),
                     "readiness_ok": health.get("readiness_ok"),
                 },
+                cooldown_seconds=config.alert_cooldown_seconds,
+                dedupe_key="healthcheck-failed:" + ",".join(issue_codes),
+                webhook_url_env=config.webhook_url_env,
             )
         except Exception as exc:  # healthcheck output must survive alert I/O failures
             LOGGER.exception("Failed to emit healthcheck alert")
             health["healthcheck_alert"] = {"sent": False, "error": str(exc)}
+    elif emit_failure_alert and not health.get("issues") and isinstance(previous_health, dict):
+        previous_issues = [
+            issue
+            for issue in previous_health.get("issues", [])
+            if isinstance(issue, dict)
+        ]
+        if previous_issues:
+            cleared_codes = sorted(
+                {str(issue.get("code") or "unknown") for issue in previous_issues}
+            )
+            recovery_marker = str(
+                previous_health.get("operator_report_generated_at")
+                or previous_health.get("status_generated_at")
+                or "unknown"
+            )
+            try:
+                health["healthcheck_recovery_alert"] = emit_alert(
+                    alert_file=config.alert_file,
+                    state_file=config.alert_state_file,
+                    severity="info",
+                    title="autopilot healthcheck recovered",
+                    detail={
+                        "cleared_issue_codes": cleared_codes,
+                        "autonomous": True,
+                        "operator_action_required": False,
+                        "status_generated_at": health.get("status_generated_at"),
+                        "operator_report_generated_at": health.get(
+                            "operator_report_generated_at"
+                        ),
+                    },
+                    cooldown_seconds=24 * 60 * 60,
+                    dedupe_key=(
+                        "healthcheck-recovered:"
+                        + ",".join(cleared_codes)
+                        + ":"
+                        + recovery_marker
+                    ),
+                    webhook_url_env=config.webhook_url_env,
+                )
+            except Exception as exc:  # recovery output must survive alert I/O failures
+                LOGGER.exception("Failed to emit healthcheck recovery alert")
+                health["healthcheck_recovery_alert"] = {
+                    "sent": False,
+                    "error": str(exc),
+                }
     return health
 
 
@@ -2089,6 +2146,14 @@ def main() -> None:
     args = parse_args()
     try:
         config = load_config(args.config)
+        previous_health = None
+        if args.output and args.output.exists() and not args.output.is_symlink():
+            try:
+                loaded_previous = json.loads(args.output.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                loaded_previous = None
+            if isinstance(loaded_previous, dict):
+                previous_health = loaded_previous
         health = build_healthcheck(
             config,
             include_readiness=not args.skip_readiness,
@@ -2100,6 +2165,7 @@ def main() -> None:
                 else None
             ),
             emit_failure_alert=not args.no_alert,
+            previous_health=previous_health,
         )
         health["config"] = str(args.config)
     except Exception as exc:

@@ -3774,6 +3774,37 @@ def test_build_healthcheck_does_not_alert_when_ok(monkeypatch, tmp_path):
     assert not cfg.alert_file.exists()
 
 
+def test_build_healthcheck_emits_one_recovery_after_previous_failure(monkeypatch, tmp_path):
+    cfg = AutopilotConfig(
+        alert_file=tmp_path / "alerts.jsonl",
+        alert_state_file=tmp_path / "alert_state.json",
+    )
+    monkeypatch.setattr(
+        "src.autopilot.healthcheck.build_operator_report",
+        lambda config: operator_report(),
+    )
+    monkeypatch.setattr(
+        "src.autopilot.healthcheck.build_readiness_report",
+        lambda config, **_kwargs: {"ok": True, "checks": []},
+    )
+
+    health = build_healthcheck(
+        cfg,
+        emit_failure_alert=True,
+        previous_health={
+            "ok": False,
+            "issues": [{"code": "scheduled_job_failed", "message": "research failed"}],
+        },
+    )
+
+    assert health["ok"] is True
+    assert health["healthcheck_recovery_alert"]["sent"] is True
+    alert = json.loads(cfg.alert_file.read_text(encoding="utf-8").splitlines()[0])
+    assert alert["title"] == "autopilot healthcheck recovered"
+    assert alert["detail"]["cleared_issue_codes"] == ["scheduled_job_failed"]
+    assert alert["detail"]["operator_action_required"] is False
+
+
 def test_healthcheck_cli_prints_json_when_output_write_fails(monkeypatch, tmp_path, capsys):
     output = tmp_path / "healthcheck.json"
     monkeypatch.setattr(

@@ -4044,6 +4044,11 @@ def _bot_status_snapshot(bot: PaperTradingBot) -> dict[str, Any]:
         if isinstance(inactive_strategies, list)
         else [],
     }
+    position_events = getattr(bot, "position_events", []) or []
+    if isinstance(position_events, list):
+        snapshot["position_events"] = [
+            dict(event) for event in position_events if isinstance(event, dict)
+        ]
     exit_intent = state.get("exit_accounting_intent")
     if isinstance(exit_intent, dict):
         snapshot["exit_accounting_intent"] = {
@@ -4458,6 +4463,8 @@ def _emit_runtime_alert(
     severity: str,
     title: str,
     detail: dict[str, Any],
+    cooldown_seconds: int | None = None,
+    dedupe_key: str | None = None,
 ) -> dict[str, Any]:
     try:
         return emit_alert(
@@ -4466,12 +4473,173 @@ def _emit_runtime_alert(
             severity=severity,
             title=title,
             detail=detail,
-            cooldown_seconds=config.alert_cooldown_seconds,
+            cooldown_seconds=(
+                config.alert_cooldown_seconds
+                if cooldown_seconds is None
+                else cooldown_seconds
+            ),
+            dedupe_key=dedupe_key,
             webhook_url_env=config.webhook_url_env,
         )
     except Exception as exc:  # alerting must never crash trading supervision
         LOGGER.exception("Failed to emit autopilot alert: %s", title)
         return {"sent": False, "error": str(exc)}
+
+
+def _stable_digest(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _cycle_failure_dedupe_key(report: dict[str, Any]) -> str:
+    failed_products = sorted(
+        str((item.get("product") or {}).get("name") or "unknown")
+        for item in report.get("products", [])
+        if isinstance(item, dict) and not item.get("ok")
+    )
+    failed_jobs = sorted(
+        str(item.get("name") or "unknown")
+        for item in report.get("jobs", [])
+        if isinstance(item, dict) and not item.get("ok")
+    )
+    signature = {
+        "control_error": bool(report.get("control_error")),
+        "job_config_errors": bool(report.get("job_config_errors")),
+        "data_update_failed": isinstance(report.get("data_update"), dict)
+        and not report["data_update"].get("ok"),
+        "products": failed_products,
+        "jobs": failed_jobs,
+    }
+    return f"cycle-failed:{_stable_digest(signature)}"
+
+
+def _emit_position_change_alerts(
+    config: AutopilotConfig,
+    products: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for product_status in products:
+        if not isinstance(product_status, dict):
+            continue
+        product = product_status.get("product")
+        product = product if isinstance(product, dict) else {}
+        events = product_status.get("position_events")
+        if not isinstance(events, list):
+            continue
+        for raw_event in events:
+            if not isinstance(raw_event, dict):
+                continue
+            event_id = raw_event.get("event_id")
+            event_type = raw_event.get("event_type")
+            if not isinstance(event_id, str) or not event_id:
+                continue
+            if event_type not in {"opened", "closed"}:
+                continue
+            detail = {
+                **raw_event,
+                "product": product.get("name"),
+                "objective": product.get("objective"),
+                "configured_mode": product.get("execution_mode"),
+                "autonomous": True,
+                "operator_action_required": False,
+            }
+            result = _emit_runtime_alert(
+                config,
+                severity="info",
+                title=f"autonomous position {event_type}",
+                detail=detail,
+                cooldown_seconds=7 * 24 * 60 * 60,
+                dedupe_key=f"position:{event_type}:{event_id}",
+            )
+            results.append(
+                {
+                    "event_id": event_id,
+                    "event_type": event_type,
+                    "product": product.get("name"),
+                    **result,
+                }
+            )
+    return results
+
+
+def _daily_digest_detail(operator_report: dict[str, Any]) -> dict[str, Any]:
+    products = []
+    for item in operator_report.get("products", []):
+        if not isinstance(item, dict) or item.get("enabled") is False:
+            continue
+        products.append(
+            {
+                key: item.get(key)
+                for key in (
+                    "name",
+                    "objective",
+                    "market",
+                    "mode",
+                    "cycle_ok",
+                    "equity",
+                    "drawdown_fraction",
+                    "drawdown_halted",
+                    "open_positions",
+                    "reason",
+                )
+            }
+        )
+    jobs = [
+        item
+        for item in operator_report.get("scheduled_jobs", [])
+        if isinstance(item, dict) and item.get("enabled")
+    ]
+    research_cycle = operator_report.get("research_cycle")
+    research_cycle = research_cycle if isinstance(research_cycle, dict) else {}
+    generated_batch = operator_report.get("generated_batch")
+    generated_batch = generated_batch if isinstance(generated_batch, dict) else {}
+    candidate_paper = operator_report.get("candidate_paper")
+    candidate_paper = candidate_paper if isinstance(candidate_paper, dict) else {}
+    return {
+        "autonomous": True,
+        "operator_action_required": False,
+        "system_ok": operator_report.get("ok"),
+        "products": products,
+        "scheduled_jobs": {
+            "enabled": len(jobs),
+            "failing": sorted(
+                str(item.get("name") or "unknown")
+                for item in jobs
+                if item.get("status") == "failed" or item.get("ok") is False
+            ),
+            "overdue": sorted(
+                str(item.get("name") or "unknown")
+                for item in jobs
+                if item.get("overdue") is True
+            ),
+        },
+        "research": {
+            "cycle_ok": research_cycle.get("ok"),
+            "cycle_generated_at": research_cycle.get("generated_at"),
+            "cycle_summary": research_cycle.get("summary"),
+            "batch_ok": generated_batch.get("ok"),
+            "batch_generated_at": generated_batch.get("generated_at"),
+            "batch_summary": generated_batch.get("summary"),
+        },
+        "candidate_paper": {
+            key: candidate_paper.get(key)
+            for key in (
+                "status",
+                "ok",
+                "fresh",
+                "products",
+                "open_positions",
+                "activation_ready_products",
+                "drawdown_halted_products",
+            )
+        },
+    }
 
 
 def _auto_clear_successful_flatten_requests(
@@ -4706,6 +4874,11 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
         if product.objective == "active_income":
             report["active_income_portfolio"] = _active_income_portfolio_status(config)
 
+    if config.alerts_enabled and config.position_change_alerts_enabled:
+        position_alerts = _emit_position_change_alerts(config, report["products"])
+        if position_alerts:
+            report["position_alerts"] = position_alerts
+
     # Product supervision and emergency flattening always run before bounded
     # maintenance/research work.  A slow data job must never postpone the first
     # risk-management pass of a cycle.
@@ -4747,6 +4920,7 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
             severity="error",
             title="autopilot cycle failed",
             detail=failure_detail(report),
+            dedupe_key=_cycle_failure_dedupe_key(report),
         )
     write_status(config.status_file, report)
     if config.auto_report_enabled:
@@ -4816,6 +4990,21 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
                         detail=promotion_detail,
                     )
                     reports_need_refresh = True
+                if config.daily_digest_enabled:
+                    digest_period = int(
+                        time.time() // config.daily_digest_cadence_seconds
+                    )
+                    digest_alert = _emit_runtime_alert(
+                        config,
+                        severity="info",
+                        title="autopilot daily digest",
+                        detail=_daily_digest_detail(operator_report),
+                        cooldown_seconds=config.daily_digest_cadence_seconds * 2,
+                        dedupe_key=f"daily-digest:{digest_period}",
+                    )
+                    report["daily_digest_alert"] = digest_alert
+                    if digest_alert.get("sent"):
+                        reports_need_refresh = True
             if reports_need_refresh:
                 write_status(config.status_file, report)
                 report["reporting"] = write_cycle_reports(config)
