@@ -1098,12 +1098,13 @@ def evaluate_health(
             )
         )
     cycle_failure_detail = _cycle_failure_detail(operator_report)
-    if operator_report.get("ok") is not True or cycle_failure_detail is not None:
+    runtime_cycle_ok = operator_report.get("runtime_ok", operator_report.get("ok"))
+    if runtime_cycle_ok is not True or cycle_failure_detail is not None:
         issues.append(
             _issue(
                 "cycle_failed",
                 "latest autopilot cycle did not complete successfully",
-                detail=cycle_failure_detail or {"ok": operator_report.get("ok")},
+                detail=cycle_failure_detail or {"ok": runtime_cycle_ok},
             )
         )
     active_control_detail = _active_control_detail(operator_report)
@@ -1472,6 +1473,31 @@ def evaluate_health(
                 "scheduled_job_state_invalid",
                 "one or more enabled scheduled jobs reported invalid scheduler state",
                 detail={"jobs": scheduled_job_state_issues},
+            )
+        )
+    job_worker = (
+        operator_report.get("job_worker")
+        if isinstance(operator_report.get("job_worker"), dict)
+        else {}
+    )
+    if job_worker.get("configured") is True and job_worker.get("ok") is not True:
+        issues.append(
+            _issue(
+                "scheduled_job_worker_unhealthy",
+                "the independent scheduled-job worker is missing, stale, or failing",
+                detail={
+                    key: job_worker.get(key)
+                    for key in (
+                        "reason",
+                        "path",
+                        "generated_at",
+                        "age_seconds",
+                        "limit_seconds",
+                        "last_cycle_ok",
+                        "last_cycle_reason",
+                        "enabled_jobs",
+                    )
+                },
             )
         )
     truncated_job_outputs = _scheduled_job_output_truncation_warnings(operator_report)

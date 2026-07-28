@@ -1,5 +1,6 @@
 import json
 import sys
+from datetime import datetime
 
 from src.autopilot.config import AutopilotConfig, JobConfig
 from src.autopilot.job_worker import (
@@ -50,7 +51,29 @@ def test_worker_runs_due_job_and_writes_own_status(tmp_path):
     assert report["jobs"][0]["ok"] is True
     saved = json.loads(job_worker_status_path(config).read_text(encoding="utf-8"))
     assert saved["ok"] is True
+    assert saved["phase"] == "idle"
+    assert saved["generated_at"] >= saved["cycle_started_at"]
     assert not config.status_file.exists()
+
+
+def test_worker_publishes_running_heartbeat_before_blocking_job(monkeypatch, tmp_path):
+    config = worker_config(tmp_path)
+    observed = {}
+
+    def fake_run_due_jobs(*args, **kwargs):
+        observed.update(json.loads(job_worker_status_path(config).read_text(encoding="utf-8")))
+        return []
+
+    monkeypatch.setattr("src.autopilot.job_worker.run_due_jobs", fake_run_due_jobs)
+
+    report = run_worker_once(config)
+
+    assert observed["ok"] is True
+    assert observed["phase"] == "running"
+    assert observed["heartbeat_only"] is True
+    assert datetime.fromisoformat(observed["generated_at"])
+    assert report["phase"] == "idle"
+    assert report["generated_at"] >= observed["generated_at"]
 
 
 def test_worker_pause_keeps_jobs_responsive_without_running_subprocess(tmp_path):

@@ -2956,6 +2956,49 @@ def test_run_product_once_surfaces_bot_cycle_errors(monkeypatch, tmp_path):
     ]
 
 
+def test_run_product_once_blocks_bootstrap_entries_but_keeps_management(monkeypatch, tmp_path):
+    artifact = tmp_path / "bootstrap.json"
+    strategy_artifact(artifact)
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "schema": "autopilot.paper_bootstrap/v1",
+            "source": "paper_bootstrap",
+            "live_allowed": False,
+            "promotion_eligible": False,
+        }
+    )
+    payload["strategies"][0]["metrics"] = {}
+    artifact.write_text(json.dumps(payload), encoding="utf-8")
+    paper_product = product(tmp_path, strategies_path=artifact)
+    observed = {}
+
+    class FakeBot:
+        def __init__(self, **kwargs):
+            observed.update(kwargs)
+            self.state = {"equity": 1000.0, "open_positions": {}, "inactive_strategies": []}
+            self.strategies = kwargs["artifact_payload"]["strategies"]
+            self.cycle_errors = []
+
+        def run_cycle(self):
+            return None
+
+    monkeypatch.setattr("src.autopilot.runtime.PaperTradingBot", FakeBot)
+
+    status = run_product_once(paper_product, approval_ledger=tmp_path / "approvals.json")
+
+    assert status["ok"] is True
+    assert status["entries_allowed"] is False
+    assert status["entry_gate"] == {
+        "status": "management_only",
+        "reason": "unvalidated_bootstrap_artifact",
+        "artifact_source": "paper_bootstrap",
+        "artifact_schema": "autopilot.paper_bootstrap/v1",
+    }
+    assert observed["allow_entries"] is False
+    assert observed["artifact_payload"]["source"] == "paper_bootstrap"
+
+
 def test_bot_status_snapshot_compacts_durable_recovery_and_accounting_state():
     bot = SimpleNamespace(
         state={

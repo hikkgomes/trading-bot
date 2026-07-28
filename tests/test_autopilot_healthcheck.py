@@ -2308,6 +2308,62 @@ def test_healthcheck_allows_enabled_job_that_is_due_but_not_overdue():
     assert health["issues"] == []
 
 
+def test_healthcheck_fails_when_independent_job_worker_is_stale():
+    health = evaluate_health(
+        operator_report(
+            job_worker={
+                "configured": True,
+                "ok": False,
+                "reason": "stale",
+                "path": "runtime/job_worker_status.json",
+                "generated_at": "2026-01-01T00:00:00+00:00",
+                "age_seconds": 600.0,
+                "limit_seconds": 300.0,
+                "last_cycle_ok": True,
+                "last_cycle_reason": None,
+                "enabled_jobs": ["research_factory", "research_cycle"],
+            }
+        )
+    )
+
+    assert health["ok"] is False
+    assert health["issues"] == [
+        {
+            "code": "scheduled_job_worker_unhealthy",
+            "message": "the independent scheduled-job worker is missing, stale, or failing",
+            "detail": {
+                "reason": "stale",
+                "path": "runtime/job_worker_status.json",
+                "generated_at": "2026-01-01T00:00:00+00:00",
+                "age_seconds": 600.0,
+                "limit_seconds": 300.0,
+                "last_cycle_ok": True,
+                "last_cycle_reason": None,
+                "enabled_jobs": ["research_factory", "research_cycle"],
+            },
+        }
+    ]
+
+
+def test_healthcheck_does_not_mislabel_operational_failure_as_runtime_cycle_failure():
+    health = evaluate_health(
+        operator_report(
+            ok=False,
+            runtime_ok=True,
+            job_worker={
+                "configured": True,
+                "ok": False,
+                "reason": "missing",
+                "path": "runtime/job_worker_status.json",
+                "enabled_jobs": ["research_cycle"],
+            },
+        )
+    )
+
+    assert health["ok"] is False
+    assert [issue["code"] for issue in health["issues"]] == ["scheduled_job_worker_unhealthy"]
+
+
 def test_healthcheck_fails_for_enabled_overdue_scheduled_job():
     health = evaluate_health(
         operator_report(

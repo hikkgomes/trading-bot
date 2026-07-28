@@ -273,6 +273,105 @@ def _status_heartbeat(
     return heartbeat
 
 
+def _job_worker_status(
+    config: AutopilotConfig,
+    payload: dict[str, Any],
+    *,
+    path: Path,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    enabled_jobs = [job.name for job in config.jobs if job.enabled]
+    configured = bool(enabled_jobs)
+    limit_seconds = max(float(config.loop_sleep_seconds) * 3.0, 300.0)
+    generated_at = payload.get("generated_at")
+    generated_ts = _parse_timestamp(generated_at)
+    current_ts = now_ts if now_ts is not None else dt.datetime.now(dt.UTC).timestamp()
+    age_seconds = None
+    fresh = None
+    reason = None
+    if not configured:
+        return {
+            "configured": False,
+            "ok": True,
+            "fresh": None,
+            "path": str(path),
+            "enabled_jobs": [],
+            "limit_seconds": round(limit_seconds, 3),
+        }
+    if not payload:
+        reason = "missing"
+    elif payload.get("_load_error"):
+        reason = "read_error"
+    elif generated_ts is None:
+        reason = "invalid_generated_at"
+    elif generated_ts > current_ts:
+        fresh = False
+        reason = "future_generated_at"
+    else:
+        age_seconds = current_ts - generated_ts
+        fresh = age_seconds <= limit_seconds
+        if not fresh:
+            reason = "stale"
+        elif payload.get("ok") is not True:
+            reason = "worker_failed"
+    ok = fresh is True and payload.get("ok") is True
+    return {
+        "configured": True,
+        "ok": ok,
+        "fresh": fresh,
+        "reason": reason,
+        "path": str(path),
+        "generated_at": generated_at,
+        "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+        "limit_seconds": round(limit_seconds, 3),
+        "enabled_jobs": enabled_jobs,
+        "last_cycle_ok": payload.get("ok"),
+        "phase": payload.get("phase"),
+        "cycle_started_at": payload.get("cycle_started_at"),
+        "skipped": payload.get("skipped"),
+        "last_cycle_reason": payload.get("reason"),
+    }
+
+
+def _artifact_freshness(
+    payload: dict[str, Any],
+    config: AutopilotConfig,
+    *,
+    job_name: str,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    job = next((item for item in config.jobs if item.name == job_name and item.enabled), None)
+    if job is None or not payload:
+        return {"fresh": None, "age_seconds": None, "max_age_seconds": None}
+    generated_ts = _parse_timestamp(payload.get("generated_at"))
+    current_ts = now_ts if now_ts is not None else dt.datetime.now(dt.UTC).timestamp()
+    max_age_seconds = max(
+        float(job.cadence_seconds) * 2.0,
+        float(job.cadence_seconds + job.timeout_seconds),
+    )
+    if generated_ts is None:
+        return {
+            "fresh": False,
+            "age_seconds": None,
+            "max_age_seconds": round(max_age_seconds, 3),
+            "freshness_reason": "invalid_generated_at",
+        }
+    if generated_ts > current_ts:
+        return {
+            "fresh": False,
+            "age_seconds": None,
+            "max_age_seconds": round(max_age_seconds, 3),
+            "freshness_reason": "future_generated_at",
+        }
+    age_seconds = current_ts - generated_ts
+    return {
+        "fresh": age_seconds <= max_age_seconds,
+        "age_seconds": round(age_seconds, 3),
+        "max_age_seconds": round(max_age_seconds, 3),
+        **({"freshness_reason": "stale"} if age_seconds > max_age_seconds else {}),
+    }
+
+
 def _trade_summary(path: Path) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "path": str(path),
@@ -1214,10 +1313,13 @@ def build_operator_report(
     artifact_hygiene = _load_json(config.artifact_hygiene_file)
     backup_report = _load_json(config.backup_report_file)
     job_state = _load_json(config.job_state_file)
+    worker_status_path = config.job_state_file.with_name("job_worker_status.json")
+    worker_status_payload = _load_json(worker_status_path)
     candidate_paper = _candidate_paper_status(config, now_ts=now_ts)
     loaded_payloads = {
         "status": status,
         "job_state": job_state,
+        "job_worker_status": worker_status_payload,
         "approval_ledger": approval_ledger,
         "research_smoke": research_smoke,
         "strategy_smoke": strategy_smoke,
@@ -1388,19 +1490,62 @@ def build_operator_report(
         ),
         count_keys=("hypotheses", "mutation_metadata", "skipped"),
     )
+    research_cycle_view.update(
+        _artifact_freshness(
+            research_cycle,
+            config,
+            job_name="research_cycle",
+            now_ts=now_ts,
+        )
+    )
+    generated_batch_view.update(
+        _artifact_freshness(
+            generated_batch,
+            config,
+            job_name="research_factory",
+            now_ts=now_ts,
+        )
+    )
+    status_heartbeat = _status_heartbeat(status, config, now_ts=now_ts)
+    runtime_load_errors = _runtime_load_errors(loaded_payloads)
+    runtime_shape_errors = _runtime_shape_errors(
+        status=status,
+        job_state=job_state,
+        approval_ledger=approval_ledger,
+        config=config,
+    )
+    job_worker = _job_worker_status(
+        config,
+        worker_status_payload,
+        path=worker_status_path,
+        now_ts=now_ts,
+    )
+    operational_issues = []
+    if status.get("ok") is not True:
+        operational_issues.append("runtime_cycle_unhealthy")
+    if status_heartbeat.get("fresh") is not True:
+        operational_issues.append("runtime_status_stale")
+    if aggregate_market_data.get("ok") is not True:
+        operational_issues.append("market_data_unhealthy")
+    if aggregate_indicator_features.get("ok") is not True:
+        operational_issues.append("indicator_features_unhealthy")
+    if job_worker.get("ok") is not True:
+        operational_issues.append("job_worker_unhealthy")
+    if runtime_load_errors:
+        operational_issues.append("runtime_file_unreadable")
+    if runtime_shape_errors:
+        operational_issues.append("runtime_file_malformed")
     return {
         "generated_at": utc_now(),
         "status_file": str(config.status_file),
         "status_generated_at": status.get("generated_at"),
-        "status_heartbeat": _status_heartbeat(status, config, now_ts=now_ts),
-        "runtime_load_errors": _runtime_load_errors(loaded_payloads),
-        "runtime_shape_errors": _runtime_shape_errors(
-            status=status,
-            job_state=job_state,
-            approval_ledger=approval_ledger,
-            config=config,
-        ),
-        "ok": status.get("ok"),
+        "status_heartbeat": status_heartbeat,
+        "runtime_load_errors": runtime_load_errors,
+        "runtime_shape_errors": runtime_shape_errors,
+        "runtime_ok": status.get("ok"),
+        "ok": not operational_issues,
+        "operational_issues": operational_issues,
+        "job_worker": job_worker,
         "control": status.get("control", {}),
         "control_error": status.get("control_error")
         or (status.get("control") or {}).get("control_error"),
@@ -2024,7 +2169,9 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
         "",
         f"- Generated: `{report['generated_at']}`",
         f"- Last status: `{report.get('status_generated_at') or 'missing'}`",
-        f"- Overall status: `{_fmt_bool(report.get('ok'))}`",
+        f"- Operational status: `{_fmt_bool(report.get('ok'))}`",
+        f"- Trading runtime cycle: `{_fmt_bool(report.get('runtime_ok'))}`",
+        f"- Operational issues: `{', '.join(report.get('operational_issues') or []) or 'none'}`",
         f"- Runtime file issues: `{_runtime_load_error_detail((report.get('runtime_load_errors') or []) + (report.get('runtime_shape_errors') or []))}`",
         f"- Report issues: `{_report_error_detail(report.get('report_errors') or [])}`",
         f"- Strategy approvals: {_approval_detail(report.get('approval_summary'), int(report.get('approval_count') or 0))}",
@@ -2041,6 +2188,17 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
         f"(age {_fmt_age(heartbeat.get('age_seconds'))}, "
         f"limit {_fmt_age(heartbeat.get('limit_seconds'))})"
     )
+    job_worker = report.get("job_worker") or {}
+    if job_worker.get("configured") is False:
+        lines.append("- Scheduled-job worker: `not configured`")
+    else:
+        worker_detail = job_worker.get("reason") or job_worker.get("phase") or "running"
+        lines.append(
+            f"- Scheduled-job worker: `{_fmt_bool(job_worker.get('ok'))}` "
+            f"({worker_detail}, age {_fmt_age(job_worker.get('age_seconds'))}, "
+            f"limit {_fmt_age(job_worker.get('limit_seconds'))}, "
+            f"last heartbeat `{job_worker.get('generated_at') or 'missing'}`)"
+        )
     market_data = report.get("market_data") or {}
     market_details = []
     for market, item in sorted((market_data.get("markets") or {}).items()):
@@ -2180,7 +2338,9 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
             detail += f", {'; '.join(recovery_notes)}"
         lines.append(
             f"- Research cycle: `{_fmt_bool(research_cycle.get('ok'))}` "
-            f"({detail}, generated `{research_cycle.get('generated_at', 'unknown')}`)"
+            f"({detail}, generated `{research_cycle.get('generated_at', 'unknown')}`, "
+            f"fresh `{_fmt_bool(research_cycle.get('fresh'))}`, "
+            f"age {_fmt_age(research_cycle.get('age_seconds'))})"
         )
     else:
         lines.append("- Research cycle: `unknown` (missing report)")
@@ -2212,7 +2372,11 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
         )
         if method_detail:
             detail += f", methods {method_detail}"
-        detail += f", {safety}, generated `{generated_batch.get('generated_at', 'unknown')}`"
+        detail += (
+            f", {safety}, generated `{generated_batch.get('generated_at', 'unknown')}`, "
+            f"fresh `{_fmt_bool(generated_batch.get('fresh'))}`, "
+            f"age {_fmt_age(generated_batch.get('age_seconds'))}"
+        )
         if generated_batch.get("error"):
             detail += f", error {_truncate(str(generated_batch.get('error')), 120)}"
         lines.append(

@@ -1239,6 +1239,41 @@ def test_research_handoff_warning_detail_ignores_current_sources():
     assert research_handoff_warning_detail(report) == {"warnings": []}
 
 
+def test_research_handoff_warning_detail_marks_unconsumed_generated_batch():
+    report = {
+        "research_cycle": {
+            "generated_at": "2026-01-01T01:05:00+00:00",
+            "fresh": False,
+            "age_seconds": 200_000.0,
+            "max_age_seconds": 172_800.0,
+            "freshness_reason": "stale",
+        },
+        "generated_batch": {
+            "generated_at": "2026-01-02T01:05:00+00:00",
+            "hypotheses_count": 15,
+            "fresh": True,
+        },
+    }
+
+    assert research_handoff_warning_detail(report) == {
+        "warnings": [
+            {
+                "name": "generated_batch_unconsumed",
+                "generated_batch_generated_at": "2026-01-02T01:05:00+00:00",
+                "research_cycle_generated_at": "2026-01-01T01:05:00+00:00",
+                "hypotheses": 15,
+            },
+            {
+                "name": "research_cycle_stale",
+                "generated_at": "2026-01-01T01:05:00+00:00",
+                "age_seconds": 200_000.0,
+                "max_age_seconds": 172_800.0,
+                "reason": "stale",
+            },
+        ]
+    }
+
+
 def test_research_progress_warning_detail_summarizes_no_exportable_research():
     report = {
         "research_cycle": {

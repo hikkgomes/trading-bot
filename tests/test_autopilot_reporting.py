@@ -504,7 +504,10 @@ def test_operator_report_summarizes_status_approvals_and_trades(tmp_path):
     report = build_operator_report(cfg, now_ts=200.0)
     markdown = render_operator_markdown(report)
 
-    assert report["ok"] is True
+    assert report["runtime_ok"] is True
+    assert report["ok"] is False
+    assert report["job_worker"]["reason"] == "missing"
+    assert "job_worker_unhealthy" in report["operational_issues"]
     assert report["status_heartbeat"]["fresh"] is True
     assert report["status_heartbeat"]["age_seconds"] == 80.0
     assert report["status_heartbeat"]["limit_seconds"] == 300.0
@@ -546,6 +549,7 @@ def test_operator_report_summarizes_status_approvals_and_trades(tmp_path):
     assert "Pause jobs: `True`" in markdown
     assert "Paused jobs: `market_data_update_futures`" in markdown
     assert "Status heartbeat: `ok` (age 80s, limit 300s)" in markdown
+    assert "Scheduled-job worker: `fail` (missing" in markdown
     assert "Error alert: `none`" in markdown
     assert "Readiness alert: `none`" in markdown
     assert "Research handoff alert: `none`" in markdown
@@ -2454,6 +2458,9 @@ def test_operator_report_marks_enabled_jobs_that_never_ran(tmp_path):
 
     assert report["scheduled_jobs"][0]["status"] == "never_run"
     assert report["scheduled_jobs"][0]["due"] is True
+    assert report["job_worker"]["ok"] is False
+    assert report["job_worker"]["reason"] == "missing"
+    assert report["ok"] is False
 
 
 def test_operator_report_surfaces_cycle_limited_scheduled_job(tmp_path):

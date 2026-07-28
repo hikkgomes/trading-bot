@@ -71,7 +71,6 @@ from src.autopilot.reporting import (
 from src.autopilot.strategy_policy import (
     StrategyPolicyError,
     assert_loaded_strategy_artifact_allowed,
-    assert_strategy_artifact_allowed,
 )
 from src.autopilot.testnet_rehearsal import (
     summarize_testnet_rehearsal_report,
@@ -4308,8 +4307,8 @@ def run_product_once(
         return status
 
     try:
-        status["strategy_policy"] = assert_strategy_artifact_allowed(product)
-    except StrategyPolicyError as exc:
+        artifact_snapshot = load_artifact(product.strategies_path)
+    except ApprovalError as exc:
         status.update(
             ok=True,
             skipped=True,
@@ -4317,6 +4316,42 @@ def run_product_once(
             detail=str(exc),
         )
         return status
+    bootstrap_management_only = (
+        artifact_snapshot.get("source") == "paper_bootstrap"
+        or artifact_snapshot.get("schema") == "autopilot.paper_bootstrap/v1"
+    )
+    if bootstrap_management_only:
+        status["strategy_policy"] = {
+            "ok": False,
+            "management_only": True,
+            "artifact": str(product.strategies_path),
+            "strategies": len(artifact_snapshot.get("strategies", [])),
+        }
+    else:
+        try:
+            status["strategy_policy"] = assert_loaded_strategy_artifact_allowed(
+                product,
+                artifact_snapshot,
+                artifact_path=product.strategies_path,
+                require_live_eligible=False,
+            )
+        except StrategyPolicyError as exc:
+            status.update(
+                ok=True,
+                skipped=True,
+                reason="strategy_policy_blocked",
+                detail=str(exc),
+            )
+            return status
+    effective_allow_entries = allow_entries and not bootstrap_management_only
+    status["entries_allowed"] = effective_allow_entries
+    if bootstrap_management_only:
+        status["entry_gate"] = {
+            "status": "management_only",
+            "reason": "unvalidated_bootstrap_artifact",
+            "artifact_source": artifact_snapshot.get("source"),
+            "artifact_schema": artifact_snapshot.get("schema"),
+        }
     bot = PaperTradingBot(
         strategies_path=product.strategies_path,
         state_file=product.state_file,
@@ -4328,7 +4363,8 @@ def run_product_once(
         market=product.market,
         objective=product.objective,
         base_asset=product.base_asset,
-        allow_entries=allow_entries,
+        allow_entries=effective_allow_entries,
+        artifact_payload=artifact_snapshot,
     )
     try:
         bot.run_cycle()

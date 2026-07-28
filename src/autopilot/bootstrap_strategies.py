@@ -1,8 +1,10 @@
-"""Generate conservative paper-only bootstrap strategy artifacts.
+"""Generate paper artifacts for execution-path diagnostics.
 
 These artifacts are not research results. They exist to let a fresh server
-exercise paper execution while the research loop searches for validated edges.
-They are explicitly blocked from promotion/live trading by artifact metadata.
+validate artifact loading and, for legacy open positions, exercise exit
+management while the research loop searches for validated edges. The runtime
+blocks them from opening new positions and their metadata blocks promotion/live
+trading.
 """
 
 from __future__ import annotations
@@ -15,7 +17,6 @@ from typing import Any
 
 from src.autopilot.config import DEFAULT_CONFIG_PATH, AutopilotConfig, ProductConfig, load_config
 from src.autopilot.io import write_json_atomic
-from src.autopilot.strategy_policy import StrategyPolicyError, assert_strategy_artifact_allowed
 
 SCHEMA_VERSION = 1
 
@@ -34,7 +35,9 @@ def _paper_only_payload(product: ProductConfig, strategies: list[dict[str, Any]]
         "schema": "autopilot.paper_bootstrap/v1",
         "generated_at": _now(),
         "source": "paper_bootstrap",
-        "paper_trade_allowed": True,
+        "entry_policy": "management_only",
+        "executable": False,
+        "paper_trade_allowed": False,
         "live_allowed": False,
         "promotion_eligible": False,
         "market": product.market,
@@ -186,26 +189,14 @@ def write_bootstrap_artifacts(
         artifact = build_bootstrap_artifact(product)
         path.parent.mkdir(parents=True, exist_ok=True)
         write_json_atomic(path, artifact)
-        try:
-            policy = assert_strategy_artifact_allowed(product, require_live_eligible=False)
-        except StrategyPolicyError as exc:
-            rows.append(
-                {
-                    "product": product.name,
-                    "path": str(path),
-                    "ok": False,
-                    "action": "wrote_invalid",
-                    "error": str(exc),
-                }
-            )
-            continue
         rows.append(
             {
                 "product": product.name,
                 "path": str(path),
                 "ok": True,
                 "action": "written",
-                "strategies": policy["strategies"],
+                "entry_policy": "management_only",
+                "strategies": len(artifact["strategies"]),
             }
         )
     return {"generated_at": _now(), "ok": all(row["ok"] for row in rows), "artifacts": rows}

@@ -26,18 +26,21 @@ def product(tmp_path, **overrides):
     return ProductConfig(**payload)
 
 
-def test_build_bootstrap_artifact_is_paper_only_and_policy_valid_for_paper(tmp_path):
+def test_build_bootstrap_artifact_is_non_executable_and_management_only(tmp_path):
     active_product = product(tmp_path)
     artifact = build_bootstrap_artifact(active_product)
     active_product.strategies_path.write_text(json.dumps(artifact), encoding="utf-8")
 
-    assert artifact["paper_trade_allowed"] is True
+    assert artifact["entry_policy"] == "management_only"
+    assert artifact["executable"] is False
+    assert artifact["paper_trade_allowed"] is False
     assert artifact["live_allowed"] is False
     assert artifact["promotion_eligible"] is False
     assert len(artifact["strategies"]) == 2
     assert all(strategy["metrics"] == {} for strategy in artifact["strategies"])
-    assert_strategy_artifact_allowed(active_product, require_live_eligible=False)
-    with pytest.raises(StrategyPolicyError, match="not allowed for live trading"):
+    with pytest.raises(StrategyPolicyError, match="marked non-executable"):
+        assert_strategy_artifact_allowed(active_product, require_live_eligible=False)
+    with pytest.raises(StrategyPolicyError, match="marked non-executable"):
         assert_strategy_artifact_allowed(active_product, require_live_eligible=True)
 
 
@@ -79,6 +82,7 @@ def test_write_bootstrap_artifacts_skips_existing_and_overwrites_when_requested(
     written = write_bootstrap_artifacts(cfg, overwrite=True)
     payload = json.loads(active_product.strategies_path.read_text(encoding="utf-8"))
     assert written["artifacts"][0]["action"] == "written"
+    assert written["artifacts"][0]["entry_policy"] == "management_only"
     assert payload["schema"] == "autopilot.paper_bootstrap/v1"
 
 

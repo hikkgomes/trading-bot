@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import ipaddress
 import json
@@ -43,6 +44,18 @@ def _dict_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, dict)]
+
+
+def _parse_timestamp(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed.timestamp()
 
 
 def _fingerprint_value(value: Any) -> Any:
@@ -583,6 +596,9 @@ def research_handoff_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
     mutation_batch = (
         report.get("mutation_batch") if isinstance(report.get("mutation_batch"), dict) else {}
     )
+    generated_batch = (
+        report.get("generated_batch") if isinstance(report.get("generated_batch"), dict) else {}
+    )
 
     def unsafe_flags(payload: dict[str, Any]) -> list[str]:
         flags = [
@@ -669,6 +685,39 @@ def research_handoff_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
                 "mutation_batch_generated_at": mutation_batch.get("generated_at"),
             }
         )
+    research_generated_ts = _parse_timestamp(research_generated_at)
+    generated_batch_at = generated_batch.get("generated_at")
+    generated_batch_ts = _parse_timestamp(generated_batch_at)
+    if (
+        research_generated_ts is not None
+        and generated_batch_ts is not None
+        and generated_batch_ts > research_generated_ts
+    ):
+        warnings.append(
+            {
+                "name": "generated_batch_unconsumed",
+                "generated_batch_generated_at": generated_batch_at,
+                "research_cycle_generated_at": research_generated_at,
+                "hypotheses": generated_batch.get(
+                    "hypotheses_count",
+                    (generated_batch.get("summary") or {}).get("hypotheses"),
+                ),
+            }
+        )
+    for name, payload in (
+        ("research_cycle_stale", research_cycle),
+        ("generated_batch_stale", generated_batch),
+    ):
+        if payload.get("fresh") is False:
+            warnings.append(
+                {
+                    "name": name,
+                    "generated_at": payload.get("generated_at"),
+                    "age_seconds": payload.get("age_seconds"),
+                    "max_age_seconds": payload.get("max_age_seconds"),
+                    "reason": payload.get("freshness_reason"),
+                }
+            )
     return {"warnings": warnings}
 
 
