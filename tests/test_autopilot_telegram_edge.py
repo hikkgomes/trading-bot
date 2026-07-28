@@ -87,8 +87,7 @@ def test_settings_file_is_explicit_private_and_strictly_allowlisted(monkeypatch,
 def test_settings_file_pointer_is_resolved_from_isolated_alert_environment(tmp_path):
     settings_file = tmp_path / "telegram.env"
     settings_file.write_text(
-        "AUTOPILOT_TELEGRAM_BOT_TOKEN=file-token\n"
-        "AUTOPILOT_TELEGRAM_CHAT_ID=123\n",
+        "AUTOPILOT_TELEGRAM_BOT_TOKEN=file-token\nAUTOPILOT_TELEGRAM_CHAT_ID=123\n",
         encoding="utf-8",
     )
     settings_file.chmod(0o600)
@@ -218,6 +217,77 @@ def test_alert_rendering_recursively_redacts_credentials_and_tokens():
     assert "super-secret" not in message
     assert "Bearer secret" not in message
     assert "visible" in message
+
+
+def test_position_alert_rendering_is_concise_and_hides_internal_metadata():
+    message = format_alert_message(
+        {
+            "severity": "info",
+            "title": "autonomous position opened",
+            "detail": {
+                "schema": "autopilot.position_event/v1",
+                "event_id": "internal-event-id",
+                "event_type": "opened",
+                "configured_mode": "paper",
+                "symbol": "BTCUSDT",
+                "direction": "long",
+                "product": "active_income",
+                "entry_price": 63_454.4,
+                "position_size": 0.05,
+                "sl_price": 63_200.5824,
+                "tp_price": 63_962.0352,
+                "strategy_id": "active_bootstrap_long_rsi_5m",
+                "operator_action_required": False,
+            },
+        }
+    )
+
+    assert message == (
+        "Position opened · PAPER\n"
+        "BTCUSDT · LONG · active income\n"
+        "Entry: 63,454.4\n"
+        "Position size: 5.00% of equity\n"
+        "Stop: 63,200.58 · Target: 63,962.04\n"
+        "Strategy: active bootstrap long rsi 5m\n"
+        "No action required."
+    )
+    assert "event" not in message.lower()
+    assert "schema" not in message.lower()
+
+
+def test_health_alert_rendering_summarizes_jobs_without_raw_json():
+    message = format_alert_message(
+        {
+            "severity": "critical",
+            "title": "autopilot healthcheck failed",
+            "detail": {
+                "issues": [
+                    {
+                        "code": "scheduled_job_failed",
+                        "message": "one or more enabled scheduled jobs are failing",
+                        "detail": {
+                            "jobs": [
+                                {"name": "market_data_update_universe"},
+                                {"name": "research_cycle"},
+                            ]
+                        },
+                    }
+                ],
+                "warning_count": 4,
+            },
+        }
+    )
+
+    assert message == (
+        "System issue detected\n"
+        "Research/data jobs failing (2):\n"
+        "• market data update universe\n"
+        "• research cycle\n"
+        "Position supervision is still running.\n"
+        "You will receive one recovery message when this clears."
+    )
+    assert "issues" not in message.lower()
+    assert "[{" not in message
 
 
 def test_alert_rendering_omits_protected_results_and_redacts_secret_patterns():

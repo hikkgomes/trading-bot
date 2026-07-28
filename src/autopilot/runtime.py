@@ -4474,9 +4474,7 @@ def _emit_runtime_alert(
             title=title,
             detail=detail,
             cooldown_seconds=(
-                config.alert_cooldown_seconds
-                if cooldown_seconds is None
-                else cooldown_seconds
+                config.alert_cooldown_seconds if cooldown_seconds is None else cooldown_seconds
             ),
             dedupe_key=dedupe_key,
             webhook_url_env=config.webhook_url_env,
@@ -4517,6 +4515,18 @@ def _cycle_failure_dedupe_key(report: dict[str, Any]) -> str:
         "jobs": failed_jobs,
     }
     return f"cycle-failed:{_stable_digest(signature)}"
+
+
+def _previous_status(path: Path) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        return {}
+    try:
+        if path.stat().st_size > 2 * 1024 * 1024:
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _emit_position_change_alerts(
@@ -4614,9 +4624,7 @@ def _daily_digest_detail(operator_report: dict[str, Any]) -> dict[str, Any]:
                 if item.get("status") == "failed" or item.get("ok") is False
             ),
             "overdue": sorted(
-                str(item.get("name") or "unknown")
-                for item in jobs
-                if item.get("overdue") is True
+                str(item.get("name") or "unknown") for item in jobs if item.get("overdue") is True
             ),
         },
         "research": {
@@ -4751,6 +4759,7 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
     if errors:
         return {"ok": False, "errors": errors, "products": []}
 
+    previous_status = _previous_status(config.status_file)
     control = load_control(config.control_file)
     report: dict[str, Any] = {
         "ok": True,
@@ -4915,22 +4924,53 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
         report["ok"] = report["ok"] and all(bool(item.get("ok")) for item in control_clear)
 
     if config.alerts_enabled and not report["ok"]:
-        report["alert"] = _emit_runtime_alert(
+        incident_key = _cycle_failure_dedupe_key(report)
+        previous_incident_key = (
+            _cycle_failure_dedupe_key(previous_status)
+            if previous_status.get("ok") is False
+            else None
+        )
+        if previous_incident_key == incident_key:
+            report["alert"] = {
+                "sent": False,
+                "reason": "unchanged_incident",
+                "incident_key": incident_key,
+            }
+        else:
+            report["alert"] = _emit_runtime_alert(
+                config,
+                severity="error",
+                title="autopilot cycle failed",
+                detail=failure_detail(report),
+                cooldown_seconds=0,
+                dedupe_key=incident_key,
+            )
+    elif config.alerts_enabled and previous_status.get("ok") is False:
+        previous_incident_key = _cycle_failure_dedupe_key(previous_status)
+        report["recovery_alert"] = _emit_runtime_alert(
             config,
-            severity="error",
-            title="autopilot cycle failed",
-            detail=failure_detail(report),
-            dedupe_key=_cycle_failure_dedupe_key(report),
+            severity="info",
+            title="autopilot cycle recovered",
+            detail={
+                "cleared_incident": previous_incident_key,
+                "operator_action_required": False,
+            },
+            cooldown_seconds=0,
+            dedupe_key=f"cycle-recovered:{previous_incident_key}:{utc_now()}",
         )
     write_status(config.status_file, report)
     if config.auto_report_enabled:
         try:
             report["reporting"] = write_cycle_reports(config)
             reports_need_refresh = False
-            if config.alerts_enabled and _report_json_available(
-                report.get("reporting", {}),
-                "readiness_report_json",
-                config.readiness_report_json_file,
+            if (
+                config.alerts_enabled
+                and config.advisory_alerts_enabled
+                and _report_json_available(
+                    report.get("reporting", {}),
+                    "readiness_report_json",
+                    config.readiness_report_json_file,
+                )
             ):
                 readiness_report = json.loads(
                     config.readiness_report_json_file.read_text(encoding="utf-8")
@@ -4953,7 +4993,7 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
                     config.operator_report_json_file.read_text(encoding="utf-8")
                 )
                 research_handoff_detail = research_handoff_warning_detail(operator_report)
-                if research_handoff_detail["warnings"]:
+                if config.advisory_alerts_enabled and research_handoff_detail["warnings"]:
                     report["research_handoff_alert"] = _emit_runtime_alert(
                         config,
                         severity="warning",
@@ -4962,7 +5002,7 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
                     )
                     reports_need_refresh = True
                 research_progress_detail = research_progress_warning_detail(operator_report)
-                if research_progress_detail["warnings"]:
+                if config.advisory_alerts_enabled and research_progress_detail["warnings"]:
                     report["research_progress_alert"] = _emit_runtime_alert(
                         config,
                         severity="warning",
@@ -4973,7 +5013,7 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
                 testnet_rehearsal_detail = required_testnet_rehearsal_warning_detail(
                     operator_report
                 )
-                if testnet_rehearsal_detail["warnings"]:
+                if config.advisory_alerts_enabled and testnet_rehearsal_detail["warnings"]:
                     report["testnet_rehearsal_alert"] = _emit_runtime_alert(
                         config,
                         severity="warning",
@@ -4982,7 +5022,7 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
                     )
                     reports_need_refresh = True
                 promotion_detail = promotion_warning_detail(operator_report)
-                if promotion_detail["warnings"]:
+                if config.advisory_alerts_enabled and promotion_detail["warnings"]:
                     report["promotion_alert"] = _emit_runtime_alert(
                         config,
                         severity="warning",
@@ -4991,9 +5031,7 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
                     )
                     reports_need_refresh = True
                 if config.daily_digest_enabled:
-                    digest_period = int(
-                        time.time() // config.daily_digest_cadence_seconds
-                    )
+                    digest_period = int(time.time() // config.daily_digest_cadence_seconds)
                     digest_alert = _emit_runtime_alert(
                         config,
                         severity="info",

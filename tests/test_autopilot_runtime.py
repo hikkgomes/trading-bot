@@ -2185,6 +2185,7 @@ def test_run_once_emits_readiness_warning_alert_after_reports(monkeypatch, tmp_p
         alert_file=tmp_path / "alerts.jsonl",
         alert_state_file=tmp_path / "alert_state.json",
         auto_report_enabled=True,
+        advisory_alerts_enabled=True,
         alert_cooldown_seconds=60,
         products=[],
     )
@@ -2329,10 +2330,7 @@ def test_run_once_emits_daily_digest_once_per_configured_period(monkeypatch, tmp
     assert first["daily_digest_alert"]["sent"] is True
     assert second["daily_digest_alert"]["sent"] is False
     assert second["daily_digest_alert"]["reason"] == "cooldown"
-    alerts = [
-        json.loads(line)
-        for line in cfg.alert_file.read_text(encoding="utf-8").splitlines()
-    ]
+    alerts = [json.loads(line) for line in cfg.alert_file.read_text(encoding="utf-8").splitlines()]
     assert len(alerts) == 1
     assert alerts[0]["title"] == "autopilot daily digest"
     assert alerts[0]["detail"]["research"]["cycle_summary"]["keepers"] == 2
@@ -2346,6 +2344,7 @@ def test_run_once_records_readiness_alert_failure_without_failing_cycle(monkeypa
         alert_file=tmp_path / "alerts.jsonl",
         alert_state_file=tmp_path / "alert_state.json",
         auto_report_enabled=True,
+        advisory_alerts_enabled=True,
         products=[],
     )
     calls = {"write_reports": 0}
@@ -2403,6 +2402,7 @@ def test_run_once_emits_promotion_warning_alert_after_reports(monkeypatch, tmp_p
         operator_report_json_file=tmp_path / "operator_report.json",
         readiness_report_json_file=tmp_path / "readiness_report.json",
         auto_report_enabled=True,
+        advisory_alerts_enabled=True,
         alert_cooldown_seconds=60,
         products=[],
     )
@@ -2460,6 +2460,7 @@ def test_run_once_emits_research_handoff_warning_alert_after_reports(monkeypatch
         operator_report_json_file=tmp_path / "operator_report.json",
         readiness_report_json_file=tmp_path / "readiness_report.json",
         auto_report_enabled=True,
+        advisory_alerts_enabled=True,
         alert_cooldown_seconds=60,
         products=[],
     )
@@ -2523,6 +2524,7 @@ def test_run_once_emits_research_progress_warning_alert_after_reports(monkeypatc
         operator_report_json_file=tmp_path / "operator_report.json",
         readiness_report_json_file=tmp_path / "readiness_report.json",
         auto_report_enabled=True,
+        advisory_alerts_enabled=True,
         alert_cooldown_seconds=60,
         products=[],
     )
@@ -2595,6 +2597,7 @@ def test_run_once_emits_testnet_rehearsal_warning_alert_after_reports(monkeypatc
         readiness_report_json_file=tmp_path / "readiness_report.json",
         auto_report_enabled=True,
         alerts_enabled=True,
+        advisory_alerts_enabled=True,
         products=[],
     )
     calls = {"write_reports": 0}
@@ -2658,6 +2661,65 @@ def test_run_once_emits_testnet_rehearsal_warning_alert_after_reports(monkeypatc
     ]
 
 
+def test_run_once_keeps_advisory_warnings_out_of_telegram_by_default(
+    monkeypatch,
+    tmp_path,
+):
+    cfg = AutopilotConfig(
+        control_file=tmp_path / "control.json",
+        status_file=tmp_path / "status.json",
+        approval_ledger=tmp_path / "approvals.json",
+        alert_file=tmp_path / "alerts.jsonl",
+        alert_state_file=tmp_path / "alert_state.json",
+        operator_report_json_file=tmp_path / "operator_report.json",
+        readiness_report_json_file=tmp_path / "readiness_report.json",
+        auto_report_enabled=True,
+        products=[],
+    )
+
+    def write_reports(config):
+        config.operator_report_json_file.write_text(
+            json.dumps(
+                {
+                    "testnet_rehearsal": {
+                        "required": True,
+                        "required_by": ["active_income"],
+                        "status": "missing",
+                        "ok": False,
+                    },
+                    "promotion_reviews": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        config.readiness_report_json_file.write_text(
+            json.dumps(
+                {
+                    "ok": True,
+                    "checks": [
+                        {
+                            "name": "market data",
+                            "level": "warning",
+                            "ok": False,
+                            "detail": {"reason": "stale"},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {"ok": True}
+
+    monkeypatch.setattr("src.autopilot.runtime.write_cycle_reports", write_reports)
+
+    report = run_once(cfg)
+
+    assert report["ok"] is True
+    assert "readiness_alert" not in report
+    assert "testnet_rehearsal_alert" not in report
+    assert not cfg.alert_file.exists()
+
+
 def test_run_once_still_fails_for_missing_live_artifact(tmp_path):
     cfg = AutopilotConfig(
         control_file=tmp_path / "control.json",
@@ -2673,6 +2735,60 @@ def test_run_once_still_fails_for_missing_live_artifact(tmp_path):
     assert report["ok"] is False
     assert "not found" in report["products"][0]["error"]
     assert report["alert"]["sent"] is True
+
+
+def test_run_once_does_not_repeat_unchanged_cycle_failure(tmp_path):
+    cfg = AutopilotConfig(
+        control_file=tmp_path / "control.json",
+        status_file=tmp_path / "status.json",
+        approval_ledger=tmp_path / "approvals.json",
+        alert_file=tmp_path / "alerts.jsonl",
+        alert_state_file=tmp_path / "alert_state.json",
+        products=[product(tmp_path, execution_mode="live", require_testnet_rehearsal=True)],
+    )
+
+    first = run_once(cfg)
+    second = run_once(cfg)
+
+    assert first["alert"]["sent"] is True
+    assert second["alert"]["sent"] is False
+    assert second["alert"]["reason"] == "unchanged_incident"
+    assert len(cfg.alert_file.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_run_once_emits_recovery_once_after_failed_cycle(monkeypatch, tmp_path):
+    cfg = AutopilotConfig(
+        control_file=tmp_path / "control.json",
+        status_file=tmp_path / "status.json",
+        approval_ledger=tmp_path / "approvals.json",
+        alert_file=tmp_path / "alerts.jsonl",
+        alert_state_file=tmp_path / "alert_state.json",
+        products=[product(tmp_path)],
+    )
+    outcomes = iter(
+        [
+            {"product": {"name": "active_income"}, "ok": False, "error": "temporary"},
+            {"product": {"name": "active_income"}, "ok": True},
+            {"product": {"name": "active_income"}, "ok": True},
+        ]
+    )
+    monkeypatch.setattr(
+        "src.autopilot.runtime.run_product_once",
+        lambda *_args, **_kwargs: next(outcomes),
+    )
+
+    failed = run_once(cfg)
+    recovered = run_once(cfg)
+    stable = run_once(cfg)
+
+    assert failed["alert"]["sent"] is True
+    assert recovered["recovery_alert"]["sent"] is True
+    assert "recovery_alert" not in stable
+    alerts = [json.loads(line) for line in cfg.alert_file.read_text(encoding="utf-8").splitlines()]
+    assert [item["title"] for item in alerts] == [
+        "autopilot cycle failed",
+        "autopilot cycle recovered",
+    ]
 
 
 def test_run_once_skips_policy_blocked_paper_artifact(monkeypatch, tmp_path):

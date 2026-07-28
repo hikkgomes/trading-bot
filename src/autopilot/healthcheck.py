@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import logging
 import math
@@ -58,6 +59,40 @@ def _issue(code: str, message: str, *, detail: dict[str, Any] | None = None) -> 
     if detail:
         payload["detail"] = detail
     return payload
+
+
+def _incident_signature(issues: Any) -> str | None:
+    if not isinstance(issues, list) or not issues:
+        return None
+    identities = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        detail = issue.get("detail")
+        detail = detail if isinstance(detail, dict) else {}
+        jobs = detail.get("jobs")
+        job_names = (
+            sorted(str(job.get("name") or "unknown") for job in jobs if isinstance(job, dict))
+            if isinstance(jobs, list)
+            else []
+        )
+        identities.append(
+            {
+                "code": str(issue.get("code") or "unknown"),
+                "jobs": job_names,
+                "product": detail.get("product"),
+                "market": detail.get("market"),
+            }
+        )
+    if not identities:
+        return None
+    encoded = json.dumps(
+        sorted(identities, key=lambda item: json.dumps(item, sort_keys=True)),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _dict_list(payload: dict[str, Any], key: str) -> list[dict[str, Any]]:
@@ -2032,39 +2067,45 @@ def build_healthcheck(
         max_backup_age_seconds=max_backup_age_seconds,
         max_consecutive_job_deferrals=config.max_consecutive_job_deferrals,
     )
+    incident_signature = _incident_signature(health.get("issues"))
+    previous_signature = (
+        previous_health.get("incident_signature") if isinstance(previous_health, dict) else None
+    )
+    if previous_signature is None and isinstance(previous_health, dict):
+        previous_signature = _incident_signature(previous_health.get("issues"))
+    if incident_signature is not None:
+        health["incident_signature"] = incident_signature
     if emit_failure_alert and health.get("issues"):
-        issue_codes = sorted(
-            {
-                str(issue.get("code") or "unknown")
-                for issue in health.get("issues", [])
-                if isinstance(issue, dict)
+        if previous_signature == incident_signature:
+            health["healthcheck_alert"] = {
+                "sent": False,
+                "reason": "unchanged_incident",
+                "incident_signature": incident_signature,
             }
-        )
-        try:
-            health["healthcheck_alert"] = emit_alert(
-                alert_file=config.alert_file,
-                state_file=config.alert_state_file,
-                severity="critical",
-                title="autopilot healthcheck failed",
-                detail={
-                    "issues": health.get("issues", []),
-                    "warning_count": len(health.get("warnings", [])),
-                    "status_generated_at": health.get("status_generated_at"),
-                    "operator_report_generated_at": health.get("operator_report_generated_at"),
-                    "readiness_ok": health.get("readiness_ok"),
-                },
-                cooldown_seconds=config.alert_cooldown_seconds,
-                dedupe_key="healthcheck-failed:" + ",".join(issue_codes),
-                webhook_url_env=config.webhook_url_env,
-            )
-        except Exception as exc:  # healthcheck output must survive alert I/O failures
-            LOGGER.exception("Failed to emit healthcheck alert")
-            health["healthcheck_alert"] = {"sent": False, "error": str(exc)}
+        else:
+            try:
+                health["healthcheck_alert"] = emit_alert(
+                    alert_file=config.alert_file,
+                    state_file=config.alert_state_file,
+                    severity="critical",
+                    title="autopilot healthcheck failed",
+                    detail={
+                        "issues": health.get("issues", []),
+                        "warning_count": len(health.get("warnings", [])),
+                        "status_generated_at": health.get("status_generated_at"),
+                        "operator_report_generated_at": health.get("operator_report_generated_at"),
+                        "readiness_ok": health.get("readiness_ok"),
+                    },
+                    cooldown_seconds=0,
+                    dedupe_key=f"healthcheck-incident:{incident_signature}",
+                    webhook_url_env=config.webhook_url_env,
+                )
+            except Exception as exc:  # healthcheck output must survive alert I/O failures
+                LOGGER.exception("Failed to emit healthcheck alert")
+                health["healthcheck_alert"] = {"sent": False, "error": str(exc)}
     elif emit_failure_alert and not health.get("issues") and isinstance(previous_health, dict):
         previous_issues = [
-            issue
-            for issue in previous_health.get("issues", [])
-            if isinstance(issue, dict)
+            issue for issue in previous_health.get("issues", []) if isinstance(issue, dict)
         ]
         if previous_issues:
             cleared_codes = sorted(
@@ -2086,16 +2127,11 @@ def build_healthcheck(
                         "autonomous": True,
                         "operator_action_required": False,
                         "status_generated_at": health.get("status_generated_at"),
-                        "operator_report_generated_at": health.get(
-                            "operator_report_generated_at"
-                        ),
+                        "operator_report_generated_at": health.get("operator_report_generated_at"),
                     },
-                    cooldown_seconds=24 * 60 * 60,
+                    cooldown_seconds=0,
                     dedupe_key=(
-                        "healthcheck-recovered:"
-                        + ",".join(cleared_codes)
-                        + ":"
-                        + recovery_marker
+                        "healthcheck-recovered:" + ",".join(cleared_codes) + ":" + recovery_marker
                     ),
                     webhook_url_env=config.webhook_url_env,
                 )

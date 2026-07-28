@@ -476,24 +476,206 @@ def send_text(
     return {"ok": True, "message_id": message_id}
 
 
+def _friendly_name(value: Any) -> str:
+    return str(value or "unknown").replace("_", " ").strip()
+
+
+def _formatted_number(value: Any, *, decimals: int = 2) -> str | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    rendered = f"{number:,.{decimals}f}"
+    return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+
+
+def _formatted_percent(value: Any) -> str | None:
+    try:
+        number = float(value) * 100.0
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return f"{number:+.2f}%"
+
+
+def _format_position_alert(title: str, detail: dict[str, Any]) -> str:
+    event_type = str(detail.get("event_type") or "").lower()
+    opened = event_type == "opened" or title.endswith("opened")
+    mode = str(detail.get("configured_mode") or detail.get("execution") or "unknown").upper()
+    symbol = str(detail.get("symbol") or "unknown")
+    direction = str(detail.get("direction") or "unknown").upper()
+    product = _friendly_name(detail.get("product") or detail.get("objective"))
+    lines = [
+        f"{'Position opened' if opened else 'Position closed'} · {mode}",
+        f"{symbol} · {direction} · {product}",
+    ]
+    entry = _formatted_number(detail.get("entry_price"))
+    if opened:
+        if entry is not None:
+            lines.append(f"Entry: {entry}")
+        size = _formatted_percent(detail.get("position_size"))
+        if size is not None:
+            lines.append(f"Position size: {size.removeprefix('+')} of equity")
+        stop = _formatted_number(detail.get("sl_price"))
+        target = _formatted_number(detail.get("tp_price"))
+        if stop is not None or target is not None:
+            lines.append(f"Stop: {stop or 'n/a'} · Target: {target or 'n/a'}")
+        strategy = detail.get("strategy_id")
+        if strategy:
+            lines.append(f"Strategy: {_friendly_name(strategy)}")
+    else:
+        exit_price = _formatted_number(detail.get("exit_price"))
+        if entry is not None or exit_price is not None:
+            lines.append(f"Entry: {entry or 'n/a'} → Exit: {exit_price or 'n/a'}")
+        result = _formatted_percent(detail.get("sized_return"))
+        if result is not None:
+            lines.append(f"Portfolio result: {result}")
+        reason = detail.get("exit_reason")
+        if reason:
+            lines.append(f"Reason: {_friendly_name(reason)}")
+        equity = _formatted_number(detail.get("equity_after"))
+        if equity is not None:
+            lines.append(f"Equity after close: {equity}")
+    lines.append("No action required.")
+    return "\n".join(lines)
+
+
+def _format_health_alert(detail: dict[str, Any]) -> str:
+    issues = detail.get("issues")
+    issues = issues if isinstance(issues, list) else []
+    lines = ["System issue detected"]
+    rendered_issue = False
+    only_research_jobs = True
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        code = str(issue.get("code") or "unknown")
+        issue_detail = issue.get("detail")
+        issue_detail = issue_detail if isinstance(issue_detail, dict) else {}
+        if code == "scheduled_job_failed":
+            jobs = issue_detail.get("jobs")
+            names = (
+                [
+                    _friendly_name(job.get("name"))
+                    for job in jobs
+                    if isinstance(job, dict) and job.get("name")
+                ]
+                if isinstance(jobs, list)
+                else []
+            )
+            if names:
+                lines.append(f"Research/data jobs failing ({len(names)}):")
+                lines.extend(f"• {name}" for name in names)
+            else:
+                lines.append("One or more research/data jobs are failing.")
+            rendered_issue = True
+            continue
+        only_research_jobs = False
+        message = issue.get("message")
+        lines.append(f"• {_friendly_name(message or code)}")
+        rendered_issue = True
+    if not rendered_issue:
+        lines.append("The healthcheck found a blocking operational problem.")
+        only_research_jobs = False
+    if only_research_jobs:
+        lines.append("Position supervision is still running.")
+    lines.append("You will receive one recovery message when this clears.")
+    return "\n".join(lines)
+
+
+def _append_readable_detail(
+    lines: list[str],
+    value: Any,
+    *,
+    label: str,
+    depth: int = 0,
+) -> None:
+    if len(lines) >= 14 or depth > 2:
+        return
+    if isinstance(value, bool):
+        lines.append(f"{label}: {'yes' if value else 'no'}")
+    elif isinstance(value, str | int | float) or value is None:
+        lines.append(f"{label}: {'none' if value is None else value}")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            child = _friendly_name(key).capitalize()
+            _append_readable_detail(lines, item, label=child, depth=depth + 1)
+    elif isinstance(value, list):
+        scalar_items = [str(item) for item in value if isinstance(item, str | int | float)]
+        if scalar_items:
+            lines.append(f"{label}: {', '.join(scalar_items[:5])}")
+        for item in value:
+            if isinstance(item, dict):
+                _append_readable_detail(lines, item, label=label, depth=depth + 1)
+
+
 def format_alert_message(payload: dict[str, Any]) -> str:
     safe = redact_sensitive(payload)
-    severity = str(safe.get("severity") or "info").upper()
     title = str(safe.get("title") or "Autopilot notification")[:200]
-    generated_at = str(safe.get("generated_at") or "unknown")[:80]
     detail = safe.get("detail") if isinstance(safe.get("detail"), dict) else {}
-    lines = [f"{severity}: {title}", f"Time: {generated_at}"]
-    if detail:
-        lines.append("Details:")
-        for key, value in sorted(detail.items()):
-            label = str(key).replace("_", " ").strip().capitalize()
-            if isinstance(value, bool):
-                rendered = "yes" if value else "no"
-            elif isinstance(value, str | int | float) or value is None:
-                rendered = "none" if value is None else str(value)
-            else:
-                rendered = json.dumps(value, sort_keys=True, ensure_ascii=False)
-            lines.append(f"- {label}: {rendered}")
+    if title in {"autonomous position opened", "autonomous position closed"}:
+        return _format_position_alert(title, detail)
+    if title == "autopilot healthcheck failed":
+        return _format_health_alert(detail)
+    if title == "autopilot healthcheck recovered":
+        cleared = detail.get("cleared_issue_codes")
+        cleared = cleared if isinstance(cleared, list) else []
+        lines = ["System recovered"]
+        if cleared:
+            lines.append("Cleared: " + ", ".join(_friendly_name(item) for item in cleared))
+        lines.append("No action required.")
+        return "\n".join(lines)
+    if title == "autopilot cycle failed":
+        lines = ["Trading supervision cycle failed"]
+        products = detail.get("products")
+        product_names = (
+            [
+                _friendly_name(item.get("name"))
+                for item in products
+                if isinstance(item, dict) and item.get("name")
+            ]
+            if isinstance(products, list)
+            else []
+        )
+        jobs = detail.get("jobs")
+        job_names = (
+            [
+                _friendly_name(item.get("name"))
+                for item in jobs
+                if isinstance(item, dict) and item.get("name")
+            ]
+            if isinstance(jobs, list)
+            else []
+        )
+        if product_names:
+            lines.append("Affected products: " + ", ".join(product_names))
+        if job_names:
+            lines.append("Failed jobs: " + ", ".join(job_names))
+        if detail.get("control"):
+            lines.append("Operator control state is invalid.")
+        lines.append("Check the operator report. This will not repeat unless the incident changes.")
+        return "\n".join(lines)
+    if title == "autopilot cycle recovered":
+        return "Trading supervision recovered\nNo action required."
+
+    severity = str(safe.get("severity") or "info").upper()
+    lines = [f"{severity.title()} · {title}"]
+    for key, value in detail.items():
+        if key in {
+            "autonomous",
+            "event_id",
+            "operator_action_required",
+            "schema",
+        }:
+            continue
+        _append_readable_detail(
+            lines,
+            value,
+            label=_friendly_name(key).capitalize(),
+        )
     return "\n".join(lines)
 
 

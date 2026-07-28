@@ -78,6 +78,7 @@ PRODUCT_CONFIG_KEYS = {
     "trade_log",
 }
 AUTOPILOT_CONFIG_KEYS = {
+    "advisory_alerts_enabled",
     "alert_cooldown_seconds",
     "active_income_max_open_positions",
     "alert_file",
@@ -330,6 +331,7 @@ class AutopilotConfig:
     active_income_max_open_positions: int = 3
     auto_report_enabled: bool = False
     alerts_enabled: bool = True
+    advisory_alerts_enabled: bool = False
     alert_cooldown_seconds: int = 900
     position_change_alerts_enabled: bool = False
     daily_digest_enabled: bool = False
@@ -633,6 +635,12 @@ class AutopilotConfig:
             ),
             alerts_enabled=_json_bool(
                 payload, "alerts_enabled", default=True, field="alerts_enabled"
+            ),
+            advisory_alerts_enabled=_json_bool(
+                payload,
+                "advisory_alerts_enabled",
+                default=False,
+                field="advisory_alerts_enabled",
             ),
             alert_cooldown_seconds=alert_cooldown_seconds,
             position_change_alerts_enabled=_json_bool(

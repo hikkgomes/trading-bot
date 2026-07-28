@@ -1446,6 +1446,7 @@ def build_operator_report(
         "data_update": status.get("data_update"),
         "reporting": status.get("reporting"),
         "alert": status.get("alert"),
+        "recovery_alert": status.get("recovery_alert"),
         "readiness_alert": status.get("readiness_alert"),
         "research_handoff_alert": status.get("research_handoff_alert"),
         "research_progress_alert": status.get("research_progress_alert"),

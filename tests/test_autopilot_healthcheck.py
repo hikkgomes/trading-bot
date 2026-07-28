@@ -3659,7 +3659,7 @@ def test_build_healthcheck_emits_alert_for_blocking_issues(monkeypatch, tmp_path
     assert alert["detail"]["issues"][0]["code"] == "cycle_failed"
 
 
-def test_build_healthcheck_alert_respects_cooldown(monkeypatch, tmp_path):
+def test_build_healthcheck_does_not_repeat_unchanged_incident(monkeypatch, tmp_path):
     cfg = AutopilotConfig(
         alert_file=tmp_path / "alerts.jsonl",
         alert_state_file=tmp_path / "alert_state.json",
@@ -3674,13 +3674,17 @@ def test_build_healthcheck_alert_respects_cooldown(monkeypatch, tmp_path):
     )
 
     first = build_healthcheck(cfg, emit_failure_alert=True)
-    second = build_healthcheck(cfg, emit_failure_alert=True)
+    second = build_healthcheck(
+        cfg,
+        emit_failure_alert=True,
+        previous_health=first,
+    )
 
     assert first["healthcheck_alert"]["sent"] is True
     assert second["healthcheck_alert"] == {
         "sent": False,
-        "reason": "cooldown",
-        "fingerprint": first["healthcheck_alert"]["fingerprint"],
+        "reason": "unchanged_incident",
+        "incident_signature": first["incident_signature"],
     }
     assert len(cfg.alert_file.read_text(encoding="utf-8").splitlines()) == 1
 
