@@ -84,6 +84,24 @@ def test_settings_file_is_explicit_private_and_strictly_allowlisted(monkeypatch,
         TelegramSettings.from_environment()
 
 
+def test_settings_file_pointer_is_resolved_from_isolated_alert_environment(tmp_path):
+    settings_file = tmp_path / "telegram.env"
+    settings_file.write_text(
+        "AUTOPILOT_TELEGRAM_BOT_TOKEN=file-token\n"
+        "AUTOPILOT_TELEGRAM_CHAT_ID=123\n",
+        encoding="utf-8",
+    )
+    settings_file.chmod(0o600)
+
+    loaded = TelegramSettings.from_environment(
+        {"AUTOPILOT_TELEGRAM_SETTINGS_FILE": str(settings_file)}
+    )
+
+    assert loaded is not None
+    assert loaded.bot_token == "file-token"
+    assert loaded.chat_id == "123"
+
+
 @pytest.mark.parametrize(
     ("content", "message", "forbidden"),
     [

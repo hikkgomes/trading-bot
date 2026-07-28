@@ -170,10 +170,8 @@ class TelegramSettings:
         *,
         required: bool = False,
     ) -> TelegramSettings | None:
-        if environ is None:
-            values: Mapping[str, str] = _environment_with_private_settings(os.environ)
-        else:
-            values = environ
+        source = os.environ if environ is None else environ
+        values: Mapping[str, str] = _environment_with_private_settings(source)
         token = str(values.get("AUTOPILOT_TELEGRAM_BOT_TOKEN", "")).strip()
         chat_id = str(values.get("AUTOPILOT_TELEGRAM_CHAT_ID", "")).strip()
         if not token and not chat_id and not required:
