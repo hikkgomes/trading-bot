@@ -48,6 +48,7 @@ from src.autopilot.experiment_memory import (
 )
 from src.autopilot.io import write_json_atomic
 from src.autopilot.openclaw_bridge import ACCEPTED_SCHEMA
+from src.autopilot.research_history_contract import listing_history_compatibility
 from src.config import PROJECT_ROOT, indicator_data_dir
 
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "research_factory.json"
@@ -479,6 +480,7 @@ def _market_universe_context(
 
     context: dict[str, Any] = {
         "eligible_symbols": ["BTCUSDT"],
+        "listing_days": {},
         "snapshot_id": None,
         "generated_at": None,
         "selection_mode": "btc_fallback",
@@ -513,8 +515,18 @@ def _market_universe_context(
                     for symbol in report.get("eligible_research_symbols") or []
                     if isinstance(symbol, str) and symbol.upper().endswith("USDT")
                 }
+                listing_days = {
+                    str(item.get("symbol") or "").upper(): float(
+                        (item.get("metrics") or {}).get("listing_days")
+                    )
+                    for item in report.get("symbols") or []
+                    if isinstance(item, Mapping)
+                    and isinstance(item.get("metrics"), Mapping)
+                    and isinstance((item.get("metrics") or {}).get("listing_days"), int | float)
+                }
                 context = {
                     "eligible_symbols": sorted(eligible),
+                    "listing_days": listing_days,
                     "snapshot_id": snapshot.get("id"),
                     "generated_at": report.get("generated_at"),
                     "selection_mode": report.get("selection_mode") or "screened",
@@ -588,7 +600,18 @@ def _search_spaces_for_cycle(
     if config.dynamic_active_income_universe:
         templates = [space for space in config.search_spaces if space.product == "active_income"]
         expanded = [
-            _symbol_space(template, symbol) for symbol in sorted(eligible) for template in templates
+            _symbol_space(template, symbol)
+            for symbol in sorted(eligible)
+            for template in templates
+            if symbol == "BTCUSDT"
+            or (
+                symbol in context["listing_days"]
+                and listing_history_compatibility(
+                    template,
+                    listing_days=context["listing_days"][symbol],
+                    as_of=context["generated_at"],
+                )["ok"]
+            )
         ]
         return (
             *(space for space in config.search_spaces if space.product == "btc_accumulation"),
@@ -1234,11 +1257,19 @@ def build_generation(
     *,
     seed: int | None = None,
     now: str | None = None,
+    market_universe_report: Path = DEFAULT_MARKET_UNIVERSE_REPORT,
 ) -> dict[str, Any]:
     generated_at = now or _utc_now()
     cycle_seed = _seed_for_cycle(config, generated_at, seed)
-    cycle_spaces = _search_spaces_for_cycle(config, generated_at=generated_at)
-    universe_context = _market_universe_context(generated_at=generated_at)
+    cycle_spaces = _search_spaces_for_cycle(
+        config,
+        generated_at=generated_at,
+        report_path=market_universe_report,
+    )
+    universe_context = _market_universe_context(
+        generated_at=generated_at,
+        report_path=market_universe_report,
+    )
     rng = random.Random(cycle_seed)
     if config.dynamic_active_income_universe:
         btc_spaces = [space for space in cycle_spaces if space.product == "btc_accumulation"]
@@ -1622,10 +1653,16 @@ def run_factory(
     output_path: Path | None = None,
     seed: int | None = None,
     now: str | None = None,
+    market_universe_report: Path = DEFAULT_MARKET_UNIVERSE_REPORT,
 ) -> dict[str, Any]:
     try:
         config = load_factory_config(config_path)
-        report = build_generation(config, seed=seed, now=now)
+        report = build_generation(
+            config,
+            seed=seed,
+            now=now,
+            market_universe_report=market_universe_report,
+        )
         destination = Path(output_path) if output_path is not None else config.generated_batch_path
         if destination.is_symlink():
             raise ResearchFactoryConfigError(
@@ -1654,6 +1691,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a bounded autonomous research batch.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--market-universe-report",
+        type=Path,
+        default=DEFAULT_MARKET_UNIVERSE_REPORT,
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--validate", action="store_true", help="Validate config and memory only.")
     return parser.parse_args()
@@ -1680,7 +1722,12 @@ def main() -> None:
                 "error": f"{type(exc).__name__}: {exc}",
             }
     else:
-        payload = run_factory(config_path=args.config, output_path=args.output, seed=args.seed)
+        payload = run_factory(
+            config_path=args.config,
+            output_path=args.output,
+            seed=args.seed,
+            market_universe_report=args.market_universe_report,
+        )
     compact = {
         key: payload.get(key)
         for key in ("ok", "schema", "generated_at", "output", "error", "search_spaces")

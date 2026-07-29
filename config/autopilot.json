@@ -64,6 +64,7 @@
         "--config", "config/research_factory.json",
         "--market-universe-report", "runtime/market_universe.json",
         "--exclude-timeframes", "1m",
+        "--max-runtime-seconds", "240",
         "--output", "runtime/universe_history.json"
       ],
       "cadence_seconds": 21600,
@@ -77,6 +78,7 @@
         "--config", "config/research_factory.json",
         "--market-universe-report", "runtime/market_universe.json",
         "--timeframes", "1m",
+        "--max-runtime-seconds", "240",
         "--output", "runtime/universe_history_1m.json"
       ],
       "cadence_seconds": 86400,
@@ -159,6 +161,7 @@
       "command": [
         ".venv/bin/python", "-m", "src.autopilot.research_factory",
         "--config", "config/research_factory.json",
+        "--market-universe-report", "runtime/market_universe.json",
         "--output", "runtime/research/generated_hypotheses.json"
       ],
       "cadence_seconds": 86400,

@@ -7,6 +7,7 @@ an orchestration import cycle.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 
@@ -52,4 +53,37 @@ def generated_history_contract(space: SearchSpaceHistoryIdentity) -> dict[str, o
         "coverage_max_latest_age_hours": 24,
         "coverage_min_span_days": 900,
         "coverage_min_rows": 20_000,
+    }
+
+
+def listing_history_compatibility(
+    space: SearchSpaceHistoryIdentity,
+    *,
+    listing_days: float,
+    as_of: str | datetime,
+) -> dict[str, object]:
+    """Check whether a symbol can physically satisfy a search-space contract."""
+
+    reference = (
+        as_of
+        if isinstance(as_of, datetime)
+        else datetime.fromisoformat(str(as_of).replace("Z", "+00:00"))
+    )
+    reference = (
+        reference.replace(tzinfo=UTC)
+        if reference.tzinfo is None
+        else reference.astimezone(UTC)
+    )
+    contract = generated_history_contract(space)
+    earliest = datetime.fromisoformat(str(contract["coverage_earliest"])).replace(tzinfo=UTC)
+    maximum_delay_days = float(contract["coverage_max_start_delay_days"])
+    latest_compatible_listing = earliest + timedelta(days=maximum_delay_days)
+    listed_at = reference - timedelta(days=float(listing_days))
+    compatible = listed_at <= latest_compatible_listing
+    return {
+        "ok": compatible,
+        "listing_days": round(float(listing_days), 3),
+        "listed_at": listed_at.isoformat(),
+        "coverage_earliest": earliest.isoformat(),
+        "latest_compatible_listing": latest_compatible_listing.isoformat(),
     }

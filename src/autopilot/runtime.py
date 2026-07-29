@@ -264,12 +264,14 @@ REQUIRED_CORE_JOB_FLAG_VALUES = {
         "--config": ("config/research_factory.json",),
         "--market-universe-report": ("runtime/market_universe.json",),
         "--exclude-timeframes": ("1m",),
+        "--max-runtime-seconds": ("240",),
         "--output": ("runtime/universe_history.json",),
     },
     "market_data_update_universe_1m": {
         "--config": ("config/research_factory.json",),
         "--market-universe-report": ("runtime/market_universe.json",),
         "--timeframes": ("1m",),
+        "--max-runtime-seconds": ("240",),
         "--output": ("runtime/universe_history_1m.json",),
     },
     "market_data_update_futures": {
@@ -301,6 +303,7 @@ REQUIRED_CORE_JOB_FLAG_VALUES = {
     },
     "research_factory": {
         "--config": ("config/research_factory.json",),
+        "--market-universe-report": ("runtime/market_universe.json",),
         "--output": ("runtime/research/generated_hypotheses.json",),
     },
     "research_cycle": {

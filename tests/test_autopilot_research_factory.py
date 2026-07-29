@@ -48,6 +48,10 @@ def test_factory_expands_fresh_market_universe_across_all_active_horizons(tmp_pa
                 "schema": "autopilot.market_universe/v2",
                 "generated_at": "2026-07-27T00:00:00+00:00",
                 "eligible_research_symbols": ["BTCUSDT", "ETHUSDT", "DOGEUSDT"],
+                "symbols": [
+                    {"symbol": symbol, "metrics": {"listing_days": 2000}}
+                    for symbol in ("BTCUSDT", "ETHUSDT", "DOGEUSDT")
+                ],
                 "snapshot": {"id": "sha256:" + "3" * 64},
             }
         ),
@@ -72,6 +76,36 @@ def test_factory_expands_fresh_market_universe_across_all_active_horizons(tmp_pa
         "day_trading",
         "swing_trading",
     }
+
+
+def test_factory_excludes_horizons_that_predate_symbol_listing(tmp_path):
+    config = load_factory_config(DEFAULT_CONFIG)
+    report = tmp_path / "market_universe.json"
+    report.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "schema": "autopilot.market_universe/v2",
+                "generated_at": "2026-07-27T00:00:00+00:00",
+                "eligible_research_symbols": ["BTCUSDT", "SUIUSDT"],
+                "symbols": [
+                    {"symbol": "BTCUSDT", "metrics": {"listing_days": 2500}},
+                    {"symbol": "SUIUSDT", "metrics": {"listing_days": 1181.5}},
+                ],
+                "snapshot": {"id": "sha256:" + "5" * 64},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    spaces = _search_spaces_for_cycle(
+        config,
+        generated_at="2026-07-27T12:00:00+00:00",
+        report_path=report,
+    )
+
+    sui = [space for space in spaces if space.symbol == "SUIUSDT"]
+    assert [space.opportunity_type for space in sui] == ["scalping"]
 
 
 def _spaces() -> tuple[SearchSpace, ...]:

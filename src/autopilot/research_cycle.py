@@ -1663,10 +1663,12 @@ def _coverage_failure_report(
     selection: dict[str, Any] | None,
     unsupported_hypotheses: list[dict[str, Any]],
     research_factory_config_path: Path = DEFAULT_RESEARCH_FACTORY_CONFIG,
+    deferred: bool = False,
 ) -> dict[str, Any]:
     return {
-        "ok": False,
+        "ok": deferred,
         "skipped": True,
+        **({"deferred": True} if deferred else {}),
         "reason": "insufficient_history_coverage",
         "name": scenario.name,
         "product": scenario.product,
@@ -3120,6 +3122,7 @@ def run_research_cycle(
                         selection=None,
                         unsupported_hypotheses=[],
                         research_factory_config_path=research_factory_config_path,
+                        deferred=True,
                     )
                 )
                 continue
@@ -3252,7 +3255,10 @@ def run_research_cycle(
     report["scenarios"] = scenario_reports
 
     export_reports: list[dict[str, Any]] = []
-    has_healthy_scenario = any(bool(item.get("ok")) for item in scenario_reports)
+    has_healthy_scenario = any(
+        bool(item.get("ok")) and item.get("deferred") is not True
+        for item in scenario_reports
+    )
     for product, export_cfg in DEFAULT_EXPORTS.items() if has_healthy_scenario else ():
         product_config = configured_products.get(product)
         if product_config is None:
@@ -3402,7 +3408,15 @@ def run_research_cycle(
         mutation_batch_summary=mutation_batch_summary,
         generated_batch_summary=generated_batch_summary,
     )
+    coverage_deferred = any(
+        item.get("deferred") is True
+        and item.get("reason") == "insufficient_history_coverage"
+        for item in scenario_reports
+    )
     report["ok"] = all(bool(item.get("ok")) for item in scenario_reports + export_reports)
+    if coverage_deferred and report["ok"]:
+        report["deferred"] = True
+        report["reason"] = "history_bootstrap_pending"
     report["last_market_timestamp"] = last_timestamp
     report["last_market_marker"] = market_marker
     report["last_mutation_batch_marker"] = mutation_marker

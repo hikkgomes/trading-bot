@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 
 import pytest
@@ -661,6 +662,7 @@ def test_universe_history_due_when_market_snapshot_has_not_been_bootstrapped(tmp
         json.dumps(
             {
                 "ok": True,
+                "complete": True,
                 "market_universe": {"snapshot_id": "sha256:" + "1" * 64},
             }
         ),
@@ -672,6 +674,55 @@ def test_universe_history_due_when_market_snapshot_has_not_been_bootstrapped(tmp
         json.dumps({"snapshot": {"id": "sha256:" + "2" * 64}}),
         encoding="utf-8",
     )
+    assert job_due(cfg, state, now=120.0)
+
+
+def test_deferred_research_is_due_when_missing_history_is_published(tmp_path):
+    output = tmp_path / "research_cycle.json"
+    indicator = tmp_path / "ETHUSDT_5m_all_indicators.parquet"
+    output.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "deferred": True,
+                "reason": "history_bootstrap_pending",
+                "history_coverage": {
+                    "scenarios": {
+                        "active_day_eth": {
+                            "ok": False,
+                            "path": str(indicator),
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = job(
+        tmp_path,
+        name="research_cycle",
+        command=[
+            sys.executable,
+            "-m",
+            "src.autopilot.research_cycle",
+            "--output",
+            str(output),
+        ],
+        cadence_seconds=86400,
+    )
+    state = {
+        "version": 1,
+        "jobs": {
+            "research_cycle": {
+                "last_started_ts": 100.0,
+                "last_ok": True,
+            }
+        },
+    }
+
+    assert not job_due(cfg, state, now=120.0)
+    indicator.write_bytes(b"published")
+    os.utime(indicator, (110.0, 110.0))
     assert job_due(cfg, state, now=120.0)
 
 

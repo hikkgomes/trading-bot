@@ -54,6 +54,22 @@ TIMEFRAME_DELTAS = {
 }
 
 
+class HistoryBootstrapDeferred(RuntimeError):
+    """The bounded bootstrap saved a checkpoint and should resume later."""
+
+
+def _defer_if_deadline_reached(
+    deadline_monotonic: float | None,
+    *,
+    market: str,
+    timeframe: str,
+) -> None:
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        raise HistoryBootstrapDeferred(
+            f"{market} {timeframe}: bounded bootstrap time budget exhausted"
+        )
+
+
 @dataclass(frozen=True)
 class HistoryRequirement:
     market: str
@@ -111,6 +127,7 @@ def build_default_requirements(
     exclude_timeframes: Iterable[str] | None = None,
     now: str | pd.Timestamp | None = None,
     symbol: str = SYMBOL,
+    search_spaces: Iterable[Any] | None = None,
 ) -> tuple[HistoryRequirement, ...]:
     """Derive native datasets from the authoritative factory search spaces."""
 
@@ -138,7 +155,12 @@ def build_default_requirements(
     starts: dict[tuple[str, str], pd.Timestamp] = {}
     features: dict[tuple[str, str], set[str]] = defaultdict(set)
     scenario_names: dict[tuple[str, str], set[str]] = defaultdict(set)
-    for space in search_spaces_for_symbol(factory_config, symbol):
+    resolved_spaces = (
+        tuple(search_spaces)
+        if search_spaces is not None
+        else search_spaces_for_symbol(factory_config, symbol)
+    )
+    for space in resolved_spaces:
         if space.market not in selected_markets:
             continue
         configured_timeframes = {
@@ -524,6 +546,7 @@ def _download_ranges(
     max_request_pages: int,
     fetch_page: Callable[..., pd.DataFrame],
     request_pages_used: int = 0,
+    deadline_monotonic: float | None = None,
 ) -> tuple[pd.DataFrame, int]:
     if checkpoint_pages <= 0:
         raise ValueError("checkpoint_pages must be positive")
@@ -550,6 +573,11 @@ def _download_ranges(
             cursor_ms = int(range_start.value // 1_000_000)
             end_ms = int(range_end.value // 1_000_000)
             while cursor_ms <= end_ms:
+                _defer_if_deadline_reached(
+                    deadline_monotonic,
+                    market=requirement.market,
+                    timeframe=requirement.timeframe,
+                )
                 if request_pages >= max_request_pages:
                     raise RuntimeError(
                         f"{requirement.market} {requirement.timeframe}: API page budget "
@@ -600,6 +628,7 @@ def sync_requirement(
     request_delay_seconds: float = DEFAULT_REQUEST_DELAY_SECONDS,
     max_request_pages: int = DEFAULT_MAX_REQUEST_PAGES,
     fetch_page: Callable[..., pd.DataFrame] = fetch_kline_page,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     reference = _utc_timestamp(now if now is not None else pd.Timestamp.now(tz="UTC"))
     last_closed = _last_closed_open(reference, requirement.timeframe)
@@ -645,12 +674,18 @@ def sync_requirement(
             request_delay_seconds=request_delay_seconds,
             max_request_pages=max_request_pages,
             fetch_page=fetch_page,
+            deadline_monotonic=deadline_monotonic,
         )
         if ranges
         else (checkpoint, 0)
     )
     merged = _merge_frames(existing, downloaded)
     merged = merged.loc[(merged.index >= requirement.start) & (merged.index <= last_closed)]
+    _defer_if_deadline_reached(
+        deadline_monotonic,
+        market=requirement.market,
+        timeframe=requirement.timeframe,
+    )
     gap_policy = _exchange_gap_policy(symbol, requirement.market, requirement.timeframe)
     merged = validate_candle_frame(
         merged,
@@ -690,6 +725,7 @@ def sync_requirement(
                 max_request_pages=max_request_pages,
                 fetch_page=fetch_page,
                 request_pages_used=request_pages_used,
+                deadline_monotonic=deadline_monotonic,
             )
             targeted_gap_ranges.update(repair_ranges)
             merged = _merge_frames(existing, downloaded)
@@ -731,6 +767,11 @@ def sync_requirement(
     indicator_path: Path | None = None
     indicator_columns = 0
     if requirement.build_indicators:
+        _defer_if_deadline_reached(
+            deadline_monotonic,
+            market=requirement.market,
+            timeframe=requirement.timeframe,
+        )
         indicator_path = indicator_dir / f"{symbol}_{requirement.timeframe}_all_indicators.parquet"
         indicators = bbid.build_indicator_features(
             merged,
@@ -814,6 +855,8 @@ def run_history_bootstrap(
     max_request_pages: int = DEFAULT_MAX_REQUEST_PAGES,
     fetch_page: Callable[..., pd.DataFrame] = fetch_kline_page,
     report_path: Path | None = None,
+    search_spaces: Iterable[Any] | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     generated_at = _utc_timestamp(
         now if now is not None else pd.Timestamp.now(tz="UTC")
@@ -826,6 +869,7 @@ def run_history_bootstrap(
             exclude_timeframes=exclude_timeframes,
             now=now,
             symbol=symbol,
+            search_spaces=search_spaces,
         )
     except (OSError, ValueError) as exc:
         report = {
@@ -859,7 +903,20 @@ def run_history_bootstrap(
                 request_delay_seconds=request_delay_seconds,
                 max_request_pages=max_request_pages,
                 fetch_page=fetch_page,
+                deadline_monotonic=deadline_monotonic,
             )
+        except HistoryBootstrapDeferred as exc:
+            result = {
+                "ok": True,
+                "deferred": True,
+                "reason": "time_budget_exhausted",
+                "market": requirement.market,
+                "timeframe": requirement.timeframe,
+                "requested_start": requirement.start.isoformat(),
+                "scenarios": list(requirement.scenario_names),
+                "detail": str(exc),
+                "remediation": "rerun the same command; the atomic checkpoint resumes completed pages",
+            }
         except Exception as exc:
             result = {
                 "ok": False,
@@ -873,11 +930,17 @@ def run_history_bootstrap(
         report["datasets"].append(result)
         if report_path:
             write_json_atomic(report_path, report)
-        if not result["ok"]:
+        if result.get("deferred") or not result["ok"]:
             break
     report["ok"] = bool(requirements) and all(item.get("ok") for item in report["datasets"])
     report["dataset_count"] = len(report["datasets"])
     report["required_dataset_count"] = len(requirements)
+    report["deferred"] = any(item.get("deferred") for item in report["datasets"])
+    report["complete"] = bool(
+        report["ok"]
+        and not report["deferred"]
+        and len(report["datasets"]) == len(requirements)
+    )
     if report_path:
         write_json_atomic(report_path, report)
     return report

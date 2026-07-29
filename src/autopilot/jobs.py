@@ -255,8 +255,10 @@ def _stale_universe_history_due(job: JobConfig) -> bool:
         return False
     output = _load_json_object(output_path)
     output_universe = output.get("market_universe")
-    return not isinstance(output_universe, dict) or (
-        output_universe.get("snapshot_id") != snapshot["id"]
+    return (
+        output.get("complete") is not True
+        or not isinstance(output_universe, dict)
+        or output_universe.get("snapshot_id") != snapshot["id"]
     )
 
 
@@ -373,6 +375,47 @@ def _generated_batch_awaiting_research_due(job: JobConfig) -> bool:
     )
 
 
+def _completed_history_awaiting_research_due(
+    job: JobConfig,
+    entry: dict[str, Any],
+) -> bool:
+    """Wake deferred research when one of its missing indicator files changes."""
+
+    command = list(job.command)
+    if "src.autopilot.research_cycle" not in command:
+        return False
+    output_path = _command_path_value(job, "--output")
+    if output_path is None:
+        return False
+    report = _load_json_object(output_path)
+    if not (
+        report.get("deferred") is True
+        and report.get("reason") == "history_bootstrap_pending"
+    ):
+        return False
+    last_started = _float_or_none(entry.get("last_started_ts"))
+    if last_started is None:
+        return True
+    coverage = report.get("history_coverage")
+    scenarios = coverage.get("scenarios") if isinstance(coverage, dict) else {}
+    if not isinstance(scenarios, dict):
+        return False
+    for status in scenarios.values():
+        if not isinstance(status, dict) or status.get("ok") is True:
+            continue
+        raw_path = status.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        path = Path(raw_path)
+        path = path if path.is_absolute() else job.working_dir / path
+        try:
+            if path.is_file() and path.stat().st_mtime > last_started:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _blocked_export_products(payload: dict[str, Any]) -> set[str]:
     exports = payload.get("exports")
     if not isinstance(exports, list):
@@ -442,6 +485,8 @@ def job_due(job: JobConfig, job_state: dict[str, Any], now: float | None = None)
     if _mutation_batch_awaiting_research_due(job, job_state):
         return True
     if _generated_batch_awaiting_research_due(job):
+        return True
+    if _completed_history_awaiting_research_due(job, entry):
         return True
     if _open_position_blocked_export_due(job):
         return True

@@ -515,7 +515,10 @@ def test_one_history_failure_is_isolated_to_its_scenario(tmp_path, monkeypatch):
     )
 
     by_name = {item["name"]: item for item in report["scenarios"]}
-    assert report["ok"] is False
+    assert report["ok"] is True
+    assert report["deferred"] is True
+    assert report["reason"] == "history_bootstrap_pending"
     assert by_name["spot_shallow"]["reason"] == "insufficient_history_coverage"
+    assert by_name["spot_shallow"]["deferred"] is True
     assert by_name["futures_ready"]["ok"] is True
     assert validated == ["futures_ready"]

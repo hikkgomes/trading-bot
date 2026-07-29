@@ -774,3 +774,24 @@ def test_run_history_bootstrap_writes_failure_report_with_resume_remediation(
     assert report["datasets"][0]["ok"] is False
     assert "checkpoint resumes" in report["datasets"][0]["remediation"]
     assert json.loads(report_path.read_text())["ok"] is False
+
+
+def test_run_history_bootstrap_reports_time_budget_as_deferred(monkeypatch):
+    monkeypatch.setattr(
+        hb,
+        "sync_requirement",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            hb.HistoryBootstrapDeferred("time budget exhausted")
+        ),
+    )
+
+    report = hb.run_history_bootstrap(
+        markets=["spot"],
+        timeframes=["1m"],
+        now="2026-01-08T00:00:00Z",
+    )
+
+    assert report["ok"] is True
+    assert report["deferred"] is True
+    assert report["complete"] is False
+    assert report["datasets"][0]["reason"] == "time_budget_exhausted"
