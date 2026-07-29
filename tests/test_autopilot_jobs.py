@@ -963,6 +963,48 @@ def test_run_due_jobs_defers_due_jobs_after_cycle_limit(tmp_path):
     assert state["scheduler"]["next_index"] == 1
 
 
+def test_cycle_limit_deferral_preserves_changed_job_fingerprint(tmp_path):
+    state_path = tmp_path / "jobs.json"
+    first = job(tmp_path, name="first")
+    old_second = job(
+        tmp_path,
+        name="second",
+        command=[sys.executable, "-c", "print('old')"],
+    )
+    second = job(
+        tmp_path,
+        name="second",
+        command=[sys.executable, "-c", "print('new')"],
+    )
+    original_fingerprint = job_definition_fingerprint(old_second)
+    save_job_state(
+        state_path,
+        {
+            "version": 1,
+            "jobs": {
+                "second": {
+                    "last_started_ts": 90.0,
+                    "last_ok": False,
+                    "consecutive_failures": 3,
+                    "definition_fingerprint": original_fingerprint,
+                }
+            },
+        },
+    )
+
+    results = run_due_jobs(
+        [first, second],
+        state_path,
+        now=100.0,
+        max_jobs_per_cycle=1,
+    )
+
+    assert results[1]["reason"] == "cycle_job_limit"
+    state = load_job_state(state_path)
+    assert state["jobs"]["second"]["definition_fingerprint"] == original_fingerprint
+    assert job_due(second, state, now=101.0)
+
+
 def test_run_due_jobs_rotates_after_cycle_limited_execution(tmp_path):
     state_path = tmp_path / "jobs.json"
     first = job(tmp_path, name="first")

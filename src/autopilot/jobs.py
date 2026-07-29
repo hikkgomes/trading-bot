@@ -744,7 +744,6 @@ def run_due_jobs(
                 "last_deferred_ts": deferred_ts,
                 "last_deferred_reason": "cycle_job_limit",
                 "consecutive_deferrals": previous_deferrals + 1,
-                "definition_fingerprint": job_definition_fingerprint(job),
             }
             save_job_state(state_path, state)
             results.append(
