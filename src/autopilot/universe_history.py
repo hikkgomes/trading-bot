@@ -214,9 +214,7 @@ def run_universe_history(
         if isinstance(item, dict) and item.get("ok") is True
     ]
     completed_symbols = {
-        str(item.get("symbol"))
-        for item in reports
-        if isinstance(item.get("symbol"), str)
+        str(item.get("symbol")) for item in reports if isinstance(item.get("symbol"), str)
     }
     try:
         next_index = int(progress.get("next_index") or 0)
@@ -275,9 +273,7 @@ def run_universe_history(
                     "partition": partition,
                     "complete": False,
                     "deferred": not failures,
-                    "reason": (
-                        "bootstrap_failed" if failures else "bootstrap_in_progress"
-                    ),
+                    "reason": ("bootstrap_failed" if failures else "bootstrap_in_progress"),
                     "completed": len(completed_symbols),
                     "completed_symbols": sorted(completed_symbols),
                     "next_index": next_index,
@@ -309,9 +305,7 @@ def run_universe_history(
         "complete": complete,
         "deferred": is_deferred,
         "reason": (
-            None
-            if complete
-            else ("bootstrap_in_progress" if is_deferred else "bootstrap_failed")
+            None if complete else ("bootstrap_in_progress" if is_deferred else "bootstrap_failed")
         ),
         "completed": len(completed_symbols),
         "completed_symbols": sorted(completed_symbols),

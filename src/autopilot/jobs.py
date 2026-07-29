@@ -388,10 +388,7 @@ def _completed_history_awaiting_research_due(
     if output_path is None:
         return False
     report = _load_json_object(output_path)
-    if not (
-        report.get("deferred") is True
-        and report.get("reason") == "history_bootstrap_pending"
-    ):
+    if not (report.get("deferred") is True and report.get("reason") == "history_bootstrap_pending"):
         return False
     last_started = _float_or_none(entry.get("last_started_ts"))
     if last_started is None:

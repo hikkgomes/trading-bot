@@ -70,9 +70,7 @@ def listing_history_compatibility(
         else datetime.fromisoformat(str(as_of).replace("Z", "+00:00"))
     )
     reference = (
-        reference.replace(tzinfo=UTC)
-        if reference.tzinfo is None
-        else reference.astimezone(UTC)
+        reference.replace(tzinfo=UTC) if reference.tzinfo is None else reference.astimezone(UTC)
     )
     contract = generated_history_contract(space)
     earliest = datetime.fromisoformat(str(contract["coverage_earliest"])).replace(tzinfo=UTC)

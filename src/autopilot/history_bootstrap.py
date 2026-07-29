@@ -937,9 +937,7 @@ def run_history_bootstrap(
     report["required_dataset_count"] = len(requirements)
     report["deferred"] = any(item.get("deferred") for item in report["datasets"])
     report["complete"] = bool(
-        report["ok"]
-        and not report["deferred"]
-        and len(report["datasets"]) == len(requirements)
+        report["ok"] and not report["deferred"] and len(report["datasets"]) == len(requirements)
     )
     if report_path:
         write_json_atomic(report_path, report)

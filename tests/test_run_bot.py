@@ -148,9 +148,12 @@ def test_position_events_are_recorded_only_after_durable_entry(bot_env):
     assert event["strategy_id"] == strategy["id"]
     assert event["execution"] == "paper"
     assert event["entry_price"] == 100.0
-    assert json.loads(bot.state_file.read_text(encoding="utf-8"))["open_positions"][
-        strategy["id"]
-    ]["entry_price"] == 100.0
+    assert (
+        json.loads(bot.state_file.read_text(encoding="utf-8"))["open_positions"][strategy["id"]][
+            "entry_price"
+        ]
+        == 100.0
+    )
 
 
 class PriceSource:

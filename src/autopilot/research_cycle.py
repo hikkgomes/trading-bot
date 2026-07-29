@@ -3256,8 +3256,7 @@ def run_research_cycle(
 
     export_reports: list[dict[str, Any]] = []
     has_healthy_scenario = any(
-        bool(item.get("ok")) and item.get("deferred") is not True
-        for item in scenario_reports
+        bool(item.get("ok")) and item.get("deferred") is not True for item in scenario_reports
     )
     for product, export_cfg in DEFAULT_EXPORTS.items() if has_healthy_scenario else ():
         product_config = configured_products.get(product)
@@ -3409,8 +3408,7 @@ def run_research_cycle(
         generated_batch_summary=generated_batch_summary,
     )
     coverage_deferred = any(
-        item.get("deferred") is True
-        and item.get("reason") == "insufficient_history_coverage"
+        item.get("deferred") is True and item.get("reason") == "insufficient_history_coverage"
         for item in scenario_reports
     )
     report["ok"] = all(bool(item.get("ok")) for item in scenario_reports + export_reports)
