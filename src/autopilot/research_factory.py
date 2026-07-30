@@ -47,7 +47,7 @@ from src.autopilot.experiment_memory import (
     canonical_strategy_hash,
 )
 from src.autopilot.io import write_json_atomic
-from src.autopilot.openclaw_bridge import ACCEPTED_SCHEMA
+from src.autopilot.openclaw_bridge import ACCEPTED_SCHEMA, LEGACY_ACCEPTED_SCHEMA
 from src.autopilot.research_history_contract import listing_history_compatibility
 from src.config import PROJECT_ROOT, indicator_data_dir
 
@@ -60,7 +60,8 @@ MAX_CONFIG_BYTES = 256 * 1024
 MAX_ACCEPTED_PROPOSAL_BYTES = 64 * 1024
 MAX_PROPOSAL_FILES_PER_CYCLE = 100
 MAX_PROPOSAL_FILES_SCANNED = 20_000
-MAX_PROPOSAL_STATE_ITEMS = 10_000
+MAX_PROPOSAL_STATE_ITEMS = 2_000
+MAX_PROPOSAL_STATE_BYTES = 16 * 1024 * 1024
 MAX_SUBMITTED_SPEC_KEYS = 32
 MEMORY_COMPACTION_TRIGGER_FRACTION = 0.80
 MAX_MEMORY_COMPACTION_ROWS_PER_CYCLE = 5_000
@@ -699,7 +700,11 @@ def _feedback_weights(feedback: Mapping[str, Any]) -> dict[str, float]:
 def _proposal_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"version": 1, "processed": {}}
-    payload = _strict_json_file(path, maximum_bytes=2 * 1024 * 1024, label="proposal state")
+    payload = _strict_json_file(
+        path,
+        maximum_bytes=MAX_PROPOSAL_STATE_BYTES,
+        label="proposal state",
+    )
     processed = payload.get("processed")
     if payload.get("version") != 1 or not isinstance(processed, dict):
         raise ResearchFactoryConfigError("proposal state has invalid schema")
@@ -718,6 +723,16 @@ def _save_proposal_state(path: Path, state: dict[str, Any]) -> None:
         )[:MAX_PROPOSAL_STATE_ITEMS]
         state["processed"] = dict(newest)
     write_json_atomic(path, state)
+
+
+def _disposition_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return value[:1000]
+    if isinstance(value, list):
+        return [str(item)[:240] for item in value[:32]]
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    return str(value)[:1000]
 
 
 def _load_accepted_proposals(directory: Path, processed: set[str]) -> list[dict[str, Any]]:
@@ -739,7 +754,10 @@ def _load_accepted_proposals(directory: Path, processed: set[str]) -> list[dict[
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if not isinstance(payload, dict) or payload.get("schema") != ACCEPTED_SCHEMA:
+        if not isinstance(payload, dict) or payload.get("schema") not in {
+            ACCEPTED_SCHEMA,
+            LEGACY_ACCEPTED_SCHEMA,
+        }:
             continue
         proposal_id = payload.get("proposal_id")
         safety = payload.get("safety")
@@ -791,7 +809,10 @@ def _purge_processed_proposals(directory: Path, processed: set[str]) -> int:
         if identity_before != identity_after or not isinstance(payload, dict):
             continue
         proposal_id = payload.get("proposal_id")
-        if payload.get("schema") != ACCEPTED_SCHEMA or proposal_id not in processed:
+        if (
+            payload.get("schema") not in {ACCEPTED_SCHEMA, LEGACY_ACCEPTED_SCHEMA}
+            or proposal_id not in processed
+        ):
             continue
         try:
             path.unlink()
@@ -847,6 +868,7 @@ def _compile_openclaw_proposal(
     proposal: Mapping[str, Any],
     space: SearchSpace,
     *,
+    parent: Mapping[str, Any] | None = None,
     rng: random.Random,
     available_features: Mapping[str, Iterable[str]] | None,
     feedback_weights: Mapping[str, float],
@@ -907,7 +929,7 @@ def _compile_openclaw_proposal(
                 raise UntrustedProposalCompileError(
                     f"suggested spec violates search-space limits: {', '.join(problems)}"
                 )
-            return GeneratedIdea(
+            idea = GeneratedIdea(
                 hypothesis=hypothesis,
                 generation_method="openclaw_compiled_proposal",
                 grammar_keys=tuple(
@@ -917,6 +939,41 @@ def _compile_openclaw_proposal(
                 ),
                 motif=_motif_for_proposal(proposal),
             )
+            if parent is not None:
+                return dataclasses.replace(
+                    idea,
+                    generation_method="openclaw_compiled_revision",
+                    parent_hashes=(str(parent["behavior_hash"]),),
+                    adaptation_reasons=tuple(
+                        str(item)[:128] for item in proposal.get("changes") or []
+                    ),
+                )
+            return idea
+    if parent is not None:
+        parent_hypothesis = _parent_hypothesis(parent)
+        if parent_hypothesis is None:
+            raise UntrustedProposalCompileError("revision parent has no valid hypothesis")
+        latest = parent.get("latest_evaluation")
+        failure_reasons = (
+            tuple(str(item) for item in latest.get("rejection_reasons") or [])
+            if isinstance(latest, Mapping)
+            else ()
+        )
+        failure_reasons = (
+            *failure_reasons,
+            *(str(item) for item in proposal.get("changes") or []),
+        )
+        idea = mutate_hypothesis(
+            parent_hypothesis,
+            space,
+            parent_hash=str(parent["behavior_hash"]),
+            rng=rng,
+            available_features=available_features,
+            feedback_weights=feedback_weights,
+            limits=limits,
+            failure_reasons=failure_reasons,
+        )
+        return dataclasses.replace(idea, generation_method="openclaw_guided_revision")
     # A high-level thesis is a seed, not executable input.  Native grammar owns
     # the actual structure, so OpenClaw can be absent or wrong without widening
     # the trusted language.
@@ -1383,7 +1440,27 @@ def build_generation(
         proposals = _load_accepted_proposals(config.openclaw_accepted_dir, set(processed))
         for proposal in proposals:
             proposal_id = str(proposal["proposal_id"])
-            disposition: dict[str, Any] = {"processed_at": generated_at}
+            action = str(proposal.get("action") or "new")
+            parent_hypothesis_id = proposal.get("parent_hypothesis_id")
+            disposition: dict[str, Any] = {
+                "processed_at": generated_at,
+                "action": action,
+                **{
+                    key: _disposition_value(proposal.get(key))
+                    for key in (
+                        "parent_hypothesis_id",
+                        "objective",
+                        "opportunity_type",
+                        "symbol",
+                        "thesis",
+                        "reasoning",
+                        "changes",
+                        "expected_outcome",
+                        "falsification_criteria",
+                    )
+                    if key in proposal
+                },
+            }
             space = _space_for_proposal(proposal, cycle_spaces)
             if space is None:
                 disposition.update(status="rejected", reason="no_matching_search_space")
@@ -1392,34 +1469,95 @@ def build_generation(
                     {"reason": "openclaw_no_matching_space", "proposal_id": proposal_id}
                 )
                 continue
-            if (
-                len(accepted) >= budgets.max_candidates_per_cycle
-                or by_space[space.name] >= budgets.max_candidates_per_space
-            ):
-                # Leave it unprocessed so the next bounded cycle can consume it.
-                continue
+            parent: dict[str, Any] | None = None
             try:
-                idea = _compile_openclaw_proposal(
-                    proposal,
-                    space,
-                    rng=rng,
-                    available_features=features_by_space[space.name],
-                    feedback_weights=weights,
-                    limits=limits,
-                )
-                candidate, rejection = _try_register(
-                    memory,
-                    idea,
-                    space,
-                    parents=parents_by_space[space.name],
-                    dedup_population=dedup_by_space[space.name],
-                    budgets=budgets,
-                    extra_metadata={
-                        "proposal_id": proposal_id,
-                        "proposal_digest": proposal.get("content_digest"),
-                        "proposal_source": "openclaw",
-                    },
-                )
+                if action != "new":
+                    if not isinstance(parent_hypothesis_id, str):
+                        raise ValueError(f"{action} requires parent_hypothesis_id")
+                    parent = memory.get_strategy(parent_hypothesis_id)
+                    parent_metadata = parent.get("metadata")
+                    if not isinstance(parent_metadata, Mapping):
+                        raise ValueError("parent has invalid metadata")
+                    if (
+                        parent_metadata.get("product") != space.product
+                        or parent_metadata.get("opportunity_type") != space.opportunity_type
+                        or parent_metadata.get("base_timeframe") != space.base_timeframe
+                        or parent_metadata.get("symbol", "BTCUSDT") != space.symbol
+                    ):
+                        raise ValueError("parent does not match the requested research space")
+                    if action != "retire" and (
+                        parent.get("retired_at") is not None
+                        or parent.get("holdout_exposed_at") is not None
+                    ):
+                        raise ValueError(
+                            "retired or protected-holdout-exposed parent cannot be adapted"
+                        )
+                if action == "retire":
+                    memory.retire_strategy(
+                        str(parent_hypothesis_id),
+                        reason=f"Alfred research retirement: {proposal.get('reasoning')}"[:512],
+                    )
+                    disposition.update(status="retired", strategy_hash=parent_hypothesis_id)
+                    processed[proposal_id] = disposition
+                    continue
+                if (
+                    len(accepted) >= budgets.max_candidates_per_cycle
+                    or by_space[space.name] >= budgets.max_candidates_per_space
+                ):
+                    # Leave it unprocessed so the next bounded cycle can consume it.
+                    continue
+                if action in {"retry", "request_test"}:
+                    if parent is None:
+                        raise ValueError(f"{action} requires an available parent")
+                    candidate = _candidate_payload_from_pending(parent, space)
+                    if candidate is None:
+                        raise ValueError("parent cannot be reconstructed for a trusted test")
+                    candidate["metadata"].update(
+                        proposal_id=proposal_id,
+                        proposal_digest=proposal.get("content_digest"),
+                        proposal_source="openclaw",
+                        research_action=action,
+                        requested_test=True,
+                        requested_test_reason=proposal.get("reasoning"),
+                    )
+                    rejection = None
+                    idea = None
+                else:
+                    if action not in {"new", "revise"}:
+                        raise ValueError(f"unsupported research action: {action}")
+                    idea = _compile_openclaw_proposal(
+                        proposal,
+                        space,
+                        parent=parent if action == "revise" else None,
+                        rng=rng,
+                        available_features=features_by_space[space.name],
+                        feedback_weights=weights,
+                        limits=limits,
+                    )
+                    parent_pool = parents_by_space[space.name]
+                    if parent is not None and all(
+                        item.get("behavior_hash") != parent.get("behavior_hash")
+                        for item in parent_pool
+                    ):
+                        parent_pool = [parent, *parent_pool]
+                    candidate, rejection = _try_register(
+                        memory,
+                        idea,
+                        space,
+                        parents=parent_pool,
+                        dedup_population=dedup_by_space[space.name],
+                        budgets=budgets,
+                        extra_metadata={
+                            "proposal_id": proposal_id,
+                            "proposal_digest": proposal.get("content_digest"),
+                            "proposal_source": "openclaw",
+                            "research_action": action,
+                            "research_reasoning": proposal.get("reasoning"),
+                            "expected_outcome": proposal.get("expected_outcome"),
+                            "falsification_criteria": proposal.get("falsification_criteria"),
+                            "requested_changes": proposal.get("changes") or [],
+                        },
+                    )
             except ExperimentMemoryError:
                 raise
             except (KeyError, TypeError, ValueError) as exc:
@@ -1433,12 +1571,12 @@ def build_generation(
                 rejected.append({"proposal_id": proposal_id, **(rejection or {})})
             else:
                 disposition.update(
-                    status="accepted",
+                    status="queued_for_test",
                     strategy_hash=candidate["metadata"]["strategy_hash"],
                 )
                 accepted.append(candidate)
                 by_space[space.name] += 1
-                by_method[idea.generation_method] += 1
+                by_method[idea.generation_method if idea is not None else f"openclaw_{action}"] += 1
             processed[proposal_id] = disposition
 
         schedule = _method_schedule(

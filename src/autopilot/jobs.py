@@ -375,6 +375,34 @@ def _generated_batch_awaiting_research_due(job: JobConfig) -> bool:
     )
 
 
+def _openclaw_actions_awaiting_factory_due(job: JobConfig) -> bool:
+    """Wake the bounded factory promptly when the trusted bridge accepts work."""
+
+    command = list(job.command)
+    if "src.autopilot.research_factory" not in command:
+        return False
+    config_path = _command_path_value(job, "--config")
+    if config_path is None:
+        config_path = job.working_dir / "config" / "research_factory.json"
+    payload = _load_json_object(config_path)
+    raw_directory = payload.get("openclaw_accepted_dir")
+    if not isinstance(raw_directory, str) or not raw_directory:
+        return False
+    directory = Path(raw_directory)
+    if not directory.is_absolute():
+        directory = job.working_dir / directory
+    try:
+        if directory.is_symlink() or not directory.is_dir():
+            return False
+        return any(
+            path.is_file() and not path.is_symlink()
+            for index, path in enumerate(directory.glob("*.json"))
+            if index < 101
+        )
+    except OSError:
+        return False
+
+
 def _completed_history_awaiting_research_due(
     job: JobConfig,
     entry: dict[str, Any],
@@ -480,6 +508,8 @@ def job_due(job: JobConfig, job_state: dict[str, Any], now: float | None = None)
     if _stale_universe_history_due(job):
         return True
     if _mutation_batch_awaiting_research_due(job, job_state):
+        return True
+    if _openclaw_actions_awaiting_factory_due(job):
         return True
     if _generated_batch_awaiting_research_due(job):
         return True

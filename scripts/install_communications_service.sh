@@ -19,7 +19,10 @@ SERVICE_NAME="${SERVICE_NAME:-trading-bot-telegram.service}"
 REPORT_SERVICE_NAME="${REPORT_SERVICE_NAME:-trading-bot-telegram-report.service}"
 REPORT_TIMER_NAME="${REPORT_TIMER_NAME:-trading-bot-telegram-report.timer}"
 REPORT_INTERVAL="${REPORT_INTERVAL:-24h}"
-TELEGRAM_POLLING_ENABLED="${TELEGRAM_POLLING_ENABLED:-1}"
+# OpenClaw is the primary Telegram identity. Polling is opt-in so a routine
+# communications redeploy cannot silently recreate a competing getUpdates
+# consumer for the same token.
+TELEGRAM_POLLING_ENABLED="${TELEGRAM_POLLING_ENABLED:-0}"
 UNIT_DIR="${UNIT_DIR:-$HOME/.config/systemd/user}"
 DRY_RUN="${DRY_RUN:-0}"
 TARGET_UNIT_DIR="$UNIT_DIR"

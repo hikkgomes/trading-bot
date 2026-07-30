@@ -13,7 +13,7 @@ def test_telegram_service_uses_telegram_only_environment_and_pause_edge():
     script = Path("scripts/install_communications_service.sh").read_text(encoding="utf-8")
 
     assert 'TELEGRAM_ENV="${TELEGRAM_ENV:-$REPO/runtime/telegram.env}"' in script
-    assert 'TELEGRAM_POLLING_ENABLED="${TELEGRAM_POLLING_ENABLED:-1}"' in script
+    assert 'TELEGRAM_POLLING_ENABLED="${TELEGRAM_POLLING_ENABLED:-0}"' in script
     assert "TELEGRAM_POLLING_ENABLED must be 0 or 1" in script
     assert "EnvironmentFile=" not in script
     assert "--settings-file $TELEGRAM_ENV_UNIT --validate-settings" in script
@@ -46,6 +46,21 @@ def test_telegram_service_uses_telegram_only_environment_and_pause_edge():
     assert "prepare_unit_staging()" in script
     assert "publish_unit_files()" in script
     assert verify_call < script.index("publish_unit_files", verify_call)
+
+
+def test_alfred_installer_manages_four_reviews_event_wakes_and_operator_instructions():
+    script = Path("scripts/install_alfred_integration.sh").read_text(encoding="utf-8")
+    instructions = Path("config/alfred_trading_operator.md").read_text(encoding="utf-8")
+
+    assert 'REVIEW_CRON="${REVIEW_CRON:-45 0,6,12,18 * * *}"' in script
+    assert 'EVENT_INTERVAL="${EVENT_INTERVAL:-15m}"' in script
+    assert "openclaw_bridge claim-event" in script
+    assert "cron run $review_id" in script
+    assert "Trading Research Daily Review" in script
+    assert "--announce --channel telegram" in script
+    assert "USER_IDS.md" in script
+    assert "OpenClaw is the sole inbound Telegram poller" in instructions
+    assert "autonomously promote" in instructions
 
 
 def test_openclaw_timer_never_launches_openclaw_or_loads_trading_environment():

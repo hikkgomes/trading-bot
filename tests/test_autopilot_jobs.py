@@ -138,6 +138,44 @@ def test_disabled_job_is_not_due(tmp_path):
     assert not job_due(job(tmp_path, enabled=False), {"version": 1, "jobs": {}}, now=100.0)
 
 
+def test_accepted_openclaw_action_makes_research_factory_due_immediately(tmp_path):
+    accepted = tmp_path / "runtime" / "research_inbox" / "openclaw" / "accepted"
+    accepted.mkdir(parents=True)
+    accepted.joinpath("action.json").write_text("{}", encoding="utf-8")
+    config = tmp_path / "config" / "research_factory.json"
+    config.parent.mkdir()
+    config.write_text(
+        json.dumps({"openclaw_accepted_dir": "runtime/research_inbox/openclaw/accepted"}),
+        encoding="utf-8",
+    )
+    cfg = job(
+        tmp_path,
+        name="research_factory",
+        command=[
+            sys.executable,
+            "-m",
+            "src.autopilot.research_factory",
+            "--config",
+            "config/research_factory.json",
+        ],
+        cadence_seconds=21600,
+    )
+    state = {
+        "version": 1,
+        "jobs": {
+            "research_factory": {
+                "last_started_ts": 100.0,
+                "last_ok": True,
+                "definition_fingerprint": job_definition_fingerprint(cfg),
+            }
+        },
+    }
+
+    assert job_due(cfg, state, now=120.0)
+    accepted.joinpath("action.json").unlink()
+    assert not job_due(cfg, state, now=120.0)
+
+
 def test_missing_seed_makes_bootstrap_market_data_job_due(tmp_path, monkeypatch):
     seed_path = tmp_path / "missing" / "BTCUSDT_1m.parquet"
     monkeypatch.setattr("src.autopilot.jobs.default_1m_candle_path", lambda market: seed_path)

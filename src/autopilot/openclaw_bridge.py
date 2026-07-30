@@ -1,9 +1,10 @@
-"""One-way, credential-free bridge between OpenClaw and trusted research code.
+"""Credential-free research workspace between OpenClaw and trusted research code.
 
 OpenClaw runs as a separate service/user.  This module never launches it and
-never passes environment variables to it.  The outward context is allowlisted
-and excludes final-holdout outcomes.  Inbound proposals are untrusted inert
-records; they are not strategy artifacts and cannot be executed or promoted.
+never passes environment variables to it. The outward workspace is allowlisted,
+includes operational and development-research feedback, and excludes secrets
+and final-holdout outcomes. Inbound actions are untrusted inert records; they
+are never directly executed or promoted.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import stat
 import tempfile
 import time
@@ -36,12 +38,19 @@ DEFAULT_INDEX = INBOX_ROOT / "index.json"
 DEFAULT_INGEST_STATUS = INBOX_ROOT / "ingest_status.json"
 DEFAULT_CONTEXT = Path("runtime/openclaw/research_context.json")
 DEFAULT_REVIEW_AUDIT = Path("runtime/openclaw/review_audit.jsonl")
+DEFAULT_EVENT_STATE = Path("runtime/openclaw/event_state.json")
 DEFAULT_RESEARCH_CYCLE = Path("runtime/research_cycle.json")
 DEFAULT_GENERATED_BATCH = Path("runtime/research/generated_hypotheses.json")
 DEFAULT_MARKET_UNIVERSE = Path("runtime/market_universe.json")
+DEFAULT_OPERATOR_REPORT = Path("runtime/operator_report.json")
+DEFAULT_EXPERIMENT_MEMORY = Path("runtime/research/experiment_memory.sqlite3")
+DEFAULT_PROPOSAL_STATE = Path("runtime/research/openclaw_proposal_state.json")
 PROPOSAL_SCHEMA = "research_proposal/v1"
-ACCEPTED_SCHEMA = "autopilot.openclaw_research_proposal/v1"
-CONTEXT_SCHEMA = "autopilot.openclaw_research_context/v1"
+ACTION_SCHEMA = "research_action/v1"
+ACCEPTED_SCHEMA = "autopilot.openclaw_research_action/v2"
+LEGACY_ACCEPTED_SCHEMA = "autopilot.openclaw_research_proposal/v1"
+CONTEXT_SCHEMA = "autopilot.openclaw_research_workspace/v2"
+ACTION_TYPES = frozenset({"new", "revise", "retry", "retire", "request_test"})
 OBJECTIVES = frozenset({"active_income", "btc_accumulation"})
 OPPORTUNITY_TYPES = frozenset({"day", "position", "scalp", "swing"})
 TIMEFRAMES = frozenset(
@@ -50,11 +59,17 @@ TIMEFRAMES = frozenset(
 INPUT_KEYS = frozenset(
     {
         "base_timeframe",
+        "action",
+        "changes",
         "constraints",
         "created_at",
+        "expected_outcome",
+        "falsification_criteria",
         "objective",
         "opportunity_type",
+        "parent_hypothesis_id",
         "provenance",
+        "reasoning",
         "schema",
         "source",
         "source_proposal_id",
@@ -77,6 +92,11 @@ SAFETY = {
 MAX_PROPOSAL_BYTES = 64 * 1024
 MAX_SPEC_BYTES = 32 * 1024
 MAX_BATCH = 100
+MAX_WORKSPACE_HYPOTHESES = 2_000
+MAX_WORKSPACE_EVALUATIONS_PER_HYPOTHESIS = 8
+MAX_WORKSPACE_ACTION_HISTORY = 200
+MAX_REVIEW_HISTORY = 40
+EVENT_WAKE_COOLDOWN_SECONDS = 15 * 60
 MAX_ACCEPTED_SCAN = 20_000
 MAX_ACCEPTED_FILES = 2_000
 MAX_ACCEPTED_BYTES = 128 * 1024 * 1024
@@ -323,8 +343,9 @@ def validate_proposal(payload: dict[str, Any]) -> dict[str, Any]:
     unknown = sorted(set(payload) - INPUT_KEYS)
     if unknown:
         raise ProposalValidationError(f"proposal has unknown fields: {', '.join(unknown)}")
-    if payload.get("schema") != PROPOSAL_SCHEMA:
-        raise ProposalValidationError(f"schema must be {PROPOSAL_SCHEMA!r}")
+    schema = payload.get("schema")
+    if schema not in {PROPOSAL_SCHEMA, ACTION_SCHEMA}:
+        raise ProposalValidationError(f"schema must be {PROPOSAL_SCHEMA!r} or {ACTION_SCHEMA!r}")
     if payload.get("source") != "openclaw":
         raise ProposalValidationError("source must be 'openclaw'")
     objective = _required_string(payload, "objective", maximum=40)
@@ -351,6 +372,50 @@ def validate_proposal(payload: dict[str, Any]) -> dict[str, Any]:
             r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", source_proposal_id
         ):
             raise ProposalValidationError("source_proposal_id contains unsupported characters")
+    raw_action = payload.get("action", "new")
+    if not isinstance(raw_action, str):
+        raise ProposalValidationError("action must be a string")
+    action = raw_action.strip().lower()
+    if action not in ACTION_TYPES:
+        raise ProposalValidationError(f"action must be one of {sorted(ACTION_TYPES)}")
+    parent_hypothesis_id = payload.get("parent_hypothesis_id")
+    if action == "new":
+        if parent_hypothesis_id is not None:
+            raise ProposalValidationError("new actions cannot specify parent_hypothesis_id")
+    else:
+        if not isinstance(parent_hypothesis_id, str) or not re.fullmatch(
+            r"sha256:[a-f0-9]{64}", parent_hypothesis_id
+        ):
+            raise ProposalValidationError(
+                f"{action} actions require parent_hypothesis_id as a sha256 behavior hash"
+            )
+    raw_reasoning = payload.get("reasoning", thesis)
+    if not isinstance(raw_reasoning, str):
+        raise ProposalValidationError("reasoning must be a string")
+    reasoning = raw_reasoning.strip()
+    if not 20 <= len(reasoning) <= 4000:
+        raise ProposalValidationError("reasoning length must be between 20 and 4000")
+    raw_expected_outcome = payload.get("expected_outcome", "")
+    raw_falsification_criteria = payload.get("falsification_criteria", "")
+    if not isinstance(raw_expected_outcome, str):
+        raise ProposalValidationError("expected_outcome must be a string")
+    if not isinstance(raw_falsification_criteria, str):
+        raise ProposalValidationError("falsification_criteria must be a string")
+    expected_outcome = raw_expected_outcome.strip()
+    falsification_criteria = raw_falsification_criteria.strip()
+    if (
+        schema == ACTION_SCHEMA
+        and action in {"new", "revise"}
+        and (len(expected_outcome) < 10 or len(falsification_criteria) < 10)
+    ):
+        raise ProposalValidationError(
+            "new/revise actions require expected_outcome and falsification_criteria"
+        )
+    if len(expected_outcome) > 2000 or len(falsification_criteria) > 2000:
+        raise ProposalValidationError(
+            "expected_outcome and falsification_criteria must be at most 2000 characters"
+        )
+    changes = _bounded_string_list(payload, "changes")
     suggested_spec = payload.get("suggested_spec", {})
     if suggested_spec is None:
         suggested_spec = {}
@@ -362,10 +427,15 @@ def validate_proposal(payload: dict[str, Any]) -> dict[str, Any]:
     normalized = {
         "source": "openclaw",
         "source_created_at": created_at,
+        "action": action,
         "objective": objective,
         "opportunity_type": opportunity_type,
         "base_timeframe": base_timeframe,
         "thesis": thesis,
+        "reasoning": reasoning,
+        "expected_outcome": expected_outcome,
+        "falsification_criteria": falsification_criteria,
+        "changes": changes,
         "symbol": symbol,
         "suggested_primitives": _bounded_string_list(payload, "suggested_primitives"),
         "constraints": _bounded_string_list(payload, "constraints"),
@@ -374,6 +444,8 @@ def validate_proposal(payload: dict[str, Any]) -> dict[str, Any]:
     }
     if source_proposal_id is not None:
         normalized["source_proposal_id"] = source_proposal_id
+    if parent_hypothesis_id is not None:
+        normalized["parent_hypothesis_id"] = parent_hypothesis_id
     return normalized
 
 
@@ -382,9 +454,15 @@ def canonical_proposal_digest(proposal: dict[str, Any]) -> str:
         key: proposal.get(key)
         for key in (
             "base_timeframe",
+            "action",
+            "changes",
             "constraints",
+            "expected_outcome",
+            "falsification_criteria",
             "objective",
             "opportunity_type",
+            "parent_hypothesis_id",
+            "reasoning",
             "suggested_primitives",
             "symbol",
             "thesis",
@@ -400,7 +478,7 @@ def build_accepted_proposal(payload: dict[str, Any]) -> dict[str, Any]:
     digest = canonical_proposal_digest(normalized)
     return {
         "schema": ACCEPTED_SCHEMA,
-        "proposal_id": f"openclaw-{digest.removeprefix('sha256:')[:20]}",
+        "proposal_id": f"openclaw-action-{digest.removeprefix('sha256:')[:20]}",
         "content_digest": digest,
         "received_at": utc_now(),
         **normalized,
@@ -1164,13 +1242,379 @@ def _development_reasons(value: Any) -> dict[str, int]:
     return result
 
 
+def _safe_trade_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: _safe_scalar(value.get(key))
+        for key in (
+            "trades",
+            "wins",
+            "win_rate",
+            "net_return_sum",
+            "sized_return_sum",
+            "last_exit_time",
+            "invalid_rows",
+        )
+        if key in value
+    }
+
+
+def _safe_operational_snapshot(path: Path) -> dict[str, Any]:
+    report = _read_json_object(path)
+    products: list[dict[str, Any]] = []
+    for item in report.get("products") or []:
+        if not isinstance(item, dict):
+            continue
+        products.append(
+            {
+                key: _safe_scalar(item.get(key))
+                for key in (
+                    "name",
+                    "objective",
+                    "market",
+                    "mode",
+                    "enabled",
+                    "cycle_ok",
+                    "skipped",
+                    "reason",
+                    "error",
+                    "equity",
+                    "peak_equity",
+                    "drawdown_fraction",
+                    "drawdown_limit_fraction",
+                    "drawdown_halted",
+                    "drawdown_halt_reason",
+                    "open_positions",
+                    "open_position_details",
+                )
+                if key in item
+            }
+            | {"trade_summary": _safe_trade_summary(item.get("trade_summary"))}
+        )
+    scheduled_jobs: list[dict[str, Any]] = []
+    for item in report.get("scheduled_jobs") or []:
+        if not isinstance(item, dict):
+            continue
+        scheduled_jobs.append(
+            {
+                key: _safe_scalar(item.get(key))
+                for key in (
+                    "name",
+                    "enabled",
+                    "status",
+                    "due",
+                    "last_ok",
+                    "last_started_at",
+                    "last_duration_seconds",
+                    "last_reason",
+                    "last_error",
+                    "consecutive_failures",
+                    "consecutive_deferrals",
+                    "cadence_seconds",
+                )
+                if key in item
+            }
+        )
+    control = report.get("control") if isinstance(report.get("control"), dict) else {}
+    candidate_paper = (
+        report.get("candidate_paper") if isinstance(report.get("candidate_paper"), dict) else {}
+    )
+    job_worker = report.get("job_worker") if isinstance(report.get("job_worker"), dict) else {}
+    return {
+        "source_generated_at": report.get("generated_at"),
+        "ok": _safe_scalar(report.get("ok")),
+        "runtime_ok": _safe_scalar(report.get("runtime_ok")),
+        "control": {
+            key: _safe_scalar(control.get(key))
+            for key in ("paused", "pause_jobs", "paused_products", "paused_jobs", "reason")
+            if key in control
+        },
+        "products": products,
+        "job_worker": {
+            key: _safe_scalar(job_worker.get(key))
+            for key in (
+                "ok",
+                "fresh",
+                "last_cycle_ok",
+                "last_cycle_reason",
+                "generated_at",
+            )
+            if key in job_worker
+        },
+        "scheduled_jobs": scheduled_jobs,
+        "candidate_paper": {
+            key: _safe_scalar(candidate_paper.get(key))
+            for key in (
+                "ok",
+                "status",
+                "reason",
+                "generated_at",
+                "open_positions",
+                "activation_ready_products",
+                "drawdown_halted_products",
+                "products",
+            )
+            if key in candidate_paper
+        },
+        "operational_issues": _safe_scalar(report.get("operational_issues", [])),
+        "position_alerts": _safe_scalar(report.get("position_alerts", [])),
+    }
+
+
+def _safe_strategy_spec(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: _safe_scalar(value.get(key))
+        for key in (
+            "direction",
+            "base_timeframe",
+            "regime_timeframe",
+            "setup_timeframe",
+            "trigger_timeframe",
+            "regime",
+            "setup",
+            "trigger",
+            "exit",
+            "risk",
+            "_product",
+            "_market",
+            "_pnl_unit",
+            "_symbol",
+        )
+        if key in value
+    }
+
+
+def _stored_json_or_default(value: Any, default: Any) -> Any:
+    if not isinstance(value, str):
+        return default
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return default
+    return parsed
+
+
+def _hypothesis_workspace(memory_path: Path) -> dict[str, Any]:
+    if memory_path.is_symlink() or not memory_path.is_file():
+        return {"available": False, "hypotheses": [], "count": 0, "truncated": False}
+    connection: sqlite3.Connection | None = None
+    try:
+        uri = f"file:{memory_path.resolve()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=5)
+        connection.row_factory = sqlite3.Row
+        rows = list(
+            connection.execute(
+                """
+                SELECT * FROM strategies
+                WHERE retired_at IS NULL AND holdout_exposed_at IS NULL
+                ORDER BY created_at DESC, behavior_hash
+                LIMIT ?
+                """,
+                (MAX_WORKSPACE_HYPOTHESES + 1,),
+            )
+        )
+        truncated = len(rows) > MAX_WORKSPACE_HYPOTHESES
+        rows = rows[:MAX_WORKSPACE_HYPOTHESES]
+        hypotheses: list[dict[str, Any]] = []
+        for row in rows:
+            behavior_hash = str(row["behavior_hash"])
+            parent_rows = connection.execute(
+                """
+                SELECT parent_hash FROM lineage_edges
+                WHERE child_hash = ? ORDER BY parent_ordinal, parent_hash
+                """,
+                (behavior_hash,),
+            ).fetchall()
+            evaluations: list[dict[str, Any]] = []
+            for evaluation in connection.execute(
+                """
+                SELECT * FROM evaluations
+                WHERE behavior_hash = ?
+                ORDER BY COALESCE(completed_at, claimed_at) DESC, evaluation_key DESC
+                LIMIT ?
+                """,
+                (behavior_hash, MAX_WORKSPACE_EVALUATIONS_PER_HYPOTHESIS * 3),
+            ):
+                phase = str(evaluation["phase"] or "")
+                if _is_holdout_key(phase):
+                    continue
+                evaluations.append(
+                    {
+                        "evaluation_key": evaluation["evaluation_key"],
+                        "phase": phase,
+                        "status": evaluation["status"],
+                        "claimed_at": evaluation["claimed_at"],
+                        "completed_at": evaluation["completed_at"],
+                        "outcome": evaluation["outcome"],
+                        "rejection_reasons": _safe_scalar(
+                            _stored_json_or_default(evaluation["rejection_reasons_json"], [])
+                        ),
+                        "metrics": _safe_scalar(
+                            _stored_json_or_default(evaluation["metrics_json"], {})
+                        ),
+                        "details": _safe_scalar(
+                            _stored_json_or_default(evaluation["details_json"], {})
+                        ),
+                    }
+                )
+                if len(evaluations) >= MAX_WORKSPACE_EVALUATIONS_PER_HYPOTHESIS:
+                    break
+            metadata = _stored_json_or_default(row["metadata_json"], {})
+            hypotheses.append(
+                {
+                    "hypothesis_id": behavior_hash,
+                    "strategy_id": row["primary_strategy_id"],
+                    "created_at": row["created_at"],
+                    "generation_method": row["generation_method"],
+                    "parent_hypothesis_ids": [str(parent["parent_hash"]) for parent in parent_rows],
+                    "lineage_depth": _safe_scalar(
+                        metadata.get("lineage_depth") if isinstance(metadata, dict) else 0
+                    ),
+                    "product": _safe_scalar(
+                        metadata.get("product") if isinstance(metadata, dict) else row["product"]
+                    ),
+                    "opportunity_type": _safe_scalar(
+                        metadata.get("opportunity_type")
+                        if isinstance(metadata, dict)
+                        else row["opportunity_type"]
+                    ),
+                    "symbol": _safe_scalar(
+                        metadata.get("symbol", "BTCUSDT")
+                        if isinstance(metadata, dict)
+                        else "BTCUSDT"
+                    ),
+                    "base_timeframe": _safe_scalar(
+                        metadata.get("base_timeframe") if isinstance(metadata, dict) else None
+                    ),
+                    "proposal_id": _safe_scalar(
+                        metadata.get("proposal_id") if isinstance(metadata, dict) else None
+                    ),
+                    "novelty_score": _safe_scalar(row["novelty_score"]),
+                    "spec": _safe_strategy_spec(
+                        _stored_json_or_default(row["primary_spec_json"], {})
+                    ),
+                    "latest_evaluation": evaluations[0] if evaluations else None,
+                    "evaluation_history": evaluations,
+                }
+            )
+        return {
+            "available": True,
+            "count": len(hypotheses),
+            "truncated": truncated,
+            "hypotheses": hypotheses,
+        }
+    except (OSError, sqlite3.DatabaseError):
+        return {"available": False, "hypotheses": [], "count": 0, "truncated": False}
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _action_history(path: Path, hypotheses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    state = _read_json_object(path, max_bytes=16 * 1024 * 1024)
+    processed = state.get("processed") if isinstance(state.get("processed"), dict) else {}
+    latest_by_hash = {
+        item["hypothesis_id"]: item.get("latest_evaluation")
+        for item in hypotheses
+        if isinstance(item, dict) and isinstance(item.get("hypothesis_id"), str)
+    }
+    items: list[dict[str, Any]] = []
+    for proposal_id, disposition in processed.items():
+        if not isinstance(disposition, dict):
+            continue
+        strategy_hash = disposition.get("strategy_hash") or disposition.get("parent_hypothesis_id")
+        latest_result = latest_by_hash.get(strategy_hash)
+        if isinstance(latest_result, dict):
+            result_at = latest_result.get("completed_at") or latest_result.get("claimed_at")
+            processed_at = disposition.get("processed_at")
+            try:
+                result_time = datetime.fromisoformat(str(result_at).replace("Z", "+00:00"))
+                action_time = datetime.fromisoformat(str(processed_at).replace("Z", "+00:00"))
+            except ValueError:
+                latest_result = None
+            else:
+                if result_time <= action_time:
+                    latest_result = None
+        items.append(
+            {
+                key: _safe_scalar(disposition.get(key))
+                for key in (
+                    "processed_at",
+                    "status",
+                    "reason",
+                    "action",
+                    "parent_hypothesis_id",
+                    "strategy_hash",
+                    "objective",
+                    "opportunity_type",
+                    "symbol",
+                    "thesis",
+                    "reasoning",
+                    "changes",
+                    "expected_outcome",
+                    "falsification_criteria",
+                )
+                if key in disposition
+            }
+            | {
+                "proposal_id": str(proposal_id)[:160],
+                "latest_result": latest_result,
+            }
+        )
+    items.sort(key=lambda item: str(item.get("processed_at") or ""), reverse=True)
+    return items[:MAX_WORKSPACE_ACTION_HISTORY]
+
+
+def _review_history(path: Path) -> list[dict[str, Any]]:
+    if path.is_symlink() or not path.is_file():
+        return []
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 512 * 1024))
+            data = handle.read()
+    except OSError:
+        return []
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    items: list[dict[str, Any]] = []
+    for line in lines[-MAX_REVIEW_HISTORY:]:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            items.append(
+                {
+                    key: _safe_scalar(item.get(key))
+                    for key in (
+                        "recorded_at",
+                        "run_id",
+                        "model",
+                        "summary",
+                        "proposal_count",
+                        "action_counts",
+                    )
+                    if key in item
+                }
+            )
+    return items
+
+
 def build_research_context(
     *,
     research_cycle_path: Path = DEFAULT_RESEARCH_CYCLE,
     generated_batch_path: Path = DEFAULT_GENERATED_BATCH,
     market_universe_path: Path = DEFAULT_MARKET_UNIVERSE,
+    operator_report_path: Path = DEFAULT_OPERATOR_REPORT,
+    experiment_memory_path: Path = DEFAULT_EXPERIMENT_MEMORY,
+    proposal_state_path: Path = DEFAULT_PROPOSAL_STATE,
+    review_audit_path: Path = DEFAULT_REVIEW_AUDIT,
 ) -> dict[str, Any]:
-    """Build allowlisted research feedback with no final-holdout information."""
+    """Build the allowlisted operational and research workspace for Alfred."""
 
     research = _read_json_object(research_cycle_path)
     batch = _read_json_object(generated_batch_path)
@@ -1208,10 +1652,13 @@ def build_research_context(
         )
         if key in feedback_totals
     }
+    hypothesis_workspace = _hypothesis_workspace(experiment_memory_path)
+    hypotheses = hypothesis_workspace.get("hypotheses") or []
     return {
         "schema": CONTEXT_SCHEMA,
         "generated_at": utc_now(),
-        "purpose": "sanitized_research_proposal_context",
+        "purpose": "alfred_autonomous_research_supervision",
+        "operational_snapshot": _safe_operational_snapshot(operator_report_path),
         "objectives": [
             {
                 "name": "btc_accumulation",
@@ -1260,20 +1707,30 @@ def build_research_context(
             ),
             "cumulative_trials": _safe_scalar(batch_summary.get("cumulative_trials", 0)),
         },
+        "hypothesis_workspace": hypothesis_workspace,
+        "action_history": _action_history(proposal_state_path, hypotheses),
+        "review_history": _review_history(review_audit_path),
         "proposal_contract": {
             "drop_directory": str(DEFAULT_INCOMING),
-            "schema": PROPOSAL_SCHEMA,
+            "schema": ACTION_SCHEMA,
             "source": "openclaw",
+            "actions": sorted(ACTION_TYPES),
             "required_fields": [
                 "schema",
                 "source",
                 "created_at",
+                "action",
                 "objective",
                 "opportunity_type",
                 "base_timeframe",
                 "thesis",
+                "reasoning",
+                "expected_outcome",
+                "falsification_criteria",
             ],
             "optional_fields": [
+                "parent_hypothesis_id",
+                "changes",
                 "suggested_primitives",
                 "constraints",
                 "suggested_spec",
@@ -1287,12 +1744,241 @@ def build_research_context(
             "research_only": True,
             "credentials_excluded": True,
             "approvals_excluded": True,
-            "execution_state_excluded": True,
-            "live_controls_excluded": True,
+            "operational_state_allowlisted": True,
+            "live_controls_read_only_in_workspace": True,
             "final_holdout_feedback_excluded": True,
             "direct_strategy_import_forbidden": True,
+            "autonomous_live_promotion_forbidden": True,
+            "autonomous_order_placement_forbidden": True,
+            "autonomous_risk_increase_forbidden": True,
         },
     }
+
+
+def _event_semantics(context: dict[str, Any]) -> dict[str, Any]:
+    operational = context.get("operational_snapshot")
+    operational = operational if isinstance(operational, dict) else {}
+    products = operational.get("products") if isinstance(operational.get("products"), list) else []
+    hypotheses = context.get("hypothesis_workspace")
+    hypotheses = hypotheses if isinstance(hypotheses, dict) else {}
+    hypothesis_items = (
+        hypotheses.get("hypotheses") if isinstance(hypotheses.get("hypotheses"), list) else []
+    )
+    actions = context.get("action_history")
+    actions = actions if isinstance(actions, list) else []
+    return {
+        "operational_ok": operational.get("ok"),
+        "runtime_ok": operational.get("runtime_ok"),
+        "products": [
+            {
+                key: item.get(key)
+                for key in (
+                    "name",
+                    "cycle_ok",
+                    "error",
+                    "drawdown_halted",
+                    "drawdown_fraction",
+                    "open_positions",
+                    "equity",
+                    "trade_summary",
+                )
+            }
+            for item in products
+            if isinstance(item, dict)
+        ],
+        "job_worker": {
+            key: (operational.get("job_worker") or {}).get(key)
+            for key in ("ok", "fresh", "last_cycle_ok", "last_cycle_reason")
+            if isinstance(operational.get("job_worker"), dict)
+        },
+        "scheduled_jobs": [
+            {
+                key: item.get(key)
+                for key in (
+                    "name",
+                    "status",
+                    "last_ok",
+                    "last_error",
+                    "consecutive_failures",
+                )
+            }
+            for item in operational.get("scheduled_jobs") or []
+            if isinstance(item, dict)
+        ],
+        "operational_issues": operational.get("operational_issues"),
+        "position_alerts": operational.get("position_alerts"),
+        "hypotheses": [
+            {
+                "hypothesis_id": item.get("hypothesis_id"),
+                "latest_evaluation": item.get("latest_evaluation"),
+            }
+            for item in hypothesis_items
+            if isinstance(item, dict)
+        ],
+        "actions": [
+            {
+                "proposal_id": item.get("proposal_id"),
+                "status": item.get("status"),
+                "strategy_hash": item.get("strategy_hash"),
+                "latest_result": item.get("latest_result"),
+            }
+            for item in actions[:50]
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _material_event_reasons(before: Any, after: dict[str, Any]) -> list[str]:
+    if not isinstance(before, dict):
+        return []
+    reasons: list[str] = []
+    if before.get("operational_ok") != after.get("operational_ok"):
+        reasons.append("operational_health_changed")
+    if before.get("runtime_ok") != after.get("runtime_ok"):
+        reasons.append("runtime_health_changed")
+    before_products = {
+        item.get("name"): item
+        for item in before.get("products") or []
+        if isinstance(item, dict) and item.get("name")
+    }
+    for item in after.get("products") or []:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        prior = before_products.get(item["name"])
+        if prior is None:
+            continue
+        if prior.get("cycle_ok") != item.get("cycle_ok") or prior.get("error") != item.get("error"):
+            reasons.append(f"product_health_changed:{item['name']}")
+        if prior.get("drawdown_halted") != item.get("drawdown_halted"):
+            reasons.append(f"drawdown_halt_changed:{item['name']}")
+        if prior.get("open_positions") != item.get("open_positions"):
+            reasons.append(f"position_count_changed:{item['name']}")
+        prior_trades = (
+            prior.get("trade_summary", {}).get("trades")
+            if isinstance(prior.get("trade_summary"), dict)
+            else None
+        )
+        current_trades = (
+            item.get("trade_summary", {}).get("trades")
+            if isinstance(item.get("trade_summary"), dict)
+            else None
+        )
+        if prior_trades != current_trades:
+            reasons.append(f"paper_trade_result_changed:{item['name']}")
+        try:
+            drawdown_delta = abs(
+                float(item.get("drawdown_fraction") or 0)
+                - float(prior.get("drawdown_fraction") or 0)
+            )
+        except (TypeError, ValueError):
+            drawdown_delta = 0
+        if drawdown_delta >= 0.01:
+            reasons.append(f"material_drawdown_change:{item['name']}")
+        try:
+            prior_equity = float(prior.get("equity"))
+            current_equity = float(item.get("equity"))
+            equity_change = abs(current_equity - prior_equity) / max(abs(prior_equity), 1e-12)
+        except (TypeError, ValueError):
+            equity_change = 0
+        if equity_change >= 0.01:
+            reasons.append(f"material_equity_change:{item['name']}")
+    before_hypotheses = {
+        item.get("hypothesis_id"): item.get("latest_evaluation")
+        for item in before.get("hypotheses") or []
+        if isinstance(item, dict) and item.get("hypothesis_id")
+    }
+    for item in after.get("hypotheses") or []:
+        if not isinstance(item, dict) or not item.get("hypothesis_id"):
+            continue
+        prior = before_hypotheses.get(item["hypothesis_id"])
+        latest = item.get("latest_evaluation")
+        if prior != latest and latest is not None:
+            reasons.append(f"research_result_completed:{item['hypothesis_id']}")
+    if before.get("actions") != after.get("actions"):
+        reasons.append("research_action_disposition_changed")
+    if before.get("job_worker") != after.get("job_worker"):
+        reasons.append("job_worker_state_changed")
+    if before.get("scheduled_jobs") != after.get("scheduled_jobs"):
+        reasons.append("scheduled_job_state_changed")
+    if before.get("operational_issues") != after.get("operational_issues"):
+        reasons.append("operational_issue_changed")
+    if before.get("position_alerts") != after.get("position_alerts"):
+        reasons.append("position_or_risk_alert_changed")
+    return list(dict.fromkeys(reasons))[:40]
+
+
+def update_event_state(
+    context: dict[str, Any],
+    *,
+    event_path: Path = DEFAULT_EVENT_STATE,
+) -> dict[str, Any]:
+    semantics = _event_semantics(context)
+    previous = _read_json_object(event_path)
+    reasons = _material_event_reasons(previous.get("semantics"), semantics)
+    payload = {
+        "schema": "autopilot.openclaw_event_state/v1",
+        "updated_at": utc_now(),
+        "pending": bool(previous.get("pending")) or bool(reasons),
+        "reasons": list(dict.fromkeys([*(previous.get("reasons") or []), *reasons]))[:80],
+        "first_pending_at": (
+            previous.get("first_pending_at")
+            if previous.get("pending")
+            else (utc_now() if reasons else None)
+        ),
+        "last_wake_at": previous.get("last_wake_at"),
+        "last_acknowledged_at": previous.get("last_acknowledged_at"),
+        "semantics": semantics,
+    }
+    write_json_atomic(event_path, payload)
+    event_path.chmod(0o600)
+    return payload
+
+
+def claim_review_event(
+    *,
+    event_path: Path = DEFAULT_EVENT_STATE,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    payload = _read_json_object(event_path)
+    if not payload.get("pending"):
+        return {"claimed": False, "reason": "no_pending_event"}
+    current = now or datetime.now(UTC)
+    last_wake_at = payload.get("last_wake_at")
+    if isinstance(last_wake_at, str):
+        try:
+            last_wake = datetime.fromisoformat(last_wake_at.replace("Z", "+00:00"))
+        except ValueError:
+            last_wake = None
+        if (
+            last_wake is not None
+            and (current - last_wake.astimezone(UTC)).total_seconds() < EVENT_WAKE_COOLDOWN_SECONDS
+        ):
+            return {"claimed": False, "reason": "wake_cooldown"}
+    payload["last_wake_at"] = current.astimezone(UTC).isoformat()
+    write_json_atomic(event_path, payload)
+    event_path.chmod(0o600)
+    return {
+        "claimed": True,
+        "reasons": _safe_scalar(payload.get("reasons", [])),
+        "first_pending_at": payload.get("first_pending_at"),
+    }
+
+
+def acknowledge_review_event(
+    *,
+    event_path: Path = DEFAULT_EVENT_STATE,
+) -> None:
+    payload = _read_json_object(event_path)
+    if not payload:
+        return
+    payload.update(
+        pending=False,
+        reasons=[],
+        first_pending_at=None,
+        last_acknowledged_at=utc_now(),
+    )
+    write_json_atomic(event_path, payload)
+    event_path.chmod(0o600)
 
 
 def export_research_context(
@@ -1301,11 +1987,20 @@ def export_research_context(
     research_cycle_path: Path = DEFAULT_RESEARCH_CYCLE,
     generated_batch_path: Path = DEFAULT_GENERATED_BATCH,
     market_universe_path: Path = DEFAULT_MARKET_UNIVERSE,
+    operator_report_path: Path = DEFAULT_OPERATOR_REPORT,
+    experiment_memory_path: Path = DEFAULT_EXPERIMENT_MEMORY,
+    proposal_state_path: Path = DEFAULT_PROPOSAL_STATE,
+    review_audit_path: Path = DEFAULT_REVIEW_AUDIT,
+    event_path: Path | None = None,
 ) -> dict[str, Any]:
     context = build_research_context(
         research_cycle_path=research_cycle_path,
         generated_batch_path=generated_batch_path,
         market_universe_path=market_universe_path,
+        operator_report_path=operator_report_path,
+        experiment_memory_path=experiment_memory_path,
+        proposal_state_path=proposal_state_path,
+        review_audit_path=review_audit_path,
     )
     if output_path.is_symlink():
         raise ValueError(f"OpenClaw context output must not be a symlink: {output_path}")
@@ -1313,6 +2008,10 @@ def export_research_context(
     _chmod_if_needed(output_path.parent, 0o2750 if _shared_group_enabled() else 0o700)
     write_json_atomic(output_path, context)
     output_path.chmod(0o640 if _shared_group_enabled() else 0o600)
+    update_event_state(
+        context,
+        event_path=event_path or output_path.with_name("event_state.json"),
+    )
     return context
 
 
@@ -1324,8 +2023,10 @@ def record_review(
     model: str,
     summary: str,
     proposal_count: int,
+    action_counts: dict[str, int] | None = None,
+    event_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Append a bounded receipt for every OpenClaw review, including no-op reviews."""
+    """Append a bounded receipt for every Alfred review, including no-op reviews."""
 
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", run_id):
         raise ProposalValidationError("run_id contains unsupported characters")
@@ -1335,16 +2036,31 @@ def record_review(
         raise ProposalValidationError("summary must be 1-1000 characters")
     if not 0 <= proposal_count <= MAX_BATCH:
         raise ProposalValidationError(f"proposal_count must be between 0 and {MAX_BATCH}")
+    action_counts = action_counts or {}
+    if (
+        not isinstance(action_counts, dict)
+        or set(action_counts) - ACTION_TYPES
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0 or value > MAX_BATCH
+            for value in action_counts.values()
+        )
+        or sum(action_counts.values()) != proposal_count
+    ):
+        raise ProposalValidationError(
+            "action_counts must contain known actions with non-negative integer counts "
+            "summing to proposal_count"
+        )
     if context_path.is_symlink() or not context_path.is_file():
         raise ProposalValidationError("research context must be a regular file")
     context_digest = "sha256:" + hashlib.sha256(context_path.read_bytes()).hexdigest()
     receipt = {
-        "schema": "autopilot.openclaw_daily_review/v1",
+        "schema": "autopilot.alfred_research_review/v2",
         "recorded_at": utc_now(),
         "run_id": run_id,
         "model": model.strip(),
         "summary": summary.strip(),
         "proposal_count": proposal_count,
+        "action_counts": dict(sorted(action_counts.items())),
         "context_digest": context_digest,
         "research_only": True,
         "live_allowed": False,
@@ -1356,6 +2072,7 @@ def record_review(
         handle.write(encoded)
         handle.flush()
         os.fsync(handle.fileno())
+    acknowledge_review_event(event_path=event_path or context_path.with_name("event_state.json"))
     return receipt
 
 
@@ -1369,6 +2086,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     export.add_argument("--research-cycle", type=Path, default=DEFAULT_RESEARCH_CYCLE)
     export.add_argument("--generated-batch", type=Path, default=DEFAULT_GENERATED_BATCH)
     export.add_argument("--market-universe", type=Path, default=DEFAULT_MARKET_UNIVERSE)
+    export.add_argument("--operator-report", type=Path, default=DEFAULT_OPERATOR_REPORT)
+    export.add_argument("--experiment-memory", type=Path, default=DEFAULT_EXPERIMENT_MEMORY)
+    export.add_argument("--proposal-state", type=Path, default=DEFAULT_PROPOSAL_STATE)
+    export.add_argument("--review-audit", type=Path, default=DEFAULT_REVIEW_AUDIT)
+    export.add_argument("--event-state", type=Path, default=DEFAULT_EVENT_STATE)
     ingest = subparsers.add_parser("ingest", help="Validate and archive untrusted proposal files.")
     ingest.add_argument("--incoming", type=Path, default=DEFAULT_INCOMING)
     ingest.add_argument("--accepted", type=Path, default=DEFAULT_ACCEPTED)
@@ -1386,6 +2108,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     review.add_argument("--model", required=True)
     review.add_argument("--summary", required=True)
     review.add_argument("--proposal-count", type=int, required=True)
+    review.add_argument(
+        "--action-counts-json",
+        default="{}",
+        help='Action counts as JSON, for example {"new":1,"revise":1}.',
+    )
+    review.add_argument("--event-state", type=Path, default=DEFAULT_EVENT_STATE)
+    event = subparsers.add_parser(
+        "claim-event",
+        help="Claim a pending material-event wake; exits 1 when no wake is due.",
+    )
+    event.add_argument("--event-state", type=Path, default=DEFAULT_EVENT_STATE)
     return parser.parse_args(argv)
 
 
@@ -1397,6 +2130,11 @@ def main(argv: list[str] | None = None) -> None:
             research_cycle_path=args.research_cycle,
             generated_batch_path=args.generated_batch,
             market_universe_path=args.market_universe,
+            operator_report_path=args.operator_report,
+            experiment_memory_path=args.experiment_memory,
+            proposal_state_path=args.proposal_state,
+            review_audit_path=args.review_audit,
+            event_path=args.event_state,
         )
     elif args.command == "ingest":
         payload = ingest_inbox(
@@ -1409,7 +2147,11 @@ def main(argv: list[str] | None = None) -> None:
         )
         write_json_atomic(args.status, payload)
         args.status.chmod(0o600)
-    else:
+    elif args.command == "record-review":
+        try:
+            action_counts = json.loads(args.action_counts_json)
+        except json.JSONDecodeError as exc:
+            raise ProposalValidationError("action-counts-json must be valid JSON") from exc
         payload = record_review(
             audit_path=args.audit,
             context_path=args.context,
@@ -1417,9 +2159,15 @@ def main(argv: list[str] | None = None) -> None:
             model=args.model,
             summary=args.summary,
             proposal_count=args.proposal_count,
+            action_counts=action_counts,
+            event_path=args.event_state,
         )
+    else:
+        payload = claim_review_event(event_path=args.event_state)
     print(json.dumps(payload, indent=2, sort_keys=True))
     if args.command == "ingest" and not payload.get("ok"):
+        raise SystemExit(1)
+    if args.command == "claim-event" and not payload.get("claimed"):
         raise SystemExit(1)
 
 

@@ -56,7 +56,7 @@ REPO="$PWD" TELEGRAM_POLLING_ENABLED=0 \
 ```
 
 To use this edge's `/status` and restricted pause commands, create a separate
-BotFather bot/token and run the installer with its default
+BotFather bot/token and explicitly install it with
 `TELEGRAM_POLLING_ENABLED=1`. Never run the trading edge and OpenClaw as pollers
 for the same token; Telegram will continuously terminate one of them with an
 HTTP 409 conflict.
@@ -157,24 +157,27 @@ restart the service. Both the exact chat ID and the sender user ID must match.
 
 ## OpenClaw
 
-OpenClaw is an optional idea and reporting assistant, not part of the trusted
-trading process. Do not run OpenClaw from the autopilot job worker: that trusted
-worker has broad research/runtime write access and is not a sandbox for an
-untrusted assistant. Its installed unit strips trading and operations variables,
-but that does not replace process and filesystem isolation. Keep the existing
-OpenClaw installation in a separate service, container, or Unix account with
-access only to:
+Alfred/OpenClaw has two roles: an on-demand natural-language operator acting
+only on Henrique's explicit requests, and an autonomous research supervisor.
+It is not part of the deterministic trading process, which continues when
+OpenClaw or its model is unavailable. Do not run OpenClaw from the autopilot job
+worker: the trusted worker is not an agent sandbox.
 
-- read: `runtime/openclaw/research_context.json`
+The recurring research loop uses a narrow credential-free workspace with:
+
+- read: `runtime/openclaw/research_context.json`, containing allowlisted
+  operational state and non-protected research evidence
 - write: `runtime/research_inbox/openclaw/incoming/`
 
-It must not receive access to `.env`, `runtime/approvals.json`, control files,
-product state, trade logs, strategy artifacts, `data/`, or exchange credentials.
-If the existing OpenClaw process runs as the same unrestricted Unix user as the
-trader, filesystem isolation is not real; move it to a separate account or
-container before enabling the bridge.
+The autonomous loop must not receive `.env`, approvals, credentials, raw market
+data, or protected/final-holdout evidence. The on-demand operator is a separate
+explicit-authority path: it may inspect status and use audited control/service
+commands when Henrique asks, but cannot autonomously promote, order, approve,
+or increase live risk. If OpenClaw runs as the same Unix user as the trader,
+these limits are policy rather than filesystem isolation; a dedicated account
+or container remains the stronger production boundary.
 
-### One-way sanitized context
+### Sanitized research workspace
 
 Export context for OpenClaw:
 
@@ -182,38 +185,42 @@ Export context for OpenClaw:
 .venv/bin/python -m src.autopilot.openclaw_bridge export
 ```
 
-The output contains aggregate development/train/validation research progress,
-failure categories, generation methods, feature/primitive performance, coverage,
-and novelty counts. Its sources are the latest trusted generated batch at
-`runtime/research/generated_hypotheses.json` and the latest research-cycle
-summary. The generated batch carries a bounded snapshot of
-`ExperimentMemory.generator_feedback()`, whose contract includes development
-phases only. OpenClaw receives neither direct SQLite access nor the detailed
-experiment log.
+The output contains allowlisted paper-product health/performance, scheduled-job
+health, aggregate development/train/validation progress, every active
+non-protected hypothesis with stable identity/spec summary/lineage/evaluation
+history, prior Alfred action dispositions, and review receipts. The exporter
+reads experiment memory through a read-only SQLite connection. OpenClaw receives
+neither direct SQLite access nor protected evaluation rows.
 
-The context excludes credentials, approvals, live state, control state, account
-information, raw market data, and locked/final holdout outcomes and metrics.
+The context excludes credentials, approvals, exchange account information, raw
+market data, live-control mutation capability, and locked/final holdout outcomes.
 Final holdout decisions are deliberately one-way: they may gate export, stage a
 candidate, or retire a lineage inside the trusted core but never become
 feedback that OpenClaw can optimize against. Forward-paper evidence is also
 excluded from the adaptive research context.
 
-### Proposal contract
+### Research action contract
 
-OpenClaw may write one JSON file per idea to
+OpenClaw may write one JSON file per action to
 `runtime/research_inbox/openclaw/incoming/`. It should write a non-`.json`
 temporary file completely and then atomically rename it to `.json`, so the
 ingester never sees a partial record. Example:
 
 ```json
 {
-  "schema": "research_proposal/v1",
+  "schema": "research_action/v1",
   "source": "openclaw",
   "created_at": "2026-07-10T12:00:00Z",
+  "action": "revise",
+  "parent_hypothesis_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "objective": "active_income",
   "opportunity_type": "day",
   "base_timeframe": "5m",
   "thesis": "A volatility expansion after a quiet regime may carry short-term continuation.",
+  "reasoning": "The parent had enough trades but weak validation edge, so simplify the entry.",
+  "changes": ["remove one setup predicate"],
+  "expected_outcome": "Higher validation trade count without worse drawdown.",
+  "falsification_criteria": "Reject if validation edge remains non-positive.",
   "suggested_primitives": ["volatility percentile", "range expansion"],
   "constraints": ["avoid unusually high funding windows"],
   "provenance": {
@@ -224,8 +231,10 @@ ingester never sees a partial record. Example:
 }
 ```
 
-Valid objectives are `btc_accumulation` and `active_income`. Valid opportunity
-types are `scalp`, `day`, `swing`, and `position`.
+Actions are `new`, `revise`, `retry`, `request_test`, and `retire`. Every action
+except `new` references a stable parent behavior hash. Valid objectives are
+`btc_accumulation` and `active_income`; opportunity types are `scalp`, `day`,
+`swing`, and `position`.
 
 Ingest proposals with:
 
@@ -277,7 +286,7 @@ This cleanup is not a security quota: for a separate user or container, apply a
 filesystem/project quota to `incoming/`. A malicious or much faster writer can
 otherwise outpace any periodic userspace cleanup.
 
-Every accepted record is stamped as research-only, non-executable, not eligible
+Every accepted action is stamped as research-only, non-executable, not eligible
 for paper trading, promotion, or live trading, and requiring trusted compilation
 and full validation. The optional `suggested_spec` is renamed
 `untrusted_suggested_spec`; it is never passed directly to an executor. On the
@@ -362,6 +371,22 @@ systemctl --user status \
 journalctl --user -u trading-bot-openclaw-bridge.service -n 100 --no-pager
 ```
 
+Install Alfred's managed natural-language operator instructions, four daily
+research reviews, and the 15-minute material-event watcher:
+
+```bash
+REPO="$PWD" bash scripts/install_alfred_integration.sh
+```
+
+The scheduled reviews run at 00:45, 06:45, 12:45, and 18:45 Europe/Madrid. The
+bridge records material operational/research changes; the event watcher wakes
+the same review job with a cooldown and leaves a failed event pending for retry.
+Accepted actions make `research_factory` immediately due, and the changed batch
+makes `research_cycle` immediately due, closing the action-to-result loop.
+Meaningful findings are announced to Henrique's Telegram mapping from
+`USER_IDS.md` (or `TELEGRAM_TO`); audited no-op reviews finish with `NO_REPLY`
+and remain quiet.
+
 OpenClaw being unavailable, returning invalid JSON, or proposing unsafe content
-cannot stop the trading supervisor. Its proposal remains inert or is rejected;
+cannot stop the trading supervisor. Its action remains inert or is rejected;
 there is no direct OpenClaw-to-execution path.

@@ -1,5 +1,7 @@
 import json
 import os
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,7 @@ from src.autopilot.openclaw_bridge import (
     build_accepted_proposal,
     build_research_context,
     canonical_proposal_digest,
+    claim_review_event,
     export_research_context,
     ingest_inbox,
     record_review,
@@ -57,6 +60,39 @@ def proposal(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def action(**overrides):
+    payload = proposal(
+        schema="research_action/v1",
+        action="new",
+        reasoning="A distinct evidence-backed reason for running this bounded experiment.",
+        expected_outcome="Validation trade count improves while drawdown remains bounded.",
+        falsification_criteria="Reject if validation edge is non-positive or drawdown worsens.",
+        changes=[],
+    )
+    payload.update(overrides)
+    return payload
+
+
+def test_research_actions_require_scientific_memory_and_parent_identity():
+    revised = validate_proposal(
+        action(
+            action="revise",
+            parent_hypothesis_id="sha256:" + "a" * 64,
+            changes=["remove one setup predicate"],
+        )
+    )
+
+    assert revised["action"] == "revise"
+    assert revised["parent_hypothesis_id"] == "sha256:" + "a" * 64
+    assert revised["changes"] == ["remove one setup predicate"]
+    with pytest.raises(ProposalValidationError, match="require parent_hypothesis_id"):
+        validate_proposal(action(action="retry"))
+    with pytest.raises(ProposalValidationError, match="cannot specify parent"):
+        validate_proposal(action(action="new", parent_hypothesis_id="sha256:" + "a" * 64))
+    with pytest.raises(ProposalValidationError, match="expected_outcome"):
+        validate_proposal(action(expected_outcome=""))
 
 
 def inbox_paths(tmp_path):
@@ -492,6 +528,237 @@ def test_accepted_spool_backpressure_prevents_unprocessed_disk_growth(monkeypatc
 
 def write_json(path: Path, payload):
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def write_workspace_memory(path: Path):
+    behavior_hash = "sha256:" + "b" * 64
+    parent_hash = "sha256:" + "a" * 64
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE strategies (
+            behavior_hash TEXT PRIMARY KEY,
+            primary_strategy_id TEXT,
+            primary_spec_json TEXT,
+            generation_method TEXT,
+            metadata_json TEXT,
+            novelty_score REAL,
+            product TEXT,
+            opportunity_type TEXT,
+            created_at TEXT,
+            retired_at TEXT,
+            holdout_exposed_at TEXT
+        );
+        CREATE TABLE lineage_edges (
+            child_hash TEXT,
+            parent_hash TEXT,
+            parent_ordinal INTEGER
+        );
+        CREATE TABLE evaluations (
+            evaluation_key TEXT,
+            behavior_hash TEXT,
+            phase TEXT,
+            status TEXT,
+            claimed_at TEXT,
+            completed_at TEXT,
+            outcome TEXT,
+            rejection_reasons_json TEXT,
+            metrics_json TEXT,
+            details_json TEXT
+        );
+        """
+    )
+    spec = {
+        "direction": "long",
+        "base_timeframe": "5m",
+        "regime_timeframe": "1h",
+        "setup_timeframe": "15m",
+        "trigger_timeframe": "5m",
+        "regime": [{"feature": "ema_20"}],
+        "setup": [{"feature": "rsi_14"}],
+        "trigger": [{"feature": "close"}],
+        "exit": {"take_profit": 0.01},
+        "risk": {"risk_per_trade": 0.002},
+        "_product": "active_income",
+        "_market": "futures",
+        "_pnl_unit": "usdt",
+        "_symbol": "BTCUSDT",
+    }
+    metadata = {
+        "product": "active_income",
+        "opportunity_type": "day_trading",
+        "base_timeframe": "5m",
+        "symbol": "BTCUSDT",
+        "lineage_depth": 1,
+        "proposal_id": "openclaw-action-example",
+    }
+    connection.execute(
+        "INSERT INTO strategies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+        (
+            behavior_hash,
+            "GEN_ACTIVE_TEST",
+            json.dumps(spec),
+            "openclaw_guided_revision",
+            json.dumps(metadata),
+            0.72,
+            "active_income",
+            "day_trading",
+            "2026-07-30T00:00:00+00:00",
+        ),
+    )
+    connection.execute("INSERT INTO lineage_edges VALUES (?, ?, 0)", (behavior_hash, parent_hash))
+    connection.execute(
+        "INSERT INTO evaluations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "evaluation-development",
+            behavior_hash,
+            "validation",
+            "completed",
+            "2026-07-30T01:00:00+00:00",
+            "2026-07-30T01:10:00+00:00",
+            "reject",
+            json.dumps(["no_validation_edge"]),
+            json.dumps({"trades": 14, "sharpe": -0.1}),
+            json.dumps({"note": "development evidence"}),
+        ),
+    )
+    connection.execute(
+        "INSERT INTO evaluations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "evaluation-protected",
+            behavior_hash,
+            "final_holdout",
+            "completed",
+            "2026-07-30T02:00:00+00:00",
+            "2026-07-30T02:10:00+00:00",
+            "keep",
+            "[]",
+            json.dumps({"secret_return": 99}),
+            "{}",
+        ),
+    )
+    connection.commit()
+    connection.close()
+    return behavior_hash
+
+
+def test_workspace_exposes_operational_state_lineage_actions_and_development_results(tmp_path):
+    memory = tmp_path / "memory.sqlite3"
+    behavior_hash = write_workspace_memory(memory)
+    operator = tmp_path / "operator.json"
+    write_json(
+        operator,
+        {
+            "generated_at": "2026-07-30T03:00:00+00:00",
+            "ok": True,
+            "runtime_ok": True,
+            "control": {"paused": False, "pause_jobs": False},
+            "products": [
+                {
+                    "name": "active_income",
+                    "mode": "paper",
+                    "cycle_ok": True,
+                    "equity": 1004.0,
+                    "drawdown_fraction": 0.01,
+                    "open_positions": 1,
+                    "trade_summary": {"trades": 12, "wins": 7, "win_rate": 7 / 12},
+                }
+            ],
+        },
+    )
+    state = tmp_path / "actions.json"
+    write_json(
+        state,
+        {
+            "version": 1,
+            "processed": {
+                "openclaw-action-example": {
+                    "processed_at": "2026-07-30T00:30:00+00:00",
+                    "status": "queued_for_test",
+                    "action": "revise",
+                    "parent_hypothesis_id": "sha256:" + "a" * 64,
+                    "strategy_hash": behavior_hash,
+                    "reasoning": "Simplify the weak parent.",
+                }
+            },
+        },
+    )
+
+    context = build_research_context(
+        operator_report_path=operator,
+        experiment_memory_path=memory,
+        proposal_state_path=state,
+        research_cycle_path=tmp_path / "missing-research.json",
+        generated_batch_path=tmp_path / "missing-batch.json",
+    )
+    rendered = json.dumps(context)
+
+    assert context["operational_snapshot"]["products"][0]["mode"] == "paper"
+    hypothesis = context["hypothesis_workspace"]["hypotheses"][0]
+    assert hypothesis["hypothesis_id"] == behavior_hash
+    assert hypothesis["parent_hypothesis_ids"] == ["sha256:" + "a" * 64]
+    assert hypothesis["latest_evaluation"]["outcome"] == "reject"
+    assert context["action_history"][0]["latest_result"]["outcome"] == "reject"
+    assert "evaluation-protected" not in rendered
+    assert "secret_return" not in rendered
+
+
+def test_material_event_wake_retries_until_review_receipt_acknowledges_it(tmp_path):
+    output = tmp_path / "openclaw" / "research_context.json"
+    event = tmp_path / "openclaw" / "event_state.json"
+    operator = tmp_path / "operator.json"
+    base = {
+        "generated_at": "2026-07-30T00:00:00+00:00",
+        "ok": True,
+        "runtime_ok": True,
+        "products": [
+            {
+                "name": "active_income",
+                "mode": "paper",
+                "cycle_ok": True,
+                "drawdown_fraction": 0.0,
+                "open_positions": 0,
+            }
+        ],
+    }
+    write_json(operator, base)
+    export_research_context(
+        output,
+        operator_report_path=operator,
+        event_path=event,
+        research_cycle_path=tmp_path / "missing-research.json",
+        generated_batch_path=tmp_path / "missing-batch.json",
+    )
+    assert json.loads(event.read_text())["pending"] is False
+
+    base["products"][0]["open_positions"] = 1
+    write_json(operator, base)
+    export_research_context(
+        output,
+        operator_report_path=operator,
+        event_path=event,
+        research_cycle_path=tmp_path / "missing-research.json",
+        generated_batch_path=tmp_path / "missing-batch.json",
+    )
+    assert "position_count_changed:active_income" in json.loads(event.read_text())["reasons"]
+
+    now = datetime(2026, 7, 30, 4, tzinfo=UTC)
+    assert claim_review_event(event_path=event, now=now)["claimed"] is True
+    assert claim_review_event(event_path=event, now=now + timedelta(minutes=1)) == {
+        "claimed": False,
+        "reason": "wake_cooldown",
+    }
+    record_review(
+        audit_path=tmp_path / "review.jsonl",
+        context_path=output,
+        event_path=event,
+        run_id="event-review",
+        model="openai/gpt-5.5",
+        summary="Reviewed the material paper-position change.",
+        proposal_count=1,
+        action_counts={"request_test": 1},
+    )
+    assert json.loads(event.read_text())["pending"] is False
 
 
 def test_research_context_excludes_secrets_live_state_approvals_and_final_holdout_feedback(

@@ -29,7 +29,7 @@ environment and broker readiness checks.
 | Strategy contract | `src/export_strategies.py`, `outputs/active_strategies*.json` | Converts validated research results into execution artifacts. Holdout is a hard gate by default. |
 | Runtime | `src/autopilot/` | Lightweight 24/7 orchestration, file-based pause control, status reporting, and live approval enforcement. |
 | Execution | `src/run_bot.py`, `src/execution/` | Closed-candle paper execution by default; approved active-income live mode can route orders through the ccxt broker behind safety rails. |
-| Communications | `src/autopilot/telegram_edge.py`, `src/autopilot/openclaw_bridge.py` | Optional deterministic Telegram alerts/status/pause-only control and an isolated, research-only OpenClaw proposal boundary. |
+| Communications | `src/autopilot/telegram_edge.py`, `src/autopilot/openclaw_bridge.py` | Outbound Telegram alerts with OpenClaw as the sole inbound poller, plus Alfred's natural-language operator and autonomous research action workspace. |
 
 Generated datasets, search results, runtime state, and trade logs are ignored by
 git. The repo should stay small; regenerate artifacts when needed.

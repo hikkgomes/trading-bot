@@ -270,6 +270,153 @@ def test_openclaw_is_optional_untrusted_and_never_bypasses_native_grammar(monkey
     assert all(item["live_allowed"] is False for item in [report])
 
 
+def test_alfred_revision_is_lineage_linked_and_queued_for_trusted_testing(monkeypatch, tmp_path):
+    engine = "sha256:" + "9" * 64
+    monkeypatch.setattr(
+        "src.autopilot.research_factory._feature_inventory_for_space", lambda _space: None
+    )
+    monkeypatch.setattr("src.autopilot.research_factory.execution_engine_digest", lambda: engine)
+    config = _config(tmp_path, candidates=4)
+    first = build_generation(config, seed=50, now="2026-07-10T00:00:00+00:00")
+    with ExperimentMemory(config.memory_path) as memory:
+        for item in first["generation_metadata"]:
+            memory.record_outcome(
+                item["strategy_hash"],
+                dataset={"snapshot_id": "development-v1"},
+                window={"start": "2024-01-01", "end": "2025-01-01"},
+                protocol={"research_engine_digest": engine},
+                phase="development",
+                outcome="reject",
+                rejection_reasons=("no_train_edge",),
+            )
+    parent = next(
+        item for item in first["generation_metadata"] if item["product"] == "active_income"
+    )
+    config.openclaw_accepted_dir.mkdir(parents=True)
+    accepted = build_accepted_proposal(
+        {
+            "schema": "research_action/v1",
+            "source": "openclaw",
+            "created_at": "2026-07-10T12:00:00+00:00",
+            "action": "revise",
+            "parent_hypothesis_id": parent["strategy_hash"],
+            "objective": "active_income",
+            "opportunity_type": "day",
+            "base_timeframe": "5m",
+            "thesis": "Simplifying the weak parent may recover a measurable development edge.",
+            "reasoning": "The parent completed development with no train edge, so alter one bounded grammar element.",
+            "changes": ["simplify or replace one entry condition"],
+            "expected_outcome": "Development edge becomes positive with sufficient trades.",
+            "falsification_criteria": "Reject if edge remains non-positive or trade count is insufficient.",
+            "source_proposal_id": "review-1:revision-1",
+        }
+    )
+    config.openclaw_accepted_dir.joinpath("revision.json").write_text(
+        json.dumps(accepted), encoding="utf-8"
+    )
+
+    report = build_generation(config, seed=51, now="2026-07-10T13:00:00+00:00")
+    revised = next(
+        item
+        for item in report["generation_metadata"]
+        if item.get("proposal_id") == accepted["proposal_id"]
+    )
+    state = json.loads(config.proposal_state_path.read_text())
+    disposition = state["processed"][accepted["proposal_id"]]
+
+    assert revised["research_action"] == "revise"
+    assert revised["parent_hashes"] == [parent["strategy_hash"]]
+    assert revised["strategy_hash"] != parent["strategy_hash"]
+    assert disposition["status"] == "queued_for_test"
+    assert disposition["parent_hypothesis_id"] == parent["strategy_hash"]
+    assert disposition["strategy_hash"] == revised["strategy_hash"]
+
+
+def test_alfred_retry_queues_existing_identity_and_retire_closes_research_branch(
+    monkeypatch, tmp_path
+):
+    engine = "sha256:" + "8" * 64
+    monkeypatch.setattr(
+        "src.autopilot.research_factory._feature_inventory_for_space", lambda _space: None
+    )
+    monkeypatch.setattr("src.autopilot.research_factory.execution_engine_digest", lambda: engine)
+    config = _config(tmp_path, candidates=4)
+    first = build_generation(config, seed=60, now="2026-07-10T00:00:00+00:00")
+    with ExperimentMemory(config.memory_path) as memory:
+        for item in first["generation_metadata"]:
+            memory.record_outcome(
+                item["strategy_hash"],
+                dataset={"snapshot_id": "development-v1"},
+                window={"start": "2024-01-01", "end": "2025-01-01"},
+                protocol={"research_engine_digest": engine},
+                phase="development",
+                outcome="inconclusive",
+                rejection_reasons=(),
+            )
+    active = next(
+        item for item in first["generation_metadata"] if item["product"] == "active_income"
+    )
+    btc = next(
+        item for item in first["generation_metadata"] if item["product"] == "btc_accumulation"
+    )
+    config.openclaw_accepted_dir.mkdir(parents=True)
+    retry = build_accepted_proposal(
+        {
+            "schema": "research_action/v1",
+            "source": "openclaw",
+            "created_at": "2026-07-10T12:00:00+00:00",
+            "action": "retry",
+            "parent_hypothesis_id": active["strategy_hash"],
+            "objective": "active_income",
+            "opportunity_type": "day",
+            "base_timeframe": "5m",
+            "thesis": "The inconclusive parent merits one test on the latest eligible snapshot.",
+            "reasoning": "The prior result was inconclusive rather than rejected and new data may resolve it.",
+            "expected_outcome": "The new snapshot produces a decisive development result.",
+            "falsification_criteria": "Retire or revise if the result remains inconclusive.",
+            "source_proposal_id": "review-2:retry-1",
+        }
+    )
+    retire = build_accepted_proposal(
+        {
+            "schema": "research_action/v1",
+            "source": "openclaw",
+            "created_at": "2026-07-10T12:01:00+00:00",
+            "action": "retire",
+            "parent_hypothesis_id": btc["strategy_hash"],
+            "objective": "btc_accumulation",
+            "opportunity_type": "position",
+            "base_timeframe": "1h",
+            "thesis": "This exhausted BTC research branch should stop consuming experiment budget.",
+            "reasoning": "The branch is no longer the best use of bounded research capacity.",
+            "expected_outcome": "Research budget shifts to more informative hypotheses.",
+            "falsification_criteria": "Reconsider only if materially new development evidence appears.",
+            "source_proposal_id": "review-2:retire-1",
+        }
+    )
+    config.openclaw_accepted_dir.joinpath("retry.json").write_text(
+        json.dumps(retry), encoding="utf-8"
+    )
+    config.openclaw_accepted_dir.joinpath("retire.json").write_text(
+        json.dumps(retire), encoding="utf-8"
+    )
+
+    report = build_generation(config, seed=61, now="2026-07-10T13:00:00+00:00")
+    retried = next(
+        item
+        for item in report["generation_metadata"]
+        if item.get("proposal_id") == retry["proposal_id"]
+    )
+    state = json.loads(config.proposal_state_path.read_text())["processed"]
+
+    assert retried["strategy_hash"] == active["strategy_hash"]
+    assert retried["requested_test"] is True
+    assert state[retry["proposal_id"]]["status"] == "queued_for_test"
+    assert state[retire["proposal_id"]]["status"] == "retired"
+    with ExperimentMemory(config.memory_path) as memory:
+        assert memory.get_strategy(btc["strategy_hash"])["retired_at"] is not None
+
+
 def test_load_config_requires_both_products_horizons_and_fail_closed_holdout(monkeypatch, tmp_path):
     monkeypatch.setattr("src.autopilot.research_factory.PROJECT_ROOT", tmp_path)
     payload = json.loads(Path("config/research_factory.json").read_text(encoding="utf-8"))
