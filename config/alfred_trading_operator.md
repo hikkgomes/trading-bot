@@ -54,6 +54,11 @@ autonomously create, revise, retry, test, or retire research hypotheses through
 the research-action inbox. You may not autonomously promote to live, place
 orders, alter live risk, approve a strategy, or edit active strategy artifacts.
 
+Once weekly, follow
+`/home/alfred/trading-bot/config/openclaw_weekly_deep_review_prompt.md` for a
+Sol quality-first audit across the complete active research portfolio. The same
+research-only authority and live-trading prohibitions apply.
+
 The trading process is deterministic and must continue if you or the model are
 offline. OpenClaw is the sole inbound Telegram poller. The trading bot may send
 outbound alerts through the same bot token but its inbound poller must remain

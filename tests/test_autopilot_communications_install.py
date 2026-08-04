@@ -48,12 +48,20 @@ def test_telegram_service_uses_telegram_only_environment_and_pause_edge():
     assert verify_call < script.index("publish_unit_files", verify_call)
 
 
-def test_alfred_installer_manages_four_reviews_event_wakes_and_operator_instructions():
+def test_alfred_installer_manages_routine_and_weekly_reviews_event_wakes_and_instructions():
     script = Path("scripts/install_alfred_integration.sh").read_text(encoding="utf-8")
     instructions = Path("config/alfred_trading_operator.md").read_text(encoding="utf-8")
+    weekly_prompt = Path("config/openclaw_weekly_deep_review_prompt.md").read_text(
+        encoding="utf-8"
+    )
 
     assert 'REVIEW_CRON="${REVIEW_CRON:-45 0,6,12,18 * * *}"' in script
     assert 'MODEL="${MODEL:-openai/gpt-5.6-terra}"' in script
+    assert 'SOL_REVIEW_CRON="${SOL_REVIEW_CRON:-30 10 * * 0}"' in script
+    assert 'SOL_MODEL="${SOL_MODEL:-openai/gpt-5.6-sol}"' in script
+    assert 'SOL_REVIEW_NAME="Trading Research Weekly Deep Review"' in script
+    assert '--message "$SOL_MESSAGE" --model "$SOL_MODEL"' in script
+    assert '--thinking high --timeout-seconds 1800' in script
     assert 'EVENT_INTERVAL="${EVENT_INTERVAL:-15m}"' in script
     assert "openclaw_bridge claim-event" in script
     assert "cron run $review_id" in script
@@ -62,6 +70,10 @@ def test_alfred_installer_manages_four_reviews_event_wakes_and_operator_instruct
     assert "USER_IDS.md" in script
     assert "OpenClaw is the sole inbound Telegram poller" in instructions
     assert "autonomously promote" in instructions
+    assert "openclaw_weekly_deep_review_prompt.md" in instructions
+    assert "openai/gpt-5.6-sol" in weekly_prompt
+    assert "weekly portfolio-level audit" in weekly_prompt
+    assert "Do not promote" in weekly_prompt
 
 
 def test_openclaw_timer_never_launches_openclaw_or_loads_trading_environment():

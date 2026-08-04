@@ -5,12 +5,15 @@ REPO="${REPO:-/home/alfred/trading-bot}"
 OPENCLAW_BIN="${OPENCLAW_BIN:-/home/alfred/.npm-global/bin/openclaw}"
 OPENCLAW_WORKSPACE="${OPENCLAW_WORKSPACE:-/home/alfred/.openclaw/workspace}"
 MODEL="${MODEL:-openai/gpt-5.6-terra}"
+SOL_MODEL="${SOL_MODEL:-openai/gpt-5.6-sol}"
 TIMEZONE="${TIMEZONE:-Europe/Madrid}"
 REVIEW_CRON="${REVIEW_CRON:-45 0,6,12,18 * * *}"
+SOL_REVIEW_CRON="${SOL_REVIEW_CRON:-30 10 * * 0}"
 EVENT_INTERVAL="${EVENT_INTERVAL:-15m}"
 TELEGRAM_TO="${TELEGRAM_TO:-}"
 DRY_RUN="${DRY_RUN:-0}"
 REVIEW_NAME="Trading Research Supervisor"
+SOL_REVIEW_NAME="Trading Research Weekly Deep Review"
 EVENT_NAME="Trading Research Event Watcher"
 MANAGED_START="<!-- trading-bot-alfred:start -->"
 MANAGED_END="<!-- trading-bot-alfred:end -->"
@@ -24,12 +27,14 @@ if [[ "$REPO" == "/" || "$OPENCLAW_WORKSPACE" == "/" ]]; then
   exit 1
 fi
 if [[ ! -f "$REPO/config/openclaw_daily_review_prompt.md" ||
+      ! -f "$REPO/config/openclaw_weekly_deep_review_prompt.md" ||
       ! -f "$REPO/config/alfred_trading_operator.md" ]]; then
   echo "Alfred integration files are missing from $REPO" >&2
   exit 1
 fi
 
 MESSAGE="From $REPO, read and follow $REPO/config/openclaw_daily_review_prompt.md exactly. This is an autonomous research-supervisor cycle and must always end with an audited review receipt."
+SOL_MESSAGE="From $REPO, read and follow $REPO/config/openclaw_weekly_deep_review_prompt.md exactly. This is the weekly Sol research audit and must always end with an audited review receipt."
 if [[ -z "$TELEGRAM_TO" && -f "$OPENCLAW_WORKSPACE/USER_IDS.md" ]]; then
   TELEGRAM_TO="$(sed -nE 's/^- \\*\\*Henrique\\*\\*: ([0-9]+)$/\\1/p' \
     "$OPENCLAW_WORKSPACE/USER_IDS.md" | head -n 1)"
@@ -38,6 +43,7 @@ fi
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "Would install managed Alfred instructions in $OPENCLAW_WORKSPACE/AGENTS.md"
   echo "Would schedule $REVIEW_NAME at $REVIEW_CRON ($TIMEZONE)"
+  echo "Would schedule $SOL_REVIEW_NAME at $SOL_REVIEW_CRON ($TIMEZONE)"
   echo "Would schedule $EVENT_NAME every $EVENT_INTERVAL"
   echo "Would deliver meaningful findings to ${TELEGRAM_TO:-the last active channel}"
   exit 0
@@ -106,6 +112,34 @@ else
   review_id="$(python3 -c 'import json,sys; p=json.load(sys.stdin); print(p.get("id") or (p.get("job") or {}).get("id") or "")' <<<"$review_json")"
   if [[ -z "$review_id" ]]; then
     echo "OpenClaw did not return the created review job id" >&2
+    exit 1
+  fi
+fi
+
+"$OPENCLAW_BIN" cron list --json > "$cron_json"
+sol_review_id="$(python3 - "$cron_json" "$SOL_REVIEW_NAME" <<'PY'
+import json, sys
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+matches = [item["id"] for item in payload.get("jobs", []) if item.get("name") == sys.argv[2]]
+if len(matches) > 1:
+    raise SystemExit("multiple Alfred weekly Sol research review cron jobs exist")
+print(matches[0] if matches else "")
+PY
+)"
+
+if [[ -n "$sol_review_id" ]]; then
+  "$OPENCLAW_BIN" cron edit "$sol_review_id" \
+    --name "$SOL_REVIEW_NAME" --cron "$SOL_REVIEW_CRON" --tz "$TIMEZONE" \
+    --session isolated --wake now --message "$SOL_MESSAGE" --model "$SOL_MODEL" \
+    --thinking high --timeout-seconds 1800 "${delivery_args[@]}" --enable
+else
+  sol_review_json="$("$OPENCLAW_BIN" cron add --json \
+    --name "$SOL_REVIEW_NAME" --cron "$SOL_REVIEW_CRON" --tz "$TIMEZONE" \
+    --session isolated --wake now --message "$SOL_MESSAGE" --model "$SOL_MODEL" \
+    --thinking high --timeout-seconds 1800 "${delivery_args[@]}")"
+  sol_review_id="$(python3 -c 'import json,sys; p=json.load(sys.stdin); print(p.get("id") or (p.get("job") or {}).get("id") or "")' <<<"$sol_review_json")"
+  if [[ -z "$sol_review_id" ]]; then
+    echo "OpenClaw did not return the created weekly Sol review job id" >&2
     exit 1
   fi
 fi
