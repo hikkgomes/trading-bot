@@ -4,7 +4,7 @@ set -euo pipefail
 REPO="${REPO:-/home/alfred/trading-bot}"
 OPENCLAW_BIN="${OPENCLAW_BIN:-/home/alfred/.npm-global/bin/openclaw}"
 OPENCLAW_WORKSPACE="${OPENCLAW_WORKSPACE:-/home/alfred/.openclaw/workspace}"
-MODEL="${MODEL:-openai/gpt-5.5}"
+MODEL="${MODEL:-openai/gpt-5.6-terra}"
 TIMEZONE="${TIMEZONE:-Europe/Madrid}"
 REVIEW_CRON="${REVIEW_CRON:-45 0,6,12,18 * * *}"
 EVENT_INTERVAL="${EVENT_INTERVAL:-15m}"

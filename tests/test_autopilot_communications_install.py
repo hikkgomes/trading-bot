@@ -53,6 +53,7 @@ def test_alfred_installer_manages_four_reviews_event_wakes_and_operator_instruct
     instructions = Path("config/alfred_trading_operator.md").read_text(encoding="utf-8")
 
     assert 'REVIEW_CRON="${REVIEW_CRON:-45 0,6,12,18 * * *}"' in script
+    assert 'MODEL="${MODEL:-openai/gpt-5.6-terra}"' in script
     assert 'EVENT_INTERVAL="${EVENT_INTERVAL:-15m}"' in script
     assert "openclaw_bridge claim-event" in script
     assert "cron run $review_id" in script

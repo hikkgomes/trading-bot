@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable
@@ -38,8 +39,12 @@ WARMUP_BARS = 250
 OPERATIONAL_SEED_DAYS = 7
 DEFAULT_CHECKPOINT_PAGES = 20
 DEFAULT_REQUEST_DELAY_SECONDS = 0.2
+DEFAULT_REQUEST_MAX_ATTEMPTS = 4
+DEFAULT_RETRY_BASE_SECONDS = 1.0
+DEFAULT_RETRY_MAX_SECONDS = 30.0
 DEFAULT_MAX_REQUEST_PAGES = 5_000
 KLINE_LIMIT = 1_000
+RETRYABLE_HTTP_STATUSES = frozenset({408, 429})
 MAX_EXCHANGE_GAP_DURATION = pd.Timedelta(hours=12)
 MAX_EXCHANGE_MISSING_FRACTION = 0.001
 TIMEFRAME_DELTAS = {
@@ -368,6 +373,38 @@ def _endpoint(market: str) -> str:
     raise ValueError(f"unsupported market {market!r}")
 
 
+def _retry_after_seconds(response: Any) -> float | None:
+    headers = getattr(response, "headers", {})
+    raw_value = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if raw_value is None:
+        return None
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _retryable_http_status(status_code: int) -> bool:
+    return status_code in RETRYABLE_HTTP_STATUSES or 500 <= status_code < 600
+
+
+def _request_retry_delay(
+    attempt: int,
+    *,
+    response: Any | None,
+    retry_base_seconds: float,
+    retry_max_seconds: float,
+    random_uniform: Callable[[float, float], float],
+) -> float:
+    exponential = retry_base_seconds * (2 ** (attempt - 1))
+    retry_after = _retry_after_seconds(response) if response is not None else None
+    baseline = max(exponential, retry_after or 0.0)
+    bounded = min(retry_max_seconds, baseline)
+    jitter_ceiling = min(1.0, bounded * 0.25)
+    return min(retry_max_seconds, bounded + random_uniform(0.0, jitter_ceiling))
+
+
 def fetch_kline_page(
     *,
     symbol: str,
@@ -377,23 +414,79 @@ def fetch_kline_page(
     end_ms: int,
     limit: int = KLINE_LIMIT,
     request_get: Callable[..., Any] = requests.get,
+    max_attempts: int = DEFAULT_REQUEST_MAX_ATTEMPTS,
+    retry_base_seconds: float = DEFAULT_RETRY_BASE_SECONDS,
+    retry_max_seconds: float = DEFAULT_RETRY_MAX_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    random_uniform: Callable[[float, float], float] = random.uniform,
 ) -> pd.DataFrame:
-    response = request_get(
-        _endpoint(market),
-        params={
-            "symbol": symbol,
-            "interval": timeframe,
-            "startTime": int(start_ms),
-            "endTime": int(end_ms),
-            "limit": int(limit),
-        },
-        timeout=30,
-    )
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Binance {market} {timeframe} API error: status={response.status_code} "
-            f"response={response.text}"
+    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
+        raise ValueError("max_attempts must be a positive integer")
+    if retry_base_seconds < 0 or retry_max_seconds < retry_base_seconds:
+        raise ValueError("retry delays must be non-negative and max must be at least base")
+    endpoint = _endpoint(market)
+    params = {
+        "symbol": symbol,
+        "interval": timeframe,
+        "startTime": int(start_ms),
+        "endTime": int(end_ms),
+        "limit": int(limit),
+    }
+    response: Any | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = request_get(endpoint, params=params, timeout=30)
+        except requests.RequestException as exc:
+            if attempt >= max_attempts:
+                raise RuntimeError(
+                    f"Binance {market} {timeframe} request failed after {attempt} attempts: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            delay = _request_retry_delay(
+                attempt,
+                response=None,
+                retry_base_seconds=retry_base_seconds,
+                retry_max_seconds=retry_max_seconds,
+                random_uniform=random_uniform,
+            )
+            LOGGER.warning(
+                "Binance %s %s request attempt %d/%d failed (%s); retrying in %.2fs",
+                market,
+                timeframe,
+                attempt,
+                max_attempts,
+                type(exc).__name__,
+                delay,
+            )
+            sleep(delay)
+            continue
+        if response.status_code == 200:
+            break
+        if not _retryable_http_status(response.status_code) or attempt >= max_attempts:
+            response_text = str(getattr(response, "text", ""))[:500]
+            raise RuntimeError(
+                f"Binance {market} {timeframe} API error: status={response.status_code} "
+                f"attempts={attempt} response={response_text}"
+            )
+        delay = _request_retry_delay(
+            attempt,
+            response=response,
+            retry_base_seconds=retry_base_seconds,
+            retry_max_seconds=retry_max_seconds,
+            random_uniform=random_uniform,
         )
+        LOGGER.warning(
+            "Binance %s %s returned status %d on attempt %d/%d; retrying in %.2fs",
+            market,
+            timeframe,
+            response.status_code,
+            attempt,
+            max_attempts,
+            delay,
+        )
+        sleep(delay)
+    if response is None:
+        raise RuntimeError(f"Binance {market} {timeframe} request produced no response")
     payload = response.json()
     if not isinstance(payload, list):
         raise ValueError(f"Binance {market} {timeframe} response must be a list")

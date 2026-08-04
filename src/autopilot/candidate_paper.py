@@ -4,31 +4,98 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime as dt
 import json
+import logging
+import re
 from pathlib import Path
 from typing import Any
 
-from src.autopilot.approvals import artifact_digest, load_artifact
-from src.autopilot.candidate_activation import (
-    DEFAULT_CANDIDATE_DIR,
-    candidate_path_for_product,
-    product_identity,
-)
 from src.autopilot.config import DEFAULT_CONFIG_PATH, AutopilotConfig, ProductConfig, load_config
 from src.autopilot.io import write_json_atomic
 from src.autopilot.locking import acquire_runtime_lock
-from src.autopilot.promotion import (
-    PromotionThresholds,
-    build_promotion_review,
-    write_review,
-)
-from src.autopilot.reporting import utc_now
-from src.autopilot.strategy_policy import assert_loaded_strategy_artifact_allowed
 from src.config import PROJECT_ROOT
-from src.run_bot import PaperTradingBot, configure_logging
 
+DEFAULT_CANDIDATE_DIR = PROJECT_ROOT / "runtime" / "candidates"
 DEFAULT_STATUS = PROJECT_ROOT / "runtime" / "candidate_paper_status.json"
 DEFAULT_LOCK = PROJECT_ROOT / "runtime" / "candidate_paper.lock"
+SAFE_PRODUCT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+# Candidate execution imports pandas and the complete trading engine. Keep
+# these bindings lazy so the normal no-candidate timer path stays lightweight.
+artifact_digest: Any = None
+load_artifact: Any = None
+assert_loaded_strategy_artifact_allowed: Any = None
+PromotionThresholds: Any = None
+build_promotion_review: Any = None
+write_review: Any = None
+PaperTradingBot: Any = None
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+
+
+def candidate_path_for_product(
+    product_name: str,
+    *,
+    candidate_dir: Path = DEFAULT_CANDIDATE_DIR,
+) -> Path:
+    if not SAFE_PRODUCT_NAME_RE.fullmatch(product_name):
+        raise ValueError(f"unsafe product name for candidate path: {product_name!r}")
+    return candidate_dir / f"{product_name}.json"
+
+
+def product_identity(product: ProductConfig) -> dict[str, Any]:
+    return {
+        "name": product.name,
+        "objective": product.objective,
+        "base_asset": product.base_asset.upper(),
+        "market": product.market,
+        "symbol": product.symbol.upper(),
+        "starting_equity": product.starting_equity,
+        "regime_guard": product.regime_guard,
+        "regime_mayer_top": product.regime_mayer_top,
+    }
+
+
+def _load_candidate_runtime() -> None:
+    global PromotionThresholds
+    global PaperTradingBot
+    global artifact_digest
+    global assert_loaded_strategy_artifact_allowed
+    global build_promotion_review
+    global load_artifact
+    global write_review
+
+    if artifact_digest is None or load_artifact is None:
+        from src.autopilot.approvals import artifact_digest as digest_artifact
+        from src.autopilot.approvals import load_artifact as read_artifact
+
+        artifact_digest = artifact_digest or digest_artifact
+        load_artifact = load_artifact or read_artifact
+    if assert_loaded_strategy_artifact_allowed is None:
+        from src.autopilot.strategy_policy import (
+            assert_loaded_strategy_artifact_allowed as assert_artifact_allowed,
+        )
+
+        assert_loaded_strategy_artifact_allowed = assert_artifact_allowed
+    if (
+        PromotionThresholds is None
+        or build_promotion_review is None
+        or write_review is None
+    ):
+        from src.autopilot.promotion import PromotionThresholds as Thresholds
+        from src.autopilot.promotion import build_promotion_review as build_review
+        from src.autopilot.promotion import write_review as save_review
+
+        PromotionThresholds = PromotionThresholds or Thresholds
+        build_promotion_review = build_promotion_review or build_review
+        write_review = write_review or save_review
+    if PaperTradingBot is None:
+        from src.run_bot import PaperTradingBot as TradingBot
+
+        PaperTradingBot = TradingBot
 
 
 def candidate_paper_paths(
@@ -66,6 +133,7 @@ def _paper_result(
             "reason": "waiting_for_staged_candidate",
             "candidate": str(candidate_path),
         }
+    _load_candidate_runtime()
     candidate = load_artifact(candidate_path)
     if candidate.get("product") != product_identity(product):
         raise ValueError(f"{product.name}: staged candidate product identity mismatch")
@@ -196,6 +264,7 @@ def _discovered_symbol_products(
     for path in sorted(candidate_dir.glob(f"{base.name}__*usdt.json")):
         if path.is_symlink() or not path.is_file():
             continue
+        _load_candidate_runtime()
         candidate = load_artifact(path)
         identity = candidate.get("product")
         if not isinstance(identity, dict):
@@ -323,7 +392,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> None:
-    configure_logging()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     args = parse_args(argv)
     try:
         with acquire_runtime_lock(args.lock):

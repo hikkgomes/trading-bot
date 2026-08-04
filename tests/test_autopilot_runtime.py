@@ -152,6 +152,9 @@ def test_checked_in_autopilot_configs_validate_and_cover_core_jobs():
         assert cfg.max_jobs_per_cycle == 1
         assert cfg.max_consecutive_job_deferrals == 16
         assert CORE_AUTOPILOT_JOBS <= job_names
+        jobs = {job.name: job for job in cfg.jobs}
+        assert jobs["market_data_update_universe_1m"].cadence_seconds == 6 * 60 * 60
+        assert jobs["market_data_update_futures_1m"].cadence_seconds == 6 * 60 * 60
 
 
 def test_validate_config_rejects_legacy_inline_data_update():

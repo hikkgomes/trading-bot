@@ -81,7 +81,7 @@
         "--max-runtime-seconds", "240",
         "--output", "runtime/universe_history_1m.json"
       ],
-      "cadence_seconds": 86400,
+      "cadence_seconds": 21600,
       "timeout_seconds": 1800
     },
     {
@@ -123,7 +123,7 @@
         "--timeframes", "1m",
         "--report", "runtime/history_bootstrap_futures_1m.json"
       ],
-      "cadence_seconds": 86400,
+      "cadence_seconds": 21600,
       "timeout_seconds": 1800
     },
     {

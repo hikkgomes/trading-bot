@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 
 import pandas as pd
 import pytest
@@ -181,6 +183,53 @@ def test_candidate_paper_skips_non_live_product_without_candidate(tmp_path):
 
     assert report["ok"] is True
     assert report["products"][0]["reason"] == "product_not_live"
+
+
+def test_candidate_paper_no_candidate_import_path_stays_lightweight(tmp_path):
+    script = """
+import json
+import sys
+from pathlib import Path
+from src.autopilot.candidate_paper import run_candidate_paper
+from src.autopilot.config import AutopilotConfig, ProductConfig
+
+root = Path(sys.argv[1])
+product = ProductConfig(
+    name="active_income",
+    enabled=True,
+    objective="active_income",
+    base_asset="USDT",
+    market="futures",
+    execution_mode="live",
+    symbol="BTCUSDT",
+    strategies_path=root / "active.json",
+    state_file=root / "state.json",
+    trade_log=root / "trades.csv",
+    starting_equity=1000.0,
+)
+report = run_candidate_paper(
+    AutopilotConfig(products=[product]),
+    candidate_dir=root / "candidates",
+)
+print(json.dumps({
+    "reason": report["products"][0]["reason"],
+    "pandas_loaded": "pandas" in sys.modules,
+    "trading_engine_loaded": "src.run_bot" in sys.modules,
+}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = json.loads(completed.stdout)
+    assert result == {
+        "reason": "waiting_for_staged_candidate",
+        "pandas_loaded": False,
+        "trading_engine_loaded": False,
+    }
 
 
 def test_candidate_paper_discovers_symbol_isolated_altcoin_candidate(tmp_path):

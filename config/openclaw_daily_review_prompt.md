@@ -80,7 +80,7 @@ Use `research_action/v1`:
   "suggested_spec": {},
   "provenance": {
     "agent": "alfred-research-supervisor",
-    "model": "openai/gpt-5.5",
+    "model": "openai/gpt-5.6-terra",
     "reference": "hypothesis_id or review context"
   },
   "source_proposal_id": "unique-review-id:action-1"
@@ -102,7 +102,7 @@ End every run, including a no-op, by running:
 ```bash
 .venv/bin/python -m src.autopilot.openclaw_bridge record-review \
   --run-id <unique-run-id> \
-  --model openai/gpt-5.5 \
+  --model openai/gpt-5.6-terra \
   --summary <plain-language-summary-up-to-1000-characters> \
   --proposal-count <0-to-3> \
   --action-counts-json '<JSON-object-whose-counts-sum-to-proposal-count>'

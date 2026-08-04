@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import requests
 
 from src.autopilot import history_bootstrap as hb
 
@@ -51,11 +52,11 @@ def kline_row(open_time_ms):
 
 
 class FakeResponse:
-    status_code = 200
-    text = "ok"
-
-    def __init__(self, payload):
+    def __init__(self, payload, *, status_code=200, text="ok", headers=None):
         self.payload = payload
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers or {}
 
     def json(self):
         return self.payload
@@ -279,6 +280,59 @@ def test_fetch_kline_page_uses_market_endpoint_and_validates_payload():
             end_ms=first,
             request_get=lambda *args, **kwargs: FakeResponse({"bad": True}),
         )
+
+
+def test_fetch_kline_page_retries_rate_limits_and_transient_network_errors():
+    first = int(pd.Timestamp("2026-01-01T00:00:00Z").value // 1_000_000)
+    responses = iter(
+        [
+            FakeResponse([], status_code=429, text="rate limited", headers={"Retry-After": "2"}),
+            FakeResponse([], status_code=501, text="temporary server error"),
+            requests.ConnectionError("temporary DNS failure"),
+            FakeResponse([kline_row(first)]),
+        ]
+    )
+    delays = []
+
+    def fake_get(*args, **kwargs):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    frame = hb.fetch_kline_page(
+        symbol="BTCUSDT",
+        market="spot",
+        timeframe="1m",
+        start_ms=first,
+        end_ms=first,
+        request_get=fake_get,
+        sleep=delays.append,
+        random_uniform=lambda lower, upper: 0.0,
+    )
+
+    assert len(frame) == 1
+    assert delays == [2.0, 2.0, 4.0]
+
+
+def test_fetch_kline_page_fails_fast_for_non_retryable_http_error():
+    first = int(pd.Timestamp("2026-01-01T00:00:00Z").value // 1_000_000)
+    delays = []
+
+    with pytest.raises(RuntimeError, match="status=400 attempts=1"):
+        hb.fetch_kline_page(
+            symbol="BTCUSDT",
+            market="spot",
+            timeframe="1m",
+            start_ms=first,
+            end_ms=first,
+            request_get=lambda *args, **kwargs: FakeResponse(
+                [], status_code=400, text="bad request"
+            ),
+            sleep=delays.append,
+        )
+
+    assert delays == []
 
 
 def test_fetch_kline_page_accepts_only_bounded_exchange_side_gaps():
