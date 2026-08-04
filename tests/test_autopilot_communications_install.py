@@ -76,6 +76,30 @@ def test_alfred_installer_manages_routine_and_weekly_reviews_event_wakes_and_ins
     assert "Do not promote" in weekly_prompt
 
 
+def test_alfred_installer_resolves_henrique_telegram_target(tmp_path):
+    workspace = tmp_path / "openclaw-workspace"
+    workspace.mkdir()
+    (workspace / "USER_IDS.md").write_text(
+        "# User IDs\n- **Henrique**: 1633386729\n- **Marcela**: 1078417460\n",
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        ["bash", "scripts/install_alfred_integration.sh"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "DRY_RUN": "1",
+            "REPO": str(Path.cwd()),
+            "OPENCLAW_WORKSPACE": str(workspace),
+            "OPENCLAW_BIN": "/usr/bin/false",
+        },
+    )
+
+    assert "Would deliver meaningful findings to 1633386729" in completed.stdout
+
+
 def test_openclaw_timer_never_launches_openclaw_or_loads_trading_environment():
     script = Path("scripts/install_openclaw_bridge_timer.sh").read_text(encoding="utf-8")
 

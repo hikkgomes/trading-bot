@@ -36,7 +36,7 @@ fi
 MESSAGE="From $REPO, read and follow $REPO/config/openclaw_daily_review_prompt.md exactly. This is an autonomous research-supervisor cycle and must always end with an audited review receipt."
 SOL_MESSAGE="From $REPO, read and follow $REPO/config/openclaw_weekly_deep_review_prompt.md exactly. This is the weekly Sol research audit and must always end with an audited review receipt."
 if [[ -z "$TELEGRAM_TO" && -f "$OPENCLAW_WORKSPACE/USER_IDS.md" ]]; then
-  TELEGRAM_TO="$(sed -nE 's/^- \\*\\*Henrique\\*\\*: ([0-9]+)$/\\1/p' \
+  TELEGRAM_TO="$(sed -nE 's/^- \*\*Henrique\*\*: ([0-9]+)$/\1/p' \
     "$OPENCLAW_WORKSPACE/USER_IDS.md" | head -n 1)"
 fi
 
