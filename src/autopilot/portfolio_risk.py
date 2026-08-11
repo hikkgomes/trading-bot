@@ -199,7 +199,7 @@ def build_risk_model(config: PortfolioRiskConfig) -> dict[str, Any]:
             "inputs": inputs,
             "waiting": waiting,
         }
-    matrix = pd.concat(returns.values(), axis=1, join="outer").sort_index()
+    matrix = pd.concat(returns.values(), axis=1, join="outer", sort=False).sort_index()
     correlations: dict[str, dict[str, float]] = {symbol: {} for symbol in returns}
     beta: dict[str, float] = {}
     benchmark = matrix[config.benchmark_symbol]
