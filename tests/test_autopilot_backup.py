@@ -48,6 +48,11 @@ def write_config(tmp_path):
                 "job_state_file": str(tmp_path / "job_state.json"),
                 "alert_file": str(tmp_path / "alerts.jsonl"),
                 "alert_state_file": str(tmp_path / "alert_state.json"),
+                "candidate_paper_status_file": str(tmp_path / "candidate_paper_status.json"),
+                "event_capture_status_file": str(tmp_path / "event_capture_status.json"),
+                "portfolio_risk_file": str(tmp_path / "portfolio_risk.json"),
+                "trade_starvation_history_file": str(tmp_path / "trade_starvation_history.jsonl"),
+                "trade_starvation_report_file": str(tmp_path / "trade_starvation.json"),
                 "research_smoke_file": str(tmp_path / "research_smoke.json"),
                 "strategy_smoke_file": str(tmp_path / "strategy_smoke.json"),
                 "research_cycle_file": str(tmp_path / "research_cycle.json"),
@@ -78,6 +83,9 @@ def write_config(tmp_path):
                         "state_file": str(tmp_path / "active_income_state.json"),
                         "trade_log": str(tmp_path / "active_income_trades.csv"),
                         "preflight_report": str(tmp_path / "active_income_preflight.json"),
+                        "testnet_rehearsal_report": str(
+                            tmp_path / "active_income_testnet_rehearsal.json"
+                        ),
                         "starting_equity": 1000.0,
                     }
                 ],

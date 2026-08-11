@@ -44,6 +44,67 @@ def test_chronological_windows_purge_label_horizon_and_embargo(tmp_path):
         assert validation.stop - validation.start == 100
 
 
+def test_ml_selects_capable_epoch_before_protected_history(tmp_path):
+    config = dataclasses.replace(
+        _config(tmp_path),
+        min_train_rows=200,
+        validation_rows=100,
+        step_rows=100,
+        min_windows=2,
+    )
+    index = pd.date_range("2024-01-01", periods=1_400, freq="15min", tz="UTC")
+    frame = pd.DataFrame({"close": range(len(index))}, index=index)
+    protected = (
+        {
+            "interval_key": "protected",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "start": str(index[900]),
+            "end": str(index[1_000]),
+        },
+    )
+
+    selected, detail = ml_research._select_unprotected_epoch(
+        frame,
+        config.datasets[0],
+        config,
+        protected,
+    )
+
+    assert len(selected) == 900
+    assert selected.index[-1] < index[900]
+    assert detail["policy"] == "largest_contiguous_unprotected_ml_epoch"
+    assert detail["protected_rows_excluded"] == 101
+    assert detail["feature_dependency_embargo_rows_excluded"] == 399
+
+
+def test_ml_waits_when_no_unprotected_epoch_has_enough_rows(tmp_path, monkeypatch):
+    config = dataclasses.replace(_config(tmp_path), max_trials_per_cycle=1)
+    frame = pd.DataFrame(
+        {"close": range(1, 101)},
+        index=pd.date_range("2024-01-01", periods=100, freq="15min", tz="UTC"),
+    )
+    monkeypatch.setattr(ml_research, "_load_dataset", lambda *args: frame)
+    monkeypatch.setattr(
+        ml_research,
+        "_select_unprotected_epoch",
+        lambda *args: (_ for _ in ()).throw(
+            ml_research.UnprotectedMlEpochUnavailableError("insufficient safe history")
+        ),
+    )
+
+    report = ml_research.run_cycle(
+        config,
+        output_path=tmp_path / "report.json",
+        state_path=tmp_path / "state.json",
+    )
+
+    assert report["ok"] is True
+    assert report["summary"]["waiting"] == 1
+    assert report["summary"]["errors"] == 0
+    assert report["trials"][0]["status"] == "waiting_for_unprotected_epoch"
+
+
 def test_cycle_waits_safely_when_datasets_are_missing(tmp_path, monkeypatch):
     config = _config(tmp_path)
     monkeypatch.setattr(

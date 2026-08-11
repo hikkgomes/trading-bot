@@ -8,6 +8,7 @@ JSON config.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import math
 import subprocess
@@ -76,8 +77,32 @@ def save_job_state(path: Path, payload: dict[str, Any]) -> None:
 
 
 def job_definition_fingerprint(job: JobConfig) -> str:
+    config_dependencies: list[dict[str, Any]] = []
+    for index, argument in enumerate(job.command):
+        raw_path: str | None = None
+        if argument == "--config" and index + 1 < len(job.command):
+            raw_path = job.command[index + 1]
+        elif argument.startswith("--config="):
+            raw_path = argument.partition("=")[2]
+        if not raw_path:
+            continue
+        path = Path(raw_path)
+        path = path if path.is_absolute() else job.working_dir / path
+        dependency: dict[str, Any] = {"path": raw_path}
+        try:
+            if path.is_symlink():
+                dependency["status"] = "symlink"
+            elif not path.is_file():
+                dependency["status"] = "missing"
+            else:
+                with path.open("rb") as handle:
+                    dependency["sha256"] = hashlib.file_digest(handle, "sha256").hexdigest()
+        except OSError as exc:
+            dependency["status"] = f"unreadable:{type(exc).__name__}"
+        config_dependencies.append(dependency)
     payload = {
         "command": list(job.command),
+        "config_dependencies": config_dependencies,
         "cadence_seconds": int(job.cadence_seconds),
         "timeout_seconds": int(job.timeout_seconds),
         "working_dir": str(job.working_dir),
@@ -784,6 +809,15 @@ def run_due_jobs(
                 }
             )
             continue
+        previous_entry = state["jobs"].get(job.name, {})
+        previous_entry = previous_entry if isinstance(previous_entry, dict) else {}
+        execution_definition_fingerprint = job_definition_fingerprint(job)
+        previous_definition_fingerprint = previous_entry.get("definition_fingerprint")
+        definition_changed = bool(
+            previous_definition_fingerprint
+            and previous_definition_fingerprint != execution_definition_fingerprint
+        )
+
         result = run_job(job)
         executed_jobs += 1
         if scheduler_now is not None:
@@ -793,11 +827,13 @@ def run_due_jobs(
             structured_report = result.get("structured_report_summary")
         if not isinstance(structured_report, dict):
             structured_report = {}
-        previous_entry = state["jobs"].get(job.name, {})
-        try:
-            previous_failures = int(previous_entry.get("consecutive_failures") or 0)
-        except (TypeError, ValueError):
+        if definition_changed:
             previous_failures = 0
+        else:
+            try:
+                previous_failures = int(previous_entry.get("consecutive_failures") or 0)
+            except (TypeError, ValueError):
+                previous_failures = 0
         consecutive_failures = 0 if result["ok"] else previous_failures + 1
         state["jobs"][job.name] = {
             "last_started_at": result["started_at"],
@@ -806,7 +842,7 @@ def run_due_jobs(
             "last_returncode": result["returncode"],
             "last_duration_seconds": result["duration_seconds"],
             "consecutive_failures": consecutive_failures,
-            "definition_fingerprint": job_definition_fingerprint(job),
+            "definition_fingerprint": execution_definition_fingerprint,
             **(
                 {"last_stdout_truncated": True, "last_stdout_bytes": result["stdout_bytes"]}
                 if result.get("stdout_truncated")

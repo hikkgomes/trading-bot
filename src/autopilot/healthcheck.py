@@ -61,10 +61,10 @@ def _issue(code: str, message: str, *, detail: dict[str, Any] | None = None) -> 
     return payload
 
 
-def _incident_signature(issues: Any) -> str | None:
+def _incident_identities(issues: Any) -> tuple[str, ...]:
     if not isinstance(issues, list) or not issues:
-        return None
-    identities = []
+        return ()
+    identities: list[str] = []
     for issue in issues:
         if not isinstance(issue, dict):
             continue
@@ -76,18 +76,30 @@ def _incident_signature(issues: Any) -> str | None:
             if isinstance(jobs, list)
             else []
         )
-        identities.append(
-            {
-                "code": str(issue.get("code") or "unknown"),
-                "jobs": job_names,
-                "product": detail.get("product"),
-                "market": detail.get("market"),
-            }
+        base = {
+            "code": str(issue.get("code") or "unknown"),
+            "product": detail.get("product"),
+            "market": detail.get("market"),
+        }
+        identity_payloads = [{**base, "job": name} for name in job_names] if job_names else [base]
+        identities.extend(
+            json.dumps(
+                identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            for identity in identity_payloads
         )
+    return tuple(sorted(set(identities)))
+
+
+def _incident_signature(issues: Any) -> str | None:
+    identities = _incident_identities(issues)
     if not identities:
         return None
     encoded = json.dumps(
-        sorted(identities, key=lambda item: json.dumps(item, sort_keys=True)),
+        identities,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
@@ -2279,15 +2291,22 @@ def build_healthcheck(
         max_consecutive_job_deferrals=config.max_consecutive_job_deferrals,
     )
     incident_signature = _incident_signature(health.get("issues"))
-    previous_signature = (
-        previous_health.get("incident_signature") if isinstance(previous_health, dict) else None
-    )
-    if previous_signature is None and isinstance(previous_health, dict):
-        previous_signature = _incident_signature(previous_health.get("issues"))
+    current_identities = set(_incident_identities(health.get("issues")))
+    previous_notified: set[str] = set()
+    if isinstance(previous_health, dict) and previous_health.get("issues"):
+        stored_identities = previous_health.get("notified_incident_identities")
+        if isinstance(stored_identities, list) and all(
+            isinstance(item, str) for item in stored_identities
+        ):
+            previous_notified.update(stored_identities)
+        else:
+            previous_notified.update(_incident_identities(previous_health.get("issues")))
+    new_identities = current_identities - previous_notified
     if incident_signature is not None:
         health["incident_signature"] = incident_signature
+        health["notified_incident_identities"] = sorted(previous_notified | current_identities)
     if emit_failure_alert and health.get("issues"):
-        if previous_signature == incident_signature:
+        if not new_identities:
             health["healthcheck_alert"] = {
                 "sent": False,
                 "reason": "unchanged_incident",

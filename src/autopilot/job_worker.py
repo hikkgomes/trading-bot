@@ -19,7 +19,7 @@ from typing import Any
 from src.autopilot.config import DEFAULT_CONFIG_PATH, AutopilotConfig, load_config
 from src.autopilot.control import is_job_paused, load_control, unknown_control_selectors
 from src.autopilot.io import write_json_atomic
-from src.autopilot.jobs import run_due_jobs
+from src.autopilot.jobs import load_job_state, run_due_jobs
 from src.autopilot.notifications import emit_alert
 from src.autopilot.reporting import utc_now
 from src.autopilot.runtime import acquire_runtime_lock, validate_config
@@ -41,6 +41,28 @@ def job_worker_status_path(config: AutopilotConfig) -> Path:
 def _worker_alert(config: AutopilotConfig, report: dict[str, Any]) -> dict[str, Any] | None:
     if not config.alerts_enabled or report.get("ok"):
         return None
+    failed_jobs = [item for item in report.get("jobs", []) if not item.get("ok")]
+    first_failures = failed_jobs
+    try:
+        state = load_job_state(config.job_state_file)
+        entries = state.get("jobs", {})
+        first_failures = []
+        for item in failed_jobs:
+            entry = entries.get(item.get("name"), {}) if isinstance(entries, dict) else {}
+            try:
+                consecutive_failures = int(entry.get("consecutive_failures") or 0)
+            except (AttributeError, TypeError, ValueError):
+                consecutive_failures = 0
+            if consecutive_failures <= 1:
+                first_failures.append(item)
+    except (OSError, RuntimeError, ValueError):
+        LOGGER.exception("Could not inspect scheduled-job failure streaks")
+    if failed_jobs and not first_failures:
+        return {
+            "sent": False,
+            "reason": "continuing_failure",
+            "jobs": sorted(str(item.get("name") or "unknown") for item in failed_jobs),
+        }
     try:
         return emit_alert(
             alert_file=config.alert_file,
@@ -49,9 +71,11 @@ def _worker_alert(config: AutopilotConfig, report: dict[str, Any]) -> dict[str, 
             title="autopilot scheduled job worker failed",
             detail={
                 "control_error": report.get("control_error"),
-                "jobs": [item for item in report.get("jobs", []) if not item.get("ok")],
+                "jobs": first_failures,
             },
             cooldown_seconds=config.alert_cooldown_seconds,
+            dedupe_key="job-worker-first-failure:"
+            + ",".join(sorted(str(item.get("name") or "unknown") for item in first_failures)),
             webhook_url_env=config.webhook_url_env,
         )
     except Exception as exc:  # the worker status must survive alert failures

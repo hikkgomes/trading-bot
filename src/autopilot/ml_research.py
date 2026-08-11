@@ -40,6 +40,7 @@ from src.autopilot.ml_candidate_artifact import (
     DEFAULT_REVIEWABLE_DIR,
     export_reviewable_artifact,
 )
+from src.build_dataset import TIMEFRAME_SECONDS
 from src.config import PROJECT_ROOT, indicator_data_dir
 from src.strategies import BacktestConfig, Strategy, run_backtest
 from src.strategies.library.ml_classifier import MlClassifierStrategy
@@ -51,10 +52,15 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config" / "ml_research.json"
 DEFAULT_OUTPUT = PROJECT_ROOT / "runtime" / "research" / "ml_research.json"
 DEFAULT_STATE = PROJECT_ROOT / "runtime" / "research" / "ml_research_state.json"
 MAX_CONFIG_BYTES = 256 * 1024
+ML_FEATURE_DEPENDENCY_BARS = 480
 
 
 class MlResearchConfigError(ValueError):
     """The ML research configuration is malformed or exceeds safe bounds."""
+
+
+class UnprotectedMlEpochUnavailableError(EvaluationConflictError):
+    """No sufficiently large adaptive ML epoch remains outside protected evidence."""
 
 
 def _utc_now() -> str:
@@ -461,6 +467,90 @@ def _load_dataset(dataset: DatasetSpec, max_rows: int) -> pd.DataFrame:
     if not frame.index.is_monotonic_increasing or frame.index.has_duplicates:
         raise ValueError("dataset index must be unique and chronological")
     return frame
+
+
+def _minimum_epoch_rows(config: MlResearchConfig) -> int:
+    adaptive_rows = (
+        config.min_train_rows
+        + max(config.horizons)
+        + config.embargo_bars
+        + config.validation_rows
+        + (config.min_windows - 1) * config.step_rows
+    )
+    rows = math.ceil(adaptive_rows / (1.0 - config.final_holdout_fraction))
+    while rows - math.ceil(rows * config.final_holdout_fraction) < adaptive_rows:
+        rows += 1
+    return rows
+
+
+def _select_unprotected_epoch(
+    frame: pd.DataFrame,
+    dataset: DatasetSpec,
+    config: MlResearchConfig,
+    protected_intervals: tuple[dict[str, str], ...],
+) -> tuple[pd.DataFrame, dict[str, Any] | None]:
+    """Select the largest sufficiently capable epoch outside protected timestamps."""
+
+    if not protected_intervals or frame.empty:
+        return frame, None
+    timeframe_seconds = TIMEFRAME_SECONDS.get(dataset.timeframe)
+    if timeframe_seconds is None:
+        raise ValueError(f"unsupported ML dataset timeframe: {dataset.timeframe}")
+    timestamps = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True, errors="raise"))
+    protected = np.zeros(len(frame), dtype=bool)
+    dependency_embargo = np.zeros(len(frame), dtype=bool)
+    relevant: list[dict[str, str]] = []
+    dependency_seconds = ML_FEATURE_DEPENDENCY_BARS * timeframe_seconds
+    for interval in protected_intervals:
+        start = pd.Timestamp(interval["start"])
+        end = pd.Timestamp(interval["end"])
+        overlap = np.asarray((timestamps >= start) & (timestamps <= end), dtype=bool)
+        embargo_end = end + pd.Timedelta(seconds=dependency_seconds)
+        embargo = np.asarray((timestamps > end) & (timestamps <= embargo_end), dtype=bool)
+        if overlap.any() or embargo.any():
+            protected |= overlap
+            dependency_embargo |= embargo
+            relevant.append(interval)
+    if not relevant:
+        return frame, None
+    dependency_embargo &= ~protected
+    blocked = protected | dependency_embargo
+    runs: list[tuple[int, int]] = []
+    run_start: int | None = None
+    for position, is_blocked in enumerate(blocked):
+        if not is_blocked and run_start is None:
+            run_start = position
+        elif is_blocked and run_start is not None:
+            runs.append((run_start, position))
+            run_start = None
+    if run_start is not None:
+        runs.append((run_start, len(frame)))
+    minimum_rows = _minimum_epoch_rows(config)
+    eligible = [run for run in runs if run[1] - run[0] >= minimum_rows]
+    if not eligible:
+        raise UnprotectedMlEpochUnavailableError(
+            "no unprotected chronological ML epoch satisfies the minimum sample capacity: "
+            f"required_rows={minimum_rows} available_rows="
+            f"{max((end - start for start, end in runs), default=0)}"
+        )
+    start_position, end_position = max(
+        eligible,
+        key=lambda run: (run[1] - run[0], timestamps[run[1] - 1]),
+    )
+    selected = frame.iloc[start_position:end_position].copy()
+    return selected, {
+        "policy": "largest_contiguous_unprotected_ml_epoch",
+        "input_rows": int(len(frame)),
+        "selected_rows": int(len(selected)),
+        "minimum_rows": minimum_rows,
+        "excluded_rows": int(blocked.sum()),
+        "protected_rows_excluded": int(protected.sum()),
+        "feature_dependency_embargo_rows_excluded": int(dependency_embargo.sum()),
+        "feature_dependency_embargo_bars": ML_FEATURE_DEPENDENCY_BARS,
+        "start": str(timestamps[start_position]),
+        "end": str(timestamps[end_position - 1]),
+        "protected_intervals_considered": len(relevant),
+    }
 
 
 def _feature_columns(frame: pd.DataFrame, feature_set: str) -> list[str] | None:
@@ -961,7 +1051,7 @@ def run_cycle(
         (item.product, item.market, item.symbol, item.timeframe, item.pnl_unit): item
         for item in config.datasets
     }
-    cache: dict[tuple[str, str, str, str, str], pd.DataFrame] = {}
+    cache: dict[tuple[str, str, str, str, str], tuple[pd.DataFrame, dict[str, Any] | None]] = {}
     trials: list[dict[str, Any]] = []
     holdout_candidates: dict[
         str, list[tuple[dict[str, Any], DatasetSpec, pd.DataFrame, dict[str, Any]]]
@@ -975,9 +1065,22 @@ def run_cycle(
         dataset = by_identity[identity]
         try:
             if identity not in cache:
-                cache[identity] = _load_dataset(dataset, config.max_rows)
-            frame = cache[identity]
+                loaded = _load_dataset(dataset, config.max_rows)
+                with ExperimentMemory(config.memory_path) as memory:
+                    protected_intervals = memory.protected_intervals(
+                        market=dataset.market,
+                        symbol=dataset.symbol,
+                    )
+                cache[identity] = _select_unprotected_epoch(
+                    loaded,
+                    dataset,
+                    config,
+                    protected_intervals,
+                )
+            frame, epoch_selection = cache[identity]
             result = evaluate_experiment(spec, dataset, frame, config)
+            if epoch_selection is not None:
+                result["protected_epoch_selection"] = epoch_selection
             if result["status"] in {"pre_holdout_pass", "pre_holdout_reject"}:
                 context = _remember_evaluation(config, spec, dataset, frame, result)
                 result["experiment_memory"] = {
@@ -1010,6 +1113,15 @@ def run_cycle(
                     **spec,
                     "status": "waiting_for_dependency",
                     "dependency": str(spec["model"]),
+                    "detail": str(exc),
+                    "pre_holdout_eligible": False,
+                }
+            )
+        except UnprotectedMlEpochUnavailableError as exc:
+            trials.append(
+                {
+                    **spec,
+                    "status": "waiting_for_unprotected_epoch",
                     "detail": str(exc),
                     "pre_holdout_eligible": False,
                 }

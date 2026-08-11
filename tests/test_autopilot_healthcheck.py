@@ -3783,6 +3783,94 @@ def test_build_healthcheck_does_not_repeat_unchanged_incident(monkeypatch, tmp_p
     assert len(cfg.alert_file.read_text(encoding="utf-8").splitlines()) == 1
 
 
+def test_build_healthcheck_does_not_realert_when_incident_shrinks_or_flaps(monkeypatch, tmp_path):
+    cfg = AutopilotConfig(
+        alert_file=tmp_path / "alerts.jsonl",
+        alert_state_file=tmp_path / "alert_state.json",
+    )
+
+    def report_for(*names):
+        return operator_report(
+            scheduled_jobs=[
+                {
+                    "name": name,
+                    "enabled": True,
+                    "status": "fail",
+                    "due": False,
+                    "consecutive_failures": 1,
+                }
+                for name in names
+            ]
+        )
+
+    current = {"report": report_for("research_factory", "ml_research")}
+    monkeypatch.setattr(
+        "src.autopilot.healthcheck.build_operator_report",
+        lambda config: current["report"],
+    )
+    monkeypatch.setattr(
+        "src.autopilot.healthcheck.build_readiness_report",
+        lambda config, **_kwargs: {"ok": True, "checks": []},
+    )
+
+    first = build_healthcheck(cfg, emit_failure_alert=True)
+    current["report"] = report_for("research_factory")
+    second = build_healthcheck(cfg, emit_failure_alert=True, previous_health=first)
+    current["report"] = report_for("research_factory", "ml_research")
+    third = build_healthcheck(cfg, emit_failure_alert=True, previous_health=second)
+
+    assert first["healthcheck_alert"]["sent"] is True
+    assert second["healthcheck_alert"]["reason"] == "unchanged_incident"
+    assert third["healthcheck_alert"]["reason"] == "unchanged_incident"
+    assert len(cfg.alert_file.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_build_healthcheck_alerts_for_new_identity_during_existing_incident(monkeypatch, tmp_path):
+    cfg = AutopilotConfig(
+        alert_file=tmp_path / "alerts.jsonl",
+        alert_state_file=tmp_path / "alert_state.json",
+    )
+    current = {
+        "report": operator_report(
+            scheduled_jobs=[
+                {
+                    "name": "research_factory",
+                    "enabled": True,
+                    "status": "fail",
+                    "due": False,
+                    "consecutive_failures": 1,
+                }
+            ]
+        )
+    }
+    monkeypatch.setattr(
+        "src.autopilot.healthcheck.build_operator_report",
+        lambda config: current["report"],
+    )
+    monkeypatch.setattr(
+        "src.autopilot.healthcheck.build_readiness_report",
+        lambda config, **_kwargs: {"ok": True, "checks": []},
+    )
+
+    first = build_healthcheck(cfg, emit_failure_alert=True)
+    current["report"] = operator_report(
+        scheduled_jobs=[
+            {
+                "name": name,
+                "enabled": True,
+                "status": "fail",
+                "due": False,
+                "consecutive_failures": 1,
+            }
+            for name in ("research_factory", "portfolio_risk")
+        ]
+    )
+    second = build_healthcheck(cfg, emit_failure_alert=True, previous_health=first)
+
+    assert second["healthcheck_alert"]["sent"] is True
+    assert len(cfg.alert_file.read_text(encoding="utf-8").splitlines()) == 2
+
+
 def test_build_healthcheck_records_alert_failure_without_crashing(monkeypatch, tmp_path):
     cfg = AutopilotConfig(
         alert_file=tmp_path / "alerts.jsonl",

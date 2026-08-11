@@ -91,6 +91,46 @@ def test_job_due_when_persisted_definition_changes(tmp_path):
     assert job_due(changed, state, now=120.0)
 
 
+def test_job_due_when_referenced_config_contents_change(tmp_path):
+    config_path = tmp_path / "research.json"
+    config_path.write_text('{"limit": 1}', encoding="utf-8")
+    cfg = job(
+        tmp_path,
+        command=[sys.executable, "-m", "worker", "--config", "research.json"],
+    )
+    state = {
+        "version": 1,
+        "jobs": {
+            "smoke": {
+                "last_started_ts": 100.0,
+                "last_ok": False,
+                "consecutive_failures": 4,
+                "definition_fingerprint": job_definition_fingerprint(cfg),
+            }
+        },
+    }
+
+    assert not job_due(cfg, state, now=120.0)
+
+    config_path.write_text('{"limit": 2}', encoding="utf-8")
+
+    assert job_due(cfg, state, now=120.0)
+
+
+def test_job_fingerprint_tracks_equals_form_config_argument(tmp_path):
+    config_path = tmp_path / "research.json"
+    config_path.write_text('{"limit": 1}', encoding="utf-8")
+    cfg = job(
+        tmp_path,
+        command=[sys.executable, "-m", "worker", "--config=research.json"],
+    )
+    original = job_definition_fingerprint(cfg)
+
+    config_path.write_text('{"limit": 2}', encoding="utf-8")
+
+    assert job_definition_fingerprint(cfg) != original
+
+
 def test_missing_definition_fingerprint_keeps_existing_cadence_for_migration(tmp_path):
     cfg = job(tmp_path, cadence_seconds=60)
     state = {"version": 1, "jobs": {"smoke": {"last_started_ts": 100.0, "last_ok": True}}}
@@ -1130,6 +1170,58 @@ def test_run_due_jobs_increments_and_resets_consecutive_failures(tmp_path):
     state = load_job_state(state_path)
     assert state["jobs"]["smoke"]["last_ok"] is True
     assert state["jobs"]["smoke"]["consecutive_failures"] == 0
+
+
+def test_changed_definition_starts_a_new_failure_streak(tmp_path):
+    state_path = tmp_path / "jobs.json"
+    old = job(tmp_path, command=[sys.executable, "-c", "raise SystemExit(7)"])
+    changed = job(tmp_path, command=[sys.executable, "-c", "raise SystemExit(8)"])
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "jobs": {
+                    "smoke": {
+                        "last_started_ts": 100.0,
+                        "last_ok": False,
+                        "consecutive_failures": 10,
+                        "definition_fingerprint": job_definition_fingerprint(old),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    run_due_jobs([changed], state_path, now=120.0)
+
+    state = load_job_state(state_path)
+    assert state["jobs"]["smoke"]["last_returncode"] == 8
+    assert state["jobs"]["smoke"]["consecutive_failures"] == 1
+
+
+def test_config_change_during_execution_remains_due(tmp_path):
+    state_path = tmp_path / "jobs.json"
+    config_path = tmp_path / "research.json"
+    config_path.write_text('{"limit": 1}', encoding="utf-8")
+    cfg = job(
+        tmp_path,
+        command=[
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('research.json').write_text('{\"limit\": 2}')",
+            "--config",
+            "research.json",
+        ],
+    )
+    execution_fingerprint = job_definition_fingerprint(cfg)
+
+    run_due_jobs([cfg], state_path, now=100.0)
+
+    state = load_job_state(state_path)
+    assert state["jobs"]["smoke"]["definition_fingerprint"] == execution_fingerprint
+    assert job_definition_fingerprint(cfg) != execution_fingerprint
+    assert job_due(cfg, state, now=101.0)
 
 
 def test_run_due_jobs_repairs_malformed_job_entry(tmp_path):

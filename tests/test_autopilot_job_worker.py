@@ -4,6 +4,7 @@ from datetime import datetime
 
 from src.autopilot.config import AutopilotConfig, JobConfig
 from src.autopilot.job_worker import (
+    _worker_alert,
     job_worker_lock_path,
     job_worker_status_path,
     run_worker_once,
@@ -98,3 +99,32 @@ def test_worker_malformed_control_fails_closed(tmp_path):
     assert report["ok"] is False
     assert "JSONDecodeError" in report["control_error"]
     assert report["jobs"] == []
+
+
+def test_worker_alerts_only_on_first_failure_in_streak(tmp_path):
+    config = worker_config(tmp_path)
+    config.alerts_enabled = True
+    report = {
+        "ok": False,
+        "control_error": None,
+        "jobs": [{"name": "smoke", "ok": False, "error": "broken"}],
+    }
+    config.job_state_file.write_text(
+        json.dumps({"version": 1, "jobs": {"smoke": {"consecutive_failures": 1}}}),
+        encoding="utf-8",
+    )
+
+    first = _worker_alert(config, report)
+    config.job_state_file.write_text(
+        json.dumps({"version": 1, "jobs": {"smoke": {"consecutive_failures": 2}}}),
+        encoding="utf-8",
+    )
+    repeated = _worker_alert(config, report)
+
+    assert first["sent"] is True
+    assert repeated == {
+        "sent": False,
+        "reason": "continuing_failure",
+        "jobs": ["smoke"],
+    }
+    assert len(config.alert_file.read_text(encoding="utf-8").splitlines()) == 1
