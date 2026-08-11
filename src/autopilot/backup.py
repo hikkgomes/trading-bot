@@ -27,6 +27,7 @@ JOB_PATH_FLAGS = (
     "--artifact",
     "--input",
     "--json-output",
+    "--journal",
     "--markdown-output",
     "--mutation-batch",
     "--output",
@@ -67,17 +68,28 @@ def _job_command_path(job, flag: str) -> Path | None:
     return path if path.is_absolute() else job.working_dir / path
 
 
+def _uses_project_artifacts(config_path: Path) -> bool:
+    try:
+        config_path.resolve(strict=False).relative_to(PROJECT_ROOT.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def configured_backup_paths(config: AutopilotConfig, *, config_path: Path) -> list[Path]:
     """Return the small files needed to recover/review autopilot state."""
 
     paths: list[Path] = []
     seen: set[Path] = set()
+    include_project_artifacts = _uses_project_artifacts(config_path)
     for path in (
         config_path,
         config.approval_ledger,
         config.control_file,
         config.control_audit_file,
         config.status_file,
+        config.trade_starvation_history_file,
+        config.trade_starvation_report_file,
         config.job_state_file,
         config.alert_file,
         config.alert_state_file,
@@ -96,8 +108,52 @@ def configured_backup_paths(config: AutopilotConfig, *, config_path: Path) -> li
         config.operator_report_json_file,
         config.readiness_report_file,
         config.readiness_report_json_file,
+        PROJECT_ROOT / "config" / "event_capture.json" if include_project_artifacts else None,
+        config.event_capture_status_file,
+        PROJECT_ROOT / "config" / "microstructure_research.json"
+        if include_project_artifacts
+        else None,
+        PROJECT_ROOT / "runtime" / "research" / "microstructure.json"
+        if include_project_artifacts
+        else None,
+        PROJECT_ROOT / "config" / "ml_research.json" if include_project_artifacts else None,
+        PROJECT_ROOT / "config" / "portfolio_risk.json" if include_project_artifacts else None,
+        config.portfolio_risk_file,
+        PROJECT_ROOT / "config" / "relative_value.json" if include_project_artifacts else None,
+        PROJECT_ROOT / "runtime" / "research" / "relative_value.json"
+        if include_project_artifacts
+        else None,
+        PROJECT_ROOT / "runtime" / "research" / "relative_value_paper.json"
+        if include_project_artifacts
+        else None,
+        PROJECT_ROOT / "runtime" / "research" / "relative_value_paper_state.json"
+        if include_project_artifacts
+        else None,
+        PROJECT_ROOT / "runtime" / "research" / "ml_research.json"
+        if include_project_artifacts
+        else None,
+        PROJECT_ROOT / "runtime" / "research" / "ml_research_state.json"
+        if include_project_artifacts
+        else None,
+        PROJECT_ROOT / "runtime" / "research" / "ml_forward_paper.json"
+        if include_project_artifacts
+        else None,
+        PROJECT_ROOT / "runtime" / "research" / "ml_forward_paper_state.json"
+        if include_project_artifacts
+        else None,
+        PROJECT_ROOT / "runtime" / "exploration_paper" / "manifest.json"
+        if include_project_artifacts
+        else None,
+        PROJECT_ROOT / "runtime" / "exploration_paper" / "status.json"
+        if include_project_artifacts
+        else None,
     ):
         _add_path(paths, seen, path)
+    if include_project_artifacts:
+        for path in sorted(
+            (PROJECT_ROOT / "runtime" / "research" / "ml_candidates").glob("*.json")
+        ):
+            _add_path(paths, seen, path)
     if config.candidate_paper_enabled:
         _add_path(paths, seen, config.candidate_paper_status_file)
     for product in config.products:
@@ -128,6 +184,7 @@ def _configured_backup_roles(
     config_path: Path,
 ) -> dict[Path, str]:
     roles: dict[Path, str] = {}
+    include_project_artifacts = _uses_project_artifacts(config_path)
 
     def add(path: Path | None, role: str) -> None:
         if path is not None:
@@ -135,6 +192,8 @@ def _configured_backup_roles(
 
     for path, role in (
         (config_path, "autopilot_config"),
+        (config.trade_starvation_history_file, "trade_starvation_history"),
+        (config.trade_starvation_report_file, "trade_starvation_report"),
         (config.approval_ledger, "approval_ledger"),
         (config.control_file, "operator_control"),
         (config.control_audit_file, "operator_control_audit"),
@@ -157,8 +216,97 @@ def _configured_backup_roles(
         (config.operator_report_json_file, "operator_report_json"),
         (config.readiness_report_file, "readiness_report_markdown"),
         (config.readiness_report_json_file, "readiness_report_json"),
+        (
+            PROJECT_ROOT / "config" / "event_capture.json" if include_project_artifacts else None,
+            "event_capture_config",
+        ),
+        (config.event_capture_status_file, "event_capture_status"),
+        (
+            PROJECT_ROOT / "config" / "microstructure_research.json"
+            if include_project_artifacts
+            else None,
+            "microstructure_research_config",
+        ),
+        (
+            PROJECT_ROOT / "runtime" / "research" / "microstructure.json"
+            if include_project_artifacts
+            else None,
+            "microstructure_research_report",
+        ),
+        (
+            PROJECT_ROOT / "config" / "ml_research.json" if include_project_artifacts else None,
+            "ml_research_config",
+        ),
+        (
+            PROJECT_ROOT / "config" / "portfolio_risk.json" if include_project_artifacts else None,
+            "portfolio_risk_config",
+        ),
+        (config.portfolio_risk_file, "portfolio_risk_model"),
+        (
+            PROJECT_ROOT / "config" / "relative_value.json" if include_project_artifacts else None,
+            "relative_value_config",
+        ),
+        (
+            PROJECT_ROOT / "runtime" / "research" / "relative_value.json"
+            if include_project_artifacts
+            else None,
+            "relative_value_report",
+        ),
+        (
+            PROJECT_ROOT / "runtime" / "research" / "relative_value_paper.json"
+            if include_project_artifacts
+            else None,
+            "relative_value_paper_report",
+        ),
+        (
+            PROJECT_ROOT / "runtime" / "research" / "relative_value_paper_state.json"
+            if include_project_artifacts
+            else None,
+            "relative_value_paper_state",
+        ),
+        (
+            PROJECT_ROOT / "runtime" / "research" / "ml_research.json"
+            if include_project_artifacts
+            else None,
+            "ml_research_report",
+        ),
+        (
+            PROJECT_ROOT / "runtime" / "research" / "ml_research_state.json"
+            if include_project_artifacts
+            else None,
+            "ml_research_state",
+        ),
+        (
+            PROJECT_ROOT / "runtime" / "research" / "ml_forward_paper.json"
+            if include_project_artifacts
+            else None,
+            "ml_forward_paper_report",
+        ),
+        (
+            PROJECT_ROOT / "runtime" / "research" / "ml_forward_paper_state.json"
+            if include_project_artifacts
+            else None,
+            "ml_forward_paper_state",
+        ),
+        (
+            PROJECT_ROOT / "runtime" / "exploration_paper" / "manifest.json"
+            if include_project_artifacts
+            else None,
+            "exploration_paper_manifest",
+        ),
+        (
+            PROJECT_ROOT / "runtime" / "exploration_paper" / "status.json"
+            if include_project_artifacts
+            else None,
+            "exploration_paper_status",
+        ),
     ):
         add(path, role)
+    if include_project_artifacts:
+        for path in sorted(
+            (PROJECT_ROOT / "runtime" / "research" / "ml_candidates").glob("*.json")
+        ):
+            add(path, "ml_reviewable_candidate")
     if config.candidate_paper_enabled:
         add(config.candidate_paper_status_file, "candidate_paper_status")
     for product in config.products:

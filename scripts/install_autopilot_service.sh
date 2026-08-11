@@ -6,12 +6,14 @@ umask 077
 REPO="${REPO:-$HOME/trading-bot}"
 PYTHON="${PYTHON:-$REPO/.venv/bin/python}"
 CONFIG="${CONFIG:-$REPO/config/autopilot.json}"
+EVENT_CAPTURE_CONFIG="${EVENT_CAPTURE_CONFIG:-$REPO/config/event_capture.json}"
 ALERT_ENV_FILE="${ALERT_ENV_FILE:-$REPO/runtime/alerts.env}"
 TELEGRAM_ENV_FILE="${TELEGRAM_ENV_FILE:-$REPO/runtime/telegram.env}"
 SERVICE_NAME="${SERVICE_NAME:-trading-bot-autopilot.service}"
 JOB_SERVICE_NAME="${JOB_SERVICE_NAME:-trading-bot-autopilot-jobs.service}"
 CANDIDATE_PAPER_SERVICE_NAME="${CANDIDATE_PAPER_SERVICE_NAME:-trading-bot-candidate-paper.service}"
 CANDIDATE_PAPER_TIMER_NAME="${CANDIDATE_PAPER_TIMER_NAME:-trading-bot-candidate-paper.timer}"
+EVENT_CAPTURE_SERVICE_NAME="${EVENT_CAPTURE_SERVICE_NAME:-trading-bot-event-capture.service}"
 BACKUP_SERVICE_NAME="${BACKUP_SERVICE_NAME:-trading-bot-autopilot-backup.service}"
 BACKUP_TIMER_NAME="${BACKUP_TIMER_NAME:-trading-bot-autopilot-backup.timer}"
 HEALTHCHECK_SERVICE_NAME="${HEALTHCHECK_SERVICE_NAME:-trading-bot-autopilot-healthcheck.service}"
@@ -170,6 +172,7 @@ validate_unit_name "$SERVICE_NAME" ".service" "SERVICE_NAME"
 validate_unit_name "$JOB_SERVICE_NAME" ".service" "JOB_SERVICE_NAME"
 validate_unit_name "$CANDIDATE_PAPER_SERVICE_NAME" ".service" "CANDIDATE_PAPER_SERVICE_NAME"
 validate_unit_name "$CANDIDATE_PAPER_TIMER_NAME" ".timer" "CANDIDATE_PAPER_TIMER_NAME"
+validate_unit_name "$EVENT_CAPTURE_SERVICE_NAME" ".service" "EVENT_CAPTURE_SERVICE_NAME"
 validate_unit_name "$BACKUP_SERVICE_NAME" ".service" "BACKUP_SERVICE_NAME"
 validate_unit_name "$BACKUP_TIMER_NAME" ".timer" "BACKUP_TIMER_NAME"
 validate_unit_name "$HEALTHCHECK_SERVICE_NAME" ".service" "HEALTHCHECK_SERVICE_NAME"
@@ -200,6 +203,10 @@ if [ ! -f "$CONFIG" ]; then
   echo "Missing autopilot config: $CONFIG" >&2
   exit 1
 fi
+if [ ! -f "$EVENT_CAPTURE_CONFIG" ]; then
+  echo "Missing event capture config: $EVENT_CAPTURE_CONFIG" >&2
+  exit 1
+fi
 
 mkdir -p "$REPO/runtime" "$REPO/data" "$REPO/outputs"
 prepare_unit_staging
@@ -207,6 +214,7 @@ UNIT_FILE="$UNIT_DIR/$SERVICE_NAME"
 JOB_SERVICE_FILE="$UNIT_DIR/$JOB_SERVICE_NAME"
 CANDIDATE_PAPER_SERVICE_FILE="$UNIT_DIR/$CANDIDATE_PAPER_SERVICE_NAME"
 CANDIDATE_PAPER_TIMER_FILE="$UNIT_DIR/$CANDIDATE_PAPER_TIMER_NAME"
+EVENT_CAPTURE_SERVICE_FILE="$UNIT_DIR/$EVENT_CAPTURE_SERVICE_NAME"
 BACKUP_SERVICE_FILE="$UNIT_DIR/$BACKUP_SERVICE_NAME"
 BACKUP_TIMER_FILE="$UNIT_DIR/$BACKUP_TIMER_NAME"
 HEALTHCHECK_SERVICE_FILE="$UNIT_DIR/$HEALTHCHECK_SERVICE_NAME"
@@ -216,6 +224,7 @@ REPO_UNIT="$(systemd_quote "$REPO")"
 REPO_WORKING_DIRECTORY="$(systemd_scalar "$REPO")"
 PYTHON_UNIT="$(systemd_quote "$PYTHON")"
 CONFIG_UNIT="$(systemd_quote "$CONFIG")"
+EVENT_CAPTURE_CONFIG_UNIT="$(systemd_quote "$EVENT_CAPTURE_CONFIG")"
 ENV_FILE_SCALAR="$(systemd_scalar "-$REPO/.env")"
 ALERT_ENV_FILE_UNIT="$(systemd_quote "-$ALERT_ENV_FILE")"
 ALERT_ENV_PATH_UNIT="$(systemd_quote "$ALERT_ENV_FILE")"
@@ -223,6 +232,7 @@ ALERT_ENV_ASSIGNMENT_UNIT="$(systemd_quote "AUTOPILOT_ALERT_SETTINGS_FILE=$ALERT
 TELEGRAM_ENV_FILE_UNIT="$(systemd_quote "-$TELEGRAM_ENV_FILE")"
 HEALTHCHECK_JSON_UNIT="$(systemd_quote "$REPO/runtime/healthcheck.json")"
 CANDIDATE_PAPER_LOCK_UNIT="$(systemd_quote "$REPO/runtime/candidate_paper.lock")"
+EVENT_CAPTURE_STATUS_UNIT="$(systemd_quote "$REPO/runtime/event_capture_status.json")"
 RUNTIME_UNIT="$(systemd_quote "$REPO/runtime")"
 DATA_UNIT="$(systemd_quote "$REPO/data")"
 OUTPUTS_UNIT="$(systemd_quote "$REPO/outputs")"
@@ -230,6 +240,8 @@ JOB_ENV_INACCESSIBLE_UNIT="$(systemd_quote "-$REPO/.env")"
 
 echo "Validating autopilot config..."
 "$PYTHON" -m src.autopilot.runtime --config "$CONFIG" --validate
+echo "Validating event capture config..."
+"$PYTHON" -m src.autopilot.event_capture --config "$EVENT_CAPTURE_CONFIG" --validate
 echo "Validating operations-only alert settings..."
 "$PYTHON" -m src.autopilot.alert_settings --file "$ALERT_ENV_FILE"
 echo "Checking autopilot readiness..."
@@ -492,6 +504,55 @@ Unit=$CANDIDATE_PAPER_SERVICE_NAME
 WantedBy=timers.target
 UNIT
 
+cat > "$EVENT_CAPTURE_SERVICE_FILE" <<UNIT
+[Unit]
+Description=Trading Bot Bounded Public Market Event Capture
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=$REPO_WORKING_DIRECTORY
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+UnsetEnvironment=EXCHANGE_API_KEY EXCHANGE_API_SECRET EXCHANGE_API_PASSWORD TRADING_LIVE EXCHANGE_TESTNET AUTOPILOT_WEBHOOK_URL AUTOPILOT_TELEGRAM_BOT_TOKEN AUTOPILOT_TELEGRAM_CHAT_ID AUTOPILOT_TELEGRAM_PAUSE_COMMANDS AUTOPILOT_TELEGRAM_ALLOWED_USER_IDS AUTOPILOT_TELEGRAM_SETTINGS_FILE AUTOPILOT_ALERT_SETTINGS_FILE
+ExecStartPre=$PYTHON_UNIT -m src.autopilot.event_capture --config $EVENT_CAPTURE_CONFIG_UNIT --validate
+ExecStart=$PYTHON_UNIT -m src.autopilot.event_capture --config $EVENT_CAPTURE_CONFIG_UNIT --status $EVENT_CAPTURE_STATUS_UNIT
+Restart=always
+RestartSec=5
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+MemoryAccounting=true
+MemoryMax=512M
+CPUAccounting=true
+CPUQuota=35%
+TasksAccounting=true
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=$REPO_UNIT
+ReadWritePaths=$RUNTIME_UNIT
+InaccessiblePaths=$JOB_ENV_INACCESSIBLE_UNIT
+InaccessiblePaths=$JOB_APPROVALS_INACCESSIBLE_UNIT
+InaccessiblePaths=$ALERT_ENV_FILE_UNIT
+InaccessiblePaths=$TELEGRAM_ENV_FILE_UNIT
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+UNIT
+
 cat > "$BACKUP_SERVICE_FILE" <<UNIT
 [Unit]
 Description=Trading Bot Trusted Runtime Backup
@@ -556,6 +617,7 @@ verify_unit_files \
   "$JOB_SERVICE_FILE" \
   "$CANDIDATE_PAPER_SERVICE_FILE" \
   "$CANDIDATE_PAPER_TIMER_FILE" \
+  "$EVENT_CAPTURE_SERVICE_FILE" \
   "$BACKUP_SERVICE_FILE" \
   "$BACKUP_TIMER_FILE" \
   "$HEALTHCHECK_SERVICE_FILE" \
@@ -566,6 +628,7 @@ publish_unit_files \
   "$JOB_SERVICE_FILE" \
   "$CANDIDATE_PAPER_SERVICE_FILE" \
   "$CANDIDATE_PAPER_TIMER_FILE" \
+  "$EVENT_CAPTURE_SERVICE_FILE" \
   "$BACKUP_SERVICE_FILE" \
   "$BACKUP_TIMER_FILE" \
   "$HEALTHCHECK_SERVICE_FILE" \
@@ -574,6 +637,7 @@ UNIT_FILE="$UNIT_DIR/$SERVICE_NAME"
 JOB_SERVICE_FILE="$UNIT_DIR/$JOB_SERVICE_NAME"
 CANDIDATE_PAPER_SERVICE_FILE="$UNIT_DIR/$CANDIDATE_PAPER_SERVICE_NAME"
 CANDIDATE_PAPER_TIMER_FILE="$UNIT_DIR/$CANDIDATE_PAPER_TIMER_NAME"
+EVENT_CAPTURE_SERVICE_FILE="$UNIT_DIR/$EVENT_CAPTURE_SERVICE_NAME"
 BACKUP_SERVICE_FILE="$UNIT_DIR/$BACKUP_SERVICE_NAME"
 BACKUP_TIMER_FILE="$UNIT_DIR/$BACKUP_TIMER_NAME"
 HEALTHCHECK_SERVICE_FILE="$UNIT_DIR/$HEALTHCHECK_SERVICE_NAME"
@@ -585,6 +649,7 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "  $JOB_SERVICE_FILE"
   echo "  $CANDIDATE_PAPER_SERVICE_FILE"
   echo "  $CANDIDATE_PAPER_TIMER_FILE"
+  echo "  $EVENT_CAPTURE_SERVICE_FILE"
   echo "  $BACKUP_SERVICE_FILE"
   echo "  $BACKUP_TIMER_FILE"
   echo "  $HEALTHCHECK_SERVICE_FILE"
@@ -599,11 +664,13 @@ systemctl --user daemon-reload
 systemctl --user enable --now "$SERVICE_NAME"
 systemctl --user enable --now "$JOB_SERVICE_NAME"
 systemctl --user enable --now "$CANDIDATE_PAPER_TIMER_NAME"
+systemctl --user enable --now "$EVENT_CAPTURE_SERVICE_NAME"
 systemctl --user enable --now "$BACKUP_TIMER_NAME"
 systemctl --user enable --now "$HEALTHCHECK_TIMER_NAME"
 
 systemctl --user status "$SERVICE_NAME" --no-pager
 systemctl --user status "$JOB_SERVICE_NAME" --no-pager
 systemctl --user list-timers "$CANDIDATE_PAPER_TIMER_NAME" --no-pager
+systemctl --user status "$EVENT_CAPTURE_SERVICE_NAME" --no-pager
 systemctl --user list-timers "$BACKUP_TIMER_NAME" --no-pager
 systemctl --user list-timers "$HEALTHCHECK_TIMER_NAME" --no-pager

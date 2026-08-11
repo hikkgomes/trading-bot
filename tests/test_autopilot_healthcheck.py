@@ -38,6 +38,44 @@ def test_healthcheck_passes_for_fresh_ok_report():
     assert health["readiness_ok"] is True
 
 
+def test_healthcheck_warns_when_enabled_product_entries_are_disabled():
+    health = evaluate_health(
+        operator_report(
+            products=[
+                {
+                    "name": "active_income",
+                    "enabled": True,
+                    "objective": "active_income",
+                    "market": "futures",
+                    "mode": "paper",
+                    "entries_allowed": False,
+                    "entry_gate": {
+                        "status": "management_only",
+                        "reason": "unvalidated_bootstrap_artifact",
+                    },
+                    "decision_trace": {"summary": {"outcomes": {"entry_disabled": 2}}},
+                }
+            ]
+        )
+    )
+
+    assert health["ok"] is True
+    warning = next(
+        item for item in health["warnings"] if item["code"] == "product_entries_disabled"
+    )
+    assert warning["detail"]["products"] == [
+        {
+            "name": "active_income",
+            "objective": "active_income",
+            "market": "futures",
+            "mode": "paper",
+            "gate_status": "management_only",
+            "gate_reason": "unvalidated_bootstrap_artifact",
+            "decision_outcomes": {"entry_disabled": 2},
+        }
+    ]
+
+
 def test_healthcheck_fails_for_unhealthy_candidate_paper_status_and_returns_summary():
     candidate_paper = {
         "configured": True,

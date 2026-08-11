@@ -233,3 +233,37 @@ def test_mutation_plan_retires_failed_holdout_without_generating_feedback():
             "disposition": "retired_from_autonomous_mutation",
         }
     ]
+
+
+def test_mutation_plan_prioritizes_actionable_exploration_funnel_feedback():
+    payload = research_cycle_payload()
+    exploration = {
+        "schema": "autopilot.exploration_paper/v1",
+        "generated_at": "2026-01-02T00:00:00+00:00",
+        "adaptive_evidence": True,
+        "promotion_eligible": False,
+        "candidate_feedback": {
+            "sha256:example": {
+                "product": "active_income",
+                "hypothesis_id": "VOLBREAK_LONG",
+                "diagnosis": "trigger_never_fires",
+                "mutation_focus_stage": "trigger",
+                "cycles": 20,
+                "data_ready": 20,
+                "market_bars_processed": 20,
+                "signals": 0,
+                "failed_stages": {"trigger": 20},
+                "failed_predicates": {"5m:volume_z_20 >= 1.0": 20},
+            }
+        },
+    }
+
+    plan = build_mutation_plan(payload, exploration_status=exploration)
+
+    proposal = next(
+        item for item in plan["proposals"] if item["source_candidate_id"] == "VOLBREAK_LONG"
+    )
+    assert proposal["reason"] == "trigger_never_fires"
+    assert proposal["mutation_focus_stage"] == "trigger"
+    assert proposal["adaptive_feedback"]["signals"] == 0
+    assert proposal["actions"][0] == "soften or replace the dominant trigger predicate only"

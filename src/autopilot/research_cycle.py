@@ -835,6 +835,12 @@ def _segment_summary(result: dict[str, Any], name: str) -> dict[str, Any] | None
 
     return {
         "trades": _int_count(segment.get("trades")),
+        "n_signals": _int_count(segment.get("n_signals")),
+        "signal_frequency": (
+            segment.get("signal_frequency")
+            if isinstance(segment.get("signal_frequency"), dict)
+            else {}
+        ),
         "total_return": float(segment.get("total_return") or 0.0),
         "win_rate": finite_or_none(segment.get("win_rate")),
         "sharpe": finite_or_none(segment.get("sharpe")),
@@ -1325,7 +1331,9 @@ def build_incubation_review(
                     "scenario": scenario.get("name"),
                     "product": product,
                     "market": scenario.get("market"),
+                    "symbol": scenario.get("symbol"),
                     "pnl_unit": scenario.get("pnl_unit"),
+                    "position": scenario.get("position"),
                     "opportunity_type": scenario.get("opportunity_type", "research"),
                     "base_tf": scenario.get("base_tf"),
                 }
@@ -3388,6 +3396,7 @@ def run_research_cycle(
         scenario_reports,
         generated_at=str(report["generated_at"]),
     )
+    exploration_paper_ok = True
     if incubation_output_path:
         write_json_atomic(incubation_output_path, incubation_review)
         report["incubation_review"] = {
@@ -3401,6 +3410,30 @@ def run_research_cycle(
             "candidates": incubation_review["summary"]["candidates"],
             "by_product": incubation_review["summary"]["by_product"],
         }
+        try:
+            from src.autopilot.exploration_paper import build_exploration_manifest
+
+            exploration_manifest = build_exploration_manifest(
+                config,
+                incubation_path=incubation_output_path,
+                log_path=log_path,
+                root=incubation_output_path.parent / "exploration_paper",
+            )
+            report["exploration_paper"] = {
+                "ok": True,
+                "manifest": str(incubation_output_path.parent / "exploration_paper/manifest.json"),
+                "adaptive_evidence": True,
+                "promotion_eligible": False,
+                "summary": exploration_manifest.get("summary", {}),
+            }
+        except Exception as exc:
+            exploration_paper_ok = False
+            report["exploration_paper"] = {
+                "ok": False,
+                "adaptive_evidence": True,
+                "promotion_eligible": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
     report["summary"] = _summarize_cycle(
         scenario_reports,
         export_reports,
@@ -3411,7 +3444,9 @@ def run_research_cycle(
         item.get("deferred") is True and item.get("reason") == "insufficient_history_coverage"
         for item in scenario_reports
     )
-    report["ok"] = all(bool(item.get("ok")) for item in scenario_reports + export_reports)
+    report["ok"] = exploration_paper_ok and all(
+        bool(item.get("ok")) for item in scenario_reports + export_reports
+    )
     if coverage_deferred and report["ok"]:
         report["deferred"] = True
         report["reason"] = "history_bootstrap_pending"

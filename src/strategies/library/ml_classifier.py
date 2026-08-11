@@ -26,19 +26,28 @@ from src.strategies.registry import register
 LOGGER = logging.getLogger(__name__)
 
 
-def _make_model(kind: str):
+def _make_model(
+    kind: str,
+    *,
+    n_estimators: int,
+    learning_rate: float,
+    num_leaves: int,
+    max_depth: int,
+    n_jobs: int,
+):
     if kind in ("auto", "lightgbm"):
         try:
             from lightgbm import LGBMClassifier
 
             return LGBMClassifier(
-                n_estimators=200,
-                num_leaves=31,
-                learning_rate=0.05,
+                n_estimators=n_estimators,
+                num_leaves=num_leaves,
+                learning_rate=learning_rate,
+                max_depth=max_depth,
                 subsample=0.8,
                 colsample_bytree=0.8,
                 random_state=42,
-                n_jobs=-1,
+                n_jobs=n_jobs,
                 verbosity=-1,
             )
         except ImportError:
@@ -46,7 +55,12 @@ def _make_model(kind: str):
                 raise
     from sklearn.ensemble import GradientBoostingClassifier
 
-    return GradientBoostingClassifier(random_state=42)
+    return GradientBoostingClassifier(
+        n_estimators=n_estimators,
+        learning_rate=learning_rate,
+        max_depth=max_depth if max_depth > 0 else 3,
+        random_state=42,
+    )
 
 
 @register
@@ -64,6 +78,11 @@ class MlClassifierStrategy(Strategy):
             "short_threshold": 0.45,
             "allow_short": True,
             "model": "auto",  # "auto" | "lightgbm" | "sklearn"
+            "n_estimators": 200,
+            "learning_rate": 0.05,
+            "num_leaves": 31,
+            "max_depth": -1,
+            "n_jobs": 1,
             "feature_cols": None,  # None = auto-select numeric feature columns
             "max_features": 80,
             "feature_screen": "spearman",
@@ -119,7 +138,14 @@ class MlClassifierStrategy(Strategy):
         valid = y.notna() & np.isfinite(y) & X.notna().all(axis=1)
         if valid.sum() < 50:
             raise ValueError(f"Too few training rows ({int(valid.sum())}) for the ML strategy.")
-        self._model = _make_model(self.params["model"])
+        self._model = _make_model(
+            self.params["model"],
+            n_estimators=int(self.params["n_estimators"]),
+            learning_rate=float(self.params["learning_rate"]),
+            num_leaves=int(self.params["num_leaves"]),
+            max_depth=int(self.params["max_depth"]),
+            n_jobs=int(self.params["n_jobs"]),
+        )
         self._model.fit(X[valid], y[valid].to_numpy())
         LOGGER.info(
             "Fitted %s on %d rows, %d features", self.name, int(valid.sum()), len(self._features)

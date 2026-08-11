@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
+import datetime as dt
 import hashlib
 import importlib.util
 import json
@@ -62,6 +64,13 @@ from src.autopilot.notifications import (
     research_handoff_warning_detail,
     research_progress_warning_detail,
 )
+from src.autopilot.portfolio import (
+    AlphaForecast,
+    PortfolioPolicy,
+    PortfolioPosition,
+    PortfolioRiskModel,
+    allocate_forecasts,
+)
 from src.autopilot.reporting import (
     build_operator_report,
     render_operator_markdown,
@@ -76,6 +85,7 @@ from src.autopilot.testnet_rehearsal import (
     summarize_testnet_rehearsal_report,
     testnet_rehearsal_next_action,
 )
+from src.autopilot.trade_starvation import update_trade_starvation
 from src.build_dataset import TIMEFRAME_SECONDS
 from src.execution.broker import (
     Fill,
@@ -209,6 +219,7 @@ CLIENT_ORDER_ID_SAFE_CHARS = frozenset(
 )
 JOB_OUTPUT_PATH_FLAGS = {
     "--json-output",
+    "--journal",
     "--markdown-output",
     "--output",
     "--output-json",
@@ -780,6 +791,18 @@ def validate_config(
         or not 1 <= config.active_income_max_open_positions <= 20
     ):
         errors.append("active_income_max_open_positions must be an integer in [1, 20]")
+    for field in (
+        "active_income_max_gross_fraction",
+        "active_income_max_net_fraction",
+        "active_income_max_symbol_fraction",
+    ):
+        value = getattr(config, field)
+        if not isinstance(value, int | float) or isinstance(value, bool) or not 0 < value <= 1:
+            errors.append(f"{field} must be in (0, 1]")
+    for field in ("active_income_min_alpha_confidence", "active_income_min_alpha_score"):
+        value = getattr(config, field)
+        if not isinstance(value, int | float) or isinstance(value, bool) or not 0 <= value <= 1:
+            errors.append(f"{field} must be in [0, 1]")
     if require_core_products:
         errors.extend(_core_product_errors(config.products))
     if validate_jobs and require_core_jobs:
@@ -1729,8 +1752,11 @@ def _local_open_position_count(product: ProductConfig) -> int | None:
 
 def _active_income_portfolio_status(config: AutopilotConfig) -> dict[str, Any]:
     products: dict[str, Any] = {}
+    positions: list[PortfolioPosition] = []
     total = 0
     ok = True
+    current_equity = 0.0
+    peak_equity = 0.0
     for product in config.products:
         if not product.enabled or product.objective != "active_income":
             continue
@@ -1748,15 +1774,152 @@ def _active_income_portfolio_status(config: AutopilotConfig) -> dict[str, Any]:
             else:
                 item["open_positions"] = count
                 total += count
+                try:
+                    state = json.loads(product.state_file.read_text(encoding="utf-8"))
+                    equity = float(state.get("equity", product.starting_equity))
+                    peak = float(state.get("peak_equity", max(equity, product.starting_equity)))
+                    if (
+                        not math.isfinite(equity)
+                        or not math.isfinite(peak)
+                        or equity <= 0
+                        or peak <= 0
+                    ):
+                        raise ValueError("portfolio equity/peak is invalid")
+                    current_equity += equity
+                    peak_equity += peak
+                    for raw_position in state.get("open_positions", {}).values():
+                        if not isinstance(raw_position, dict):
+                            raise ValueError("open position must be an object")
+                        positions.append(
+                            PortfolioPosition(
+                                product=product.name,
+                                symbol=product.symbol,
+                                direction=str(raw_position.get("direction") or ""),
+                                fraction=float(raw_position.get("position_size")),
+                            )
+                        )
+                except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    item.update(ok=False, reason="portfolio_position_invalid", error=str(exc))
         products[product.name] = item
         ok = ok and bool(item["ok"])
+    gross = sum(position.fraction for position in positions)
+    net = sum(position.signed_fraction for position in positions)
+    symbol_fractions: dict[str, float] = {}
+    for position in positions:
+        symbol_fractions[position.symbol] = (
+            symbol_fractions.get(position.symbol, 0.0) + position.fraction
+        )
+    portfolio_drawdown = current_equity / peak_equity - 1 if peak_equity else 0.0
+    risk_status: dict[str, Any] = {
+        "required": config.portfolio_risk_required,
+        "path": str(config.portfolio_risk_file),
+        "ok": False,
+        "fresh": False,
+        "age_seconds": None,
+        "model": None,
+    }
+    if config.portfolio_risk_file.is_symlink():
+        risk_status["reason"] = "risk_model_symlink"
+    elif not config.portfolio_risk_file.exists():
+        risk_status["reason"] = "risk_model_missing"
+    else:
+        try:
+            payload = json.loads(config.portfolio_risk_file.read_text(encoding="utf-8"))
+            model = PortfolioRiskModel.from_dict(payload)
+            active_symbols = {
+                product.symbol.upper()
+                for product in config.products
+                if product.enabled and product.objective == "active_income"
+            }
+            missing_beta = sorted(active_symbols - set(model.beta_by_symbol))
+            missing_pairs = sorted(
+                f"{first}:{second}"
+                for first in active_symbols
+                for second in active_symbols
+                if model.correlation(first, second) is None
+            )
+            if missing_beta or missing_pairs:
+                raise ValueError(
+                    "risk model is incomplete for configured symbols: "
+                    f"missing_beta={missing_beta}, missing_correlations={missing_pairs}"
+                )
+            generated = dt.datetime.fromisoformat(model.generated_at.replace("Z", "+00:00"))
+            if generated.tzinfo is None:
+                generated = generated.replace(tzinfo=dt.UTC)
+            age = time.time() - generated.timestamp()
+            fresh = 0 <= age <= config.portfolio_risk_max_age_seconds
+            risk_status.update(
+                ok=fresh,
+                fresh=fresh,
+                age_seconds=round(age, 3),
+                reason=None if fresh else "risk_model_stale_or_future",
+                model=payload if fresh else None,
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            risk_status.update(reason="risk_model_invalid", error=str(exc))
+    ok = ok and (bool(risk_status["ok"]) or not config.portfolio_risk_required)
+    policy = PortfolioPolicy(
+        max_positions=config.active_income_max_open_positions,
+        max_gross_fraction=config.active_income_max_gross_fraction,
+        max_net_fraction=config.active_income_max_net_fraction,
+        max_symbol_fraction=config.active_income_max_symbol_fraction,
+        min_confidence=config.active_income_min_alpha_confidence,
+        min_score=config.active_income_min_alpha_score,
+        max_correlated_fraction=config.active_income_max_correlated_fraction,
+        max_abs_beta_fraction=config.active_income_max_abs_beta_fraction,
+        max_drawdown_fraction=config.active_income_max_portfolio_drawdown_fraction,
+    )
     return {
         "ok": ok,
         "open_positions": total,
         "max_open_positions": config.active_income_max_open_positions,
-        "entry_capacity_available": ok and total < config.active_income_max_open_positions,
+        "gross_fraction": round(gross, 12),
+        "net_fraction": round(net, 12),
+        "symbol_fractions": symbol_fractions,
+        "portfolio_drawdown_fraction": round(portfolio_drawdown, 12),
+        "risk_model": risk_status,
+        "policy": asdict(policy),
+        "position_details": [asdict(position) for position in positions],
+        "entry_capacity_available": (
+            ok
+            and total < config.active_income_max_open_positions
+            and gross < config.active_income_max_gross_fraction
+        ),
         "products": products,
     }
+
+
+def _active_income_portfolio_decision(
+    config: AutopilotConfig,
+    proposal: dict[str, Any],
+) -> dict[str, Any]:
+    status = _active_income_portfolio_status(config)
+    if not status["ok"]:
+        reason = (
+            "portfolio_risk_unavailable"
+            if status["risk_model"]["required"] and not status["risk_model"]["ok"]
+            else "portfolio_state_invalid"
+        )
+        return {
+            "allowed": False,
+            "allocated_fraction": 0.0,
+            "reason": reason,
+            "portfolio": status,
+        }
+    forecast = AlphaForecast.from_dict(proposal["forecast"])
+    positions = [PortfolioPosition(**item) for item in status["position_details"]]
+    risk_payload = status["risk_model"].get("model")
+    risk_model = PortfolioRiskModel.from_dict(risk_payload) if risk_payload else None
+    allocation = allocate_forecasts(
+        [forecast],
+        existing_positions=positions,
+        requested_fractions={forecast.source_id: float(proposal["requested_fraction"])},
+        policy=PortfolioPolicy(**status["policy"]),
+        risk_model=risk_model,
+        portfolio_drawdown_fraction=float(status["portfolio_drawdown_fraction"]),
+    )
+    decision = allocation["decisions"][0]
+    return {**decision, "portfolio_exposure": allocation["exposure"]}
 
 
 def _local_state_requires_management(product: ProductConfig) -> bool:
@@ -4051,6 +4214,9 @@ def _bot_status_snapshot(bot: PaperTradingBot) -> dict[str, Any]:
         snapshot["position_events"] = [
             dict(event) for event in position_events if isinstance(event, dict)
         ]
+    decision_trace = getattr(bot, "decision_trace", None)
+    if isinstance(decision_trace, dict):
+        snapshot["decision_trace"] = copy.deepcopy(decision_trace)
     exit_intent = state.get("exit_accounting_intent")
     if isinstance(exit_intent, dict):
         snapshot["exit_accounting_intent"] = {
@@ -4174,6 +4340,12 @@ def run_product_once(
     if not product.enabled:
         status.update(ok=True, skipped=True, reason="disabled")
         return status
+    portfolio_gate = None
+    if config is not None and product.objective == "active_income":
+
+        def portfolio_gate(proposal: dict[str, Any]) -> dict[str, Any]:
+            return _active_income_portfolio_decision(config, proposal)
+
     if product.execution_mode == "live":
         local_open_positions = _local_open_position_count(product)
         local_state_management = _local_state_requires_management(product)
@@ -4285,6 +4457,7 @@ def run_product_once(
             allow_entries=not management_only,
             artifact_payload=artifact_snapshot,
             pre_entry_gate=pre_entry_gate,
+            portfolio_gate=portfolio_gate,
         )
         try:
             bot.run_cycle()
@@ -4368,6 +4541,7 @@ def run_product_once(
         base_asset=product.base_asset,
         allow_entries=effective_allow_entries,
         artifact_payload=artifact_snapshot,
+        portfolio_gate=portfolio_gate,
     )
     try:
         bot.run_cycle()
@@ -4899,7 +5073,11 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
                 portfolio_gate = _active_income_portfolio_status(config)
                 if not portfolio_gate["entry_capacity_available"]:
                     product_kwargs["allow_entries"] = False
-            if product.execution_mode == "live":
+            # Active-income paper trading is part of the same portfolio risk
+            # process as live execution.  Pass the config so the paper bot
+            # receives the allocator callback rather than only the coarse
+            # pre-cycle capacity check.
+            if product.execution_mode == "live" or product.objective == "active_income":
                 product_kwargs["config"] = config
             product_status = run_product_once(product, **product_kwargs)
             if portfolio_gate is not None:
@@ -4961,6 +5139,19 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
     if control_clear:
         report["control_clear"] = control_clear
         report["ok"] = report["ok"] and all(bool(item.get("ok")) for item in control_clear)
+
+    if config.trade_starvation_enabled:
+        try:
+            report["trade_starvation"] = update_trade_starvation(config, report)
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            LOGGER.exception("Trade-starvation diagnostic failed")
+            report["trade_starvation"] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "history": str(config.trade_starvation_history_file),
+                "report": str(config.trade_starvation_report_file),
+            }
+            report["ok"] = False
 
     if config.alerts_enabled and not report["ok"]:
         incident_key = _cycle_failure_dedupe_key(report)

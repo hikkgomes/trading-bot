@@ -181,6 +181,11 @@ Build the compact regime artifact and exercise the research/runtime wiring:
 
 ```bash
 make regime-tag-futures
+make portfolio-risk-validate
+make portfolio-risk
+make relative-value-validate
+make relative-value
+make relative-value-paper-once
 make research-smoke
 make strategy-smoke
 make research-generate
@@ -204,6 +209,13 @@ yet run; the separate job worker will drain the due queue one bounded job per
 cycle. Do not treat the deployment as healthy until `make healthcheck` exits
 zero after that queue has progressed.
 
+The six-hour `portfolio_risk` job derives rolling cross-symbol correlations and
+BTC beta from local 1h futures history. The checked-in runtime configuration
+requires a fresh complete model before active-income entries, and separately
+caps correlated exposure, absolute BTC-beta exposure, and aggregate drawdown.
+Missing, stale, malformed, or incomplete risk data disables new entries but
+does not disable management of existing positions.
+
 `make autopilot-once` is supervision-only: it manages products and flatten
 requests but never launches data/research jobs. `make jobs-once` executes at
 most one due job under the separate job-worker lock. The enabled history jobs
@@ -223,18 +235,69 @@ make readiness
 REPO="$PWD" bash scripts/install_autopilot_service.sh
 ```
 
-The installer creates eight user units:
+The installer creates nine user units:
 
 | Unit | Role |
 |---|---|
 | `trading-bot-autopilot.service` | Trading supervision and emergency flattening. It runs `src.autopilot.runtime --skip-jobs`, so a slow research/data task cannot block a position-management cycle. |
 | `trading-bot-autopilot-jobs.service` | Independent bounded scheduled-job loop (`src.autopilot.job_worker`). |
-| `trading-bot-candidate-paper.service` | Credential-free, approval-ledger-inaccessible, resource-limited one-shot candidate paper cycle with a nonblocking process lock. |
+| `trading-bot-candidate-paper.service` | Credential-free, approval-ledger-inaccessible, resource-limited one-shot cycle for frozen promotion-paper candidates and separately flagged adaptive exploration paper, with a nonblocking process lock. |
 | `trading-bot-candidate-paper.timer` | Starts candidate papering every 45 seconds. A digest-specific closed-bar cursor recovers every unseen bar, while downtime/backfill rows are quarantined from promotion evidence. |
+| `trading-bot-event-capture.service` | Credential-free Binance public WebSocket capture for trades, aggregate trades, top/depth books, mark/index/funding, and futures liquidations. Files rotate hourly/by size and are capped by retention and total-byte budgets. |
 | `trading-bot-autopilot-backup.service` | Credential-free daily backup with the live approval ledger mounted read-only and bounded runtime writes. |
 | `trading-bot-autopilot-backup.timer` | Starts the verified backup workflow every 24 hours. |
 | `trading-bot-autopilot-healthcheck.service` | One-shot machine-readable watchdog. It reads `runtime/alerts.env` through a strict two-key owner-private parser (never as a systemd `EnvironmentFile`), strips inherited exchange/operations variables, skips credential-aware readiness, and performs a bounded drain of queued webhook/Telegram alerts before exit. |
 | `trading-bot-autopilot-healthcheck.timer` | Starts the healthcheck every five minutes by default. |
+
+The event collector is a research-data service, never an order path. Its
+allowlisted public streams and hard storage budgets live in
+`config/event_capture.json`; the default is 128 MiB per file, 5 GiB total, and
+seven-day retention. Validate or smoke it with:
+
+```bash
+make event-capture-validate
+make event-capture-smoke
+make event-replay PATHS='runtime/events/futures_*.jsonl' SYMBOL=BTCUSDT
+make microstructure-research-validate
+make microstructure-research
+```
+
+Replay is ordered by local receive time and fails on regressions. It reconstructs
+bounded L2 snapshots, trade aggressor flow, spread/microprice/depth features,
+spot-perpetual basis inputs, and deterministic depth-consuming market fills.
+Optional passive orders add activation latency, queue-ahead approximation,
+trade-driven partial fills, cancellation timeouts, maker fees, funding carry,
+and post-fill adverse-selection measurement. These remain conservative research
+models rather than an exchange queue-position guarantee.
+
+The daily `ml_research` job is separate from execution. It evaluates at most two
+single-core chronological trials, reserves the final 20% tail, durably seals and
+claims a protected cohort before scoring that tail, and records both phases in
+shared experiment memory. Holdout survivors feed the isolated 15-minute
+`ml_forward_paper` job through a safe frozen-JSON model; no production process
+loads a pickle or refits the reviewed model. Policy-valid review artifacts are
+written under `runtime/research/ml_candidates/` and are not staged
+automatically. Use `make ml-stage-candidate PRODUCT=<name> ARTIFACT=<path>
+DIGEST=sha256:<digest>` only after exact-digest review; this starts the existing
+candidate-paper path, not live execution. Use `make ml-research-validate` for a
+cheap configuration check, `make ml-research-once` intentionally because it
+performs model fitting, and `make ml-forward-paper-once` for a bounded manual
+paper cycle. Candidate paper can run while the configured product remains in
+paper mode; activation still refuses until that product is deliberately moved
+to live mode.
+
+Every supervisor cycle also updates `runtime/trade_starvation.json` from the
+bounded history in `runtime/trade_starvation_history.jsonl`. Check each
+product's `summary.starvation_point`, unique `market_bars_processed`, outcome counts, killer predicates, and
+last signal/entry/trade timestamps before changing research parameters. An
+`entry_gate` result means strategy looseness is not the current problem.
+
+The hourly `accounting_attribution` job converts completed trades into a
+balanced, hash-chained journal at `runtime/accounting/journal.jsonl`. It
+reconciles the equity sequence and attributes realized return, costs, forecast
+bias, and wins by strategy, alpha source, product, market, symbol, direction,
+and accounting source. `make accounting` runs the same control manually;
+reconciliation or chain failures are healthcheck failures.
 
 The installer validates config and full readiness before initial enablement,
 writes restrictive units with resource limits, enables both long-running
@@ -419,7 +482,7 @@ candidate-paper state/log/review files, the research-factory config/latest batch
 and a transactionally consistent SQLite experiment-memory snapshot. The live
 SQLite file is never copied directly. Archives exclude `.env`, credentials,
 large market data, and large research outputs. Before the default experiment
-memory reaches its explicit 48 MiB ceiling, the factory automatically compresses
+memory reaches its explicit 256 MiB ceiling, the factory automatically compresses
 a bounded number of rows without deleting canonical identities, lineage,
 evaluation context, engine scope, or holdout claims, then deeply verifies and
 vacuums the database. If that safe maintenance cannot bring an anomalously large

@@ -1,0 +1,18 @@
+{
+  "schema": "autopilot.microstructure_research_config/v1",
+  "event_capture_config": "config/event_capture.json",
+  "output": "runtime/research/microstructure.json",
+  "market": "futures",
+  "maximum_symbols": 4,
+  "maximum_files": 2,
+  "maximum_events_per_symbol": 50000,
+  "sample_every": 100,
+  "strategy_quantity": 0.001,
+  "policy": {
+    "minimum_abs_score": 0.35,
+    "maximum_spread_bps": 8.0,
+    "minimum_total_depth": 0.01,
+    "minimum_liquidity_vacuum_ratio": 0.35,
+    "horizon_seconds": 30
+  }
+}

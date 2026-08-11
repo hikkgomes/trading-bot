@@ -8,12 +8,15 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from research_exploration.experiment_log import DEFAULT_LOG, load_log
+from research_exploration.hypothesis_schema import Hypothesis
 from src.autopilot.io import write_json_atomic, write_text_atomic
 from src.autopilot.reporting import utc_now
 
 DEFAULT_INPUT = Path("runtime/research_cycle.json")
 DEFAULT_OUTPUT = Path("runtime/mutation_plan.json")
 DEFAULT_MARKDOWN = Path("runtime/mutation_plan.md")
+DEFAULT_EXPLORATION_STATUS = Path("runtime/exploration_paper/status.json")
 SKIPPED_CANDIDATE_SETS = {"mutation"}
 RETIRED_REASONS = {"failed_holdout"}
 
@@ -82,6 +85,22 @@ FAMILY_ACTIONS = {
 }
 
 REASON_ACTIONS = {
+    "regime_never_fires": [
+        "soften or replace the dominant regime predicate only",
+        "leave setup, trigger, exit, and risk unchanged for attribution",
+    ],
+    "setup_never_fires": [
+        "soften or replace the dominant setup predicate only",
+        "leave regime, trigger, exit, and risk unchanged for attribution",
+    ],
+    "trigger_never_fires": [
+        "soften or replace the dominant trigger predicate only",
+        "leave regime, setup, exit, and risk unchanged for attribution",
+    ],
+    "trades_exist_but_negative_expectancy": [
+        "leave signal frequency and entry predicates unchanged",
+        "mutate the exit envelope before considering any entry change",
+    ],
     "failed_validation": [
         "mutate thresholds only; do not expand family count yet",
         "retest the same family on the next market-data refresh",
@@ -110,6 +129,9 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _primary_reason(candidate: dict[str, Any]) -> str:
+    adaptive_reason = candidate.get("adaptive_mutation_reason")
+    if isinstance(adaptive_reason, str) and adaptive_reason:
+        return adaptive_reason
     reasons = candidate.get("reasons") or []
     return str(reasons[0]) if reasons else "unknown"
 
@@ -142,9 +164,14 @@ def _actions_for(candidate: dict[str, Any]) -> list[str]:
     return list(actions)
 
 
-def _proposal(scenario: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+def _proposal(
+    scenario: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    source_hypothesis: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     reason = _primary_reason(candidate)
-    return {
+    proposal = {
         "id": f"mutate:{candidate.get('id', 'unknown')}:{reason}",
         "source_candidate_id": candidate.get("id"),
         "source_scenario": scenario.get("name"),
@@ -159,6 +186,16 @@ def _proposal(scenario: dict[str, Any], candidate: dict[str, Any]) -> dict[str, 
         "stage_reached": candidate.get("stage_reached"),
         "score": candidate.get("score"),
         "actions": _actions_for(candidate),
+        **(
+            {
+                "adaptive_feedback": candidate["adaptive_feedback"],
+                "mutation_focus_stage": candidate["adaptive_feedback"].get(
+                    "mutation_focus_stage"
+                ),
+            }
+            if isinstance(candidate.get("adaptive_feedback"), dict)
+            else {}
+        ),
         "validation_scope": {
             "candidate_set": scenario.get("candidate_set"),
             "pnl_unit": scenario.get("pnl_unit"),
@@ -172,6 +209,70 @@ def _proposal(scenario: dict[str, Any], candidate: dict[str, Any]) -> dict[str, 
             "requires_full_validation_before_export": True,
         },
     }
+    if source_hypothesis is not None:
+        parsed = Hypothesis.from_dict(source_hypothesis)
+        if parsed.id != proposal["source_candidate_id"]:
+            raise ValueError("source hypothesis identity does not match mutation proposal")
+        proposal["source_hypothesis"] = parsed.to_dict()
+    return proposal
+
+
+def _exploration_feedback_map(payload: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    if not payload:
+        return {}
+    if (
+        payload.get("schema") != "autopilot.exploration_paper/v1"
+        or payload.get("adaptive_evidence") is not True
+        or payload.get("promotion_eligible") is not False
+    ):
+        return {}
+    actionable = {
+        "regime_never_fires",
+        "setup_never_fires",
+        "trigger_never_fires",
+        "trades_exist_but_negative_expectancy",
+    }
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in (payload.get("candidate_feedback") or {}).values():
+        if not isinstance(item, dict) or item.get("diagnosis") not in actionable:
+            continue
+        product = str(item.get("product") or "")
+        hypothesis_id = str(item.get("hypothesis_id") or "")
+        if not product or not hypothesis_id:
+            continue
+        result[(product, hypothesis_id)] = {
+            key: item.get(key)
+            for key in (
+                "diagnosis",
+                "mutation_focus_stage",
+                "cycles",
+                "data_ready",
+                "market_bars_processed",
+                "signals",
+                "entries_opened",
+                "completed_trades",
+                "net_return_sum",
+                "sized_return_sum",
+                "signal_frequency",
+                "failed_stages",
+                "failed_predicates",
+            )
+            if key in item
+        }
+    return result
+
+
+def _source_hypotheses(path: Path) -> dict[str, dict[str, Any]]:
+    latest: dict[str, tuple[str, dict[str, Any]]] = {}
+    for record in load_log(path):
+        if not isinstance(record, dict) or not isinstance(record.get("hypothesis"), dict):
+            continue
+        hypothesis = Hypothesis.from_dict(record["hypothesis"])
+        timestamp = str(record.get("timestamp") or "")
+        prior = latest.get(hypothesis.id)
+        if prior is None or timestamp > prior[0]:
+            latest[hypothesis.id] = (timestamp, hypothesis.to_dict())
+    return {key: value[1] for key, value in latest.items()}
 
 
 def _source_key(scenario_name: Any, candidate_id: Any, reason: Any) -> tuple[str, str, str] | None:
@@ -220,12 +321,16 @@ def build_mutation_plan(
     *,
     top_per_scenario: int = 2,
     max_total: int = 12,
+    exploration_status: dict[str, Any] | None = None,
+    source_hypotheses: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     proposals: list[dict[str, Any]] = []
     skipped_scenarios: list[dict[str, Any]] = []
     suppressed_sources = _recent_failed_mutation_sources(research_cycle)
     suppressed_repeated_sources: list[dict[str, Any]] = []
     retired_candidates: list[dict[str, Any]] = []
+    forward_feedback = _exploration_feedback_map(exploration_status or {})
+    source_hypotheses = source_hypotheses or {}
     for scenario in research_cycle.get("scenarios") or []:
         if not isinstance(scenario, dict):
             continue
@@ -248,6 +353,13 @@ def build_mutation_plan(
             if retired_reason is not None:
                 retired_candidates.append(_retired_candidate(scenario, candidate, retired_reason))
                 continue
+            candidate = dict(candidate)
+            feedback = forward_feedback.get(
+                (str(scenario.get("product") or ""), str(candidate.get("id") or ""))
+            )
+            if feedback is not None:
+                candidate["adaptive_mutation_reason"] = feedback["diagnosis"]
+                candidate["adaptive_feedback"] = feedback
             candidates.append(candidate)
         candidates = sorted(
             candidates,
@@ -264,7 +376,14 @@ def build_mutation_plan(
             selected.append(candidate)
             if len(selected) >= top_per_scenario:
                 break
-        proposals.extend(_proposal(scenario, candidate) for candidate in selected)
+        proposals.extend(
+            _proposal(
+                scenario,
+                candidate,
+                source_hypothesis=source_hypotheses.get(str(candidate.get("id") or "")),
+            )
+            for candidate in selected
+        )
     proposals = sorted(
         proposals,
         key=lambda proposal: float(proposal.get("score") or 0.0),
@@ -289,6 +408,7 @@ def build_mutation_plan(
             "research_generated_at": research_cycle.get("generated_at"),
             "keepers": (research_cycle.get("summary") or {}).get("keepers", 0),
             "exports": (research_cycle.get("summary") or {}).get("exported", 0),
+            "exploration_generated_at": (exploration_status or {}).get("generated_at"),
         },
         "summary": {
             "proposals": len(proposals),
@@ -346,6 +466,8 @@ def run(
     markdown_path: Path | None = DEFAULT_MARKDOWN,
     top_per_scenario: int = 2,
     max_total: int = 12,
+    exploration_status_path: Path = DEFAULT_EXPLORATION_STATUS,
+    experiment_log_path: Path = DEFAULT_LOG,
 ) -> dict[str, Any]:
     research_cycle = _load_json(input_path)
     if not research_cycle:
@@ -361,6 +483,8 @@ def run(
             research_cycle,
             top_per_scenario=top_per_scenario,
             max_total=max_total,
+            exploration_status=_load_json(exploration_status_path),
+            source_hypotheses=_source_hypotheses(experiment_log_path),
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_json_atomic(output_path, plan)
@@ -377,6 +501,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--markdown-output", type=Path, default=DEFAULT_MARKDOWN)
     parser.add_argument("--top-per-scenario", type=int, default=2)
     parser.add_argument("--max-total", type=int, default=12)
+    parser.add_argument("--exploration-status", type=Path, default=DEFAULT_EXPLORATION_STATUS)
+    parser.add_argument("--experiment-log", type=Path, default=DEFAULT_LOG)
     return parser.parse_args()
 
 
@@ -388,6 +514,8 @@ def main() -> None:
         markdown_path=args.markdown_output,
         top_per_scenario=args.top_per_scenario,
         max_total=args.max_total,
+        exploration_status_path=args.exploration_status,
+        experiment_log_path=args.experiment_log,
     )
     print(json.dumps(plan, indent=2, sort_keys=True))
 

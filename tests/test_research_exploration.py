@@ -305,6 +305,23 @@ def test_evaluate_produces_trades_and_metrics():
     ):
         assert key in m
     assert 0.0 <= m["win_rate"] <= 1.0
+    frequency = m["signal_frequency"]
+    assert frequency["signals"] == m["n_signals"]
+    assert frequency["signals_per_day"] > 0
+    assert frequency["signals_per_week"] == pytest.approx(
+        frequency["signals_per_day"] * 7, rel=1e-5
+    )
+    assert frequency["median_signal_gap_bars"] is not None
+    assert frequency["p95_signal_gap_bars"] is not None
+    assert frequency["median_signal_gap_seconds"] == pytest.approx(
+        frequency["median_signal_gap_bars"] * 300
+    )
+    assert frequency["p95_signal_gap_seconds"] == pytest.approx(
+        frequency["p95_signal_gap_bars"] * 300
+    )
+    assert frequency["regime_eligible_bars"] == len(frame)
+    assert frequency["regime_coverage"] == 1.0
+    assert frequency["months_with_signal_fraction"] is None
 
 
 def test_entry_is_next_bar_no_lookahead():

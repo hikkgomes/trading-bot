@@ -111,10 +111,13 @@ def predicate_mask(frame: pd.DataFrame, p: Predicate, base_tf: str | None = None
 
 
 def entry_mask(frame: pd.DataFrame, hyp: Hypothesis, cfg=None) -> pd.Series:
-    """AND of every regime/setup/trigger predicate, plus optional vol filters."""
-    mask = pd.Series(True, index=frame.index)
-    for p in hyp.all_predicates():
-        mask &= predicate_mask(frame, p, base_tf=hyp.base_timeframe).fillna(False)
+    """Canonical Boolean or weighted entry decision, plus optional volatility filters."""
+    if hyp.entry_score is None:
+        mask = pd.Series(True, index=frame.index)
+        for p in hyp.all_predicates():
+            mask &= predicate_mask(frame, p, base_tf=hyp.base_timeframe).fillna(False)
+    else:
+        mask = entry_score_series(frame, hyp) >= hyp.entry_score.threshold
     # Risk volatility filter (skip too-quiet / too-wild bars), if NATR available.
     natr_col = f"{TIMEFRAME_PREFIXES[hyp.base_timeframe]}natr_14"
     if natr_col in frame.columns and (hyp.risk.min_atr_pct or hyp.risk.max_atr_pct):
@@ -124,6 +127,21 @@ def entry_mask(frame: pd.DataFrame, hyp: Hypothesis, cfg=None) -> pd.Series:
         if hyp.risk.max_atr_pct:
             mask &= natr_pct <= hyp.risk.max_atr_pct
     return mask.fillna(False)
+
+
+def entry_score_series(frame: pd.DataFrame, hyp: Hypothesis) -> pd.Series:
+    """Return the normalized weighted predicate score used by a scored hypothesis."""
+    if hyp.entry_score is None:
+        raise ValueError("hypothesis has no entry_score rule")
+    predicates = hyp.all_predicates()
+    if len(hyp.entry_score.weights) != len(predicates):
+        raise ValueError("entry score weights must align one-to-one with all predicates")
+    total_weight = sum(hyp.entry_score.weights)
+    score = pd.Series(0.0, index=frame.index)
+    for predicate, weight in zip(predicates, hyp.entry_score.weights, strict=True):
+        matched = predicate_mask(frame, predicate, base_tf=hyp.base_timeframe).fillna(False)
+        score += matched.astype(float) * float(weight)
+    return (score / total_weight).clip(lower=0.0, upper=1.0)
 
 
 def hypothesis_history_requirements(hyp: Hypothesis) -> dict[str, int]:

@@ -1367,6 +1367,158 @@ def evaluate_health(
                     detail={"products": halted_products},
                 )
             )
+    event_capture = operator_report.get("event_capture")
+    if isinstance(event_capture, dict) and event_capture.get("enabled") is True:
+        if event_capture.get("ok") is not True:
+            issues.append(
+                _issue(
+                    "event_capture_unhealthy",
+                    "public market event capture is stale, missing, or not receiving events",
+                    detail={
+                        key: event_capture.get(key)
+                        for key in (
+                            "path",
+                            "exists",
+                            "fresh",
+                            "age_seconds",
+                            "max_age_seconds",
+                            "reason",
+                            "last_event_at",
+                            "events",
+                        )
+                    },
+                )
+            )
+    microstructure = operator_report.get("microstructure_research")
+    if isinstance(microstructure, dict) and microstructure and microstructure.get("ok") is not True:
+        issues.append(
+            _issue(
+                "microstructure_research_failed",
+                "bounded short-horizon event replay reported a failure",
+                detail={
+                    "artifact": microstructure.get("artifact"),
+                    "generated_at": microstructure.get("generated_at"),
+                    "status": microstructure.get("status"),
+                    "summary": microstructure.get("summary"),
+                },
+            )
+        )
+    active_income_portfolio = operator_report.get("active_income_portfolio")
+    if isinstance(active_income_portfolio, dict):
+        portfolio_risk = active_income_portfolio.get("risk_model")
+        if (
+            isinstance(portfolio_risk, dict)
+            and portfolio_risk.get("required") is True
+            and portfolio_risk.get("ok") is not True
+        ):
+            issues.append(
+                _issue(
+                    "portfolio_risk_unhealthy",
+                    "required portfolio correlation and beta model is unavailable or stale",
+                    detail={
+                        key: portfolio_risk.get(key)
+                        for key in (
+                            "path",
+                            "fresh",
+                            "age_seconds",
+                            "reason",
+                            "error",
+                        )
+                    },
+                )
+            )
+    accounting = operator_report.get("accounting")
+    if isinstance(accounting, dict) and accounting and accounting.get("ok") is not True:
+        issues.append(
+            _issue(
+                "accounting_unreconciled",
+                "trade accounting journal or equity reconciliation is unhealthy",
+                detail={
+                    "artifact": accounting.get("artifact"),
+                    "summary": accounting.get("summary"),
+                    "reconciliation_errors": accounting.get("reconciliation_errors") or [],
+                },
+            )
+        )
+    ml_research = operator_report.get("ml_research")
+    if isinstance(ml_research, dict) and ml_research and ml_research.get("ok") is not True:
+        issues.append(
+            _issue(
+                "ml_research_failed",
+                "bounded chronological ML research reported one or more trial failures",
+                detail={
+                    "artifact": ml_research.get("artifact"),
+                    "generated_at": ml_research.get("generated_at"),
+                    "summary": ml_research.get("summary"),
+                },
+            )
+        )
+    ml_forward_paper = operator_report.get("ml_forward_paper")
+    if (
+        isinstance(ml_forward_paper, dict)
+        and ml_forward_paper
+        and ml_forward_paper.get("ok") is not True
+    ):
+        issues.append(
+            _issue(
+                "ml_forward_paper_failed",
+                "isolated ML forward paper reported an integrity or evaluation failure",
+                detail={
+                    "artifact": ml_forward_paper.get("artifact"),
+                    "generated_at": ml_forward_paper.get("generated_at"),
+                    "status": ml_forward_paper.get("status"),
+                    "summary": ml_forward_paper.get("summary"),
+                },
+            )
+        )
+    trade_starvation = operator_report.get("trade_starvation")
+    if (
+        isinstance(trade_starvation, dict)
+        and trade_starvation
+        and trade_starvation.get("ok") is not True
+    ):
+        issues.append(
+            _issue(
+                "trade_starvation_diagnostic_failed",
+                "rolling trade-starvation diagnostic is unhealthy",
+                detail={
+                    "generated_at": trade_starvation.get("generated_at"),
+                    "error": trade_starvation.get("error"),
+                },
+            )
+        )
+    relative_value = operator_report.get("relative_value")
+    if isinstance(relative_value, dict) and relative_value and relative_value.get("ok") is not True:
+        issues.append(
+            _issue(
+                "relative_value_research_failed",
+                "bounded relative-value research is waiting or unhealthy",
+                detail={
+                    "artifact": relative_value.get("artifact"),
+                    "generated_at": relative_value.get("generated_at"),
+                    "status": relative_value.get("status"),
+                    "summary": relative_value.get("summary"),
+                },
+            )
+        )
+    relative_value_paper = operator_report.get("relative_value_paper")
+    if (
+        isinstance(relative_value_paper, dict)
+        and relative_value_paper
+        and relative_value_paper.get("ok") is not True
+    ):
+        issues.append(
+            _issue(
+                "relative_value_paper_failed",
+                "isolated relative-value forward paper is unhealthy",
+                detail={
+                    "artifact": relative_value_paper.get("artifact"),
+                    "generated_at": relative_value_paper.get("generated_at"),
+                    "status": relative_value_paper.get("status"),
+                    "summary": relative_value_paper.get("summary"),
+                },
+            )
+        )
     backup_report = operator_report.get("backup_report") or {}
     if backup_report:
         verification = backup_report.get("verification") or {}
@@ -1618,6 +1770,39 @@ def evaluate_health(
                     for key in ("name", "objective", "market", "strategy_artifact", "detail")
                     if product.get(key) is not None
                 },
+            )
+        )
+    entry_disabled_products = []
+    for product in operator_report.get("products") or []:
+        if not isinstance(product, dict) or product.get("enabled") is not True:
+            continue
+        if product.get("entries_allowed") is not False:
+            continue
+        gate = product.get("entry_gate") if isinstance(product.get("entry_gate"), dict) else {}
+        trace = (
+            product.get("decision_trace") if isinstance(product.get("decision_trace"), dict) else {}
+        )
+        entry_disabled_products.append(
+            {
+                "name": product.get("name"),
+                "objective": product.get("objective"),
+                "market": product.get("market"),
+                "mode": product.get("mode"),
+                "gate_status": gate.get("status"),
+                "gate_reason": gate.get("reason"),
+                "decision_outcomes": (
+                    (trace.get("summary") or {}).get("outcomes")
+                    if isinstance(trace.get("summary"), dict)
+                    else None
+                ),
+            }
+        )
+    if entry_disabled_products:
+        warnings.append(
+            _issue(
+                "product_entries_disabled",
+                "one or more enabled products cannot open new positions",
+                detail={"products": entry_disabled_products},
             )
         )
     stale_positions = _stale_open_positions(operator_report, now_ts)

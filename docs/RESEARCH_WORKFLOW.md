@@ -74,7 +74,7 @@ defaults emit at most 50 candidates, at most 1 per symbol/horizon search space,
 stop after 5,000 attempts or 60 seconds, and cap parent-pool and lineage sizes.
 That normally covers about 16 eligible symbols across scalp, day, and swing in
 one daily batch; a deterministic daily rotation covers larger sets. At 80% of the
-explicit 48 MiB SQLite budget, the factory performs at most 5,000 rows of
+explicit 256 MiB SQLite budget, the factory performs at most 5,000 rows of
 evidence-preserving compaction and an integrity-checked vacuum. Repeated cycles
 provide the ongoing exploration; one process is never allowed to consume the
 server indefinitely. If valid compacted memory still exceeds the hard ceiling,
@@ -88,6 +88,7 @@ Python code. Every idea contains:
 - market context and direction;
 - multi-timeframe `regime`, `setup`, and `trigger` predicates;
 - bounded take-profit, stop-loss, and time exit;
+- either an all-predicates entry rule or a normalized weighted-predicate score;
 - bounded risk per trade, maximum position fraction, daily trade cap,
   cooldown, and optional volatility limits.
 
@@ -111,6 +112,34 @@ fragility can lead to different filters, exits, or structure. This is
 programmatic hypothesis generation inside a safety grammar, not a fixed list of
 handwritten strategies and not arbitrary self-modifying code.
 
+Scored hypotheses use the same canonical `entry_score_series` implementation in
+research, exploration paper, promotion paper, and execution. Weights and the
+threshold are part of the behavior hash, so changing either invalidates prior
+evidence. Every triggered Boolean or scored strategy is adapted to
+`autopilot.alpha_forecast/v1` with direction, score, expected return,
+confidence, and horizon. The active-income portfolio gate then applies the
+configured position-count, gross, net, per-symbol, score, and confidence limits.
+It also consumes the scheduled rolling 1h correlation/BTC-beta model, caps
+same-risk and benchmark exposure, and blocks new entries at the aggregate
+active-income drawdown limit. The strategy risk block remains an independent
+upper bound. Build or validate that model with `make portfolio-risk` and
+`make portfolio-risk-validate`.
+
+Every research segment also records signals/day, signals/week, median and 95th
+percentile signal gaps in bars and elapsed seconds, signal-bar coverage,
+strategy-regime coverage, and the fraction of observed months with at least one signal. Sparse candidates feed the existing
+`insufficient_*_trades` reason into mutation, which preferentially removes or
+softens predicates and can convert descendants to scored entries; weak-edge
+candidates instead preserve frequency and mutate entry/exit structure.
+
+The production supervisor separately appends a bounded decision-funnel record
+on every cycle when `trade_starvation_enabled` is true. The rolling 30-day
+report identifies the first blocked layer for each product—entry gate, market
+data/features, signal generation, portfolio/risk/execution, or exits—and keeps
+outcome counts, unique processed market bars, regime/setup/trigger progression, killer predicates, last
+signal/entry/trade timestamps, and completed trades. Adaptive exploration may
+use its own evidence, but this operational report never grants promotion.
+
 The authoritative search spaces and limits live in
 `config/research_factory.json`. They cover active-income scalping, day trading,
 and swing trading plus two BTC-accumulation horizons. The config loader refuses
@@ -119,6 +148,56 @@ search-space fields/types/timeframe ordering are invalid, budgets are unsafe,
 the exploration floor is removed, or the holdout policy is changed. The history
 plan is derived from these exact search-space roles rather than a separate fixed
 scenario list.
+
+## Machine-learning and relative-value research
+
+`src.autopilot.ml_research` is the bounded ML idea factory. It rotates through
+the declared feature sets, direction/triple-barrier/return labels, horizons,
+causal regime gates, model families, and hyperparameters in
+`config/ml_research.json`. Each cycle runs at most two single-core trials and
+uses purged chronological walk-forward windows only. The final 20% tail is
+reserved and is never fit or scored by this adaptive stage. Trial identities
+and results share the canonical SQLite experiment memory with rule research.
+
+Pre-holdout ML survivors are sealed into a durable cohort and claim their
+protected tail before it is scored. The protected gate includes the declared
+multiple-testing universe and a conservatively floored, V2 deflated Sharpe
+ratio. Passing sklearn models are frozen into bounded JSON decision trees;
+neither paper nor live inference loads pickle or refits the reviewed model.
+
+The isolated `ml_forward_paper` worker verifies the immutable training digest
+and processes only later bars. Protected-holdout winners also produce
+policy-validated review artifacts under `runtime/research/ml_candidates/`, but
+those artifacts are not staged or activated automatically. After reviewing an
+exact digest, stage it for the normal candidate-paper pipeline with
+`make ml-stage-candidate PRODUCT=active_income ARTIFACT=<path> DIGEST=sha256:<digest>`.
+Replacing an existing staged candidate additionally requires `REPLACE=1`.
+Candidate paper runs for enabled paper products, so evidence can accumulate
+before any live-mode transition. Activation still requires live mode; preflight,
+testnet rehearsal, behavior approval, and live gates are unchanged. Validate or
+run the bounded stages with `make ml-research-validate`,
+`make ml-research-once`, and `make ml-forward-paper-once`.
+
+`src.autopilot.relative_value_research` runs a bounded six-hour lane over the
+liquidity-screened universe and local 1h spot/futures histories. It produces
+spot/perpetual basis, cross-sectional, and statistical-pairs forecasts. Validate
+or run it with `make relative-value-validate` and `make relative-value`.
+Single-symbol cross-sectional forecasts use the common alpha vocabulary;
+hedged multi-leg forecasts are always exploration/research-only and
+non-promotable until atomic execution, borrow, funding, and partial-fill risk
+controls exist.
+
+`src.autopilot.relative_value_paper` tracks those forecasts in a separate
+zero-money state machine. It records weighted leg PnL, fees/slippage, funding,
+borrow assumptions, horizon exits, virtual equity, and drawdown without exposing
+an order API. Run one bounded cycle with `make relative-value-paper-once`.
+
+`src.autopilot.microstructure_research` continuously replays the newest bounded
+event files through a typed short-horizon alpha policy. It combines weighted
+depth, aggressor flow, microprice displacement, and cancel/add pressure behind
+spread, depth, and liquidity gates, then uses the deterministic depth-aware fill
+model to produce research-only trade evidence. Validate or run it with
+`make microstructure-research-validate` and `make microstructure-research`.
 
 ## Persistent experiment memory
 
@@ -328,7 +407,32 @@ batch or explicitly reports why it skipped, and the job worker continues to
 advance. It does not mean a keeper must exist. `no_exportable_strategies` is an
 honest successful outcome.
 
-## Paper handoff and the mandatory live gate
+## Exploration paper, promotion paper, and the mandatory live gate
+
+Every completed research cycle now compiles the ranked incubation queue into
+digest-isolated artifacts under `runtime/exploration_paper/`. These artifacts
+explicitly set `adaptive_evidence: true`, `live_allowed: false`, and
+`promotion_eligible: false`. The candidate-paper timer runs them alongside the
+promotion-paper path and accumulates signal, entry, outcome, and killer-predicate
+counts in `runtime/exploration_paper/status.json`. This evidence may guide later
+mutation and research selection, but can never satisfy a promotion threshold.
+After twelve data-ready forward observations, the status assigns an actionable
+regime/setup/trigger starvation diagnosis or, after at least three completed
+trades, a negative-expectancy diagnosis. The scheduled `mutation_plan` job
+turns only that diagnosed stage into a research-only instruction;
+`mutation_batch` compiles the exact source hypothesis; and the next
+`research_cycle --include-mutations` chronologically validates the descendant.
+Entry predicates remain unchanged when forward signals exist but expectancy is
+negative. Mutation descendants cannot recursively mutate themselves.
+
+`make exploration-paper-build` rebuilds the bounded manifest and
+`make exploration-paper-once` runs it manually. Each selected strategy has an
+isolated artifact, state file, and trade log so a changing research cohort cannot
+inherit another behavior's observations.
+
+Promotion paper remains the pristine path described below: it only executes a
+fully validated, frozen staged candidate and binds genuine forward observations
+to its exact artifact and execution-engine fingerprint.
 
 For a product configured `paper`, a keeper may atomically replace its configured
 paper strategy artifact only while the product has no open position. The paper
@@ -425,7 +529,22 @@ cutover checklist.
 | Path | Purpose |
 |---|---|
 | `config/research_factory.json` | Trusted search spaces, budgets, and immutable holdout policy. |
+| `config/ml_research.json` | Bounded ML datasets, search grid, chronological split budgets, and pre-holdout gates. |
+| `config/portfolio_risk.json` | Bounded rolling correlation and BTC-beta model inputs. |
+| `config/relative_value.json` | Bounded universe, history, basis, ranking, and pairs research budgets. |
+| `config/microstructure_research.json` | Bounded recent-file, event, symbol, sampling, sizing, and alpha-policy budgets. |
 | `runtime/research/experiment_memory.sqlite3` | Canonical strategy, lineage, evaluation, and holdout-claim memory. |
+| `runtime/research/ml_research.json` | Latest pre-holdout ML trial results; never an executable model artifact. |
+| `runtime/research/ml_research_state.json` | Durable deterministic cursor through the bounded ML grid. |
+| `runtime/research/ml_forward_paper.json` | Isolated non-promotable forward results for protected-holdout ML candidates. |
+| `runtime/research/ml_forward_paper_state.json` | Durable cursors, virtual positions, equity, and trades for ML forward paper. |
+| `runtime/portfolio_risk.json` | Latest fail-closed cross-symbol correlation and benchmark-beta model. |
+| `runtime/trade_starvation.json` | Rolling product funnel and the currently identified starvation point. |
+| `runtime/trade_starvation_history.jsonl` | Durable bounded per-cycle decision evidence behind the rolling diagnostic. |
+| `runtime/research/relative_value.json` | Latest autonomous basis, cross-sectional, and pairs forecasts. |
+| `runtime/research/relative_value_paper.json` | Latest isolated multi/single-leg forward-paper status. |
+| `runtime/research/relative_value_paper_state.json` | Durable virtual positions, equity, and trade evidence. |
+| `runtime/research/microstructure.json` | Latest bounded event replay, short-horizon alpha, and simulated-fill evidence. |
 | `runtime/research/generated_hypotheses.json` | Latest bounded, research-only generated batch and safe development feedback. |
 | `runtime/market_universe.json` | Latest all-USDT-perpetual liquidity selection. |
 | `runtime/market_universe_snapshots/*.json` | Append-only point-in-time selection lineage. |
@@ -433,6 +552,8 @@ cutover checklist.
 | `runtime/research_cycle_state.json` | Market/batch markers and cycle cursor/recovery state; not a substitute for SQLite memory. |
 | `outputs/research_exploration/experiment_log.jsonl` | Detailed append-only validation audit, including protected results. Never expose it to OpenClaw. |
 | `runtime/incubation_candidates.json` | Ranked research-attention queue; explicitly non-executable and non-promotable. |
+| `runtime/exploration_paper/manifest.json` | Bounded adaptive-paper cohort compiled from incubation records; permanently non-live and non-promotable. |
+| `runtime/exploration_paper/status.json` | Cumulative signal/outcome/predicate funnel for exploration-paper candidates. |
 | `outputs/active_strategies_position.json` | BTC-accumulation active paper/live artifact, according to product mode. |
 | `outputs/active_strategies_flow.json` | Active-income active paper/live artifact, according to product mode. |
 | `runtime/candidates/<product>.json` | Inert staged replacement or symbol-specific `active_income__<symbol>` candidate. |

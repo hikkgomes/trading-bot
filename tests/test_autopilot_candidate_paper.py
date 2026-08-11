@@ -95,11 +95,13 @@ def _candidate(product):
     }
 
 
+@pytest.mark.parametrize("mode", ["paper", "live"])
 def test_candidate_paper_uses_digest_isolated_state_and_exact_artifact(
     monkeypatch,
     tmp_path,
+    mode,
 ):
-    product = _product(tmp_path)
+    product = _product(tmp_path, mode=mode)
     candidate_dir = tmp_path / "candidates"
     candidate_dir.mkdir()
     candidate = _candidate(product)
@@ -175,14 +177,14 @@ def test_candidate_paper_uses_digest_isolated_state_and_exact_artifact(
     assert captured["review"]["strategies"][0]["approval_command"] is None
 
 
-def test_candidate_paper_skips_non_live_product_without_candidate(tmp_path):
+def test_candidate_paper_incubates_for_paper_product_before_live_transition(tmp_path):
     report = run_candidate_paper(
         AutopilotConfig(products=[_product(tmp_path, mode="paper")]),
         candidate_dir=tmp_path / "candidates",
     )
 
     assert report["ok"] is True
-    assert report["products"][0]["reason"] == "product_not_live"
+    assert report["products"][0]["reason"] == "waiting_for_staged_candidate"
 
 
 def test_candidate_paper_no_candidate_import_path_stays_lightweight(tmp_path):

@@ -390,6 +390,13 @@ def hypothesis_trades(
     Returns ``(trades, n_signals, resolved_backtest_config)`` so callers (the
     validation harness, regime breakdowns) can work with the raw trades without
     re-implementing the signal->simulate wiring."""
+    trades, direction, bt = _hypothesis_trades_with_signals(frame, hyp, cfg)
+    return trades, int((direction != 0).sum()), bt
+
+
+def _hypothesis_trades_with_signals(
+    frame: pd.DataFrame, hyp: Hypothesis, cfg: EvalConfig | None = None
+) -> tuple[pd.DataFrame, np.ndarray, BacktestConfig]:
     cfg = cfg or EvalConfig()
     bt = _resolve_exit(frame, hyp, cfg)
     o, hi, lo, c = _ohlc(frame, hyp.base_timeframe)
@@ -409,7 +416,57 @@ def hypothesis_trades(
             risk,
         )
     )
-    return trades, int((direction != 0).sum()), bt
+    return trades, direction, bt
+
+
+def _signal_frequency(
+    frame: pd.DataFrame,
+    hyp: Hypothesis,
+    direction: np.ndarray,
+) -> dict[str, float | int | None]:
+    indices = np.flatnonzero(direction != 0)
+    timeframe_seconds = TIMEFRAME_SECONDS[hyp.base_timeframe]
+    observed_days = max(len(frame) * timeframe_seconds / 86_400.0, timeframe_seconds / 86_400.0)
+    gaps = np.diff(indices)
+    regime_mask = pd.Series(True, index=frame.index)
+    for predicate in hyp.regime:
+        regime_mask &= predicate_mask(frame, predicate, base_tf=hyp.base_timeframe).fillna(False)
+    regime_eligible_bars = int(regime_mask.sum())
+    months_with_signal_fraction: float | None = None
+    timestamps: pd.Series | None = None
+    if "timestamp" in frame.columns:
+        timestamps = pd.Series(pd.to_datetime(frame["timestamp"], utc=True, errors="coerce"))
+    elif isinstance(frame.index, pd.DatetimeIndex):
+        timestamps = pd.Series(pd.to_datetime(frame.index, utc=True, errors="coerce"))
+    if timestamps is not None and timestamps.notna().any():
+        all_months = timestamps.dt.tz_convert(None).dt.to_period("M")
+        observed_months = int(all_months.nunique())
+        signal_months = int(all_months.iloc[indices].nunique()) if indices.size else 0
+        if observed_months:
+            months_with_signal_fraction = signal_months / observed_months
+    return {
+        "signals": int(indices.size),
+        "signals_per_day": round(float(indices.size / observed_days), 6),
+        "signals_per_week": round(float(indices.size / observed_days * 7), 6),
+        "median_signal_gap_bars": round(float(np.median(gaps)), 3) if gaps.size else None,
+        "p95_signal_gap_bars": round(float(np.percentile(gaps, 95)), 3) if gaps.size else None,
+        "median_signal_gap_seconds": (
+            round(float(np.median(gaps) * timeframe_seconds), 3) if gaps.size else None
+        ),
+        "p95_signal_gap_seconds": (
+            round(float(np.percentile(gaps, 95) * timeframe_seconds), 3)
+            if gaps.size
+            else None
+        ),
+        "months_with_signal_fraction": (
+            round(float(months_with_signal_fraction), 6)
+            if months_with_signal_fraction is not None
+            else None
+        ),
+        "signal_bar_fraction": round(float(indices.size / max(1, len(frame))), 8),
+        "regime_eligible_bars": regime_eligible_bars,
+        "regime_coverage": round(float(regime_eligible_bars / max(1, len(frame))), 8),
+    }
 
 
 def evaluate_hypothesis(
@@ -417,7 +474,9 @@ def evaluate_hypothesis(
 ) -> dict:
     """Run one hypothesis over an aligned frame; return metrics + breakdowns."""
     cfg = cfg or EvalConfig()
-    trades, n_signals, bt = hypothesis_trades(frame, hyp, cfg)
+    trades, direction, bt = _hypothesis_trades_with_signals(frame, hyp, cfg)
+    n_signals = int((direction != 0).sum())
+    signal_frequency = _signal_frequency(frame, hyp, direction)
     resolved_risk = effective_risk(hyp, market=cfg.market, pnl_unit=cfg.pnl_unit).to_dict()
     if trades.empty:
         return {
@@ -425,6 +484,7 @@ def evaluate_hypothesis(
             "family": hyp.family,
             "direction": hyp.direction,
             "n_signals": n_signals,
+            "signal_frequency": signal_frequency,
             "trades": 0,
             "win_rate": float("nan"),
             "total_return": 0.0,
@@ -454,6 +514,7 @@ def evaluate_hypothesis(
         "direction": hyp.direction,
         "base_tf": hyp.base_timeframe,
         "n_signals": n_signals,
+        "signal_frequency": signal_frequency,
         "trades": n,
         "win_rate": round(float((r > 0).mean()), 4),
         "total_return": round(float(equity[-1] - 1.0), 5),

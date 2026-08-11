@@ -1844,9 +1844,11 @@ def test_run_once_blocks_all_active_income_entries_at_portfolio_cap(
         encoding="utf-8",
     )
     seen = {}
+    received_config = {}
 
     def supervise(product_config, **kwargs):
         seen[product_config.name] = kwargs.get("allow_entries", True)
+        received_config[product_config.name] = kwargs.get("config")
         return {"product": {"name": product_config.name}, "ok": True}
 
     monkeypatch.setattr("src.autopilot.runtime.run_product_once", supervise)
@@ -1866,6 +1868,10 @@ def test_run_once_blocks_all_active_income_entries_at_portfolio_cap(
     assert seen == {
         "active_income": False,
         "active_income__ethusdt": False,
+    }
+    assert received_config == {
+        "active_income": cfg,
+        "active_income__ethusdt": cfg,
     }
     assert report["active_income_portfolio"]["open_positions"] == 1
     assert report["active_income_portfolio"]["entry_capacity_available"] is False
@@ -1893,7 +1899,7 @@ def test_run_once_supervises_products_before_scheduled_jobs(monkeypatch, tmp_pat
         jobs=[configured_job],
     )
 
-    def supervise(product_config, *, approval_ledger):
+    def supervise(product_config, *, approval_ledger, **kwargs):
         calls.append(("product", product_config.name))
         return {"product": {"name": product_config.name}, "ok": True}
 
@@ -1962,7 +1968,7 @@ def test_run_once_supervision_only_is_not_blocked_by_invalid_job_definition(
     )
     seen = []
 
-    def supervise(product_config, *, approval_ledger):
+    def supervise(product_config, *, approval_ledger, **kwargs):
         seen.append(product_config.name)
         return {"product": {"name": product_config.name}, "ok": True}
 
@@ -1993,7 +1999,7 @@ def test_run_once_supervision_continues_but_fails_heartbeat_for_job_parse_errors
     )
     seen = []
 
-    def supervise(product_config, *, approval_ledger):
+    def supervise(product_config, *, approval_ledger, **kwargs):
         seen.append(product_config.name)
         return {"product": {"name": product_config.name}, "ok": True}
 

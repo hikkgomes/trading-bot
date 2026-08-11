@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "root": "runtime/events",
+  "market_universe_report": "runtime/market_universe.json",
+  "max_dynamic_symbols": 12,
+  "max_file_bytes": 134217728,
+  "max_total_bytes": 5368709120,
+  "retention_seconds": 604800,
+  "flush_seconds": 1.0,
+  "queue_max_events": 50000,
+  "sources": [
+    {
+      "market": "futures",
+      "url": "wss://fstream.binance.com/stream",
+      "symbols": ["BTCUSDT"],
+      "dynamic_universe": true,
+      "streams": ["aggTrade", "trade", "bookTicker", "depth20@100ms", "markPrice@1s"],
+      "include_liquidations": true
+    },
+    {
+      "market": "spot",
+      "url": "wss://stream.binance.com:9443/stream",
+      "symbols": ["BTCUSDT"],
+      "dynamic_universe": false,
+      "streams": ["aggTrade", "bookTicker", "depth20@100ms"],
+      "include_liquidations": false
+    }
+  ]
+}

@@ -26,7 +26,13 @@ import requests
 
 import build_binance_indicator_dataset as bbid
 from research_exploration.hypothesis_schema import Hypothesis
-from research_exploration.predicates import entry_mask, hypothesis_history_requirements
+from research_exploration.predicates import (
+    entry_mask,
+    entry_score_series,
+    hypothesis_history_requirements,
+    predicate_mask,
+)
+from src.alpha.frozen_gradient_boosting import FrozenGradientBoostingModel
 from src.autopilot.approvals import (
     artifact_digest as approval_artifact_digest,
 )
@@ -43,6 +49,7 @@ from src.autopilot.candidate_evidence import (
     candidate_paper_engine_digest,
 )
 from src.autopilot.io import write_json_atomic, write_text_atomic
+from src.autopilot.portfolio import AlphaForecast, aggregate_forecasts, forecast_from_strategy
 from src.build_dataset import TIMEFRAME_SECONDS
 from src.config import PROJECT_ROOT
 from src.discover_patterns import Condition, condition_mask
@@ -80,11 +87,20 @@ LIVE_SPOT_BASE_BALANCE_MAX_FEE_FRACTION = 0.01
 CANDIDATE_REPLAY_SCHEMA_VERSION = 2
 CANDIDATE_REPLAY_CURSOR_KEY = "candidate_replay_cursor_by_strategy"
 CANDIDATE_REPLAY_PENDING_KEY = "candidate_replay_pending_entries_by_strategy"
+DECISION_TRACE_SCHEMA = "autopilot.decision_trace/v1"
 TRADE_LOG_COLUMNS = (
     "exit_event_id",
     "strategy_id",
     "strategy_fingerprint",
     "artifact_digest",
+    "alpha_source_id",
+    "alpha_product",
+    "alpha_market",
+    "alpha_symbol",
+    "alpha_score",
+    "alpha_expected_return",
+    "alpha_confidence",
+    "alpha_horizon_seconds",
     "candidate_paper_execution_schema",
     "candidate_paper_engine_digest",
     "candidate_paper_evidence_eligible",
@@ -530,6 +546,7 @@ class PaperTradingBot:
         allow_entries: bool = True,
         artifact_payload: dict | None = None,
         pre_entry_gate=None,
+        portfolio_gate=None,
     ):
         self.strategies_path = strategies_path
         self.state_file = state_file
@@ -566,6 +583,9 @@ class PaperTradingBot:
         if pre_entry_gate is not None and not callable(pre_entry_gate):
             raise ValueError("pre_entry_gate must be callable when supplied.")
         self.pre_entry_gate = pre_entry_gate
+        if portfolio_gate is not None and not callable(portfolio_gate):
+            raise ValueError("portfolio_gate must be callable when supplied.")
+        self.portfolio_gate = portfolio_gate
         self._artifact_payload: dict | None = None
         if artifact_payload is not None:
             if not isinstance(artifact_payload, dict):
@@ -595,6 +615,10 @@ class PaperTradingBot:
         # transition is durable. The autopilot consumes these after each cycle;
         # they never authorize, delay, or alter order execution.
         self.position_events: list[dict] = []
+        # Read-only per-cycle observability. This never participates in a
+        # trading decision and is copied into runtime/status.json by the
+        # supervisor so an idle product explains exactly where it stopped.
+        self.decision_trace: dict[str, Any] = {}
         # Per-cycle macro regime evaluation (held-vs-flat overlay for the BTC bot).
         self._macro_aside: bool = False
         self._macro_detail: dict = {}
@@ -602,6 +626,224 @@ class PaperTradingBot:
 
         self._load_strategies()
         self._load_state()
+
+    def _start_decision_trace(self) -> None:
+        self.decision_trace = {
+            "schema": DECISION_TRACE_SCHEMA,
+            "generated_at": datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat(),
+            "product": self.objective,
+            "market": self.market,
+            "symbol": self.symbol,
+            "entries_enabled": self.allow_entries,
+            "strategies": {},
+            "summary": {
+                "strategies": len(self.strategies),
+                "data_ready": 0,
+                "market_bars_processed": 0,
+                "market_bars": [],
+                "signals": 0,
+                "entries_opened": 0,
+                "positions_managed": 0,
+                "outcomes": {},
+            },
+        }
+
+    def _record_market_bar(self, strategy: dict, frame: pd.DataFrame) -> None:
+        """Record each unique closed product/timeframe bar observed this cycle."""
+        timestamp = self._normalized_bar_timestamp(frame.iloc[-1]["timestamp"])
+        bar = {
+            "timeframe": str(strategy["base_timeframe"]),
+            "timestamp": timestamp,
+        }
+        bars = self.decision_trace["summary"]["market_bars"]
+        if bar not in bars:
+            bars.append(bar)
+            self.decision_trace["summary"]["market_bars_processed"] = len(bars)
+
+    @staticmethod
+    def _decision_trace_value(value: Any) -> Any:
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, str | int | float | bool) or value is None:
+            return value
+        if isinstance(value, dict):
+            return {
+                str(key): PaperTradingBot._decision_trace_value(item) for key, item in value.items()
+            }
+        if isinstance(value, list | tuple):
+            return [PaperTradingBot._decision_trace_value(item) for item in value]
+        return str(value)
+
+    def _record_decision(self, strategy: dict, outcome: str, **detail: Any) -> None:
+        if not self.decision_trace:
+            self._start_decision_trace()
+        strategy_id = str(strategy["id"])
+        item = {
+            "strategy_id": strategy_id,
+            "base_timeframe": strategy.get("base_timeframe"),
+            "direction": strategy.get("direction"),
+            "outcome": outcome,
+            **{
+                key: self._decision_trace_value(value)
+                for key, value in detail.items()
+                if value is not None
+            },
+        }
+        self.decision_trace["strategies"][strategy_id] = item
+        outcomes = self.decision_trace["summary"]["outcomes"]
+        outcomes[outcome] = int(outcomes.get(outcome, 0)) + 1
+
+    def _trace_hypothesis_signal(self, strategy: dict, frame: pd.DataFrame) -> tuple[bool, dict]:
+        hypothesis = strategy["_hypothesis"]
+        if hypothesis.entry_score is not None:
+            predicates = hypothesis.all_predicates()
+            matches = [
+                bool(
+                    predicate_mask(frame, predicate, base_tf=hypothesis.base_timeframe)
+                    .fillna(False)
+                    .iloc[-1]
+                )
+                for predicate in predicates
+            ]
+            score = float(entry_score_series(frame, hypothesis).iloc[-1])
+            threshold = float(hypothesis.entry_score.threshold)
+            triggered = bool(entry_mask(frame, hypothesis).iloc[-1])
+            score_passed = score >= threshold
+            return triggered, {
+                "failed_stage": (
+                    None
+                    if triggered
+                    else "volatility_filter"
+                    if score_passed
+                    else "score_threshold"
+                ),
+                "alpha_score": round(score, 8),
+                "score_threshold": threshold,
+                "matched_predicates": sum(matches),
+                "total_predicates": len(predicates),
+                "predicate_matches": {
+                    predicate.describe(): matched
+                    for predicate, matched in zip(predicates, matches, strict=True)
+                },
+            }
+        matched = 0
+        total = 0
+        stage_counts: dict[str, dict[str, int]] = {}
+        for stage, predicates in (
+            ("regime", hypothesis.regime),
+            ("setup", hypothesis.setup),
+            ("trigger", hypothesis.trigger),
+        ):
+            stage_matched = 0
+            for predicate in predicates:
+                total += 1
+                passed = bool(
+                    predicate_mask(
+                        frame,
+                        predicate,
+                        base_tf=hypothesis.base_timeframe,
+                    )
+                    .fillna(False)
+                    .iloc[-1]
+                )
+                if passed:
+                    matched += 1
+                    stage_matched += 1
+                    continue
+                return False, {
+                    "failed_stage": stage,
+                    "failed_predicate": predicate.describe(),
+                    "matched_predicates": matched,
+                    "total_predicates": len(hypothesis.all_predicates()),
+                    "stage_counts": {
+                        **stage_counts,
+                        stage: {"matched": stage_matched, "total": len(predicates)},
+                    },
+                }
+            stage_counts[stage] = {"matched": stage_matched, "total": len(predicates)}
+        # Keep the exact canonical entry mask as the final authority because it
+        # also applies the hypothesis volatility risk filter.
+        triggered = bool(entry_mask(frame, hypothesis).iloc[-1])
+        return triggered, {
+            "failed_stage": None if triggered else "volatility_filter",
+            "matched_predicates": matched,
+            "total_predicates": total,
+            "stage_counts": stage_counts,
+        }
+
+    @staticmethod
+    def _frozen_ml_regime_mask(
+        frame: pd.DataFrame,
+        regime: str,
+        *,
+        close_feature: str | None = None,
+        base_timeframe: str | None = None,
+    ) -> pd.Series:
+        if regime == "all":
+            return pd.Series(True, index=frame.index)
+        selected_close = close_feature
+        if selected_close not in frame.columns and selected_close and base_timeframe:
+            prefixed = f"tf_{base_timeframe}_{selected_close}"
+            selected_close = prefixed if prefixed in frame.columns else selected_close
+        if not selected_close:
+            close_columns = [
+                name for name in frame.columns if name == "close" or name.endswith("_close")
+            ]
+            selected_close = close_columns[0] if close_columns else None
+        if selected_close not in frame.columns:
+            raise ValueError("frozen ML regime close feature is missing")
+        returns = frame[selected_close].astype(float).pct_change()
+        volatility = returns.rolling(48, min_periods=24).std()
+        baseline = volatility.rolling(480, min_periods=96).median()
+        if regime == "high_volatility":
+            return (volatility >= baseline).fillna(False)
+        if regime == "low_volatility":
+            return (volatility < baseline).fillna(False)
+        if regime == "trend":
+            trend = returns.rolling(48, min_periods=24).sum().abs()
+            return (trend >= volatility * math.sqrt(48)).fillna(False)
+        raise ValueError(f"unsupported frozen ML regime: {regime!r}")
+
+    @staticmethod
+    def _trace_frozen_ml_signal(strategy: dict, frame: pd.DataFrame) -> tuple[bool, dict]:
+        model = strategy["_frozen_ml"]
+        row = frame.iloc[-1].to_dict()
+        base_prefix = f"tf_{strategy['base_timeframe']}_"
+        for feature in model.feature_names:
+            runtime_feature = f"{base_prefix}{feature}"
+            if feature not in row and runtime_feature in row:
+                row[feature] = row[runtime_feature]
+        prediction = model.prediction(row)
+        threshold_triggered = model.triggered(row, strategy["direction"])
+        regime = strategy.get("ml_regime", "all")
+        regime_triggered = bool(
+            PaperTradingBot._frozen_ml_regime_mask(
+                frame,
+                regime,
+                close_feature=strategy.get("ml_regime_close_feature"),
+                base_timeframe=strategy["base_timeframe"],
+            ).iloc[-1]
+        )
+        triggered = threshold_triggered and regime_triggered
+        return triggered, {
+            "failed_stage": (
+                None
+                if triggered
+                else "frozen_ml_threshold"
+                if not threshold_triggered
+                else "frozen_ml_regime"
+            ),
+            "model_kind": model.kind,
+            "prediction": prediction,
+            "long_threshold": model.long_threshold,
+            "short_threshold": model.short_threshold,
+            "min_edge": model.min_edge,
+            "feature_count": len(model.feature_names),
+            "ml_regime": regime,
+            "regime_triggered": regime_triggered,
+        }
 
     # ------------------------------------------------------------------
     # Configuration / state
@@ -698,11 +940,17 @@ class PaperTradingBot:
         seen_strategy_ids: set[str] = set()
         for strategy in self.strategies:
             entry_type = strategy.get("entry_type", "conditions")
-            if entry_type not in {"conditions", "hypothesis"}:
+            if entry_type not in {"conditions", "hypothesis", "frozen_ml"}:
                 raise ValueError(
-                    f"Strategy {strategy.get('id', '<unknown>')} entry_type must be 'conditions' or 'hypothesis'."
+                    f"Strategy {strategy.get('id', '<unknown>')} entry_type must be conditions, hypothesis, or frozen_ml."
                 )
-            entry_key = "hypothesis" if entry_type == "hypothesis" else "conditions"
+            entry_key = (
+                "hypothesis"
+                if entry_type == "hypothesis"
+                else "frozen_model"
+                if entry_type == "frozen_ml"
+                else "conditions"
+            )
             for key in (
                 "id",
                 "base_timeframe",
@@ -756,6 +1004,25 @@ class PaperTradingBot:
             strategy["fees"] = _normalize_strategy_fees(strategy)
             if entry_type == "hypothesis":
                 strategy["_hypothesis"] = Hypothesis.from_dict(strategy["hypothesis"])
+                strategy["_conditions"] = []
+            elif entry_type == "frozen_ml":
+                if strategy.get("ml_regime", "all") not in {
+                    "all",
+                    "trend",
+                    "high_volatility",
+                    "low_volatility",
+                }:
+                    raise ValueError(f"Strategy {strategy['id']} ml_regime is invalid.")
+                close_feature = strategy.get("ml_regime_close_feature")
+                if close_feature is not None and (
+                    not isinstance(close_feature, str) or not close_feature
+                ):
+                    raise ValueError(
+                        f"Strategy {strategy['id']} ml_regime_close_feature is invalid."
+                    )
+                strategy["_frozen_ml"] = FrozenGradientBoostingModel.from_dict(
+                    strategy["frozen_model"]
+                )
                 strategy["_conditions"] = []
             else:
                 strategy["_conditions"] = _normalize_conditions(strategy)
@@ -1181,10 +1448,27 @@ class PaperTradingBot:
                     runtime_strategy["hypothesis"]
                 )
                 runtime_strategy["_conditions"] = []
+            elif entry_type == "frozen_ml":
+                if runtime_strategy.get("ml_regime", "all") not in {
+                    "all",
+                    "trend",
+                    "high_volatility",
+                    "low_volatility",
+                }:
+                    raise ValueError("snapshot ml_regime is invalid")
+                close_feature = runtime_strategy.get("ml_regime_close_feature")
+                if close_feature is not None and (
+                    not isinstance(close_feature, str) or not close_feature
+                ):
+                    raise ValueError("snapshot ml_regime_close_feature is invalid")
+                runtime_strategy["_frozen_ml"] = FrozenGradientBoostingModel.from_dict(
+                    runtime_strategy["frozen_model"]
+                )
+                runtime_strategy["_conditions"] = []
             elif entry_type == "conditions":
                 runtime_strategy["_conditions"] = _normalize_conditions(runtime_strategy)
             else:
-                raise ValueError("snapshot entry_type must be conditions or hypothesis")
+                raise ValueError("snapshot entry_type must be conditions, hypothesis, or frozen_ml")
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(
                 f"State open_positions[{current_strategy['id']!r}].strategy_snapshot is not a valid "
@@ -2784,6 +3068,12 @@ class PaperTradingBot:
                 required.setdefault(base_tf, {"open", "high", "low", "close"}).add("natr_14")
             return required
 
+        if strategy.get("entry_type") == "frozen_ml":
+            for feature in strategy["_frozen_ml"].feature_names:
+                timeframe, name = self._split_prefixed_feature(feature, base_tf)
+                required.setdefault(timeframe, {"open", "high", "low", "close"}).add(name)
+            return required
+
         for condition in strategy["_conditions"]:
             tf, feature = self._split_prefixed_feature(condition.feature, base_tf)
             required.setdefault(tf, {"open", "high", "low", "close"}).add(feature)
@@ -3213,6 +3503,8 @@ class PaperTradingBot:
     def _candidate_replay_signal(strategy: dict, frame: pd.DataFrame) -> bool:
         if strategy.get("entry_type", "conditions") == "hypothesis":
             return bool(entry_mask(frame, strategy["_hypothesis"]).iloc[-1])
+        if strategy.get("entry_type") == "frozen_ml":
+            return PaperTradingBot._trace_frozen_ml_signal(strategy, frame)[0]
         for condition in strategy["_conditions"]:
             if not bool(condition_mask(frame, condition).fillna(False).iloc[-1]):
                 return False
@@ -3720,6 +4012,7 @@ class PaperTradingBot:
     def run_cycle(self):
         self.cycle_errors = []
         self.position_events = []
+        self._start_decision_trace()
         self._feature_frame_cache = {}
         self._resume_exit_accounting_intent()
         self._recover_live_futures_pending_entry()
@@ -3744,9 +4037,11 @@ class PaperTradingBot:
             frozen_strategy = self._strategy_for_open_position(strategy, open_position)
             if self._reconcile_native_protection(frozen_strategy, open_position):
                 native_stop_exits.add(strategy["id"])
+                self._record_decision(strategy, "native_stop_exit")
                 continue
             self._reconcile_broker_position(frozen_strategy, open_position)
         self._evaluate_macro_regime()
+        pending_entry_candidates: list[dict[str, Any]] = []
         for strategy in cycle_strategies:
             if strategy["id"] in native_stop_exits:
                 continue
@@ -3761,6 +4056,7 @@ class PaperTradingBot:
                     LOGGER.info(
                         "New entries are disabled. Skipping flat strategy %s.", strategy["id"]
                     )
+                    self._record_decision(strategy, "entry_disabled")
                     continue
                 if self._has_other_open_position(strategy):
                     LOGGER.info(
@@ -3768,12 +4064,14 @@ class PaperTradingBot:
                         self.symbol,
                         strategy["id"],
                     )
+                    self._record_decision(strategy, "position_capacity_blocked")
                     continue
                 if strategy["id"] in self.state["inactive_strategies"]:
                     LOGGER.info(
                         "Strategy %s is deactivated (OOD kill switch). Skipping new entry.",
                         strategy["id"],
                     )
+                    self._record_decision(strategy, "strategy_inactive")
                     continue
                 self._assert_broker_flat_before_new_entry(strategy)
                 if self.state["drawdown_halted"]:
@@ -3783,6 +4081,7 @@ class PaperTradingBot:
                         strategy["id"],
                         self.state.get("drawdown_halt_reason"),
                     )
+                    self._record_decision(strategy, "drawdown_halted")
                     continue
             try:
                 df_features, base_close = self._build_feature_frame(cycle_strategy)
@@ -3795,10 +4094,20 @@ class PaperTradingBot:
                         "error": str(exc),
                     }
                 )
+                self._record_decision(strategy, "feature_build_failed", error=str(exc))
                 continue
+
+            self.decision_trace["summary"]["data_ready"] += 1
+            self._record_market_bar(cycle_strategy, df_features)
 
             if open_position is not None:
                 self._manage_open_position(cycle_strategy, df_features)
+                self.decision_trace["summary"]["positions_managed"] += 1
+                self._record_decision(
+                    strategy,
+                    "position_managed",
+                    latest_bar=df_features.iloc[-1]["timestamp"],
+                )
                 continue
 
             signal_bar_time = df_features.iloc[-1]["timestamp"]
@@ -3808,6 +4117,11 @@ class PaperTradingBot:
                     strategy["id"],
                     self._normalized_bar_timestamp(signal_bar_time),
                 )
+                self._record_decision(
+                    strategy,
+                    "bar_already_processed",
+                    latest_bar=signal_bar_time,
+                )
                 continue
             # Persist the decision cursor before any risk gate or exchange
             # side effect.  Restarts cannot evaluate the same closed signal bar
@@ -3816,6 +4130,7 @@ class PaperTradingBot:
 
             if time.time() < self.state["cooldown_until_ts"]:
                 LOGGER.info("Account in cooldown. Skipping entries.")
+                self._record_decision(strategy, "cooldown")
                 continue
             if self.regime_guard and self._macro_detail.get("fail_closed"):
                 LOGGER.warning(
@@ -3823,6 +4138,7 @@ class PaperTradingBot:
                     strategy["id"],
                     self._macro_detail,
                 )
+                self._record_decision(strategy, "macro_data_unavailable")
                 continue
             if self.regime_guard and self._macro_aside and strategy["direction"] == "long":
                 LOGGER.warning(
@@ -3830,6 +4146,7 @@ class PaperTradingBot:
                     strategy["id"],
                     self._macro_detail,
                 )
+                self._record_decision(strategy, "macro_regime_blocked")
                 continue
             if self.state["daily_pnl"] <= self._account_risk()["daily_stop_loss"]:
                 LOGGER.warning(
@@ -3837,6 +4154,7 @@ class PaperTradingBot:
                     self.state["daily_pnl"],
                     self._account_risk()["daily_stop_loss"],
                 )
+                self._record_decision(strategy, "daily_stop")
                 continue
             if self._daily_trade_limit_reached(strategy):
                 LOGGER.info(
@@ -3845,21 +4163,161 @@ class PaperTradingBot:
                     self._daily_trade_count(strategy),
                     strategy["risk"].get("max_trades_per_day"),
                 )
+                self._record_decision(strategy, "daily_trade_limit")
                 continue
 
             if strategy.get("entry_type", "conditions") == "hypothesis":
                 # Same mask code that scored the hypothesis in research
                 # (research_exploration.predicates) — live == validated.
-                signal_triggered = bool(entry_mask(df_features, strategy["_hypothesis"]).iloc[-1])
+                signal_triggered, signal_detail = self._trace_hypothesis_signal(
+                    strategy,
+                    df_features,
+                )
+            elif strategy.get("entry_type") == "frozen_ml":
+                signal_triggered, signal_detail = self._trace_frozen_ml_signal(
+                    strategy, df_features
+                )
             else:
                 signal_triggered = True
-                for cond in strategy["_conditions"]:
+                signal_detail = {
+                    "matched_predicates": 0,
+                    "total_predicates": len(strategy["_conditions"]),
+                }
+                for condition_index, cond in enumerate(strategy["_conditions"]):
                     mask = condition_mask(df_features, cond).fillna(False)
                     if not bool(mask.iloc[-1]):
                         signal_triggered = False
+                        signal_detail.update(
+                            failed_stage="conditions",
+                            failed_predicate=getattr(cond, "description", None)
+                            or f"{cond.feature} {cond.kind}",
+                            matched_predicates=condition_index,
+                        )
                         break
+                    signal_detail["matched_predicates"] = condition_index + 1
             if signal_triggered:
-                self._enter_position(strategy, df_features, base_close)
+                forecast = forecast_from_strategy(
+                    strategy,
+                    product=self.objective or "unclassified",
+                    market=self.market,
+                    symbol=self.symbol,
+                    signal_detail=signal_detail,
+                ).to_dict()
+                signal_detail["alpha_forecast"] = forecast
+                self.decision_trace["summary"]["signals"] += 1
+                tp_pct, sl_pct = self._resolve_tp_sl(strategy, df_features, base_close)
+                requested_fraction = (
+                    min(
+                        strategy["risk"]["risk_per_trade"] / sl_pct,
+                        strategy["risk"]["max_position_fraction"],
+                        1.0,
+                    )
+                    if sl_pct > 0
+                    else 0.0
+                )
+                pending_entry_candidates.append(
+                    {
+                        "strategy": strategy,
+                        "df_features": df_features,
+                        "base_close": base_close,
+                        "signal_bar_time": signal_bar_time,
+                        "signal_detail": signal_detail,
+                        "forecast": forecast,
+                        "requested_fraction": requested_fraction,
+                        "take_profit_fraction": tp_pct,
+                        "stop_loss_fraction": sl_pct,
+                    }
+                )
+            else:
+                self._record_decision(
+                    strategy,
+                    "signal_not_triggered",
+                    latest_bar=signal_bar_time,
+                    **signal_detail,
+                )
+        self._resolve_pending_entry_candidates(pending_entry_candidates)
+
+    def _resolve_pending_entry_candidates(self, candidates: list[dict[str, Any]]) -> None:
+        """Aggregate same-symbol alpha before selecting one strategy execution envelope."""
+        if not candidates:
+            return
+        aggregation = aggregate_forecasts(
+            [AlphaForecast.from_dict(candidate["forecast"]) for candidate in candidates]
+        )
+        if not aggregation["allowed"]:
+            for candidate in candidates:
+                self._record_decision(
+                    candidate["strategy"],
+                    "alpha_ensemble_rejected",
+                    latest_bar=candidate["signal_bar_time"],
+                    alpha_aggregation=aggregation,
+                    **candidate["signal_detail"],
+                )
+            return
+        ensemble = AlphaForecast.from_dict(aggregation["forecast"])
+        aligned = [
+            candidate
+            for candidate in candidates
+            if candidate["forecast"]["direction"] == ensemble.direction
+        ]
+        selected = max(
+            aligned,
+            key=lambda candidate: AlphaForecast.from_dict(candidate["forecast"]).utility,
+        )
+        for candidate in candidates:
+            if candidate is selected:
+                continue
+            outcome = (
+                "alpha_ensemble_not_selected" if candidate in aligned else "alpha_ensemble_conflict"
+            )
+            self._record_decision(
+                candidate["strategy"],
+                outcome,
+                latest_bar=candidate["signal_bar_time"],
+                alpha_aggregation=aggregation,
+                **candidate["signal_detail"],
+            )
+        allocated_position_fraction = None
+        signal_detail = {
+            **selected["signal_detail"],
+            "alpha_forecast": aggregation["forecast"],
+            "alpha_aggregation": aggregation,
+        }
+        if self.portfolio_gate is not None:
+            allocation = self.portfolio_gate(
+                {
+                    "forecast": aggregation["forecast"],
+                    "requested_fraction": selected["requested_fraction"],
+                    "take_profit_fraction": selected["take_profit_fraction"],
+                    "stop_loss_fraction": selected["stop_loss_fraction"],
+                }
+            )
+            if not isinstance(allocation, dict) or not isinstance(allocation.get("allowed"), bool):
+                raise RuntimeError("portfolio gate returned an invalid decision")
+            signal_detail["portfolio_allocation"] = allocation
+            if not allocation["allowed"]:
+                self._record_decision(
+                    selected["strategy"],
+                    "portfolio_rejected",
+                    latest_bar=selected["signal_bar_time"],
+                    **signal_detail,
+                )
+                return
+            allocated_position_fraction = float(allocation["allocated_fraction"])
+        self._enter_position(
+            selected["strategy"],
+            selected["df_features"],
+            selected["base_close"],
+            alpha_forecast=aggregation["forecast"],
+            allocated_position_fraction=allocated_position_fraction,
+        )
+        self.decision_trace["summary"]["entries_opened"] += 1
+        self._record_decision(
+            selected["strategy"],
+            "entry_opened",
+            latest_bar=selected["signal_bar_time"],
+            **signal_detail,
+        )
 
     def _resolve_tp_sl(
         self, strategy: dict, df_features: pd.DataFrame, base_close: float
@@ -3888,6 +4346,8 @@ class PaperTradingBot:
         *,
         paper_entry_time=None,
         candidate_paper_evidence: dict | None = None,
+        alpha_forecast: dict | None = None,
+        allocated_position_fraction: float | None = None,
     ):
         strategy_snapshot, strategy_fingerprint = self._strategy_snapshot(strategy)
         signal_time = pd.Timestamp(df_features.iloc[-1]["timestamp"])
@@ -3916,6 +4376,14 @@ class PaperTradingBot:
         position_size = (
             min(risk_per_trade / sl_pct, max_position_fraction, 1.0) if sl_pct > 0 else 0.0
         )
+        if allocated_position_fraction is not None:
+            if (
+                not math.isfinite(allocated_position_fraction)
+                or allocated_position_fraction <= 0
+                or allocated_position_fraction - position_size > 1e-12
+            ):
+                raise RuntimeError("portfolio allocation exceeds the strategy risk envelope")
+            position_size = allocated_position_fraction
         entry_price = base_close
         broker_fill = None
         spot_sell_base_before = None
@@ -4032,6 +4500,24 @@ class PaperTradingBot:
             "approval_strategy_fingerprint": self.approval_fingerprints_by_strategy[strategy["id"]],
             "artifact_digest": self.artifact_content_digest,
         }
+        if alpha_forecast is None:
+            signal_detail: dict[str, Any] = {}
+            hypothesis = strategy.get("_hypothesis")
+            if hypothesis is not None and hypothesis.entry_score is not None:
+                signal_detail["alpha_score"] = float(
+                    entry_score_series(df_features, hypothesis).iloc[-1]
+                )
+            alpha_forecast = forecast_from_strategy(
+                strategy,
+                product=self.objective or "unclassified",
+                market=self.market,
+                symbol=self.symbol,
+                signal_detail=signal_detail,
+                generated_at=entry_time_text,
+            ).to_dict()
+        position["alpha_forecast"] = self._decision_trace_value(alpha_forecast)
+        if allocated_position_fraction is not None:
+            position["portfolio_allocated_fraction"] = allocated_position_fraction
         candidate_engine_digest = getattr(
             self,
             "_candidate_paper_engine_digest",
@@ -5583,6 +6069,7 @@ class PaperTradingBot:
             broker_exit_fill=broker_exit_fill,
             strategy_fingerprint_value=open_position.get("approval_strategy_fingerprint"),
             artifact_digest_value=open_position.get("artifact_digest"),
+            alpha_forecast=open_position.get("alpha_forecast"),
             candidate_paper_execution_schema=open_position.get("candidate_paper_execution_schema"),
             candidate_paper_engine_digest_value=open_position.get("candidate_paper_engine_digest"),
             candidate_paper_evidence_eligible=open_position.get(
@@ -5693,6 +6180,7 @@ class PaperTradingBot:
         broker_exit_fill=None,
         strategy_fingerprint_value: str | None = None,
         artifact_digest_value: str | None = None,
+        alpha_forecast: dict | None = None,
         candidate_paper_execution_schema: str | None = None,
         candidate_paper_engine_digest_value: str | None = None,
         candidate_paper_evidence_eligible: bool | None = None,
@@ -5725,6 +6213,18 @@ class PaperTradingBot:
             "position_size": position_size,
             "equity_after": equity_after,
         }
+        if alpha_forecast is not None:
+            forecast = AlphaForecast.from_dict(alpha_forecast)
+            trade_data.update(
+                alpha_source_id=forecast.source_id,
+                alpha_product=forecast.product,
+                alpha_market=forecast.market,
+                alpha_symbol=forecast.symbol,
+                alpha_score=forecast.score,
+                alpha_expected_return=forecast.expected_return,
+                alpha_confidence=forecast.confidence,
+                alpha_horizon_seconds=forecast.horizon_seconds,
+            )
         if (
             candidate_paper_execution_schema is not None
             or candidate_paper_engine_digest_value is not None

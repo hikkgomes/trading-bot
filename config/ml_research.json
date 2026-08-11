@@ -1,0 +1,55 @@
+{
+  "schema": "autopilot.ml_research_config/v1",
+  "memory_path": "runtime/research/experiment_memory.sqlite3",
+  "datasets": [
+    {
+      "enabled": true,
+      "product": "active_income",
+      "market": "futures",
+      "symbol": "BTCUSDT",
+      "timeframe": "15m",
+      "pnl_unit": "usdt"
+    },
+    {
+      "enabled": true,
+      "product": "btc_accumulation",
+      "market": "spot",
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "pnl_unit": "btc"
+    }
+  ],
+  "budgets": {
+    "max_trials_per_cycle": 2,
+    "max_runtime_seconds": 600,
+    "max_rows": 200000,
+    "min_train_rows": 4000,
+    "validation_rows": 1000,
+    "step_rows": 1000,
+    "min_windows": 3,
+    "final_holdout_fraction": 0.2,
+    "embargo_bars": 1
+  },
+  "search": {
+    "feature_sets": ["price_volume", "technical_core", "technical_wide"],
+    "families": [
+      "classifier_direction",
+      "classifier_triple_barrier",
+      "regressor_return",
+      "regressor_triple_barrier"
+    ],
+    "models": ["sklearn", "lightgbm"],
+    "horizons": [8, 24, 96],
+    "regimes": ["all", "trend", "high_volatility", "low_volatility"],
+    "max_features": [24, 48],
+    "estimators": [120, 240],
+    "learning_rates": [0.03, 0.07]
+  },
+  "gates": {
+    "minimum_total_trades": 30,
+    "minimum_holdout_trades": 5,
+    "minimum_profitable_window_fraction": 0.67,
+    "maximum_drawdown": -0.15,
+    "minimum_dsr": 0.6
+  }
+}

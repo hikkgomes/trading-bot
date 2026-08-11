@@ -1,7 +1,7 @@
 import json
 
 from research_exploration.hypothesis_generator import generate_batch, position_trading_set
-from research_exploration.hypothesis_schema import Hypothesis
+from research_exploration.hypothesis_schema import ExitRule, Hypothesis, Predicate, RiskRule
 from src.autopilot.mutation_batch import build_mutation_batch, run
 
 
@@ -173,3 +173,93 @@ def test_mutation_batch_does_not_remutate_mutation_candidate_set():
             "reason": "source_candidate_not_found",
         }
     ]
+
+
+def test_mutation_batch_changes_only_forward_diagnosed_trigger_stage():
+    source = Hypothesis(
+        id="FORWARD_TRIGGER_SOURCE",
+        family="momentum_continuation",
+        idea="forward diagnosis source",
+        market_logic="test stage-directed mutation",
+        direction="long",
+        base_timeframe="5m",
+        regime_timeframe="5m",
+        setup_timeframe="5m",
+        trigger_timeframe="5m",
+        regime=[Predicate("5m", "adx_14", "ge", reference=20.0)],
+        setup=[Predicate("5m", "rsi_14", "le", reference=70.0)],
+        trigger=[Predicate("5m", "volume_z_20", "ge", reference=1.0)],
+        exit=ExitRule(take_profit=0.02, stop_loss=0.01, horizon_bars=12),
+        risk=RiskRule(),
+    )
+    plan = {
+        "ok": True,
+        "summary": {"proposals": 1, "executable": False},
+        "proposals": [
+            {
+                "source_candidate_id": source.id,
+                "source_scenario": "active_income_5m",
+                "source_hypothesis": source.to_dict(),
+                "product": "active_income",
+                "market": "futures",
+                "opportunity_type": "day_trading",
+                "reason": "trigger_never_fires",
+                "mutation_focus_stage": "trigger",
+                "validation_scope": {"candidate_set": "generated", "pnl_unit": "usdt"},
+            }
+        ],
+    }
+
+    batch = build_mutation_batch(plan)
+    mutated = Hypothesis.from_dict(batch["hypotheses"][0])
+
+    assert mutated.regime == source.regime
+    assert mutated.setup == source.setup
+    assert mutated.trigger != source.trigger
+    assert mutated.trigger[0].reference == 0.75
+    assert mutated.exit == source.exit
+    assert batch["mutation_metadata"][0]["mutation_focus_stage"] == "trigger"
+
+
+def test_mutation_batch_preserves_entries_for_negative_forward_expectancy():
+    source = Hypothesis(
+        id="FORWARD_NEGATIVE_SOURCE",
+        family="mean_reversion",
+        idea="negative forward expectancy source",
+        market_logic="test exit-only mutation",
+        direction="long",
+        base_timeframe="5m",
+        regime_timeframe="5m",
+        setup_timeframe="5m",
+        trigger_timeframe="5m",
+        regime=[Predicate("5m", "adx_14", "ge", reference=20.0)],
+        setup=[Predicate("5m", "rsi_14", "le", reference=30.0)],
+        trigger=[Predicate("5m", "volume_z_20", "ge", reference=1.0)],
+        exit=ExitRule(take_profit=0.02, stop_loss=0.01, horizon_bars=12),
+        risk=RiskRule(),
+    )
+    plan = {
+        "ok": True,
+        "summary": {"proposals": 1, "executable": False},
+        "proposals": [
+            {
+                "source_candidate_id": source.id,
+                "source_hypothesis": source.to_dict(),
+                "source_scenario": "active_income_5m",
+                "product": "active_income",
+                "market": "futures",
+                "opportunity_type": "day_trading",
+                "reason": "trades_exist_but_negative_expectancy",
+                "mutation_focus_stage": "exit_risk",
+                "validation_scope": {"candidate_set": "generated", "pnl_unit": "usdt"},
+            }
+        ],
+    }
+
+    mutated = Hypothesis.from_dict(build_mutation_batch(plan)["hypotheses"][0])
+
+    assert mutated.regime == source.regime
+    assert mutated.setup == source.setup
+    assert mutated.trigger == source.trigger
+    assert mutated.exit.take_profit == 0.022
+    assert mutated.exit.stop_loss == 0.009

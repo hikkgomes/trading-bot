@@ -1,0 +1,11 @@
+{
+  "schema": "autopilot.portfolio_risk_config/v1",
+  "market": "futures",
+  "benchmark_symbol": "BTCUSDT",
+  "timeframe": "1h",
+  "lookback_rows": 2160,
+  "minimum_overlap_rows": 500,
+  "maximum_symbols": 25,
+  "market_universe_report": "runtime/market_universe.json",
+  "output": "runtime/portfolio_risk.json"
+}

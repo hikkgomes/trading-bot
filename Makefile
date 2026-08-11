@@ -271,17 +271,81 @@ strategy-smoke:  ## Run lightweight strategy-framework sweeps on synthetic + reg
 		--regime-input runtime/regime/futures_15m_regime.parquet
 
 .PHONY: research-cycle
-research-cycle:  ## Validate the autonomous population and gate paper handoff
+research-cycle: mutation-batch  ## Validate the autonomous population and gate paper handoff
 	$(PY) -m src.autopilot.research_cycle \
 		--config config/autopilot.json \
 		--output runtime/research_cycle.json \
 		--state runtime/research_cycle_state.json \
-		--include-generated --generated-only \
+		--include-generated --generated-only --include-mutations \
 		--generated-batch runtime/research/generated_hypotheses.json \
+		--mutation-batch runtime/mutation_hypotheses.json \
 		--research-factory-config config/research_factory.json
 
+.PHONY: mutation-plan
+mutation-plan:  ## Convert exploration/predicate feedback into research-only mutation instructions
+	$(PY) -m src.autopilot.mutation_plan \
+		--input runtime/research_cycle.json \
+		--exploration-status runtime/exploration_paper/status.json \
+		--experiment-log outputs/research_exploration/experiment_log.jsonl \
+		--output runtime/mutation_plan.json \
+		--markdown-output runtime/mutation_plan.md --max-total 12
+
+.PHONY: mutation-batch
+mutation-batch: mutation-plan  ## Compile bounded research-only stage-directed mutations
+	$(PY) -m src.autopilot.mutation_batch \
+		--input runtime/mutation_plan.json \
+		--output runtime/mutation_hypotheses.json --max-total 12
+
 .PHONY: research-once
-research-once: research-generate research-cycle  ## Generate and validate one bounded population
+research-once: research-generate research-cycle  ## Generate, mutate, and validate one bounded population
+
+.PHONY: ml-research-validate
+ml-research-validate:  ## Validate the bounded chronological ML research grid
+	$(PY) -m src.autopilot.ml_research --config config/ml_research.json --validate
+
+.PHONY: ml-research-once
+ml-research-once:  ## Run at most two pre-holdout ML trials (resource bounded)
+	$(PY) -m src.autopilot.ml_research --config config/ml_research.json \
+		--output runtime/research/ml_research.json \
+		--state runtime/research/ml_research_state.json
+
+.PHONY: ml-forward-paper-once
+ml-forward-paper-once:  ## Run isolated non-promotable forward paper for protected ML candidates
+	$(PY) -m src.autopilot.ml_forward_paper --config config/ml_research.json \
+		--candidates runtime/research/ml_research.json \
+		--output runtime/research/ml_forward_paper.json \
+		--state runtime/research/ml_forward_paper_state.json
+
+.PHONY: ml-stage-candidate
+ml-stage-candidate:  ## Stage an exact reviewed ML artifact for candidate paper (PRODUCT=... ARTIFACT=... DIGEST=...)
+	$(PY) -m src.autopilot.ml_candidate_artifact --config config/autopilot.json \
+		--product "$(PRODUCT)" --artifact "$(ARTIFACT)" --expected-digest "$(DIGEST)" \
+		$(if $(REPLACE),--replace,)
+
+.PHONY: portfolio-risk-validate
+portfolio-risk-validate:  ## Validate rolling correlation and benchmark-beta configuration
+	$(PY) -m src.autopilot.portfolio_risk --config config/portfolio_risk.json --validate
+
+.PHONY: portfolio-risk
+portfolio-risk:  ## Build the rolling cross-symbol risk model
+	$(PY) -m src.autopilot.portfolio_risk --config config/portfolio_risk.json \
+		--output runtime/portfolio_risk.json
+
+.PHONY: relative-value-validate
+relative-value-validate:  ## Validate bounded relative-value research configuration
+	$(PY) -m src.autopilot.relative_value_research --config config/relative_value.json --validate
+
+.PHONY: relative-value
+relative-value:  ## Build research-only basis, cross-sectional, and pairs forecasts
+	$(PY) -m src.autopilot.relative_value_research --config config/relative_value.json \
+		--output runtime/research/relative_value.json
+
+.PHONY: relative-value-paper-once
+relative-value-paper-once:  ## Run zero-money non-promotable relative-value forward paper
+	$(PY) -m src.autopilot.relative_value_paper \
+		--input runtime/research/relative_value.json \
+		--output runtime/research/relative_value_paper.json \
+		--state runtime/research/relative_value_paper_state.json --timeframe 1h
 
 .PHONY: activate-candidate
 activate-candidate:  ## Activate reviewed live candidate. Usage: make activate-candidate PRODUCT=active_income CANDIDATE_DIGEST=sha256:... CONFIRM=1
@@ -296,9 +360,49 @@ activate-candidate:  ## Activate reviewed live candidate. Usage: make activate-c
 		--expected-candidate-digest "$(CANDIDATE_DIGEST)" --confirm $(if $(OPERATOR),--operator "$(OPERATOR)")
 
 .PHONY: candidate-paper-once
-candidate-paper-once:  ## Run one isolated paper cycle for each staged live candidate
+candidate-paper-once:  ## Run promotion-paper candidates and adaptive exploration paper once
 	$(PY) -m src.autopilot.candidate_paper --config config/autopilot.json \
 		--output runtime/candidate_paper_status.json
+
+.PHONY: exploration-paper-build
+exploration-paper-build:  ## Compile the incubation queue into non-promotable paper artifacts
+	$(PY) -m src.autopilot.exploration_paper --config config/autopilot.json --build
+
+.PHONY: exploration-paper-once
+exploration-paper-once:  ## Run one adaptive, permanently non-promotable paper cycle
+	$(PY) -m src.autopilot.exploration_paper --config config/autopilot.json
+
+.PHONY: event-capture-validate
+event-capture-validate:  ## Validate bounded public market-event capture configuration
+	$(PY) -m src.autopilot.event_capture --config config/event_capture.json --validate
+
+.PHONY: event-capture-smoke
+event-capture-smoke:  ## Capture at most 100 public events for an operational smoke test
+	$(PY) -m src.autopilot.event_capture --config config/event_capture.json \
+		--status runtime/event_capture_status.json --max-events 100 --max-seconds 30
+
+.PHONY: event-replay
+event-replay:  ## Replay captured events. Usage: make event-replay PATHS='runtime/events/*.jsonl' SYMBOL=BTCUSDT
+	@if [ -z "$(PATHS)" ] || [ -z "$(SYMBOL)" ]; then \
+		echo "Refusing: pass PATHS='<event files>' and SYMBOL=<symbol>."; exit 1; fi
+	$(PY) -m src.autopilot.event_replay $(PATHS) --symbol "$(SYMBOL)"
+
+.PHONY: microstructure-research-validate
+microstructure-research-validate:  ## Validate bounded short-horizon replay configuration
+	$(PY) -m src.autopilot.microstructure_research \
+		--config config/microstructure_research.json --validate
+
+.PHONY: microstructure-research
+microstructure-research:  ## Replay recent events through research-only microstructure alpha
+	$(PY) -m src.autopilot.microstructure_research \
+		--config config/microstructure_research.json \
+		--output runtime/research/microstructure.json
+
+.PHONY: accounting
+accounting:  ## Reconcile trade logs and update the hash-chained attribution journal
+	$(PY) -m src.autopilot.accounting --config config/autopilot.json \
+		--journal runtime/accounting/journal.jsonl \
+		--output runtime/accounting/report.json
 
 .PHONY: rehearse
 rehearse:  ## Run offline end-to-end autopilot workflow rehearsal

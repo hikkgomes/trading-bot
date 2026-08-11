@@ -25,6 +25,7 @@ from src.autopilot.market_data import (
 )
 from src.autopilot.regime_data import build_regime_data_statuses
 from src.autopilot.testnet_rehearsal import summarize_testnet_rehearsal_report
+from src.config import PROJECT_ROOT
 
 LOGGER = logging.getLogger("autopilot.reporting")
 
@@ -1037,8 +1038,82 @@ def _candidate_paper_status(
         drawdown_halted_products=drawdown_halted_products,
         errors=errors[:20],
     )
+    exploration = payload.get("exploration_paper")
+    if isinstance(exploration, dict):
+        status["exploration_paper"] = {
+            key: exploration.get(key)
+            for key in (
+                "schema",
+                "generated_at",
+                "ok",
+                "skipped",
+                "reason",
+                "adaptive_evidence",
+                "promotion_eligible",
+                "summary",
+                "aggregate",
+            )
+            if key in exploration
+        }
     if payload.get("error"):
         status["error"] = payload.get("error")
+    return status
+
+
+def _event_capture_status(
+    config: AutopilotConfig,
+    *,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.UTC).timestamp()
+    path = config.event_capture_status_file
+    status: dict[str, Any] = {
+        "configured": config.event_capture_enabled,
+        "enabled": config.event_capture_enabled,
+        "path": str(path),
+        "exists": path.exists(),
+        "ok": None,
+        "fresh": None,
+        "age_seconds": None,
+        "max_age_seconds": config.event_capture_max_age_seconds,
+    }
+    if not config.event_capture_enabled:
+        return status
+    if not path.exists():
+        return {**status, "ok": False, "fresh": False, "reason": "status_file_missing"}
+    if path.is_symlink():
+        return {**status, "ok": False, "fresh": False, "reason": "status_file_symlink"}
+    payload = _load_json(path)
+    if payload.get("_load_error"):
+        return {
+            **status,
+            "ok": False,
+            "fresh": False,
+            "reason": "status_file_unreadable",
+            "error": payload["_load_error"],
+        }
+    generated_at = payload.get("generated_at")
+    generated_ts = _parse_timestamp(generated_at)
+    age = now_ts - generated_ts if generated_ts is not None else None
+    fresh = age is not None and 0 <= age <= config.event_capture_max_age_seconds
+    status.update(
+        generated_at=generated_at,
+        age_seconds=round(age, 3) if age is not None else None,
+        fresh=fresh,
+        ok=payload.get("ok") is True and fresh,
+        running=payload.get("running"),
+        events=payload.get("events"),
+        bytes_written=payload.get("bytes_written"),
+        queue_size=payload.get("queue_size"),
+        last_event_at=payload.get("last_event_at"),
+        sources=payload.get("sources"),
+        dynamic_symbols=payload.get("dynamic_symbols"),
+        retention=payload.get("retention"),
+    )
+    if not fresh:
+        status["reason"] = "stale_or_invalid_heartbeat"
+    elif payload.get("ok") is not True:
+        status["reason"] = "capture_reported_unhealthy"
     return status
 
 
@@ -1316,6 +1391,84 @@ def build_operator_report(
     worker_status_path = config.job_state_file.with_name("job_worker_status.json")
     worker_status_payload = _load_json(worker_status_path)
     candidate_paper = _candidate_paper_status(config, now_ts=now_ts)
+    event_capture = _event_capture_status(config, now_ts=now_ts)
+    microstructure_job = next(
+        (job for job in config.jobs if job.name == "microstructure_research"), None
+    )
+    microstructure_path = (
+        Path(_command_value(microstructure_job.command, "--output"))
+        if microstructure_job is not None and _command_value(microstructure_job.command, "--output")
+        else PROJECT_ROOT / "runtime" / "research" / "microstructure.json"
+    )
+    if not microstructure_path.is_absolute() and microstructure_job is not None:
+        microstructure_path = microstructure_job.working_dir / microstructure_path
+    microstructure = _load_json(microstructure_path)
+    active_income_portfolio = status.get("active_income_portfolio")
+    if not isinstance(active_income_portfolio, dict):
+        active_income_portfolio = {
+            "ok": not config.portfolio_risk_required,
+            "risk_model": {
+                "required": config.portfolio_risk_required,
+                "ok": False,
+                "reason": "runtime_portfolio_status_missing",
+                "path": str(config.portfolio_risk_file),
+            },
+        }
+    accounting_job = next(
+        (job for job in config.jobs if job.name == "accounting_attribution"), None
+    )
+    accounting_path = (
+        Path(_command_value(accounting_job.command, "--output"))
+        if accounting_job is not None and _command_value(accounting_job.command, "--output")
+        else PROJECT_ROOT / "runtime" / "accounting" / "report.json"
+    )
+    if not accounting_path.is_absolute() and accounting_job is not None:
+        accounting_path = accounting_job.working_dir / accounting_path
+    accounting = _load_json(accounting_path)
+    ml_research_job = next((job for job in config.jobs if job.name == "ml_research"), None)
+    ml_research_path = (
+        Path(_command_value(ml_research_job.command, "--output"))
+        if ml_research_job is not None and _command_value(ml_research_job.command, "--output")
+        else PROJECT_ROOT / "runtime" / "research" / "ml_research.json"
+    )
+    if not ml_research_path.is_absolute() and ml_research_job is not None:
+        ml_research_path = ml_research_job.working_dir / ml_research_path
+    ml_research = _load_json(ml_research_path)
+    ml_forward_paper_job = next(
+        (job for job in config.jobs if job.name == "ml_forward_paper"), None
+    )
+    ml_forward_paper_path = (
+        Path(_command_value(ml_forward_paper_job.command, "--output"))
+        if ml_forward_paper_job is not None
+        and _command_value(ml_forward_paper_job.command, "--output")
+        else PROJECT_ROOT / "runtime" / "research" / "ml_forward_paper.json"
+    )
+    if not ml_forward_paper_path.is_absolute() and ml_forward_paper_job is not None:
+        ml_forward_paper_path = ml_forward_paper_job.working_dir / ml_forward_paper_path
+    ml_forward_paper = _load_json(ml_forward_paper_path)
+    relative_value_job = next(
+        (job for job in config.jobs if job.name == "relative_value_research"), None
+    )
+    relative_value_path = (
+        Path(_command_value(relative_value_job.command, "--output"))
+        if relative_value_job is not None and _command_value(relative_value_job.command, "--output")
+        else PROJECT_ROOT / "runtime" / "research" / "relative_value.json"
+    )
+    if not relative_value_path.is_absolute() and relative_value_job is not None:
+        relative_value_path = relative_value_job.working_dir / relative_value_path
+    relative_value = _load_json(relative_value_path)
+    relative_value_paper_job = next(
+        (job for job in config.jobs if job.name == "relative_value_paper"), None
+    )
+    relative_value_paper_path = (
+        Path(_command_value(relative_value_paper_job.command, "--output"))
+        if relative_value_paper_job is not None
+        and _command_value(relative_value_paper_job.command, "--output")
+        else PROJECT_ROOT / "runtime" / "research" / "relative_value_paper.json"
+    )
+    if not relative_value_paper_path.is_absolute() and relative_value_paper_job is not None:
+        relative_value_paper_path = relative_value_paper_job.working_dir / relative_value_paper_path
+    relative_value_paper = _load_json(relative_value_paper_path)
     loaded_payloads = {
         "status": status,
         "job_state": job_state,
@@ -1330,6 +1483,8 @@ def build_operator_report(
         "mutation_batch": mutation_batch,
         "artifact_hygiene": artifact_hygiene,
         "backup_report": backup_report,
+        "accounting": accounting,
+        "ml_research": ml_research,
     }
     testnet_rehearsal = _testnet_rehearsal_status(config, now_ts=now_ts)
     product_statuses = {
@@ -1353,6 +1508,10 @@ def build_operator_report(
                 "close_error": cycle.get("close_error"),
                 "detail": cycle.get("detail"),
                 "broker": cycle.get("broker"),
+                "entries_allowed": cycle.get("entries_allowed"),
+                "entry_gate": cycle.get("entry_gate"),
+                "strategy_policy": cycle.get("strategy_policy"),
+                "decision_trace": cycle.get("decision_trace"),
                 "flattened": cycle.get("flattened"),
                 "fill": cycle.get("fill"),
                 "spot_step_aside": cycle.get("spot_step_aside"),
@@ -1521,6 +1680,8 @@ def build_operator_report(
         now_ts=now_ts,
     )
     operational_issues = []
+    trade_starvation = status.get("trade_starvation")
+    trade_starvation = trade_starvation if isinstance(trade_starvation, dict) else {}
     if status.get("ok") is not True:
         operational_issues.append("runtime_cycle_unhealthy")
     if status_heartbeat.get("fresh") is not True:
@@ -1531,6 +1692,25 @@ def build_operator_report(
         operational_issues.append("indicator_features_unhealthy")
     if job_worker.get("ok") is not True:
         operational_issues.append("job_worker_unhealthy")
+    if event_capture.get("enabled") is True and event_capture.get("ok") is not True:
+        operational_issues.append("event_capture_unhealthy")
+    if microstructure and microstructure.get("ok") is not True:
+        operational_issues.append("microstructure_research_failed")
+    portfolio_risk_status = active_income_portfolio.get("risk_model") or {}
+    if portfolio_risk_status.get("required") and portfolio_risk_status.get("ok") is not True:
+        operational_issues.append("portfolio_risk_unhealthy")
+    if accounting and accounting.get("ok") is not True:
+        operational_issues.append("accounting_unreconciled")
+    if ml_research and ml_research.get("ok") is not True:
+        operational_issues.append("ml_research_failed")
+    if ml_forward_paper and ml_forward_paper.get("ok") is not True:
+        operational_issues.append("ml_forward_paper_failed")
+    if relative_value and relative_value.get("ok") is not True:
+        operational_issues.append("relative_value_research_failed")
+    if relative_value_paper and relative_value_paper.get("ok") is not True:
+        operational_issues.append("relative_value_paper_failed")
+    if config.trade_starvation_enabled and trade_starvation.get("ok") is not True:
+        operational_issues.append("trade_starvation_diagnostic_failed")
     if runtime_load_errors:
         operational_issues.append("runtime_file_unreadable")
     if runtime_shape_errors:
@@ -1579,6 +1759,53 @@ def build_operator_report(
             "timeout_seconds": config.backup_timeout_seconds,
         },
         "candidate_paper": candidate_paper,
+        "trade_starvation": trade_starvation,
+        "event_capture": event_capture,
+        "microstructure_research": _compact_artifact_payload(
+            microstructure,
+            path=microstructure_path,
+            keep_keys=("schema", "generated_at", "ok", "status", "summary", "safety"),
+            count_keys=("symbols", "files"),
+        ),
+        "active_income_portfolio": active_income_portfolio,
+        "accounting": _compact_artifact_payload(
+            accounting,
+            path=accounting_path,
+            keep_keys=("schema", "generated_at", "ok", "summary", "reconciliation_errors"),
+            count_keys=(),
+        ),
+        "ml_research": _compact_artifact_payload(
+            ml_research,
+            path=ml_research_path,
+            keep_keys=(
+                "schema",
+                "generated_at",
+                "ok",
+                "grid_size",
+                "cursor",
+                "next_cursor",
+                "summary",
+            ),
+            count_keys=("trials",),
+        ),
+        "ml_forward_paper": _compact_artifact_payload(
+            ml_forward_paper,
+            path=ml_forward_paper_path,
+            keep_keys=("schema", "generated_at", "ok", "status", "summary", "safety"),
+            count_keys=("candidates",),
+        ),
+        "relative_value": _compact_artifact_payload(
+            relative_value,
+            path=relative_value_path,
+            keep_keys=("schema", "generated_at", "ok", "status", "summary", "safety"),
+            count_keys=("waiting",),
+        ),
+        "relative_value_paper": _compact_artifact_payload(
+            relative_value_paper,
+            path=relative_value_paper_path,
+            keep_keys=("schema", "generated_at", "ok", "status", "summary", "safety"),
+            count_keys=("results",),
+        ),
         "testnet_rehearsal": testnet_rehearsal,
         "products": products,
         "scheduled_jobs": _scheduled_job_summary(
@@ -1844,6 +2071,19 @@ def _candidate_paper_detail(status: dict[str, Any]) -> str:
         )
     if status.get("reason"):
         parts.append(f"reason {status['reason']}")
+    exploration = status.get("exploration_paper")
+    if isinstance(exploration, dict):
+        summary = exploration.get("summary") or {}
+        aggregate = exploration.get("aggregate") or {}
+        parts.append(
+            "exploration "
+            f"{'ok' if exploration.get('ok') else 'fail'} "
+            f"candidates {int(summary.get('candidates') or 0)}, "
+            f"signals {int(aggregate.get('signals') or 0)}, "
+            f"entries {int(aggregate.get('entries_opened') or 0)}, "
+            "non-promotable, "
+            f"diagnoses {summary.get('diagnoses') or {}}"
+        )
     return ", ".join(parts)
 
 
@@ -2518,6 +2758,91 @@ def render_operator_markdown(report: dict[str, Any]) -> str:
     lines.append(
         f"- Candidate paper: `{candidate_paper.get('status') or 'unknown'}` "
         f"({_candidate_paper_detail(candidate_paper)})"
+    )
+    starvation = report.get("trade_starvation") or {}
+    starvation_products = starvation.get("products") or []
+    starvation_detail = ", ".join(
+        f"{item.get('product')}: {(item.get('summary') or {}).get('starvation_point', 'unknown')}"
+        for item in starvation_products
+        if isinstance(item, dict)
+    )
+    lines.append(
+        f"- Trade starvation: `{_fmt_bool(starvation.get('ok'))}` "
+        f"({starvation_detail or 'no product evidence'})"
+    )
+    event_capture = report.get("event_capture") or {}
+    lines.append(
+        f"- Event capture: `{_fmt_bool(event_capture.get('ok'))}` "
+        f"(enabled `{bool(event_capture.get('enabled'))}`, fresh "
+        f"`{_fmt_bool(event_capture.get('fresh'))}`, events "
+        f"{int(event_capture.get('events') or 0)}, last event "
+        f"`{event_capture.get('last_event_at') or 'none'}`, retained bytes "
+        f"{int((event_capture.get('retention') or {}).get('total_bytes') or 0)})"
+    )
+    microstructure = report.get("microstructure_research") or {}
+    micro_summary = microstructure.get("summary") or {}
+    lines.append(
+        f"- Microstructure research: `{_fmt_bool(microstructure.get('ok'))}` "
+        f"(symbols {int(micro_summary.get('symbols') or 0)}, events "
+        f"{int(micro_summary.get('events') or 0)}, signals "
+        f"{int(micro_summary.get('signals') or 0)}, replay trades "
+        f"{int(micro_summary.get('completed_trades') or 0)})"
+    )
+    active_income_portfolio = report.get("active_income_portfolio") or {}
+    portfolio_risk = active_income_portfolio.get("risk_model") or {}
+    lines.append(
+        f"- Portfolio risk: `{_fmt_bool(portfolio_risk.get('ok'))}` "
+        f"(required `{bool(portfolio_risk.get('required'))}`, fresh "
+        f"`{_fmt_bool(portfolio_risk.get('fresh'))}`, drawdown "
+        f"{float(active_income_portfolio.get('portfolio_drawdown_fraction') or 0.0):.2%}, "
+        f"gross {float(active_income_portfolio.get('gross_fraction') or 0.0):.2%}, "
+        f"net {float(active_income_portfolio.get('net_fraction') or 0.0):.2%})"
+    )
+    accounting = report.get("accounting") or {}
+    accounting_summary = accounting.get("summary") or {}
+    lines.append(
+        f"- Accounting: `{_fmt_bool(accounting.get('ok'))}` "
+        f"(trades {int(accounting_summary.get('trades') or 0)}, journal events "
+        f"{int(accounting_summary.get('journal_events') or 0)}, reconciliation errors "
+        f"{int(accounting_summary.get('reconciliation_errors') or 0)}, chain "
+        f"`{str(accounting_summary.get('latest_journal_hash') or 'none')[:12]}`)"
+    )
+    ml_research = report.get("ml_research") or {}
+    ml_summary = ml_research.get("summary") or {}
+    lines.append(
+        f"- ML research: `{_fmt_bool(ml_research.get('ok'))}` "
+        f"(attempted {int(ml_summary.get('attempted') or 0)}, waiting "
+        f"{int(ml_summary.get('waiting') or 0)}, pre-holdout passes "
+        f"{int(ml_summary.get('pre_holdout_passes') or 0)}, review artifacts "
+        f"{int(ml_summary.get('reviewable_candidate_artifacts') or 0)}, grid "
+        f"{int(ml_research.get('grid_size') or 0)})"
+    )
+    ml_forward_paper = report.get("ml_forward_paper") or {}
+    ml_forward_summary = ml_forward_paper.get("summary") or {}
+    lines.append(
+        f"- ML forward paper: `{_fmt_bool(ml_forward_paper.get('ok'))}` "
+        f"(configured {int(ml_forward_summary.get('configured') or 0)}, active "
+        f"{int(ml_forward_summary.get('active') or 0)}, waiting "
+        f"{int(ml_forward_summary.get('waiting') or 0)}, completed trades "
+        f"{int(ml_forward_summary.get('completed_trades') or 0)})"
+    )
+    relative_value = report.get("relative_value") or {}
+    relative_summary = relative_value.get("summary") or {}
+    lines.append(
+        f"- Relative value: `{_fmt_bool(relative_value.get('ok'))}` "
+        f"(basis {int(relative_summary.get('basis') or 0)}, cross-sectional "
+        f"{int(relative_summary.get('cross_sectional') or 0)}, pairs "
+        f"{int(relative_summary.get('pairs') or 0)}, waiting inputs "
+        f"{int(relative_summary.get('waiting_inputs') or 0)})"
+    )
+    relative_paper = report.get("relative_value_paper") or {}
+    relative_paper_summary = relative_paper.get("summary") or {}
+    lines.append(
+        f"- Relative-value paper: `{_fmt_bool(relative_paper.get('ok'))}` "
+        f"(forecasts {int(relative_paper_summary.get('forecasts') or 0)}, open "
+        f"{int(relative_paper_summary.get('open_positions') or 0)}, completed trades "
+        f"{int(relative_paper_summary.get('completed_trades') or 0)}, waiting "
+        f"{int(relative_paper_summary.get('waiting') or 0)})"
     )
     hygiene = report.get("artifact_hygiene") or {}
     if hygiene:

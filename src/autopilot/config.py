@@ -47,6 +47,10 @@ DEFAULT_OPERATOR_REPORT_JSON_FILE = PROJECT_ROOT / "runtime" / "operator_report.
 DEFAULT_READINESS_REPORT_FILE = PROJECT_ROOT / "runtime" / "readiness_report.md"
 DEFAULT_READINESS_REPORT_JSON_FILE = PROJECT_ROOT / "runtime" / "readiness_report.json"
 DEFAULT_CANDIDATE_PAPER_STATUS_FILE = PROJECT_ROOT / "runtime" / "candidate_paper_status.json"
+DEFAULT_EVENT_CAPTURE_STATUS_FILE = PROJECT_ROOT / "runtime" / "event_capture_status.json"
+DEFAULT_PORTFOLIO_RISK_FILE = PROJECT_ROOT / "runtime" / "portfolio_risk.json"
+DEFAULT_TRADE_STARVATION_HISTORY_FILE = PROJECT_ROOT / "runtime" / "trade_starvation_history.jsonl"
+DEFAULT_TRADE_STARVATION_REPORT_FILE = PROJECT_ROOT / "runtime" / "trade_starvation.json"
 DEFAULT_MIN_RUNTIME_FREE_BYTES = 512 * 1024 * 1024
 JOB_CONFIG_KEYS = {
     "cadence_seconds",
@@ -81,6 +85,14 @@ AUTOPILOT_CONFIG_KEYS = {
     "advisory_alerts_enabled",
     "alert_cooldown_seconds",
     "active_income_max_open_positions",
+    "active_income_max_gross_fraction",
+    "active_income_max_net_fraction",
+    "active_income_max_symbol_fraction",
+    "active_income_max_correlated_fraction",
+    "active_income_max_abs_beta_fraction",
+    "active_income_max_portfolio_drawdown_fraction",
+    "active_income_min_alpha_confidence",
+    "active_income_min_alpha_score",
     "alert_file",
     "alert_state_file",
     "alerts_enabled",
@@ -100,6 +112,16 @@ AUTOPILOT_CONFIG_KEYS = {
     "control_file",
     "experiment_memory_backup_file",
     "experiment_memory_file",
+    "event_capture_enabled",
+    "event_capture_max_age_seconds",
+    "event_capture_status_file",
+    "portfolio_risk_file",
+    "portfolio_risk_required",
+    "portfolio_risk_max_age_seconds",
+    "trade_starvation_enabled",
+    "trade_starvation_history_file",
+    "trade_starvation_report_file",
+    "trade_starvation_window_days",
     "generated_batch_file",
     "incubation_candidates_file",
     "job_state_file",
@@ -328,7 +350,25 @@ class AutopilotConfig:
     candidate_paper_cadence_seconds: int = 45
     candidate_paper_max_unseen_bars: int = 240
     candidate_paper_timeout_seconds: int = 240
+    event_capture_status_file: Path = DEFAULT_EVENT_CAPTURE_STATUS_FILE
+    event_capture_enabled: bool = False
+    event_capture_max_age_seconds: int = 120
+    portfolio_risk_file: Path = DEFAULT_PORTFOLIO_RISK_FILE
+    portfolio_risk_required: bool = False
+    portfolio_risk_max_age_seconds: int = 86400
+    trade_starvation_enabled: bool = False
+    trade_starvation_history_file: Path = DEFAULT_TRADE_STARVATION_HISTORY_FILE
+    trade_starvation_report_file: Path = DEFAULT_TRADE_STARVATION_REPORT_FILE
+    trade_starvation_window_days: int = 30
     active_income_max_open_positions: int = 3
+    active_income_max_gross_fraction: float = 0.60
+    active_income_max_net_fraction: float = 0.40
+    active_income_max_symbol_fraction: float = 0.25
+    active_income_max_correlated_fraction: float = 0.40
+    active_income_max_abs_beta_fraction: float = 0.40
+    active_income_max_portfolio_drawdown_fraction: float = 0.10
+    active_income_min_alpha_confidence: float = 0.50
+    active_income_min_alpha_score: float = 0.55
     auto_report_enabled: bool = False
     alerts_enabled: bool = True
     advisory_alerts_enabled: bool = False
@@ -422,12 +462,64 @@ class AutopilotConfig:
             payload.get("candidate_paper_timeout_seconds", 240),
             "candidate_paper_timeout_seconds",
         )
+        event_capture_max_age_seconds = _positive_int(
+            payload.get("event_capture_max_age_seconds", 120),
+            "event_capture_max_age_seconds",
+        )
+        portfolio_risk_max_age_seconds = _positive_int(
+            payload.get("portfolio_risk_max_age_seconds", 86400),
+            "portfolio_risk_max_age_seconds",
+        )
+        trade_starvation_window_days = _positive_int(
+            payload.get("trade_starvation_window_days", 30),
+            "trade_starvation_window_days",
+        )
+        if trade_starvation_window_days > 365:
+            raise ValueError("trade_starvation_window_days must be at most 365")
         active_income_max_open_positions = _positive_int(
             payload.get("active_income_max_open_positions", 3),
             "active_income_max_open_positions",
         )
         if active_income_max_open_positions > 20:
             raise ValueError("active_income_max_open_positions must be at most 20")
+        active_income_max_gross_fraction = _unit_fraction(
+            payload.get("active_income_max_gross_fraction", 0.60),
+            "active_income_max_gross_fraction",
+            positive=True,
+        )
+        active_income_max_net_fraction = _unit_fraction(
+            payload.get("active_income_max_net_fraction", 0.40),
+            "active_income_max_net_fraction",
+            positive=True,
+        )
+        active_income_max_symbol_fraction = _unit_fraction(
+            payload.get("active_income_max_symbol_fraction", 0.25),
+            "active_income_max_symbol_fraction",
+            positive=True,
+        )
+        active_income_max_correlated_fraction = _unit_fraction(
+            payload.get("active_income_max_correlated_fraction", 0.40),
+            "active_income_max_correlated_fraction",
+            positive=True,
+        )
+        active_income_max_abs_beta_fraction = _unit_fraction(
+            payload.get("active_income_max_abs_beta_fraction", 0.40),
+            "active_income_max_abs_beta_fraction",
+            positive=True,
+        )
+        active_income_max_portfolio_drawdown_fraction = _unit_fraction(
+            payload.get("active_income_max_portfolio_drawdown_fraction", 0.10),
+            "active_income_max_portfolio_drawdown_fraction",
+            positive=True,
+        )
+        active_income_min_alpha_confidence = _unit_fraction(
+            payload.get("active_income_min_alpha_confidence", 0.50),
+            "active_income_min_alpha_confidence",
+        )
+        active_income_min_alpha_score = _unit_fraction(
+            payload.get("active_income_min_alpha_score", 0.55),
+            "active_income_min_alpha_score",
+        )
         backup_cadence_seconds = _positive_int(
             payload.get("backup_cadence_seconds", 86400),
             "backup_cadence_seconds",
@@ -626,7 +718,62 @@ class AutopilotConfig:
             candidate_paper_cadence_seconds=candidate_paper_cadence_seconds,
             candidate_paper_max_unseen_bars=candidate_paper_max_unseen_bars,
             candidate_paper_timeout_seconds=candidate_paper_timeout_seconds,
+            event_capture_status_file=_optional_project_path(
+                payload,
+                "event_capture_status_file",
+                default=DEFAULT_EVENT_CAPTURE_STATUS_FILE,
+                field="event_capture_status_file",
+            ),
+            event_capture_enabled=_json_bool(
+                payload,
+                "event_capture_enabled",
+                default=False,
+                field="event_capture_enabled",
+            ),
+            event_capture_max_age_seconds=event_capture_max_age_seconds,
+            portfolio_risk_file=_optional_project_path(
+                payload,
+                "portfolio_risk_file",
+                default=DEFAULT_PORTFOLIO_RISK_FILE,
+                field="portfolio_risk_file",
+            ),
+            portfolio_risk_required=_json_bool(
+                payload,
+                "portfolio_risk_required",
+                default=False,
+                field="portfolio_risk_required",
+            ),
+            portfolio_risk_max_age_seconds=portfolio_risk_max_age_seconds,
+            trade_starvation_enabled=_json_bool(
+                payload,
+                "trade_starvation_enabled",
+                default=False,
+                field="trade_starvation_enabled",
+            ),
+            trade_starvation_history_file=_optional_project_path(
+                payload,
+                "trade_starvation_history_file",
+                default=DEFAULT_TRADE_STARVATION_HISTORY_FILE,
+                field="trade_starvation_history_file",
+            ),
+            trade_starvation_report_file=_optional_project_path(
+                payload,
+                "trade_starvation_report_file",
+                default=DEFAULT_TRADE_STARVATION_REPORT_FILE,
+                field="trade_starvation_report_file",
+            ),
+            trade_starvation_window_days=trade_starvation_window_days,
             active_income_max_open_positions=active_income_max_open_positions,
+            active_income_max_gross_fraction=active_income_max_gross_fraction,
+            active_income_max_net_fraction=active_income_max_net_fraction,
+            active_income_max_symbol_fraction=active_income_max_symbol_fraction,
+            active_income_max_correlated_fraction=active_income_max_correlated_fraction,
+            active_income_max_abs_beta_fraction=active_income_max_abs_beta_fraction,
+            active_income_max_portfolio_drawdown_fraction=(
+                active_income_max_portfolio_drawdown_fraction
+            ),
+            active_income_min_alpha_confidence=active_income_min_alpha_confidence,
+            active_income_min_alpha_score=active_income_min_alpha_score,
             auto_report_enabled=_json_bool(
                 payload,
                 "auto_report_enabled",
@@ -737,6 +884,17 @@ def _positive_float(value: Any, field: str) -> float:
         raise ValueError(f"{field} must be finite")
     if parsed <= 0:
         raise ValueError(f"{field} must be positive")
+    return parsed
+
+
+def _unit_fraction(value: Any, field: str, *, positive: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{field} must be a finite JSON number")
+    parsed = float(value)
+    lower_ok = parsed > 0 if positive else parsed >= 0
+    if not math.isfinite(parsed) or not lower_ok or parsed > 1:
+        interval = "(0, 1]" if positive else "[0, 1]"
+        raise ValueError(f"{field} must be in {interval}")
     return parsed
 
 

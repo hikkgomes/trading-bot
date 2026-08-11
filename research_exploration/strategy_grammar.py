@@ -24,6 +24,7 @@ from typing import Any
 from research_exploration.feature_inventory import classify_column
 from research_exploration.hypothesis_schema import (
     TF_RANK,
+    EntryScoreRule,
     ExitRule,
     Hypothesis,
     Predicate,
@@ -792,6 +793,27 @@ def _new_risk(space: SearchSpace, rng: random.Random) -> RiskRule:
     )
 
 
+def _new_entry_score(
+    stages: Mapping[str, Sequence[Predicate]],
+    rng: random.Random,
+) -> EntryScoreRule:
+    """Build a bounded normalized vote with extra emphasis on timely triggers."""
+    weights: list[float] = []
+    for stage in ("regime", "setup", "trigger"):
+        bounds = {
+            "regime": (0.10, 0.25),
+            "setup": (0.15, 0.30),
+            "trigger": (0.25, 0.45),
+        }[stage]
+        weights.extend(rng.uniform(*bounds) for _ in stages[stage])
+    total = sum(weights)
+    normalized = tuple(round(weight / total, 8) for weight in weights)
+    return EntryScoreRule(
+        weights=normalized,
+        threshold=rng.choice((0.55, 0.60, 0.65, 0.70, 0.75, 0.80)),
+    )
+
+
 def build_fresh_hypothesis(
     space: SearchSpace,
     *,
@@ -859,6 +881,7 @@ def build_fresh_hypothesis(
         trigger=stages["trigger"],
         exit=_new_exit(space, rng),
         risk=_new_risk(space, rng),
+        entry_score=_new_entry_score(stages, rng) if rng.random() < 0.4 else None,
         expected_holding=space.opportunity_type.replace("_", " "),
         expected_frequency="unknown until measured on training data",
         invalidation="stop, time exit, risk breaker, or loss of the generated entry conditions",
@@ -1070,6 +1093,14 @@ def mutate_hypothesis(
         trigger=stages["trigger"],
         exit=exit_rule,
         risk=risk_rule,
+        entry_score=(
+            _new_entry_score(stages, rng)
+            if parent.entry_score is not None
+            or "sparse" in reason_text
+            or "insufficient" in reason_text
+            or rng.random() < 0.25
+            else None
+        ),
         tags=[*dict.fromkeys([*parent.tags, "autonomous_generation", "recursive_mutation"])],
     )
     problems = validate_hypothesis_against_space(
@@ -1150,6 +1181,11 @@ def crossover_hypotheses(
         trigger=stages["trigger"],
         exit=exit_rule,
         risk=risk_rule,
+        entry_score=(
+            _new_entry_score(stages, rng)
+            if first.entry_score is not None or second.entry_score is not None or rng.random() < 0.3
+            else None
+        ),
         tags=["autonomous_generation", "crossover", space.name],
     )
     child = mutate_hypothesis(
@@ -1203,6 +1239,7 @@ def structural_tokens(hypothesis: Hypothesis, *, include_values: bool = False) -
                 f"sl:{round(hypothesis.exit.stop_loss, 6)}",
                 f"horizon:{hypothesis.exit.horizon_bars}",
                 f"trail:{hypothesis.exit.trail}",
+                f"entry_score:{hypothesis.entry_score.to_dict() if hypothesis.entry_score else None}",
                 *{
                     f"risk:{key}:{_rounded(value) if isinstance(value, float) else value}"
                     for key, value in dataclasses.asdict(hypothesis.risk).items()
@@ -1269,6 +1306,8 @@ def validate_hypothesis_against_space(
                         problems.append(f"missing_feature:{expected_tf}:{feature}")
     if total > limits.max_total_predicates:
         problems.append("total_predicate_limit")
+    if hypothesis.entry_score is not None and len(hypothesis.entry_score.weights) != total:
+        problems.append("entry_score_weight_count")
 
     if not space.take_profit_range[0] <= hypothesis.exit.take_profit <= space.take_profit_range[1]:
         problems.append("take_profit_out_of_bounds")

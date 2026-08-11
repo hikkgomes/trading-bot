@@ -766,6 +766,7 @@ def test_research_context_excludes_secrets_live_state_approvals_and_final_holdou
 ):
     research = tmp_path / "research.json"
     batch = tmp_path / "batch.json"
+    operator = tmp_path / "operator.json"
     write_json(
         research,
         {
@@ -824,10 +825,24 @@ def test_research_context_excludes_secrets_live_state_approvals_and_final_holdou
             },
         },
     )
+    write_json(
+        operator,
+        {
+            "generated_at": "operator-time",
+            "ok": True,
+            "runtime_ok": True,
+            "candidate_paper": {
+                "status": "waiting_for_staged_candidate",
+                "activation_ready_products": ["active_income"],
+                "products": [{"candidate_digest": "sha256:" + "a" * 64}],
+            },
+        },
+    )
 
     context = build_research_context(
         research_cycle_path=research,
         generated_batch_path=batch,
+        operator_report_path=operator,
     )
     rendered = json.dumps(context, sort_keys=True)
 

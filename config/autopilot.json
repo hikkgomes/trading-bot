@@ -21,7 +21,25 @@
   "candidate_paper_cadence_seconds": 45,
   "candidate_paper_max_unseen_bars": 240,
   "candidate_paper_timeout_seconds": 240,
+  "event_capture_enabled": true,
+  "event_capture_status_file": "runtime/event_capture_status.json",
+  "event_capture_max_age_seconds": 120,
+  "portfolio_risk_file": "runtime/portfolio_risk.json",
+  "portfolio_risk_required": true,
+  "portfolio_risk_max_age_seconds": 86400,
+  "trade_starvation_enabled": true,
+  "trade_starvation_history_file": "runtime/trade_starvation_history.jsonl",
+  "trade_starvation_report_file": "runtime/trade_starvation.json",
+  "trade_starvation_window_days": 30,
   "active_income_max_open_positions": 3,
+  "active_income_max_gross_fraction": 0.6,
+  "active_income_max_net_fraction": 0.4,
+  "active_income_max_symbol_fraction": 0.25,
+  "active_income_max_correlated_fraction": 0.4,
+  "active_income_max_abs_beta_fraction": 0.4,
+  "active_income_max_portfolio_drawdown_fraction": 0.1,
+  "active_income_min_alpha_confidence": 0.5,
+  "active_income_min_alpha_score": 0.55,
   "job_state_file": "runtime/job_state.json",
   "lock_file": "runtime/autopilot.lock",
   "incubation_candidates_file": "runtime/incubation_candidates.json",
@@ -114,6 +132,52 @@
       "timeout_seconds": 300
     },
     {
+      "name": "portfolio_risk",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.portfolio_risk",
+        "--config", "config/portfolio_risk.json",
+        "--output", "runtime/portfolio_risk.json"
+      ],
+      "cadence_seconds": 21600,
+      "timeout_seconds": 120
+    },
+    {
+      "name": "relative_value_research",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.relative_value_research",
+        "--config", "config/relative_value.json",
+        "--output", "runtime/research/relative_value.json"
+      ],
+      "cadence_seconds": 21600,
+      "timeout_seconds": 120
+    },
+    {
+      "name": "relative_value_paper",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.relative_value_paper",
+        "--input", "runtime/research/relative_value.json",
+        "--output", "runtime/research/relative_value_paper.json",
+        "--state", "runtime/research/relative_value_paper_state.json",
+        "--timeframe", "1h"
+      ],
+      "cadence_seconds": 3600,
+      "timeout_seconds": 120
+    },
+    {
+      "name": "microstructure_research",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.microstructure_research",
+        "--config", "config/microstructure_research.json",
+        "--output", "runtime/research/microstructure.json"
+      ],
+      "cadence_seconds": 900,
+      "timeout_seconds": 300
+    },
+    {
       "name": "market_data_update_futures_1m",
       "enabled": true,
       "command": [
@@ -168,6 +232,33 @@
       "timeout_seconds": 120
     },
     {
+      "name": "mutation_plan",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.mutation_plan",
+        "--input", "runtime/research_cycle.json",
+        "--exploration-status", "runtime/exploration_paper/status.json",
+        "--experiment-log", "outputs/research_exploration/experiment_log.jsonl",
+        "--output", "runtime/mutation_plan.json",
+        "--markdown-output", "runtime/mutation_plan.md",
+        "--max-total", "12"
+      ],
+      "cadence_seconds": 21600,
+      "timeout_seconds": 120
+    },
+    {
+      "name": "mutation_batch",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.mutation_batch",
+        "--input", "runtime/mutation_plan.json",
+        "--output", "runtime/mutation_hypotheses.json",
+        "--max-total", "12"
+      ],
+      "cadence_seconds": 21600,
+      "timeout_seconds": 120
+    },
+    {
       "name": "research_cycle",
       "enabled": true,
       "command": [
@@ -175,12 +266,40 @@
         "--output", "runtime/research_cycle.json",
         "--state", "runtime/research_cycle_state.json",
         "--include-generated",
+        "--include-mutations",
         "--generated-only",
         "--generated-batch", "runtime/research/generated_hypotheses.json",
+        "--mutation-batch", "runtime/mutation_hypotheses.json",
         "--research-factory-config", "config/research_factory.json"
       ],
       "cadence_seconds": 21600,
       "timeout_seconds": 1800
+    },
+    {
+      "name": "ml_research",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.ml_research",
+        "--config", "config/ml_research.json",
+        "--output", "runtime/research/ml_research.json",
+        "--state", "runtime/research/ml_research_state.json"
+      ],
+      "cadence_seconds": 86400,
+      "timeout_seconds": 900
+    },
+    {
+      "name": "ml_forward_paper",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.ml_forward_paper",
+        "--config", "config/ml_research.json",
+        "--candidates", "runtime/research/ml_research.json",
+        "--output", "runtime/research/ml_forward_paper.json",
+        "--state", "runtime/research/ml_forward_paper_state.json",
+        "--maximum-candidates", "20"
+      ],
+      "cadence_seconds": 900,
+      "timeout_seconds": 600
     },
     {
       "name": "synthetic_strategy_sweep",
@@ -229,6 +348,18 @@
         "--output-md", "runtime/btc_accumulation_promotion_review.md"
       ],
       "cadence_seconds": 86400,
+      "timeout_seconds": 120
+    },
+    {
+      "name": "accounting_attribution",
+      "enabled": true,
+      "command": [
+        ".venv/bin/python", "-m", "src.autopilot.accounting",
+        "--config", "config/autopilot.json",
+        "--journal", "runtime/accounting/journal.jsonl",
+        "--output", "runtime/accounting/report.json"
+      ],
+      "cadence_seconds": 3600,
       "timeout_seconds": 120
     },
     {

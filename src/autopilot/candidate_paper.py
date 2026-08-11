@@ -1,4 +1,4 @@
-"""Isolated forward-paper cycles for candidates staged beside a live product."""
+"""Isolated forward-paper cycles for staged product candidates."""
 
 from __future__ import annotations
 
@@ -80,11 +80,7 @@ def _load_candidate_runtime() -> None:
         )
 
         assert_loaded_strategy_artifact_allowed = assert_artifact_allowed
-    if (
-        PromotionThresholds is None
-        or build_promotion_review is None
-        or write_review is None
-    ):
+    if PromotionThresholds is None or build_promotion_review is None or write_review is None:
         from src.autopilot.promotion import PromotionThresholds as Thresholds
         from src.autopilot.promotion import build_promotion_review as build_review
         from src.autopilot.promotion import write_review as save_review
@@ -123,8 +119,8 @@ def _paper_result(
     allow_entries: bool = True,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"product": product.name, "ok": True}
-    if product.execution_mode != "live":
-        return {**result, "skipped": True, "reason": "product_not_live"}
+    if not product.enabled:
+        return {**result, "skipped": True, "reason": "product_disabled"}
     candidate_path = candidate_path_for_product(product.name, candidate_dir=candidate_dir)
     if not candidate_path.exists():
         return {
@@ -388,6 +384,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--candidate-dir", type=Path, default=DEFAULT_CANDIDATE_DIR)
     parser.add_argument("--output", type=Path, default=DEFAULT_STATUS)
     parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
+    parser.add_argument(
+        "--exploration-manifest",
+        type=Path,
+        default=PROJECT_ROOT / "runtime" / "exploration_paper" / "manifest.json",
+    )
+    parser.add_argument(
+        "--exploration-status",
+        type=Path,
+        default=PROJECT_ROOT / "runtime" / "exploration_paper" / "status.json",
+    )
     return parser.parse_args(argv)
 
 
@@ -400,10 +406,21 @@ def main(argv: list[str] | None = None) -> None:
     try:
         with acquire_runtime_lock(args.lock):
             try:
+                config = load_config(args.config)
                 report = run_candidate_paper(
-                    load_config(args.config),
+                    config,
                     candidate_dir=args.candidate_dir,
                 )
+                from src.autopilot.exploration_paper import run_exploration_paper
+
+                exploration = run_exploration_paper(
+                    config,
+                    manifest_path=args.exploration_manifest,
+                    previous_status_path=args.exploration_status,
+                )
+                write_json_atomic(args.exploration_status, exploration)
+                report["exploration_paper"] = exploration
+                report["ok"] = bool(report["ok"] and exploration.get("ok"))
             except Exception as exc:
                 report = {
                     "generated_at": utc_now(),

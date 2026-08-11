@@ -102,6 +102,7 @@ SPEC_KEYS = frozenset(
     {
         "base_timeframe",
         "direction",
+        "entry_score",
         "exit",
         "expected_frequency",
         "expected_holding",

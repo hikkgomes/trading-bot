@@ -1317,9 +1317,6 @@ def _safe_operational_snapshot(path: Path) -> dict[str, Any]:
             }
         )
     control = report.get("control") if isinstance(report.get("control"), dict) else {}
-    candidate_paper = (
-        report.get("candidate_paper") if isinstance(report.get("candidate_paper"), dict) else {}
-    )
     job_worker = report.get("job_worker") if isinstance(report.get("job_worker"), dict) else {}
     return {
         "source_generated_at": report.get("generated_at"),
@@ -1343,20 +1340,6 @@ def _safe_operational_snapshot(path: Path) -> dict[str, Any]:
             if key in job_worker
         },
         "scheduled_jobs": scheduled_jobs,
-        "candidate_paper": {
-            key: _safe_scalar(candidate_paper.get(key))
-            for key in (
-                "ok",
-                "status",
-                "reason",
-                "generated_at",
-                "open_positions",
-                "activation_ready_products",
-                "drawdown_halted_products",
-                "products",
-            )
-            if key in candidate_paper
-        },
         "operational_issues": _safe_scalar(report.get("operational_issues", [])),
         "position_alerts": _safe_scalar(report.get("position_alerts", [])),
     }

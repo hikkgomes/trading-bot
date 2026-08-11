@@ -26,6 +26,8 @@ def real_install_env(tmp_path: Path, fake_bin: Path) -> dict[str, str]:
     write_executable(fake_bin / "systemd-analyze", "#!/bin/sh\nexit 0\n")
     config = tmp_path / "autopilot.json"
     config.write_text("{}\n", encoding="utf-8")
+    event_config = tmp_path / "event_capture.json"
+    event_config.write_text("{}\n", encoding="utf-8")
     return {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
@@ -35,6 +37,7 @@ def real_install_env(tmp_path: Path, fake_bin: Path) -> dict[str, str]:
         "REPO": str(tmp_path / "repo"),
         "PYTHON": str(fake_python),
         "CONFIG": str(config),
+        "EVENT_CAPTURE_CONFIG": str(event_config),
         "DRY_RUN": "0",
     }
 
@@ -498,6 +501,11 @@ def test_installer_dry_run_generates_units_without_systemctl(tmp_path):
     config_file.write_text(
         (repo / "config" / "autopilot.json").read_text(encoding="utf-8"), encoding="utf-8"
     )
+    event_config_file = config_dir / "event capture config.json"
+    event_config_file.write_text(
+        (repo / "config" / "event_capture.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
 
     env = {
         **os.environ,
@@ -506,11 +514,13 @@ def test_installer_dry_run_generates_units_without_systemctl(tmp_path):
         "REPO": str(service_repo),
         "PYTHON": str(python_link),
         "CONFIG": str(config_file),
+        "EVENT_CAPTURE_CONFIG": str(event_config_file),
         "DRY_RUN": "1",
         "SERVICE_NAME": "test-autopilot.service",
         "JOB_SERVICE_NAME": "test-autopilot-jobs.service",
         "CANDIDATE_PAPER_SERVICE_NAME": "test-candidate-paper.service",
         "CANDIDATE_PAPER_TIMER_NAME": "test-candidate-paper.timer",
+        "EVENT_CAPTURE_SERVICE_NAME": "test-event-capture.service",
         "BACKUP_SERVICE_NAME": "test-autopilot-backup.service",
         "BACKUP_TIMER_NAME": "test-autopilot-backup.timer",
         "HEALTHCHECK_SERVICE_NAME": "test-autopilot-healthcheck.service",

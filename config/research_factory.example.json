@@ -11,7 +11,7 @@
     "max_parent_pool": 200,
     "max_lineage_depth": 8,
     "max_total_predicates": 7,
-    "max_memory_bytes": 50331648,
+    "max_memory_bytes": 268435456,
     "near_duplicate_threshold": 0.88,
     "exploration_fraction": 0.5,
     "mutation_fraction": 0.3,

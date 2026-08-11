@@ -11,6 +11,7 @@ from typing import Any
 
 from research_exploration.dsr import DSR_METHOD, LIVE_MIN_DSR
 from research_exploration.hypothesis_schema import Hypothesis
+from src.alpha.frozen_gradient_boosting import FrozenGradientBoostingModel
 from src.autopilot.config import ProductConfig
 from src.autopilot.exchange_policy import split_symbol
 
@@ -219,6 +220,21 @@ def _validate_condition(label: str, condition: Any, index: int, errors: list[str
 
 def _validate_entry_payload(label: str, strategy: dict[str, Any], errors: list[str]) -> None:
     entry_type = strategy.get("entry_type", "conditions")
+    if entry_type == "frozen_ml":
+        regime = strategy.get("ml_regime", "all")
+        if regime not in {"all", "trend", "high_volatility", "low_volatility"}:
+            errors.append(f"{label}: ml_regime is invalid.")
+        close_feature = strategy.get("ml_regime_close_feature")
+        if close_feature is not None and (
+            not isinstance(close_feature, str) or not close_feature
+        ):
+            errors.append(f"{label}: ml_regime_close_feature must be a non-empty string.")
+        payload = strategy.get("frozen_model")
+        try:
+            FrozenGradientBoostingModel.from_dict(payload)
+        except Exception as exc:
+            errors.append(f"{label}: invalid frozen ML payload: {type(exc).__name__}: {exc}")
+        return
     if entry_type == "hypothesis":
         payload = strategy.get("hypothesis")
         if not isinstance(payload, dict):
@@ -230,7 +246,7 @@ def _validate_entry_payload(label: str, strategy: dict[str, Any], errors: list[s
             errors.append(f"{label}: invalid hypothesis payload: {type(exc).__name__}: {exc}")
         return
     if entry_type != "conditions":
-        errors.append(f"{label}: entry_type must be 'conditions' or 'hypothesis'.")
+        errors.append(f"{label}: entry_type must be conditions, hypothesis, or frozen_ml.")
         return
     conditions = strategy.get("conditions")
     if not isinstance(conditions, list) or not conditions:

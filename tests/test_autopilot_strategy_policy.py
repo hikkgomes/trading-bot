@@ -569,7 +569,7 @@ def test_strategy_policy_rejects_unknown_entry_type(tmp_path):
 
     errors = validate_strategy_artifact(product(tmp_path), artifact)
 
-    assert errors == ["policy_r1: entry_type must be 'conditions' or 'hypothesis'."]
+    assert errors == ["policy_r1: entry_type must be conditions, hypothesis, or frozen_ml."]
 
 
 @pytest.mark.parametrize(

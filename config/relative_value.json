@@ -1,0 +1,14 @@
+{
+  "schema": "autopilot.relative_value_config/v1",
+  "market_universe_report": "runtime/market_universe.json",
+  "output": "runtime/research/relative_value.json",
+  "timeframe": "1h",
+  "maximum_symbols": 12,
+  "lookback_rows": 720,
+  "cross_sectional_lookback_rows": 24,
+  "cross_sectional_top_k": 2,
+  "basis_entry_threshold": 0.001,
+  "basis_funding_intervals": 3,
+  "pairs_entry_z": 2.0,
+  "maximum_pairs": 30
+}

@@ -131,6 +131,41 @@ def make_bot(env, starting_equity=10_000.0):
     )
 
 
+def test_frozen_ml_entry_contract_loads_and_uses_safe_json_inference(bot_env):
+    strategies_path, _, _ = bot_env
+    artifact = json.loads(strategies_path.read_text(encoding="utf-8"))
+    strategy = artifact["strategies"][0]
+    strategy["entry_type"] = "frozen_ml"
+    strategy.pop("conditions")
+    strategy["frozen_model"] = {
+        "schema": "autopilot.frozen_gradient_boosting/v1",
+        "kind": "classifier",
+        "feature_names": ["close"],
+        "learning_rate": 0.1,
+        "initial_prediction": 10.0,
+        "trees": [
+            {
+                "children_left": [-1],
+                "children_right": [-1],
+                "feature": [-2],
+                "threshold": [-2.0],
+                "value": [0.0],
+            }
+        ],
+        "long_threshold": 0.55,
+        "short_threshold": 0.45,
+    }
+    strategies_path.write_text(json.dumps(artifact), encoding="utf-8")
+    bot = make_bot(bot_env)
+    frame = pd.DataFrame({"tf_5m_close": [100.0]})
+
+    triggered, detail = bot._trace_frozen_ml_signal(bot.strategies[0], frame)
+
+    assert triggered is True
+    assert detail["model_kind"] == "classifier"
+    assert bot._candidate_replay_signal(bot.strategies[0], frame) is True
+
+
 def test_position_events_are_recorded_only_after_durable_entry(bot_env):
     bot = make_bot(bot_env)
     strategy = bot.strategies[0]
@@ -813,7 +848,11 @@ def test_bot_init_normalizes_numeric_fee_strings(tmp_path):
         ("horizon_bars", 1.5, "horizon_bars must be an integer"),
         ("take_profit", float("nan"), "take_profit must be finite"),
         ("stop_loss", -1.0, "stop_loss must be positive"),
-        ("entry_type", "external", "entry_type must be 'conditions' or 'hypothesis'"),
+        (
+            "entry_type",
+            "external",
+            "entry_type must be conditions, hypothesis, or frozen_ml",
+        ),
     ],
 )
 def test_bot_init_rejects_invalid_strategy_execution_fields(tmp_path, field, value, message):
@@ -1798,6 +1837,18 @@ def test_run_cycle_signal_not_triggered(mock_build_ind, mock_get, bot_env):
 
     bot.run_cycle()
     assert bot.state["open_positions"] == {}
+    assert bot.decision_trace["schema"] == "autopilot.decision_trace/v1"
+    assert bot.decision_trace["summary"]["data_ready"] == 1
+    assert bot.decision_trace["summary"]["market_bars_processed"] == 1
+    assert bot.decision_trace["summary"]["market_bars"] == [
+        {"timeframe": "5m", "timestamp": "2021-01-01T00:20:00+00:00"}
+    ]
+    assert bot.decision_trace["summary"]["signals"] == 0
+    decision = bot.decision_trace["strategies"]["5m_long_r1"]
+    assert decision["outcome"] == "signal_not_triggered"
+    assert decision["failed_stage"] == "conditions"
+    assert decision["matched_predicates"] == 0
+    assert decision["total_predicates"] == 1
 
 
 @patch("src.run_bot.requests.get")
@@ -1816,6 +1867,10 @@ def test_run_cycle_does_not_reconsider_same_closed_entry_bar(mock_build_ind, moc
 
     assert bot.state["open_positions"] == {}
     assert bot.state["daily_trades_by_strategy"] == {}
+    assert bot.decision_trace["entries_enabled"] is True
+    assert bot.decision_trace["summary"]["data_ready"] == 1
+    assert bot.decision_trace["summary"]["market_bars_processed"] == 1
+    assert bot.decision_trace["summary"]["outcomes"] == {"bar_already_processed": 1}
     assert "5m_long_r1" in bot.state["last_entry_decision_bar_by_strategy"]
 
 
@@ -1839,6 +1894,10 @@ def test_run_cycle_allow_entries_false_skips_flat_strategy_evaluation(bot_env, m
 
     assert bot.state["open_positions"] == {}
     assert bot.state["daily_trades_by_strategy"] == {}
+    assert bot.decision_trace["entries_enabled"] is False
+    assert bot.decision_trace["summary"]["data_ready"] == 0
+    assert bot.decision_trace["summary"]["outcomes"] == {"entry_disabled": 1}
+    assert bot.decision_trace["strategies"]["5m_long_r1"]["outcome"] == "entry_disabled"
 
 
 def test_drawdown_halt_skips_flat_strategy_evaluation(bot_env, monkeypatch):
@@ -1941,6 +2000,46 @@ def test_run_cycle_signal_triggered_opens_position(mock_build_ind, mock_get, bot
     assert pos["tp_price"] == 104.0
     assert pos["position_size"] == 1.0  # 0.02 risk / 0.02 SL
     assert bot.state["daily_trades_by_strategy"]["5m_long_r1"] == 1
+    assert bot.decision_trace["summary"]["signals"] == 1
+    assert bot.decision_trace["summary"]["entries_opened"] == 1
+    assert bot.decision_trace["summary"]["outcomes"] == {"entry_opened": 1}
+    assert bot.decision_trace["strategies"]["5m_long_r1"]["outcome"] == "entry_opened"
+    assert pos["alpha_forecast"]["schema"] == "autopilot.alpha_forecast/v1"
+    assert bot.decision_trace["strategies"]["5m_long_r1"]["alpha_forecast"] == pos["alpha_forecast"]
+
+
+@patch("src.run_bot.requests.get")
+@patch("build_binance_indicator_dataset.build_indicator_features")
+def test_run_cycle_portfolio_gate_can_reject_signal_without_entry(
+    mock_build_ind, mock_get, bot_env
+):
+    strategies_path, state_file, trade_log = bot_env
+    bot = PaperTradingBot(
+        strategies_path=strategies_path,
+        state_file=state_file,
+        trade_log=trade_log,
+        portfolio_gate=lambda proposal: {
+            "allowed": False,
+            "allocated_fraction": 0.0,
+            "reason": "net_exposure_limit",
+        },
+    )
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
+    mock_get.return_value = mock_resp
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
+
+    bot.run_cycle()
+
+    assert bot.state["open_positions"] == {}
+    assert bot.decision_trace["summary"]["signals"] == 1
+    assert bot.decision_trace["summary"]["entries_opened"] == 0
+    assert bot.decision_trace["summary"]["outcomes"] == {"portfolio_rejected": 1}
+    decision = bot.decision_trace["strategies"]["5m_long_r1"]
+    assert decision["portfolio_allocation"]["reason"] == "net_exposure_limit"
 
 
 @patch("src.run_bot.requests.get")
@@ -2063,6 +2162,45 @@ def test_run_cycle_allows_only_one_open_position_per_product(mock_build_ind, moc
     assert set(bot.state["open_positions"]) == {"5m_long_r1"}
     assert bot.state["daily_trades_by_strategy"] == {"5m_long_r1": 1}
     assert mock_build_ind.call_count == 1
+
+
+@patch("src.run_bot.requests.get")
+@patch("build_binance_indicator_dataset.build_indicator_features")
+def test_run_cycle_aggregates_conflicting_strategy_alpha_before_entry(
+    mock_build_ind, mock_get, tmp_path
+):
+    strategies_path = tmp_path / "active_strategies.json"
+    state_file = tmp_path / "bot_state.json"
+    trade_log = tmp_path / "paper_trades.csv"
+    create_artifact(strategies_path)
+    artifact = json.loads(strategies_path.read_text(encoding="utf-8"))
+    second = json.loads(json.dumps(artifact["strategies"][0]))
+    second["id"] = "5m_short_r1"
+    second["direction"] = "short"
+    artifact["strategies"].append(second)
+    strategies_path.write_text(json.dumps(artifact), encoding="utf-8")
+    bot = PaperTradingBot(
+        strategies_path=strategies_path,
+        state_file=state_file,
+        trade_log=trade_log,
+        starting_equity=10_000,
+    )
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = get_mock_binance_klines(5, close_price=100.0)
+    mock_get.return_value = mock_resp
+    mock_build_ind.side_effect = lambda df, tf: mock_indicator_features(
+        df, tf, rsi_value=60.0, atr_value=2.0
+    )
+
+    bot.run_cycle()
+
+    assert bot.state["open_positions"] == {}
+    assert bot.decision_trace["summary"]["signals"] == 2
+    assert bot.decision_trace["summary"]["entries_opened"] == 0
+    assert {item["outcome"] for item in bot.decision_trace["strategies"].values()} == {
+        "alpha_ensemble_rejected"
+    }
 
 
 @patch("src.run_bot.requests.get")

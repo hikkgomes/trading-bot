@@ -54,6 +54,12 @@ def _find_source_hypothesis(proposal: dict[str, Any]) -> Hypothesis | None:
     source_id = str(proposal.get("source_candidate_id") or "")
     if not source_id:
         return None
+    embedded = proposal.get("source_hypothesis")
+    if isinstance(embedded, dict):
+        source = Hypothesis.from_dict(embedded)
+        if source.id != source_id or source.id.startswith("MUT_"):
+            return None
+        return source
     scope = (
         proposal.get("validation_scope")
         if isinstance(proposal.get("validation_scope"), dict)
@@ -86,7 +92,12 @@ def _with_note(pred: Predicate, suffix: str) -> Predicate:
 
 def _mutate_predicate(pred: Predicate, reason: str) -> Predicate:
     suffix = f"mutation:{reason}"
-    if reason == "insufficient_train_trades":
+    if reason in {
+        "insufficient_train_trades",
+        "regime_never_fires",
+        "setup_never_fires",
+        "trigger_never_fires",
+    }:
         if pred.op in {"ge", "gt"} and pred.reference is not None:
             if pred.feature == "volume_z_20":
                 return _with_note(
@@ -171,6 +182,12 @@ def _mutate_exit(exit_rule: ExitRule, reason: str) -> ExitRule:
         return dataclasses.replace(
             exit_rule, horizon_bars=max(1, round(exit_rule.horizon_bars * 1.15))
         )
+    if reason == "trades_exist_but_negative_expectancy":
+        return dataclasses.replace(
+            exit_rule,
+            take_profit=min(0.99, round(exit_rule.take_profit * 1.1, 6)),
+            stop_loss=max(0.000001, round(exit_rule.stop_loss * 0.9, 6)),
+        )
     return exit_rule
 
 
@@ -203,13 +220,25 @@ def _proposal_unsafe_flags(proposal: dict[str, Any]) -> list[str]:
 
 def mutate_hypothesis(source: Hypothesis, proposal: dict[str, Any], index: int) -> Hypothesis:
     reason = str(proposal.get("reason") or "unknown")
+    focus_stage = {
+        "regime_never_fires": "regime",
+        "setup_never_fires": "setup",
+        "trigger_never_fires": "trigger",
+        "trades_exist_but_negative_expectancy": "exit_risk",
+    }.get(reason)
+
+    def stage_values(stage: str, values: list[Predicate]) -> list[Predicate]:
+        if focus_stage is not None and focus_stage != stage:
+            return list(values)
+        return [_mutate_predicate(pred, reason) for pred in values]
+
     mutated = dataclasses.replace(
         source,
         id=_mutation_id(source.id, reason, index),
         idea=f"{source.idea} Mutation from autopilot watchlist: {reason}.",
-        regime=[_mutate_predicate(pred, reason) for pred in source.regime],
-        setup=[_mutate_predicate(pred, reason) for pred in source.setup],
-        trigger=[_mutate_predicate(pred, reason) for pred in source.trigger],
+        regime=stage_values("regime", source.regime),
+        setup=stage_values("setup", source.setup),
+        trigger=stage_values("trigger", source.trigger),
         exit=_mutate_exit(source.exit, reason),
         invalidation=(
             f"{source.invalidation} Mutation remains research-only until full validation and explicit approval."
@@ -283,6 +312,7 @@ def build_mutation_batch(plan: dict[str, Any], *, max_total: int | None = None) 
                 "market": proposal.get("market"),
                 "opportunity_type": proposal.get("opportunity_type"),
                 "reason": proposal.get("reason"),
+                "mutation_focus_stage": proposal.get("mutation_focus_stage"),
                 "validation_scope": proposal.get("validation_scope") or {},
                 "safety": dict(SAFETY),
             }

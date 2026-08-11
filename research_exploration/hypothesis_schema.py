@@ -258,6 +258,32 @@ class RiskRule:
         return RiskRule(**d)
 
 
+@dataclass(frozen=True)
+class EntryScoreRule:
+    """Weighted predicate vote used instead of an all-predicates Boolean AND."""
+
+    weights: tuple[float, ...]
+    threshold: float
+
+    def __post_init__(self) -> None:
+        if not self.weights:
+            raise ValueError("entry score weights cannot be empty")
+        if any(not 0 < float(weight) <= 1 for weight in self.weights):
+            raise ValueError("entry score weights must be in (0, 1]")
+        if not 0 < float(self.threshold) <= 1:
+            raise ValueError("entry score threshold must be in (0, 1]")
+
+    def to_dict(self) -> dict:
+        return {"weights": list(self.weights), "threshold": float(self.threshold)}
+
+    @staticmethod
+    def from_dict(d: dict) -> EntryScoreRule:
+        return EntryScoreRule(
+            weights=tuple(float(value) for value in d["weights"]),
+            threshold=float(d["threshold"]),
+        )
+
+
 @dataclass
 class Hypothesis:
     """A complete, testable multi-timeframe trade idea."""
@@ -276,6 +302,7 @@ class Hypothesis:
     trigger: list[Predicate]
     exit: ExitRule
     risk: RiskRule = field(default_factory=RiskRule)
+    entry_score: EntryScoreRule | None = None
     expected_holding: str = ""
     expected_frequency: str = ""
     invalidation: str = ""
@@ -361,6 +388,7 @@ class Hypothesis:
             "trigger": [p.to_dict() for p in self.trigger],
             "exit": self.exit.to_dict(),
             "risk": self.risk.to_dict(),
+            **({"entry_score": self.entry_score.to_dict()} if self.entry_score else {}),
             "expected_holding": self.expected_holding,
             "expected_frequency": self.expected_frequency,
             "invalidation": self.invalidation,
@@ -370,7 +398,7 @@ class Hypothesis:
 
     @staticmethod
     def from_dict(d: dict) -> Hypothesis:
-        return Hypothesis(
+        hypothesis = Hypothesis(
             id=d["id"],
             family=d["family"],
             idea=d["idea"],
@@ -385,11 +413,21 @@ class Hypothesis:
             trigger=[Predicate.from_dict(p) for p in d.get("trigger", [])],
             exit=ExitRule.from_dict(d["exit"]),
             risk=RiskRule.from_dict(d.get("risk", {})),
+            entry_score=(
+                EntryScoreRule.from_dict(d["entry_score"])
+                if d.get("entry_score") is not None
+                else None
+            ),
             expected_holding=d.get("expected_holding", ""),
             expected_frequency=d.get("expected_frequency", ""),
             invalidation=d.get("invalidation", ""),
             tags=list(d.get("tags", [])),
         )
+        if hypothesis.entry_score is not None and len(hypothesis.entry_score.weights) != len(
+            hypothesis.all_predicates()
+        ):
+            raise ValueError("entry score weights must align one-to-one with all predicates")
+        return hypothesis
 
 
 def validate_columns_against_inventory(hyp: Hypothesis, inventory: dict[str, dict]) -> list[str]:

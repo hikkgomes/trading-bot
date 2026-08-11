@@ -98,6 +98,16 @@ def test_operator_report_surfaces_candidate_paper_digest_freshness_and_readiness
                         "drawdown_halted": False,
                     }
                 ],
+                "exploration_paper": {
+                    "schema": "autopilot.exploration_paper/v1",
+                    "generated_at": "1970-01-01T00:01:40+00:00",
+                    "ok": True,
+                    "adaptive_evidence": True,
+                    "promotion_eligible": False,
+                    "summary": {"candidates": 8, "healthy": 8, "failed": 0},
+                    "aggregate": {"signals": 3, "entries_opened": 2},
+                    "products": [{"intentionally": "excluded from bounded report"}],
+                },
             }
         ),
         encoding="utf-8",
@@ -157,11 +167,21 @@ def test_operator_report_surfaces_candidate_paper_digest_freshness_and_readiness
         "activation_ready_products": ["active_income"],
         "drawdown_halted_products": [],
         "errors": [],
+        "exploration_paper": {
+            "schema": "autopilot.exploration_paper/v1",
+            "generated_at": "1970-01-01T00:01:40+00:00",
+            "ok": True,
+            "adaptive_evidence": True,
+            "promotion_eligible": False,
+            "summary": {"candidates": 8, "healthy": 8, "failed": 0},
+            "aggregate": {"signals": 3, "entries_opened": 2},
+        },
     }
     assert "Candidate paper: `ready`" in markdown
     assert "activation ready active_income" in markdown
     assert "open positions 2" in markdown
     assert "active_income aaaaaaaaaaaa valid" in markdown
+    assert "exploration ok candidates 8, signals 3, entries 2, non-promotable" in markdown
 
     candidate_status.unlink()
     symlink_target = tmp_path / "outside_candidate_status.json"
@@ -310,6 +330,26 @@ def test_operator_report_summarizes_status_approvals_and_trades(tmp_path):
                         "drawdown_halted": False,
                         "drawdown_halted_at": None,
                         "drawdown_halt_reason": None,
+                        "entries_allowed": False,
+                        "entry_gate": {
+                            "status": "management_only",
+                            "reason": "unvalidated_bootstrap_artifact",
+                        },
+                        "strategy_policy": {
+                            "status": "bootstrap_management_only",
+                            "artifact_fingerprint": "abc123",
+                        },
+                        "decision_trace": {
+                            "schema": "autopilot.decision_trace/v1",
+                            "summary": {
+                                "strategies": 1,
+                                "data_ready": 0,
+                                "signals": 0,
+                                "entries_opened": 0,
+                                "positions_managed": 0,
+                                "outcomes": {"entry_disabled": 1},
+                            },
+                        },
                         "open_positions": 1,
                         "state_errors": [
                             {"field": "paper_state", "error": "example state warning"}
@@ -536,6 +576,10 @@ def test_operator_report_summarizes_status_approvals_and_trades(tmp_path):
     assert report["products"][0]["drawdown_fraction"] == pytest.approx(0.0466666667)
     assert report["products"][0]["drawdown_limit_fraction"] == pytest.approx(0.10)
     assert report["products"][0]["drawdown_halted"] is False
+    assert report["products"][0]["entries_allowed"] is False
+    assert report["products"][0]["entry_gate"]["reason"] == "unvalidated_bootstrap_artifact"
+    assert report["products"][0]["strategy_policy"]["artifact_fingerprint"] == "abc123"
+    assert report["products"][0]["decision_trace"]["summary"]["outcomes"] == {"entry_disabled": 1}
     assert report["products"][0]["trade_summary"]["trades"] == 2
     assert report["products"][0]["trade_summary"]["win_rate"] == 0.5
     assert "active_income" in markdown

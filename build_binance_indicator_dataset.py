@@ -476,6 +476,26 @@ def _required_indicator_specs(required_features: set[str]) -> set[tuple[str, int
     return specs
 
 
+def unsupported_required_features(required_features: set[str]) -> set[str]:
+    """Return names the bounded live indicator builder cannot reproduce."""
+    all_functions = talib.get_functions()
+    functions_by_lower = {name.lower(): name for name in all_functions}
+    variant_candidates = set(get_variant_candidates())
+    unsupported: set[str] = set()
+    for feature in required_features:
+        if feature in CANDLE_COLUMNS or feature in flow_feature_names():
+            continue
+        match = _PERIOD_FEATURE_RE.match(feature)
+        if match:
+            function_name = functions_by_lower.get(match.group(1))
+            if function_name in variant_candidates:
+                continue
+        if any(feature in _normalised_feature_names(name) for name in all_functions):
+            continue
+        unsupported.add(feature)
+    return unsupported
+
+
 def build_indicator_features(
     df: pd.DataFrame,
     timeframe: str,
