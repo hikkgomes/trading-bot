@@ -183,8 +183,18 @@ def _closes(symbol: str, market: str, config: RelativeValueConfig) -> pd.Series:
     )
     if path.is_symlink() or not path.is_file():
         raise FileNotFoundError(path)
-    frame = pd.read_parquet(path, columns=["timestamp", "close"]).tail(config.lookback_rows)
-    timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="raise")
+    # Current candle stores use a DatetimeIndex; retain support for legacy
+    # datasets that instead contain a physical timestamp column.
+    frame = pd.read_parquet(path, columns=["close"]).tail(config.lookback_rows)
+    if isinstance(frame.index, pd.DatetimeIndex):
+        timestamps = pd.to_datetime(frame.index, utc=True, errors="raise")
+    else:
+        frame = pd.read_parquet(path, columns=["timestamp", "close"]).tail(
+            config.lookback_rows
+        )
+        if "timestamp" not in frame:
+            raise ValueError(f"{symbol} {market} history has no timestamp index or column")
+        timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="raise")
     close = pd.Series(pd.to_numeric(frame["close"], errors="raise").to_numpy(), index=timestamps)
     if close.index.has_duplicates or not close.index.is_monotonic_increasing:
         raise ValueError(f"{symbol} {market} history is not unique and chronological")

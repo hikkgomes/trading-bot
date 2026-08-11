@@ -19,16 +19,19 @@ def _config(tmp_path: Path):
     )
 
 
-def _write_history(root: Path, symbol: str, returns: np.ndarray):
+def _write_history(root: Path, symbol: str, returns: np.ndarray, *, datetime_index: bool = False):
     close = 100 * np.exp(np.cumsum(returns))
     path = root / symbol / f"{symbol}_1h.parquet"
     path.parent.mkdir(parents=True)
-    pd.DataFrame(
+    frame = pd.DataFrame(
         {
             "timestamp": pd.date_range("2025-01-01", periods=len(close), freq="1h", tz="UTC"),
             "close": close,
         }
-    ).to_parquet(path, index=False)
+    )
+    if datetime_index:
+        frame = frame.set_index("timestamp")
+    frame.to_parquet(path, index=datetime_index)
     return path
 
 
@@ -64,3 +67,24 @@ def test_portfolio_risk_model_waits_when_benchmark_history_is_missing(tmp_path):
 
     assert report["ok"] is False
     assert report["reason"] == "benchmark_history_unavailable"
+
+
+def test_portfolio_risk_model_supports_current_datetime_index_candles(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config.market_universe_report.write_text(
+        json.dumps({"research_symbols": ["BTCUSDT", "ETHUSDT"]}), encoding="utf-8"
+    )
+    rng = np.random.default_rng(7)
+    btc = rng.normal(0, 0.01, 600)
+    _write_history(tmp_path, "BTCUSDT", btc, datetime_index=True)
+    _write_history(tmp_path, "ETHUSDT", btc * 1.2, datetime_index=True)
+    monkeypatch.setattr(
+        portfolio_risk,
+        "candle_data_dir",
+        lambda symbol, market, legacy_fallback=True: tmp_path / symbol,
+    )
+
+    report = portfolio_risk.build_risk_model(config)
+
+    assert report["ok"] is True
+    assert report["beta_by_symbol"]["ETHUSDT"] > 1

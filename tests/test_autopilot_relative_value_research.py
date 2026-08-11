@@ -22,7 +22,7 @@ def _config(tmp_path):
     )
 
 
-def _history(root, symbol, market, returns):
+def _history(root, symbol, market, returns, *, datetime_index=False):
     path = root / market / symbol
     path.mkdir(parents=True)
     frame = pd.DataFrame(
@@ -31,7 +31,9 @@ def _history(root, symbol, market, returns):
             "close": 100 * np.exp(np.cumsum(returns)),
         }
     )
-    frame.to_parquet(path / f"{symbol}_1h.parquet", index=False)
+    if datetime_index:
+        frame = frame.set_index("timestamp")
+    frame.to_parquet(path / f"{symbol}_1h.parquet", index=datetime_index)
 
 
 def test_relative_value_job_builds_all_three_research_families(tmp_path, monkeypatch):
@@ -84,3 +86,32 @@ def test_relative_value_job_waits_safely_without_universe(tmp_path):
     assert report["ok"] is False
     assert report["status"] == "waiting_for_universe"
     assert report["safety"]["promotion_allowed"] is False
+
+
+def test_relative_value_job_supports_current_datetime_index_candles(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+    config.market_universe_report.write_text(
+        json.dumps(
+            {
+                "research_symbols": symbols,
+                "symbols": [
+                    {"symbol": symbol, "metrics": {"funding_rate": 0.001}}
+                    for symbol in symbols
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    rng = np.random.default_rng(18)
+    for symbol in symbols:
+        returns = rng.normal(0, 0.01, 120)
+        _history(tmp_path, symbol, "futures", returns, datetime_index=True)
+        _history(tmp_path, symbol, "spot", returns, datetime_index=True)
+    monkeypatch.setattr(
+        relative_value_research,
+        "candle_data_dir",
+        lambda symbol, market, legacy_fallback=True: tmp_path / market / symbol,
+    )
+
+    assert relative_value_research.build_report(config)["ok"] is True
