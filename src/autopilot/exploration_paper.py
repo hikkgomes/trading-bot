@@ -20,7 +20,10 @@ from research_exploration.hypothesis_schema import Hypothesis
 from src.autopilot.candidate_activation import product_identity
 from src.autopilot.config import DEFAULT_CONFIG_PATH, AutopilotConfig, ProductConfig, load_config
 from src.autopilot.io import write_json_atomic
-from src.autopilot.strategy_policy import assert_loaded_strategy_artifact_allowed
+from src.autopilot.strategy_policy import (
+    StrategyPolicyError,
+    assert_loaded_strategy_artifact_allowed,
+)
 from src.config import PROJECT_ROOT
 from src.run_bot import PaperTradingBot
 
@@ -226,6 +229,7 @@ def build_exploration_manifest(
     trades_dir.mkdir(parents=True, exist_ok=True)
     candidates: list[dict[str, Any]] = []
     missing_records: list[dict[str, str]] = []
+    policy_rejected_candidates: list[dict[str, str]] = []
     seen_digests: set[str] = set()
     for product_name, items in sorted(products.items()):
         if not isinstance(items, list):
@@ -251,11 +255,23 @@ def build_exploration_manifest(
                 symbol=symbol,
             )
             artifact = _artifact_for_record(record, product)
-            assert_loaded_strategy_artifact_allowed(
-                product,
-                artifact,
-                require_live_eligible=False,
-            )
+            try:
+                assert_loaded_strategy_artifact_allowed(
+                    product,
+                    artifact,
+                    require_live_eligible=False,
+                )
+            except StrategyPolicyError as exc:
+                policy_rejected_candidates.append(
+                    {
+                        "product": str(product_name),
+                        "symbol": symbol,
+                        "id": hypothesis_id,
+                        "reason": "strategy_policy_rejected",
+                        "detail": str(exc),
+                    }
+                )
+                continue
             digest = _identity_digest(artifact)
             if digest in seen_digests:
                 continue
@@ -298,8 +314,10 @@ def build_exploration_manifest(
         "summary": {
             "candidates": len(candidates),
             "missing_experiment_records": len(missing_records),
+            "policy_rejected_candidates": len(policy_rejected_candidates),
         },
         "missing_experiment_records": missing_records,
+        "policy_rejected_candidates": policy_rejected_candidates,
         "candidates": candidates,
     }
     write_json_atomic(root / "manifest.json", manifest)

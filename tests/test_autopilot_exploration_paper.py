@@ -114,7 +114,11 @@ def test_build_exploration_manifest_compiles_rejected_candidate_as_non_promotabl
     )
 
     assert manifest["ok"] is True
-    assert manifest["summary"] == {"candidates": 1, "missing_experiment_records": 0}
+    assert manifest["summary"] == {
+        "candidates": 1,
+        "missing_experiment_records": 0,
+        "policy_rejected_candidates": 0,
+    }
     assert manifest["adaptive_evidence"] is True
     assert manifest["promotion_eligible"] is False
     artifact = json.loads(Path(manifest["candidates"][0]["artifact"]).read_text(encoding="utf-8"))
@@ -123,6 +127,41 @@ def test_build_exploration_manifest_compiles_rejected_candidate_as_non_promotabl
     assert artifact["promotion_eligible"] is False
     assert artifact["exploration_only"] is True
     assert artifact["strategies"][0]["id"] == "EXPLORE_LONG_5M"
+
+
+def test_build_exploration_manifest_skips_policy_rejected_candidate(tmp_path):
+    incubation, log_path = _write_sources(tmp_path)
+    record = json.loads(log_path.read_text(encoding="utf-8"))
+    record["hypothesis"]["exit"]["stop_loss"] = 0.06
+    log_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    manifest = build_exploration_manifest(
+        AutopilotConfig(products=[_product(tmp_path)]),
+        incubation_path=incubation,
+        log_path=log_path,
+        root=tmp_path / "exploration",
+    )
+
+    assert manifest["ok"] is True
+    assert manifest["candidates"] == []
+    assert manifest["summary"] == {
+        "candidates": 0,
+        "missing_experiment_records": 0,
+        "policy_rejected_candidates": 1,
+    }
+    assert manifest["policy_rejected_candidates"] == [
+        {
+            "product": "active_income",
+            "symbol": "BTCUSDT",
+            "id": "EXPLORE_LONG_5M",
+            "reason": "strategy_policy_rejected",
+            "detail": (
+                "active_income: strategy artifact violates policy: EXPLORE_LONG_5M: "
+                "stop_loss 0.060000 exceeds 0.050000."
+            ),
+        }
+    ]
+    assert list((tmp_path / "exploration" / "artifacts").glob("*.json")) == []
 
 
 def test_run_exploration_paper_records_decision_trace_without_promotion_evidence(
