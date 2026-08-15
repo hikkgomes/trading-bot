@@ -63,8 +63,12 @@ def _load_config(path: Path) -> dict[str, Any]:
         if discovery.get("mode") != "all_trading_usdt_perpetuals":
             raise ValueError("discovery.mode must be all_trading_usdt_perpetuals")
         maximum = discovery.get("maximum_research_symbols")
-        if not isinstance(maximum, int) or isinstance(maximum, bool) or not 1 <= maximum <= 100:
-            raise ValueError("discovery.maximum_research_symbols must be in [1, 100]")
+        if maximum is not None and (
+            not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1
+        ):
+            raise ValueError(
+                "discovery.maximum_research_symbols must be a positive integer when set"
+            )
         for field in ("always_include", "exclude"):
             values = discovery.get(field, [])
             if not isinstance(values, list) or any(
@@ -126,7 +130,11 @@ def run_screen(
                 and isinstance(item.get("symbol"), str)
                 and item.get("symbol") not in excluded
             )
-            maximum_research_symbols = int(discovery["maximum_research_symbols"])
+            # A strategy selects its own dynamic universe from the full
+            # eligible list. A configured cap remains available only for an
+            # explicitly bounded operational deployment, never as a platform
+            # restriction.
+            maximum_research_symbols = discovery.get("maximum_research_symbols")
             always_include = {str(item).upper() for item in discovery.get("always_include", [])}
             selection_mode = str(discovery["mode"])
         rows: list[dict[str, Any]] = []
@@ -192,7 +200,12 @@ def run_screen(
                 row["symbol"],
             ),
         )
-        selected_symbols = [str(row["symbol"]) for row in eligible_rows[:maximum_research_symbols]]
+        selected_rows = (
+            eligible_rows
+            if maximum_research_symbols is None
+            else eligible_rows[: int(maximum_research_symbols)]
+        )
+        selected_symbols = [str(row["symbol"]) for row in selected_rows]
         selected = set(selected_symbols)
         for row in rows:
             row["research_enabled"] = row["symbol"] in selected

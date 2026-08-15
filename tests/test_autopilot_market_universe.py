@@ -190,3 +190,40 @@ def test_market_universe_discovers_all_contracts_and_writes_snapshot(tmp_path: P
     assert report["snapshot"]["id"].startswith("sha256:")
     assert len(list(snapshots.glob("*.json"))) == 1
     assert json.loads(output.read_text(encoding="utf-8"))["snapshot"]["path"]
+
+
+def test_market_universe_without_explicit_cap_keeps_every_eligible_symbol(tmp_path: Path):
+    config = tmp_path / "universe.json"
+    config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "market": "futures",
+                "quote_asset": "USDT",
+                "discovery": {
+                    "mode": "all_trading_usdt_perpetuals",
+                    "always_include": ["BTCUSDT"],
+                    "exclude": [],
+                },
+                "criteria": {
+                    "minimum_listing_days": 1000,
+                    "minimum_24h_quote_volume_usdt": 50000000,
+                    "minimum_24h_trades": 50000,
+                    "maximum_spread_bps": 5.0,
+                    "minimum_open_interest_usdt": 25000000,
+                    "maximum_absolute_funding_rate": 0.001,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = run_screen(
+        config_path=config,
+        output_path=None,
+        session=_DynamicSession(),
+        now=datetime(2026, 7, 19, tzinfo=UTC),
+    )
+
+    assert report["maximum_research_symbols"] is None
+    assert report["eligible_research_symbols"] == ["BTCUSDT", "DOGEUSDT"]

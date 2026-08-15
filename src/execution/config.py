@@ -43,6 +43,7 @@ class ExchangeConfig:
     max_futures_leverage: int = 1
     futures_margin_mode: str = "isolated"
     quote_asset: str = "USDT"
+    allow_multi_symbol_positions: bool = False
 
     @property
     def account_fingerprint(self) -> str:
@@ -110,6 +111,7 @@ class ExchangeConfig:
             max_futures_leverage=max_futures_leverage,
             futures_margin_mode=futures_margin_mode,
             quote_asset=quote_asset,
+            allow_multi_symbol_positions=_env_bool("ALLOW_MULTI_SYMBOL_POSITIONS", False),
         )
 
 

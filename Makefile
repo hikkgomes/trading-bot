@@ -99,10 +99,21 @@ bot-flow:  ## Run one active-income paper cycle using runtime state
 autopilot-validate:  ## Validate the 24/7 autopilot config
 	$(PY) -m src.autopilot.runtime --config config/autopilot.json --validate
 
+.PHONY: platform-validate
+platform-validate:  ## Validate split platform configuration and node assignments
+	$(PY) -m src.services.supervisor --config config/platform.json \
+		--node linux-optiplex --service product-supervisor --validate
+
 .PHONY: bootstrap-strategies
 bootstrap-strategies:  ## Write paper-only bootstrap strategy artifacts for missing paper products
 	$(PY) -m src.autopilot.bootstrap_strategies --config config/autopilot.json \
 		--report runtime/bootstrap_strategies.json $(if $(OVERWRITE),--overwrite,)
+
+.PHONY: execution-diagnostic
+execution-diagnostic:  ## Run the isolated paper order, fill, and position diagnostic
+	$(PY) -m src.products.execution_diagnostic \
+		--journal runtime/execution_diagnostic_orders.jsonl \
+		--output runtime/execution_diagnostic.json
 
 .PHONY: readiness
 readiness:  ## Check local server readiness for autopilot operation
@@ -276,7 +287,7 @@ research-cycle: mutation-batch  ## Validate the autonomous population and gate p
 		--config config/autopilot.json \
 		--output runtime/research_cycle.json \
 		--state runtime/research_cycle_state.json \
-		--include-generated --generated-only --include-mutations \
+		--include-generated --include-mutations \
 		--generated-batch runtime/research/generated_hypotheses.json \
 		--mutation-batch runtime/mutation_hypotheses.json \
 		--research-factory-config config/research_factory.json

@@ -1961,7 +1961,7 @@ def evaluate_health(
         warnings.append(
             _issue(
                 "research_cycle_generated_batch_missing",
-                "generated-only research is waiting for a valid generated strategy batch",
+                "generated research input is waiting for a valid generated strategy batch",
                 detail={
                     "generated_at": research_cycle.get("generated_at"),
                     "status": (

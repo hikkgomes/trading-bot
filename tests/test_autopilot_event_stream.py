@@ -32,11 +32,14 @@ def test_default_event_capture_config_is_bounded_and_uses_approved_streams():
 
     assert config.max_total_bytes == 5 * 1024**3
     assert config.retention_seconds == 7 * 86400
-    futures = next(source for source in config.sources if source.market == "futures")
+    futures = next(source for source in config.sources if "depth20@100ms" in source.streams)
     names = stream_names(futures, ("ETHUSDT",))
     assert "btcusdt@depth20@100ms" in names
     assert "ethusdt@aggTrade" in names
     assert "!forceOrder@arr" in names
+    candle_source = next(source for source in config.sources if source.streams == ("kline_1m",))
+    assert candle_source.max_dynamic_symbols == 1_000
+    assert "ethusdt@kline_1m" in stream_names(candle_source, ("ETHUSDT",))
 
 
 def test_event_writer_rotates_and_never_exceeds_bounded_line_size(tmp_path):

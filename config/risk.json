@@ -1,0 +1,47 @@
+{
+  "schema": "risk/v1",
+  "global": {
+    "maximum_drawdown": 0.2,
+    "maximum_database_staleness_seconds": 30,
+    "maximum_market_data_staleness_seconds": 5,
+    "maximum_clock_skew_seconds": 1
+  },
+  "accounts": {
+    "binance-spot-main": {
+      "maximum_drawdown": 0.15,
+      "minimum_liquidation_buffer": 1.0
+    },
+    "binance-futures-main": {
+      "maximum_drawdown": 0.1,
+      "minimum_liquidation_buffer": 0.25,
+      "maximum_margin_fraction": 0.5
+    }
+  },
+  "products": {
+    "btc-accumulation": {
+      "maximum_daily_loss": 0.02,
+      "maximum_exposure": 1.0,
+      "maximum_drawdown": 0.12
+    },
+    "active-income": {
+      "maximum_daily_loss": 0.02,
+      "maximum_gross": 1.5,
+      "maximum_net": 0.5,
+      "maximum_drawdown": 0.1,
+      "maximum_margin_fraction": 0.5
+    }
+  },
+  "instrument": {
+    "maximum_fraction": 0.2,
+    "maximum_slippage_bps": 25.0,
+    "minimum_daily_quote_volume": 10000000.0
+  },
+  "strategy": {
+    "maximum_fraction": 0.25,
+    "maximum_drawdown": 0.1
+  },
+  "sleeve": {
+    "maximum_fraction": 0.5,
+    "maximum_correlation": 0.8
+  }
+}

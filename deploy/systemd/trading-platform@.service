@@ -1,0 +1,39 @@
+[Unit]
+Description=Trading platform service %i
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=trading-platform
+Group=trading-platform
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=/etc/trading-platform/platform.env
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/opt/trading-bot/.venv/bin/python -m src.services.supervisor --config /opt/trading-bot/config/platform.json --node linux-optiplex --service %i --validate
+ExecStart=/opt/trading-bot/.venv/bin/python -m src.services.supervisor --config /opt/trading-bot/config/platform.json --node linux-optiplex --service %i
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/opt/trading-bot/data /opt/trading-bot/runtime
+
+[Install]
+WantedBy=multi-user.target

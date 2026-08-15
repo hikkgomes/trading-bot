@@ -593,7 +593,7 @@ class CcxtBroker(Broker):
             params["reduceOnly"] = True
         if self.config.market_type == "futures" and not normalized_order.reduce_only:
             self._assert_no_open_orders_before_entry(normalized_order.symbol)
-            self._assert_futures_flat_before_entry(normalized_order.symbol)
+            self._assert_futures_position_compatible(normalized_order)
         result = self._client.create_order(
             symbol=client_symbol,
             type=normalized_order.type.value,
@@ -677,12 +677,15 @@ class CcxtBroker(Broker):
         symbol: str | None,
         conditional: bool,
     ) -> tuple[OpenOrderIdentity, ...]:
-        if (
-            self.config.market_type != "futures"
-            or str(self.config.exchange).lower() != "binanceusdm"
-        ):
+        exchange_name = str(self.config.exchange).lower()
+        futures_supported = self.config.market_type == "futures" and exchange_name == "binanceusdm"
+        spot_supported = (
+            self.config.market_type == "spot" and exchange_name == "binance" and not conditional
+        )
+        if not (futures_supported or spot_supported):
             raise RuntimeError(
-                "Open-order inventory verification is only validated for Binance USD-M futures."
+                "Open-order inventory verification is only validated for Binance spot regular "
+                "orders and Binance USD-M futures."
             )
         fetch_open_orders = getattr(self._client, "fetch_open_orders", None)
         if not callable(fetch_open_orders):
@@ -893,18 +896,30 @@ class CcxtBroker(Broker):
             or str(self.config.exchange).lower() != "binanceusdm"
         ):
             return
-        regular = self.list_account_open_orders(conditional=False)
-        conditional = self.list_account_open_orders(conditional=True)
+        if self.config.allow_multi_symbol_positions:
+            regular = self.list_open_orders(symbol, conditional=False)
+            conditional = ()
+        else:
+            regular = self.list_account_open_orders(conditional=False)
+            conditional = self.list_account_open_orders(conditional=True)
         if regular or conditional:
             raise RuntimeError(
                 "Refusing Binance USD-M entry: dedicated account has outstanding "
                 f"orders (regular={len(regular)}, conditional={len(conditional)})."
             )
 
-    def _assert_futures_flat_before_entry(self, symbol: str) -> None:
-        """Prove flatness at the final broker boundary before adding risk."""
+    def _assert_futures_position_compatible(self, order: Order) -> None:
+        """Prove that account state is compatible immediately before adding risk."""
 
         if self.config.market_type != "futures":
+            return
+        if self.config.allow_multi_symbol_positions:
+            position = self.get_position(order.symbol)
+            if not position.is_flat and position.side is not order.side:
+                raise RuntimeError(
+                    "Refusing futures entry: a non-reduce-only order would oppose the "
+                    f"current {order.symbol} position."
+                )
             return
         positions = self.list_account_futures_positions()
         if positions:

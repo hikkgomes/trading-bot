@@ -13,7 +13,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlparse
 
 import aiohttp
@@ -25,7 +25,9 @@ SCHEMA = "autopilot.market_event/v1"
 STATUS_SCHEMA = "autopilot.event_capture_status/v1"
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "event_capture.json"
 DEFAULT_STATUS = PROJECT_ROOT / "runtime" / "event_capture_status.json"
-ALLOWED_STREAMS = frozenset({"aggTrade", "trade", "bookTicker", "depth20@100ms", "markPrice@1s"})
+ALLOWED_STREAMS = frozenset(
+    {"aggTrade", "trade", "bookTicker", "depth20@100ms", "markPrice@1s", "kline_1m"}
+)
 ALLOWED_HOSTS = frozenset({"fstream.binance.com", "stream.binance.com"})
 MAX_EVENT_BYTES = 1024 * 1024
 
@@ -38,6 +40,7 @@ class EventSource:
     dynamic_universe: bool
     streams: tuple[str, ...]
     include_liquidations: bool
+    max_dynamic_symbols: int
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,7 @@ def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig
                 "dynamic_universe",
                 "streams",
                 "include_liquidations",
+                "max_dynamic_symbols",
             }
         ):
             raise ValueError(f"sources[{index}] has unknown fields: {', '.join(unknown)}")
@@ -151,6 +155,11 @@ def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig
                 dynamic_universe=dynamic,
                 streams=tuple(map(str, streams)),
                 include_liquidations=liquidations,
+                max_dynamic_symbols=_positive_int(
+                    item.get("max_dynamic_symbols", payload.get("max_dynamic_symbols")),
+                    field=f"sources[{index}].max_dynamic_symbols",
+                    maximum=1_000,
+                ),
             )
         )
     max_file_bytes = _positive_int(
@@ -193,12 +202,21 @@ def _dynamic_symbols(config: EventCaptureConfig) -> tuple[str, ...]:
     symbols = payload.get("eligible_research_symbols") if isinstance(payload, dict) else None
     if not isinstance(symbols, list):
         return ()
-    return tuple(str(symbol).upper() for symbol in symbols[: config.max_dynamic_symbols])
+    maximum = max(
+        (source.max_dynamic_symbols for source in config.sources if source.dynamic_universe),
+        default=config.max_dynamic_symbols,
+    )
+    return tuple(str(symbol).upper() for symbol in symbols[:maximum])
 
 
 def stream_names(source: EventSource, dynamic_symbols: tuple[str, ...] = ()) -> tuple[str, ...]:
     symbols = tuple(
-        dict.fromkeys((*source.symbols, *(dynamic_symbols if source.dynamic_universe else ())))
+        dict.fromkeys(
+            (
+                *source.symbols,
+                *(dynamic_symbols[: source.max_dynamic_symbols] if source.dynamic_universe else ()),
+            )
+        )
     )
     names = [f"{symbol.lower()}@{stream}" for symbol in symbols for stream in source.streams]
     if source.include_liquidations:
@@ -331,6 +349,19 @@ class EventWriter:
         return {"removed_files": removed, "removed_bytes": removed_bytes, "total_bytes": total}
 
 
+class EventSink(Protocol):
+    events: int
+    bytes: int
+
+    def write(self, event: Mapping[str, Any]) -> None: ...
+
+    def flush(self) -> None: ...
+
+    def close(self) -> None: ...
+
+    def enforce_retention(self, *, now: float | None = None) -> dict[str, int]: ...
+
+
 async def _collect_source(
     session: aiohttp.ClientSession,
     source: EventSource,
@@ -376,6 +407,7 @@ async def capture(
     max_events: int | None = None,
     max_seconds: float | None = None,
     status_path: Path | None = None,
+    sink: EventSink | None = None,
 ) -> dict[str, Any]:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -386,7 +418,7 @@ async def capture(
             pass
     dynamic = _dynamic_symbols(config)
     queue: asyncio.Queue = asyncio.Queue(maxsize=config.queue_max_events)
-    writer = EventWriter(config)
+    writer = sink or EventWriter(config)
     started = time.monotonic()
     last_status_write = 0.0
     last_event_ns: int | None = None

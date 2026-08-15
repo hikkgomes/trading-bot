@@ -1,0 +1,18 @@
+[Unit]
+Description=Trading platform %i backup
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=trading-platform
+Group=trading-platform
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=/etc/trading-platform/platform.env
+ExecStart=/opt/trading-bot/.venv/bin/python -m src.services.backup_service --config /opt/trading-bot/config/platform.json --mode %i
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot/runtime/backups

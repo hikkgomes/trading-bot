@@ -1,0 +1,42 @@
+{
+  "schema": "products/v1",
+  "products": [
+    {
+      "product_id": "btc_accumulation",
+      "objective": "increase BTC NAV relative to passive BTC hold",
+      "base_accounting_asset": "BTC",
+      "account_id": "binance-spot-main",
+      "universe_id": "btc-spot",
+      "portfolio_id": "btc-accumulation-portfolio",
+      "sleeves": ["tactical-allocation"],
+      "strategy_eligibility": ["named", "generated_dsl", "python", "ml"],
+      "promotion_policy_id": "btc-accumulation",
+      "risk_policy_id": "btc-accumulation",
+      "accounting_policy": "btc_nav",
+      "execution_costs": {"fee_bps": 10.0, "slippage_bps": 2.0},
+      "execution_mode": "paper"
+    },
+    {
+      "product_id": "active_income",
+      "objective": "produce risk-adjusted USDT income",
+      "base_accounting_asset": "USDT",
+      "account_id": "binance-futures-main",
+      "universe_id": "binance-usdt-perpetuals",
+      "portfolio_id": "active-income-portfolio",
+      "sleeves": ["directional", "relative-value", "funding", "microstructure"],
+      "strategy_eligibility": [
+        "named",
+        "generated_dsl",
+        "python",
+        "ml",
+        "relative_value",
+        "agent"
+      ],
+      "promotion_policy_id": "active-income",
+      "risk_policy_id": "active-income",
+      "accounting_policy": "usdt_nav",
+      "execution_costs": {"fee_bps": 5.0, "slippage_bps": 2.0},
+      "execution_mode": "paper"
+    }
+  ]
+}

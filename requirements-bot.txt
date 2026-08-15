@@ -11,9 +11,11 @@ ccxt==4.5.64
 numpy==2.4.4
 pandas==3.0.2
 pyarrow==24.0.0
+psycopg[binary]==3.3.4
 requests==2.33.1
 scipy==1.17.1
 scikit-learn==1.8.0
+SQLAlchemy==2.0.50
 TA-Lib==0.6.8
 
 # Locked transitive runtime dependencies.

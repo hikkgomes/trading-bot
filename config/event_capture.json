@@ -14,6 +14,16 @@
       "url": "wss://fstream.binance.com/stream",
       "symbols": ["BTCUSDT"],
       "dynamic_universe": true,
+      "max_dynamic_symbols": 1000,
+      "streams": ["kline_1m"],
+      "include_liquidations": false
+    },
+    {
+      "market": "futures",
+      "url": "wss://fstream.binance.com/stream",
+      "symbols": ["BTCUSDT"],
+      "dynamic_universe": true,
+      "max_dynamic_symbols": 12,
       "streams": ["aggTrade", "trade", "bookTicker", "depth20@100ms", "markPrice@1s"],
       "include_liquidations": true
     },
@@ -22,7 +32,7 @@
       "url": "wss://stream.binance.com:9443/stream",
       "symbols": ["BTCUSDT"],
       "dynamic_universe": false,
-      "streams": ["aggTrade", "bookTicker", "depth20@100ms"],
+      "streams": ["aggTrade", "bookTicker", "depth20@100ms", "kline_1m"],
       "include_liquidations": false
     }
   ]

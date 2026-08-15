@@ -1,0 +1,116 @@
+"""Canonical OpenClaw proposal contracts and safety policy."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from enum import StrEnum
+from pathlib import PurePosixPath
+from typing import Any
+
+from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
+
+
+class AgentRole(StrEnum):
+    RESEARCHER = "researcher"
+    CRITIC = "critic"
+    IMPLEMENTER = "implementer"
+    REVIEWER = "reviewer"
+
+
+class AgentAction(StrEnum):
+    CREATE_THESIS = "create_thesis"
+    REVISE_STRATEGY = "revise_strategy"
+    CREATE_DSL = "create_dsl"
+    CREATE_PYTHON_STRATEGY = "create_python_strategy"
+    CREATE_FEATURE = "create_feature"
+    CREATE_DATA_ADAPTER = "create_data_adapter"
+    CREATE_PARAMETER_SPACE = "create_parameter_space"
+    CREATE_ML_EXPERIMENT = "create_ml_experiment"
+    CREATE_ENSEMBLE = "create_ensemble"
+    REQUEST_RESEARCH_TEST = "request_research_test"
+    RETIRE_LINEAGE = "retire_lineage"
+    CREATE_TESTS = "create_tests"
+    RUN_BOUNDED_RESEARCH = "run_bounded_research"
+    PRODUCE_BRANCH = "produce_branch"
+    PRODUCE_MERGE_REQUEST = "produce_merge_request"
+    PRODUCE_EVIDENCE_REPORT = "produce_evidence_report"
+
+
+ALLOWED_FILE_ROOTS = (
+    PurePosixPath("src/strategies/library"),
+    PurePosixPath("src/features"),
+    PurePosixPath("src/data/adapters"),
+    PurePosixPath("src/research"),
+    PurePosixPath("tests"),
+)
+FORBIDDEN_CODE_MARKERS = (
+    "src.execution",
+    "src.run_bot",
+    "ccxt",
+    "CcxtBroker",
+    "BrokerExecutionVenue",
+    ".place_order(",
+    "EXCHANGE_API_KEY",
+    "EXCHANGE_API_SECRET",
+    "TRADING_LIVE",
+    "runtime/approvals.json",
+)
+
+
+@dataclass(frozen=True)
+class AgentProposal:
+    proposal_id: str
+    role: AgentRole
+    action: AgentAction
+    product_id: str
+    created_at: str
+    thesis: str
+    files: Mapping[str, str] = field(default_factory=dict)
+    research_jobs: tuple[Mapping[str, Any], ...] = ()
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "proposal_id", non_empty(self.proposal_id, field="proposal_id"))
+        object.__setattr__(self, "product_id", non_empty(self.product_id, field="product_id"))
+        if self.product_id not in {"btc_accumulation", "active_income"}:
+            raise ValueError("agent proposal product is unsupported")
+        object.__setattr__(self, "created_at", timestamp(self.created_at, field="created_at"))
+        object.__setattr__(self, "thesis", non_empty(self.thesis, field="thesis"))
+        if len(self.thesis.encode()) > 32_768:
+            raise ValueError("agent proposal thesis is too large")
+        if not isinstance(self.files, Mapping):
+            raise ValueError("agent proposal files must be an object")
+        normalised_files: dict[str, str] = {}
+        total_bytes = 0
+        for raw_path, content in self.files.items():
+            path = PurePosixPath(non_empty(raw_path, field="proposal file path"))
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError("agent proposal file paths must stay in the worktree")
+            if not any(path == root or root in path.parents for root in ALLOWED_FILE_ROOTS):
+                raise ValueError(f"agent proposal file path is outside allowed roots: {path}")
+            if not isinstance(content, str):
+                raise ValueError("agent proposal file content must be text")
+            total_bytes += len(content.encode())
+            if any(marker in content for marker in FORBIDDEN_CODE_MARKERS):
+                raise ValueError(f"agent proposal contains forbidden execution marker: {path}")
+            normalised_files[str(path)] = content
+        if len(normalised_files) > 40 or total_bytes > 524_288:
+            raise ValueError("agent proposal exceeds the code resource budget")
+        object.__setattr__(self, "files", normalised_files)
+        if len(self.research_jobs) > 10:
+            raise ValueError("agent proposal requests too many research jobs")
+        object.__setattr__(
+            self,
+            "research_jobs",
+            tuple(json_value(dict(item), field="research job") for item in self.research_jobs),
+        )
+        if not isinstance(self.provenance, Mapping):
+            raise ValueError("agent proposal provenance must be an object")
+        object.__setattr__(
+            self, "provenance", json_value(dict(self.provenance), field="provenance")
+        )
+
+    @property
+    def content_hash(self) -> str:
+        return canonical_hash(self)

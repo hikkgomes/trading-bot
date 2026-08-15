@@ -1,0 +1,31 @@
+{
+  "schema": "accounts/v1",
+  "accounts": [
+    {
+      "account_id": "binance-spot-main",
+      "venue": "binance",
+      "market": "spot",
+      "products": ["btc_accumulation"],
+      "quote_assets": ["USDT"],
+      "settlement_assets": ["BTC", "USDT"],
+      "environment": "production",
+      "maximum_leverage": 1.0,
+      "margin_mode": "cash",
+      "api_key_env": "BINANCE_API_KEY",
+      "api_secret_env": "BINANCE_API_SECRET"
+    },
+    {
+      "account_id": "binance-futures-main",
+      "venue": "binance",
+      "market": "usdt_futures",
+      "products": ["active_income"],
+      "quote_assets": ["USDT"],
+      "settlement_assets": ["USDT"],
+      "environment": "production",
+      "maximum_leverage": 3.0,
+      "margin_mode": "isolated",
+      "api_key_env": "BINANCE_API_KEY",
+      "api_secret_env": "BINANCE_API_SECRET"
+    }
+  ]
+}

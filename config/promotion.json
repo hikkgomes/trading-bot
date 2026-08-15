@@ -1,0 +1,29 @@
+{
+  "schema": "promotion/v1",
+  "policies": [
+    {
+      "policy_id": "btc-accumulation",
+      "automatic_paper_promotion": true,
+      "automatic_live_canary_promotion": false,
+      "canary_capital_limit": 0.02,
+      "required_forward_evidence_days": 90,
+      "maximum_drawdown": 0.1,
+      "maximum_execution_drift": 0.1,
+      "maximum_model_drift": 0.1,
+      "retirement_conditions": ["evidence_expired", "risk_breach", "persistent_drift"],
+      "capital_increase_policy": "manual_approval_required"
+    },
+    {
+      "policy_id": "active-income",
+      "automatic_paper_promotion": true,
+      "automatic_live_canary_promotion": false,
+      "canary_capital_limit": 0.01,
+      "required_forward_evidence_days": 60,
+      "maximum_drawdown": 0.08,
+      "maximum_execution_drift": 0.1,
+      "maximum_model_drift": 0.1,
+      "retirement_conditions": ["evidence_expired", "risk_breach", "persistent_drift"],
+      "capital_increase_policy": "manual_approval_required"
+    }
+  ]
+}

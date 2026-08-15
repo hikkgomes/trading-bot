@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly trading platform PostgreSQL backup
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=300
+Unit=trading-platform-backup@postgresql.service
+
+[Install]
+WantedBy=timers.target

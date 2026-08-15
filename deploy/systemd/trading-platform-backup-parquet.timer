@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily trading platform Parquet backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=900
+Unit=trading-platform-backup@parquet.service
+
+[Install]
+WantedBy=timers.target

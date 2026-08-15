@@ -23,10 +23,14 @@ from src.execution.broker import (
     ProtectiveOrderStatus,
 )
 from src.execution.config import ExchangeConfig
+from src.execution.live_exchange import BrokerExecutionVenue
 from src.execution.paper import PaperBroker, binance_mark_price
+from src.execution.paper_exchange import PaperExchange
+from src.execution.position_manager import SqlPositionStore
 
 __all__ = [
     "Broker",
+    "BrokerExecutionVenue",
     "Order",
     "OrderSide",
     "OrderType",
@@ -37,6 +41,8 @@ __all__ = [
     "ProtectiveOrder",
     "ProtectiveOrderStatus",
     "PaperBroker",
+    "PaperExchange",
+    "SqlPositionStore",
     "binance_mark_price",
     "ExchangeConfig",
 ]

@@ -64,6 +64,7 @@ from src.execution.broker import (
     ProtectiveOrderStatus,
 )
 from src.execution.config import ACCOUNT_FINGERPRINT_PREFIX
+from src.observability.decision_trace import DecisionTrace, DecisionTraceStage
 from src.trade_utils import gross_return_for_pnl_unit
 
 LOGGER = logging.getLogger("trading_bot")
@@ -680,20 +681,129 @@ class PaperTradingBot:
         if not self.decision_trace:
             self._start_decision_trace()
         strategy_id = str(strategy["id"])
+        serialized_detail = {
+            key: self._decision_trace_value(value)
+            for key, value in detail.items()
+            if value is not None
+        }
         item = {
             "strategy_id": strategy_id,
             "base_timeframe": strategy.get("base_timeframe"),
             "direction": strategy.get("direction"),
             "outcome": outcome,
-            **{
-                key: self._decision_trace_value(value)
-                for key, value in detail.items()
-                if value is not None
-            },
+            "funnel": self._decision_funnel(strategy_id, outcome, serialized_detail),
+            **serialized_detail,
         }
         self.decision_trace["strategies"][strategy_id] = item
         outcomes = self.decision_trace["summary"]["outcomes"]
         outcomes[outcome] = int(outcomes.get(outcome, 0)) + 1
+
+    def _decision_funnel(
+        self,
+        strategy_id: str,
+        outcome: str,
+        detail: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Map every executor outcome to the canonical no-trade funnel.
+
+        The legacy outcome remains for operator compatibility. ``funnel`` adds
+        the first blocked stage and a stable machine-readable reason without
+        participating in any trading decision.
+        """
+        event_time = str(
+            detail.get("latest_bar") or datetime.datetime.now(datetime.UTC).isoformat()
+        )
+        trace = DecisionTrace.start(
+            event_id=f"{strategy_id}:{event_time}",
+            instrument_id=f"{self.market}:{self.symbol}",
+        )
+
+        def passed_through(stage: DecisionTraceStage) -> DecisionTrace:
+            value = trace
+            for candidate in tuple(DecisionTraceStage):
+                if candidate is stage:
+                    break
+                value = value.pass_stage(candidate)
+            return value
+
+        signal_stage = {
+            "regime": DecisionTraceStage.REGIME_PASSED,
+            "setup": DecisionTraceStage.SETUP_PASSED,
+            "trigger": DecisionTraceStage.TRIGGER_PASSED,
+            "conditions": DecisionTraceStage.TRIGGER_PASSED,
+            "score_threshold": DecisionTraceStage.TRIGGER_PASSED,
+            "volatility_filter": DecisionTraceStage.TRIGGER_PASSED,
+        }
+        if outcome == "feature_build_failed":
+            return trace.block(
+                DecisionTraceStage.DATA_AVAILABLE,
+                reason_code="feature_or_data_unavailable",
+                executor_outcome=outcome,
+            ).to_dict()
+        if outcome in {"macro_data_unavailable", "macro_regime_blocked"}:
+            trace = passed_through(DecisionTraceStage.REGIME_PASSED)
+            return trace.block(
+                DecisionTraceStage.REGIME_PASSED,
+                reason_code=outcome,
+                executor_outcome=outcome,
+            ).to_dict()
+        if outcome == "signal_not_triggered":
+            stage = signal_stage.get(
+                str(detail.get("failed_stage")), DecisionTraceStage.TRIGGER_PASSED
+            )
+            trace = passed_through(stage)
+            return trace.block(
+                stage,
+                reason_code=str(detail.get("failed_stage") or "signal_not_triggered"),
+                executor_outcome=outcome,
+            ).to_dict()
+        if outcome in {
+            "alpha_ensemble_rejected",
+            "alpha_ensemble_not_selected",
+            "alpha_ensemble_conflict",
+            "portfolio_rejected",
+        }:
+            trace = passed_through(DecisionTraceStage.PORTFOLIO_ACCEPTED)
+            return trace.block(
+                DecisionTraceStage.PORTFOLIO_ACCEPTED,
+                reason_code=outcome,
+                executor_outcome=outcome,
+            ).to_dict()
+        if outcome in {
+            "cooldown",
+            "daily_stop",
+            "daily_trade_limit",
+            "drawdown_halted",
+            "position_capacity_blocked",
+            "entry_disabled",
+            "strategy_inactive",
+            "bar_already_processed",
+        }:
+            return trace.block(
+                DecisionTraceStage.DATA_AVAILABLE,
+                reason_code=outcome,
+                executor_outcome=outcome,
+            ).to_dict()
+        if outcome == "native_stop_exit":
+            trace = passed_through(DecisionTraceStage.POSITION_CLOSED)
+            return trace.pass_stage(
+                DecisionTraceStage.POSITION_CLOSED, executor_outcome=outcome
+            ).to_dict()
+        if outcome == "position_managed":
+            trace = passed_through(DecisionTraceStage.POSITION_OPENED)
+            return trace.pass_stage(
+                DecisionTraceStage.POSITION_OPENED, executor_outcome=outcome
+            ).to_dict()
+        if outcome == "entry_opened":
+            trace = passed_through(DecisionTraceStage.POSITION_OPENED)
+            return trace.pass_stage(
+                DecisionTraceStage.POSITION_OPENED, executor_outcome=outcome
+            ).to_dict()
+        return trace.block(
+            DecisionTraceStage.DATA_AVAILABLE,
+            reason_code=outcome,
+            executor_outcome=outcome,
+        ).to_dict()
 
     def _trace_hypothesis_signal(self, strategy: dict, frame: pd.DataFrame) -> tuple[bool, dict]:
         hypothesis = strategy["_hypothesis"]

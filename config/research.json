@@ -1,0 +1,49 @@
+{
+  "schema": "research/v1",
+  "strategy_families": [
+    "named",
+    "generated_dsl",
+    "python",
+    "ml",
+    "relative_value",
+    "microstructure",
+    "agent"
+  ],
+  "search_budgets": {
+    "maximum_candidates_per_day": 100,
+    "maximum_cpu_minutes_per_job": 120,
+    "maximum_memory_mb": 8192
+  },
+  "data_requirements": {
+    "point_in_time_universe": true,
+    "availability_timestamps": true,
+    "minimum_history_days": 365
+  },
+  "validation": {
+    "chronological_only": true,
+    "costs_required": true,
+    "portfolio_overlap_required": true,
+    "determinism_required": true,
+    "look_ahead_test_required": true
+  },
+  "holdout": {
+    "protected": true,
+    "single_claim_per_strategy_version": true,
+    "adaptive_feedback": false
+  },
+  "model_families": ["scikit_learn", "lightgbm"],
+  "agent_permissions": {
+    "create_dsl": true,
+    "create_python": true,
+    "create_features": true,
+    "create_tests": true,
+    "run_bounded_research": true,
+    "submit_exchange_orders": false
+  },
+  "worker_node": "macbook-research",
+  "resource_limits": {
+    "maximum_patch_files": 40,
+    "maximum_patch_bytes": 524288,
+    "maximum_runtime_seconds": 7200
+  }
+}

@@ -6,8 +6,9 @@ development evidence, and durably claims a lineage's protected holdout before
 it can be read.  Qualified outputs may enter isolated paper incubation, but no
 candidate can become an active live strategy through this module.
 
-Legacy curated and mutation-batch loaders remain available for old reports and
-tests; production configuration uses ``--generated-only``.
+Generated, mutation, and baseline strategy scenarios use the same bounded
+research cycle. Production configuration includes both the registered baseline
+coverage and generated candidates.
 """
 
 from __future__ import annotations
@@ -2960,7 +2961,6 @@ def run_research_cycle(
     include_mutations: bool = False,
     mutation_batch_path: Path = DEFAULT_MUTATION_BATCH,
     include_generated: bool = False,
-    generated_only: bool = False,
     generated_batch_path: Path = DEFAULT_GENERATED_BATCH,
     research_factory_config_path: Path = DEFAULT_RESEARCH_FACTORY_CONFIG,
 ) -> dict[str, Any]:
@@ -2991,10 +2991,9 @@ def run_research_cycle(
             generated_batch_path,
             factory_config_path=research_factory_config_path,
         )
-    base_scenarios = () if generated_only else scenarios
     scenarios = tuple(
         sorted(
-            (*base_scenarios, *generated_scenarios, *mutation_scenarios),
+            (*scenarios, *generated_scenarios, *mutation_scenarios),
             key=_protected_epoch_scenario_order,
         )
     )
@@ -3046,11 +3045,6 @@ def run_research_cycle(
         "exports": [],
         "skipped": False,
     }
-    if generated_only and not generated_scenarios:
-        report.update(error="generated_batch_not_ready")
-        if output_path:
-            write_json_atomic(output_path, report)
-        return report
     if not ready_markets:
         report.update(error="market_data_not_ready")
         if output_path:
@@ -3516,11 +3510,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Validate the safe autonomous batch from --generated-batch.",
     )
-    parser.add_argument(
-        "--generated-only",
-        action="store_true",
-        help="Disable the finite legacy scenarios and evaluate generated candidates only.",
-    )
     parser.add_argument("--generated-batch", type=Path, default=DEFAULT_GENERATED_BATCH)
     parser.add_argument(
         "--research-factory-config",
@@ -3547,7 +3536,6 @@ def main() -> None:
         include_mutations=args.include_mutations,
         mutation_batch_path=args.mutation_batch,
         include_generated=args.include_generated,
-        generated_only=args.generated_only,
         generated_batch_path=args.generated_batch,
         research_factory_config_path=args.research_factory_config,
         incubation_output_path=args.incubation_output,

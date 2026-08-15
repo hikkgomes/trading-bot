@@ -354,7 +354,7 @@ REQUIRED_CORE_JOB_FLAG_VALUES = {
 }
 REQUIRED_CORE_JOB_PRESENCE_FLAGS = {
     "regime_tag_futures_15m": ("--compact", "--skip-if-missing"),
-    "research_cycle": ("--include-generated", "--generated-only"),
+    "research_cycle": ("--include-generated",),
 }
 REQUIRED_CORE_JOB_FORBIDDEN_FLAGS = {
     "market_data_update_universe": ("--timeframes",),
@@ -362,6 +362,7 @@ REQUIRED_CORE_JOB_FORBIDDEN_FLAGS = {
     "market_data_update_futures": ("--timeframes",),
     "market_data_update_futures_1m": ("--exclude-timeframes",),
     "market_data_update_spot": ("--timeframes", "--exclude-timeframes"),
+    "research_cycle": ("--generated-only",),
 }
 
 
