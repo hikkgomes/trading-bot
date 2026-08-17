@@ -205,6 +205,7 @@ def run_screen(
             if maximum_research_symbols is None
             else eligible_rows[: int(maximum_research_symbols)]
         )
+        research_universe_symbols = [str(row["symbol"]) for row in eligible_rows]
         selected_symbols = [str(row["symbol"]) for row in selected_rows]
         selected = set(selected_symbols)
         for row in rows:
@@ -226,6 +227,8 @@ def run_screen(
             "eligible_symbols": [str(row["symbol"]) for row in eligible_rows],
             "research_symbols": selected_symbols,
             "eligible_research_symbols": selected_symbols,
+            "research_universe_symbols": research_universe_symbols,
+            "collection_symbols": selected_symbols,
             "maximum_research_symbols": maximum_research_symbols,
             "excluded_symbols": sorted(excluded),
             "criteria": criteria,

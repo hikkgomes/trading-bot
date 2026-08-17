@@ -8,6 +8,11 @@
   "retention_seconds": 604800,
   "flush_seconds": 1.0,
   "queue_max_events": 50000,
+  "data_tiers": {
+    "candles_funding_open_interest": {"maximum_symbols": 1000000},
+    "trades_best_bid_ask": {"maximum_symbols": 1000},
+    "rotating_depth": {"maximum_symbols": 100}
+  },
   "sources": [
     {
       "market": "futures",

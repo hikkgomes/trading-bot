@@ -1,0 +1,4 @@
+-- 001_platform_schema
+-- The executable migration is generated from src.data.database metadata by
+-- src.data.migrations. This marker keeps the applied version visible to
+-- operators and packaging tools.

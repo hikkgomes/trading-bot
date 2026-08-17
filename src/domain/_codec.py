@@ -7,6 +7,7 @@ import datetime as dt
 import hashlib
 import json
 import math
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 
@@ -50,7 +51,7 @@ def json_value(value: Any, *, field: str) -> Any:
 
 
 def canonical_hash(value: Any) -> str:
-    if dataclasses.is_dataclass(value):
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
         value = dataclasses.asdict(value)
     if isinstance(value, Enum):
         value = value.value
@@ -63,8 +64,10 @@ def canonical_hash(value: Any) -> str:
 def _json_default(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
-    if dataclasses.is_dataclass(value):
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return dataclasses.asdict(value)
+    if isinstance(value, Decimal):
+        return str(value)
     raise TypeError(f"Cannot encode {type(value).__name__}")
 
 

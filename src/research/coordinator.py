@@ -32,7 +32,8 @@ class Candidate:
     def __post_init__(self) -> None:
         object.__setattr__(self, "provider", non_empty(self.provider, field="provider"))
         if not self.dataset_snapshot_hashes or any(
-            not item.startswith("sha256:") for item in self.dataset_snapshot_hashes
+            not isinstance(item, str) or len(item) != 71 or not item.startswith("sha256:")
+            for item in self.dataset_snapshot_hashes
         ):
             raise ValueError("dataset_snapshot_hashes must contain SHA-256 hashes")
         object.__setattr__(self, "submitted_at", timestamp(self.submitted_at, field="submitted_at"))

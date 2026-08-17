@@ -96,8 +96,7 @@ def test_relative_value_job_supports_current_datetime_index_candles(tmp_path, mo
             {
                 "research_symbols": symbols,
                 "symbols": [
-                    {"symbol": symbol, "metrics": {"funding_rate": 0.001}}
-                    for symbol in symbols
+                    {"symbol": symbol, "metrics": {"funding_rate": 0.001}} for symbol in symbols
                 ],
             }
         ),

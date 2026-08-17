@@ -147,6 +147,8 @@ def _dynamic_universe_readiness(
                 and isinstance(snapshot_payload, dict)
                 and (snapshot_payload.get("snapshot") or {}).get("id") == snapshot_id
                 and snapshot_payload.get("generated_at") == payload.get("generated_at")
+                and snapshot_payload.get("research_universe_symbols")
+                == payload.get("research_universe_symbols")
                 and snapshot_payload.get("eligible_research_symbols")
                 == payload.get("eligible_research_symbols")
             )
@@ -154,7 +156,11 @@ def _dynamic_universe_readiness(
             snapshot_valid = False
     symbols = [
         str(symbol).upper()
-        for symbol in payload.get("eligible_research_symbols") or []
+        for symbol in (
+            payload.get("research_universe_symbols")
+            or payload.get("eligible_research_symbols")
+            or []
+        )
         if isinstance(symbol, str)
     ]
     age_seconds = (datetime.now(UTC) - generated_at).total_seconds()

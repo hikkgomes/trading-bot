@@ -11,6 +11,7 @@
       "sleeves": ["tactical-allocation"],
       "strategy_eligibility": ["named", "generated_dsl", "python", "ml"],
       "promotion_policy_id": "btc-accumulation",
+      "preflight_max_age_seconds": 3600,
       "risk_policy_id": "btc-accumulation",
       "accounting_policy": "btc_nav",
       "execution_costs": {"fee_bps": 10.0, "slippage_bps": 2.0},
@@ -33,6 +34,7 @@
         "agent"
       ],
       "promotion_policy_id": "active-income",
+      "preflight_max_age_seconds": 3600,
       "risk_policy_id": "active-income",
       "accounting_policy": "usdt_nav",
       "execution_costs": {"fee_bps": 5.0, "slippage_bps": 2.0},

@@ -154,9 +154,7 @@ def _close_series(config: PortfolioRiskConfig, symbol: str) -> tuple[pd.Series, 
     if isinstance(frame.index, pd.DatetimeIndex):
         timestamps = pd.to_datetime(frame.index, utc=True, errors="raise")
     else:
-        frame = pd.read_parquet(path, columns=["timestamp", "close"]).tail(
-            config.lookback_rows
-        )
+        frame = pd.read_parquet(path, columns=["timestamp", "close"]).tail(config.lookback_rows)
         if "timestamp" not in frame:
             raise ValueError(f"{symbol} risk history has no timestamp index or column")
         timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="raise")

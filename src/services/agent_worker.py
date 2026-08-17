@@ -65,9 +65,6 @@ class DatabaseAgentJobHandlers:
                 name=name,
                 payload={
                     **payload,
-                    "agent_proposal_id": proposal.proposal_id,
-                    "maximum_seconds": maximum_seconds,
-                    "agent_may_submit_orders": False,
                 },
                 available_at=proposal.created_at,
                 priority=5,

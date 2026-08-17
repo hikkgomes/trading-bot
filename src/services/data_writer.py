@@ -100,7 +100,7 @@ class DatabaseMarketDataWriter:
             "feature_set_version": "core-bars-v1",
             "source_event_time": source_event_time,
             "source_close_time": source_close_time,
-            "availability_time": event.receive_timestamp,
+            "availability_time": event.availability_timestamp,
             "inputs": {
                 "open": float(candle["o"]),
                 "high": float(candle["h"]),
@@ -120,7 +120,7 @@ class DatabaseMarketDataWriter:
             job_id=job_id,
             name="live_feature_calculation",
             payload=payload,
-            available_at=event.receive_timestamp,
+            available_at=event.availability_timestamp,
             priority=10,
         )
         return job_id

@@ -47,6 +47,12 @@ class StrategyDefinition:
             object.__setattr__(
                 self, attribute, non_empty(getattr(self, attribute), field=attribute)
             )
+        if (
+            not self.source_hash.startswith("sha256:")
+            or len(self.source_hash) != 71
+            or any(character not in "0123456789abcdef" for character in self.source_hash[7:])
+        ):
+            raise ValueError("source_hash must be a sha256: identity")
         for attribute in (
             "universe",
             "data_requirements",

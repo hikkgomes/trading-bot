@@ -454,9 +454,7 @@ def _signal_frequency(
             round(float(np.median(gaps) * timeframe_seconds), 3) if gaps.size else None
         ),
         "p95_signal_gap_seconds": (
-            round(float(np.percentile(gaps, 95) * timeframe_seconds), 3)
-            if gaps.size
-            else None
+            round(float(np.percentile(gaps, 95) * timeframe_seconds), 3) if gaps.size else None
         ),
         "months_with_signal_fraction": (
             round(float(months_with_signal_fraction), 6)

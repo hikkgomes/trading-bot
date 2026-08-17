@@ -33,6 +33,8 @@ class MarketEvent:
     receive_timestamp: str
     sequence: int
     payload: Mapping[str, Any]
+    close_timestamp: str | None = None
+    availability_time: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "event_type", MarketEventType(self.event_type))
@@ -56,11 +58,19 @@ class MarketEvent:
         if not isinstance(self.payload, Mapping):
             raise ValueError("payload must be an object")
         object.__setattr__(self, "payload", json_value(dict(self.payload), field="payload"))
+        close_timestamp = self.close_timestamp or self.exchange_timestamp
+        availability_time = self.availability_time or self.receive_timestamp
+        close_timestamp = timestamp(close_timestamp, field="close_timestamp")
+        availability_time = timestamp(availability_time, field="availability_time")
+        if availability_time < self.receive_timestamp:
+            raise ValueError("availability_time cannot precede receive_timestamp")
+        object.__setattr__(self, "close_timestamp", close_timestamp)
+        object.__setattr__(self, "availability_time", availability_time)
 
     @property
     def availability_timestamp(self) -> str:
         """The earliest time a live strategy is permitted to use this event."""
-        return self.receive_timestamp
+        return str(self.availability_time)
 
     @property
     def event_id(self) -> str:
@@ -69,7 +79,9 @@ class MarketEvent:
                 "instrument_id": self.instrument_id,
                 "event_type": self.event_type.value,
                 "exchange_timestamp": self.exchange_timestamp,
+                "close_timestamp": self.close_timestamp,
                 "receive_timestamp": self.receive_timestamp,
+                "availability_time": self.availability_time,
                 "sequence": self.sequence,
                 "payload": dict(self.payload),
             }

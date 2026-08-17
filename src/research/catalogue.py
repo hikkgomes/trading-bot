@@ -9,6 +9,12 @@ from collections.abc import Iterable
 from src.domain.strategies import StrategyDefinition, StrategySourceType
 from src.research.coordinator import Candidate
 from src.strategies import library  # noqa: F401
+from src.strategies.manifest import (
+    assert_manifest_complete,
+    manifest_by_name,
+    manifest_description,
+    manifest_source_type,
+)
 from src.strategies.registry import available, describe
 
 
@@ -23,16 +29,18 @@ def registered_strategy_candidates(
     named strategy library from being excluded merely because it is not DSL.
     """
     now = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+    assert_manifest_complete()
     descriptions = describe()
+    manifest = manifest_by_name()
     candidates: list[Candidate] = []
-    for name in available():
+    names = sorted(set(available()) | set(manifest))
+    for name in names:
         source_hash = "sha256:" + hashlib.sha256(name.encode()).hexdigest()
+        entry = manifest.get(name)
         evidence_type = (
             "btc_allocation"
             if product == "btc_accumulation"
-            else "ml"
-            if name.startswith("ml_")
-            else "swing"
+            else (entry.evidence_type if entry is not None else "swing")
         )
         definition = StrategyDefinition(
             identity=name,
@@ -47,9 +55,17 @@ def registered_strategy_candidates(
             execution_preferences={},
             risk_policy={},
             validation_policy={"evidence_type": evidence_type},
+            # The common queue owns execution of these catalogue entries. The
+            # family-specific source type remains explicit metadata until a
+            # concrete evaluator is registered for that family.
             source_type=StrategySourceType.REGISTERED_PYTHON,
             source_hash=source_hash,
-            metadata={"description": descriptions.get(name, "")},
+            metadata={
+                "description": descriptions.get(name) or manifest_description(name),
+                "manifest_family": entry.family if entry is not None else "supplemental",
+                "canonical_source_type": manifest_source_type(name),
+                "executable_registry_entry": name in available(),
+            },
         )
         candidates.append(
             Candidate(

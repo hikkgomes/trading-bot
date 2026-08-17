@@ -17,6 +17,9 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
       --shell /usr/sbin/nologin trading-platform
   fi
   install -d -m 0750 -o trading-platform -g trading-platform /etc/trading-platform
+  for directory in data runtime runtime/backups; do
+    install -d -m 0750 -o trading-platform -g trading-platform "$REPO/$directory"
+  done
   install -m 0644 "$REPO/deploy/systemd/trading-platform@.service" \
     /etc/systemd/system/trading-platform@.service
   install -m 0644 "$REPO/deploy/systemd/trading-platform-backup@.service" \

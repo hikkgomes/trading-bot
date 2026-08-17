@@ -52,6 +52,8 @@ def normalise_public_event(
     if not symbol or not symbol.isalnum():
         raise ValueError("Binance public event has no valid symbol")
     event_time = payload.get("E", payload.get("T"))
+    kline = payload.get("k") if isinstance(payload.get("k"), Mapping) else {}
+    close_time = kline.get("T") if kline else event_time
     sequence_value = next(
         (
             payload[key]
@@ -68,4 +70,6 @@ def normalise_public_event(
         receive_timestamp=receive_timestamp,
         sequence=int(sequence_value),
         payload={"stream": stream, "data": dict(payload)},
+        close_timestamp=_time_from_ms(close_time, fallback=receive_timestamp),
+        availability_time=receive_timestamp,
     )

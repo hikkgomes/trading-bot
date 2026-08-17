@@ -46,7 +46,12 @@ from src.services.order_execution import (
 from src.services.order_recovery import DatabaseLiveRecoveryWorker
 from src.services.portfolio_engine import DatabasePortfolioWorker, DatabaseProductCoordinator
 from src.services.portfolio_service import SqlPortfolioRepository
-from src.services.promotion import DatabasePromotionWorker, SqlPromotionStore
+from src.services.promotion import (
+    DatabasePromotionWorker,
+    PromotionPolicy,
+    SqlPromotionPolicyStore,
+    SqlPromotionStore,
+)
 from src.services.report_worker import DatabaseReportWorker
 from src.services.research_jobs import DatabaseResearchJobHandlers
 from src.services.research_worker import ResearchWorker
@@ -163,7 +168,6 @@ def _execution_cycle(
     *,
     database: PlatformDatabase,
     configuration: Mapping[str, Mapping[str, Any]],
-    config_root: Path,
     node_id: str,
 ) -> Callable[[], dict[str, Any]]:
     products = _by_id(configuration["products"], collection="products", identity="product_id")
@@ -229,7 +233,6 @@ def _execution_cycle(
         approved_live = ApprovedLiveExecution(
             engine=database.engine,
             configuration=configuration,
-            config_root=config_root,
             order_manager=order_manager,
             positions=positions,
         )
@@ -393,7 +396,12 @@ def _feature_cycle(
     return lambda: worker.run_once(now=utc_now())
 
 
-def _promotion_cycle(*, database: PlatformDatabase, node_id: str) -> Callable[[], dict[str, Any]]:
+def _promotion_cycle(
+    *,
+    database: PlatformDatabase,
+    node_id: str,
+    configuration: Mapping[str, Mapping[str, Any]],
+) -> Callable[[], dict[str, Any]]:
     queue = DatabaseJobQueue(database.engine)
     worker_id = f"{node_id}:promotion-engine"
     queue.register_worker(
@@ -403,10 +411,23 @@ def _promotion_cycle(*, database: PlatformDatabase, node_id: str) -> Callable[[]
         capabilities=("promotion_evaluation",),
         observed_at=utc_now(),
     )
+    policy_store = SqlPromotionPolicyStore(database.engine)
+    for raw_policy in configuration["promotion"]["policies"]:
+        policy_fields = {
+            key: raw_policy[key]
+            for key in PromotionPolicy.__dataclass_fields__
+            if key in raw_policy
+        }
+        policy_store.put(
+            str(raw_policy["policy_id"]),
+            PromotionPolicy(**policy_fields),
+            created_at=utc_now(),
+        )
     worker = DatabasePromotionWorker(
         queue=queue,
         worker_id=worker_id,
         store=SqlPromotionStore(database.engine),
+        policy_store=policy_store,
     )
     return lambda: worker.run_once(now=utc_now())
 
@@ -559,7 +580,9 @@ def run(args: argparse.Namespace) -> int:
     if not database.is_postgresql:
         raise ValueError("platform services require PostgreSQL")
     if args.initialise_schema:
-        database.create_schema()
+        database.migrate()
+    else:
+        database.assert_migrated()
     heartbeat_store = DatabaseHeartbeatStore(database.engine)
     runtime = ServiceRuntime(
         config=config,
@@ -584,7 +607,6 @@ def run(args: argparse.Namespace) -> int:
         work = _execution_cycle(
             database=database,
             configuration=split_configuration,
-            config_root=args.config.parent,
             node_id=args.node,
         )
     elif args.service == "paper-engine":
@@ -605,7 +627,11 @@ def run(args: argparse.Namespace) -> int:
             parquet_root=Path(config.paths["parquet"]),
         )
     elif args.service == "promotion-engine":
-        work = _promotion_cycle(database=database, node_id=args.node)
+        work = _promotion_cycle(
+            database=database,
+            node_id=args.node,
+            configuration=split_configuration,
+        )
     elif args.service == "accounting-service":
         work = _accounting_cycle(database=database, node_id=args.node)
     elif args.service == "report-worker":

@@ -6,7 +6,7 @@ from src.data.catalogue import InstrumentCatalogue
 from src.data.feature_store import DeterministicFeatureCalculator, FeatureValue, SqlFeatureStore
 from src.data.historical_query import DuckDBHistoricalQuery
 from src.data.parquet_store import ContentAddressedStore, PartitionedMarketEventStore
-from src.data.snapshots import DatasetSnapshot
+from src.data.snapshots import DatasetSnapshot, SqlDatasetSnapshotStore
 from src.data.universe import (
     InstrumentObservation,
     SqlUniverseStore,
@@ -17,6 +17,7 @@ from src.data.universe import (
 __all__ = [
     "ContentAddressedStore",
     "DatasetSnapshot",
+    "SqlDatasetSnapshotStore",
     "DeterministicFeatureCalculator",
     "DuckDBHistoricalQuery",
     "FeatureValue",

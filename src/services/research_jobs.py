@@ -16,6 +16,7 @@ from src.research.backtest.event_engine import (
 )
 from src.research.catalogue import registered_strategy_candidates
 from src.research.coordinator import Candidate, ResearchCoordinator
+from src.research.evaluation import CanonicalResearchEvaluator, EvaluationRequest
 from src.research.ml import MlExperimentRunner
 from src.research.providers import provider_candidate
 from src.research.store import SqlResearchStore
@@ -123,47 +124,16 @@ class DatabaseResearchJobHandlers:
     def evaluate_candidate(
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
     ) -> dict[str, Any]:
-        coordinator = ResearchCoordinator(self.store)
-        stages = claimed.payload.get("stages")
-        if not isinstance(stages, Mapping):
-            raise ValueError("research evaluation stages must be an object")
-
-        def validator(stage_name: str):
-            def evaluate(_candidate: Candidate):
-                renew()
-                stage = stages.get(stage_name)
-                if not isinstance(stage, Mapping):
-                    raise ValueError(f"research evaluation is missing {stage_name}")
-                accepted = stage.get("accepted")
-                evidence = stage.get("evidence")
-                if not isinstance(accepted, bool) or not isinstance(evidence, Mapping):
-                    raise ValueError(f"research evaluation {stage_name} is invalid")
-                if accepted:
-                    missing = _REQUIRED_EVIDENCE[stage_name] - set(evidence)
-                    if missing:
-                        raise ValueError(
-                            f"research evaluation {stage_name} lacks evidence: {sorted(missing)}"
-                        )
-                    if stage_name == "development":
-                        _validate_sample_evidence(_candidate, evidence["sample_evidence"])
-                reason = stage.get("reason_code")
-                return accepted, str(reason) if reason is not None else None, dict(evidence)
-
-            return evaluate
-
-        result = coordinator.evaluate(
-            str(claimed.payload["candidate_id"]),
-            screening=validator("screening"),
-            development=validator("development"),
-            robustness=validator("robustness"),
-            protected=validator("protected"),
-            evaluated_at=str(claimed.payload["evaluated_at"]),
-        )
+        renew()
+        request = EvaluationRequest.from_payload(claimed.payload)
+        result = CanonicalResearchEvaluator(self.store).evaluate(request)
         return {
             "candidate_id": result.candidate_id,
-            "state": result.state.value,
+            "stage": result.stage,
             "accepted": result.accepted,
             "reason_code": result.reason_code,
+            "run_id": result.run_id,
+            "evidence_hash": result.evidence_hash,
         }
 
     def bounded_backtest(
@@ -234,7 +204,7 @@ class DatabaseResearchJobHandlers:
             }
             for item in result.orders
         ]
-        evidence = {
+        evidence: dict[str, object] = {
             "orders": order_evidence,
             "positions": dict(result.positions),
             "connection_gaps": list(result.connection_gaps),

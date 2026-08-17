@@ -189,9 +189,7 @@ def _proposal(
         **(
             {
                 "adaptive_feedback": candidate["adaptive_feedback"],
-                "mutation_focus_stage": candidate["adaptive_feedback"].get(
-                    "mutation_focus_stage"
-                ),
+                "mutation_focus_stage": candidate["adaptive_feedback"].get("mutation_focus_stage"),
             }
             if isinstance(candidate.get("adaptive_feedback"), dict)
             else {}

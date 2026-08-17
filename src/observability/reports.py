@@ -12,6 +12,7 @@ from src.accounting.ledger import Ledger, SqlLedgerStore
 from src.accounting.nav import NavSnapshot
 from src.data.database import (
     accounting_entry,
+    active_strategy_assignment,
     agent_action,
     alert,
     alpha_forecast,
@@ -19,14 +20,26 @@ from src.data.database import (
     exchange_order,
     experiment,
     fill,
+    forward_evidence,
+    forward_paper_observation,
+    holdout_claim,
+    holdout_outcome,
     job,
     nav_snapshot,
     position,
+    production_preflight,
+    promotion_event,
     protective_stop,
+    strategy_approval,
+    strategy_artefact,
+    strategy_identity,
+    strategy_lineage,
     target_position,
     validation_result,
+    validation_stage,
     worker,
 )
+from src.domain._codec import to_primitive
 from src.observability.decision_trace import SqlDecisionTraceStore
 from src.services.health import DatabaseHeartbeatStore
 
@@ -56,7 +69,7 @@ class DatabasePlatformReport:
         if order_by is not None:
             statement = statement.order_by(order_by)
         with self.engine.connect() as connection:
-            return [dict(item) for item in connection.execute(statement).mappings()]
+            return [to_primitive(dict(item)) for item in connection.execute(statement).mappings()]
 
     def _trading(self) -> dict[str, Any]:
         positions = self._payloads(position, order_by=position.c.created_at.desc())
@@ -68,6 +81,10 @@ class DatabasePlatformReport:
             "target_positions": targets,
             "alpha_forecasts": forecasts,
             "stops": stops,
+            "active_strategy_assignments": self._rows(
+                active_strategy_assignment,
+                order_by=active_strategy_assignment.c.assigned_at.desc(),
+            ),
             "account_balances": self._payloads(
                 balance_snapshot, order_by=balance_snapshot.c.created_at.desc()
             ),
@@ -84,6 +101,17 @@ class DatabasePlatformReport:
             ],
             "experiments": experiments,
             "validation_results": results,
+            "validation_stages": self._rows(validation_stage),
+            "holdout_claims": self._rows(holdout_claim),
+            "holdout_outcomes": self._rows(holdout_outcome),
+            "forward_evidence": self._rows(forward_evidence),
+            "forward_paper_observations": self._rows(forward_paper_observation),
+            "strategy_identities": self._rows(strategy_identity),
+            "strategy_lineage": self._rows(strategy_lineage),
+            "strategy_artefacts": self._rows(strategy_artefact),
+            "strategy_approvals": self._rows(strategy_approval),
+            "production_preflights": self._rows(production_preflight),
+            "promotion_events": self._rows(promotion_event),
             "rejection_reasons": [
                 item.get("reason_code") for item in results if item.get("reason_code")
             ],
@@ -116,7 +144,8 @@ class DatabasePlatformReport:
                     },
                 },
             )
-            metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+            raw_metadata = entry.get("metadata")
+            metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
             kind = str(metadata.get("kind") or "")
             effect = float(metadata.get("pnl_effect") or 0.0)
             metric = "fees" if kind == "fee" else kind

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -238,6 +239,35 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
         configuration["portfolios"], collection="portfolios", key="portfolio_id"
     )
     policies = _unique_records(configuration["promotion"], collection="policies", key="policy_id")
+    for policy_id, policy in policies.items():
+        for field in ("automatic_paper_promotion", "automatic_live_canary_promotion"):
+            if not isinstance(policy.get(field), bool):
+                raise ValueError(f"promotion policy {policy_id}.{field} must be a boolean")
+        required_days = policy.get("required_forward_evidence_days")
+        if (
+            not isinstance(required_days, int)
+            or isinstance(required_days, bool)
+            or required_days <= 0
+        ):
+            raise ValueError(
+                f"promotion policy {policy_id}.required_forward_evidence_days must be positive"
+            )
+        for field in (
+            "canary_capital_limit",
+            "maximum_drawdown",
+            "maximum_execution_drift",
+            "maximum_model_drift",
+        ):
+            value = policy.get(field)
+            if (
+                not isinstance(value, int | float)
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            ):
+                raise ValueError(
+                    f"promotion policy {policy_id}.{field} must be finite and non-negative"
+                )
     risk_products = _mapping(configuration["risk"].get("products"), field="risk.products")
     if set(products) != {"btc_accumulation", "active_income"}:
         raise ValueError("products must define btc_accumulation and active_income")
@@ -262,6 +292,13 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
             raise ValueError(f"product {product_id} refers to an unknown risk policy")
         if product.get("execution_mode") not in {"paper", "live"}:
             raise ValueError(f"product {product_id} has an invalid execution mode")
+        preflight_age = product.get("preflight_max_age_seconds", 3_600)
+        if (
+            not isinstance(preflight_age, int)
+            or isinstance(preflight_age, bool)
+            or preflight_age <= 0
+        ):
+            raise ValueError(f"product {product_id} has an invalid preflight age")
         costs = _mapping(product.get("execution_costs"), field=f"{product_id}.execution_costs")
         for name in ("fee_bps", "slippage_bps"):
             value = costs.get(name)

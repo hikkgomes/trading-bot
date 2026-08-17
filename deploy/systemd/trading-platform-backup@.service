@@ -10,6 +10,7 @@ User=trading-platform
 Group=trading-platform
 WorkingDirectory=/opt/trading-bot
 EnvironmentFile=/etc/trading-platform/platform.env
+ExecStartPre=/opt/trading-bot/.venv/bin/python -m src.data.migrate
 ExecStart=/opt/trading-bot/.venv/bin/python -m src.services.backup_service --config /opt/trading-bot/config/platform.json --mode %i
 NoNewPrivileges=true
 PrivateTmp=true

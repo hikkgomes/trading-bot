@@ -5,21 +5,13 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import replace
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
-from src.autopilot.approvals import (
-    artifact_digest,
-    assert_loaded_artifact_live_approved,
-    load_artifact,
-    load_production_preflight_evidence,
-)
-from src.autopilot.config import load_config as load_autopilot_config
-from src.autopilot.runtime import assert_recent_testnet_rehearsal
 from src.data.database import instrument as instrument_table
+from src.domain._codec import canonical_hash
 from src.domain.instruments import Instrument, MarketType
 from src.domain.orders import OrderIntent
 from src.execution.ccxt_broker import CcxtBroker
@@ -28,17 +20,23 @@ from src.execution.live_exchange import BrokerExecutionVenue
 from src.execution.order_manager import OrderManager
 from src.execution.position_manager import PositionManager
 from src.execution.reconciler import ReconciliationResult, reconcile_account
+from src.research.canonical import (
+    SqlActiveStrategyAssignmentRepository,
+    SqlApprovalRepository,
+    SqlPreflightRepository,
+    SqlStrategyArtefactRepository,
+    preflight_is_fresh,
+)
 
 
 class ApprovedLiveExecution:
-    """Build live adapters only when split and mandatory legacy gates agree."""
+    """Build live adapters only from canonical PostgreSQL-backed authority."""
 
     def __init__(
         self,
         *,
         engine: Engine,
         configuration: Mapping[str, Mapping[str, Any]],
-        config_root: Path,
         order_manager: OrderManager,
         positions: PositionManager,
     ) -> None:
@@ -49,21 +47,22 @@ class ApprovedLiveExecution:
             for product_id, product in products.items()
             if product["execution_mode"] == "live"
         }
-        autopilot = load_autopilot_config(config_root / "autopilot.json", strict_jobs=False)
-        self.legacy_products = {product.name: product for product in autopilot.products}
-        self.approval_ledger = autopilot.approval_ledger
         self.order_manager = order_manager
         self.positions = positions
+        self.products = products
+        self.assignments = SqlActiveStrategyAssignmentRepository(engine)
+        self.artefacts = SqlStrategyArtefactRepository(engine)
+        self.approvals = SqlApprovalRepository(engine)
+        self.preflights = SqlPreflightRepository(engine)
         self.product_portfolios = {
             product_id: str(product["portfolio_id"]) for product_id, product in products.items()
         }
         instruments = _load_instruments(engine)
         self.venues: dict[str, BrokerExecutionVenue] = {}
         for product_id, product in live_products.items():
-            legacy = self.legacy_products.get(product_id)
-            if legacy is None or legacy.execution_mode != "live":
+            if self.assignments.active(product_id) is None:
                 raise ValueError(
-                    f"live product {product_id} must also be live in config/autopilot.json"
+                    f"live product {product_id} has no active canonical strategy assignment"
                 )
             account = accounts[str(product["account_id"])]
             market = "spot" if account["market"] == "spot" else "futures"
@@ -135,26 +134,85 @@ class ApprovedLiveExecution:
 
     def authorise(self, payload: Mapping[str, Any], order: OrderIntent) -> None:
         product_id = str(payload["product_id"])
-        product = self.legacy_products[product_id]
-        artifact = load_artifact(product.strategies_path)
-        digest = artifact_digest(artifact)
-        load_production_preflight_evidence(
-            product,
-            expected_artifact_digest=digest,
-            require_fresh=True,
+        product = self.products[product_id]
+        account_id = str(product["account_id"])
+        current_assignment = self.assignments.active(product_id)
+        if current_assignment is None:
+            raise PermissionError("live product has no active canonical assignment")
+        requested_strategy_id = str(payload.get("strategy_version_id") or "")
+        if (
+            requested_strategy_id
+            and requested_strategy_id != current_assignment["strategy_version_id"]
+        ):
+            raise PermissionError("live order strategy identity does not match assignment")
+        requested_artefact_hash = str(payload.get("artefact_hash") or "")
+        if (
+            requested_artefact_hash
+            and requested_artefact_hash != current_assignment["artefact_hash"]
+        ):
+            raise PermissionError("live order artefact identity does not match assignment")
+        assignment = self.assignments.assert_binding(
+            product_id=product_id,
+            strategy_version_id=str(current_assignment["strategy_version_id"]),
+            artefact_hash=str(current_assignment["artefact_hash"]),
+            execution_mode="live",
         )
-        assert_loaded_artifact_live_approved(
-            artifact,
-            product.strategies_path,
-            self.approval_ledger,
-            product=product,
+        artifact = self.artefacts.get(str(assignment["artefact_hash"]))
+        declared_hash = artifact.get("artefact_hash")
+        content = dict(artifact)
+        content.pop("artefact_hash", None)
+        if declared_hash != assignment["artefact_hash"] or canonical_hash(content) != declared_hash:
+            raise PermissionError("canonical live artefact content hash does not match assignment")
+        strategy_version_id = str(artifact.get("strategy_version_id") or "")
+        if strategy_version_id != assignment["strategy_version_id"]:
+            raise PermissionError(
+                "canonical live artefact strategy identity does not match assignment"
+            )
+        if artifact.get("product_id") != product_id or artifact.get("account_id") != account_id:
+            raise PermissionError("canonical live artefact account or product does not match")
+        if artifact.get("portfolio_id") != assignment["portfolio_id"]:
+            raise PermissionError("canonical live artefact portfolio does not match assignment")
+        approval = self.approvals.latest(
+            strategy_version_id=strategy_version_id,
+            product_id=product_id,
+            account_id=account_id,
         )
-        assert_recent_testnet_rehearsal(product, artifact=artifact)
+        if approval is None or approval["status"] != "approved":
+            raise PermissionError("canonical live artefact has no current human approval")
+        preflight = self.preflights.latest(
+            strategy_version_id=strategy_version_id,
+            product_id=product_id,
+            account_id=account_id,
+        )
+        if preflight is None or not preflight["accepted"]:
+            raise PermissionError("canonical live artefact has no accepted preflight")
+        if not preflight_is_fresh(
+            str(preflight["checked_at"]),
+            maximum_age_seconds=int(product.get("preflight_max_age_seconds", 3_600)),
+        ):
+            raise PermissionError("canonical live artefact preflight is stale")
+        for record, label in ((approval, "approval"), (preflight, "preflight")):
+            if any(
+                record[field] != artifact.get(field)
+                for field in ("artefact_hash", "source_commit_hash", "engine_version")
+            ):
+                raise PermissionError(f"canonical {label} is not bound to the live artefact")
+        if float(assignment["capital_limit"]) > min(
+            float(approval["capital_cap"]), float(preflight["capital_cap"])
+        ):
+            raise PermissionError("active assignment exceeds approved/preflight capital cap")
         strategies = {
             str(item.get("id") or ""): item
-            for item in artifact["strategies"]
+            for item in artifact.get("strategies", [])
             if isinstance(item, dict)
         }
+        if not strategies:
+            strategies = {
+                strategy_version_id: {
+                    "id": strategy_version_id,
+                    "supported_instruments": artifact.get("supported_instruments", []),
+                }
+            }
         contributions = set(order.strategy_contributions)
         if not contributions or not contributions <= set(strategies):
             raise PermissionError(
@@ -163,13 +221,9 @@ class ApprovedLiveExecution:
         instrument = self.venues[product_id].instruments.get(order.instrument_id)
         if instrument is None:
             raise PermissionError("live order instrument is not persisted and tradable")
-        if any(
-            str(strategies[strategy_id].get("symbol") or "").upper() != instrument.exchange_symbol
-            for strategy_id in contributions
-        ):
-            raise PermissionError(
-                "live order instrument does not match each approved contributing strategy"
-            )
+        allowed_instruments = set(artifact.get("supported_instruments", []))
+        if instrument.instrument_id not in allowed_instruments:
+            raise PermissionError("live order instrument is not bound to the canonical artefact")
 
 
 def _records(

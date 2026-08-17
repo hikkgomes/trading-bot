@@ -12,6 +12,22 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: trading_platform
+          POSTGRES_PASSWORD: trading_platform
+          POSTGRES_DB: trading_platform
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U trading_platform -d trading_platform"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      TRADING_PLATFORM_DATABASE_URL: postgresql+psycopg://trading_platform:trading_platform@127.0.0.1:5432/trading_platform
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,7 +42,13 @@ jobs:
         run: |
           .venv/bin/python -m ruff check .
           .venv/bin/python -m ruff format --check .
+      - name: Type-check platform boundary
+        run: make typecheck-platform
       - name: Validate production autopilot configuration
         run: .venv/bin/python -m src.autopilot.runtime --config config/autopilot.json --validate
+      - name: Apply and verify PostgreSQL migrations
+        run: |
+          .venv/bin/python -m src.data.migrate
+          .venv/bin/python -m src.data.migrate --check
       - name: Test
         run: .venv/bin/python -m pytest

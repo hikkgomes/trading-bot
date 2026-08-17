@@ -61,7 +61,7 @@ class ContentAddressedStore:
                 os.link(temporary, destination)
             except FileExistsError:
                 if self.digest(destination) != digest:
-                    raise RuntimeError(f"content-address collision at {destination}")
+                    raise RuntimeError(f"content-address collision at {destination}") from None
         finally:
             temporary.unlink(missing_ok=True)
         return destination
@@ -106,7 +106,9 @@ class PartitionedMarketEventStore:
                 "instrument_id": [event.instrument_id],
                 "event_type": [event.event_type.value],
                 "exchange_timestamp": [event.exchange_timestamp],
+                "close_timestamp": [event.close_timestamp],
                 "receive_timestamp": [event.receive_timestamp],
+                "availability_time": [event.availability_time],
                 "sequence": [event.sequence],
                 "payload_json": [json.dumps(payload["payload"], sort_keys=True)],
             }
@@ -167,7 +169,7 @@ class PartitionedBarStore:
                 "instrument_id": [event.instrument_id],
                 "open_time_ms": [int(candle["t"])],
                 "close_time_ms": [int(candle["T"])],
-                "availability_time": [event.receive_timestamp],
+                "availability_time": [event.availability_time],
                 "open": [float(candle["o"])],
                 "high": [float(candle["h"])],
                 "low": [float(candle["l"])],
