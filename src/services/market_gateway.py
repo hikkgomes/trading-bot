@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -369,6 +370,149 @@ class DatabaseMarketGateway:
         self.universe_symbols = universe_symbols or (lambda: ())
         self.maximum_clock_skew_ms = maximum_clock_skew_ms
         self.user_streams = BinanceUserStreams()
+        self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._task: asyncio.Task[dict[str, Any]] | None = None
+        self._continuous_status: dict[str, Any] = {"reason_code": "market_gateway_not_started"}
+        self._continuous_error: BaseException | None = None
+
+    def start(self) -> None:
+        """Start one persistent event loop for all public and authenticated streams."""
+
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._continuous_error = None
+        self._thread = threading.Thread(
+            target=self._run_continuous_thread,
+            name="market-gateway-streams",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def __call__(self) -> dict[str, Any]:
+        return self.poll()
+
+    def poll(self) -> dict[str, Any]:
+        self.start()
+        if self._continuous_error is not None:
+            raise RuntimeError("persistent market gateway failed") from self._continuous_error
+        return dict(self._continuous_status)
+
+    def stop(self) -> None:
+        loop, task = self._loop, self._task
+        if loop is not None and task is not None and not task.done():
+            loop.call_soon_threadsafe(task.cancel)
+        if self._thread is not None:
+            self._thread.join(timeout=30)
+            if self._thread.is_alive():
+                raise RuntimeError("persistent market gateway did not stop cleanly")
+
+    def _run_continuous_thread(self) -> None:
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
+        self._task = loop.create_task(self._run_continuous())
+        try:
+            loop.run_until_complete(self._task)
+        except asyncio.CancelledError:
+            pass
+        except BaseException as exc:
+            self._continuous_error = exc
+        finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+            self._loop = None
+            self._task = None
+
+    async def _run_continuous(self) -> dict[str, Any]:
+        timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=120)
+        sink = DatabaseGatewaySink(
+            self.queue,
+            spool=DurableMarketBatchSpool(
+                self.capture_config.root / "spool",
+                max_rows=min(self.capture_config.queue_max_events, 5_000),
+                max_bytes=self.capture_config.max_file_bytes,
+            ),
+        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            clocks = await self._clock_status(session)
+            public = asyncio.create_task(
+                capture(
+                    self.capture_config,
+                    sink=sink,
+                    dynamic_symbols=self.universe_symbols(),
+                )
+            )
+            authenticated = [
+                asyncio.create_task(self._capture_user_forever(session, account, sink))
+                for account in self.accounts
+            ]
+            self._continuous_status = {
+                "reason_code": "market_gateway_running",
+                "events_enqueued": 0,
+                "bytes_received": 0,
+                "clock_status": clocks,
+                "user_stream_accounts": len(self.accounts),
+            }
+            try:
+                while True:
+                    await asyncio.sleep(1)
+                    self._continuous_status = {
+                        **self._continuous_status,
+                        "events_enqueued": sink.events,
+                        "bytes_received": sink.bytes,
+                    }
+                    failed = next(
+                        (
+                            task.exception()
+                            for task in (public, *authenticated)
+                            if task.done() and not task.cancelled() and task.exception() is not None
+                        ),
+                        None,
+                    )
+                    if failed is not None:
+                        raise failed
+                    if public.done():
+                        raise RuntimeError("public market stream stopped unexpectedly")
+            finally:
+                for task in (public, *authenticated):
+                    task.cancel()
+                await asyncio.gather(public, *authenticated, return_exceptions=True)
+                sink.close()
+
+    async def _capture_user_forever(
+        self,
+        session: aiohttp.ClientSession,
+        account: UserStreamAccount,
+        sink: DatabaseGatewaySink,
+    ) -> None:
+        delay = 1.0
+        while True:
+            try:
+                await self.user_streams.capture(
+                    session=session,
+                    account=account,
+                    sink=sink,
+                    maximum_seconds=3_600,
+                )
+                delay = 1.0
+            except asyncio.CancelledError:
+                raise
+            except (
+                aiohttp.ClientError,
+                TimeoutError,
+                RuntimeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                self.user_streams._listen_keys.pop(account.account_id, None)
+                sink.flush()
+                await asyncio.sleep(delay)
+                delay = min(30.0, delay * 2)
 
     def run_once(self, *, maximum_seconds: float, maximum_events: int = 5_000) -> dict[str, Any]:
         return asyncio.run(

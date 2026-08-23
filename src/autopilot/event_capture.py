@@ -456,7 +456,7 @@ async def capture(
     for signum in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(signum, stop.set)
-        except NotImplementedError:
+        except (NotImplementedError, RuntimeError):
             pass
     dynamic = tuple(dict.fromkeys(str(symbol).upper() for symbol in dynamic_symbols))
     queue: asyncio.Queue = asyncio.Queue(maxsize=config.queue_max_events)

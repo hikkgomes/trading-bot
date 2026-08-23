@@ -146,6 +146,11 @@ class DatabaseExecutionWorker:
                     "accounting_asset": configuration["base_accounting_asset"],
                     "fee_in_base": product_id == "btc_accumulation",
                     "order_group_id": order.group_id,
+                    **(
+                        {"fill_fraction": float(configuration["fill_fraction"])}
+                        if "fill_fraction" in configuration
+                        else {}
+                    ),
                 }
                 identity = canonical_hash(order_payload)
                 job_prefix = "paper-order" if mode == "paper" else "live-order"
@@ -702,6 +707,11 @@ class DatabaseUserStreamWorker:
         order: OrderIntent,
         values: Mapping[str, Any],
     ) -> dict[str, Any]:
+        if self.order_manager is None or self.positions is None or self.trace_store is None:
+            raise RuntimeError("user-stream worker requires durable execution stores")
+        order_manager = self.order_manager
+        positions = self.positions
+        trace_store = self.trace_store
         quantity = float(values.get("l", 0.0))
         price = float(values.get("L", 0.0))
         fee = float(values.get("n", 0.0) or 0.0)
@@ -717,13 +727,13 @@ class DatabaseUserStreamWorker:
                 "trade_id": trade_id,
             }
         )
-        if any(fill.fill_id == fill_id for fill in self.order_manager.fills_for(order.order_id)):
+        if any(fill.fill_id == fill_id for fill in order_manager.fills_for(order.order_id)):
             return {"reason_code": "exchange_fill_already_recorded", "fill_id": fill_id}
         product_id = self.account_products.get(account_id)
         ledger = self.ledgers.get(product_id) if product_id is not None else None
         if fee and ledger is not None and fee_asset != ledger.accounting_asset:
             if order.status is not OrderStatus.RECOVERY_REQUIRED:
-                order = self.order_manager.recovery_required(order.order_id)
+                order = order_manager.recovery_required(order.order_id)
             recovery_payload = {
                 "account_id": account_id,
                 "order_id": order.order_id,
@@ -752,11 +762,11 @@ class DatabaseUserStreamWorker:
                 "recovery_job_id": recovery_job_id,
             }
         if order.status is OrderStatus.PERSISTED:
-            self.order_manager.submitted(order.order_id)
-            self.order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
+            order_manager.submitted(order.order_id)
+            order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
         elif order.status is OrderStatus.SUBMITTED:
-            self.order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
-        previous_position = self.positions.get(order.portfolio_id, order.instrument_id)
+            order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
+        previous_position = positions.get(order.portfolio_id, order.instrument_id)
         fill = Fill(
             fill_id=fill_id,
             order_id=order.order_id,
@@ -769,21 +779,21 @@ class DatabaseUserStreamWorker:
             fee_asset=fee_asset,
             metadata={"reference_price": price, "slippage_cost": 0.0, "user_stream": True},
         )
-        updated = self.order_manager.apply_fill(fill)
-        position = self.positions.apply_fill(
+        updated = order_manager.apply_fill(fill)
+        position = positions.apply_fill(
             order.portfolio_id,
             fill,
             contributions=dict(order.strategy_contributions),
         )
         if product_id is not None and product_id in self.ledgers:
             recorder = ExecutionService(
-                paper_exchange=_RecordedVenue(self.order_manager),
-                positions=self.positions,
+                paper_exchange=_RecordedVenue(order_manager),
+                positions=positions,
                 ledger=self.ledgers[product_id],
-                trace_store=self.trace_store,
+                trace_store=trace_store,
             )
             recorder.record_execution_costs(order, fill, previous_position=previous_position)
-        self.trace_store.append(
+        trace_store.append(
             _filled_trace(
                 event_id=event.event_id,
                 order_id=order.order_id,
@@ -793,7 +803,7 @@ class DatabaseUserStreamWorker:
                 position_quantity=position.quantity,
             )
         )
-        _after_group_fill(self.order_groups, self.order_manager, updated)
+        _after_group_fill(self.order_groups, order_manager, updated)
         return {
             "reason_code": (
                 "exchange_order_partially_filled"
@@ -808,29 +818,28 @@ class DatabaseUserStreamWorker:
     def _apply_status_event(
         self, *, order: OrderIntent, values: Mapping[str, Any], event: MarketEvent
     ) -> dict[str, Any]:
+        if self.order_manager is None:
+            raise RuntimeError("user-stream worker requires a durable order store")
+        order_manager = self.order_manager
         status = str(values.get("X") or values.get("x") or "").upper()
         if order.status is OrderStatus.PERSISTED:
-            self.order_manager.submitted(order.order_id)
-            order = self.order_manager.acknowledged(
-                order.order_id, event_at=event.exchange_timestamp
-            )
+            order_manager.submitted(order.order_id)
+            order = order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
         elif order.status is OrderStatus.SUBMITTED:
-            order = self.order_manager.acknowledged(
-                order.order_id, event_at=event.exchange_timestamp
-            )
+            order = order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
         if status == "NEW":
             pass
         elif status in {"CANCELED", "CANCELLED"}:
             if order.status in {OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED}:
-                self.order_manager.request_cancel(order.order_id)
-            order = self.order_manager.cancelled(order.order_id)
+                order_manager.request_cancel(order.order_id)
+            order = order_manager.cancelled(order.order_id)
             _mark_group_recovery(self.order_groups, order)
         elif status == "REJECTED":
-            order = self.order_manager.transition(order.order_id, OrderStatus.REJECTED)
+            order = order_manager.transition(order.order_id, OrderStatus.REJECTED)
         elif status == "EXPIRED":
-            order = self.order_manager.transition(order.order_id, OrderStatus.EXPIRED)
+            order = order_manager.transition(order.order_id, OrderStatus.EXPIRED)
         elif status == "FILLED" and order.status is not OrderStatus.FILLED:
-            order = self.order_manager.recovery_required(order.order_id)
+            order = order_manager.recovery_required(order.order_id)
         elif status not in {"PARTIALLY_FILLED", "FILLED"}:
             raise ValueError(f"unsupported exchange order status: {status}")
         return {

@@ -31,6 +31,8 @@ import time
 
 from src.execution.broker import (
     Broker,
+    BrokerOrderAcknowledgement,
+    BrokerOrderState,
     Fill,
     FuturesPositionIdentity,
     OpenOrderIdentity,
@@ -62,6 +64,44 @@ class CcxtBroker(Broker):
         )
         self._client = self._build_client()
         self._precision_markets: dict[str, dict] = {}
+        self._acknowledgement_only = False
+        self._submission_responses: dict[str, dict] = {}
+
+    def submit_order(self, order: Order) -> BrokerOrderAcknowledgement:
+        """Accept Binance ACK/RESULT/NEW responses without inventing a fill."""
+
+        self._acknowledgement_only = True
+        try:
+            acknowledgement = self.place_order(order)
+        finally:
+            self._acknowledgement_only = False
+        if not isinstance(acknowledgement, BrokerOrderAcknowledgement):
+            raise RuntimeError("ccxt submission did not return an acknowledgement")
+        return acknowledgement
+
+    def query_order(
+        self, *, symbol: str, exchange_order_id: str, client_order_id: str
+    ) -> BrokerOrderState:
+        cached = getattr(self, "_submission_responses", {}).get(exchange_order_id)
+        fetch = getattr(self._client, "fetch_order", None)
+        payload = fetch(exchange_order_id, self._ccxt_symbol(symbol)) if callable(fetch) else cached
+        if not isinstance(payload, dict):
+            raise RuntimeError("exchange order state is unavailable")
+        raw_info = payload.get("info")
+        info = raw_info if isinstance(raw_info, dict) else {}
+        status = str(payload.get("status") or info.get("status") or "unknown").lower()
+        filled = float(payload.get("filled") or info.get("executedQty") or 0.0)
+        average_raw = payload.get("average") or payload.get("price")
+        average = float(average_raw) if average_raw not in {None, ""} and filled > 0 else None
+        return BrokerOrderState(
+            exchange_order_id=exchange_order_id,
+            client_order_id=str(
+                payload.get("clientOrderId") or info.get("clientOrderId") or client_order_id
+            ),
+            status=status,
+            filled_quantity=filled,
+            average_price=average,
+        )
 
     @property
     def account_fingerprint(self) -> str:
@@ -486,7 +526,8 @@ class CcxtBroker(Broker):
         for position in positions:
             if not isinstance(position, dict):
                 continue
-            info = position.get("info") if isinstance(position.get("info"), dict) else {}
+            raw_info = position.get("info")
+            info: dict = raw_info if isinstance(raw_info, dict) else {}
             reported_symbol = position.get("symbol") or info.get("symbol")
             if (
                 reported_symbol == client_symbol
@@ -499,7 +540,8 @@ class CcxtBroker(Broker):
                 f"position-settings record for {client_symbol}."
             )
         position = matches[0]
-        info = position.get("info") if isinstance(position.get("info"), dict) else {}
+        raw_info = position.get("info")
+        info = raw_info if isinstance(raw_info, dict) else {}
         margin_mode = str(position.get("marginMode") or info.get("marginType") or "").lower()
         if margin_mode != "isolated":
             raise RuntimeError(
@@ -575,7 +617,7 @@ class CcxtBroker(Broker):
             self._verify_futures_risk_settings(normalized_order.symbol)
 
         client_symbol = self._ccxt_symbol(normalized_order.symbol)
-        params = {}
+        params: dict[str, object] = {}
         if normalized_order.client_id is not None:
             if not isinstance(normalized_order.client_id, str) or not CLIENT_ORDER_ID_RE.fullmatch(
                 normalized_order.client_id
@@ -603,8 +645,35 @@ class CcxtBroker(Broker):
             price=normalized_order.price,
             params=params,
         )
-        self._assert_order_status_accepted(result, requested_quantity=normalized_order.qty)
+        self._assert_order_status_accepted(
+            result,
+            requested_quantity=normalized_order.qty,
+            acknowledgement_only=getattr(self, "_acknowledgement_only", False),
+        )
         self._assert_order_response_matches(result, normalized_order)
+        exchange_order_id = str(
+            result.get("id") or (result.get("info") or {}).get("orderId") or ""
+        ).strip()
+        acknowledged_client_id = str(
+            result.get("clientOrderId")
+            or (result.get("info") or {}).get("clientOrderId")
+            or normalized_order.client_id
+            or ""
+        ).strip()
+        if getattr(self, "_acknowledgement_only", False):
+            if not exchange_order_id or not acknowledged_client_id:
+                raise RuntimeError("exchange acknowledgement has no order identity")
+            if not hasattr(self, "_submission_responses"):
+                self._submission_responses = {}
+            self._submission_responses[exchange_order_id] = dict(result)
+            return BrokerOrderAcknowledgement(  # type: ignore[return-value]
+                exchange_order_id=exchange_order_id,
+                client_order_id=acknowledged_client_id,
+                status=str(
+                    result.get("status") or (result.get("info") or {}).get("status") or "ack"
+                ).lower(),
+                submitted_at=float(result.get("timestamp") or time.time()),
+            )
         fill_price = float(
             self._required_first_present(result, ("average", "price"), label="Filled order price")
         )
@@ -914,7 +983,7 @@ class CcxtBroker(Broker):
             return
         if self.config.allow_multi_symbol_positions:
             regular = self.list_open_orders(symbol, conditional=False)
-            conditional = ()
+            conditional: tuple[OpenOrderIdentity, ...] = ()
         else:
             regular = self.list_account_open_orders(conditional=False)
             conditional = self.list_account_open_orders(conditional=True)
@@ -1332,11 +1401,28 @@ class CcxtBroker(Broker):
         raise ValueError(f"{label} missing from exchange response. Refusing to assume order fill.")
 
     @staticmethod
-    def _assert_order_status_accepted(payload: dict, *, requested_quantity: float) -> None:
+    def _assert_order_status_accepted(
+        payload: dict, *, requested_quantity: float, acknowledgement_only: bool = False
+    ) -> None:
         status = payload.get("status")
         if status is None:
             return
         normalized = str(status).lower()
+        acknowledgement_statuses = {
+            "new",
+            "open",
+            "accepted",
+            "partially_filled",
+            "ack",
+            "result",
+            "pending",
+            "closed",
+            "filled",
+        }
+        if acknowledgement_only:
+            if normalized not in acknowledgement_statuses:
+                raise ValueError(f"Exchange order status {status!r} is not accepted")
+            return
         if normalized in {"new", "open", "accepted", "partially_filled"}:
             filled = float(payload.get("filled") or 0.0)
             amount = float(payload.get("amount") or requested_quantity)

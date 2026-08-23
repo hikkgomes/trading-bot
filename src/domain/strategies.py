@@ -83,7 +83,9 @@ class ResearchThesis:
             values = tuple(non_empty(item, field=attribute) for item in getattr(self, attribute))
             object.__setattr__(self, attribute, values)
         if not self.expected_causal_chain or not self.required_data or not self.instrument_universe:
-            raise ValueError("a thesis needs a causal chain, required data, and predeclared universe")
+            raise ValueError(
+                "a thesis needs a causal chain, required data, and predeclared universe"
+            )
         if self.cumulative_trial_budget < 1:
             raise ValueError("cumulative_trial_budget must be positive")
         for attribute in ("generalisation_scope", "execution_capacity_assumptions"):

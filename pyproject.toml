@@ -37,3 +37,7 @@ ignore = [
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.mypy]
+ignore_missing_imports = true
+follow_imports = "skip"

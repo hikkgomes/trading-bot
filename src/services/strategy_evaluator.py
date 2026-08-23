@@ -42,7 +42,9 @@ class DatabaseStrategyEvaluator:
         self.portfolio = portfolio
         self.assignments = assignments
         self.engine_version = engine_version
-        self.forecast_fn = forecast_fn or (artefact_dispatcher or ArtefactDispatcher()).evaluate
+        self.forecast_fn = (
+            forecast_fn or (artefact_dispatcher or ArtefactDispatcher.default()).evaluate
+        )
         self.lease_seconds = lease_seconds
 
     def run_once(self, *, now: str) -> dict[str, Any]:
@@ -170,6 +172,7 @@ class DatabaseStrategyEvaluator:
             "forecast_id": forecast_id,
             "portfolio_job_id": f"portfolio-target:{portfolio_job_id.removeprefix('sha256:')}",
         }
+
 
 def _strict_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     allowed = frozenset(

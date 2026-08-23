@@ -85,7 +85,7 @@ class DatabaseRiskWorker:
             else:
                 product_id = request.product_id
                 assessment_id = request.assessment_id
-                snapshot_inputs = self._load_snapshot_inputs(request)
+                loaded_inputs = self._load_snapshot_inputs(request)
                 policy_limits = SqlRiskPolicyStore(self.store.engine).resolve(
                     request.risk_policy_ids
                 )
@@ -93,7 +93,7 @@ class DatabaseRiskWorker:
                     raise ValueError("risk policies must define all six risk scopes")
                 snapshot_inputs = {
                     scope: {**dict(values), "limits": policy_limits[scope]}
-                    for scope, values in snapshot_inputs.items()
+                    for scope, values in loaded_inputs.items()
                 }
             decisions = tuple(
                 self._evaluate_scope(snapshot_inputs, scope, evaluator, limits_type)

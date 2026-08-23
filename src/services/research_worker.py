@@ -80,6 +80,7 @@ class ResearchWorker:
                 "job_name": claimed.name,
             }
         current = claimed
+        heavy_compute = self.heavy_compute
 
         def renew() -> ClaimedJob:
             nonlocal current
@@ -88,10 +89,10 @@ class ResearchWorker:
                 now=utc_now(),
                 lease_seconds=self.lease_seconds,
             )
-            if compute_lease is not None:
+            if compute_lease is not None and heavy_compute is not None:
                 # Renewal is deliberately tied to the queue lease so a dead
                 # worker cannot keep the singleton slot indefinitely.
-                self.heavy_compute.renew(
+                heavy_compute.renew(
                     compute_lease,
                     now=current.lease_expires_at,
                     lease_seconds=self.lease_seconds,
@@ -101,8 +102,8 @@ class ResearchWorker:
         try:
             result = dict(handler(current, renew) or {})
         except Exception as exc:
-            if compute_lease is not None:
-                self.heavy_compute.release(compute_lease)
+            if compute_lease is not None and heavy_compute is not None:
+                heavy_compute.release(compute_lease)
             completed_at = utc_now()
             self.queue.fail(
                 current,
@@ -117,8 +118,8 @@ class ResearchWorker:
                 "error": str(exc),
             }
         self.queue.complete(current, completed_at=utc_now())
-        if compute_lease is not None:
-            self.heavy_compute.release(compute_lease)
+        if compute_lease is not None and heavy_compute is not None:
+            heavy_compute.release(compute_lease)
         return {"reason_code": "research_job_completed", "job_id": current.job_id, **result}
 
 

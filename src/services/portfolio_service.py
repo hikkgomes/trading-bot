@@ -285,23 +285,29 @@ class DatabaseProductCycleWorker:
                 prices = {str(key): float(value) for key, value in payload["prices"].items()}
                 if self.update_prices is not None:
                     self.update_prices(prices)
-                result = self.supervisor.run_active_income(
-                    event_id=str(payload["event_id"]),
-                    evaluated_at=str(payload["evaluated_at"]),
-                    prices=prices,
-                    valid_until=str(payload["valid_until"]),
-                    risk_assessment=risk,
-                    correlations=payload.get("correlations"),
-                    beta_by_instrument=payload.get("beta_by_instrument"),
-                    observed_volatility=payload.get("observed_volatility"),
-                    liquidity_fraction_caps=payload.get("liquidity_fraction_caps"),
-                    funding_rates=payload.get("funding_rates"),
-                    sleeve_budgets=payload.get("sleeve_budgets"),
-                    cluster_by_instrument=payload.get("cluster_by_instrument"),
-                    cluster_fraction_caps=payload.get("cluster_fraction_caps"),
-                    product_drawdown_fraction=float(payload.get("product_drawdown_fraction", 0.0)),
-                    available_margin_fraction=float(payload.get("available_margin_fraction", 1.0)),
-                    equity=float(payload["equity"]),
+                result: ProductCycleResult | BtcProductCycleResult = (
+                    self.supervisor.run_active_income(
+                        event_id=str(payload["event_id"]),
+                        evaluated_at=str(payload["evaluated_at"]),
+                        prices=prices,
+                        valid_until=str(payload["valid_until"]),
+                        risk_assessment=risk,
+                        correlations=payload.get("correlations"),
+                        beta_by_instrument=payload.get("beta_by_instrument"),
+                        observed_volatility=payload.get("observed_volatility"),
+                        liquidity_fraction_caps=payload.get("liquidity_fraction_caps"),
+                        funding_rates=payload.get("funding_rates"),
+                        sleeve_budgets=payload.get("sleeve_budgets"),
+                        cluster_by_instrument=payload.get("cluster_by_instrument"),
+                        cluster_fraction_caps=payload.get("cluster_fraction_caps"),
+                        product_drawdown_fraction=float(
+                            payload.get("product_drawdown_fraction", 0.0)
+                        ),
+                        available_margin_fraction=float(
+                            payload.get("available_margin_fraction", 1.0)
+                        ),
+                        equity=float(payload["equity"]),
+                    )
                 )
             else:
                 stablecoin_per_btc = float(payload["stablecoin_per_btc"])

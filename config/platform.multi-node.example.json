@@ -7,7 +7,7 @@
       "production_authority": true,
       "services": [
         "market-gateway", "data-writer", "feature-service", "strategy-evaluator",
-        "portfolio-engine", "risk-engine", "execution-engine", "paper-engine",
+        "portfolio-engine", "portfolio-state-service", "risk-engine", "execution-engine", "paper-engine",
         "product-supervisor", "accounting-service", "promotion-engine",
         "control-api", "universe-service", "migration-service"
       ]

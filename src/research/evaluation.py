@@ -19,6 +19,7 @@ from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlHoldoutRepository, SqlValidationRepository
 from src.research.executors import ExecutorError, ProviderExecutorRegistry
 from src.research.store import SqlResearchStore
+from src.research.theses import SqlThesisRegistry, ThesisError
 
 STAGES = ("screening", "development", "robustness", "protected", "forward")
 FORBIDDEN_SUBMITTED_FIELDS = frozenset(
@@ -166,6 +167,147 @@ class StageEvaluation:
     evidence: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class EvidencePolicy:
+    """Typed acceptance thresholds for measured research evidence."""
+
+    minimum_cost_adjusted_return: float = 0.0
+    minimum_deflated_sharpe: float = 0.0
+    minimum_walk_forward_windows: int = 3
+    minimum_walk_forward_pass_fraction: float = 0.5
+    maximum_backtest_overfitting_probability: float = 0.5
+
+    def accepts(self, stage: str, evidence: Mapping[str, Any], controls: tuple[str, ...]) -> bool:
+        validators = _STAGE_EVIDENCE_VALIDATORS.get(stage, {})
+        if not validators or any(
+            not validator(evidence.get(name), self) for name, validator in validators.items()
+        ):
+            return False
+        if stage == "robustness":
+            results = evidence.get("negative_control_results")
+            if not isinstance(results, Mapping) or any(
+                not _passed_mapping(results.get(control)) for control in controls
+            ):
+                return False
+        return True
+
+
+def _passed_mapping(value: object) -> bool:
+    return isinstance(value, Mapping) and value.get("passed") is True
+
+
+def _true(value: object, _policy: EvidencePolicy) -> bool:
+    return value is True
+
+
+def _finite(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    result = float(value)
+    return result if __import__("math").isfinite(result) else None
+
+
+def _nonnegative(value: object, _policy: EvidencePolicy) -> bool:
+    measured = _finite(value)
+    return measured is not None and measured >= 0
+
+
+def _positive(value: object, _policy: EvidencePolicy) -> bool:
+    measured = _finite(value)
+    return measured is not None and measured > 0
+
+
+def _return_passes(value: object, policy: EvidencePolicy) -> bool:
+    measured = _finite(value)
+    return measured is not None and measured >= policy.minimum_cost_adjusted_return
+
+
+def _deflated_sharpe_passes(value: object, policy: EvidencePolicy) -> bool:
+    measured = _finite(value)
+    return measured is not None and measured >= policy.minimum_deflated_sharpe
+
+
+def _pbo_passes(value: object, policy: EvidencePolicy) -> bool:
+    measured = _finite(value)
+    return measured is not None and 0 <= measured <= policy.maximum_backtest_overfitting_probability
+
+
+def _walk_forward_passes(value: object, policy: EvidencePolicy) -> bool:
+    if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    windows = value.get("window_count")
+    fraction = _finite(value.get("pass_fraction"))
+    return (
+        isinstance(windows, int)
+        and not isinstance(windows, bool)
+        and windows >= policy.minimum_walk_forward_windows
+        and fraction is not None
+        and fraction >= policy.minimum_walk_forward_pass_fraction
+    )
+
+
+def _mapping_passes(value: object, _policy: EvidencePolicy) -> bool:
+    return _passed_mapping(value)
+
+
+def _mapping(value: object, _policy: EvidencePolicy) -> bool:
+    return isinstance(value, Mapping) and bool(value)
+
+
+EvidenceValidator = Callable[[object, EvidencePolicy], bool]
+
+
+_STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
+    "screening": {
+        "compiled": _true,
+        "features_valid": _true,
+        "causality_valid": _true,
+        "signal_frequency": _positive,
+        "turnover": _nonnegative,
+    },
+    "development": {
+        "chronological": _true,
+        "cost_adjusted_return": _return_passes,
+        "fees": _nonnegative,
+        "slippage": _nonnegative,
+        "funding": _nonnegative,
+        "regime_breakdown": _mapping_passes,
+        "parameter_stability": _mapping_passes,
+        "sample_evidence": _mapping_passes,
+        "cross_symbol_stability": _mapping_passes,
+        "universe_evidence": _mapping_passes,
+        "portfolio_overlap": _mapping_passes,
+    },
+    "robustness": {
+        "walk_forward": _walk_forward_passes,
+        "purged": _true,
+        "embargo": _positive,
+        "cost_stress": _mapping_passes,
+        "delay_stress": _mapping_passes,
+        "adverse_fill_stress": _mapping_passes,
+        "missing_data_stress": _mapping_passes,
+        "funding_stress": _mapping_passes,
+        "monte_carlo_trade_order": _mapping_passes,
+        "bootstrap_confidence": _mapping_passes,
+        "probability_backtest_overfitting": _pbo_passes,
+        "deflated_sharpe": _deflated_sharpe_passes,
+        "drawdown_stability": _mapping_passes,
+        "null_results": _mapping_passes,
+        "negative_control_results": _mapping,
+    },
+    "forward": {
+        "production_equivalent": _true,
+        "exact_strategy_identity": _true,
+        "exact_artefact_hash": _true,
+        "exact_engine_hash": _true,
+        "exact_cost_model": _true,
+        "drift_checks": _mapping_passes,
+        "duration": _positive,
+        "evidence_units": _positive,
+    },
+}
+
+
 class ProtectedEvaluationBoundary:
     """Small boundary that can inspect protected claims but not adaptive input."""
 
@@ -238,6 +380,7 @@ class CanonicalResearchEvaluator:
         executors: ProviderExecutorRegistry | None = None,
         provider_context: Mapping[str, Any] | None = None,
         protected_worker: ProtectedHoldoutWorker | None = None,
+        evidence_policy: EvidencePolicy | None = None,
     ):
         self.store = store
         self.validation = SqlValidationRepository(store.engine)
@@ -245,6 +388,13 @@ class CanonicalResearchEvaluator:
         self.executors = executors or ProviderExecutorRegistry.default()
         self.provider_context = dict(provider_context or {})
         self.protected_worker = protected_worker
+        self.evidence_policy = evidence_policy or EvidencePolicy()
+
+    def _negative_controls(self, thesis_id: str) -> tuple[str, ...]:
+        try:
+            return SqlThesisRegistry(self.store.engine).get(thesis_id).negative_controls
+        except ThesisError:
+            return ()
 
     def evaluate(self, request: EvaluationRequest) -> StageEvaluation:
         candidate = self.store.get_candidate(request.candidate_id)
@@ -386,17 +536,12 @@ class CanonicalResearchEvaluator:
                 "context": dict(context),
                 "execution_receipt": dict(execution.receipt),
             }
-            screening_required = (
-                "compiled",
-                "features_valid",
-                "causality_valid",
-                "signal_frequency",
-                "turnover",
-            )
             accepted = (
                 fields_valid
                 and causality_valid
-                and all(_measured(measured.get(field)) for field in screening_required)
+                and self.evidence_policy.accepts(
+                    "screening", measured, self._negative_controls(candidate.thesis_id)
+                )
             )
             return (
                 evidence,
@@ -541,7 +686,7 @@ class CanonicalResearchEvaluator:
                     if isinstance(value, int | float) and not isinstance(value, bool):
                         metrics[str(key)] = float(value)
         evidence.update(run_measured)
-        required_fields = {
+        required_fields: tuple[str, ...] = {
             "development": (
                 "chronological",
                 "cost_adjusted_return",
@@ -581,8 +726,15 @@ class CanonicalResearchEvaluator:
                 "evidence_units",
             ),
         }[stage]
-        missing = [field for field in required_fields if not _measured(evidence.get(field))]
-        accepted = not missing
+        controls = self._negative_controls(candidate.thesis_id)
+        policy_fields = _STAGE_EVIDENCE_VALIDATORS[stage]
+        missing = [
+            field
+            for field in required_fields
+            if field not in policy_fields
+            or not policy_fields[field](evidence.get(field), self.evidence_policy)
+        ]
+        accepted = not missing and self.evidence_policy.accepts(stage, evidence, controls)
         evidence["missing_evidence"] = missing
         receipt: Mapping[str, Any] | None = None
         for row in authoritative_runs:
@@ -600,15 +752,3 @@ class CanonicalResearchEvaluator:
             receipt,
             metrics,
         )
-
-
-def _measured(value: object) -> bool:
-    """Return true only for evidence produced by a run, never a default flag."""
-
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, Mapping) | isinstance(value, list) | isinstance(value, tuple):
-        return bool(value)
-    if isinstance(value, int | float) and not isinstance(value, bool):
-        return value != 0
-    return isinstance(value, str) and bool(value.strip())

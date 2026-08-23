@@ -18,6 +18,8 @@ class StrategyManifestEntry:
             return "portfolio_meta"
         if self.family == "execution":
             return "execution_policy"
+        if self.family == "market_making":
+            return "market_making"
         return "predictive_alpha"
 
     @property
@@ -29,6 +31,7 @@ class StrategyManifestEntry:
             "machine_learning": "frozen_model_feature_manifest",
             "meta_strategy": "alpha_forecast_collection",
             "execution": "target_delta_and_market_state",
+            "market_making": "quote_state",
         }.get(self.family, "single_instrument_time_series")
 
     @property
@@ -38,6 +41,7 @@ class StrategyManifestEntry:
             "relative_value": "hedged_multi_leg_targets",
             "meta_strategy": "aggregated_forecasts",
             "execution": "order_intents",
+            "market_making": "quote_targets",
         }.get(self.family, "alpha_forecast_or_target_position")
 
 
@@ -75,14 +79,55 @@ _FAMILIES = {
     "relative_value": (
         "spot_perpetual_basis",
         "beta_neutral_spreads",
+        "pairs_trading",
     ),
     "microstructure": (
         "bid_ask_depth_imbalance",
         "microprice_displacement",
+        "aggressor_flow_scalping",
+        "liquidation_burst_scalping",
+        "liquidity_vacuum_scalping",
     ),
-    "machine_learning": ("frozen_linear_model",),
-    "meta_strategy": ("correlation_aware_ensemble",),
-    "execution": ("market_execution",),
+    "machine_learning": (
+        "frozen_linear_model",
+        "frozen_logistic_model",
+        "lightgbm_classifier",
+        "lightgbm_regressor",
+        "cross_sectional_ranker",
+        "triple_barrier_classifier",
+        "return_regressor",
+        "meta_labelling",
+        "probability_calibration",
+        "regime_classification",
+    ),
+    "advanced_alpha": (
+        "seasonality",
+        "volatility_forecast",
+        "statistical_pattern_recognition",
+        "point_in_time_sentiment",
+    ),
+    "meta_strategy": (
+        "correlation_aware_ensemble",
+        "regime_routing",
+        "performance_decay_weighting",
+        "forecast_conflict_suppression",
+        "drift_based_capital_reduction",
+        "sleeve_reallocation",
+    ),
+    "execution": (
+        "market_execution",
+        "limit_execution",
+        "post_only_execution",
+        "twap",
+        "vwap",
+        "percentage_of_volume",
+        "adaptive_urgency",
+        "spread_aware_selection",
+        "depth_aware_sizing",
+        "cancel_replace",
+        "binance_spot_sor",
+    ),
+    "market_making": ("inventory_aware_market_making",),
 }
 
 _EVIDENCE = {
@@ -92,11 +137,57 @@ _EVIDENCE = {
     "relative_value": "pairs",
     "microstructure": "scalping",
     "machine_learning": "ml",
+    "advanced_alpha": "swing",
     "meta_strategy": "intraday",
     "execution": "market_making",
+    "market_making": "market_making",
 }
 
 REQUIRED_STRATEGY_UNIVERSE = tuple(name for family in _FAMILIES.values() for name in family)
+
+_REGISTERED_LIVE_RULES: dict[str, tuple[tuple[str, float, float, float], ...]] = {
+    "sma_cross": (("sma_fast", 1.0, 0.0, 1.0), ("sma_slow", -1.0, 0.0, 1.0)),
+    "macd_trend": (("macd", 1.0, 0.0, 1.0),),
+    "supertrend": (("supertrend", 1.0, 0.0, 1.0),),
+    "adx_trend": (("adx", 1.0, 0.0, 1.0),),
+    "momentum_roc": (("bar_return", 1.0, 0.0, 0.01),),
+    "donchian_breakout": (("breakout", 1.0, 0.0, 0.01),),
+    "keltner_breakout": (("keltner", 1.0, 0.0, 1.0),),
+    "atr_channel_breakout": (("supertrend", 1.0, 0.0, 1.0),),
+    "bollinger_squeeze": (("bollinger", 1.0, 0.0, 2.0),),
+    "multi_tf_trend": (("multi_timeframe", 1.0, 0.0, 0.01),),
+    "regression_channel": (("bar_return", 1.0, 0.0, 0.01),),
+    "swing_structure": (("breakout", 1.0, 0.0, 0.01),),
+    "btc_cycle_guard": (("realised_volatility", -1.0, 0.0, 1.0),),
+    "rsi_reversion": (("rsi", -1.0, 50.0, 50.0),),
+    "bollinger_reversion": (("bollinger", -1.0, 0.0, 2.0),),
+    "zscore_reversion": (("bollinger", -1.0, 0.0, 2.0),),
+    "stochastic_reversion": (("rsi", -1.0, 50.0, 50.0),),
+    "candlestick_reversal": (("bar_return", -1.0, 0.0, 0.01),),
+    "rsi_divergence": (("rsi", -1.0, 50.0, 50.0),),
+    "fear_greed_contrarian": (("sentiment", -1.0, 0.0, 1.0),),
+    "condition_grid": (
+        ("rsi", -0.5, 50.0, 50.0),
+        ("adx", 0.5, 0.0, 1.0),
+    ),
+    "regime_filter": (("bar_return", 1.0, 0.0, 0.01),),
+}
+
+
+def registered_live_contract(name: str) -> tuple[tuple[str, ...], dict[str, object]]:
+    try:
+        terms = _REGISTERED_LIVE_RULES[name]
+    except KeyError as exc:
+        raise ValueError(f"registered strategy has no live feature contract: {name}") from exc
+    nodes = tuple(dict.fromkeys(term[0] for term in terms))
+    rule = {
+        "kind": "linear_feature_score/v1",
+        "terms": [
+            {"feature": feature, "weight": weight, "centre": centre, "scale": scale}
+            for feature, weight, centre, scale in terms
+        ],
+    }
+    return nodes, rule
 
 
 def strategy_manifest() -> tuple[StrategyManifestEntry, ...]:
@@ -117,6 +208,10 @@ def portfolio_meta_manifest() -> tuple[StrategyManifestEntry, ...]:
 
 def execution_policy_manifest() -> tuple[StrategyManifestEntry, ...]:
     return tuple(entry for entry in strategy_manifest() if entry.catalogue == "execution_policy")
+
+
+def market_making_manifest() -> tuple[StrategyManifestEntry, ...]:
+    return tuple(entry for entry in strategy_manifest() if entry.catalogue == "market_making")
 
 
 def manifest_by_name() -> dict[str, StrategyManifestEntry]:
@@ -141,9 +236,46 @@ def assert_manifest_complete() -> None:
             "declared strategies have no concrete implementation: "
             + ", ".join(sorted(missing_ordinary))
         )
-    for family in ("cross_sectional", "relative_value", "microstructure", "meta_strategy", "execution"):
+    missing_live_contracts = ordinary - set(_REGISTERED_LIVE_RULES)
+    if missing_live_contracts:
+        raise ValueError(
+            "declared registered strategies have no live contract: "
+            + ", ".join(sorted(missing_live_contracts))
+        )
+    semantic_names = {
+        "relative_momentum",
+        "funding_adjusted_ranking",
+        "spot_perpetual_basis",
+        "beta_neutral_spreads",
+        "bid_ask_depth_imbalance",
+        "microprice_displacement",
+        "correlation_aware_ensemble",
+        "market_execution",
+    }
+    for family in (
+        "cross_sectional",
+        "relative_value",
+        "microstructure",
+        "meta_strategy",
+        "execution",
+    ):
         for name in _FAMILIES[family]:
-            SEMANTIC_STRATEGIES.get(name)
+            if name in semantic_names:
+                SEMANTIC_STRATEGIES.get(name)
+    from src.strategies.advanced import ADVANCED_IMPLEMENTATIONS
+
+    missing_advanced = (
+        set(names)
+        - ordinary
+        - semantic_names
+        - set(_FAMILIES["machine_learning"])
+        - set(ADVANCED_IMPLEMENTATIONS)
+    )
+    if missing_advanced:
+        raise ValueError(
+            "declared advanced strategies have no implementation: "
+            + ", ".join(sorted(missing_advanced))
+        )
     if not callable(FrozenLinearModel.load):
         raise ValueError("frozen machine-learning implementation is absent")
 
@@ -166,4 +298,6 @@ def manifest_source_type(name: str) -> str:
         "machine_learning": "machine_learning",
         "meta_strategy": "ensemble",
         "execution": "registered_python",
+        "advanced_alpha": "registered_python",
+        "market_making": "microstructure",
     }.get(family.family, "registered_python")

@@ -63,12 +63,19 @@ class SqlResearchStore:
         metadata_payload = json_value(dict(candidate.metadata), field="candidate metadata")
         parent_hashes = metadata_payload.get("parent_hashes", [])
         with self.engine.begin() as connection:
-            trial = connection.execute(
-                select(thesis_trial).where(thesis_trial.c.candidate_id == candidate_id)
-            ).mappings().first()
+            trial = (
+                connection.execute(
+                    select(thesis_trial).where(thesis_trial.c.candidate_id == candidate_id)
+                )
+                .mappings()
+                .first()
+            )
             if trial is None:
                 raise ValueError("candidate trial must be claimed before candidate registration")
-            if trial["thesis_id"] != candidate.thesis_id or trial["lineage_id"] != candidate.lineage_id:
+            if (
+                trial["thesis_id"] != candidate.thesis_id
+                or trial["lineage_id"] != candidate.lineage_id
+            ):
                 raise ValueError("candidate thesis lineage does not match its claimed trial")
             existing = (
                 connection.execute(select(experiment).where(experiment.c.id == candidate_id))
@@ -205,9 +212,11 @@ class SqlResearchStore:
 
     @staticmethod
     def _candidate_from_row(connection, row) -> Candidate:
-        trial = connection.execute(
-            select(thesis_trial).where(thesis_trial.c.candidate_id == row["id"])
-        ).mappings().one()
+        trial = (
+            connection.execute(select(thesis_trial).where(thesis_trial.c.candidate_id == row["id"]))
+            .mappings()
+            .one()
+        )
         definition_payload = connection.execute(
             select(strategy_definition.c.definition)
             .select_from(

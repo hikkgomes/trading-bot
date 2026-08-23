@@ -794,7 +794,9 @@ class SqlActiveStrategyAssignmentRepository:
         if instrument_id is None and universe_id is None:
             universe_id = f"product:{product_id}"
         if (instrument_id is None) == (universe_id is None):
-            raise CanonicalEvidenceError("assignment needs exactly one instrument_id or universe_id")
+            raise CanonicalEvidenceError(
+                "assignment needs exactly one instrument_id or universe_id"
+            )
         artefact_hash = _identity(artefact_hash, field="artefact_hash")
         if not isinstance(assigned_by, str) or not assigned_by.strip():
             raise CanonicalEvidenceError("active assignment actor must be non-empty")
@@ -944,7 +946,8 @@ class SqlActiveStrategyAssignmentRepository:
         return tuple(
             row
             for _, row in sorted(latest.items())
-            if row["active"] and (at is None or row["active_until"] is None or row["active_until"] > at)
+            if row["active"]
+            and (at is None or row["active_until"] is None or row["active_until"] > at)
         )
 
     def deactivate(self, product_id: str) -> None:

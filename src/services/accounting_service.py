@@ -87,6 +87,12 @@ class AccountingService:
             "attribution": attribution,
         }
         self._append(fee_entry, entry_id, occurred_at, payload)
+        self._append(
+            trade_attribution,
+            f"{entry_id}:attribution",
+            occurred_at,
+            {"entry_id": entry_id, **attribution, "pnl_effect": str(-abs(amount))},
+        )
 
     def _append(self, table, identity: str, created_at: str, payload: dict[str, Any]) -> None:
         created_at = timestamp(created_at, field="created_at")

@@ -81,9 +81,7 @@ class DatabasePortfolioTargetBuilder:
             raise ValueError("canonical portfolio/risk state is stale")
 
         balances = {str(key): float(value) for key, value in clean["balances"].items()}
-        current_positions = {
-            str(key): float(value) for key, value in clean["positions"].items()
-        }
+        current_positions = {str(key): float(value) for key, value in clean["positions"].items()}
         market = {str(key): dict(value) for key, value in clean["market"].items()}
         missing_market = sorted({item.instrument_id for item in forecasts} - set(market))
         if missing_market:
@@ -147,7 +145,9 @@ class DatabasePortfolioTargetBuilder:
                 constraints=constraints,
                 correlations=clean["correlations"],
                 beta_by_instrument=clean["beta"],
-                observed_volatility={key: float(value["volatility"]) for key, value in market.items()},
+                observed_volatility={
+                    key: float(value["volatility"]) for key, value in market.items()
+                },
                 liquidity_fraction_caps={
                     key: min(
                         1.0,
@@ -358,9 +358,7 @@ _PORTFOLIO_STATE_FIELDS = frozenset(
 )
 
 
-def _canonical_portfolio_state(
-    state: Mapping[str, Any], *, product_id: str
-) -> dict[str, Any]:
+def _canonical_portfolio_state(state: Mapping[str, Any], *, product_id: str) -> dict[str, Any]:
     missing = sorted(_PORTFOLIO_STATE_FIELDS - set(state))
     if missing:
         raise ValueError("canonical portfolio/risk state is missing: " + ", ".join(missing))

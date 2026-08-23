@@ -192,9 +192,7 @@ class SqlRiskSnapshotStore:
             raise KeyError(f"risk snapshot does not exist: {snapshot_id}")
         return dict(payload)
 
-    def latest(
-        self, *, kind: str, product_id: str, at: str
-    ) -> tuple[str, dict[str, object]]:
+    def latest(self, *, kind: str, product_id: str, at: str) -> tuple[str, dict[str, object]]:
         at = timestamp(at, field="at")
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -204,9 +202,7 @@ class SqlRiskSnapshotStore:
                     risk_snapshot_table.c.payload,
                 )
                 .where(risk_snapshot_table.c.created_at <= at)
-                .order_by(
-                    risk_snapshot_table.c.created_at.desc(), risk_snapshot_table.c.id.desc()
-                )
+                .order_by(risk_snapshot_table.c.created_at.desc(), risk_snapshot_table.c.id.desc())
             ).mappings()
             for row in rows:
                 payload = row["payload"]

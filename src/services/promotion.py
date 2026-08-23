@@ -127,6 +127,10 @@ class PromotionEvidence:
     artefact_record_id: str | None = None
     preflight_record_id: str | None = None
     portfolio_id: str | None = None
+    market_making: bool = False
+    market_making_live_capability: bool = False
+    event_replay_passed: bool = False
+    event_replay_fills: int = 0
 
 
 @dataclass(frozen=True)
@@ -449,6 +453,12 @@ class SqlCanonicalPromotionEvidence:
                 maximum_age_seconds=int(artefact.get("preflight_max_age_seconds", 3_600)),
             )
         )
+        definition = artefact.get("definition")
+        market_making = (
+            isinstance(definition, Mapping) and definition.get("family") == "market_making"
+        )
+        capability = artefact.get("promotion_policy")
+        replay = authoritative.get("market_making_event_replay")
         evidence = PromotionEvidence(
             strategy_artefact_hash=artefact_hash,
             source_commit_hash=source_commit_hash,
@@ -469,6 +479,13 @@ class SqlCanonicalPromotionEvidence:
             artefact_record_id=str(artefact_row["id"]),
             preflight_record_id=(str(latest_preflight["id"]) if latest_preflight else None),
             portfolio_id=portfolio_id,
+            market_making=market_making,
+            market_making_live_capability=(
+                isinstance(capability, Mapping)
+                and capability.get("market_making_live_enabled") is True
+            ),
+            event_replay_passed=isinstance(replay, Mapping) and replay.get("passed") is True,
+            event_replay_fills=(int(replay.get("fills", 0)) if isinstance(replay, Mapping) else 0),
         )
         policy_id = str(artefact.get("promotion_policy_id") or "")
         policy = self.policy_store.get(policy_id) if policy_id else self.policy_store.first()
@@ -584,6 +601,15 @@ def decide_promotion(
             (not evidence.fresh_preflight, "fresh_preflight_missing"),
             (evidence.portfolio_capacity <= 0, "portfolio_capacity_unavailable"),
             (evidence.risk_budget_available <= 0, "risk_budget_unavailable"),
+            (
+                evidence.market_making and not evidence.market_making_live_capability,
+                "market_making_live_capability_missing",
+            ),
+            (
+                evidence.market_making
+                and (not evidence.event_replay_passed or evidence.event_replay_fills < 500),
+                "market_making_event_replay_insufficient",
+            ),
         )
         reason = next((reason for failed, reason in checks if failed), None)
         if reason:
@@ -750,9 +776,11 @@ class DatabasePromotionWorker:
                 # may still call the pure lifecycle function with an explicit
                 # evidence object, but production PostgreSQL never enters this
                 # branch.
-                evidence = claimed.payload.get("evidence")
-                policy = claimed.payload.get("policy")
-                if isinstance(evidence, dict) and isinstance(policy, dict):
+                raw_evidence = claimed.payload.get("evidence")
+                raw_policy = claimed.payload.get("policy")
+                if isinstance(raw_evidence, dict) and isinstance(raw_policy, dict):
+                    evidence = PromotionEvidence(**raw_evidence)
+                    policy = PromotionPolicy(**raw_policy)
                     current_state = LifecycleState(str(claimed.payload["current_state"]))
                     strategy_version_id = str(claimed.payload["strategy_version_id"])
                     evaluated_at = str(claimed.payload.get("evaluated_at") or now)

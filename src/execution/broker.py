@@ -65,6 +65,36 @@ class Fill:
 
 
 @dataclass(frozen=True)
+class BrokerOrderAcknowledgement:
+    exchange_order_id: str
+    client_order_id: str
+    status: str
+    submitted_at: float = field(default_factory=time.time)
+
+
+@dataclass(frozen=True)
+class BrokerOrderState:
+    exchange_order_id: str
+    client_order_id: str
+    status: str
+    filled_quantity: float
+    average_price: float | None
+
+
+@dataclass(frozen=True)
+class BrokerFill:
+    trade_id: str
+    exchange_order_id: str
+    client_order_id: str
+    symbol: str
+    side: OrderSide
+    quantity: float
+    price: float
+    fee: float
+    occurred_at: float
+
+
+@dataclass(frozen=True)
 class ProtectiveOrder:
     """Validated exchange-native reduce-only stop state.
 
@@ -151,6 +181,30 @@ class Broker(ABC):
 
     @abstractmethod
     def place_order(self, order: Order) -> Fill: ...
+
+    def submit_order(self, order: Order) -> BrokerOrderAcknowledgement:
+        """Submit without assigning fill authority to the REST response.
+
+        Legacy adapters receive a compatible acknowledgement from their
+        immediate fill. Live adapters must override this method.
+        """
+
+        fill = self.place_order(order)
+        exchange_order_id = str(fill.exchange_order_id or "")
+        client_order_id = str(fill.client_order_id or order.client_id or "")
+        if not exchange_order_id or not client_order_id:
+            raise RuntimeError("broker acknowledgement has no order identity")
+        return BrokerOrderAcknowledgement(
+            exchange_order_id=exchange_order_id,
+            client_order_id=client_order_id,
+            status="filled",
+            submitted_at=fill.timestamp,
+        )
+
+    def query_order(
+        self, *, symbol: str, exchange_order_id: str, client_order_id: str
+    ) -> BrokerOrderState:
+        raise NotImplementedError(f"{self.name} cannot query exchange order state")
 
     def normalize_order_qty(
         self,

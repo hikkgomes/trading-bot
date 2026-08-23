@@ -78,7 +78,15 @@ def test_target_builder_consumes_canonical_market_and_balance_snapshots(tmp_path
             "source_snapshot_ids": {
                 name: "sha256:" + str(index) * 64
                 for index, name in enumerate(
-                    ("balances", "positions", "open_orders", "account", "market", "health", "drift"),
+                    (
+                        "balances",
+                        "positions",
+                        "open_orders",
+                        "account",
+                        "market",
+                        "health",
+                        "drift",
+                    ),
                     1,
                 )
             },

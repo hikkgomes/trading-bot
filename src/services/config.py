@@ -16,6 +16,7 @@ LINUX_SERVICES = frozenset(
         "data-writer",
         "feature-service",
         "portfolio-engine",
+        "portfolio-state-service",
         "risk-engine",
         "execution-engine",
         "paper-engine",

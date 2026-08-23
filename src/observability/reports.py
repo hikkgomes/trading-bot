@@ -143,7 +143,9 @@ class DatabasePlatformReport:
             candidate_id = str(row["experiment_id"])
             evaluated_ids.add(candidate_id)
             payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-            evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else payload
+            evidence = (
+                payload.get("evidence") if isinstance(payload.get("evidence"), dict) else payload
+            )
             frequency = evidence.get("signal_frequency")
             if isinstance(frequency, int | float) and not isinstance(frequency, bool):
                 signal_frequencies.append(float(frequency))

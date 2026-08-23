@@ -69,7 +69,7 @@ class BrokerExecutionVenue:
             client_id=client_order_id,
         )
         try:
-            response = self.broker.place_order(broker_order)
+            response = self.broker.submit_order(broker_order)
         except Exception:
             self.order_manager.recovery_required(intent.order_id)
             raise

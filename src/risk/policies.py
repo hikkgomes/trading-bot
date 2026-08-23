@@ -33,9 +33,7 @@ def install_product_risk_policies(
                     "max_turnover_fraction": float(strategy["maximum_turnover_fraction"]),
                     "max_trades_per_day": int(strategy["maximum_trades_per_day"]),
                     "max_slippage_bps": float(strategy["maximum_slippage_bps"]),
-                    "max_funding_cost_fraction": float(
-                        strategy["maximum_funding_cost_fraction"]
-                    ),
+                    "max_funding_cost_fraction": float(strategy["maximum_funding_cost_fraction"]),
                 },
                 "instrument": {
                     "max_position_notional": float(instrument["maximum_position_notional"]),
@@ -55,9 +53,7 @@ def install_product_risk_policies(
                     "max_turnover_fraction": float(sleeve["maximum_turnover_fraction"]),
                 },
                 "product": {
-                    "max_gross_fraction": float(
-                        product_limits.get("maximum_gross", exposure)
-                    ),
+                    "max_gross_fraction": float(product_limits.get("maximum_gross", exposure)),
                     "max_net_fraction": float(product_limits.get("maximum_net", exposure)),
                     "max_drawdown_fraction": float(product_limits["maximum_drawdown"]),
                     "max_margin_fraction": float(
@@ -67,9 +63,7 @@ def install_product_risk_policies(
                 },
                 "account": {
                     "max_used_margin_fraction": float(account["maximum_margin_fraction"]),
-                    "min_liquidation_buffer_fraction": float(
-                        account["minimum_liquidation_buffer"]
-                    ),
+                    "min_liquidation_buffer_fraction": float(account["minimum_liquidation_buffer"]),
                     "reject_unknown_exposure": bool(account["reject_unknown_exposure"]),
                 },
                 "global": {
@@ -77,9 +71,7 @@ def install_product_risk_policies(
                     "max_data_age_seconds": float(
                         global_limits["maximum_market_data_staleness_seconds"]
                     ),
-                    "max_clock_skew_seconds": float(
-                        global_limits["maximum_clock_skew_seconds"]
-                    ),
+                    "max_clock_skew_seconds": float(global_limits["maximum_clock_skew_seconds"]),
                 },
             },
         )

@@ -144,19 +144,17 @@ def plan_orders(
         reversal_close_id: str | None = None
         for side, quantity, reduce_only, phase in legs:
             intent = _intent(
-                    target=target,
-                    side=side,
-                    quantity=quantity,
-                    reduce_only=reduce_only,
-                    phase=phase,
-                    current_quantity=current,
-                    decided_at=decided_at,
-                    order_type=order_type,
-                    limit_price=float(limit_price) if limit_price is not None else None,
-                    depends_on_order_id=(
-                        reversal_close_id if phase == "open_after_reversal" else None
-                    ),
-                )
+                target=target,
+                side=side,
+                quantity=quantity,
+                reduce_only=reduce_only,
+                phase=phase,
+                current_quantity=current,
+                decided_at=decided_at,
+                order_type=order_type,
+                limit_price=float(limit_price) if limit_price is not None else None,
+                depends_on_order_id=(reversal_close_id if phase == "open_after_reversal" else None),
+            )
             intents.append(intent)
             if phase == "close_for_reversal":
                 reversal_close_id = intent.order_id

@@ -154,6 +154,8 @@ def _test_thesis(*, budget: int = 20) -> ResearchThesis:
         created_at=NOW,
         creator_identity="test-suite",
     )
+
+
 LATER = "2026-08-13T13:00:00+00:00"
 BTC = "binance:futures:BTCUSDT:USDT"
 ETH = "binance:futures:ETHUSDT:USDT"

@@ -243,6 +243,8 @@ class EventReplayEngine:
             quantity = min(remaining, max(0.0, executable))
             if quantity <= 0:
                 continue
+            if event.best_ask is None or event.best_bid is None:
+                raise ValueError("trade event has no executable top of book")
             touch_price = (
                 float(event.best_ask)
                 if order.side is SimulatedOrderSide.BUY

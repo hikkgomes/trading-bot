@@ -7,7 +7,7 @@ import os
 from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from sqlalchemy import func, insert, select, text
 from sqlalchemy.engine import Engine
@@ -325,7 +325,7 @@ class OrderManager:
         current = self.get(order_id)
         if status not in _ALLOWED_TRANSITIONS[current.status]:
             raise ValueError(f"invalid order transition {current.status.value}->{status.value}")
-        updated = replace(current, status=status, **changes)
+        updated = replace(current, status=status, **cast(Any, changes))
         self.store.append(event_type=status.value, intent=updated, event_at=event_at)
         self._orders[order_id] = updated
         return updated

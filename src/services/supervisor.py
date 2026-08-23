@@ -17,7 +17,7 @@ from src.agents.code_worker import AgentCodeWorkflow
 from src.agents.sandbox import SandboxPolicy
 from src.agents.store import SqlAgentStore
 from src.autopilot.event_capture import load_event_capture_config
-from src.data.database import PlatformDatabase, active_strategy_assignment
+from src.data.database import PlatformDatabase, active_strategy_assignment, strategy_artefact
 from src.data.feature_store import SqlFeatureStore
 from src.data.parquet_store import PartitionedBacktestStore
 from src.data.universe import SqlUniverseStore
@@ -27,12 +27,14 @@ from src.execution.position_manager import PositionManager, SqlPositionStore
 from src.execution.recovery import SqlRecoveryStore
 from src.observability.decision_trace import SqlDecisionTraceStore
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
+from src.research.datasets import CanonicalDatasetResolver, SqlCanonicalDatasetRepository
 from src.research.ml import MlExperimentRunner, ModelArtefactStore, SqlModelArtefactStore
 from src.research.store import SqlResearchStore
 from src.risk.engine import SqlRiskDecisionStore, SqlRiskPolicyStore, SqlRiskSnapshotStore
 from src.risk.policies import install_product_risk_policies
 from src.services.accounting_service import AccountingService, DatabaseAccountingWorker
 from src.services.agent_worker import DatabaseAgentJobHandlers
+from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.config import load_platform_config, load_split_configuration
 from src.services.control_api import DatabaseControlPlane, build_control_server
 from src.services.data_writer import DatabaseMarketDataWriter
@@ -54,6 +56,7 @@ from src.services.portfolio_engine import (
     DatabaseProductCoordinator,
 )
 from src.services.portfolio_service import SqlPortfolioRepository
+from src.services.portfolio_state import DatabasePortfolioStateWorker
 from src.services.promotion import (
     DatabasePromotionWorker,
     PromotionPolicy,
@@ -161,10 +164,92 @@ def _portfolio_cycle(
             },
         ),
     )
+
     def run_once() -> dict[str, Any]:
         return target_worker.run_once(now=utc_now())
 
     return run_once
+
+
+def _portfolio_state_cycle(
+    *,
+    database: PlatformDatabase,
+    configuration: Mapping[str, Mapping[str, Any]],
+    node_id: str,
+) -> Callable[[], dict[str, Any]]:
+    queue = DatabaseJobQueue(database.engine)
+    worker_id = f"{node_id}:portfolio-state-service"
+    queue.register_worker(
+        worker_id=worker_id,
+        node_id=node_id,
+        role="portfolio-state-service",
+        capabilities=("portfolio_state_publish",),
+        observed_at=utc_now(),
+    )
+    worker = DatabasePortfolioStateWorker(
+        queue=queue,
+        worker_id=worker_id,
+        store=SqlRiskSnapshotStore(database.engine),
+    )
+    products = _by_id(configuration["products"], collection="products", identity="product_id")
+    policies = _portfolio_state_policies(configuration, products)
+
+    def run_once() -> dict[str, Any]:
+        now = utc_now()
+        result = worker.run_once(now=now)
+        if result.get("reason_code") != "portfolio_state_queue_empty":
+            return result
+        scheduled = worker.schedule_from_latest(
+            products=products,
+            state_policies=policies,
+            now=now,
+        )
+        if not scheduled:
+            return {
+                "reason_code": "portfolio_state_waiting_for_source_snapshots",
+                "products": len(products),
+            }
+        return worker.run_once(now=now)
+
+    return run_once
+
+
+def _portfolio_state_policies(
+    configuration: Mapping[str, Mapping[str, Any]],
+    products: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    risk = configuration["risk"]
+    global_limits = risk["global"]
+    instrument = risk["instrument"]
+    sleeve = risk["sleeve"]
+    product_limits = risk["products"]
+    result: dict[str, dict[str, Any]] = {}
+    for product_id, product in products.items():
+        risk_policy_id = str(product["risk_policy_id"])
+        limits = product_limits[risk_policy_id]
+        sleeves = tuple(str(item) for item in product.get("sleeves", ()))
+        sleeve_budget = 1.0 / len(sleeves) if sleeves else 1.0
+        result[product_id] = {
+            "maximum_state_age_seconds": min(
+                float(global_limits["maximum_market_data_staleness_seconds"]),
+                float(global_limits["maximum_database_staleness_seconds"]),
+            ),
+            "risk_policy_ids": [risk_policy_id],
+            "portfolio_risk_budget": float(
+                limits.get("maximum_exposure", limits.get("maximum_gross", 1.0))
+            ),
+            "maximum_symbol_fraction": float(instrument["maximum_fraction"]),
+            "maximum_abs_beta": float(sleeve["maximum_abs_beta"]),
+            "maximum_correlation": float(sleeve["maximum_correlation"]),
+            "maximum_turnover_fraction": float(sleeve["maximum_turnover_fraction"]),
+            "maximum_cluster_fraction": float(sleeve["maximum_fraction"]),
+            "maximum_product_drawdown_fraction": float(limits["maximum_drawdown"]),
+            "maximum_depth_participation": float(instrument["maximum_visible_depth_fraction"]),
+            "sleeve_budgets": {name: sleeve_budget for name in sleeves},
+            "clusters": {},
+            "cluster_fraction_caps": {},
+        }
+    return result
 
 
 def _execution_cycle(
@@ -382,7 +467,9 @@ def _market_gateway_cycle(
         accounts=accounts,
         universe_symbols=lambda: universe.eligible_symbols_for_capture(),
     )
-    return lambda: gateway.run_once(maximum_seconds=maximum_seconds)
+    if maximum_seconds <= 0:
+        raise ValueError("market gateway heartbeat interval must be positive")
+    return gateway
 
 
 def _feature_cycle(
@@ -410,6 +497,7 @@ def _feature_cycle(
         parquet_root=parquet_root,
         active_assignments=_active_assignments(database.engine),
         snapshot_store=SqlRiskSnapshotStore(database.engine),
+        feature_graph_for_assignment=_artefact_feature_graph(database.engine),
     )
     return lambda: worker.run_once(now=utc_now())
 
@@ -437,6 +525,25 @@ def _active_assignments(engine) -> Callable[[str], tuple[Mapping[str, Any], ...]
     return load
 
 
+def _artefact_feature_graph(engine) -> Callable[[Mapping[str, Any]], Mapping[str, Any]]:
+    def load(assignment: Mapping[str, Any]) -> Mapping[str, Any]:
+        with engine.connect() as connection:
+            payload = connection.execute(
+                select(strategy_artefact.c.payload).where(
+                    strategy_artefact.c.id == str(assignment["artefact_hash"])
+                )
+            ).scalar_one_or_none()
+        if not isinstance(payload, Mapping):
+            raise ValueError("active assignment artefact is missing")
+        definition = payload.get("definition")
+        graph = definition.get("feature_graph") if isinstance(definition, Mapping) else None
+        if not isinstance(graph, Mapping):
+            raise ValueError("active artefact has no feature graph")
+        return graph
+
+    return load
+
+
 def _strategy_evaluator_cycle(
     *, database: PlatformDatabase, node_id: str
 ) -> Callable[[], dict[str, Any]]:
@@ -455,6 +562,7 @@ def _strategy_evaluator_cycle(
         feature_store=SqlFeatureStore(database.engine),
         portfolio=SqlPortfolioRepository(database.engine, require_pipeline_identity=True),
         assignments=SqlActiveStrategyAssignmentRepository(database.engine),
+        artefact_dispatcher=ArtefactDispatcher.default(),
     )
     return lambda: worker.run_once(now=utc_now())
 
@@ -583,6 +691,17 @@ def _research_cycle(
         capabilities=job_names,
         observed_at=utc_now(),
     )
+    dataset_resolver = CanonicalDatasetResolver(SqlCanonicalDatasetRepository(database.engine))
+
+    def load_research_dataset(kind: str, payload: Mapping[str, Any]) -> Any:
+        context = dataset_resolver.resolve_context(
+            snapshot_ids=tuple(str(item) for item in payload["dataset_snapshot_ids"]),
+            feature_manifest_id=str(payload["feature_manifest_id"]),
+            cost_model_id=str(payload["cost_model_id"]),
+            parameter_set_id=str(payload["parameter_set_id"]),
+        )
+        return context.get(kind, context)
+
     all_handlers = DatabaseResearchJobHandlers(
         SqlResearchStore(database.engine),
         artefact_store=PartitionedBacktestStore(parquet_root),
@@ -590,6 +709,8 @@ def _research_cycle(
             artefact_store=ModelArtefactStore(artefact_root / "models"),
             metadata_store=SqlModelArtefactStore(database.engine),
         ),
+        dataset_resolver=dataset_resolver,
+        dataset_loader=load_research_dataset,
     ).handlers()
     worker = ResearchWorker(
         runtime=runtime,
@@ -684,6 +805,12 @@ def run(args: argparse.Namespace) -> int:
         work = _portfolio_cycle(
             database=database, configuration=split_configuration, node_id=args.node
         )
+    elif args.service == "portfolio-state-service":
+        work = _portfolio_state_cycle(
+            database=database,
+            configuration=split_configuration,
+            node_id=args.node,
+        )
     elif args.service == "execution-engine":
         work = _execution_cycle(
             database=database,
@@ -752,6 +879,7 @@ def run(args: argparse.Namespace) -> int:
         def work() -> dict[str, Any]:
             return _idle_cycle(args.service)
 
+    market_gateway = work if isinstance(work, DatabaseMarketGateway) else None
     if args.service != "control-api":
         unpaused_work = work
         control_plane = DatabaseControlPlane(database.engine, heartbeat_store)
@@ -798,13 +926,16 @@ def run(args: argparse.Namespace) -> int:
     while not stopping:
         cycle = runtime.run_once(work)
         reason_code = str(cycle.detail.get("reason_code") or "")
-        if args.service != "market-gateway" and (
+        if (
             args.service == "report-worker"
+            or reason_code == "market_gateway_running"
             or reason_code.endswith("queue_empty")
             or reason_code.endswith("paused")
             or reason_code in {"service_waiting_for_input", "service_cycle_failed"}
         ):
             time.sleep(args.interval_seconds)
+    if market_gateway is not None:
+        market_gateway.stop()
     runtime.heartbeat(payload={"reason_code": "service_stopped"})
     database.dispose()
     return 0

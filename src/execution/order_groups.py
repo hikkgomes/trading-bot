@@ -321,7 +321,9 @@ def release_hedges_from_primary_fill(
         for order in plan.orders[1:]
     )
     required = sum(order.quantity for order in hedges)
-    filled = sum(max(0.0, float(hedge_filled_quantities.get(order.instrument_id, 0.0))) for order in hedges)
+    filled = sum(
+        max(0.0, float(hedge_filled_quantities.get(order.instrument_id, 0.0))) for order in hedges
+    )
     error = 0.0 if required == 0 else max(0.0, (required - filled) / required)
     return HedgeRelease(hedges, primary_filled_quantity, error)
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
@@ -84,7 +84,7 @@ class ApprovedLiveExecution:
     def reconcile(self, product_id: str) -> ReconciliationResult:
         """Compare complete authenticated venue state with durable local state."""
         venue = self.venues[product_id]
-        broker = venue.broker
+        broker = cast(CcxtBroker, venue.broker)
         symbol_to_instrument = {
             instrument.exchange_symbol: identity
             for identity, instrument in venue.instruments.items()

@@ -17,7 +17,14 @@ from src.research.backtest.event_engine import (
 )
 from src.research.catalogue import registered_strategy_candidates, registered_strategy_theses
 from src.research.coordinator import Candidate, ResearchCoordinator
-from src.research.evaluation import CanonicalResearchEvaluator, EvaluationRequest
+from src.research.datasets import CanonicalDatasetResolver
+from src.research.evaluation import (
+    CanonicalResearchEvaluator,
+    EvaluationRequest,
+    EvidencePolicy,
+    ProtectedHoldoutWorker,
+)
+from src.research.executors import ProviderContextBuilderRegistry, ProviderExecutorRegistry
 from src.research.ml import MlExperimentRunner
 from src.research.providers import provider_candidate
 from src.research.store import SqlResearchStore
@@ -80,11 +87,19 @@ class DatabaseResearchJobHandlers:
         artefact_store: PartitionedBacktestStore | None = None,
         ml_runner: MlExperimentRunner | None = None,
         dataset_loader: Callable[[str, Mapping[str, Any]], Any] | None = None,
+        dataset_resolver: CanonicalDatasetResolver | None = None,
+        executors: ProviderExecutorRegistry | None = None,
+        context_builders: ProviderContextBuilderRegistry | None = None,
+        evidence_policy: EvidencePolicy | None = None,
     ):
         self.store = store
         self.artefact_store = artefact_store
         self.ml_runner = ml_runner
         self.dataset_loader = dataset_loader
+        self.dataset_resolver = dataset_resolver
+        self.executors = executors or ProviderExecutorRegistry.default()
+        self.context_builders = context_builders or ProviderContextBuilderRegistry.default()
+        self.evidence_policy = evidence_policy or EvidencePolicy()
 
     def handlers(self) -> dict[str, Callable]:
         return {
@@ -140,7 +155,42 @@ class DatabaseResearchJobHandlers:
         renew()
         ResearchJobRequest.from_mapping(claimed.payload)
         request = EvaluationRequest.from_payload(claimed.payload)
-        result = CanonicalResearchEvaluator(self.store).evaluate(request)
+        if self.dataset_resolver is None:
+            raise JobSchemaError("candidate evaluation requires a canonical dataset resolver")
+        resolved_context = self.dataset_resolver.resolve_context(
+            snapshot_ids=request.dataset_snapshot_ids,
+            feature_manifest_id=str(request.feature_manifest_id),
+            cost_model_id=str(request.cost_model_id),
+            parameter_set_id=str(request.parameter_set_id),
+        )
+        candidate = self.store.get_candidate(request.candidate_id)
+        context = self.context_builders.build(candidate, resolved_context)
+
+        def evaluate_protected(_claim: Mapping[str, Any]) -> tuple[bool, Mapping[str, Any]]:
+            execution = self.executors.execute(
+                candidate,
+                {
+                    **context,
+                    "requested_stage": "protected",
+                    "evaluated_at": request.evaluated_at,
+                },
+            )
+            measured = dict(execution.evidence)
+            accepted = self.evidence_policy.accepts("development", measured, ())
+            return accepted, {
+                "passed": accepted,
+                "metrics": dict(execution.metrics),
+                "execution_receipt": dict(execution.receipt),
+                "cost_adjusted_return": measured.get("cost_adjusted_return"),
+            }
+
+        result = CanonicalResearchEvaluator(
+            self.store,
+            executors=self.executors,
+            provider_context=context,
+            protected_worker=ProtectedHoldoutWorker(self.store.engine, evaluate_protected),
+            evidence_policy=self.evidence_policy,
+        ).evaluate(request)
         return {
             "candidate_id": result.candidate_id,
             "stage": result.stage,

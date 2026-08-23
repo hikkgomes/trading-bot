@@ -293,8 +293,8 @@ def validate_job_payload(name: str, payload: Mapping[str, Any]) -> dict[str, Any
     """
 
     if name == "evaluate_candidate":
-        request = ResearchJobRequest.from_mapping(payload)
-        return request.to_payload()
+        research_request = ResearchJobRequest.from_mapping(payload)
+        return research_request.to_payload()
     if name == "risk_assessment":
         request = RiskAssessmentRequest.from_mapping(payload)
         return {
