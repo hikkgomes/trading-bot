@@ -1,5 +1,5 @@
 {
-  "schema": "research/v1",
+  "schema": "research/v2",
   "strategy_families": [
     "named",
     "generated_dsl",
@@ -12,7 +12,9 @@
   "search_budgets": {
     "maximum_candidates_per_day": 100,
     "maximum_cpu_minutes_per_job": 120,
-    "maximum_memory_mb": 8192
+    "maximum_memory_mb": 3072,
+    "maximum_threads": 2,
+    "heavy_compute_slots": 1
   },
   "data_requirements": {
     "point_in_time_universe": true,
@@ -40,7 +42,7 @@
     "run_bounded_research": true,
     "submit_exchange_orders": false
   },
-  "worker_node": "macbook-research",
+  "worker_node": "linux-optiplex",
   "resource_limits": {
     "maximum_patch_files": 40,
     "maximum_patch_bytes": 524288,

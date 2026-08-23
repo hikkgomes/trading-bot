@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, "feature/**"]
 
 permissions:
   contents: read
@@ -36,8 +36,13 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: |
-          python -m venv .venv
-          .venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m venv .venv-runtime
+          .venv-runtime/bin/python -m pip install -r requirements-runtime.txt
+          python -m venv .venv-research
+          .venv-research/bin/python -m pip install -r requirements-research-linux.txt -r requirements-dev.txt
+          python -m venv .venv-agent
+          .venv-agent/bin/python -m pip install -r requirements-agent.txt
+          ln -s .venv-research .venv
       - name: Lint
         run: |
           .venv/bin/python -m ruff check .
@@ -48,7 +53,14 @@ jobs:
         run: .venv/bin/python -m src.autopilot.runtime --config config/autopilot.json --validate
       - name: Apply and verify PostgreSQL migrations
         run: |
+          .venv-runtime/bin/python -m alembic upgrade head
           .venv/bin/python -m src.data.migrate
           .venv/bin/python -m src.data.migrate --check
+      - name: Validate platform installer
+        run: make platform-install-dry-run
+      - name: PostgreSQL privilege boundary
+        run: .venv/bin/python -m pytest tests/test_postgresql_privileges.py -q
+      - name: Platform smoke
+        run: make platform-smoke ALLOW_EMPTY=1
       - name: Test
         run: .venv/bin/python -m pytest

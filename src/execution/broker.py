@@ -59,6 +59,9 @@ class Fill:
     price: float
     fee: float
     timestamp: float = field(default_factory=time.time)
+    exchange_order_id: str | None = None
+    client_order_id: str | None = None
+    fee_asset: str | None = None
 
 
 @dataclass(frozen=True)

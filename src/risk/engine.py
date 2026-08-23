@@ -13,7 +13,8 @@ from sqlalchemy import insert, select
 from sqlalchemy.engine import Engine
 
 from src.data.database import risk_decision as risk_decision_table
-from src.domain._codec import non_empty, to_primitive
+from src.data.database import risk_snapshot as risk_snapshot_table
+from src.domain._codec import canonical_hash, json_value, non_empty, timestamp, to_primitive
 from src.domain.risk import RiskDecision
 
 REQUIRED_RISK_SCOPES = ("strategy", "instrument", "sleeve", "product", "account", "global")
@@ -103,6 +104,47 @@ class SqlRiskDecisionStore:
         if tuple(item.scope for item in components) != REQUIRED_RISK_SCOPES:
             raise ValueError("risk assessment components are incomplete")
         return HierarchicalRiskAssessment(components, aggregate)
+
+
+class SqlRiskSnapshotStore:
+    """Immutable canonical inputs consumed by the risk worker.
+
+    Queue commands carry only these content-addressed IDs. The values stay in
+    PostgreSQL and are therefore not producer-controlled job results.
+    """
+
+    def __init__(self, engine: Engine):
+        self.engine = engine
+
+    def save(self, payload: dict[str, object], *, created_at: str) -> str:
+        clean = json_value(payload, field="risk snapshot")
+        snapshot_id = canonical_hash(clean)
+        created_at = timestamp(created_at, field="created_at")
+        with self.engine.begin() as connection:
+            existing = connection.execute(
+                select(risk_snapshot_table.c.payload).where(risk_snapshot_table.c.id == snapshot_id)
+            ).scalar_one_or_none()
+            if existing is not None:
+                if dict(existing) != clean:
+                    raise ValueError("risk snapshot content-hash collision")
+                return snapshot_id
+            connection.execute(
+                insert(risk_snapshot_table).values(
+                    id=snapshot_id,
+                    created_at=created_at,
+                    payload=clean,
+                )
+            )
+        return snapshot_id
+
+    def get(self, snapshot_id: str) -> dict[str, object]:
+        with self.engine.connect() as connection:
+            payload = connection.execute(
+                select(risk_snapshot_table.c.payload).where(risk_snapshot_table.c.id == snapshot_id)
+            ).scalar_one_or_none()
+        if not isinstance(payload, dict):
+            raise KeyError(f"risk snapshot does not exist: {snapshot_id}")
+        return dict(payload)
 
 
 @dataclass(frozen=True)

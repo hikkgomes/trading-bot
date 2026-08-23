@@ -6,12 +6,11 @@ Requires=postgresql.service
 
 [Service]
 Type=oneshot
-User=trading-platform
-Group=trading-platform
+User=trading-runtime
+Group=trading-runtime
 WorkingDirectory=/opt/trading-bot
-EnvironmentFile=/etc/trading-platform/platform.env
-ExecStartPre=/opt/trading-bot/.venv/bin/python -m src.data.migrate
-ExecStart=/opt/trading-bot/.venv/bin/python -m src.services.backup_service --config /opt/trading-bot/config/platform.json --mode %i
+EnvironmentFile=/etc/trading-platform/backup.env
+ExecStart=/opt/trading-bot/.venv-runtime/bin/python -m src.services.backup_service --config /opt/trading-bot/config/platform.json --mode %i
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

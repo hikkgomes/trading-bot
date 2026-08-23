@@ -1,0 +1,8 @@
+[Unit]
+Description=Trading platform agent sandbox services
+
+[Slice]
+CPUWeight=50
+IOWeight=50
+MemoryMax=1G
+TasksMax=64

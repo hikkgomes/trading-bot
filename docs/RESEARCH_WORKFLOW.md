@@ -653,3 +653,14 @@ floor. Do not bypass the typed compiler, canonical memory, data coverage,
 multiple-testing adjustment, durable holdout claim, paper evidence, or human
 approval boundary. Expanding the grammar increases what can be tested; it does
 not establish that any resulting strategy is profitable.
+# Platform research authority
+
+Research commands contain only candidate and immutable input identities:
+dataset snapshots, feature manifest, cost model, parameter set, evaluator
+version, producer identity, and content hash. Workers load the inputs from
+canonical stores and write measured evidence and receipts. A job cannot submit
+returns, metrics, acceptance flags, holdout results, or forward results.
+
+The protected holdout is claimed atomically before it is read. Forward evidence
+comes only from later production-equivalent paper observations bound to the
+exact strategy artefact and engine.

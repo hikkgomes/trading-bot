@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import time
 
 from src.execution.broker import (
     Broker,
@@ -602,7 +603,7 @@ class CcxtBroker(Broker):
             price=normalized_order.price,
             params=params,
         )
-        self._assert_order_status_accepted(result)
+        self._assert_order_status_accepted(result, requested_quantity=normalized_order.qty)
         self._assert_order_response_matches(result, normalized_order)
         fill_price = float(
             self._required_first_present(result, ("average", "price"), label="Filled order price")
@@ -619,7 +620,10 @@ class CcxtBroker(Broker):
             raise ValueError(f"Filled order price must be positive, got {fill_price:g}. Refusing.")
         if not math.isfinite(filled) or filled <= 0:
             raise ValueError(f"Filled order quantity must be positive, got {filled:g}. Refusing.")
-        self._assert_filled_quantity_matches_request(float(normalized_order.qty), filled)
+        if filled < float(normalized_order.qty) and not (result.get("id") or result.get("status")):
+            raise ValueError("Refusing to accept a partial fill without an exchange order identity")
+        if filled > float(normalized_order.qty) + max(float(normalized_order.qty) * 1e-12, 1e-12):
+            raise ValueError("Exchange fill quantity exceeds requested quantity. Refusing.")
         self._assert_fill_slippage_within_cap(ref_price, fill_price)
         if enforce_notional_cap:
             self._assert_notional_within_cap(fill_price * filled, label="Filled order")
@@ -636,6 +640,18 @@ class CcxtBroker(Broker):
             qty=filled,
             price=fill_price,
             fee=fee,
+            timestamp=float(
+                result.get("timestamp") or result.get("lastTradeTimestamp") or time.time()
+            ),
+            exchange_order_id=str(result.get("id") or "") or None,
+            client_order_id=str(
+                result.get("clientOrderId")
+                or (result.get("info") or {}).get("clientOrderId")
+                or normalized_order.client_id
+                or ""
+            )
+            or None,
+            fee_asset=str((result.get("fee") or {}).get("currency") or "") or None,
         )
 
     def supports_native_protective_stops(self) -> bool:
@@ -1316,11 +1332,16 @@ class CcxtBroker(Broker):
         raise ValueError(f"{label} missing from exchange response. Refusing to assume order fill.")
 
     @staticmethod
-    def _assert_order_status_accepted(payload: dict) -> None:
+    def _assert_order_status_accepted(payload: dict, *, requested_quantity: float) -> None:
         status = payload.get("status")
         if status is None:
             return
         normalized = str(status).lower()
+        if normalized in {"new", "open", "accepted", "partially_filled"}:
+            filled = float(payload.get("filled") or 0.0)
+            amount = float(payload.get("amount") or requested_quantity)
+            if 0 < filled < amount:
+                return
         if normalized not in {"closed", "filled"}:
             raise ValueError(
                 f"Exchange order status {status!r} is not closed/filled. Refusing to accept fill."

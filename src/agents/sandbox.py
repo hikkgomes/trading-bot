@@ -1,8 +1,7 @@
-"""Resource-bounded command runner for an isolated Mac research worktree."""
+"""Fail-closed Linux bubblewrap runner for agent-generated code."""
 
 from __future__ import annotations
 
-import os
 import platform
 import resource
 import shutil
@@ -15,12 +14,14 @@ from pathlib import Path
 @dataclass(frozen=True)
 class SandboxPolicy:
     timeout_seconds: int = 7_200
-    maximum_memory_mb: int = 8_192
+    maximum_memory_mb: int = 3_072
     maximum_file_bytes: int = 64 * 1024 * 1024
     maximum_processes: int = 32
+    maximum_cpu_seconds: int = 7_200
+    maximum_output_bytes: int = 64_000
 
     def __post_init__(self) -> None:
-        if self.timeout_seconds <= 0:
+        if self.timeout_seconds <= 0 or self.maximum_cpu_seconds <= 0:
             raise ValueError("sandbox timeout must be positive")
         if self.maximum_memory_mb <= 0 or self.maximum_file_bytes <= 0:
             raise ValueError("sandbox memory and file limits must be positive")
@@ -53,6 +54,9 @@ class SandboxRunner:
         self.workspace = workspace.resolve()
         self.policy = policy
         self.require_network_isolation = require_network_isolation
+        self.bwrap = shutil.which("bwrap")
+        if self.require_network_isolation and self.bwrap is None:
+            raise RuntimeError("bubblewrap is required for the Linux agent sandbox")
 
     def run(self, argv: tuple[str, ...]) -> CommandResult:
         if not argv:
@@ -64,23 +68,21 @@ class SandboxRunner:
             raise PermissionError("sandbox Python commands must use an approved module")
         command = list(argv)
         if self.require_network_isolation:
-            if platform.system() != "Darwin" or not Path("/usr/bin/sandbox-exec").is_file():
-                raise RuntimeError("the agent worker requires the macOS network sandbox")
-            command = [
-                "/usr/bin/sandbox-exec",
-                "-p",
-                "(version 1) (allow default) (deny network*)",
-                *command,
-            ]
+            if platform.system() != "Linux" or self.bwrap is None:
+                raise RuntimeError("the agent worker requires Linux bubblewrap")
+            command = self._bubblewrap_command(command)
+        environment = {
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PYTHONHASHSEED": "0",
+        }
+        if not self.require_network_isolation:
+            command = [*command]
         completed = subprocess.run(
             command,
             cwd=self.workspace,
-            env={
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                "LANG": "C.UTF-8",
-                "LC_ALL": "C.UTF-8",
-                "PYTHONHASHSEED": "0",
-            },
+            env=environment,
             capture_output=True,
             text=True,
             timeout=self.policy.timeout_seconds,
@@ -90,9 +92,59 @@ class SandboxRunner:
         return CommandResult(
             argv=argv,
             return_code=completed.returncode,
-            stdout=completed.stdout[-64_000:],
-            stderr=completed.stderr[-64_000:],
+            stdout=completed.stdout[-self.policy.maximum_output_bytes :],
+            stderr=completed.stderr[-self.policy.maximum_output_bytes :],
         )
+
+    def _bubblewrap_command(self, command: list[str]) -> list[str]:
+        """Build a minimal read-only root with a writable private worktree."""
+
+        worktree = self.workspace / ".agent-sandbox-worktree"
+        worktree.mkdir(parents=True, exist_ok=True)
+        return [
+            str(self.bwrap),
+            "--die-with-parent",
+            "--unshare-net",
+            "--unshare-pid",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind",
+            "/bin",
+            "/bin",
+            "--ro-bind",
+            "/lib",
+            "/lib",
+            "--ro-bind",
+            str(self.workspace),
+            "/repository",
+            "--bind",
+            str(worktree),
+            "/worktree",
+            "--tmpfs",
+            "/tmp",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--chdir",
+            "/worktree",
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--setenv",
+            "LANG",
+            "C.UTF-8",
+            "--setenv",
+            "LC_ALL",
+            "C.UTF-8",
+            "--setenv",
+            "PYTHONHASHSEED",
+            "0",
+            "--",
+            *command,
+        ]
 
     def _limit_resources(self) -> None:
         memory = self.policy.maximum_memory_mb * 1024 * 1024
@@ -101,6 +153,11 @@ class SandboxRunner:
             resource.RLIMIT_FSIZE,
             (self.policy.maximum_file_bytes, self.policy.maximum_file_bytes),
         )
+        if hasattr(resource, "RLIMIT_CPU"):
+            resource.setrlimit(
+                resource.RLIMIT_CPU,
+                (self.policy.maximum_cpu_seconds, self.policy.maximum_cpu_seconds),
+            )
         if hasattr(resource, "RLIMIT_NPROC"):
             resource.setrlimit(
                 resource.RLIMIT_NPROC,

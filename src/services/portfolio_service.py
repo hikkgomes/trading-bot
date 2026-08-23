@@ -30,10 +30,21 @@ def _forecast_from_dict(payload: Mapping[str, Any]) -> AlphaForecast:
 
 
 class SqlPortfolioRepository:
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: Engine, *, require_pipeline_identity: bool = False):
         self.engine = engine
+        self.require_pipeline_identity = require_pipeline_identity
 
     def save_forecast(self, forecast: AlphaForecast) -> str:
+        required_metadata = {"market_event_id", "feature_ids", "artefact_hash", "engine_version"}
+        if self.require_pipeline_identity and not required_metadata.issubset(forecast.metadata):
+            raise ValueError(
+                "alpha forecast is missing event, feature, artefact, or engine identity"
+            )
+        if self.require_pipeline_identity and (
+            not isinstance(forecast.metadata["feature_ids"], list | tuple)
+            or not forecast.metadata["feature_ids"]
+        ):
+            raise ValueError("alpha forecast must bind at least one feature identity")
         payload = to_primitive(forecast)
         forecast_id = canonical_hash(payload)
         with self.engine.begin() as connection:
@@ -69,6 +80,20 @@ class SqlPortfolioRepository:
             and forecast.valid_from <= at
             and at < forecast.valid_until
         )
+
+    def forecast(self, forecast_id: str) -> AlphaForecast:
+        with self.engine.connect() as connection:
+            payload = connection.execute(
+                select(alpha_forecast_table.c.payload).where(
+                    alpha_forecast_table.c.id == forecast_id
+                )
+            ).scalar_one_or_none()
+        if not isinstance(payload, Mapping):
+            raise KeyError(f"alpha forecast does not exist: {forecast_id}")
+        forecast = _forecast_from_dict(payload)
+        if canonical_hash(to_primitive(forecast)) != forecast_id:
+            raise ValueError("alpha forecast identity does not match its content")
+        return forecast
 
     def save_targets(
         self,

@@ -300,3 +300,23 @@ class SqlUniverseStore:
                     )
                 )
             return tuple(memberships)
+
+    def eligible_exchange_symbols(self, *, observed_at: str) -> tuple[str, ...]:
+        """Return the union of all latest point-in-time eligible snapshots."""
+
+        observed_at = timestamp(observed_at, field="observed_at")
+        with self.engine.connect() as connection:
+            universe_ids = tuple(
+                connection.execute(select(universe.c.id).order_by(universe.c.id)).scalars()
+            )
+        symbols: set[str] = set()
+        for universe_id in universe_ids:
+            symbols.update(
+                member.instrument.exchange_symbol
+                for member in self.members_at(
+                    universe_id=str(universe_id),
+                    observed_at=observed_at,
+                    eligible_only=True,
+                )
+            )
+        return tuple(sorted(symbols))

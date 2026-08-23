@@ -1,7 +1,6 @@
 {
   "version": 1,
   "root": "runtime/events",
-  "market_universe_report": "runtime/market_universe.json",
   "max_dynamic_symbols": 12,
   "max_file_bytes": 134217728,
   "max_total_bytes": 5368709120,

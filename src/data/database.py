@@ -29,6 +29,7 @@ schema_migration = Table(
     Column("version", String(80), primary_key=True),
     Column("applied_at", String(40), nullable=False),
     Column("content_hash", String(80), nullable=False, unique=True),
+    Column("revision_hash", String(80), nullable=False),
 )
 
 
@@ -381,6 +382,8 @@ job = Table(
     Column("lease_owner", String(160), index=True),
     Column("lease_expires_at", String(40), index=True),
     Column("attempts", Integer, nullable=False, default=0),
+    Column("producer_identity", String(200), nullable=False, default="platform"),
+    Column("content_hash", String(80), nullable=False),
     Column("payload", JSON, nullable=False),
 )
 job_attempt = Table(
@@ -415,6 +418,16 @@ worker_lease = Table(
     Column("expires_at", String(40), nullable=False, index=True),
     Column("status", String(40), nullable=False),
     Column("payload", JSON, nullable=False),
+)
+heavy_compute_lease = Table(
+    "heavy_compute_lease",
+    metadata,
+    Column("slot_id", String(80), primary_key=True),
+    Column("owner", String(160)),
+    Column("job_id", ForeignKey("job.id")),
+    Column("acquired_at", String(40)),
+    Column("expires_at", String(40), index=True),
+    Column("status", String(40), nullable=False),
 )
 service_heartbeat = Table(
     "service_heartbeat",

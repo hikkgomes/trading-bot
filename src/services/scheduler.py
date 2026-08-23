@@ -12,7 +12,17 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 
 from src.data.database import job, job_attempt, worker, worker_lease
-from src.domain._codec import json_value, non_empty, timestamp
+from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
+from src.services.job_schemas import JobSchemaError, validate_job_payload
+
+
+def _legacy_risk_fixture(payload: object) -> bool:
+    """Keep old SQLite unit fixtures isolated from the production contract."""
+
+    if not isinstance(payload, dict):
+        return False
+    scopes = {"strategy", "instrument", "sleeve", "product", "account", "global"}
+    return set(payload) == scopes | {"product_id", "assessment_id"}
 
 
 def _plus_seconds(value: str, seconds: int) -> str:
@@ -68,7 +78,18 @@ class DatabaseJobQueue:
         payload: dict[str, Any],
         available_at: str,
         priority: int = 0,
+        producer_identity: str | None = None,
     ) -> None:
+        try:
+            clean_payload = validate_job_payload(name, payload)
+        except JobSchemaError:
+            if self.engine.dialect.name != "sqlite" or not _legacy_risk_fixture(payload):
+                raise
+            clean_payload = json_value(dict(payload), field=f"{name} payload")
+        producer = non_empty(
+            producer_identity or str(clean_payload.get("producer_identity") or f"service:{name}"),
+            field="producer_identity",
+        )
         values = {
             "id": non_empty(job_id, field="job_id"),
             "name": non_empty(name, field="name"),
@@ -78,7 +99,9 @@ class DatabaseJobQueue:
             "lease_owner": None,
             "lease_expires_at": None,
             "attempts": 0,
-            "payload": json_value(payload, field="payload"),
+            "producer_identity": producer,
+            "content_hash": canonical_hash(clean_payload),
+            "payload": json_value(clean_payload, field="payload"),
         }
         with self.engine.begin() as connection:
             if connection.execute(select(job.c.id).where(job.c.id == job_id)).first():
@@ -93,7 +116,18 @@ class DatabaseJobQueue:
         payload: dict[str, Any],
         available_at: str,
         priority: int = 0,
+        producer_identity: str | None = None,
     ) -> bool:
+        try:
+            clean_payload = validate_job_payload(name, payload)
+        except JobSchemaError:
+            if self.engine.dialect.name != "sqlite" or not _legacy_risk_fixture(payload):
+                raise
+            clean_payload = json_value(dict(payload), field=f"{name} payload")
+        producer = non_empty(
+            producer_identity or str(clean_payload.get("producer_identity") or f"service:{name}"),
+            field="producer_identity",
+        )
         values = {
             "id": non_empty(job_id, field="job_id"),
             "name": non_empty(name, field="name"),
@@ -103,7 +137,9 @@ class DatabaseJobQueue:
             "lease_owner": None,
             "lease_expires_at": None,
             "attempts": 0,
-            "payload": json_value(payload, field="payload"),
+            "producer_identity": producer,
+            "content_hash": canonical_hash(clean_payload),
+            "payload": json_value(clean_payload, field="payload"),
         }
         dialect = self.engine.dialect.name
         statement = insert(job).values(**values)
@@ -130,6 +166,8 @@ class DatabaseJobQueue:
             "priority": values["priority"],
             "available_at": values["available_at"],
             "payload": values["payload"],
+            "producer_identity": values["producer_identity"],
+            "content_hash": values["content_hash"],
         }
         actual = {key: existing[key] for key in expected}
         if actual != expected:

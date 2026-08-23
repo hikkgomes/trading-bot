@@ -239,7 +239,11 @@ OUTPUTS_UNIT="$(systemd_quote "$REPO/outputs")"
 JOB_ENV_INACCESSIBLE_UNIT="$(systemd_quote "-$REPO/.env")"
 
 echo "Validating autopilot config..."
-"$PYTHON" -m src.autopilot.runtime --config "$CONFIG" --validate
+if [ "$DRY_RUN" = "1" ]; then
+  "$PYTHON" -m src.autopilot.runtime --config "$CONFIG" --validate --skip-jobs
+else
+  "$PYTHON" -m src.autopilot.runtime --config "$CONFIG" --validate
+fi
 echo "Validating event capture config..."
 "$PYTHON" -m src.autopilot.event_capture --config "$EVENT_CAPTURE_CONFIG" --validate
 echo "Validating operations-only alert settings..."

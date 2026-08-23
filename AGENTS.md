@@ -5,8 +5,9 @@ Guidance for coding agents working in this repository.
 ## Current System
 
 This repo is now an autonomous crypto trading framework for a light Linux
-server. The production supervisor is `src.autopilot.runtime` with configuration
-in `config/autopilot.json`.
+server. The production authority is the PostgreSQL platform supervisor in
+`src.services.supervisor`, configured by `config/platform.json`. The legacy
+autopilot modules remain safety and research libraries used by that runtime.
 
 Products:
 
@@ -38,10 +39,10 @@ make artifact-hygiene
 make control ARGS="status"
 ```
 
-For 24/7 Linux operation use the user-level systemd installer:
+For 24/7 Linux operation use the system-level Linux platform installer:
 
 ```bash
-bash scripts/install_autopilot_service.sh
+bash scripts/install_platform_services.sh
 ```
 
 Do not reintroduce the old cron deployment scripts. Historical search outputs
@@ -80,5 +81,5 @@ hard failure.
 - Keep fees, slippage, TP/SL, risk, and holdout gates in all execution artifacts.
 - Keep generated data and old research outputs out of git.
 - Prefer small, tested changes. Run focused tests first, then `make
-  lint-autopilot`, `make autopilot-validate`, full `pytest`, and
-  `make autopilot-once` for runtime changes.
+  lint-autopilot`, `make platform-validate`, full `pytest`, and
+  `make platform-smoke` for platform changes.

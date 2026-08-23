@@ -29,7 +29,7 @@ from src.observability.decision_trace import (
     DecisionTraceStage,
     SqlDecisionTraceStore,
 )
-from src.risk.engine import SqlRiskDecisionStore
+from src.risk.engine import SqlRiskDecisionStore, SqlRiskSnapshotStore
 from src.services.execution_service import ExecutionService
 from src.services.scheduler import DatabaseJobQueue
 
@@ -48,6 +48,7 @@ class DatabaseExecutionWorker:
         trace_store: SqlDecisionTraceStore,
         product_execution: Mapping[str, Mapping[str, Any]],
         order_groups: OrderGroupManager | None = None,
+        snapshot_store: SqlRiskSnapshotStore | None = None,
         lease_seconds: int = 60,
     ) -> None:
         self.queue = queue
@@ -57,6 +58,7 @@ class DatabaseExecutionWorker:
         self.risk_store = risk_store
         self.trace_store = trace_store
         self.order_groups = order_groups
+        self.snapshot_store = snapshot_store
         self.product_execution = {
             product_id: dict(configuration)
             for product_id, configuration in product_execution.items()
@@ -84,7 +86,8 @@ class DatabaseExecutionWorker:
             assessment = self.risk_store.assessment(str(payload["risk_assessment_id"]))
             if assessment.aggregate.input_snapshot.get("product_id") != product_id:
                 raise ValueError("execution risk assessment belongs to another product")
-            targets = tuple(TargetPosition(**dict(item)) for item in payload["targets"])
+            canonical_inputs = self._canonical_inputs(payload)
+            targets = tuple(TargetPosition(**dict(item)) for item in canonical_inputs["targets"])
             if not assessment.accepted:
                 for target in targets:
                     self.trace_store.append(
@@ -101,7 +104,7 @@ class DatabaseExecutionWorker:
                     "orders": 0,
                     "first_blocked_stage": DecisionTraceStage.RISK_ACCEPTED.value,
                 }
-            for instrument_id, quantity in payload.get("reconciled_positions", {}).items():
+            for instrument_id, quantity in canonical_inputs["reconciled_positions"].items():
                 self.positions.reconcile_position(
                     portfolio_id=next(
                         target.portfolio_id
@@ -110,7 +113,7 @@ class DatabaseExecutionWorker:
                     ),
                     instrument_id=str(instrument_id),
                     quantity=float(quantity),
-                    average_entry_price=float(payload["prices"][instrument_id]),
+                    average_entry_price=float(canonical_inputs["prices"][instrument_id]),
                     updated_at=str(payload["evaluated_at"]),
                 )
             current = self.positions.current_quantities(targets[0].portfolio_id)
@@ -118,7 +121,9 @@ class DatabaseExecutionWorker:
                 targets=targets,
                 current=current,
                 decided_at=str(payload["evaluated_at"]),
-                prices={str(key): float(value) for key, value in payload["prices"].items()},
+                prices={
+                    str(key): float(value) for key, value in canonical_inputs["prices"].items()
+                },
             )
             if mode not in {"paper", "live"}:
                 raise ValueError(f"unsupported execution mode: {mode}")
@@ -136,7 +141,7 @@ class DatabaseExecutionWorker:
                     "order_id": order.order_id,
                     "product_id": product_id,
                     "event_id": str(payload["event_id"]),
-                    "price": float(payload["prices"][order.instrument_id]),
+                    "price": float(canonical_inputs["prices"][order.instrument_id]),
                     "execution_costs": configuration["execution_costs"],
                     "accounting_asset": configuration["base_accounting_asset"],
                     "fee_in_base": product_id == "btc_accumulation",
@@ -174,6 +179,30 @@ class DatabaseExecutionWorker:
             "orders": len(orders),
             "venue_job_ids": venue_jobs,
             **({"paper_job_ids": venue_jobs} if mode == "paper" else {}),
+        }
+
+    def _canonical_inputs(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        snapshot_id = payload.get("target_position_snapshot_id")
+        if snapshot_id is None:
+            return {
+                "targets": payload["targets"],
+                "prices": payload["prices"],
+                "reconciled_positions": payload.get("reconciled_positions", {}),
+            }
+        if self.snapshot_store is None:
+            raise ValueError("canonical execution input store is not configured")
+        snapshot = self.snapshot_store.get(str(snapshot_id))
+        if not isinstance(snapshot.get("targets"), list):
+            raise ValueError("target snapshot has no targets")
+        if not isinstance(snapshot.get("prices"), Mapping):
+            raise ValueError("target snapshot has no prices")
+        reconciled_positions = snapshot.get("reconciled_positions", {})
+        if not isinstance(reconciled_positions, Mapping):
+            raise ValueError("target snapshot has invalid reconciled positions")
+        return {
+            "targets": snapshot["targets"],
+            "prices": snapshot["prices"],
+            "reconciled_positions": reconciled_positions,
         }
 
     def _plan_orders(
@@ -648,7 +677,10 @@ class DatabaseUserStreamWorker:
         self.order_manager.reload()
         self.positions.reload()
         matches = tuple(
-            order for order in self.order_manager.all() if order.order_id[:36] == client_order_id
+            order
+            for order in self.order_manager.all()
+            if order.metadata.get("client_order_id") == client_order_id
+            or order.order_id[:36] == client_order_id
         )
         if len(matches) != 1:
             recovery_payload = {
@@ -676,7 +708,7 @@ class DatabaseUserStreamWorker:
                 order=order,
                 values=values,
             )
-        return self._apply_status_event(order=order, values=values)
+        return self._apply_status_event(order=order, values=values, event=event)
 
     def _apply_fill_event(
         self,
@@ -737,9 +769,9 @@ class DatabaseUserStreamWorker:
             }
         if order.status is OrderStatus.PERSISTED:
             self.order_manager.submitted(order.order_id)
-            self.order_manager.acknowledged(order.order_id)
+            self.order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
         elif order.status is OrderStatus.SUBMITTED:
-            self.order_manager.acknowledged(order.order_id)
+            self.order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
         previous_position = self.positions.get(order.portfolio_id, order.instrument_id)
         fill = Fill(
             fill_id=fill_id,
@@ -790,14 +822,18 @@ class DatabaseUserStreamWorker:
         }
 
     def _apply_status_event(
-        self, *, order: OrderIntent, values: Mapping[str, Any]
+        self, *, order: OrderIntent, values: Mapping[str, Any], event: MarketEvent
     ) -> dict[str, Any]:
         status = str(values.get("X") or values.get("x") or "").upper()
         if order.status is OrderStatus.PERSISTED:
             self.order_manager.submitted(order.order_id)
-            order = self.order_manager.acknowledged(order.order_id)
+            order = self.order_manager.acknowledged(
+                order.order_id, event_at=event.exchange_timestamp
+            )
         elif order.status is OrderStatus.SUBMITTED:
-            order = self.order_manager.acknowledged(order.order_id)
+            order = self.order_manager.acknowledged(
+                order.order_id, event_at=event.exchange_timestamp
+            )
         if status == "NEW":
             pass
         elif status in {"CANCELED", "CANCELLED"}:

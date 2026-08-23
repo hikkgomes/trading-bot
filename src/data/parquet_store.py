@@ -11,7 +11,9 @@ import json
 import os
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 import pyarrow as pa
@@ -124,6 +126,129 @@ class PartitionedMarketEventStore:
         finally:
             temporary.unlink(missing_ok=True)
         return destination
+
+    def put_batch(
+        self,
+        events: Iterable[tuple[MarketEvent, str, str, str]],
+        *,
+        row_group_size: int = 1_024,
+    ) -> tuple[Path, ...]:
+        """Persist one multi-row Parquet segment per canonical partition."""
+
+        materialised = tuple(events)
+        if not materialised:
+            raise ValueError("market-event batch cannot be empty")
+        if row_group_size <= 0:
+            raise ValueError("row_group_size must be positive")
+        partitions: dict[tuple[str, str, str, str, str], list[MarketEvent]] = {}
+        for event, venue, market, symbol in materialised:
+            values = (venue.lower(), market.lower(), event.event_type.value, symbol.upper())
+            date = datetime.fromisoformat(event.exchange_timestamp).date().isoformat()
+            key = (*values, date)
+            if any(not _PARTITION_TOKEN.fullmatch(value) for value in values):
+                raise ValueError("market-event partition contains an unsafe token")
+            partitions.setdefault(key, []).append(event)
+        paths: list[Path] = []
+        for (venue, market, event_type, symbol, date), partition_events in sorted(partitions.items()):
+            ordered = tuple(sorted(partition_events, key=lambda item: (item.sequence, item.event_id)))
+            digest = canonical_hash([item.event_id for item in ordered]).removeprefix("sha256:")
+            destination = (
+                self.root / "raw" / venue / market / event_type / symbol / f"date={date}"
+                / f"batch-{digest}.parquet"
+            )
+            if destination.exists():
+                paths.append(destination)
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+            table = pa.table(
+                {
+                    "event_id": [item.event_id for item in ordered],
+                    "exchange_identity": [item.exchange_identity for item in ordered],
+                    "instrument_id": [item.instrument_id for item in ordered],
+                    "event_type": [item.event_type.value for item in ordered],
+                    "exchange_timestamp": [item.exchange_timestamp for item in ordered],
+                    "close_timestamp": [item.close_timestamp for item in ordered],
+                    "receive_timestamp": [item.receive_timestamp for item in ordered],
+                    "availability_time": [item.availability_time for item in ordered],
+                    "sequence": [item.sequence for item in ordered],
+                    "payload_json": [
+                        json.dumps(dict(item.payload), sort_keys=True, separators=(",", ":"))
+                        for item in ordered
+                    ],
+                }
+            )
+            try:
+                pq.write_table(table, temporary, compression="zstd", row_group_size=row_group_size)
+                with temporary.open("rb") as handle:
+                    os.fsync(handle.fileno())
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+            paths.append(destination)
+        return tuple(paths)
+
+
+@dataclass(frozen=True)
+class MarketEventBatchSegment:
+    path: Path
+    content_hash: str
+    row_count: int
+
+
+class DurableMarketBatchSpool:
+    """Durable local spool that publishes complete event segments atomically."""
+
+    def __init__(self, root: Path, *, max_rows: int = 5_000, max_bytes: int = 8 * 1024 * 1024):
+        if max_rows <= 0 or max_bytes <= 0:
+            raise ValueError("batch spool limits must be positive")
+        self.root = root.resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.max_rows = max_rows
+        self.max_bytes = max_bytes
+        self._rows: list[dict[str, object]] = []
+        self._bytes = 0
+
+    def append(self, event: MarketEvent, *, venue: str, market: str, symbol: str) -> MarketEventBatchSegment | None:
+        row = {
+            "venue": venue,
+            "market": market,
+            "symbol": symbol,
+            "event": to_primitive(event),
+        }
+        encoded = (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        self._rows.append(row)
+        self._bytes += len(encoded)
+        if len(self._rows) >= self.max_rows or self._bytes >= self.max_bytes:
+            return self.flush()
+        return None
+
+    def flush(self) -> MarketEventBatchSegment | None:
+        if not self._rows:
+            return None
+        body = "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in self._rows)
+        content_hash = canonical_hash(body)
+        destination = self.root / f"segment-{content_hash.removeprefix('sha256:')}.jsonl"
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        segment = MarketEventBatchSegment(destination, content_hash, len(self._rows))
+        self._rows = []
+        self._bytes = 0
+        return segment
+
+    @staticmethod
+    def read(segment: MarketEventBatchSegment | Path) -> tuple[dict[str, object], ...]:
+        path = segment.path if isinstance(segment, MarketEventBatchSegment) else segment
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("market batch segment must be a regular file")
+        rows = tuple(json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line)
+        if not rows:
+            raise ValueError("market batch segment is empty")
+        return rows
 
 
 class PartitionedBarStore:

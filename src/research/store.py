@@ -273,22 +273,40 @@ class SqlResearchStore:
         created_at: str,
         evidence: dict[str, object],
         metrics: dict[str, float],
+        receipt: Mapping[str, Any] | None = None,
     ) -> str:
         created_at = timestamp(created_at, field="created_at")
+        if not str(run_name).strip():
+            raise ValueError("experiment run name cannot be empty")
         clean_evidence = json_value(evidence, field="experiment run evidence")
+        if not clean_evidence:
+            raise ValueError("experiment run evidence cannot be empty")
         clean_metrics = {str(key): float(value) for key, value in metrics.items()}
+        if not clean_metrics:
+            raise ValueError("experiment run metrics cannot be empty")
+        clean_receipt = json_value(dict(receipt or {}), field="experiment execution receipt")
+        if receipt is not None and not {
+            "candidate_id",
+            "dataset_snapshot_ids",
+            "executor_version",
+            "input_hash",
+        }.issubset(clean_receipt):
+            raise ValueError("experiment execution receipt is incomplete")
         run_id = canonical_hash(
             {
                 "candidate_id": candidate_id,
                 "run_name": run_name,
                 "evidence": clean_evidence,
                 "metrics": clean_metrics,
+                "receipt": clean_receipt,
             }
         )
         run_payload = {
             "candidate_id": candidate_id,
             "run_name": run_name,
             "evidence": clean_evidence,
+            "metrics": clean_metrics,
+            "receipt": clean_receipt,
         }
         with self.engine.begin() as connection:
             if (

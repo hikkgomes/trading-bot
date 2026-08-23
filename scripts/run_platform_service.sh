@@ -42,7 +42,16 @@ source "$environment_file"
 set +a
 
 cd "$repository"
-exec "$repository/.venv/bin/python" -m src.services.supervisor \
+python_root="$repository/.venv-runtime"
+case "$service_name" in
+  research-worker|ml-worker|event-replay-worker|feature-build-worker|report-worker)
+    python_root="$repository/.venv-research"
+    ;;
+  agent-sandbox)
+    python_root="$repository/.venv-agent"
+    ;;
+esac
+exec "$python_root/bin/python" -m src.services.supervisor \
   --config "$repository/config/platform.json" \
   --node "$node_id" \
   --service "$service_name"

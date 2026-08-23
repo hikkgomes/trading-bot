@@ -130,3 +130,16 @@ class SqlFeatureStore:
             and value.feature_set_version == feature_set_version
             and value.availability_time <= at
         )
+
+    def by_ids(self, feature_ids: Iterable[str]) -> tuple[FeatureValue, ...]:
+        expected = tuple(feature_ids)
+        if not expected or len(set(expected)) != len(expected):
+            raise ValueError("feature_ids must be a non-empty unique sequence")
+        with self.engine.connect() as connection:
+            payloads = connection.execute(
+                select(feature_manifest.c.payload).where(feature_manifest.c.id.in_(expected))
+            ).scalars()
+            values = {value.feature_id: value for value in (FeatureValue(**dict(item)) for item in payloads)}
+        if set(values) != set(expected):
+            raise KeyError("one or more canonical feature IDs do not exist")
+        return tuple(values[item] for item in expected)

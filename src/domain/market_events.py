@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
@@ -23,6 +23,24 @@ class MarketEventType(StrEnum):
     ACCOUNT_BALANCE = "account_balance"
     ORDER_UPDATE = "order_update"
     FILL_UPDATE = "fill_update"
+
+
+@dataclass
+class ExchangeSequenceTracker:
+    """Detect duplicate and discontinuous exchange-native sequence values."""
+
+    _last: dict[tuple[str, str], int] = field(default_factory=dict)
+
+    def observe(self, event: MarketEvent) -> str:
+        key = (event.instrument_id, event.event_type.value)
+        previous = self._last.get(key)
+        if previous is not None and event.sequence <= previous:
+            if event.sequence == previous:
+                return "duplicate"
+            return "out_of_order"
+        status = "gap" if previous is not None and event.sequence > previous + 1 else "ok"
+        self._last[key] = event.sequence
+        return status
 
 
 @dataclass(frozen=True)
@@ -74,15 +92,34 @@ class MarketEvent:
 
     @property
     def event_id(self) -> str:
+        # Receive and availability times describe this observation, not the
+        # exchange event.  They must not turn a reconnect duplicate into a new
+        # event identity.
         return canonical_hash(
             {
                 "instrument_id": self.instrument_id,
                 "event_type": self.event_type.value,
                 "exchange_timestamp": self.exchange_timestamp,
                 "close_timestamp": self.close_timestamp,
-                "receive_timestamp": self.receive_timestamp,
-                "availability_time": self.availability_time,
                 "sequence": self.sequence,
                 "payload": dict(self.payload),
+            }
+        )
+
+    @property
+    def exchange_identity(self) -> str:
+        """Stable exchange-native identity used for duplicate detection."""
+
+        raw_value = self.payload.get("data")
+        if not isinstance(raw_value, Mapping):
+            raw_value = self.payload.get("event")
+        raw: Mapping[str, Any] = raw_value if isinstance(raw_value, Mapping) else {}
+        native = {key: raw[key] for key in ("a", "i", "t", "u", "U", "T", "E") if key in raw}
+        return canonical_hash(
+            {
+                "instrument_id": self.instrument_id,
+                "event_type": self.event_type.value,
+                "sequence": self.sequence,
+                "native": native,
             }
         )

@@ -432,8 +432,10 @@ class SqlCanonicalPromotionEvidence:
             row["accepted"] for row in validation_rows
         )
         protected_accepted = bool(holdout_rows) and all(row["accepted"] for row in holdout_rows)
-        forward_accepted = bool(forward_rows) and all(
-            item.get("accepted", True) is True for item in observations
+        forward_accepted = (
+            bool(forward_rows)
+            and bool(observations)
+            and all(item.get("accepted") is True for item in observations)
         )
         fresh_preflight = bool(
             latest_preflight

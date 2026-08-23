@@ -9,14 +9,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import select, update
 from sqlalchemy.engine import Engine
 
-from src.data.database import experiment, holdout_claim
+from src.data.database import experiment, holdout_claim, holdout_outcome
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
-from src.research.canonical import SqlValidationRepository
+from src.research.canonical import SqlHoldoutRepository, SqlValidationRepository
+from src.research.executors import ExecutorError, ProviderExecutorRegistry
 from src.research.store import SqlResearchStore
 
 STAGES = ("screening", "development", "robustness", "protected", "forward")
@@ -42,6 +43,12 @@ ALLOWED_REQUEST_FIELDS = frozenset(
         "code_hash",
         "feature_set_hash",
         "cost_model_hash",
+        "feature_manifest_id",
+        "cost_model_id",
+        "parameter_set_id",
+        "evaluator_version",
+        "producer_identity",
+        "content_hash",
     }
 )
 
@@ -60,6 +67,12 @@ class EvaluationRequest:
     code_hash: str | None = None
     feature_set_hash: str | None = None
     cost_model_hash: str | None = None
+    feature_manifest_id: str | None = None
+    cost_model_id: str | None = None
+    parameter_set_id: str | None = None
+    evaluator_version: str | None = None
+    producer_identity: str | None = None
+    content_hash: str | None = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> EvaluationRequest:
@@ -79,7 +92,11 @@ class EvaluationRequest:
         if not candidate_id.startswith("sha256:") or len(candidate_id) != 71:
             raise EvaluationContractError("candidate_id must be a sha256: identity")
         policy_id = non_empty(
-            str(payload.get("evaluation_policy_id") or ""), field="evaluation_policy_id"
+            str(
+                payload.get("evaluation_policy_id")
+                or f"canonical:{payload.get('evaluator_version')}"
+            ),
+            field="evaluation_policy_id",
         )
         raw_snapshots = payload.get("dataset_snapshot_ids")
         if not isinstance(raw_snapshots, list | tuple) or not raw_snapshots:
@@ -98,19 +115,42 @@ class EvaluationRequest:
             raise EvaluationContractError(f"requested_stage must be one of {STAGES}")
         evaluated_at = timestamp(str(payload.get("evaluated_at") or ""), field="evaluated_at")
         hashes: dict[str, str | None] = {}
-        for field in ("code_hash", "feature_set_hash", "cost_model_hash"):
+        for field in (
+            "code_hash",
+            "feature_set_hash",
+            "cost_model_hash",
+            "feature_manifest_id",
+            "cost_model_id",
+            "parameter_set_id",
+        ):
             value = payload.get(field)
             if value is not None:
                 value = non_empty(str(value), field=field)
                 if not value.startswith("sha256:") or len(value) != 71:
                     raise EvaluationContractError(f"{field} must be a sha256: identity")
             hashes[field] = value
+        evaluator_version = non_empty(
+            str(payload.get("evaluator_version") or ""), field="evaluator_version"
+        )
+        producer_identity = non_empty(
+            str(payload.get("producer_identity") or ""), field="producer_identity"
+        )
+        content_hash = non_empty(str(payload.get("content_hash") or ""), field="content_hash")
+        if not content_hash.startswith("sha256:") or len(content_hash) != 71:
+            raise EvaluationContractError("content_hash must be a sha256: identity")
+        unsigned = dict(payload)
+        unsigned.pop("content_hash", None)
+        if canonical_hash(unsigned) != content_hash:
+            raise EvaluationContractError("content_hash does not match the evaluation request")
         return cls(
             candidate_id=candidate_id,
             evaluation_policy_id=policy_id,
             dataset_snapshot_ids=snapshots,
             requested_stage=stage,
             evaluated_at=evaluated_at,
+            evaluator_version=evaluator_version,
+            producer_identity=producer_identity,
+            content_hash=content_hash,
             **hashes,
         )
 
@@ -144,10 +184,18 @@ class ProtectedEvaluationBoundary:
 
 
 class CanonicalResearchEvaluator:
-    def __init__(self, store: SqlResearchStore):
+    def __init__(
+        self,
+        store: SqlResearchStore,
+        *,
+        executors: ProviderExecutorRegistry | None = None,
+        provider_context: Mapping[str, Any] | None = None,
+    ):
         self.store = store
         self.validation = SqlValidationRepository(store.engine)
         self.protected = ProtectedEvaluationBoundary(store.engine)
+        self.executors = executors or ProviderExecutorRegistry.default()
+        self.provider_context = dict(provider_context or {})
 
     def evaluate(self, request: EvaluationRequest) -> StageEvaluation:
         candidate = self.store.get_candidate(request.candidate_id)
@@ -176,9 +224,15 @@ class CanonicalResearchEvaluator:
             "code_hash": request.code_hash or definition.source_hash,
             "feature_set_hash": request.feature_set_hash,
             "cost_model_hash": request.cost_model_hash,
+            "feature_manifest_id": request.feature_manifest_id,
+            "cost_model_id": request.cost_model_id,
+            "parameter_set_id": request.parameter_set_id,
+            "evaluator_version": request.evaluator_version,
+            "producer_identity": request.producer_identity,
+            "content_hash": request.content_hash,
         }
-        evidence, accepted, reason_code = self._calculate_stage(
-            request.requested_stage, definition, context
+        evidence, accepted, reason_code, receipt, metrics = self._calculate_stage(
+            request.requested_stage, candidate, context
         )
         run_id = self.store.save_run(
             candidate_id=request.candidate_id,
@@ -188,7 +242,9 @@ class CanonicalResearchEvaluator:
             metrics={
                 "accepted": 1.0 if accepted else 0.0,
                 "evidence_hash": float(int(canonical_hash(evidence)[7:15], 16)),
+                **metrics,
             },
+            receipt=receipt,
         )
         stage_id = self.validation.append_stage(
             experiment_id=request.candidate_id,
@@ -220,15 +276,41 @@ class CanonicalResearchEvaluator:
         )
 
     def _calculate_stage(
-        self, stage: str, definition, context: Mapping[str, Any]
-    ) -> tuple[dict[str, Any], bool, str | None]:
+        self, stage: str, candidate, context: Mapping[str, Any]
+    ) -> tuple[
+        dict[str, Any],
+        bool,
+        str | None,
+        Mapping[str, Any] | None,
+        Mapping[str, float],
+    ]:
+        definition = candidate.definition
         identity = canonical_hash(
             {
                 "definition_hash": definition.definition_hash,
                 "context": dict(context),
             }
         )
+        if stage in {"screening", "development", "robustness", "forward"}:
+            try:
+                execution = self.executors.execute(candidate, {**self.provider_context, **context})
+            except (ExecutorError, ValueError, TypeError) as exc:
+                return (
+                    {
+                        "identity": identity,
+                        "context": dict(context),
+                        "executor_error": f"{type(exc).__name__}: {exc}",
+                    },
+                    False,
+                    "candidate_execution_failed",
+                    None,
+                    {},
+                )
+        else:
+            execution = None
         if stage == "screening":
+            assert execution is not None
+            measured = dict(execution.evidence)
             fields_valid = all(
                 isinstance(getattr(definition, field), Mapping)
                 for field in (
@@ -249,15 +331,31 @@ class CanonicalResearchEvaluator:
             )
             evidence = {
                 "identity": identity,
-                "compiled": bool(definition.source_hash),
-                "features_valid": fields_valid,
-                "causality_valid": causality_valid,
-                "signal_frequency": {"available": bool(definition.signal_model)},
-                "turnover": {"declared": bool(definition.execution_preferences)},
+                **measured,
+                "features_contract_valid": fields_valid,
+                "causality_contract_valid": causality_valid,
                 "context": dict(context),
+                "execution_receipt": dict(execution.receipt),
             }
-            accepted = bool(definition.source_hash and fields_valid and causality_valid)
-            return evidence, accepted, None if accepted else "screening_contract_invalid"
+            screening_required = (
+                "compiled",
+                "features_valid",
+                "causality_valid",
+                "signal_frequency",
+                "turnover",
+            )
+            accepted = (
+                fields_valid
+                and causality_valid
+                and all(_measured(measured.get(field)) for field in screening_required)
+            )
+            return (
+                evidence,
+                accepted,
+                None if accepted else "screening_measured_evidence_missing",
+                execution.receipt,
+                execution.metrics,
+            )
 
         required_runs = {
             "development": ("bar_portfolio",),
@@ -265,69 +363,173 @@ class CanonicalResearchEvaluator:
             "forward": ("forward_paper",),
         }
         if stage == "protected":
+            try:
+                claim_id = SqlHoldoutRepository(self.store.engine).claim(
+                    strategy_version_id=definition.strategy_version_id,
+                    data_snapshot_id=str(context["dataset_snapshot_ids"][0]),
+                    cohort_id=f"protected:{context['candidate_id']}",
+                    source_hashes={
+                        "code_hash": str(context["code_hash"]),
+                        "feature_manifest_id": str(context["feature_manifest_id"]),
+                        "cost_model_id": str(context["cost_model_id"]),
+                    },
+                    claimed_at=str(context["evaluated_at"]),
+                )
+            except Exception as exc:
+                return (
+                    {
+                        "identity": identity,
+                        "context": dict(context),
+                        "holdout_claim_error": f"{type(exc).__name__}: {exc}",
+                    },
+                    False,
+                    "protected_holdout_claim_failed",
+                    None,
+                    {},
+                )
             claims = self.protected.claim_for(definition.strategy_version_id)
+            with self.store.engine.connect() as connection:
+                outcome = connection.execute(
+                    select(holdout_outcome.c.payload)
+                    .where(holdout_outcome.c.holdout_claim_id == claim_id)
+                    .order_by(holdout_outcome.c.evaluated_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
             evidence = {
                 "identity": identity,
                 "frozen_cohort": bool(claims),
                 "holdout_claim": [row["id"] for row in claims],
                 "data_hashes": list(context["dataset_snapshot_ids"]),
                 "code_hash": context["code_hash"],
+                "holdout_outcome": dict(outcome) if isinstance(outcome, Mapping) else {},
                 "context": dict(context),
             }
-            return evidence, bool(claims), None if claims else "protected_holdout_not_claimed"
+            accepted = bool(claims) and bool(evidence.get("holdout_outcome"))
+            return (
+                evidence,
+                accepted,
+                None if accepted else "protected_holdout_outcome_missing",
+                None,
+                {},
+            )
 
         runs = self.store.runs(context["candidate_id"])
-        run_names = {
-            str(payload.get("run_name"))
-            for row in runs
-            if isinstance((payload := row.get("payload")), dict)
-        }
-        required = required_runs[stage]
-        missing = [name for name in required if name not in run_names]
+        authoritative_runs: list[dict[str, Any]] = []
+        for row in runs:
+            raw_payload = row.get("payload")
+            if not isinstance(raw_payload, Mapping):
+                continue
+            raw_receipt = raw_payload.get("receipt")
+            if not isinstance(raw_receipt, Mapping):
+                continue
+            if raw_receipt.get("candidate_id") != context["candidate_id"]:
+                continue
+            if tuple(raw_receipt.get("dataset_snapshot_ids", ())) != tuple(
+                context["dataset_snapshot_ids"]
+            ):
+                continue
+            authoritative_runs.append({"id": str(row["id"]), "payload": dict(raw_payload)})
+        run_names = {str(row["payload"].get("run_name")) for row in authoritative_runs}
+        required_runs_for_stage = required_runs[stage]
+        if execution is not None:
+            authoritative_runs.append(
+                {
+                    "id": "executed:" + execution.receipt["input_hash"],
+                    "payload": {
+                        "run_name": "canonical-execution",
+                        "evidence": execution.evidence,
+                        "metrics": execution.metrics,
+                        "receipt": execution.receipt,
+                    },
+                }
+            )
+            run_names = run_names | {"canonical-execution"}
+        missing = (
+            []
+            if execution is not None
+            else [name for name in required_runs_for_stage if name not in run_names]
+        )
         evidence = {
             "identity": identity,
-            "authoritative_run_ids": [row["id"] for row in runs],
-            "required_runs": list(required),
+            "authoritative_run_ids": [row["id"] for row in authoritative_runs],
+            "required_runs": list(required_runs_for_stage),
             "available_runs": sorted(run_names),
             "context": dict(context),
         }
         if missing:
-            return evidence, False, "missing_authoritative_run"
-        evidence.update(
-            {
-                "chronological": True,
-                "cost_adjusted_return": True,
-                "regime_breakdown": True,
-                "parameter_stability": True,
-                "sample_evidence": True,
-                "cross_symbol_stability": True,
-                "portfolio_overlap": True,
-            }
+            return evidence, False, "missing_authoritative_run", None, {}
+        run_measured: dict[str, Any] = {}
+        metrics: dict[str, float] = {}
+        for row in authoritative_runs:
+            payload = cast(Mapping[str, Any], row["payload"])
+            run_evidence = payload.get("evidence")
+            if isinstance(run_evidence, Mapping):
+                run_measured.update(run_evidence)
+            run_metrics = payload.get("metrics")
+            if isinstance(run_metrics, Mapping):
+                for key, value in run_metrics.items():
+                    if isinstance(value, int | float) and not isinstance(value, bool):
+                        metrics[str(key)] = float(value)
+        evidence.update(run_measured)
+        required_fields = {
+            "development": (
+                "chronological",
+                "cost_adjusted_return",
+                "regime_breakdown",
+                "parameter_stability",
+                "sample_evidence",
+                "cross_symbol_stability",
+                "portfolio_overlap",
+            ),
+            "robustness": (
+                "walk_forward",
+                "purged",
+                "embargo",
+                "cost_stress",
+                "delay_stress",
+                "missing_data_stress",
+                "funding_stress",
+                "monte_carlo_trade_order",
+                "bootstrap_confidence",
+                "probability_backtest_overfitting",
+                "deflated_sharpe",
+                "drawdown_stability",
+            ),
+            "forward": (
+                "production_equivalent",
+                "exact_strategy_identity",
+                "exact_cost_model",
+                "drift_checks",
+            ),
+        }[stage]
+        missing = [field for field in required_fields if not _measured(evidence.get(field))]
+        accepted = not missing
+        evidence["missing_evidence"] = missing
+        receipt: Mapping[str, Any] | None = None
+        for row in authoritative_runs:
+            raw_receipt = cast(Mapping[str, Any], row["payload"]).get("receipt")
+            if isinstance(raw_receipt, Mapping) and raw_receipt:
+                receipt = raw_receipt
+                break
+        if execution is not None:
+            receipt = execution.receipt
+            metrics.update(execution.metrics)
+        return (
+            evidence,
+            accepted,
+            None if accepted else "measured_evidence_missing",
+            receipt,
+            metrics,
         )
-        if stage == "robustness":
-            evidence.update(
-                {
-                    "walk_forward": True,
-                    "purged": True,
-                    "embargo": True,
-                    "cost_stress": True,
-                    "delay_stress": True,
-                    "missing_data_stress": True,
-                    "funding_stress": True,
-                    "monte_carlo_trade_order": True,
-                    "bootstrap_confidence": True,
-                    "probability_backtest_overfitting": True,
-                    "deflated_sharpe": True,
-                    "drawdown_stability": True,
-                }
-            )
-        elif stage == "forward":
-            evidence.update(
-                {
-                    "production_equivalent": True,
-                    "exact_strategy_identity": True,
-                    "exact_cost_model": True,
-                    "drift_checks": True,
-                }
-            )
-        return evidence, True, None
+
+
+def _measured(value: object) -> bool:
+    """Return true only for evidence produced by a run, never a default flag."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, Mapping) | isinstance(value, list) | isinstance(value, tuple):
+        return bool(value)
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return value != 0
+    return isinstance(value, str) and bool(value.strip())

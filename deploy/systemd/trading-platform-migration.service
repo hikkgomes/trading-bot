@@ -1,0 +1,20 @@
+[Unit]
+Description=Trading platform PostgreSQL migration service
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=trading-platform-owner
+Group=trading-platform-owner
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=/etc/trading-platform/migration.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/trading-bot/.venv-runtime/bin/python -m src.services.supervisor --config /opt/trading-bot/config/platform.json --node linux-optiplex --service migration-service --once
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot/runtime
+Slice=trading-platform-critical.slice

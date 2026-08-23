@@ -74,6 +74,22 @@ credentials.
 
 ## Autopilot
 
+## PostgreSQL platform runtime
+
+The authoritative runtime is the single-node Linux platform in
+`config/platform.json`. It runs the closed-event pipeline through PostgreSQL
+and immutable Parquet:
+
+`closed event -> features -> strategy evaluator -> forecast -> target -> risk -> paper/live execution`
+
+Install it with `scripts/install_platform_services.sh`. Use `.venv-runtime` for
+runtime services and `.venv-research` for research services. Research and agent
+services receive no exchange credentials. Apply schema changes only through the
+dedicated migration service with Alembic.
+
+Useful checks are `make platform-validate`, `make platform-smoke`,
+`make platform-readiness`, and `make platform-install-dry-run`.
+
 Default config is `config/autopilot.json`. It defines:
 
 | Product | Base asset | Market | Default mode |

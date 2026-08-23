@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from src.services.heavy_compute import HeavyComputeLeaseStore
 from src.services.runtime import ServiceRuntime, utc_now
 from src.services.scheduler import ClaimedJob, DatabaseJobQueue
 
@@ -20,11 +22,14 @@ class ResearchWorker:
         worker_id: str,
         handlers: Mapping[str, JobHandler],
         lease_seconds: int = 120,
+        heavy_compute: HeavyComputeLeaseStore | None = None,
     ) -> None:
-        if runtime.node.operating_system != "macos":
-            raise ValueError("research workers must run on the macOS research node")
+        if runtime.node.operating_system != "linux":
+            raise ValueError("research workers must run on Linux")
         if runtime.can_submit_orders:
             raise PermissionError("research workers cannot submit exchange orders")
+        if any(name in os.environ for name in ("EXCHANGE_API_KEY", "EXCHANGE_API_SECRET")):
+            raise PermissionError("research workers must not receive exchange credentials")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         self.runtime = runtime
@@ -32,6 +37,7 @@ class ResearchWorker:
         self.worker_id = worker_id
         self.handlers = dict(handlers)
         self.lease_seconds = lease_seconds
+        self.heavy_compute = heavy_compute
 
     def run_once(self, *, now: str | None = None) -> dict[str, Any]:
         now = now or utc_now()
@@ -43,6 +49,22 @@ class ResearchWorker:
         )
         if claimed is None:
             return {"reason_code": "research_queue_empty"}
+        compute_lease = None
+        if self.heavy_compute is not None:
+            compute_lease = self.heavy_compute.acquire(
+                owner=self.worker_id,
+                job_id=claimed.job_id,
+                now=now,
+                lease_seconds=self.lease_seconds,
+            )
+            if compute_lease is None:
+                self.queue.fail(
+                    claimed,
+                    completed_at=now,
+                    error="heavy_compute_slot_unavailable",
+                    retry_at=_add_seconds(now, min(self.lease_seconds, 60)),
+                )
+                return {"reason_code": "heavy_compute_slot_unavailable", "job_id": claimed.job_id}
         handler = self.handlers.get(claimed.name)
         if handler is None:
             retry_at = _add_seconds(now, self.lease_seconds)
@@ -66,11 +88,21 @@ class ResearchWorker:
                 now=utc_now(),
                 lease_seconds=self.lease_seconds,
             )
+            if compute_lease is not None:
+                # Renewal is deliberately tied to the queue lease so a dead
+                # worker cannot keep the singleton slot indefinitely.
+                self.heavy_compute.renew(
+                    compute_lease,
+                    now=current.lease_expires_at,
+                    lease_seconds=self.lease_seconds,
+                )
             return current
 
         try:
             result = dict(handler(current, renew) or {})
         except Exception as exc:
+            if compute_lease is not None:
+                self.heavy_compute.release(compute_lease)
             completed_at = utc_now()
             self.queue.fail(
                 current,
@@ -85,6 +117,8 @@ class ResearchWorker:
                 "error": str(exc),
             }
         self.queue.complete(current, completed_at=utc_now())
+        if compute_lease is not None:
+            self.heavy_compute.release(compute_lease)
         return {"reason_code": "research_job_completed", "job_id": current.job_id, **result}
 
 

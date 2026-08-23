@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Protocol
 
-from sqlalchemy import func, insert, select
+from sqlalchemy import func, insert, select, text
 from sqlalchemy.engine import Engine
 
 from src.data.database import exchange_order, order_intent
@@ -84,9 +84,20 @@ class JsonlOrderStore:
     def __init__(self, path: Path):
         self.path = path
 
-    def append(self, *, event_type: str, intent: OrderIntent, fill: Fill | None = None) -> None:
+    def append(
+        self,
+        *,
+        event_type: str,
+        intent: OrderIntent,
+        fill: Fill | None = None,
+        event_at: str | None = None,
+    ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"event_type": event_type, "intent": to_primitive(intent)}
+        payload = {
+            "event_type": event_type,
+            "event_at": event_at or (fill.occurred_at if fill is not None else intent.created_at),
+            "intent": to_primitive(intent),
+        }
         if fill is not None:
             payload["fill"] = to_primitive(fill)
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
@@ -116,7 +127,14 @@ class JsonlOrderStore:
 
 
 class OrderEventStore(Protocol):
-    def append(self, *, event_type: str, intent: OrderIntent, fill: Fill | None = None) -> None: ...
+    def append(
+        self,
+        *,
+        event_type: str,
+        intent: OrderIntent,
+        fill: Fill | None = None,
+        event_at: str | None = None,
+    ) -> None: ...
 
     def read(self) -> tuple[dict[str, Any], ...]: ...
 
@@ -127,11 +145,28 @@ class SqlOrderStore:
     def __init__(self, engine: Engine):
         self.engine = engine
 
-    def append(self, *, event_type: str, intent: OrderIntent, fill: Fill | None = None) -> None:
-        payload: dict[str, Any] = {"event_type": event_type, "intent": to_primitive(intent)}
+    def append(
+        self,
+        *,
+        event_type: str,
+        intent: OrderIntent,
+        fill: Fill | None = None,
+        event_at: str | None = None,
+    ) -> None:
+        observed_at = event_at or (fill.occurred_at if fill is not None else intent.created_at)
+        payload: dict[str, Any] = {
+            "event_type": event_type,
+            "event_at": observed_at,
+            "intent": to_primitive(intent),
+        }
         if fill is not None:
             payload["fill"] = to_primitive(fill)
         with self.engine.begin() as connection:
+            if connection.dialect.name == "postgresql":
+                connection.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:order_id))"),
+                    {"order_id": intent.order_id},
+                )
             exists = connection.execute(
                 select(order_intent.c.id).where(order_intent.c.id == intent.order_id)
             ).first()
@@ -141,7 +176,7 @@ class SqlOrderStore:
                 connection.execute(
                     insert(order_intent).values(
                         id=intent.order_id,
-                        created_at=intent.created_at,
+                        created_at=observed_at,
                         payload=to_primitive(intent),
                     )
                 )
@@ -163,7 +198,7 @@ class SqlOrderStore:
                     id=event_id,
                     order_id=intent.order_id,
                     sequence=sequence,
-                    created_at=intent.created_at,
+                    created_at=observed_at,
                     status=event_type,
                     payload=payload,
                 )
@@ -242,6 +277,9 @@ class OrderManager:
                     raise ValueError(
                         f"fill event snapshot differs from order state at line {line_number}"
                     )
+            elif event_type == "client_id_bound":
+                if intent.status is not previous.status:
+                    raise ValueError(f"client binding changed order status at line {line_number}")
             else:
                 if intent.status not in _ALLOWED_TRANSITIONS[previous.status]:
                     raise ValueError(
@@ -276,12 +314,19 @@ class OrderManager:
         self._orders[intent.order_id] = intent
         return intent
 
-    def transition(self, order_id: str, status: OrderStatus, **changes: object) -> OrderIntent:
+    def transition(
+        self,
+        order_id: str,
+        status: OrderStatus,
+        *,
+        event_at: str | None = None,
+        **changes: object,
+    ) -> OrderIntent:
         current = self.get(order_id)
         if status not in _ALLOWED_TRANSITIONS[current.status]:
             raise ValueError(f"invalid order transition {current.status.value}->{status.value}")
         updated = replace(current, status=status, **changes)
-        self.store.append(event_type=status.value, intent=updated)
+        self.store.append(event_type=status.value, intent=updated, event_at=event_at)
         self._orders[order_id] = updated
         return updated
 
@@ -296,11 +341,26 @@ class OrderManager:
             return current
         raise ValueError(f"order {order_id} is not ready for submission")
 
+    def bind_client_order_id(self, order_id: str, client_order_id: str) -> OrderIntent:
+        current = self.get(order_id)
+        existing = current.metadata.get("client_order_id")
+        if existing is not None and existing != client_order_id:
+            raise ValueError("order already has a different client order ID")
+        if existing == client_order_id:
+            return current
+        updated = replace(
+            current,
+            metadata={**dict(current.metadata), "client_order_id": client_order_id},
+        )
+        self.store.append(event_type="client_id_bound", intent=updated)
+        self._orders[order_id] = updated
+        return updated
+
     def submitted(self, order_id: str) -> OrderIntent:
         return self.transition(order_id, OrderStatus.SUBMITTED)
 
-    def acknowledged(self, order_id: str) -> OrderIntent:
-        return self.transition(order_id, OrderStatus.ACKNOWLEDGED)
+    def acknowledged(self, order_id: str, *, event_at: str | None = None) -> OrderIntent:
+        return self.transition(order_id, OrderStatus.ACKNOWLEDGED, event_at=event_at)
 
     def apply_fill(self, fill: Fill) -> OrderIntent:
         current = self.get(fill.order_id)
@@ -331,15 +391,16 @@ class OrderManager:
             else OrderStatus.PARTIALLY_FILLED
         )
         if current.status is OrderStatus.SUBMITTED:
-            self.acknowledged(fill.order_id)
+            self.acknowledged(fill.order_id, event_at=fill.occurred_at)
         updated = self.transition(
             fill.order_id,
             status,
             filled_quantity=total_quantity,
             average_fill_price=average,
             fee=current.fee + fill.fee,
+            event_at=fill.occurred_at,
         )
-        self.store.append(event_type="fill", intent=updated, fill=fill)
+        self.store.append(event_type="fill", intent=updated, fill=fill, event_at=fill.occurred_at)
         self._fills.setdefault(fill.order_id, []).append(fill)
         self._fill_sequence.append(fill)
         return updated

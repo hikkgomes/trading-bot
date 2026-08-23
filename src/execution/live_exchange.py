@@ -48,6 +48,8 @@ class BrokerExecutionVenue:
             self.order_manager.create(intent)
         elif existing[intent.order_id] != intent:
             raise ValueError(f"order identity collision: {intent.order_id}")
+        client_order_id = bounded_client_order_id(intent)
+        self.order_manager.bind_client_order_id(intent.order_id, client_order_id)
         self.order_manager.persist_for_submission(intent.order_id)
         self.order_manager.submitted(intent.order_id)
         broker_order = Order(
@@ -57,7 +59,7 @@ class BrokerExecutionVenue:
             type=BrokerOrderType(intent.order_type.value),
             price=intent.limit_price,
             reduce_only=intent.reduce_only,
-            client_id=intent.order_id[:36],
+            client_id=client_order_id,
         )
         try:
             broker_fill = self.broker.place_order(broker_order)
@@ -81,8 +83,13 @@ class BrokerExecutionVenue:
             price=broker_fill.price,
             fee=broker_fill.fee,
             occurred_at=occurred_at,
-            fee_asset=instrument.quote_asset,
-            metadata={"broker": self.broker.name, "simulated": False},
+            fee_asset=broker_fill.fee_asset or instrument.quote_asset,
+            metadata={
+                "broker": self.broker.name,
+                "simulated": False,
+                "exchange_order_id": broker_fill.exchange_order_id,
+                "client_order_id": broker_fill.client_order_id or client_order_id,
+            },
         )
         updated = self.order_manager.apply_fill(fill)
         self.position_manager.apply_fill(
@@ -91,3 +98,12 @@ class BrokerExecutionVenue:
             contributions=dict(updated.strategy_contributions),
         )
         return fill
+
+
+def bounded_client_order_id(intent: OrderIntent) -> str:
+    """Create a deterministic venue-safe ID from the complete intent identity."""
+
+    material = (
+        f"{intent.order_id}|{intent.instrument_id}|{intent.created_at}|{intent.quantity:.12f}"
+    )
+    return "c" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:35]

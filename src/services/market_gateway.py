@@ -9,8 +9,9 @@ import hmac
 import json
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -18,6 +19,7 @@ import aiohttp
 from src.autopilot.event_capture import EventCaptureConfig, capture
 from src.data.binance_market import normalise_public_event
 from src.data.binance_user_stream import normalise_user_event
+from src.data.parquet_store import DurableMarketBatchSpool, MarketEventBatchSegment
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.market_events import MarketEvent, MarketEventType
 from src.services.scheduler import DatabaseJobQueue
@@ -68,8 +70,14 @@ class UserStreamAccount:
 class DatabaseGatewaySink:
     """Normalise stream envelopes and enqueue idempotent persistence jobs."""
 
-    def __init__(self, queue: DatabaseJobQueue):
+    def __init__(
+        self,
+        queue: DatabaseJobQueue,
+        *,
+        spool: DurableMarketBatchSpool | None = None,
+    ):
         self.queue = queue
+        self.spool = spool
         self.events = 0
         self.bytes = 0
 
@@ -84,26 +92,16 @@ class DatabaseGatewaySink:
             receive_timestamp=str(event["received_at"]),
         )
         symbol = str(event["symbol"])
-        self._enqueue_market_event(
-            canonical,
-            venue="binance",
-            market=str(event["market"]),
-            symbol=symbol,
-        )
+        self._write_market_event(canonical, market=str(event["market"]), symbol=symbol)
         funding = funding_event_from_mark_price(canonical)
         if funding is not None:
-            self._enqueue_market_event(
-                funding,
-                venue="binance",
-                market=str(event["market"]),
-                symbol=symbol,
-            )
+            self._write_market_event(funding, market=str(event["market"]), symbol=symbol)
         self.events += 1
         self.bytes += len(json.dumps(dict(event), sort_keys=True, separators=(",", ":")))
 
     def write_user(self, event: MarketEvent, *, account_id: str, market: str) -> None:
         payload = to_primitive(event)
-        identity = canonical_hash(payload)
+        identity = event.event_id
         self.queue.enqueue_if_absent(
             job_id=f"user-stream:{identity.removeprefix('sha256:')}",
             name="user_stream_event",
@@ -136,15 +134,43 @@ class DatabaseGatewaySink:
             priority=10,
         )
 
+    def _write_market_event(self, event: MarketEvent, *, market: str, symbol: str) -> None:
+        if self.spool is None:
+            self._enqueue_market_event(event, venue="binance", market=market, symbol=symbol)
+            return
+        segment = self.spool.append(event, venue="binance", market=market, symbol=symbol)
+        if segment is not None:
+            self._enqueue_segment(segment)
+
+    def _enqueue_segment(self, segment: MarketEventBatchSegment) -> None:
+        self.queue.enqueue_if_absent(
+            job_id=f"market-batch:{segment.content_hash.removeprefix('sha256:')}",
+            name="market_event_batch_write",
+            payload={
+                "segment_path": str(segment.path),
+                "segment_hash": segment.content_hash,
+                "row_count": segment.row_count,
+                "producer_identity": "market-gateway",
+            },
+            available_at=dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
+            priority=10,
+            producer_identity="market-gateway",
+        )
+
     def flush(self) -> None:
-        return None
+        if self.spool is not None:
+            segment = self.spool.flush()
+            if segment is not None:
+                self._enqueue_segment(segment)
 
     def close(self) -> None:
-        return None
+        self.flush()
 
     def enforce_retention(self, *, now: float | None = None) -> dict[str, int]:
         del now
-        return {"removed_files": 0, "removed_bytes": 0, "total_bytes": 0}
+        if self.spool is None:
+            return {"removed_files": 0, "removed_bytes": 0, "total_bytes": 0}
+        return _spool_retention(self.spool.root)
 
 
 class BinanceUserStreams:
@@ -304,6 +330,27 @@ def funding_event_from_mark_price(event: MarketEvent) -> MarketEvent | None:
     )
 
 
+def _spool_retention(root: Path, *, retention_seconds: int = 7 * 86_400) -> dict[str, int]:
+    now = time.time()
+    removed_files = 0
+    removed_bytes = 0
+    for path in root.glob("segment-*.jsonl"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        if now - path.stat().st_mtime > retention_seconds:
+            removed_bytes += path.stat().st_size
+            path.unlink()
+            removed_files += 1
+    total_bytes = sum(
+        path.stat().st_size for path in root.glob("segment-*.jsonl") if path.is_file()
+    )
+    return {
+        "removed_files": removed_files,
+        "removed_bytes": removed_bytes,
+        "total_bytes": total_bytes,
+    }
+
+
 class DatabaseMarketGateway:
     def __init__(
         self,
@@ -311,6 +358,7 @@ class DatabaseMarketGateway:
         queue: DatabaseJobQueue,
         capture_config: EventCaptureConfig,
         accounts: tuple[UserStreamAccount, ...] = (),
+        universe_symbols: Callable[[], tuple[str, ...]] | None = None,
         maximum_clock_skew_ms: float = 1_000.0,
     ) -> None:
         if maximum_clock_skew_ms <= 0:
@@ -318,6 +366,7 @@ class DatabaseMarketGateway:
         self.queue = queue
         self.capture_config = capture_config
         self.accounts = accounts
+        self.universe_symbols = universe_symbols or (lambda: ())
         self.maximum_clock_skew_ms = maximum_clock_skew_ms
         self.user_streams = BinanceUserStreams()
 
@@ -333,7 +382,14 @@ class DatabaseMarketGateway:
         if maximum_seconds <= 0 or maximum_events <= 0:
             raise ValueError("market gateway bounds must be positive")
         timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=120)
-        sink = DatabaseGatewaySink(self.queue)
+        sink = DatabaseGatewaySink(
+            self.queue,
+            spool=DurableMarketBatchSpool(
+                self.capture_config.root / "spool",
+                max_rows=min(self.capture_config.queue_max_events, 5_000),
+                max_bytes=self.capture_config.max_file_bytes,
+            ),
+        )
         async with aiohttp.ClientSession(timeout=timeout) as session:
             clocks = await self._clock_status(session)
             public_task = asyncio.create_task(
@@ -342,6 +398,7 @@ class DatabaseMarketGateway:
                     max_events=maximum_events,
                     max_seconds=maximum_seconds,
                     sink=sink,
+                    dynamic_symbols=self.universe_symbols(),
                 )
             )
             user_tasks = [

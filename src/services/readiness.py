@@ -35,7 +35,9 @@ def _regular_directory(path: Path) -> tuple[bool, str]:
     return True, "ready"
 
 
-def build_readiness(config_path: Path = Path("config/platform.json")) -> dict[str, Any]:
+def build_readiness(
+    config_path: Path = Path("config/platform.json"), *, live: bool = False
+) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     try:
         config = load_platform_config(config_path)
@@ -43,9 +45,11 @@ def build_readiness(config_path: Path = Path("config/platform.json")) -> dict[st
         checks.append(_check("platform_configuration", True))
         checks.append(
             _check(
-                "products_paper_only",
+                "products_paper_only" if not live else "products_execution_configured",
                 all(
                     product.get("execution_mode") == "paper"
+                    if not live
+                    else product.get("execution_mode") in {"paper", "live"}
                     for product in split["products"]["products"]
                 ),
                 detail={
@@ -130,6 +134,7 @@ def build_readiness(config_path: Path = Path("config/platform.json")) -> dict[st
 
     return {
         "schema": "platform.readiness/v1",
+        "mode": "live" if live else "paper",
         "ok": all(item["ok"] for item in checks),
         "checks": checks,
         "paths": paths,
@@ -142,12 +147,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--config", type=Path, default=Path("config/platform.json"))
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--live", action="store_true")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    report = build_readiness(args.config)
+    report = build_readiness(args.config, live=args.live)
     encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output is not None:
         if args.output.is_symlink():

@@ -1,0 +1,3 @@
+# Linux research lock. It contains the complete chronological research and
+# model toolchain used by the research security domain.
+-r requirements.txt

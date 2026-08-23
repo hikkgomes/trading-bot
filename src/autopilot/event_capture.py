@@ -47,7 +47,7 @@ class EventSource:
 class EventCaptureConfig:
     path: Path
     root: Path
-    market_universe_report: Path
+    market_universe_report: Path | None
     max_dynamic_symbols: int
     max_file_bytes: int
     max_total_bytes: int
@@ -190,8 +190,10 @@ def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig
     return EventCaptureConfig(
         path=path.resolve(),
         root=_project_path(payload.get("root"), field="root"),
-        market_universe_report=_project_path(
-            payload.get("market_universe_report"), field="market_universe_report"
+        market_universe_report=(
+            _project_path(payload.get("market_universe_report"), field="market_universe_report")
+            if payload.get("market_universe_report") is not None
+            else None
         ),
         max_dynamic_symbols=_positive_int(
             payload.get("max_dynamic_symbols"), field="max_dynamic_symbols", maximum=100
@@ -212,6 +214,8 @@ def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig
 
 def _dynamic_symbols(config: EventCaptureConfig) -> tuple[str, ...]:
     path = config.market_universe_report
+    if path is None:
+        return ()
     if not path.exists():
         return ()
     if path.is_symlink() or not path.is_file():
@@ -445,6 +449,7 @@ async def capture(
     max_seconds: float | None = None,
     status_path: Path | None = None,
     sink: EventSink | None = None,
+    dynamic_symbols: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -453,7 +458,7 @@ async def capture(
             loop.add_signal_handler(signum, stop.set)
         except NotImplementedError:
             pass
-    dynamic = _dynamic_symbols(config)
+    dynamic = tuple(dict.fromkeys(str(symbol).upper() for symbol in dynamic_symbols))
     queue: asyncio.Queue = asyncio.Queue(maxsize=config.queue_max_events)
     writer = sink or EventWriter(config)
     started = time.monotonic()

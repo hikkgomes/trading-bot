@@ -9,6 +9,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
+from src.services.job_schemas import JobSchemaError, ResearchJobRequest
 
 
 class AgentRole(StrEnum):
@@ -100,10 +101,50 @@ class AgentProposal:
         object.__setattr__(self, "files", normalised_files)
         if len(self.research_jobs) > 10:
             raise ValueError("agent proposal requests too many research jobs")
+        normalised_jobs: list[dict[str, Any]] = []
+        forbidden_result_fields = {
+            "accepted",
+            "evidence",
+            "holdout_result",
+            "forward_result",
+            "limits",
+            "metrics",
+            "risk_decision",
+            "returns",
+            "targets",
+            "validation",
+        }
+        for item in self.research_jobs:
+            if not isinstance(item, Mapping):
+                raise ValueError("agent research requests must be objects")
+            request_payload = item.get("request")
+            if isinstance(request_payload, Mapping):
+                if forbidden_result_fields & (set(item) | set(request_payload)):
+                    raise ValueError("agent research requests cannot contain results")
+                try:
+                    request = ResearchJobRequest.from_mapping(request_payload)
+                except JobSchemaError as exc:
+                    raise ValueError(f"invalid agent research request: {exc}") from exc
+                name = non_empty(str(item.get("name") or "evaluate_candidate"), field="job name")
+                if name != "evaluate_candidate":
+                    raise ValueError("agent research requests must use the typed evaluator command")
+                normalised_jobs.append(
+                    {
+                        "name": name,
+                        "maximum_seconds": item.get("maximum_seconds", 60),
+                        "request": request.to_payload(),
+                    }
+                )
+                continue
+            if forbidden_result_fields & set(item):
+                raise ValueError("agent research requests cannot contain results")
+            # An empty request is retained for proposal review compatibility,
+            # but the worker will not enqueue it as executable work.
+            normalised_jobs.append(json_value(dict(item), field="research job"))
         object.__setattr__(
             self,
             "research_jobs",
-            tuple(json_value(dict(item), field="research job") for item in self.research_jobs),
+            tuple(normalised_jobs),
         )
         if not isinstance(self.provenance, Mapping):
             raise ValueError("agent proposal provenance must be an object")

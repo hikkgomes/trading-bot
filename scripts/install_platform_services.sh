@@ -2,26 +2,50 @@
 set -euo pipefail
 
 REPO="${REPO:-/opt/trading-bot}"
-NODE="${NODE:-}"
+NODE="${NODE:-linux-optiplex}"
+
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  [[ "$NODE" == "linux-optiplex" ]] || { echo "NODE must be linux-optiplex." >&2; exit 1; }
+  [[ -f "$REPO/config/platform.json" ]] || { echo "platform config is missing" >&2; exit 1; }
+  bash -n "$REPO/scripts/run_platform_service.sh"
+  echo "dry-run: validated Linux platform installation for $REPO"
+  exit 0
+fi
 
 if [[ "$NODE" == "linux-optiplex" ]]; then
   if [[ "$(id -u)" != "0" ]]; then
     echo "Linux platform service installation requires root." >&2
     exit 1
   fi
-  if ! getent group trading-platform >/dev/null; then
-    groupadd --system trading-platform
-  fi
-  if ! id trading-platform >/dev/null 2>&1; then
-    useradd --system --gid trading-platform --home-dir /nonexistent \
-      --shell /usr/sbin/nologin trading-platform
-  fi
-  install -d -m 0750 -o trading-platform -g trading-platform /etc/trading-platform
-  for directory in data runtime runtime/backups; do
-    install -d -m 0750 -o trading-platform -g trading-platform "$REPO/$directory"
+  for group in trading-runtime trading-research trading-agent trading-platform-owner; do
+    if ! getent group "$group" >/dev/null; then
+      groupadd --system "$group"
+    fi
   done
+  for user in trading-runtime trading-research trading-agent trading-platform-owner; do
+    if ! id "$user" >/dev/null 2>&1; then
+      useradd --system --gid "$user" --home-dir /nonexistent \
+        --shell /usr/sbin/nologin "$user"
+    fi
+  done
+  install -d -m 0750 -o root -g trading-runtime /etc/trading-platform
+  for directory in data runtime runtime/backups; do
+    install -d -m 0750 -o trading-runtime -g trading-runtime "$REPO/$directory"
+  done
+  install -d -m 0750 -o trading-research -g trading-research "$REPO/data/research"
+  install -d -m 0750 -o trading-agent -g trading-agent "$REPO/runtime/agent-worktrees"
   install -m 0644 "$REPO/deploy/systemd/trading-platform@.service" \
     /etc/systemd/system/trading-platform@.service
+  install -m 0644 "$REPO/deploy/systemd/trading-platform-research@.service" \
+    /etc/systemd/system/trading-platform-research@.service
+  install -m 0644 "$REPO/deploy/systemd/trading-platform-agent@.service" \
+    /etc/systemd/system/trading-platform-agent@.service
+  install -m 0644 "$REPO/deploy/systemd/trading-platform-migration.service" \
+    /etc/systemd/system/trading-platform-migration.service
+  for slice in critical background agent; do
+    install -m 0644 "$REPO/deploy/systemd/trading-platform-${slice}.slice" \
+      "/etc/systemd/system/trading-platform-${slice}.slice"
+  done
   install -m 0644 "$REPO/deploy/systemd/trading-platform-backup@.service" \
     /etc/systemd/system/trading-platform-backup@.service
   install -m 0644 "$REPO/deploy/systemd/trading-platform-backup-postgresql.timer" \
@@ -31,42 +55,22 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   install -m 0644 "$REPO/deploy/systemd/trading-platform-backup-verify.timer" \
     /etc/systemd/system/trading-platform-backup-verify.timer
   systemctl daemon-reload
-  services=(market-gateway data-writer feature-service portfolio-engine risk-engine execution-engine paper-engine product-supervisor accounting-service promotion-engine control-api)
-  for service in "${services[@]}"; do
+  critical_services=(market-gateway data-writer feature-service strategy-evaluator portfolio-engine risk-engine execution-engine paper-engine product-supervisor accounting-service promotion-engine control-api universe-service)
+  research_services=(research-worker ml-worker event-replay-worker feature-build-worker report-worker)
+  for service in "${critical_services[@]}"; do
     systemctl enable "trading-platform@${service}.service"
   done
+  for service in "${research_services[@]}"; do
+    systemctl enable "trading-platform-research@${service}.service"
+  done
+  systemctl enable trading-platform-agent@agent-sandbox.service
+  systemctl enable trading-platform-migration.service
   systemctl enable trading-platform-backup-postgresql.timer
   systemctl enable trading-platform-backup-parquet.timer
   systemctl enable trading-platform-backup-verify.timer
-  echo "Installed Linux service units. Add /etc/trading-platform/platform.env, then start them."
+  echo "Installed Linux service units. Add service-specific files under /etc/trading-platform/, then start them."
   exit 0
 fi
 
-if [[ "$NODE" == "macbook-research" ]]; then
-  if [[ "$(uname -s)" != "Darwin" ]]; then
-    echo "The research service installer must run on macOS." >&2
-    exit 1
-  fi
-  target_dir="/Library/LaunchDaemons"
-  template="$REPO/deploy/launchd/trading-platform-worker.plist.template"
-  environment_dir="/Library/Application Support/TradingPlatform"
-  if ! id trading-research >/dev/null 2>&1; then
-    echo "Create the non-login trading-research service account before installation." >&2
-    exit 1
-  fi
-  install -d -m 0750 -o root -g wheel "$environment_dir"
-  chmod 0755 "$REPO/scripts/run_platform_service.sh"
-  services=(research-worker ml-worker event-replay-worker agent-sandbox feature-build-worker report-worker)
-  for service in "${services[@]}"; do
-    target="$target_dir/com.trading-platform.${service}.plist"
-    sed -e "s/__SERVICE__/${service}/g" -e "s|__REPOSITORY__|${REPO}|g" \
-      "$template" > "$target"
-    chown root:wheel "$target"
-    chmod 0644 "$target"
-  done
-  echo "Installed macOS research services. Add the root-owned platform.env file, then load them."
-  exit 0
-fi
-
-echo "Set NODE to linux-optiplex or macbook-research." >&2
+echo "NODE must be linux-optiplex." >&2
 exit 1

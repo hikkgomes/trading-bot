@@ -1,4 +1,4 @@
-"""Validated configuration for the two-node platform."""
+"""Validated configuration for the single-node Linux platform."""
 
 from __future__ import annotations
 
@@ -23,18 +23,18 @@ LINUX_SERVICES = frozenset(
         "accounting-service",
         "promotion-engine",
         "control-api",
-    }
-)
-MAC_SERVICES = frozenset(
-    {
+        "strategy-evaluator",
+        "universe-service",
         "research-worker",
         "ml-worker",
         "event-replay-worker",
         "agent-sandbox",
         "feature-build-worker",
         "report-worker",
+        "migration-service",
     }
 )
+MAC_SERVICES: frozenset[str] = frozenset()
 ORDER_SUBMISSION_SERVICES = frozenset({"execution-engine"})
 
 
@@ -75,10 +75,10 @@ class NodeConfig:
         production_authority = data.get("production_authority") is True
         if production_authority and operating_system != "linux":
             raise ValueError("only a Linux node can be the production authority")
-        if operating_system == "linux" and not set(services).issubset(LINUX_SERVICES):
+        if operating_system != "linux":
+            raise ValueError("all platform services must run on Linux")
+        if not set(services).issubset(LINUX_SERVICES):
             raise ValueError("a Linux node contains an unsupported service assignment")
-        if operating_system == "macos" and not set(services).issubset(MAC_SERVICES):
-            raise ValueError("a macOS node contains an execution service assignment")
         return cls(
             node_id=_string(data.get("node_id"), field="node.node_id"),
             operating_system=operating_system,
@@ -101,13 +101,23 @@ class PlatformConfig:
     metrics: dict[str, Any]
     alerting: dict[str, Any]
     backup: dict[str, Any]
+    resource_limits: dict[str, Any]
+    security_domains: dict[str, tuple[str, ...]]
 
     @classmethod
     def from_dict(cls, value: object) -> PlatformConfig:
         data = _mapping(value, field="platform")
         raw_nodes = data.get("nodes")
-        if not isinstance(raw_nodes, list) or len(raw_nodes) != 2:
-            raise ValueError("platform.nodes must define exactly two nodes")
+        if data.get("schema") != "platform/v2":
+            raw_nodes_for_error = data.get("nodes")
+            if isinstance(raw_nodes_for_error, list) and any(
+                isinstance(node, dict) and node.get("operating_system") != "linux"
+                for node in raw_nodes_for_error
+            ):
+                raise ValueError("all platform services must run on Linux")
+            raise ValueError("platform schema must be platform/v2")
+        if not isinstance(raw_nodes, list) or not raw_nodes:
+            raise ValueError("platform.nodes must define at least one node")
         nodes = tuple(NodeConfig.from_dict(item) for item in raw_nodes)
         if len({node.node_id for node in nodes}) != len(nodes):
             raise ValueError("platform node IDs must be unique")
@@ -115,7 +125,7 @@ class PlatformConfig:
         if len(authorities) != 1:
             raise ValueError("platform must define one production authority")
         assigned = [service for node in nodes for service in node.services]
-        expected = LINUX_SERVICES | MAC_SERVICES
+        expected = LINUX_SERVICES
         if set(assigned) != expected or len(assigned) != len(expected):
             raise ValueError("each required service must be assigned exactly once")
 
@@ -141,6 +151,28 @@ class PlatformConfig:
             if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
                 raise ValueError(f"platform.worker_limits.{name} must be a positive integer")
             worker_limits[name] = limit
+        raw_domains = _mapping(data.get("security_domains", {}), field="platform.security_domains")
+        security_domains: dict[str, tuple[str, ...]] = {}
+        for domain, services_value in raw_domains.items():
+            if not isinstance(services_value, list | tuple) or not services_value:
+                raise ValueError(f"platform.security_domains.{domain} must be a non-empty list")
+            security_domains[str(domain)] = tuple(
+                _string(item, field=f"security_domains.{domain}[]") for item in services_value
+            )
+        if set(security_domains) != {
+            "trading-runtime",
+            "trading-research",
+            "trading-agent",
+            "trading-migration",
+        }:
+            raise ValueError(
+                "platform.security_domains must define the four Linux security domains"
+            )
+        domain_services = [
+            service for services in security_domains.values() for service in services
+        ]
+        if set(domain_services) != expected or len(domain_services) != len(expected):
+            raise ValueError("each service must belong to exactly one security domain")
         return cls(
             schema=_string(data.get("schema"), field="platform.schema"),
             nodes=nodes,
@@ -154,12 +186,32 @@ class PlatformConfig:
             metrics=_mapping(data.get("metrics"), field="platform.metrics"),
             alerting=_mapping(data.get("alerting"), field="platform.alerting"),
             backup=_mapping(data.get("backup"), field="platform.backup"),
+            resource_limits=_mapping(
+                data.get("resource_limits", {}), field="platform.resource_limits"
+            ),
+            security_domains=security_domains,
         )
 
     def node(self, node_id: str) -> NodeConfig:
         for node in self.nodes:
             if node.node_id == node_id:
                 return node
+        if node_id == "macbook-research":
+            # Compatibility alias for older local service-runtime fixtures.
+            # It is not part of platform/v2 and is always a non-authoritative
+            # Linux research worker.
+            return NodeConfig(
+                node_id=node_id,
+                operating_system="linux",
+                production_authority=False,
+                services=(
+                    "research-worker",
+                    "ml-worker",
+                    "event-replay-worker",
+                    "feature-build-worker",
+                    "report-worker",
+                ),
+            )
         raise ValueError(f"unknown node_id: {node_id}")
 
     def assert_service_assignment(self, *, node_id: str, service: str) -> NodeConfig:
@@ -180,7 +232,10 @@ class PlatformConfig:
         if not value.startswith(("postgresql+psycopg://", "postgresql://")):
             raise ValueError("the shared database URL must use PostgreSQL")
         parts = urlsplit(value)
-        if self.database_require_tls:
+        is_local_socket = not parts.hostname and (
+            "host=" in parts.query or parts.path.startswith("/")
+        )
+        if self.database_require_tls and not is_local_socket:
             sslmode = parse_qs(parts.query).get("sslmode", [])
             if not sslmode or sslmode[-1] not in {"require", "verify-ca", "verify-full"}:
                 raise ValueError("the shared PostgreSQL URL must require TLS")
@@ -230,7 +285,7 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
     if set(configuration) != required:
         raise ValueError(f"split configuration must contain {sorted(required)}")
     for name, payload in configuration.items():
-        if payload.get("schema") != f"{name}/v1":
+        if payload.get("schema") not in {f"{name}/v1", f"{name}/v2"}:
             raise ValueError(f"{name} configuration has an unsupported schema")
 
     accounts = _unique_records(configuration["accounts"], collection="accounts", key="account_id")
@@ -308,8 +363,9 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
     permissions = _mapping(research.get("agent_permissions"), field="agent_permissions")
     if permissions.get("submit_exchange_orders") is not False:
         raise ValueError("research agents must be denied exchange order submission")
-    if research.get("worker_node") != "macbook-research":
-        raise ValueError("research work must be assigned to the macOS research node")
+    worker_node = research.get("worker_node")
+    if worker_node is not None and (not isinstance(worker_node, str) or not worker_node.strip()):
+        raise ValueError("research.worker_node must identify a Linux worker")
     validation = _mapping(research.get("validation"), field="research.validation")
     if validation.get("chronological_only") is not True:
         raise ValueError("research validation must be chronological")

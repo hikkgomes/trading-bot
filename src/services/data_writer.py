@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from pathlib import Path
 from typing import Any
 
-from src.data.parquet_store import PartitionedBarStore, PartitionedMarketEventStore
+from src.data.parquet_store import (
+    DurableMarketBatchSpool,
+    PartitionedBarStore,
+    PartitionedMarketEventStore,
+)
 from src.domain._codec import canonical_hash
-from src.domain.market_events import MarketEvent, MarketEventType
+from src.domain.market_events import ExchangeSequenceTracker, MarketEvent, MarketEventType
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -26,21 +31,31 @@ class DatabaseMarketDataWriter:
         self.store = PartitionedMarketEventStore(root)
         self.bar_store = PartitionedBarStore(root)
         self.lease_seconds = lease_seconds
+        self.sequence_tracker = ExchangeSequenceTracker()
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.lease_seconds,
-            names=("market_event_write",),
+            names=("market_event_batch_write", "market_event_write"),
         )
         if claimed is None:
             return {"reason_code": "market_event_queue_empty"}
         try:
+            if claimed.name == "market_event_batch_write":
+                result = self._write_batch(claimed.payload)
+                self.queue.complete(claimed, completed_at=now)
+                return {
+                    "reason_code": "market_event_batch_written",
+                    "job_id": claimed.job_id,
+                    **result,
+                }
             raw_event = claimed.payload.get("event")
             if not isinstance(raw_event, dict):
                 raise ValueError("market-event job has no event object")
             event = MarketEvent(**raw_event)
+            sequence_status = self.sequence_tracker.observe(event)
             venue = str(claimed.payload["venue"])
             market = str(claimed.payload["market"])
             symbol = str(claimed.payload["symbol"])
@@ -79,6 +94,43 @@ class DatabaseMarketDataWriter:
             "path": str(path),
             "bar_path": str(bar_path) if bar_path is not None else None,
             "feature_job_id": feature_job_id,
+            "sequence_status": sequence_status,
+        }
+
+    def _write_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        segment_path = Path(str(payload["segment_path"]))
+        rows = DurableMarketBatchSpool.read(segment_path)
+        body = "".join(
+            json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
+        )
+        if canonical_hash(body) != str(payload["segment_hash"]):
+            raise ValueError("market batch segment content hash is invalid")
+        events = []
+        for row in rows:
+            event = row.get("event")
+            if not isinstance(event, dict):
+                raise ValueError("market batch row has no event")
+            canonical_event = MarketEvent(**event)
+            events.append(
+                (
+                    canonical_event,
+                    str(row["venue"]),
+                    str(row["market"]),
+                    str(row["symbol"]),
+                )
+            )
+            self.sequence_tracker.observe(canonical_event)
+        paths = self.store.put_batch(events)
+        for event, venue, market, symbol in events:
+            if _is_closed_candle(event):
+                self.bar_store.put(event, venue=venue, market=market, symbol=symbol)
+                self._enqueue_closed_candle_features(
+                    event=event, venue=venue, market=market, symbol=symbol
+                )
+        return {
+            "segments": len(paths),
+            "events": len(events),
+            "paths": [str(path) for path in paths],
         }
 
     def _enqueue_closed_candle_features(

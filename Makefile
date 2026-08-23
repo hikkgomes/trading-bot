@@ -123,13 +123,40 @@ platform-validate:  ## Validate split platform configuration and node assignment
 	$(PY) -m src.services.supervisor --config config/platform.json \
 		--node linux-optiplex --service product-supervisor --validate
 
+.PHONY: platform-install-dry-run
+platform-install-dry-run:  ## Validate the Linux installer without changing the host
+	DRY_RUN=1 REPO="$(CURDIR)" bash scripts/install_platform_services.sh
+
 .PHONY: platform-readiness
 platform-readiness:  ## Check PostgreSQL, canonical tables, Parquet, and paper-only state
 	$(PY) -m src.services.readiness --config config/platform.json
 
+.PHONY: platform-readiness-live
+platform-readiness-live:  ## Check live platform readiness with PostgreSQL schema verification
+	$(PY) -m src.services.readiness --config config/platform.json --live
+
+.PHONY: platform-smoke
+platform-smoke:  ## Run the PostgreSQL closed-event platform smoke for both products
+	$(PY) -m src.services.platform_smoke --database-url "$(TRADING_PLATFORM_DATABASE_URL)" \
+		$(if $(ALLOW_EMPTY),--allow-empty,)
+
+.PHONY: platform-ci
+platform-ci:  ## Run the platform configuration, lint, migration, smoke, and test checks
+	$(MAKE) platform-validate
+	$(MAKE) lint-autopilot
+	$(MAKE) lint
+	$(MAKE) db-alembic
+	$(MAKE) db-migration-check
+	$(MAKE) platform-smoke
+	$(MAKE) test
+
 .PHONY: db-migrate
 db-migrate:  ## Apply versioned PostgreSQL migrations
 	$(PY) -m src.data.migrate --database-url "$(TRADING_PLATFORM_DATABASE_URL)"
+
+.PHONY: db-alembic
+db-alembic:  ## Apply immutable Alembic revisions as the database owner
+	TRADING_PLATFORM_DATABASE_URL="$(TRADING_PLATFORM_DATABASE_URL)" $(PY) -m alembic upgrade head
 
 .PHONY: db-migration-check
 db-migration-check:  ## Verify the complete PostgreSQL schema is migrated

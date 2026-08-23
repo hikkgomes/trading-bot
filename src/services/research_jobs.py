@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from src.data.parquet_store import PartitionedBacktestStore
+from src.domain._codec import canonical_hash
 from src.domain.strategies import StrategySourceType
 from src.research.backtest.bar_engine import BarPortfolioEngine, BarStep
 from src.research.backtest.event_engine import (
@@ -20,6 +21,7 @@ from src.research.evaluation import CanonicalResearchEvaluator, EvaluationReques
 from src.research.ml import MlExperimentRunner
 from src.research.providers import provider_candidate
 from src.research.store import SqlResearchStore
+from src.services.job_schemas import JobSchemaError, ResearchJobRequest
 from src.services.scheduler import ClaimedJob
 
 _REQUIRED_EVIDENCE: dict[str, frozenset[str]] = {
@@ -76,10 +78,12 @@ class DatabaseResearchJobHandlers:
         *,
         artefact_store: PartitionedBacktestStore | None = None,
         ml_runner: MlExperimentRunner | None = None,
+        dataset_loader: Callable[[str, Mapping[str, Any]], Any] | None = None,
     ):
         self.store = store
         self.artefact_store = artefact_store
         self.ml_runner = ml_runner
+        self.dataset_loader = dataset_loader
 
     def handlers(self) -> dict[str, Callable]:
         return {
@@ -125,6 +129,7 @@ class DatabaseResearchJobHandlers:
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
     ) -> dict[str, Any]:
         renew()
+        ResearchJobRequest.from_mapping(claimed.payload)
         request = EvaluationRequest.from_payload(claimed.payload)
         result = CanonicalResearchEvaluator(self.store).evaluate(request)
         return {
@@ -140,10 +145,18 @@ class DatabaseResearchJobHandlers:
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
     ) -> dict[str, Any]:
         renew()
-        steps = tuple(BarStep(**dict(item)) for item in claimed.payload["steps"])
+        request = _assert_result_free_research_request(
+            claimed.payload, forbidden=("steps", "returns", "metrics")
+        )
+        loaded = self._load_dataset("bar_steps", request)
+        if not isinstance(loaded, Mapping):
+            raise JobSchemaError("bar dataset loader must return a mapping")
+        steps = tuple(
+            item if isinstance(item, BarStep) else BarStep(**dict(item)) for item in loaded["steps"]
+        )
         result = BarPortfolioEngine(
-            initial_equity=float(claimed.payload["initial_equity"]),
-            fee_bps=float(claimed.payload.get("fee_bps", 5.0)),
+            initial_equity=float(loaded["initial_equity"]),
+            fee_bps=float(loaded["fee_bps"]),
         ).simulate(steps)
         final_equity = result.equity_curve[-1][1] if result.equity_curve else 0.0
         evidence: dict[str, Any] = {
@@ -174,12 +187,23 @@ class DatabaseResearchJobHandlers:
                 "fees_paid": result.fees_paid,
                 "funding_paid": result.funding_paid,
             },
+            receipt=_execution_receipt(request, executor_version="bar-engine/v2"),
         )
         return {"run_id": run_id, "final_equity": final_equity}
 
     def event_replay(self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]) -> dict[str, Any]:
         renew()
-        events = tuple(ReplayEvent(**dict(item)) for item in claimed.payload["events"])
+        request = _assert_result_free_research_request(
+            claimed.payload,
+            forbidden=("events", "orders", "fills", "positions", "returns", "metrics"),
+        )
+        loaded = self._load_dataset("event_replay", request)
+        if not isinstance(loaded, Mapping):
+            raise JobSchemaError("event replay dataset loader must return events and orders")
+        events = tuple(
+            item if isinstance(item, ReplayEvent) else ReplayEvent(**dict(item))
+            for item in loaded["events"]
+        )
         orders = tuple(
             SimulatedLimitOrder(
                 **{
@@ -187,13 +211,11 @@ class DatabaseResearchJobHandlers:
                     "side": SimulatedOrderSide(str(item["side"])),
                 }
             )
-            for item in claimed.payload["orders"]
+            for item in loaded["orders"]
         )
         result = EventReplayEngine(
-            cancel_latency_seconds=float(claimed.payload.get("cancel_latency_seconds", 0.25)),
-            impact_bps_per_depth_fraction=float(
-                claimed.payload.get("impact_bps_per_depth_fraction", 5.0)
-            ),
+            cancel_latency_seconds=float(loaded["cancel_latency_seconds"]),
+            impact_bps_per_depth_fraction=float(loaded["impact_bps_per_depth_fraction"]),
         ).simulate(events=events, orders=orders)
         order_evidence = [
             {
@@ -243,6 +265,7 @@ class DatabaseResearchJobHandlers:
                 **{str(key): float(value) for key, value in result.metrics.items()},
                 "funding_paid": result.funding_paid,
             },
+            receipt=_execution_receipt(request, executor_version="event-replay/v2"),
         )
         return {"run_id": run_id, **dict(result.metrics)}
 
@@ -253,21 +276,28 @@ class DatabaseResearchJobHandlers:
             raise RuntimeError("ML experiment runner is not configured")
         renew()
         payload = claimed.payload
+        request = _assert_result_free_research_request(
+            payload, forbidden=("rows", "metrics", "returns", "model_artifact_id")
+        )
+        loaded = self._load_dataset("ml_rows", request)
+        if not isinstance(loaded, Mapping):
+            raise JobSchemaError("ML dataset loader must return a mapping")
+        rows = loaded["rows"]
         result = self.ml_runner.run(
             candidate_id=str(payload["candidate_id"]),
-            model_name=str(payload["model_name"]),
-            feature_names=tuple(payload["feature_names"]),
-            target_name=str(payload["target_name"]),
-            rows=tuple(payload["rows"]),
-            created_at=str(payload["evaluated_at"]),
-            train_fraction=float(payload.get("train_fraction", 0.7)),
-            embargo_rows=int(payload.get("embargo_rows", 1)),
-            hyperparameters=payload.get("hyperparameters"),
+            model_name=str(loaded["model_name"]),
+            feature_names=tuple(loaded["feature_names"]),
+            target_name=str(loaded["target_name"]),
+            rows=tuple(rows),
+            created_at=request.evaluated_at,
+            train_fraction=float(loaded["train_fraction"]),
+            embargo_rows=int(loaded["embargo_rows"]),
+            hyperparameters=loaded.get("hyperparameters"),
         )
         run_id = self.store.save_run(
             candidate_id=str(payload["candidate_id"]),
-            run_name=f"ml:{payload['model_name']}",
-            created_at=str(payload["evaluated_at"]),
+            run_name=f"ml:{loaded['model_name']}",
+            created_at=request.evaluated_at,
             evidence={
                 "model_artifact_id": result.model_artifact_id,
                 "content_hash": result.content_hash,
@@ -275,10 +305,11 @@ class DatabaseResearchJobHandlers:
                 "dataset_hash": result.dataset_hash,
                 "train_rows": result.train_rows,
                 "validation_rows": result.validation_rows,
-                "chronological": True,
-                "embargo_rows": int(payload.get("embargo_rows", 1)),
+                "chronological": result.train_rows < len(tuple(rows)),
+                "embargo_rows": int(loaded["embargo_rows"]),
             },
             metrics={str(key): float(value) for key, value in result.metrics.items()},
+            receipt=_execution_receipt(request, executor_version="ml-runner/v2"),
         )
         return {
             "run_id": run_id,
@@ -286,6 +317,13 @@ class DatabaseResearchJobHandlers:
             "content_hash": result.content_hash,
             "metrics": dict(result.metrics),
         }
+
+    def _load_dataset(self, kind: str, request: ResearchJobRequest) -> Any:
+        if self.dataset_loader is None:
+            raise JobSchemaError(
+                f"{kind} requires a canonical dataset loader; queue payloads cannot contain raw data"
+            )
+        return self.dataset_loader(kind, request.to_payload())
 
     @staticmethod
     def _candidate(payload: Mapping[str, Any]) -> Candidate:
@@ -331,3 +369,29 @@ def _validate_sample_evidence(candidate: Candidate, raw: object) -> None:
         value = units[name]
         if not isinstance(value, int | float) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"strategy evidence unit {name} must be positive")
+
+
+def _assert_result_free_research_request(
+    payload: Mapping[str, Any], *, forbidden: tuple[str, ...]
+) -> ResearchJobRequest:
+    """Reject legacy jobs that smuggled a simulation into the queue payload."""
+
+    present = sorted(set(payload) & set(forbidden))
+    if present:
+        raise JobSchemaError(
+            "research jobs cannot contain precomputed results: " + ", ".join(present)
+        )
+    return ResearchJobRequest.from_mapping(payload)
+
+
+def _execution_receipt(request: ResearchJobRequest, *, executor_version: str) -> dict[str, Any]:
+    payload = {
+        "candidate_id": request.candidate_id,
+        "dataset_snapshot_ids": list(request.dataset_snapshot_ids),
+        "feature_manifest_id": request.feature_manifest_id,
+        "cost_model_id": request.cost_model_id,
+        "parameter_set_id": request.parameter_set_id,
+        "evaluator_version": request.evaluator_version,
+        "executor_version": executor_version,
+    }
+    return {**payload, "input_hash": canonical_hash(payload)}

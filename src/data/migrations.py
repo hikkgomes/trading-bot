@@ -11,7 +11,7 @@ import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import insert, inspect, select, text
+from sqlalchemy import insert, inspect, select, text, update
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.schema import CreateIndex, CreateTable
 
@@ -61,12 +61,23 @@ _APPEND_ONLY_TABLES = (
 
 
 _MIGRATION_DIR = Path(__file__).resolve().parents[2] / "migrations"
+_ALEMBIC_REVISION_FILES = {
+    "001_platform_schema": "001_platform_v2_baseline.py",
+    "002_canonical_evidence_constraints": "002_platform_v2_authority.py",
+}
 
 
 def _migration_hash(version: str) -> str:
-    path = _MIGRATION_DIR / f"{version}.sql"
+    path = _MIGRATION_DIR.parent / "alembic" / "versions" / _ALEMBIC_REVISION_FILES[version]
+    if not path.is_file() or path.is_symlink():
+        path = _MIGRATION_DIR / f"{version}.sql"
     if not path.is_file() or path.is_symlink():
         raise RuntimeError(f"migration file is missing: {path}")
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _legacy_marker_hash(version: str) -> str:
+    path = _MIGRATION_DIR / f"{version}.sql"
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
@@ -164,6 +175,40 @@ def _install_append_only_guards(connection: Connection) -> None:
             )
 
 
+def _install_postgresql_privileges(connection: Connection) -> None:
+    if connection.dialect.name != "postgresql":
+        return
+    connection.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trading_platform_owner') THEN
+                    CREATE ROLE trading_platform_owner NOLOGIN;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trading_runtime') THEN
+                    CREATE ROLE trading_runtime NOLOGIN;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trading_research') THEN
+                    CREATE ROLE trading_research NOLOGIN;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'trading_agent') THEN
+                    CREATE ROLE trading_agent NOLOGIN;
+                END IF;
+            END $$;
+            GRANT USAGE ON SCHEMA public TO trading_runtime, trading_research, trading_agent;
+            GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO trading_runtime;
+            GRANT SELECT ON ALL TABLES IN SCHEMA public TO trading_research, trading_agent;
+            GRANT SELECT, INSERT ON job TO trading_research, trading_agent;
+            REVOKE INSERT, UPDATE, DELETE ON order_intent, exchange_order, fill, position,
+                balance_snapshot, accounting_entry, strategy_approval, production_preflight,
+                active_strategy_assignment, control_event, promotion_event
+                FROM trading_research, trading_agent;
+            """
+        )
+    )
+
+
 def _ensure_migration_table(connection: Connection) -> None:
     if connection.dialect.name == "postgresql":
         connection.execute(
@@ -172,13 +217,47 @@ def _ensure_migration_table(connection: Connection) -> None:
                 CREATE TABLE IF NOT EXISTS schema_migration (
                     version VARCHAR(80) PRIMARY KEY,
                     applied_at VARCHAR(40) NOT NULL,
-                    content_hash VARCHAR(80) NOT NULL UNIQUE
+                    content_hash VARCHAR(80) NOT NULL UNIQUE,
+                    revision_hash VARCHAR(80) NOT NULL
                 )
                 """
             )
         )
+        connection.execute(
+            text(
+                "ALTER TABLE schema_migration ADD COLUMN IF NOT EXISTS revision_hash VARCHAR(80)"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE schema_migration SET revision_hash = content_hash "
+                "WHERE revision_hash IS NULL"
+            )
+        )
+        connection.execute(
+            text("ALTER TABLE schema_migration ALTER COLUMN revision_hash SET NOT NULL")
+        )
     else:
         schema_migration.create(connection, checkfirst=True)
+        columns = {column["name"] for column in inspect(connection).get_columns("schema_migration")}
+        if "revision_hash" not in columns:
+            connection.execute(
+                text("ALTER TABLE schema_migration ADD COLUMN revision_hash VARCHAR(80)")
+            )
+            connection.execute(
+                text("UPDATE schema_migration SET revision_hash = content_hash")
+            )
+    for version in MIGRATIONS:
+        current = connection.execute(
+            select(schema_migration.c.content_hash).where(schema_migration.c.version == version)
+        ).scalar_one_or_none()
+        if current == _legacy_marker_hash(version):
+            revision_hash = _migration_hash(version)
+            connection.execute(
+                update(schema_migration)
+                .where(schema_migration.c.version == version)
+                .values(content_hash=revision_hash, revision_hash=revision_hash)
+            )
 
 
 def _applied(connection: Connection) -> set[str]:
@@ -207,6 +286,7 @@ def apply_migrations(engine: Engine, *, target: str | None = None) -> tuple[str,
                 continue
             if connection.dialect.name == "postgresql":
                 _create_postgresql_schema(connection)
+                _install_postgresql_privileges(connection)
             else:
                 _create_sqlite_schema(connection)
             if version == "002_canonical_evidence_constraints":
@@ -216,6 +296,7 @@ def apply_migrations(engine: Engine, *, target: str | None = None) -> tuple[str,
                     version=version,
                     applied_at=_utc_now(),
                     content_hash=_migration_hash(version),
+                    revision_hash=_migration_hash(version),
                 )
             )
             applied_now.append(version)
@@ -223,6 +304,7 @@ def apply_migrations(engine: Engine, *, target: str | None = None) -> tuple[str,
                 break
         if target is None:
             _install_append_only_guards(connection)
+            _install_postgresql_privileges(connection)
     return tuple(applied_now)
 
 
@@ -236,7 +318,7 @@ def assert_migrated(engine: Engine) -> None:
         raise RuntimeError(f"database migrations are incomplete; missing tables: {missing}")
     with engine.connect() as connection:
         rows = {
-            str(row["version"]): str(row["content_hash"])
+            str(row["version"]): (str(row["content_hash"]), str(row["revision_hash"]))
             for row in connection.execute(select(schema_migration)).mappings()
         }
     missing_versions = sorted(set(MIGRATIONS) - set(rows))
@@ -247,7 +329,7 @@ def assert_migrated(engine: Engine) -> None:
     mismatched = {
         version: rows[version]
         for version in MIGRATIONS
-        if rows[version] != _migration_hash(version)
+        if rows[version] != (_migration_hash(version), _migration_hash(version))
     }
     if mismatched:
         raise RuntimeError(f"database migration content hashes do not match: {mismatched}")

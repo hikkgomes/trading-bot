@@ -7,6 +7,7 @@ from typing import Any
 
 from src.agents.code_worker import AgentCodeWorkflow
 from src.agents.store import SqlAgentStore
+from src.services.job_schemas import JobSchemaError, ResearchJobRequest
 from src.services.runtime import utc_now
 from src.services.scheduler import ClaimedJob, DatabaseJobQueue
 
@@ -57,17 +58,18 @@ class DatabaseAgentJobHandlers:
             maximum_seconds = int(item.get("maximum_seconds", self.maximum_runtime_seconds))
             if not 1 <= maximum_seconds <= self.maximum_runtime_seconds:
                 raise ValueError("agent research job exceeds its runtime budget")
-            raw_payload = item.get("payload")
-            payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+            raw_request = item.get("request")
+            if not isinstance(raw_request, dict):
+                raise JobSchemaError("agent research item has no typed request")
+            request = ResearchJobRequest.from_mapping(raw_request)
             job_id = f"agent:{proposal.proposal_id}:research:{index}"
             self.queue.enqueue_if_absent(
                 job_id=job_id,
                 name=name,
-                payload={
-                    **payload,
-                },
+                payload=request.to_payload(),
                 available_at=proposal.created_at,
                 priority=5,
+                producer_identity=f"agent:{proposal.proposal_id}",
             )
             queued.append(job_id)
             renew()
