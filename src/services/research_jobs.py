@@ -15,12 +15,13 @@ from src.research.backtest.event_engine import (
     SimulatedLimitOrder,
     SimulatedOrderSide,
 )
-from src.research.catalogue import registered_strategy_candidates
+from src.research.catalogue import registered_strategy_candidates, registered_strategy_theses
 from src.research.coordinator import Candidate, ResearchCoordinator
 from src.research.evaluation import CanonicalResearchEvaluator, EvaluationRequest
 from src.research.ml import MlExperimentRunner
 from src.research.providers import provider_candidate
 from src.research.store import SqlResearchStore
+from src.research.theses import SqlThesisRegistry
 from src.services.job_schemas import JobSchemaError, ResearchJobRequest
 from src.services.scheduler import ClaimedJob
 
@@ -100,9 +101,17 @@ class DatabaseResearchJobHandlers:
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
     ) -> dict[str, Any]:
         renew()
+        universe = tuple(claimed.payload.get("instrument_universe", ("BTCUSDT",)))
+        theses = registered_strategy_theses(
+            product=str(claimed.payload["product_id"]), instrument_universe=universe
+        )
+        thesis_registry = SqlThesisRegistry(self.store.engine)
+        for thesis in theses.values():
+            thesis_registry.register(thesis)
         candidates = registered_strategy_candidates(
             product=str(claimed.payload["product_id"]),
             dataset_snapshot_hashes=tuple(claimed.payload["dataset_snapshot_hashes"]),
+            instrument_universe=universe,
         )
         identities = ResearchCoordinator(self.store).register(candidates)
         return {"registered_candidates": len(identities), "candidate_ids": list(identities)}
@@ -332,6 +341,8 @@ class DatabaseResearchJobHandlers:
             version=str(payload["version"]),
             family=str(payload["family"]),
             product=str(payload["product"]),
+            thesis_id=str(payload["thesis_id"]),
+            lineage_id=str(payload["lineage_id"]),
             provider=str(payload["provider"]),
             source_type=StrategySourceType(str(payload["source_type"])),
             source_payload=dict(payload["source_payload"]),

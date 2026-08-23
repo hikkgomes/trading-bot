@@ -15,6 +15,7 @@ from src.data.database import (
     strategy_definition,
     strategy_identity,
     strategy_version,
+    thesis_trial,
     validation_result,
 )
 from src.domain._codec import canonical_hash, json_value, timestamp, to_primitive
@@ -62,6 +63,13 @@ class SqlResearchStore:
         metadata_payload = json_value(dict(candidate.metadata), field="candidate metadata")
         parent_hashes = metadata_payload.get("parent_hashes", [])
         with self.engine.begin() as connection:
+            trial = connection.execute(
+                select(thesis_trial).where(thesis_trial.c.candidate_id == candidate_id)
+            ).mappings().first()
+            if trial is None:
+                raise ValueError("candidate trial must be claimed before candidate registration")
+            if trial["thesis_id"] != candidate.thesis_id or trial["lineage_id"] != candidate.lineage_id:
+                raise ValueError("candidate thesis lineage does not match its claimed trial")
             existing = (
                 connection.execute(select(experiment).where(experiment.c.id == candidate_id))
                 .mappings()
@@ -197,6 +205,9 @@ class SqlResearchStore:
 
     @staticmethod
     def _candidate_from_row(connection, row) -> Candidate:
+        trial = connection.execute(
+            select(thesis_trial).where(thesis_trial.c.candidate_id == row["id"])
+        ).mappings().one()
         definition_payload = connection.execute(
             select(strategy_definition.c.definition)
             .select_from(
@@ -209,10 +220,22 @@ class SqlResearchStore:
         ).scalar_one()
         return Candidate(
             definition=_definition_from_dict(definition_payload),
+            thesis_id=trial["thesis_id"],
+            lineage_id=trial["lineage_id"],
             provider=row["provider"],
             dataset_snapshot_hashes=tuple(row["dataset_snapshot_hashes"]),
             submitted_at=row["submitted_at"],
             metadata=row["metadata"],
+        )
+
+    def claim_trial(self, candidate: Candidate) -> None:
+        from src.research.theses import SqlThesisRegistry
+
+        SqlThesisRegistry(self.engine).claim_trial(
+            thesis_id=candidate.thesis_id,
+            candidate_id=candidate.candidate_id,
+            lineage_id=candidate.lineage_id,
+            claimed_at=candidate.submitted_at,
         )
 
     def save_result(self, result: ResearchResult) -> None:

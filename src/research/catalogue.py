@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import hashlib
 import inspect
@@ -10,8 +11,15 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 
-from src.domain.strategies import StrategyDefinition, StrategySourceType
+from src.domain._codec import canonical_hash
+from src.domain.strategies import (
+    MechanismCategory,
+    ResearchThesis,
+    StrategyDefinition,
+    StrategySourceType,
+)
 from src.research.coordinator import Candidate
+from src.research.theses import REQUIRED_NEGATIVE_CONTROLS
 from src.strategies import library  # noqa: F401
 from src.strategies.manifest import (
     assert_manifest_complete,
@@ -20,6 +28,39 @@ from src.strategies.manifest import (
     manifest_source_type,
 )
 from src.strategies.registry import available, describe
+
+
+def registered_strategy_theses(
+    *, product: str, instrument_universe: Iterable[str]
+) -> dict[str, ResearchThesis]:
+    universe = tuple(sorted(set(instrument_universe)))
+    if not universe:
+        raise ValueError("registered strategy research requires a predeclared universe")
+    assert_manifest_complete()
+    manifest = manifest_by_name()
+    return {
+        name: ResearchThesis(
+            mechanism_category=MechanismCategory.BEHAVIOURAL,
+            market_rationale=f"Test the predeclared {name} mechanism without result-led changes.",
+            expected_causal_chain=("observable market state", name, "subsequent return"),
+            expected_direction="as declared by the strategy signal",
+            expected_horizon="strategy validation horizon",
+            required_data=("canonical closed bars",),
+            permitted_features=(name,),
+            instrument_universe=universe,
+            generalisation_scope={"product": product},
+            failure_regimes=("structural break", "insufficient liquidity"),
+            falsification_tests=("chronological holdout", "cost stress"),
+            negative_controls=REQUIRED_NEGATIVE_CONTROLS,
+            execution_capacity_assumptions={"market_impact_model_required": True},
+            parent_thesis_ids=(),
+            cumulative_trial_budget=12,
+            created_at="2026-01-01T00:00:00+00:00",
+            creator_identity="registered_strategy_catalogue/v1",
+        )
+        for name in available()
+        if name not in {"ml_classifier", "ml_regressor"} and name in manifest
+    }
 
 
 def registered_strategy_source_hash(name: str) -> str:
@@ -43,6 +84,25 @@ def registered_strategy_source_hash(name: str) -> str:
                 module_files[str(path.relative_to(repository))] = hashlib.sha256(
                     path.read_bytes()
                 ).hexdigest()
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+                direct_modules: set[str] = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        direct_modules.update(alias.name for alias in node.names)
+                    elif isinstance(node, ast.ImportFrom) and node.module:
+                        direct_modules.add(node.module)
+                for imported in sorted(direct_modules):
+                    if not (
+                        imported.startswith("src.strategies.indicators")
+                        or imported.startswith("src.features")
+                        or imported.startswith("src.indicators")
+                    ):
+                        continue
+                    dependency = repository.joinpath(*imported.split(".")).with_suffix(".py")
+                    if dependency.is_file():
+                        module_files[str(dependency.relative_to(repository))] = hashlib.sha256(
+                            dependency.read_bytes()
+                        ).hexdigest()
     for directory in (repository / "src" / "indicators", repository / "src" / "features"):
         if directory.is_dir():
             for path in sorted(directory.rglob("*.py")):
@@ -69,7 +129,17 @@ def registered_strategy_source_hash(name: str) -> str:
         "strategy": name,
         "module_files": module_files,
         "default_params": strategy.default_params(),
-        "default_config": strategy.default_config(),
+        "position_model": {"signal_timing": "next_bar", "default": strategy.default_config()},
+        "risk_policy": {
+            "take_profit": strategy.default_config().take_profit,
+            "stop_loss": strategy.default_config().stop_loss,
+            "horizon_bars": strategy.default_config().horizon_bars,
+        },
+        "cost_model": {
+            "fee_bps": strategy.default_config().fee_bps,
+            "slippage_bps": strategy.default_config().slippage_bps,
+            "pnl_unit": strategy.default_config().pnl_unit,
+        },
         "runtime_lock": lock_files,
         "python": sys.version,
         "git_commit": commit,
@@ -81,6 +151,7 @@ def registered_strategy_candidates(
     *,
     product: str,
     dataset_snapshot_hashes: Iterable[str],
+    instrument_universe: Iterable[str] = ("BTCUSDT",),
 ) -> tuple[Candidate, ...]:
     """Create common-contract candidates for every registered strategy.
 
@@ -91,15 +162,19 @@ def registered_strategy_candidates(
     assert_manifest_complete()
     descriptions = describe()
     manifest = manifest_by_name()
+    theses = registered_strategy_theses(
+        product=product, instrument_universe=instrument_universe
+    )
     candidates: list[Candidate] = []
-    names = sorted(set(available()) | set(manifest))
+    # Only executable registry entries enter research. The manifest is
+    # descriptive and cannot manufacture a candidate for missing code.
+    names = [
+        name
+        for name in available()
+        if name not in {"ml_classifier", "ml_regressor"}
+    ]
     for name in names:
-        source_hash = (
-            registered_strategy_source_hash(name)
-            if name in available()
-            else "sha256:"
-            + hashlib.sha256(canonical_manifest_payload(name).encode("utf-8")).hexdigest()
-        )
+        source_hash = registered_strategy_source_hash(name)
         entry = manifest.get(name)
         evidence_type = (
             "btc_allocation"
@@ -128,12 +203,14 @@ def registered_strategy_candidates(
                 "description": descriptions.get(name) or manifest_description(name),
                 "manifest_family": entry.family if entry is not None else "supplemental",
                 "canonical_source_type": manifest_source_type(name),
-                "executable_registry_entry": name in available(),
+                "executable_registry_entry": True,
             },
         )
         candidates.append(
             Candidate(
                 definition=definition,
+                thesis_id=theses[name].thesis_id,
+                lineage_id=canonical_hash({"thesis_id": theses[name].thesis_id, "root": name}),
                 provider="registered_strategy_catalogue",
                 dataset_snapshot_hashes=tuple(dataset_snapshot_hashes),
                 submitted_at=now,

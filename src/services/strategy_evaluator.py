@@ -13,6 +13,7 @@ from src.data.feature_store import SqlFeatureStore
 from src.domain._codec import canonical_hash, timestamp
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
+from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.job_schemas import validate_job_payload
 from src.services.portfolio_service import SqlPortfolioRepository
 from src.services.scheduler import DatabaseJobQueue
@@ -32,6 +33,7 @@ class DatabaseStrategyEvaluator:
         engine_version: str = "strategy-evaluator/v1",
         forecast_fn: Callable[[Mapping[str, float], Mapping[str, Any]], Mapping[str, Any]]
         | None = None,
+        artefact_dispatcher: ArtefactDispatcher | None = None,
         lease_seconds: int = 60,
     ) -> None:
         self.queue = queue
@@ -40,7 +42,7 @@ class DatabaseStrategyEvaluator:
         self.portfolio = portfolio
         self.assignments = assignments
         self.engine_version = engine_version
-        self.forecast_fn = forecast_fn or _diagnostic_forecast
+        self.forecast_fn = forecast_fn or (artefact_dispatcher or ArtefactDispatcher()).evaluate
         self.lease_seconds = lease_seconds
 
     def run_once(self, *, now: str) -> dict[str, Any]:
@@ -55,8 +57,12 @@ class DatabaseStrategyEvaluator:
         try:
             payload = validate_job_payload("strategy_evaluation", claimed.payload)
             product_id = payload["product_id"]
-            assignment = self.assignments.active(product_id)
-            if assignment is None or not assignment["active"]:
+            assignment = self.assignments.by_id(str(payload["assignment_id"]))
+            if (
+                assignment is None
+                or not assignment["active"]
+                or assignment["product_id"] != product_id
+            ):
                 raise ValueError(f"no active strategy assignment for {product_id}")
             if assignment["id"] != payload["assignment_id"]:
                 raise ValueError("strategy assignment changed after feature publication")
@@ -112,6 +118,7 @@ class DatabaseStrategyEvaluator:
                     "artefact_hash": artefact_hash,
                     "engine_version": self.engine_version,
                     "assignment_id": assignment["id"],
+                    "execution_receipt": forecast_values.get("execution_receipt", {}),
                 },
             )
             forecast_id = self.portfolio.save_forecast(forecast)
@@ -164,7 +171,6 @@ class DatabaseStrategyEvaluator:
             "portfolio_job_id": f"portfolio-target:{portfolio_job_id.removeprefix('sha256:')}",
         }
 
-
 def _strict_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     allowed = frozenset(
         {
@@ -189,23 +195,3 @@ def _strict_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(payload["feature_ids"], list | tuple) or not payload["feature_ids"]:
         raise ValueError("strategy evaluation requires feature IDs")
     return dict(payload)
-
-
-def _diagnostic_forecast(
-    features: Mapping[str, float], artefact: Mapping[str, Any]
-) -> Mapping[str, Any]:
-    """Small deterministic evaluator used for paper smoke and health checks."""
-
-    signal = float(features.get("bar_return", 0.0))
-    direction = "long" if signal > 0 else "short" if signal < 0 else "flat"
-    score = min(1.0, abs(signal) * 100.0)
-    maximum_position = 0.1 if score else 0.0
-    return {
-        "direction": direction,
-        "score": score,
-        "expected_return": signal,
-        "confidence": score,
-        "target_volatility": max(abs(signal), 0.0001),
-        "maximum_position": maximum_position,
-        "artefact_identity": artefact.get("artefact_hash"),
-    }

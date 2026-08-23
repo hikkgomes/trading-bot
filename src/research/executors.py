@@ -15,6 +15,7 @@ from typing import Any
 from src.domain._codec import canonical_hash, json_value
 from src.domain.strategies import StrategySourceType
 from src.research.coordinator import Candidate
+from src.strategies.semantic import SEMANTIC_STRATEGIES
 
 
 class ExecutorError(RuntimeError):
@@ -69,39 +70,115 @@ class ProviderExecutorRegistry:
     @classmethod
     def default(cls) -> ProviderExecutorRegistry:
         registry = cls()
-        supported = (
-            StrategySourceType.REGISTERED_PYTHON,
-            StrategySourceType.GENERATED_DSL,
-            StrategySourceType.MACHINE_LEARNING,
-            StrategySourceType.CROSS_SECTIONAL,
-            StrategySourceType.RELATIVE_VALUE,
-            StrategySourceType.MICROSTRUCTURE,
-            StrategySourceType.AGENT_GENERATED_PYTHON,
+        registry.register(StrategySourceType.REGISTERED_PYTHON, execute_registered_python)
+        registry.register(StrategySourceType.GENERATED_DSL, execute_generated_dsl)
+        registry.register(StrategySourceType.PARAMETER_SEARCH, execute_registered_python)
+        registry.register(StrategySourceType.MUTATION, execute_registered_python)
+        registry.register(StrategySourceType.CROSSOVER, execute_registered_python)
+        registry.register(StrategySourceType.MACHINE_LEARNING, execute_machine_learning)
+        registry.register(StrategySourceType.CROSS_SECTIONAL, execute_cross_sectional)
+        registry.register(StrategySourceType.RELATIVE_VALUE, execute_relative_value)
+        registry.register(StrategySourceType.MICROSTRUCTURE, execute_microstructure)
+        registry.register(StrategySourceType.ENSEMBLE, execute_ensemble)
+        registry.register(
+            StrategySourceType.AGENT_GENERATED_PYTHON, execute_agent_generated_python
         )
-        for source_type in supported:
-            registry.register(source_type, _execute_from_canonical_inputs)
         return registry
 
 
-def _execute_from_canonical_inputs(
+def _measured_result(candidate: Candidate, context: Mapping[str, Any], output: Any) -> ExecutionResult:
+    snapshots = tuple(str(item) for item in context.get("dataset_snapshot_ids", ()))
+    if not snapshots:
+        raise ExecutorError("executor requires canonical dataset snapshot identities")
+    output_hash = canonical_hash(output)
+    return ExecutionResult(
+        evidence={"compiled": True, "output_hash": output_hash, "observations": 1},
+        metrics={"observations": 1.0},
+        receipt=execution_receipt(
+            candidate=candidate,
+            dataset_snapshot_ids=snapshots,
+            executor_version="provider-executors/v3",
+        ),
+    )
+
+
+def execute_registered_python(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
+    from src.strategies import library  # noqa: F401
+    from src.strategies.registry import get
+
+    frame = context.get("market_frame")
+    if frame is None:
+        raise ExecutorError("registered Python execution requires a canonical market_frame")
+    name = str(candidate.definition.signal_model.get("registered_strategy") or "")
+    params = candidate.definition.signal_model.get("parameters", {})
+    strategy = get(name)(**dict(params))
+    signals = strategy.generate_signals(frame)
+    return _measured_result(candidate, context, tuple(int(value) for value in signals))
+
+
+def execute_generated_dsl(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
+    rows = context.get("feature_rows")
+    rule = candidate.definition.signal_model.get("rule")
+    if not isinstance(rows, list | tuple) or not isinstance(rule, Mapping):
+        raise ExecutorError("DSL execution requires canonical feature_rows and a typed rule")
+    feature = str(rule.get("feature", ""))
+    operator = str(rule.get("operator", ""))
+    threshold = float(rule.get("threshold"))
+    operations = {
+        "gt": lambda value: value > threshold,
+        "ge": lambda value: value >= threshold,
+        "lt": lambda value: value < threshold,
+        "le": lambda value: value <= threshold,
+    }
+    if operator not in operations:
+        raise ExecutorError("DSL rule operator is unsupported")
+    signals = tuple(1 if operations[operator](float(row[feature])) else 0 for row in rows)
+    return _measured_result(candidate, context, signals)
+
+
+def execute_machine_learning(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
+    model_hash = context.get("model_artefact_hash")
+    manifest_hash = context.get("feature_manifest_hash")
+    if not model_hash or not manifest_hash:
+        raise ExecutorError("machine-learning execution needs a frozen model and feature manifest")
+    model = context.get("frozen_model")
+    features = context.get("feature_vector")
+    if model is None or not callable(getattr(model, "evaluate", None)) or not isinstance(features, Mapping):
+        raise ExecutorError("machine-learning execution needs loaded frozen model inputs")
+    return _measured_result(candidate, context, model.evaluate(features))
+
+
+def execute_cross_sectional(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
+    return _execute_semantic(candidate, context)
+
+
+def execute_relative_value(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
+    return _execute_semantic(candidate, context)
+
+
+def execute_microstructure(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
+    return _execute_semantic(candidate, context)
+
+
+def execute_ensemble(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
+    return _execute_semantic(candidate, context)
+
+
+def execute_agent_generated_python(
     candidate: Candidate, context: Mapping[str, Any]
 ) -> ExecutionResult:
-    """Execute a provider supplied by the research runtime.
+    if not context.get("sandbox_receipt"):
+        raise ExecutorError("agent-generated Python needs a verified sandbox receipt")
+    return execute_registered_python(candidate, context)
 
-    The registry requires an injected callable in production.  Falling back to
-    an error is intentional: no empty run or fabricated metric can satisfy a
-    validation stage.
-    """
 
-    callback = context.get("provider_callable")
-    if not callable(callback):
-        raise ExecutorError(
-            f"{candidate.definition.source_type.value} executor has no canonical data runner"
-        )
-    result = callback(candidate, context)
-    if not isinstance(result, ExecutionResult):
-        raise ExecutorError("provider executor returned an invalid execution result")
-    return result
+def _execute_semantic(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
+    name = str(candidate.definition.signal_model.get("semantic_strategy") or candidate.definition.identity)
+    semantic_input = context.get("semantic_input")
+    if semantic_input is None:
+        raise ExecutorError("semantic execution requires a typed canonical input")
+    output = SEMANTIC_STRATEGIES.get(name).evaluate(semantic_input)
+    return _measured_result(candidate, context, output)
 
 
 def execution_receipt(

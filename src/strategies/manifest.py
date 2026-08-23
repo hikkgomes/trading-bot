@@ -12,121 +12,77 @@ class StrategyManifestEntry:
     evidence_type: str
     execution_contract: str = "forecast_or_target_position"
 
+    @property
+    def catalogue(self) -> str:
+        if self.family == "meta_strategy":
+            return "portfolio_meta"
+        if self.family == "execution":
+            return "execution_policy"
+        return "predictive_alpha"
+
+    @property
+    def input_contract(self) -> str:
+        return {
+            "cross_sectional": "point_in_time_instrument_panel",
+            "relative_value": "linked_instrument_panel",
+            "microstructure": "event_and_order_book_state",
+            "machine_learning": "frozen_model_feature_manifest",
+            "meta_strategy": "alpha_forecast_collection",
+            "execution": "target_delta_and_market_state",
+        }.get(self.family, "single_instrument_time_series")
+
+    @property
+    def output_contract(self) -> str:
+        return {
+            "cross_sectional": "ranked_forecasts_or_portfolio_targets",
+            "relative_value": "hedged_multi_leg_targets",
+            "meta_strategy": "aggregated_forecasts",
+            "execution": "order_intents",
+        }.get(self.family, "alpha_forecast_or_target_position")
+
 
 _FAMILIES = {
     "time_series": (
-        "moving_average_trend",
+        "sma_cross",
         "macd_trend",
         "supertrend",
         "adx_trend",
-        "time_series_momentum",
-        "rate_of_change_momentum",
+        "momentum_roc",
         "donchian_breakout",
         "keltner_breakout",
-        "atr_breakout",
+        "atr_channel_breakout",
         "bollinger_squeeze",
-        "volatility_breakout",
-        "range_breakout",
-        "channel_trading",
-        "regression_channels",
-        "market_structure_breakout",
-        "trend_pullback",
-        "volatility_scaled_trend",
+        "multi_tf_trend",
+        "regression_channel",
+        "swing_structure",
+        "btc_cycle_guard",
     ),
     "mean_reversion": (
         "rsi_reversion",
         "bollinger_reversion",
-        "z_score_reversion",
+        "zscore_reversion",
         "stochastic_reversion",
-        "vwap_reversion",
-        "residual_reversion",
-        "session_reversion",
-        "volatility_conditioned_reversion",
-        "order_flow_exhaustion",
-        "post_liquidation_reversion",
+        "candlestick_reversal",
+        "rsi_divergence",
+        "fear_greed_contrarian",
+        "condition_grid",
+        "regime_filter",
     ),
     "cross_sectional": (
         "relative_momentum",
-        "relative_reversal",
-        "volatility_adjusted_ranking",
-        "liquidity_adjusted_ranking",
         "funding_adjusted_ranking",
-        "btc_beta_neutral_residual_momentum",
-        "sector_neutral_ranking",
-        "long_short_baskets",
-        "risk_parity_basket",
-        "cross_sectional_ml_ranking",
     ),
     "relative_value": (
-        "cointegrated_pairs",
-        "rolling_hedge_ratio_pairs",
-        "pca_residual_baskets",
-        "beta_neutral_spreads",
         "spot_perpetual_basis",
-        "perpetual_funding_carry",
-        "calendar_basis",
-        "cross_symbol_relative_volatility",
-        "index_constituent_residuals",
-        "synthetic_basket_spreads",
+        "beta_neutral_spreads",
     ),
     "microstructure": (
         "bid_ask_depth_imbalance",
         "microprice_displacement",
-        "aggressor_trade_imbalance",
-        "cancel_add_pressure",
-        "spread_compression_expansion",
-        "liquidity_vacuum",
-        "short_horizon_continuation",
-        "short_horizon_reversal",
-        "liquidation_clustering",
-        "mark_price_divergence",
-        "order_book_resilience",
-        "event_time_volatility",
     ),
-    "machine_learning": (
-        "logistic_regression",
-        "elastic_net_classification",
-        "linear_regression",
-        "gradient_boosting",
-        "lightgbm",
-        "random_forest",
-        "calibrated_classifier",
-        "pairwise_ranking",
-        "cross_sectional_ranking_model",
-        "triple_barrier_classifier",
-        "return_regressor",
-        "meta_labelling",
-        "regime_classification",
-        "volatility_prediction",
-        "dynamic_position_sizing",
-        "online_learning",
-        "shallow_sequence_model",
-        "temporal_convolutional_network",
-    ),
-    "meta_strategy": (
-        "regime_routing",
-        "strategy_weighting",
-        "bayesian_model_averaging",
-        "performance_decay_weighting",
-        "correlation_aware_ensemble",
-        "conflict_suppression",
-        "confidence_calibration",
-        "dynamic_sleeve_allocation",
-        "volatility_targeting",
-        "drawdown_based_deallocation",
-    ),
-    "execution": (
-        "market_execution",
-        "passive_limit_execution",
-        "post_only_execution",
-        "time_sliced_execution",
-        "volume_weighted_execution",
-        "spread_aware_order_selection",
-        "depth_aware_sizing",
-        "cancel_replace",
-        "multi_leg_hedge_execution",
-        "emergency_unwind",
-    ),
+    "machine_learning": ("frozen_linear_model",),
+    "meta_strategy": ("correlation_aware_ensemble",),
+    "execution": ("market_execution",),
 }
 
 _EVIDENCE = {
@@ -151,6 +107,18 @@ def strategy_manifest() -> tuple[StrategyManifestEntry, ...]:
     )
 
 
+def predictive_alpha_manifest() -> tuple[StrategyManifestEntry, ...]:
+    return tuple(entry for entry in strategy_manifest() if entry.catalogue == "predictive_alpha")
+
+
+def portfolio_meta_manifest() -> tuple[StrategyManifestEntry, ...]:
+    return tuple(entry for entry in strategy_manifest() if entry.catalogue == "portfolio_meta")
+
+
+def execution_policy_manifest() -> tuple[StrategyManifestEntry, ...]:
+    return tuple(entry for entry in strategy_manifest() if entry.catalogue == "execution_policy")
+
+
 def manifest_by_name() -> dict[str, StrategyManifestEntry]:
     return {entry.name: entry for entry in strategy_manifest()}
 
@@ -162,6 +130,22 @@ def assert_manifest_complete() -> None:
         raise ValueError("strategy manifest contains duplicate names")
     if set(names) != set(REQUIRED_STRATEGY_UNIVERSE):
         raise ValueError("strategy manifest does not cover the declared strategy universe")
+    from src.strategies.frozen_model import FrozenLinearModel
+    from src.strategies.registry import available
+    from src.strategies.semantic import SEMANTIC_STRATEGIES
+
+    ordinary = set(_FAMILIES["time_series"]) | set(_FAMILIES["mean_reversion"])
+    missing_ordinary = ordinary - set(available())
+    if missing_ordinary:
+        raise ValueError(
+            "declared strategies have no concrete implementation: "
+            + ", ".join(sorted(missing_ordinary))
+        )
+    for family in ("cross_sectional", "relative_value", "microstructure", "meta_strategy", "execution"):
+        for name in _FAMILIES[family]:
+            SEMANTIC_STRATEGIES.get(name)
+    if not callable(FrozenLinearModel.load):
+        raise ValueError("frozen machine-learning implementation is absent")
 
 
 def manifest_description(name: str) -> str:

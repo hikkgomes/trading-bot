@@ -61,6 +61,6 @@ jobs:
       - name: PostgreSQL privilege boundary
         run: .venv/bin/python -m pytest tests/test_postgresql_privileges.py -q
       - name: Platform smoke
-        run: make platform-smoke ALLOW_EMPTY=1
+        run: make platform-smoke
       - name: Test
         run: .venv/bin/python -m pytest

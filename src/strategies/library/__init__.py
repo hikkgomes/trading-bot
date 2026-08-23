@@ -31,4 +31,3 @@ from src.strategies.library import (  # noqa: F401,E402,I001
     swing_structure,
     zscore_reversion,
 )
-from src.strategies.library import complete_universe  # noqa: F401,E402

@@ -318,34 +318,21 @@ class DatabaseLiveExecutionWorker:
                 raise ValueError(
                     f"live order is not in the durable pre-submission state: {order.status.value}"
                 )
+            if order.depends_on_order_id is not None:
+                dependency = self.order_manager.get(order.depends_on_order_id)
+                if dependency.status is not OrderStatus.FILLED:
+                    raise ValueError("dependent opening order is blocked until close fill")
+                reconciled = self.positions.get(order.portfolio_id, order.instrument_id)
+                if abs(reconciled.quantity) > 1e-12:
+                    raise ValueError("dependent opening order is blocked until position is flat")
             self.authorise(payload, order)
             product_id = str(payload["product_id"])
             venue = self.venues[product_id]
             if venue.order_manager is not self.order_manager:
                 raise ValueError("live venue must share the durable order manager")
-            previous_position = self.positions.get(order.portfolio_id, order.instrument_id)
             _before_group_submission(self.order_groups, order)
-            fill = venue.submit(order)
-            recorder = ExecutionService(
-                paper_exchange=venue,
-                positions=self.positions,
-                ledger=self.ledgers[product_id],
-                trace_store=self.trace_store,
-            )
-            recorder.record_execution_costs(order, fill, previous_position=previous_position)
+            acknowledgement = venue.submit(order)
             updated = self.order_manager.get(order.order_id)
-            position = self.positions.get(order.portfolio_id, order.instrument_id)
-            self.trace_store.append(
-                _filled_trace(
-                    event_id=str(payload["event_id"]),
-                    order_id=order.order_id,
-                    instrument_id=order.instrument_id,
-                    fill_id=fill.fill_id,
-                    partial=updated.status is OrderStatus.PARTIALLY_FILLED,
-                    position_quantity=position.quantity,
-                )
-            )
-            _after_group_fill(self.order_groups, self.order_manager, updated)
         except Exception as exc:
             uncertain = False
             try:
@@ -402,14 +389,11 @@ class DatabaseLiveExecutionWorker:
             }
         self.queue.complete(claimed, completed_at=now)
         return {
-            "reason_code": (
-                "live_order_partially_filled"
-                if updated.status is OrderStatus.PARTIALLY_FILLED
-                else "live_order_filled"
-            ),
+            "reason_code": "live_order_acknowledged",
             "job_id": claimed.job_id,
             "order_id": order.order_id,
-            "fill_id": fill.fill_id,
+            "exchange_order_id": acknowledgement.exchange_order_id,
+            "client_order_id": acknowledgement.client_order_id,
             "remaining_quantity": updated.remaining_quantity,
         }
 

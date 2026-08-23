@@ -48,10 +48,14 @@ class SandboxRunner:
         self,
         *,
         workspace: Path,
+        repository: Path | None = None,
+        agent_venv: Path | None = None,
         policy: SandboxPolicy = SandboxPolicy(),
         require_network_isolation: bool = True,
     ) -> None:
         self.workspace = workspace.resolve()
+        self.repository = (repository or workspace).resolve()
+        self.agent_venv = (agent_venv or self.repository / ".venv-agent").resolve()
         self.policy = policy
         self.require_network_isolation = require_network_isolation
         self.bwrap = shutil.which("bwrap")
@@ -97,10 +101,12 @@ class SandboxRunner:
         )
 
     def _bubblewrap_command(self, command: list[str]) -> list[str]:
-        """Build a minimal read-only root with a writable private worktree."""
+        """Mount the proposed worktree, baseline source, and exact agent runtime."""
 
-        worktree = self.workspace / ".agent-sandbox-worktree"
-        worktree.mkdir(parents=True, exist_ok=True)
+        interpreter = self.agent_venv / "bin" / "python"
+        if not interpreter.is_file():
+            raise RuntimeError(f"agent Python interpreter is missing: {interpreter}")
+        command[0] = "/venv-agent/bin/python"
         return [
             str(self.bwrap),
             "--die-with-parent",
@@ -116,11 +122,14 @@ class SandboxRunner:
             "/lib",
             "/lib",
             "--ro-bind",
-            str(self.workspace),
+            str(self.repository),
             "/repository",
             "--bind",
-            str(worktree),
+            str(self.workspace),
             "/worktree",
+            "--ro-bind",
+            str(self.agent_venv),
+            "/venv-agent",
             "--tmpfs",
             "/tmp",
             "--proc",
@@ -132,7 +141,7 @@ class SandboxRunner:
             "--clearenv",
             "--setenv",
             "PATH",
-            "/usr/bin:/bin",
+            "/venv-agent/bin:/usr/bin:/bin",
             "--setenv",
             "LANG",
             "C.UTF-8",

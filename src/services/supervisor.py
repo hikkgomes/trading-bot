@@ -26,12 +26,11 @@ from src.execution.order_manager import OrderManager, SqlOrderStore
 from src.execution.position_manager import PositionManager, SqlPositionStore
 from src.execution.recovery import SqlRecoveryStore
 from src.observability.decision_trace import SqlDecisionTraceStore
-from src.portfolio.optimiser import PortfolioConstraints
-from src.products.active_income import ActiveIncomePortfolio
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.research.ml import MlExperimentRunner, ModelArtefactStore, SqlModelArtefactStore
 from src.research.store import SqlResearchStore
-from src.risk.engine import SqlRiskDecisionStore, SqlRiskSnapshotStore
+from src.risk.engine import SqlRiskDecisionStore, SqlRiskPolicyStore, SqlRiskSnapshotStore
+from src.risk.policies import install_product_risk_policies
 from src.services.accounting_service import AccountingService, DatabaseAccountingWorker
 from src.services.agent_worker import DatabaseAgentJobHandlers
 from src.services.config import load_platform_config, load_split_configuration
@@ -52,7 +51,6 @@ from src.services.order_recovery import DatabaseLiveRecoveryWorker
 from src.services.portfolio_engine import (
     DatabasePortfolioTargetBuilder,
     DatabasePortfolioTargetWorker,
-    DatabasePortfolioWorker,
     DatabaseProductCoordinator,
 )
 from src.services.portfolio_service import SqlPortfolioRepository
@@ -126,16 +124,13 @@ def _portfolio_cycle(
     node_id: str,
 ) -> Callable[[], dict[str, Any]]:
     products = _by_id(configuration["products"], collection="products", identity="product_id")
-    portfolios = _by_id(
-        configuration["portfolios"], collection="portfolios", identity="portfolio_id"
-    )
-    active_product = products["active_income"]
-    active_portfolio = portfolios[str(active_product["portfolio_id"])]
     risk = configuration["risk"]
-    instrument_risk = dict(risk["instrument"])
-    sleeve_risk = dict(risk["sleeve"])
-    product_risk = dict(risk["products"][str(active_product["risk_policy_id"])])
-    _, positions, traces = _execution_components(database)
+    install_product_risk_policies(
+        SqlRiskPolicyStore(database.engine),
+        risk_configuration=risk,
+        products=products,
+    )
+    _, positions, _ = _execution_components(database)
     queue = DatabaseJobQueue(database.engine)
     worker_id = f"{node_id}:portfolio-engine"
     capabilities = (
@@ -166,39 +161,8 @@ def _portfolio_cycle(
             },
         ),
     )
-    worker = DatabasePortfolioWorker(
-        queue=queue,
-        worker_id=worker_id,
-        repository=repository,
-        positions=positions,
-        active_income=ActiveIncomePortfolio(
-            PortfolioConstraints(
-                portfolio_id=str(active_portfolio["portfolio_id"]),
-                equity=1.0,
-                max_positions=int(active_portfolio.get("maximum_positions", 12)),
-                max_gross_fraction=float(active_portfolio["maximum_gross"]),
-                max_net_fraction=float(active_portfolio["maximum_net"]),
-                max_symbol_fraction=float(instrument_risk["maximum_fraction"]),
-                max_abs_beta=float(active_portfolio["maximum_beta"]),
-                max_correlation=float(sleeve_risk["maximum_correlation"]),
-                max_margin_fraction=float(active_portfolio["maximum_margin"]),
-                max_turnover_fraction=float(active_portfolio["maximum_turnover"]),
-                max_cluster_fraction=float(sleeve_risk["maximum_fraction"]),
-                max_drawdown_fraction=float(product_risk["maximum_drawdown"]),
-            )
-        ),
-        risk_store=SqlRiskDecisionStore(database.engine),
-        trace_store=traces,
-        execution_modes={
-            product_id: str(product["execution_mode"]) for product_id, product in products.items()
-        },
-    )
-
     def run_once() -> dict[str, Any]:
-        target_result = target_worker.run_once(now=utc_now())
-        if target_result["reason_code"] != "portfolio_target_queue_empty":
-            return target_result
-        return worker.run_once(now=utc_now())
+        return target_worker.run_once(now=utc_now())
 
     return run_once
 

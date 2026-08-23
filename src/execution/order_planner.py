@@ -38,6 +38,7 @@ def _intent(
     decided_at: str,
     order_type: OrderType,
     limit_price: float | None,
+    depends_on_order_id: str | None = None,
 ) -> OrderIntent:
     return OrderIntent(
         order_id=_order_id(
@@ -57,6 +58,7 @@ def _intent(
         limit_price=limit_price,
         created_at=decided_at,
         reduce_only=reduce_only,
+        depends_on_order_id=depends_on_order_id,
         strategy_contributions=target.strategy_contributions,
         metadata={
             "phase": phase,
@@ -139,9 +141,9 @@ def plan_orders(
                 ),
             )
         )
+        reversal_close_id: str | None = None
         for side, quantity, reduce_only, phase in legs:
-            intents.append(
-                _intent(
+            intent = _intent(
                     target=target,
                     side=side,
                     quantity=quantity,
@@ -151,6 +153,11 @@ def plan_orders(
                     decided_at=decided_at,
                     order_type=order_type,
                     limit_price=float(limit_price) if limit_price is not None else None,
+                    depends_on_order_id=(
+                        reversal_close_id if phase == "open_after_reversal" else None
+                    ),
                 )
-            )
+            intents.append(intent)
+            if phase == "close_for_reversal":
+                reversal_close_id = intent.order_id
     return tuple(intents)

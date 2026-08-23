@@ -59,7 +59,7 @@
   "resource_limits": {
     "memory_mb": 8192,
     "heavy_compute_slots": 1,
-    "research_job_memory_mb": 3072,
+    "research_job_memory_mb": 2048,
     "numerical_threads": 2,
     "parquet_scan_rows": 250000,
     "event_replay_window_seconds": 86400,

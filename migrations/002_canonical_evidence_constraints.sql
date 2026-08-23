@@ -1,4 +1,0 @@
--- 002_canonical_evidence_constraints
--- Installs append-only evidence guards and canonical lifecycle constraints.
--- The executable PostgreSQL/SQLite statements live in src.data.migrations so
--- the same migration can be tested without a shell psql dependency.

@@ -106,7 +106,15 @@ class PaperBroker(Broker):
             avg = pos.avg_price  # reduced but same side
 
         self._positions[order.symbol] = Position(symbol=order.symbol, qty=new_qty, avg_price=avg)
-        fill = Fill(symbol=order.symbol, side=order.side, qty=order.qty, price=fill_price, fee=fee)
+        fill = Fill(
+            symbol=order.symbol,
+            side=order.side,
+            qty=order.qty,
+            price=fill_price,
+            fee=fee,
+            exchange_order_id=f"paper-{len(self.fills) + 1}",
+            client_order_id=order.client_id,
+        )
         self.fills.append(fill)
         return fill
 

@@ -14,7 +14,9 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-database_url = os.environ.get("TRADING_PLATFORM_DATABASE_URL", "")
+database_url = os.environ.get("TRADING_PLATFORM_DATABASE_URL", "") or config.get_main_option(
+    "sqlalchemy.url"
+)
 if not database_url:
     raise RuntimeError("TRADING_PLATFORM_DATABASE_URL is required for Alembic")
 config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))

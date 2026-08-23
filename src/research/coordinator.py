@@ -24,12 +24,19 @@ class CandidateState(StrEnum):
 @dataclass(frozen=True)
 class Candidate:
     definition: StrategyDefinition
+    thesis_id: str
+    lineage_id: str
     provider: str
     dataset_snapshot_hashes: tuple[str, ...]
     submitted_at: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        for field_name in ("thesis_id", "lineage_id"):
+            value = non_empty(getattr(self, field_name), field=field_name)
+            if not value.startswith("sha256:") or len(value) != 71:
+                raise ValueError(f"{field_name} must be a SHA-256 identity")
+            object.__setattr__(self, field_name, value)
         object.__setattr__(self, "provider", non_empty(self.provider, field="provider"))
         if not self.dataset_snapshot_hashes or any(
             not isinstance(item, str) or len(item) != 71 or not item.startswith("sha256:")
@@ -46,6 +53,8 @@ class Candidate:
         return canonical_hash(
             {
                 "definition_hash": self.definition.definition_hash,
+                "thesis_id": self.thesis_id,
+                "lineage_id": self.lineage_id,
                 "provider": self.provider,
                 "dataset_snapshot_hashes": self.dataset_snapshot_hashes,
             }
@@ -104,6 +113,9 @@ class ResearchCoordinator:
         if existing is not None and existing != candidate:
             raise ValueError("candidate hash collision")
         if self.store is not None:
+            claim_trial = getattr(self.store, "claim_trial", None)
+            if claim_trial is not None:
+                claim_trial(candidate)
             self.store.save_candidate(candidate)
         self._queue[candidate_id] = candidate
         return candidate_id

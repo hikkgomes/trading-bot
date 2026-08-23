@@ -52,6 +52,7 @@ class OrderIntent:
     created_at: str
     limit_price: float | None = None
     reduce_only: bool = False
+    depends_on_order_id: str | None = None
     group_id: str | None = None
     strategy_contributions: Mapping[str, float] = field(default_factory=dict)
     status: OrderStatus = OrderStatus.CREATED
@@ -94,6 +95,11 @@ class OrderIntent:
         object.__setattr__(self, "fee", finite(self.fee, field="fee", minimum=0.0))
         if self.group_id is not None:
             object.__setattr__(self, "group_id", non_empty(self.group_id, field="group_id"))
+        if self.depends_on_order_id is not None:
+            dependency = non_empty(self.depends_on_order_id, field="depends_on_order_id")
+            if dependency == self.order_id:
+                raise ValueError("an order cannot depend on itself")
+            object.__setattr__(self, "depends_on_order_id", dependency)
         if not isinstance(self.strategy_contributions, Mapping):
             raise ValueError("strategy_contributions must be an object")
         object.__setattr__(

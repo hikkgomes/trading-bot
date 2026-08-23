@@ -13,11 +13,57 @@ from sqlalchemy import insert, select
 from sqlalchemy.engine import Engine
 
 from src.data.database import risk_decision as risk_decision_table
+from src.data.database import risk_policy as risk_policy_table
 from src.data.database import risk_snapshot as risk_snapshot_table
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp, to_primitive
 from src.domain.risk import RiskDecision
 
 REQUIRED_RISK_SCOPES = ("strategy", "instrument", "sleeve", "product", "account", "global")
+
+
+class SqlRiskPolicyStore:
+    """Immutable typed limits resolved by policy identity."""
+
+    def __init__(self, engine: Engine):
+        self.engine = engine
+
+    def save(self, policy_id: str, limits_by_scope: dict) -> str:
+        policy_id = non_empty(policy_id, field="risk_policy_id")
+        payload = json_value(limits_by_scope, field="risk policy")
+        unknown = set(payload) - set(REQUIRED_RISK_SCOPES)
+        if unknown or not payload:
+            raise ValueError("risk policy contains unknown or no scopes")
+        record = {"policy_id": policy_id, "limits": payload}
+        with self.engine.begin() as connection:
+            existing = connection.execute(
+                select(risk_policy_table.c.payload).where(risk_policy_table.c.id == policy_id)
+            ).scalar_one_or_none()
+            if existing is None:
+                connection.execute(
+                    insert(risk_policy_table).values(
+                        id=policy_id,
+                        created_at=dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
+                        payload=record,
+                    )
+                )
+            elif dict(existing) != record:
+                raise ValueError("risk policy records are immutable")
+        return policy_id
+
+    def resolve(self, policy_ids: tuple[str, ...]) -> dict[str, dict]:
+        merged: dict[str, dict] = {}
+        with self.engine.connect() as connection:
+            for policy_id in policy_ids:
+                payload = connection.execute(
+                    select(risk_policy_table.c.payload).where(risk_policy_table.c.id == policy_id)
+                ).scalar_one_or_none()
+                if payload is None:
+                    raise KeyError(f"risk policy does not exist: {policy_id}")
+                for scope, limits in dict(payload)["limits"].items():
+                    if scope in merged:
+                        raise ValueError(f"multiple risk policies define scope {scope}")
+                    merged[scope] = dict(limits)
+        return merged
 
 
 class JsonlRiskDecisionStore:
@@ -145,6 +191,32 @@ class SqlRiskSnapshotStore:
         if not isinstance(payload, dict):
             raise KeyError(f"risk snapshot does not exist: {snapshot_id}")
         return dict(payload)
+
+    def latest(
+        self, *, kind: str, product_id: str, at: str
+    ) -> tuple[str, dict[str, object]]:
+        at = timestamp(at, field="at")
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(
+                    risk_snapshot_table.c.id,
+                    risk_snapshot_table.c.created_at,
+                    risk_snapshot_table.c.payload,
+                )
+                .where(risk_snapshot_table.c.created_at <= at)
+                .order_by(
+                    risk_snapshot_table.c.created_at.desc(), risk_snapshot_table.c.id.desc()
+                )
+            ).mappings()
+            for row in rows:
+                payload = row["payload"]
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("kind") == kind
+                    and payload.get("product_id") == product_id
+                ):
+                    return str(row["id"]), dict(payload)
+        raise KeyError(f"no {kind} snapshot exists for product {product_id} at {at}")
 
 
 @dataclass(frozen=True)

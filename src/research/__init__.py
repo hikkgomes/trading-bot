@@ -15,16 +15,19 @@ from src.research.coordinator import Candidate, ResearchCoordinator, ResearchRes
 from src.research.evaluation import (
     CanonicalResearchEvaluator,
     EvaluationRequest,
+    ProtectedHoldoutWorker,
     StageEvaluation,
 )
 from src.research.providers import provider_candidate
 from src.research.store import SqlResearchStore
+from src.research.theses import ThesisRegistry
 
 __all__ = [
     "Candidate",
     "CanonicalEvidenceError",
     "CanonicalResearchEvaluator",
     "EvaluationRequest",
+    "ProtectedHoldoutWorker",
     "ResearchCoordinator",
     "ResearchResult",
     "SqlResearchStore",
@@ -38,5 +41,6 @@ __all__ = [
     "StageEvaluation",
     "StrategyArtefact",
     "StrategyArtefactStore",
+    "ThesisRegistry",
     "provider_candidate",
 ]

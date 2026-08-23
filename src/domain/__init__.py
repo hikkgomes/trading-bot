@@ -7,7 +7,7 @@ from src.domain.orders import Fill, OrderIntent, OrderStatus
 from src.domain.portfolios import TargetPosition
 from src.domain.positions import Position, PositionStatus
 from src.domain.risk import RiskDecision
-from src.domain.strategies import StrategyDefinition
+from src.domain.strategies import MechanismCategory, ResearchThesis, StrategyDefinition
 
 __all__ = [
     "AlphaForecast",
@@ -17,11 +17,13 @@ __all__ = [
     "MarketEvent",
     "MarketEventType",
     "MarketType",
+    "MechanismCategory",
     "OrderIntent",
     "OrderStatus",
     "Position",
     "PositionStatus",
     "RiskDecision",
+    "ResearchThesis",
     "StrategyDefinition",
     "TargetPosition",
 ]

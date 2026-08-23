@@ -114,7 +114,12 @@ class AgentCodeWorkflow:
                     }
                 },
             )
-            runner = SandboxRunner(workspace=workspace, policy=self.sandbox_policy)
+            runner = SandboxRunner(
+                workspace=workspace,
+                repository=self.repository,
+                agent_venv=self.repository / ".venv-agent",
+                policy=self.sandbox_policy,
+            )
             review = self.reviewer.review(
                 proposal=proposal,
                 workspace=workspace,

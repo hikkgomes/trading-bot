@@ -23,14 +23,14 @@ from src.data.database import CORE_TABLE_NAMES, PlatformDatabase
 from src.data.feature_store import DeterministicFeatureCalculator, FeatureValue, SqlFeatureStore
 from src.data.historical_query import DuckDBHistoricalQuery
 from src.data.universe import InstrumentObservation, SqlUniverseStore, UniverseEligibilityPolicy
-from src.domain._codec import to_primitive
+from src.domain._codec import canonical_hash, to_primitive
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.domain.instruments import Instrument, MarketType
 from src.domain.market_events import MarketEventType
 from src.domain.orders import OrderSide, OrderStatus
 from src.domain.portfolios import TargetPosition
 from src.domain.risk import RiskDecision
-from src.domain.strategies import StrategySourceType
+from src.domain.strategies import MechanismCategory, ResearchThesis, StrategySourceType
 from src.execution.live_exchange import BrokerExecutionVenue
 from src.execution.order_groups import (
     JsonlOrderGroupStore,
@@ -74,11 +74,12 @@ from src.research.backtest.event_engine import (
     SimulatedOrderSide,
     SimulatedOrderStatus,
 )
-from src.research.catalogue import registered_strategy_candidates
+from src.research.catalogue import registered_strategy_candidates, registered_strategy_theses
 from src.research.coordinator import ResearchCoordinator
 from src.research.ml import MlExperimentRunner, ModelArtefactStore, SqlModelArtefactStore
 from src.research.providers import provider_candidate
 from src.research.store import SqlResearchStore
+from src.research.theses import REQUIRED_NEGATIVE_CONTROLS, SqlThesisRegistry
 from src.risk.account import AccountRiskLimits, assess_account_risk
 from src.risk.engine import JsonlRiskDecisionStore, SqlRiskDecisionStore, combine_risk_decisions
 from src.risk.global_risk import GlobalRiskLimits, assess_global_risk
@@ -131,6 +132,28 @@ from src.services.runtime import ServiceRuntime
 from src.services.scheduler import DatabaseJobQueue
 
 NOW = "2026-08-13T12:00:00+00:00"
+
+
+def _test_thesis(*, budget: int = 20) -> ResearchThesis:
+    return ResearchThesis(
+        mechanism_category=MechanismCategory.BEHAVIOURAL,
+        market_rationale="A predeclared test mechanism.",
+        expected_causal_chain=("state", "signal", "return"),
+        expected_direction="declared signal direction",
+        expected_horizon="one day",
+        required_data=("closed bars",),
+        permitted_features=("returns",),
+        instrument_universe=(BTC,),
+        generalisation_scope={"product": "active_income"},
+        failure_regimes=("structural break",),
+        falsification_tests=("chronological holdout",),
+        negative_controls=REQUIRED_NEGATIVE_CONTROLS,
+        execution_capacity_assumptions={"maximum_participation": 0.01},
+        parent_thesis_ids=(),
+        cumulative_trial_budget=budget,
+        created_at=NOW,
+        creator_identity="test-suite",
+    )
 LATER = "2026-08-13T13:00:00+00:00"
 BTC = "binance:futures:BTCUSDT:USDT"
 ETH = "binance:futures:ETHUSDT:USDT"
@@ -635,7 +658,7 @@ def test_registered_catalogue_enters_the_common_research_contract():
         product="active_income", dataset_snapshot_hashes=("sha256:" + "a" * 64,)
     )
 
-    assert len(candidates) >= 24
+    assert len(candidates) >= 22
     assert {candidate.provider for candidate in candidates} == {"registered_strategy_catalogue"}
     assert all(
         candidate.definition.source_type.value == "registered_python" for candidate in candidates
@@ -647,6 +670,8 @@ def test_all_strategy_sources_share_one_persistent_research_queue(tmp_path: Path
     database.create_schema()
     store = SqlResearchStore(database.engine)
     coordinator = ResearchCoordinator(store)
+    thesis = _test_thesis()
+    SqlThesisRegistry(database.engine).register(thesis)
     dataset_hashes = ("sha256:" + "a" * 64,)
     source_types = (
         StrategySourceType.PARAMETER_SEARCH,
@@ -666,6 +691,8 @@ def test_all_strategy_sources_share_one_persistent_research_queue(tmp_path: Path
             version="v1",
             family=source_type.value,
             product="active_income",
+            thesis_id=thesis.thesis_id,
+            lineage_id=canonical_hash({"source": source_type.value}),
             provider=f"provider-{source_type.value}",
             source_type=source_type,
             source_payload={"kind": source_type.value},
@@ -674,9 +701,17 @@ def test_all_strategy_sources_share_one_persistent_research_queue(tmp_path: Path
         )
         for source_type in source_types
     ]
+    catalogue_theses = registered_strategy_theses(
+        product="active_income", instrument_universe=(BTC,)
+    )
+    registry = SqlThesisRegistry(database.engine)
+    for catalogue_thesis in catalogue_theses.values():
+        registry.register(catalogue_thesis)
     candidates.append(
         registered_strategy_candidates(
-            product="active_income", dataset_snapshot_hashes=dataset_hashes
+            product="active_income",
+            dataset_snapshot_hashes=dataset_hashes,
+            instrument_universe=(BTC,),
         )[0]
     )
 
@@ -752,11 +787,15 @@ def test_protected_results_persist_but_never_enter_adaptive_feedback(tmp_path: P
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'platform.sqlite3'}")
     database.create_schema()
     coordinator = ResearchCoordinator(SqlResearchStore(database.engine))
+    thesis = _test_thesis()
+    SqlThesisRegistry(database.engine).register(thesis)
     candidate = provider_candidate(
         identity="protected-candidate",
         version="v1",
         family="generated",
         product="active_income",
+        thesis_id=thesis.thesis_id,
+        lineage_id=canonical_hash({"lineage": "protected"}),
         provider="generated",
         source_type=StrategySourceType.GENERATED_DSL,
         source_payload={"rule": "close > open"},
@@ -781,11 +820,14 @@ def test_protected_results_persist_but_never_enter_adaptive_feedback(tmp_path: P
 
 
 def test_strategy_artefact_is_reproducible_and_content_addressed(tmp_path: Path):
+    thesis = _test_thesis()
     candidate = provider_candidate(
         identity="artifact-candidate",
         version="v1",
         family="ml",
         product="active_income",
+        thesis_id=thesis.thesis_id,
+        lineage_id=canonical_hash({"lineage": "artifact"}),
         provider="ml",
         source_type=StrategySourceType.MACHINE_LEARNING,
         source_payload={"model": "lightgbm"},
@@ -1577,11 +1619,11 @@ def test_paper_and_broker_venues_use_the_same_durable_order_contract(tmp_path: P
         instruments={instrument.instrument_id: instrument},
     )
 
-    fill = venue.submit(intent)
+    acknowledgement = venue.submit(intent)
 
-    assert fill.order_id == intent.order_id
-    assert manager.get(intent.order_id).status is OrderStatus.FILLED
-    assert positions.get("active_income", instrument.instrument_id).quantity == pytest.approx(0.01)
+    assert acknowledgement.order_id == intent.order_id
+    assert manager.get(intent.order_id).status is OrderStatus.ACKNOWLEDGED
+    assert positions.get("active_income", instrument.instrument_id).quantity == 0
 
 
 def test_live_queue_uses_a_mandatory_authoriser_and_the_canonical_broker_contract(
@@ -1684,9 +1726,9 @@ def test_live_queue_uses_a_mandatory_authoriser_and_the_canonical_broker_contrac
     submitted = submitter.run_once(now=NOW)
 
     assert planned["reason_code"] == "live_orders_enqueued"
-    assert submitted["reason_code"] == "live_order_filled"
+    assert submitted["reason_code"] == "live_order_acknowledged"
     assert authorised == [submitted["order_id"]]
-    assert positions.get("active_income", BTC).quantity == pytest.approx(0.01)
+    assert positions.get("active_income", BTC).quantity == 0
 
 
 def test_database_product_supervisor_executes_dynamic_multi_symbol_forecasts(tmp_path: Path):

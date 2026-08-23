@@ -362,6 +362,24 @@ class OrderManager:
     def acknowledged(self, order_id: str, *, event_at: str | None = None) -> OrderIntent:
         return self.transition(order_id, OrderStatus.ACKNOWLEDGED, event_at=event_at)
 
+    def bind_exchange_acknowledgement(
+        self, order_id: str, *, exchange_order_id: str, client_order_id: str
+    ) -> OrderIntent:
+        current = self.get(order_id)
+        if current.status is not OrderStatus.SUBMITTED:
+            raise ValueError("exchange acknowledgement requires a submitted order")
+        if current.metadata.get("client_order_id") != client_order_id:
+            raise ValueError("exchange acknowledgement client order ID mismatch")
+        return self.transition(
+            order_id,
+            OrderStatus.ACKNOWLEDGED,
+            metadata={
+                **dict(current.metadata),
+                "client_order_id": client_order_id,
+                "exchange_order_id": str(exchange_order_id),
+            },
+        )
+
     def apply_fill(self, fill: Fill) -> OrderIntent:
         current = self.get(fill.order_id)
         existing = next(

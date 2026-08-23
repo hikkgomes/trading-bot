@@ -4,4 +4,6 @@ Description=Trading platform critical runtime services
 [Slice]
 CPUWeight=1000
 IOWeight=1000
+MemoryHigh=2560M
+MemoryMax=3G
 TasksMax=256

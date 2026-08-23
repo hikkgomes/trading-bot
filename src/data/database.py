@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import datetime as dt
+
 from sqlalchemy import (
     JSON,
     Boolean,
     CheckConstraint,
     Column,
+    DateTime,
     ForeignKey,
     Index,
     Integer,
@@ -19,6 +22,32 @@ from sqlalchemy import (
     create_engine,
 )
 from sqlalchemy.engine import Engine
+from sqlalchemy.types import TypeDecorator
+
+
+class UtcTimestamp(TypeDecorator[str]):
+    """TIMESTAMPTZ storage with the canonical ISO-string application contract."""
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value: str | dt.datetime | None, dialect):
+        if value is None or isinstance(value, dt.datetime):
+            parsed = value
+        else:
+            parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed is not None and parsed.tzinfo is None:
+            raise ValueError("database timestamps must include a timezone")
+        return parsed
+
+    def process_result_value(self, value: dt.datetime | str | None, dialect) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=dt.UTC)
+        return value.astimezone(dt.UTC).replace(microsecond=0).isoformat()
 
 metadata = MetaData()
 
@@ -27,7 +56,7 @@ schema_migration = Table(
     "schema_migration",
     metadata,
     Column("version", String(80), primary_key=True),
-    Column("applied_at", String(40), nullable=False),
+    Column("applied_at", UtcTimestamp(), nullable=False),
     Column("content_hash", String(80), nullable=False, unique=True),
     Column("revision_hash", String(80), nullable=False),
 )
@@ -38,7 +67,7 @@ def _id_payload_table(name: str) -> Table:
         name,
         metadata,
         Column("id", String(160), primary_key=True),
-        Column("created_at", String(40), nullable=False),
+        Column("created_at", UtcTimestamp(), nullable=False),
         Column("payload", JSON, nullable=False, default=dict),
     )
 
@@ -60,7 +89,7 @@ instrument_status = Table(
     metadata,
     Column("id", String(160), primary_key=True),
     Column("instrument_id", ForeignKey("instrument.id"), nullable=False, index=True),
-    Column("observed_at", String(40), nullable=False, index=True),
+    Column("observed_at", UtcTimestamp(), nullable=False, index=True),
     Column("status", String(40), nullable=False),
     Column("payload", JSON, nullable=False),
 )
@@ -70,7 +99,7 @@ universe_snapshot = Table(
     metadata,
     Column("id", String(160), primary_key=True),
     Column("universe_id", ForeignKey("universe.id"), nullable=False, index=True),
-    Column("observed_at", String(40), nullable=False, index=True),
+    Column("observed_at", UtcTimestamp(), nullable=False, index=True),
     Column("content_hash", String(80), nullable=False, unique=True),
     Column("payload", JSON, nullable=False),
 )
@@ -104,7 +133,7 @@ strategy_version = Table(
     Column("id", String(160), primary_key=True),
     Column("definition_id", ForeignKey("strategy_definition.id"), nullable=False, index=True),
     Column("version", String(80), nullable=False),
-    Column("created_at", String(40), nullable=False),
+    Column("created_at", UtcTimestamp(), nullable=False),
     Column("payload", JSON, nullable=False),
 )
 strategy_identity = Table(
@@ -117,10 +146,32 @@ strategy_identity = Table(
     Column("metadata", JSON, nullable=False),
     Column("parent_hashes", JSON, nullable=False),
     Column("is_duplicate", Boolean, nullable=False),
-    Column("created_at", String(40), nullable=False),
+    Column("created_at", UtcTimestamp(), nullable=False),
     CheckConstraint("is_duplicate IS NOT NULL", name="ck_strategy_identity_duplicate"),
 )
 strategy_lineage = _id_payload_table("strategy_lineage")
+research_thesis = Table(
+    "research_thesis",
+    metadata,
+    Column("id", String(80), primary_key=True),
+    Column("created_at", UtcTimestamp(), nullable=False, index=True),
+    Column("creator_identity", String(160), nullable=False),
+    Column("cumulative_trial_budget", Integer, nullable=False),
+    Column("payload", JSON, nullable=False),
+    CheckConstraint("cumulative_trial_budget > 0", name="ck_thesis_trial_budget_positive"),
+)
+thesis_trial = Table(
+    "thesis_trial",
+    metadata,
+    Column("id", String(80), primary_key=True),
+    Column("thesis_id", ForeignKey("research_thesis.id"), nullable=False, index=True),
+    Column("candidate_id", String(80), nullable=False, unique=True, index=True),
+    Column("lineage_id", String(80), nullable=False, index=True),
+    Column("ordinal", Integer, nullable=False),
+    Column("claimed_at", UtcTimestamp(), nullable=False),
+    UniqueConstraint("thesis_id", "ordinal", name="uq_thesis_trial_ordinal"),
+    CheckConstraint("ordinal > 0", name="ck_thesis_trial_ordinal_positive"),
+)
 experiment = Table(
     "experiment",
     metadata,
@@ -128,7 +179,7 @@ experiment = Table(
     Column("strategy_version_id", ForeignKey("strategy_version.id"), nullable=False, index=True),
     Column("provider", String(120), nullable=False, index=True),
     Column("state", String(80), nullable=False, index=True),
-    Column("submitted_at", String(40), nullable=False),
+    Column("submitted_at", UtcTimestamp(), nullable=False),
     Column("dataset_snapshot_hashes", JSON, nullable=False),
     Column("metadata", JSON, nullable=False),
 )
@@ -156,7 +207,7 @@ validation_stage = Table(
     Column("experiment_id", ForeignKey("experiment.id"), nullable=False, index=True),
     Column("stage", String(80), nullable=False, index=True),
     Column("source_run_id", ForeignKey("experiment_run.id"), nullable=False, index=True),
-    Column("evaluated_at", String(40), nullable=False, index=True),
+    Column("evaluated_at", UtcTimestamp(), nullable=False, index=True),
     Column("state", String(40), nullable=False),
     Column("accepted", Boolean, nullable=False),
     Column("reason_code", String(160)),
@@ -174,7 +225,7 @@ holdout_outcome = Table(
     metadata,
     Column("id", String(200), primary_key=True),
     Column("holdout_claim_id", ForeignKey("holdout_claim.id"), nullable=False, index=True),
-    Column("evaluated_at", String(40), nullable=False, index=True),
+    Column("evaluated_at", UtcTimestamp(), nullable=False, index=True),
     Column("accepted", Boolean, nullable=False),
     Column("outcome_hash", String(80), nullable=False, unique=True),
     Column("payload", JSON, nullable=False),
@@ -187,7 +238,7 @@ forward_paper_observation = Table(
     Column("strategy_version_id", ForeignKey("strategy_version.id"), nullable=False, index=True),
     Column("product_id", String(80), nullable=False, index=True),
     Column("instrument_id", String(200), nullable=False, index=True),
-    Column("observed_at", String(40), nullable=False, index=True),
+    Column("observed_at", UtcTimestamp(), nullable=False, index=True),
     Column("artefact_hash", String(80), nullable=False),
     Column("observation_hash", String(80), nullable=False, unique=True),
     Column("payload", JSON, nullable=False),
@@ -205,7 +256,7 @@ strategy_approval = Table(
     Column("engine_version", String(160), nullable=False),
     Column("capital_cap", Numeric(24, 12), nullable=False),
     Column("approved_by", String(160), nullable=False),
-    Column("approved_at", String(40), nullable=False, index=True),
+    Column("approved_at", UtcTimestamp(), nullable=False, index=True),
     Column("status", String(40), nullable=False, index=True),
     Column("payload", JSON, nullable=False),
     CheckConstraint("capital_cap >= 0", name="ck_strategy_approval_capital_nonnegative"),
@@ -234,7 +285,7 @@ production_preflight = Table(
     Column("source_commit_hash", String(80), nullable=False),
     Column("engine_version", String(160), nullable=False),
     Column("capital_cap", Numeric(24, 12), nullable=False),
-    Column("checked_at", String(40), nullable=False, index=True),
+    Column("checked_at", UtcTimestamp(), nullable=False, index=True),
     Column("content_hash", String(80), nullable=False, unique=True),
     Column("accepted", Boolean, nullable=False),
     Column("payload", JSON, nullable=False),
@@ -247,17 +298,30 @@ active_strategy_assignment = Table(
     Column("id", String(200), primary_key=True),
     Column("product_id", String(80), nullable=False, index=True),
     Column("portfolio_id", String(160), nullable=False, index=True),
+    Column("sleeve_id", String(160), nullable=False, default="default", index=True),
     Column("strategy_version_id", ForeignKey("strategy_version.id"), nullable=False, index=True),
+    Column("instrument_id", String(160), index=True),
+    Column("universe_id", String(160), index=True),
+    Column("assignment_scope_id", String(180), nullable=False, index=True),
     Column("artefact_hash", String(80), nullable=False),
     Column("lifecycle_state", String(80), nullable=False),
     Column("execution_mode", String(40), nullable=False),
     Column("capital_limit", Numeric(24, 12), nullable=False),
-    Column("assigned_at", String(40), nullable=False, index=True),
+    Column("risk_budget", Numeric(24, 12), nullable=False, default=0),
+    Column("assigned_at", UtcTimestamp(), nullable=False, index=True),
+    Column("active_until", UtcTimestamp(), index=True),
     Column("assigned_by", String(160), nullable=False),
+    Column("assignment_reason", Text, nullable=False, default="unspecified"),
     Column("active", Boolean, nullable=False),
     Column("payload", JSON, nullable=False),
     CheckConstraint("execution_mode IN ('paper', 'live')", name="ck_assignment_execution_mode"),
     CheckConstraint("capital_limit >= 0", name="ck_assignment_capital_nonnegative"),
+    CheckConstraint("risk_budget >= 0", name="ck_assignment_risk_nonnegative"),
+    CheckConstraint(
+        "(instrument_id IS NOT NULL AND universe_id IS NULL) OR "
+        "(instrument_id IS NULL AND universe_id IS NOT NULL)",
+        name="ck_assignment_instrument_xor_universe",
+    ),
     CheckConstraint(
         "lifecycle_state IN "
         "('registered', 'development', 'forward_paper', 'live_canary', 'live', 'suspended', 'retired')",
@@ -265,11 +329,14 @@ active_strategy_assignment = Table(
     ),
 )
 Index(
-    "uq_active_strategy_assignment_product_active",
+    "ix_active_strategy_assignment_authority_event",
     active_strategy_assignment.c.product_id,
-    unique=True,
-    postgresql_where=active_strategy_assignment.c.active.is_(True),
-    sqlite_where=active_strategy_assignment.c.active.is_(True),
+    active_strategy_assignment.c.portfolio_id,
+    active_strategy_assignment.c.sleeve_id,
+    active_strategy_assignment.c.strategy_version_id,
+    active_strategy_assignment.c.assignment_scope_id,
+    active_strategy_assignment.c.execution_mode,
+    unique=False,
 )
 
 import_provenance = Table(
@@ -279,7 +346,7 @@ import_provenance = Table(
     Column("source_path", Text, nullable=False),
     Column("source_hash", String(80), nullable=False, unique=True),
     Column("destination_hash", String(80), nullable=False),
-    Column("imported_at", String(40), nullable=False),
+    Column("imported_at", UtcTimestamp(), nullable=False),
     Column("archived_path", Text),
     Column("payload", JSON, nullable=False),
 )
@@ -296,12 +363,13 @@ portfolio_strategy = _id_payload_table("portfolio_strategy")
 alpha_forecast = _id_payload_table("alpha_forecast")
 target_position = _id_payload_table("target_position")
 risk_snapshot = _id_payload_table("risk_snapshot")
+risk_policy = _id_payload_table("risk_policy")
 risk_decision = Table(
     "risk_decision",
     metadata,
     Column("id", String(160), primary_key=True),
     Column("scope", String(80), nullable=False, index=True),
-    Column("evaluated_at", String(40), nullable=False, index=True),
+    Column("evaluated_at", UtcTimestamp(), nullable=False, index=True),
     Column("accepted", Boolean, nullable=False),
     Column("reason_code", String(160)),
     Column("payload", JSON, nullable=False),
@@ -316,7 +384,7 @@ exchange_order = Table(
     Column("id", String(240), primary_key=True),
     Column("order_id", ForeignKey("order_intent.id"), nullable=False, index=True),
     Column("sequence", Integer, nullable=False),
-    Column("created_at", String(40), nullable=False, index=True),
+    Column("created_at", UtcTimestamp(), nullable=False, index=True),
     Column("status", String(80), nullable=False, index=True),
     Column("payload", JSON, nullable=False),
     UniqueConstraint("order_id", "sequence", name="uq_exchange_order_sequence"),
@@ -327,7 +395,7 @@ order_group = Table(
     Column("id", String(240), primary_key=True),
     Column("group_id", String(160), nullable=False, index=True),
     Column("sequence", Integer, nullable=False),
-    Column("created_at", String(40), nullable=False, index=True),
+    Column("created_at", UtcTimestamp(), nullable=False, index=True),
     Column("status", String(80), nullable=False, index=True),
     Column("payload", JSON, nullable=False),
     UniqueConstraint("group_id", "sequence", name="uq_order_group_sequence"),
@@ -338,7 +406,7 @@ protective_stop = Table(
     Column("id", String(240), primary_key=True),
     Column("stop_id", String(160), nullable=False, index=True),
     Column("sequence", Integer, nullable=False),
-    Column("created_at", String(40), nullable=False, index=True),
+    Column("created_at", UtcTimestamp(), nullable=False, index=True),
     Column("status", String(80), nullable=False, index=True),
     Column("payload", JSON, nullable=False),
     UniqueConstraint("stop_id", "sequence", name="uq_protective_stop_sequence"),
@@ -348,7 +416,7 @@ fill = Table(
     metadata,
     Column("id", String(240), primary_key=True),
     Column("order_id", ForeignKey("order_intent.id"), nullable=False, index=True),
-    Column("created_at", String(40), nullable=False, index=True),
+    Column("created_at", UtcTimestamp(), nullable=False, index=True),
     Column("payload", JSON, nullable=False),
 )
 position = _id_payload_table("position")
@@ -362,7 +430,7 @@ accounting_entry = Table(
     Column("id", String(200), primary_key=True),
     Column("product_id", String(80), nullable=False, index=True),
     Column("sequence", Integer, nullable=False),
-    Column("created_at", String(40), nullable=False, index=True),
+    Column("created_at", UtcTimestamp(), nullable=False, index=True),
     Column("entry_hash", String(80), nullable=False, unique=True),
     Column("payload", JSON, nullable=False),
     UniqueConstraint("product_id", "sequence", name="uq_accounting_entry_sequence"),
@@ -378,9 +446,9 @@ job = Table(
     Column("name", String(160), nullable=False, index=True),
     Column("state", String(40), nullable=False, index=True),
     Column("priority", Integer, nullable=False, default=0),
-    Column("available_at", String(40), nullable=False, index=True),
+    Column("available_at", UtcTimestamp(), nullable=False, index=True),
     Column("lease_owner", String(160), index=True),
-    Column("lease_expires_at", String(40), index=True),
+    Column("lease_expires_at", UtcTimestamp(), index=True),
     Column("attempts", Integer, nullable=False, default=0),
     Column("producer_identity", String(200), nullable=False, default="platform"),
     Column("content_hash", String(80), nullable=False),
@@ -392,8 +460,8 @@ job_attempt = Table(
     Column("id", String(200), primary_key=True),
     Column("job_id", ForeignKey("job.id"), nullable=False, index=True),
     Column("worker_id", String(160), nullable=False, index=True),
-    Column("started_at", String(40), nullable=False),
-    Column("completed_at", String(40)),
+    Column("started_at", UtcTimestamp(), nullable=False),
+    Column("completed_at", UtcTimestamp()),
     Column("status", String(40), nullable=False),
     Column("error", Text),
     Column("payload", JSON, nullable=False),
@@ -404,7 +472,7 @@ worker = Table(
     Column("id", String(160), primary_key=True),
     Column("node_id", String(160), nullable=False, index=True),
     Column("role", String(120), nullable=False, index=True),
-    Column("last_heartbeat", String(40), nullable=False),
+    Column("last_heartbeat", UtcTimestamp(), nullable=False),
     Column("status", String(40), nullable=False),
     Column("capabilities", JSON, nullable=False),
     Column("payload", JSON, nullable=False),
@@ -415,7 +483,7 @@ worker_lease = Table(
     Column("id", String(200), primary_key=True),
     Column("job_id", ForeignKey("job.id"), nullable=False, index=True),
     Column("worker_id", ForeignKey("worker.id"), nullable=False, index=True),
-    Column("expires_at", String(40), nullable=False, index=True),
+    Column("expires_at", UtcTimestamp(), nullable=False, index=True),
     Column("status", String(40), nullable=False),
     Column("payload", JSON, nullable=False),
 )
@@ -425,8 +493,8 @@ heavy_compute_lease = Table(
     Column("slot_id", String(80), primary_key=True),
     Column("owner", String(160)),
     Column("job_id", ForeignKey("job.id")),
-    Column("acquired_at", String(40)),
-    Column("expires_at", String(40), index=True),
+    Column("acquired_at", UtcTimestamp()),
+    Column("expires_at", UtcTimestamp(), index=True),
     Column("status", String(40), nullable=False),
 )
 service_heartbeat = Table(
@@ -435,7 +503,7 @@ service_heartbeat = Table(
     Column("id", String(160), primary_key=True),
     Column("service_name", String(160), nullable=False, index=True),
     Column("node_id", String(160), nullable=False, index=True),
-    Column("observed_at", String(40), nullable=False, index=True),
+    Column("observed_at", UtcTimestamp(), nullable=False, index=True),
     Column("healthy", Boolean, nullable=False),
     Column("payload", JSON, nullable=False),
 )
@@ -449,7 +517,7 @@ decision_trace = Table(
     Column("id", String(200), primary_key=True),
     Column("event_id", String(240), nullable=False, index=True),
     Column("instrument_id", String(200), nullable=False, index=True),
-    Column("evaluated_at", String(40), nullable=False, index=True),
+    Column("evaluated_at", UtcTimestamp(), nullable=False, index=True),
     Column("first_blocked_stage", String(120), index=True),
     Column("payload", JSON, nullable=False),
 )
@@ -483,22 +551,72 @@ class PlatformDatabase:
         metadata.create_all(self.engine)
 
     def migrate(self, *, target: str | None = None) -> tuple[str, ...]:
-        """Apply versioned migrations and return the versions applied.
+        """Apply Alembic in production; initialise isolated SQLite tests locally."""
 
-        The import is local to avoid a module cycle because the migration
-        definitions use the tables declared above.
-        """
+        if not self.is_postgresql:
+            import datetime as dt
+            import hashlib
+            from pathlib import Path
 
-        from src.data.migrations import apply_migrations
+            from sqlalchemy import insert, select
 
-        return apply_migrations(self.engine, target=target)
+            metadata.create_all(self.engine)
+            revisions = (
+                "001_platform_v2_baseline.py",
+                "002_platform_v2_authority.py",
+                "003_platform_expansion_authority.py",
+                "004_research_thesis_authority.py",
+            )
+            applied: list[str] = []
+            with self.engine.begin() as connection:
+                for filename in revisions:
+                    revision = filename.split("_", 1)[0]
+                    if target is not None and target not in {revision, filename}:
+                        continue
+                    exists = connection.execute(
+                        select(schema_migration.c.version).where(
+                            schema_migration.c.version == revision
+                        )
+                    ).first()
+                    if exists:
+                        continue
+                    path = Path(__file__).resolve().parents[2] / "alembic" / "versions" / filename
+                    digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+                    connection.execute(
+                        insert(schema_migration).values(
+                            version=revision,
+                            applied_at=dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
+                            content_hash=digest,
+                            revision_hash=digest,
+                        )
+                    )
+                    applied.append(revision)
+            return tuple(applied)
+
+        from pathlib import Path
+
+        from alembic import command
+        from alembic.config import Config
+
+        config = Config(str(Path(__file__).resolve().parents[2] / "alembic.ini"))
+        config.set_main_option("sqlalchemy.url", self.url.replace("%", "%%"))
+        command.upgrade(config, target or "head")
+        return (target or "head",)
 
     def assert_migrated(self) -> None:
         """Fail closed when a production database has not run migrations."""
 
-        from src.data.migrations import assert_migrated
+        from sqlalchemy import inspect, text
 
-        assert_migrated(self.engine)
+        tables = set(inspect(self.engine).get_table_names())
+        missing = sorted(CORE_TABLE_NAMES - tables)
+        if missing:
+            raise RuntimeError(f"database migrations are incomplete; missing tables: {missing}")
+        if self.is_postgresql:
+            with self.engine.connect() as connection:
+                revision = connection.execute(text("SELECT version_num FROM alembic_version"))
+                if revision.scalar_one_or_none() != "platform_v2_0004":
+                    raise RuntimeError("database is not at the current Alembic revision")
 
     def dispose(self) -> None:
         self.engine.dispose()

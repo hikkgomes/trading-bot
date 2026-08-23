@@ -16,6 +16,8 @@ def provider_candidate(
     version: str,
     family: str,
     product: str,
+    thesis_id: str,
+    lineage_id: str,
     provider: str,
     source_type: StrategySourceType,
     source_payload: Mapping[str, Any],
@@ -49,6 +51,8 @@ def provider_candidate(
     )
     return Candidate(
         definition=definition,
+        thesis_id=thesis_id,
+        lineage_id=lineage_id,
         provider=provider,
         dataset_snapshot_hashes=dataset_snapshot_hashes,
         submitted_at=submitted_at,

@@ -7,7 +7,7 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import insert, select, text
 from sqlalchemy.engine import Engine
 
 from src.data.database import (
@@ -26,7 +26,7 @@ from src.data.database import (
     strategy_version,
     validation_stage,
 )
-from src.domain._codec import canonical_hash, json_value, timestamp
+from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 
 
 class CanonicalEvidenceError(RuntimeError):
@@ -760,6 +760,12 @@ class SqlActiveStrategyAssignmentRepository:
         capital_limit: float,
         assigned_at: str,
         assigned_by: str,
+        sleeve_id: str = "default",
+        instrument_id: str | None = None,
+        universe_id: str | None = None,
+        risk_budget: float = 0.0,
+        active_until: str | None = None,
+        assignment_reason: str = "unspecified",
         payload: Mapping[str, Any] | None = None,
     ) -> str:
         if execution_mode not in {"paper", "live"}:
@@ -775,11 +781,20 @@ class SqlActiveStrategyAssignmentRepository:
         }:
             raise CanonicalEvidenceError("active assignment lifecycle state is not supported")
         capital_limit = _finite_nonnegative(capital_limit, field="assignment capital limit")
+        risk_budget = _finite_nonnegative(risk_budget, field="assignment risk budget")
         product_id = str(product_id).strip()
         portfolio_id = str(portfolio_id).strip()
         strategy_version_id = str(strategy_version_id).strip()
-        if not product_id or not portfolio_id or not strategy_version_id:
+        sleeve_id = str(sleeve_id).strip()
+        if not product_id or not portfolio_id or not strategy_version_id or not sleeve_id:
             raise CanonicalEvidenceError("active assignment binding fields cannot be empty")
+        if instrument_id is None and universe_id is None:
+            instrument_id = str((payload or {}).get("instrument_id") or "").strip() or None
+            universe_id = str((payload or {}).get("universe_id") or "").strip() or None
+        if instrument_id is None and universe_id is None:
+            universe_id = f"product:{product_id}"
+        if (instrument_id is None) == (universe_id is None):
+            raise CanonicalEvidenceError("assignment needs exactly one instrument_id or universe_id")
         artefact_hash = _identity(artefact_hash, field="artefact_hash")
         if not isinstance(assigned_by, str) or not assigned_by.strip():
             raise CanonicalEvidenceError("active assignment actor must be non-empty")
@@ -787,13 +802,24 @@ class SqlActiveStrategyAssignmentRepository:
         record = {
             "product_id": product_id,
             "portfolio_id": portfolio_id,
+            "sleeve_id": sleeve_id,
             "strategy_version_id": strategy_version_id,
+            "instrument_id": instrument_id,
+            "universe_id": universe_id,
+            "assignment_scope_id": (
+                f"instrument:{instrument_id}" if instrument_id else f"universe:{universe_id}"
+            ),
             "artefact_hash": artefact_hash,
             "lifecycle_state": lifecycle_state,
             "execution_mode": execution_mode,
             "capital_limit": capital_limit,
+            "risk_budget": risk_budget,
             "assigned_at": assigned_at,
+            "active_until": (
+                timestamp(active_until, field="active_until") if active_until is not None else None
+            ),
             "assigned_by": assigned_by,
+            "assignment_reason": non_empty(assignment_reason, field="assignment_reason"),
             "active": True,
             "payload": _object(payload or {}, field="assignment payload"),
         }
@@ -802,7 +828,12 @@ class SqlActiveStrategyAssignmentRepository:
             if connection.dialect.name == "postgresql":
                 connection.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext(:assignment_key))"),
-                    {"assignment_key": f"active-assignment:{product_id}"},
+                    {
+                        "assignment_key": (
+                            f"active-assignment:{product_id}:{portfolio_id}:{sleeve_id}:"
+                            f"{strategy_version_id}:{instrument_id or universe_id}:{execution_mode}"
+                        )
+                    },
                 )
             if (
                 connection.execute(
@@ -857,25 +888,20 @@ class SqlActiveStrategyAssignmentRepository:
                     raise CanonicalEvidenceError(
                         "live assignment requires matching approval and fresh accepted preflight"
                     )
-            connection.execute(
-                update(active_strategy_assignment)
-                .where(
-                    active_strategy_assignment.c.product_id == product_id,
-                    active_strategy_assignment.c.active.is_(True),
-                )
-                .values(active=False)
-            )
             return _immutable_insert(
                 connection, active_strategy_assignment, {"id": identity, **record}
             )
 
     def active(self, product_id: str) -> dict[str, Any] | None:
+        rows = self.active_assignments(product_id)
+        return rows[0] if rows else None
+
+    def by_id(self, assignment_id: str) -> dict[str, Any] | None:
         with self.engine.connect() as connection:
             row = (
                 connection.execute(
                     select(active_strategy_assignment).where(
-                        active_strategy_assignment.c.product_id == product_id,
-                        active_strategy_assignment.c.active.is_(True),
+                        active_strategy_assignment.c.id == assignment_id
                     )
                 )
                 .mappings()
@@ -883,18 +909,63 @@ class SqlActiveStrategyAssignmentRepository:
             )
         return None if row is None else dict(row)
 
-    def deactivate(self, product_id: str) -> None:
-        """Remove execution authority while retaining the assignment history."""
-
-        with self.engine.begin() as connection:
-            connection.execute(
-                update(active_strategy_assignment)
+    def active_assignments(
+        self, product_id: str, *, at: str | None = None
+    ) -> tuple[dict[str, Any], ...]:
+        with self.engine.connect() as connection:
+            statement = (
+                select(active_strategy_assignment)
                 .where(
                     active_strategy_assignment.c.product_id == product_id,
-                    active_strategy_assignment.c.active.is_(True),
                 )
-                .values(active=False)
+                .order_by(
+                    active_strategy_assignment.c.assigned_at,
+                    active_strategy_assignment.c.id,
+                )
             )
+            if at is not None:
+                at = timestamp(at, field="assignment timestamp")
+                statement = statement.where(
+                    active_strategy_assignment.c.assigned_at <= at,
+                )
+            rows = connection.execute(statement).mappings().all()
+        latest: dict[tuple[str, ...], dict[str, Any]] = {}
+        for raw in rows:
+            row = dict(raw)
+            key = (
+                str(row["product_id"]),
+                str(row["portfolio_id"]),
+                str(row["sleeve_id"]),
+                str(row["strategy_version_id"]),
+                str(row["assignment_scope_id"]),
+                str(row["execution_mode"]),
+            )
+            latest[key] = row
+        return tuple(
+            row
+            for _, row in sorted(latest.items())
+            if row["active"] and (at is None or row["active_until"] is None or row["active_until"] > at)
+        )
+
+    def deactivate(self, product_id: str) -> None:
+        """Remove execution authority while retaining the assignment history."""
+        active = self.active_assignments(product_id)
+        deactivated_at = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+        with self.engine.begin() as connection:
+            for row in active:
+                event = {
+                    **{key: value for key, value in row.items() if key != "id"},
+                    "active": False,
+                    "assigned_at": deactivated_at,
+                    "active_until": deactivated_at,
+                    "assignment_reason": "deactivated",
+                }
+                identity = _hash(event, field="assignment deactivation")
+                _immutable_insert(
+                    connection,
+                    active_strategy_assignment,
+                    {"id": identity, **event},
+                )
 
     def assert_binding(
         self,

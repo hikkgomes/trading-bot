@@ -9,7 +9,12 @@ from typing import Any
 from src.domain._codec import canonical_hash
 from src.domain.risk import RiskDecision
 from src.risk.account import AccountRiskLimits, assess_account_risk
-from src.risk.engine import SqlRiskDecisionStore, SqlRiskSnapshotStore, combine_risk_decisions
+from src.risk.engine import (
+    SqlRiskDecisionStore,
+    SqlRiskPolicyStore,
+    SqlRiskSnapshotStore,
+    combine_risk_decisions,
+)
 from src.risk.global_risk import GlobalRiskLimits, assess_global_risk
 from src.risk.instrument import InstrumentRiskLimits, assess_instrument_risk
 from src.risk.product import ProductRiskLimits, assess_product_risk
@@ -81,6 +86,15 @@ class DatabaseRiskWorker:
                 product_id = request.product_id
                 assessment_id = request.assessment_id
                 snapshot_inputs = self._load_snapshot_inputs(request)
+                policy_limits = SqlRiskPolicyStore(self.store.engine).resolve(
+                    request.risk_policy_ids
+                )
+                if set(policy_limits) != {scope for scope, _, _ in _SCOPES}:
+                    raise ValueError("risk policies must define all six risk scopes")
+                snapshot_inputs = {
+                    scope: {**dict(values), "limits": policy_limits[scope]}
+                    for scope, values in snapshot_inputs.items()
+                }
             decisions = tuple(
                 self._evaluate_scope(snapshot_inputs, scope, evaluator, limits_type)
                 for scope, evaluator, limits_type in _SCOPES

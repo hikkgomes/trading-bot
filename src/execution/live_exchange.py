@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import datetime as dt
 import hashlib
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 from src.domain.instruments import Instrument
-from src.domain.orders import Fill, OrderIntent
-from src.domain.orders import OrderSide as DomainOrderSide
+from src.domain.orders import OrderIntent
 from src.execution.broker import (
     Broker,
     Order,
@@ -21,6 +20,14 @@ from src.execution.broker import (
 )
 from src.execution.order_manager import OrderManager
 from src.execution.position_manager import PositionManager
+
+
+@dataclass(frozen=True)
+class SubmissionAcknowledgement:
+    order_id: str
+    client_order_id: str
+    exchange_order_id: str
+    status: str
 
 
 class BrokerExecutionVenue:
@@ -39,7 +46,7 @@ class BrokerExecutionVenue:
         self.broker = broker
         self.instruments = dict(instruments)
 
-    def submit(self, intent: OrderIntent) -> Fill:
+    def submit(self, intent: OrderIntent) -> SubmissionAcknowledgement:
         instrument = self.instruments.get(intent.instrument_id)
         if instrument is None or not instrument.is_tradable:
             raise ValueError(f"instrument is not approved for execution: {intent.instrument_id}")
@@ -62,42 +69,29 @@ class BrokerExecutionVenue:
             client_id=client_order_id,
         )
         try:
-            broker_fill = self.broker.place_order(broker_order)
+            response = self.broker.place_order(broker_order)
         except Exception:
             self.order_manager.recovery_required(intent.order_id)
             raise
-        occurred_at = (
-            dt.datetime.fromtimestamp(broker_fill.timestamp, dt.UTC)
-            .replace(microsecond=0)
-            .isoformat()
+        exchange_order_id = str(response.exchange_order_id or "").strip()
+        if not exchange_order_id:
+            self.order_manager.recovery_required(intent.order_id)
+            raise RuntimeError("exchange acknowledgement has no order ID")
+        acknowledged_client_id = str(response.client_order_id or client_order_id)
+        if acknowledged_client_id != client_order_id:
+            self.order_manager.recovery_required(intent.order_id)
+            raise RuntimeError("exchange acknowledgement changed the client order ID")
+        self.order_manager.bind_exchange_acknowledgement(
+            intent.order_id,
+            exchange_order_id=exchange_order_id,
+            client_order_id=client_order_id,
         )
-        fill = Fill(
-            fill_id="fill_"
-            + hashlib.sha256(
-                f"{intent.order_id}|{broker_fill.timestamp}|{broker_fill.qty}".encode()
-            ).hexdigest()[:24],
+        return SubmissionAcknowledgement(
             order_id=intent.order_id,
-            instrument_id=intent.instrument_id,
-            side=DomainOrderSide(broker_fill.side.value),
-            quantity=broker_fill.qty,
-            price=broker_fill.price,
-            fee=broker_fill.fee,
-            occurred_at=occurred_at,
-            fee_asset=broker_fill.fee_asset or instrument.quote_asset,
-            metadata={
-                "broker": self.broker.name,
-                "simulated": False,
-                "exchange_order_id": broker_fill.exchange_order_id,
-                "client_order_id": broker_fill.client_order_id or client_order_id,
-            },
+            client_order_id=client_order_id,
+            exchange_order_id=exchange_order_id,
+            status="acknowledged",
         )
-        updated = self.order_manager.apply_fill(fill)
-        self.position_manager.apply_fill(
-            updated.portfolio_id,
-            fill,
-            contributions=dict(updated.strategy_contributions),
-        )
-        return fill
 
 
 def bounded_client_order_id(intent: OrderIntent) -> str:

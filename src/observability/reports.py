@@ -30,11 +30,14 @@ from src.data.database import (
     production_preflight,
     promotion_event,
     protective_stop,
+    research_thesis,
     strategy_approval,
     strategy_artefact,
+    strategy_definition,
     strategy_identity,
     strategy_lineage,
     target_position,
+    thesis_trial,
     validation_result,
     validation_stage,
     worker,
@@ -95,7 +98,7 @@ class DatabasePlatformReport:
     def _research(self) -> dict[str, Any]:
         experiments = self._rows(experiment, order_by=experiment.c.submitted_at.desc())
         results = self._rows(validation_result)
-        return {
+        report = {
             "candidate_queue": [
                 item for item in experiments if item.get("state", "queued") == "queued"
             ],
@@ -117,6 +120,96 @@ class DatabasePlatformReport:
             ],
             "agent_activity": self._payloads(
                 agent_action, order_by=agent_action.c.created_at.desc()
+            ),
+        }
+        report["funnel"] = self._research_funnel(experiments, results, report)
+        return report
+
+    def _research_funnel(
+        self,
+        experiments: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+        research: dict[str, Any],
+    ) -> dict[str, Any]:
+        stages = list(research["validation_stages"])
+        identities = list(research["strategy_identities"])
+        jobs = self._rows(job)
+        rejection_by_stage: dict[str, int] = {}
+        rejection_reasons: dict[str, int] = {}
+        first_blocked: dict[str, int] = {}
+        evaluated_ids: set[str] = set()
+        signal_frequencies: list[float] = []
+        for row in stages:
+            candidate_id = str(row["experiment_id"])
+            evaluated_ids.add(candidate_id)
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else payload
+            frequency = evidence.get("signal_frequency")
+            if isinstance(frequency, int | float) and not isinstance(frequency, bool):
+                signal_frequencies.append(float(frequency))
+            if not row["accepted"]:
+                stage = str(row["stage"])
+                reason = str(row.get("reason_code") or "unknown")
+                rejection_by_stage[stage] = rejection_by_stage.get(stage, 0) + 1
+                rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+        by_candidate: dict[str, list[dict[str, Any]]] = {}
+        for row in stages:
+            by_candidate.setdefault(str(row["experiment_id"]), []).append(row)
+        for candidate_stages in by_candidate.values():
+            ordered = sorted(candidate_stages, key=lambda item: str(item["evaluated_at"]))
+            blocked = next((item for item in ordered if not item["accepted"]), None)
+            if blocked is not None:
+                key = str(blocked["stage"])
+                first_blocked[key] = first_blocked.get(key, 0) + 1
+        definitions = self._rows(strategy_definition)
+        feature_families: dict[str, int] = {}
+        thesis_families: dict[str, int] = {}
+        for row in definitions:
+            definition = row.get("definition") if isinstance(row.get("definition"), dict) else {}
+            family = str(definition.get("family") or "unknown")
+            feature_families[family] = feature_families.get(family, 0) + 1
+        for row in self._rows(research_thesis):
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            family = str(payload.get("mechanism_category") or "unknown")
+            thesis_families[family] = thesis_families.get(family, 0) + 1
+        duplicate_count = sum(bool(row.get("is_duplicate")) for row in identities)
+        near_duplicate_count = sum(
+            bool((row.get("metadata") or {}).get("near_duplicate_of"))
+            for row in identities
+            if isinstance(row.get("metadata"), dict)
+        )
+        return {
+            "theses_generated": self._count(research_thesis),
+            "candidates_generated": len(experiments),
+            "candidates_compiled": sum(
+                row["stage"] == "screening" and row["accepted"] for row in stages
+            ),
+            "candidates_evaluated": len(evaluated_ids),
+            "candidates_rejected_by_stage": rejection_by_stage,
+            "top_rejection_reasons": dict(
+                sorted(rejection_reasons.items(), key=lambda item: (-item[1], item[0]))[:10]
+            ),
+            "signal_frequency_distribution": sorted(signal_frequencies),
+            "feature_family_concentration": feature_families,
+            "thesis_family_coverage": thesis_families,
+            "candidate_correlation": [
+                row.get("payload", {}).get("candidate_correlation")
+                for row in stages
+                if isinstance(row.get("payload"), dict)
+                and row.get("payload", {}).get("candidate_correlation") is not None
+            ],
+            "exact_duplicate_rate": duplicate_count / len(identities) if identities else 0.0,
+            "near_duplicate_rate": near_duplicate_count / len(identities) if identities else 0.0,
+            "cumulative_trial_count": self._count(thesis_trial),
+            "protected_holdout_count": len(research["holdout_outcomes"]),
+            "forward_paper_count": len(research["forward_paper_observations"]),
+            "strategy_promotions": len(research["promotion_events"]),
+            "first_blocked_stage": first_blocked,
+            "jobs_waiting": sum(row.get("state") == "queued" for row in jobs),
+            "jobs_deferred": sum(row.get("state") == "deferred" for row in jobs),
+            "jobs_failed": sum(row.get("state") == "failed" for row in jobs),
+            "candidates_never_evaluated": sorted(
+                str(row["id"]) for row in experiments if str(row["id"]) not in evaluated_ids
             ),
         }
 

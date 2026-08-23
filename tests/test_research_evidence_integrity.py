@@ -14,7 +14,7 @@ def test_default_executor_does_not_turn_missing_execution_into_evidence() -> Non
     candidate = SimpleNamespace(
         definition=SimpleNamespace(source_type=StrategySourceType.REGISTERED_PYTHON)
     )
-    with pytest.raises(ExecutorError, match="no canonical data runner"):
+    with pytest.raises(ExecutorError, match="canonical market_frame"):
         registry.execute(candidate, {})  # type: ignore[arg-type]
 
 

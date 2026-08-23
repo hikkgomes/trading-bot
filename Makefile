@@ -137,8 +137,7 @@ platform-readiness-live:  ## Check live platform readiness with PostgreSQL schem
 
 .PHONY: platform-smoke
 platform-smoke:  ## Run the PostgreSQL closed-event platform smoke for both products
-	$(PY) -m src.services.platform_smoke --database-url "$(TRADING_PLATFORM_DATABASE_URL)" \
-		$(if $(ALLOW_EMPTY),--allow-empty,)
+	$(PY) -m src.services.platform_smoke --database-url "$(TRADING_PLATFORM_DATABASE_URL)"
 
 .PHONY: platform-ci
 platform-ci:  ## Run the platform configuration, lint, migration, smoke, and test checks

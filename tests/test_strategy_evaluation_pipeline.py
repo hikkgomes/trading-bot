@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from sqlalchemy import insert
+from dataclasses import replace
 
-from src.data.database import PlatformDatabase, balance_snapshot
-from src.domain._codec import canonical_hash
+from src.data.database import PlatformDatabase
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.execution.position_manager import PositionManager, SqlPositionStore
 from src.risk.engine import SqlRiskSnapshotStore
@@ -54,6 +53,15 @@ def test_target_builder_consumes_canonical_market_and_balance_snapshots(tmp_path
         },
     )
     forecast_id = repository.save_forecast(forecast)
+    eth_instrument = "binance:futures:ETHUSDT:USDT"
+    repository.save_forecast(
+        replace(
+            forecast,
+            strategy_version_id="strategy-v2",
+            instrument_id=eth_instrument,
+            expected_return=0.008,
+        )
+    )
     snapshots = SqlRiskSnapshotStore(database.engine)
     market_id = snapshots.save(
         {
@@ -62,15 +70,68 @@ def test_target_builder_consumes_canonical_market_and_balance_snapshots(tmp_path
         },
         created_at=forecast.valid_from,
     )
-    balance_id = canonical_hash({"account_id": "futures", "balances": {"USDT": 1000.0}})
-    with database.engine.begin() as connection:
-        connection.execute(
-            insert(balance_snapshot).values(
-                id=balance_id,
-                created_at=forecast.valid_from,
-                payload={"account_id": "futures", "balances": {"USDT": 1000.0}},
-            )
-        )
+    snapshots.save(
+        {
+            "kind": "canonical_portfolio_risk_state",
+            "product_id": "active_income",
+            "observed_at": forecast.valid_from,
+            "source_snapshot_ids": {
+                name: "sha256:" + str(index) * 64
+                for index, name in enumerate(
+                    ("balances", "positions", "open_orders", "account", "market", "health", "drift"),
+                    1,
+                )
+            },
+            "maximum_state_age_seconds": 5,
+            "balances": {"USDT": 1000.0},
+            "positions": {},
+            "open_orders": [],
+            "used_margin_fraction": 0.0,
+            "liquidation_buffer_fraction": 1.0,
+            "unknown_exposure": {},
+            "market": {
+                forecast.instrument_id: {
+                    "price": 100.0,
+                    "spread_bps": 1.0,
+                    "visible_depth": 100_000.0,
+                    "volatility": 0.1,
+                    "funding": 0.0,
+                },
+                eth_instrument: {
+                    "price": 10.0,
+                    "spread_bps": 2.0,
+                    "visible_depth": 100_000.0,
+                    "volatility": 0.1,
+                    "funding": 0.0,
+                },
+            },
+            "correlations": {},
+            "beta": {forecast.instrument_id: 0.0, eth_instrument: 0.0},
+            "product_drawdown_fraction": 0.0,
+            "daily_pnl_fraction": 0.0,
+            "global_drawdown_fraction": 0.0,
+            "data_age_seconds": 0.0,
+            "clock_skew_seconds": 0.0,
+            "exchange_connected": True,
+            "database_healthy": True,
+            "execution_drift": False,
+            "model_drift": False,
+            "risk_policy_ids": ["active-income", "futures"],
+            "portfolio_risk_budget": 0.5,
+            "maximum_symbol_fraction": 0.2,
+            "maximum_abs_beta": 0.5,
+            "maximum_correlation": 0.8,
+            "maximum_turnover_fraction": 1.0,
+            "maximum_cluster_fraction": 1.0,
+            "maximum_product_drawdown_fraction": 0.1,
+            "maximum_depth_participation": 0.1,
+            "sleeve_budgets": {"directional": 0.5},
+            "clusters": {forecast.instrument_id: "btc", eth_instrument: "eth"},
+            "cluster_fraction_caps": {"btc": 0.5, "eth": 0.5},
+            "trades_today": 0,
+        },
+        created_at=forecast.valid_from,
+    )
     builder = DatabasePortfolioTargetBuilder(
         repository=repository,
         snapshot_store=snapshots,
@@ -95,3 +156,5 @@ def test_target_builder_consumes_canonical_market_and_balance_snapshots(tmp_path
     )
     assert refs.target_position_snapshot_id.startswith("sha256:")
     assert refs.market_data_snapshot_id.startswith("sha256:")
+    target_snapshot = snapshots.get(refs.target_position_snapshot_id)
+    assert len(target_snapshot["targets"]) == 2

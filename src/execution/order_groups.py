@@ -87,6 +87,13 @@ class MultiLegRecoveryPlan:
     target_quantities: Mapping[str, float]
 
 
+@dataclass(frozen=True)
+class HedgeRelease:
+    orders: tuple[OrderIntent, ...]
+    primary_filled_quantity: float
+    hedge_error: float
+
+
 class JsonlOrderGroupStore:
     def __init__(self, path: Path):
         self.path = path
@@ -256,11 +263,19 @@ def plan_order_group(
     )
     if len(raw_orders) < 2:
         raise ValueError("multi-leg targets must produce at least two orders")
-    orders = tuple(replace(order, group_id=group_id) for order in raw_orders)
+    primary_order_id = raw_orders[0].order_id
+    orders = tuple(
+        replace(
+            order,
+            group_id=group_id,
+            depends_on_order_id=(primary_order_id if index else order.depends_on_order_id),
+        )
+        for index, order in enumerate(raw_orders)
+    )
     group = OrderGroup(
         group_id=group_id,
         portfolio_id=materialised[0].portfolio_id,
-        primary_order_id=orders[0].order_id,
+        primary_order_id=primary_order_id,
         hedge_order_ids=tuple(order.order_id for order in orders[1:]),
         metadata={
             "created_at": decided_at,
@@ -271,3 +286,76 @@ def plan_order_group(
         },
     )
     return OrderGroupPlan(group=group, orders=orders)
+
+
+def release_hedges_from_primary_fill(
+    plan: OrderGroupPlan,
+    *,
+    primary_filled_quantity: float,
+    hedge_filled_quantities: Mapping[str, float],
+) -> HedgeRelease:
+    """Resize hedge legs from authoritative primary trade quantities."""
+
+    if primary_filled_quantity <= 0:
+        raise ValueError("primary fill quantity must be positive")
+    primary = plan.orders[0]
+    if primary_filled_quantity > primary.quantity + 1e-12:
+        raise ValueError("primary fill exceeds the planned primary quantity")
+    scale = primary_filled_quantity / primary.quantity
+    hedges = tuple(
+        replace(
+            order,
+            quantity=order.quantity * scale,
+            order_id=canonical_hash(
+                {
+                    "planned_order_id": order.order_id,
+                    "primary_filled_quantity": primary_filled_quantity,
+                }
+            ),
+            metadata={
+                **dict(order.metadata),
+                "planned_order_id": order.order_id,
+                "primary_fill_scale": scale,
+            },
+        )
+        for order in plan.orders[1:]
+    )
+    required = sum(order.quantity for order in hedges)
+    filled = sum(max(0.0, float(hedge_filled_quantities.get(order.instrument_id, 0.0))) for order in hedges)
+    error = 0.0 if required == 0 else max(0.0, (required - filled) / required)
+    return HedgeRelease(hedges, primary_filled_quantity, error)
+
+
+def deterministic_unwind_orders(
+    plan: OrderGroupPlan,
+    *,
+    actual_signed_quantities: Mapping[str, float],
+    decided_at: str,
+) -> tuple[OrderIntent, ...]:
+    """Flatten only the actual residual exposure when a hedge cannot complete."""
+
+    targets = tuple(
+        TargetPosition(
+            portfolio_id=plan.group.portfolio_id,
+            instrument_id=instrument_id,
+            target_quantity=0.0,
+            target_notional=0.0,
+            target_fraction=0.0,
+            strategy_contributions={"multi_leg_recovery": 1.0},
+            risk_budget=0.0,
+            valid_until=decided_at,
+            metadata={"reason": "multi_leg_recovery_unwind"},
+        )
+        for instrument_id, quantity in sorted(actual_signed_quantities.items())
+        if abs(float(quantity)) > 1e-12
+    )
+    if not targets:
+        return ()
+    return tuple(
+        replace(order, reduce_only=True, group_id=plan.group.group_id)
+        for order in plan_orders(
+            targets,
+            current_quantities=actual_signed_quantities,
+            decided_at=decided_at,
+        )
+    )
