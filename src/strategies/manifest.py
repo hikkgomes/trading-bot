@@ -180,7 +180,7 @@ def registered_live_contract(name: str) -> tuple[tuple[str, ...], dict[str, obje
     except KeyError as exc:
         raise ValueError(f"registered strategy has no live feature contract: {name}") from exc
     nodes = tuple(dict.fromkeys(term[0] for term in terms))
-    rule = {
+    rule: dict[str, object] = {
         "kind": "linear_feature_score/v1",
         "terms": [
             {"feature": feature, "weight": weight, "centre": centre, "scale": scale}

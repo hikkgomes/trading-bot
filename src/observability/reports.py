@@ -142,10 +142,10 @@ class DatabasePlatformReport:
         for row in stages:
             candidate_id = str(row["experiment_id"])
             evaluated_ids.add(candidate_id)
-            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-            evidence = (
-                payload.get("evidence") if isinstance(payload.get("evidence"), dict) else payload
-            )
+            raw_payload = row.get("payload")
+            payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
+            raw_evidence = payload.get("evidence")
+            evidence: dict[str, Any] = raw_evidence if isinstance(raw_evidence, dict) else payload
             frequency = evidence.get("signal_frequency")
             if isinstance(frequency, int | float) and not isinstance(frequency, bool):
                 signal_frequencies.append(float(frequency))
@@ -167,11 +167,13 @@ class DatabasePlatformReport:
         feature_families: dict[str, int] = {}
         thesis_families: dict[str, int] = {}
         for row in definitions:
-            definition = row.get("definition") if isinstance(row.get("definition"), dict) else {}
+            raw_definition = row.get("definition")
+            definition: dict[str, Any] = raw_definition if isinstance(raw_definition, dict) else {}
             family = str(definition.get("family") or "unknown")
             feature_families[family] = feature_families.get(family, 0) + 1
         for row in self._rows(research_thesis):
-            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            raw_payload = row.get("payload")
+            payload = raw_payload if isinstance(raw_payload, dict) else {}
             family = str(payload.get("mechanism_category") or "unknown")
             thesis_families[family] = thesis_families.get(family, 0) + 1
         duplicate_count = sum(bool(row.get("is_duplicate")) for row in identities)

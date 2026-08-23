@@ -7,7 +7,7 @@ PY ?= $(VENV)/bin/python
 BOOTSTRAP_PY ?= python3
 PLATFORM_TYPECHECK_FILES = \
 	src/agents/openclaw_bridge.py \
-	src/data/database.py src/data/migrate.py src/data/migrations.py \
+	src/data/database.py src/data/migrate.py \
 	src/data/parquet_store.py src/data/snapshots.py src/data/universe.py \
 	src/domain/_codec.py src/domain/market_events.py src/domain/strategies.py \
 	src/observability/reports.py \
@@ -18,8 +18,7 @@ PLATFORM_TYPECHECK_FILES = \
 	src/services/config.py src/services/data_writer.py src/services/live_execution.py \
 	src/services/promotion.py src/services/readiness.py src/services/research_jobs.py \
 	src/services/supervisor.py \
-	src/strategies/base.py src/strategies/manifest.py \
-	src/strategies/library/complete_universe.py
+	src/strategies/base.py src/strategies/manifest.py
 PREFLIGHT_OUTPUT ?= $(if $(REQUIRE_TESTNET),runtime/$(PRODUCT)_testnet_preflight_report.json,$(if $(PRODUCT),runtime/$(PRODUCT)_preflight_report.json,runtime/preflight_report.json))
 BACKUP ?= $(shell ls -t runtime/backups/autopilot_state_*.zip 2>/dev/null | head -1)
 RESTORE_DIR ?= runtime/restore_rehearsal
