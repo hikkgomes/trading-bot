@@ -51,7 +51,7 @@ jobs:
       - name: Type-check platform boundary
         run: make typecheck-platform
       - name: Validate production autopilot configuration
-        run: .venv/bin/python -m src.autopilot.runtime --config config/autopilot.json --validate
+        run: .venv-runtime/bin/python -m src.autopilot.runtime --config config/autopilot.json --validate
       - name: Apply and verify PostgreSQL migrations
         run: |
           .venv-runtime/bin/python -m alembic upgrade head
