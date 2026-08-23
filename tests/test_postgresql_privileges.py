@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -33,8 +34,11 @@ def _as_role(role: str, statement: str, parameters: dict | None = None):
     reason="requires PostgreSQL role fixture",
 )
 def test_every_platform_role_has_only_its_declared_authority() -> None:
-    assert _as_role("trading_runtime", "SELECT id FROM balance_snapshot LIMIT 1") == []
-    assert _as_role("trading_research", "SELECT id FROM instrument LIMIT 1") == []
+    run_id = uuid.uuid4().hex
+    research_job_id = f"role-test-research-job-{run_id}"
+    agent_proposal_id = f"role-test-agent-proposal-{run_id}"
+    _as_role("trading_runtime", "SELECT id FROM balance_snapshot LIMIT 1")
+    _as_role("trading_research", "SELECT id FROM instrument LIMIT 1")
     with pytest.raises(DBAPIError):
         _as_role("trading_research", "SELECT id FROM balance_snapshot LIMIT 1")
     with pytest.raises(DBAPIError):
@@ -49,14 +53,15 @@ def test_every_platform_role_has_only_its_declared_authority() -> None:
         "trading_research",
         "SELECT submit_typed_research_job(:id, 'evaluate_candidate', '{}'::jsonb, "
         "CURRENT_TIMESTAMP, 0, 'research:test', :hash)",
-        {"id": "role-test-research-job", "hash": "sha256:" + "1" * 64},
+        {"id": research_job_id, "hash": "sha256:" + "1" * 64},
     )
-    assert rows == [("role-test-research-job",)]
+    assert rows == [(research_job_id,)]
 
     _as_role(
         "trading_agent",
         "INSERT INTO agent_proposal (id, created_at, payload) "
-        "VALUES ('role-test-agent-proposal', CURRENT_TIMESTAMP, '{}'::jsonb)",
+        "VALUES (:id, CURRENT_TIMESTAMP, '{}'::jsonb)",
+        {"id": agent_proposal_id},
     )
     with pytest.raises(DBAPIError):
         _as_role("trading_agent", "SELECT id FROM strategy_approval LIMIT 1")
