@@ -263,7 +263,6 @@
         "--state", "runtime/research_cycle_state.json",
         "--include-generated",
         "--include-mutations",
-        "--generated-only",
         "--generated-batch", "runtime/research/generated_hypotheses.json",
         "--mutation-batch", "runtime/mutation_hypotheses.json",
         "--research-factory-config", "config/research_factory.json"

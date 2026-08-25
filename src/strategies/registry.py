@@ -8,11 +8,19 @@ executor can discover any strategy regardless of which paradigm it belongs to
 
 from __future__ import annotations
 
+import inspect
+
+from src.strategies.base import Strategy
+
 _REGISTRY: dict[str, type] = {}
 
 
 def register(cls: type) -> type:
     """Class decorator: register a Strategy subclass under its ``name``."""
+    if not inspect.isclass(cls) or not issubclass(cls, Strategy) or inspect.isabstract(cls):
+        raise ValueError("registered strategies need a concrete Strategy implementation")
+    if cls.generate_signals is Strategy.generate_signals:
+        raise ValueError("registered strategies need a concrete signal evaluator")
     name = getattr(cls, "name", None)
     if not name or name == "base":
         raise ValueError(f"{cls.__name__} must set a unique class-level `name`.")

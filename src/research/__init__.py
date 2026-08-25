@@ -1,0 +1,46 @@
+"""Unified strategy-registration and research-coordination contracts."""
+
+from src.research.artefacts import StrategyArtefact, StrategyArtefactStore
+from src.research.canonical import (
+    CanonicalEvidenceError,
+    SqlActiveStrategyAssignmentRepository,
+    SqlApprovalRepository,
+    SqlForwardEvidenceRepository,
+    SqlHoldoutRepository,
+    SqlPreflightRepository,
+    SqlStrategyArtefactRepository,
+    SqlValidationRepository,
+)
+from src.research.coordinator import Candidate, ResearchCoordinator, ResearchResult
+from src.research.evaluation import (
+    CanonicalResearchEvaluator,
+    EvaluationRequest,
+    ProtectedHoldoutWorker,
+    StageEvaluation,
+)
+from src.research.providers import provider_candidate
+from src.research.store import SqlResearchStore
+from src.research.theses import ThesisRegistry
+
+__all__ = [
+    "Candidate",
+    "CanonicalEvidenceError",
+    "CanonicalResearchEvaluator",
+    "EvaluationRequest",
+    "ProtectedHoldoutWorker",
+    "ResearchCoordinator",
+    "ResearchResult",
+    "SqlResearchStore",
+    "SqlActiveStrategyAssignmentRepository",
+    "SqlApprovalRepository",
+    "SqlForwardEvidenceRepository",
+    "SqlHoldoutRepository",
+    "SqlPreflightRepository",
+    "SqlStrategyArtefactRepository",
+    "SqlValidationRepository",
+    "StageEvaluation",
+    "StrategyArtefact",
+    "StrategyArtefactStore",
+    "ThesisRegistry",
+    "provider_candidate",
+]

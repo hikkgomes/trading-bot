@@ -113,7 +113,10 @@ def probability_backtest_overfitting(
         train_scores = np.array([sharpe_ratio(row[train_idx]) for row in split_returns])
         test_scores = np.array([sharpe_ratio(row[test_idx]) for row in split_returns])
         winner = int(np.nanargmax(train_scores))
-        rank = float((test_scores < test_scores[winner]).sum() + 1) / float(n_strategies + 1)
+        winner_test = test_scores[winner]
+        strictly_worse = int((test_scores < winner_test).sum())
+        tied = int((test_scores == winner_test).sum())
+        rank = float(strictly_worse + 0.5 * max(0, tied - 1)) / float(max(1, n_strategies - 1))
         rank = min(max(rank, 1e-12), 1.0 - 1e-12)
         logits.append(np.log(rank / (1.0 - rank)))
     if not logits:

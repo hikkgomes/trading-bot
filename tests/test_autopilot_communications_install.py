@@ -51,9 +51,7 @@ def test_telegram_service_uses_telegram_only_environment_and_pause_edge():
 def test_alfred_installer_manages_routine_and_weekly_reviews_event_wakes_and_instructions():
     script = Path("scripts/install_alfred_integration.sh").read_text(encoding="utf-8")
     instructions = Path("config/alfred_trading_operator.md").read_text(encoding="utf-8")
-    weekly_prompt = Path("config/openclaw_weekly_deep_review_prompt.md").read_text(
-        encoding="utf-8"
-    )
+    weekly_prompt = Path("config/openclaw_weekly_deep_review_prompt.md").read_text(encoding="utf-8")
 
     assert 'REVIEW_CRON="${REVIEW_CRON:-45 0,6,12,18 * * *}"' in script
     assert 'MODEL="${MODEL:-openai/gpt-5.6-terra}"' in script
@@ -61,7 +59,7 @@ def test_alfred_installer_manages_routine_and_weekly_reviews_event_wakes_and_ins
     assert 'SOL_MODEL="${SOL_MODEL:-openai/gpt-5.6-sol}"' in script
     assert 'SOL_REVIEW_NAME="Trading Research Weekly Deep Review"' in script
     assert '--message "$SOL_MESSAGE" --model "$SOL_MODEL"' in script
-    assert '--thinking high --timeout-seconds 1800' in script
+    assert "--thinking high --timeout-seconds 1800" in script
     assert 'EVENT_INTERVAL="${EVENT_INTERVAL:-15m}"' in script
     assert "openclaw_bridge claim-event" in script
     assert "cron run $review_id" in script

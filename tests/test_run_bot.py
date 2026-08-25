@@ -1849,6 +1849,8 @@ def test_run_cycle_signal_not_triggered(mock_build_ind, mock_get, bot_env):
     assert decision["failed_stage"] == "conditions"
     assert decision["matched_predicates"] == 0
     assert decision["total_predicates"] == 1
+    assert decision["funnel"]["first_blocked_stage"] == "trigger_passed"
+    assert decision["funnel"]["stages"]["trigger_passed"]["reason_code"] == "conditions"
 
 
 @patch("src.run_bot.requests.get")
@@ -2004,6 +2006,12 @@ def test_run_cycle_signal_triggered_opens_position(mock_build_ind, mock_get, bot
     assert bot.decision_trace["summary"]["entries_opened"] == 1
     assert bot.decision_trace["summary"]["outcomes"] == {"entry_opened": 1}
     assert bot.decision_trace["strategies"]["5m_long_r1"]["outcome"] == "entry_opened"
+    assert (
+        bot.decision_trace["strategies"]["5m_long_r1"]["funnel"]["stages"]["position_opened"][
+            "outcome"
+        ]
+        == "passed"
+    )
     assert pos["alpha_forecast"]["schema"] == "autopilot.alpha_forecast/v1"
     assert bot.decision_trace["strategies"]["5m_long_r1"]["alpha_forecast"] == pos["alpha_forecast"]
 

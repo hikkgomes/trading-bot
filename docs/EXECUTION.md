@@ -434,3 +434,15 @@ failed until it can be rerun cleanly.
 After a passing rehearsal, run the fresh `EXCHANGE_TESTNET=0` production
 preflight described above. A testnet report never substitutes for production
 account/environment evidence.
+# Platform execution path
+
+Closed market events are persisted in batches, then deterministic features are
+stored with availability timestamps. The strategy evaluator loads the exact
+active assignment, immutable artefact, and feature IDs before creating an
+`AlphaForecast`. Portfolio targets are preliminary only. The risk service loads
+canonical account, balance, position, market, and target snapshots, evaluates
+all six scopes, and enqueues execution only for an accepted assessment.
+
+Paper and live venues share the same order state machine. Exchange attempts are
+write-ahead persisted, client IDs are cryptographically bounded, partial fills
+are durable, and authenticated user-stream events reconcile the final state.

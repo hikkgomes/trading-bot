@@ -981,3 +981,16 @@ balances, the local state, the control status, and the operator report all agree
 
 See the [README](../README.md), [research workflow](RESEARCH_WORKFLOW.md), and
 [execution guide](EXECUTION.md) for deeper subsystem behavior.
+# Platform v2 deployment
+
+The production-authoritative deployment is a single Linux node running the
+services in `config/platform.json`. PostgreSQL is the operational authority and
+partitioned Parquet is the immutable public-event store.
+
+Use `make platform-install-dry-run` before installing. The installer creates
+separate runtime, research, agent, and migration service domains. Only the
+market gateway and execution engine may receive exchange credentials. Research
+and agent workers use separate virtual environments and database roles.
+
+Run `make db-alembic` as the database owner, then `make db-migration-check`.
+Runtime services only verify the schema and never apply migrations.

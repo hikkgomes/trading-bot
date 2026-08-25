@@ -1,0 +1,30 @@
+{
+  "schema": "portfolios/v1",
+  "portfolios": [
+    {
+      "portfolio_id": "btc-accumulation-portfolio",
+      "product_id": "btc_accumulation",
+      "maximum_gross": 1.0,
+      "maximum_net": 1.0,
+      "maximum_turnover": 0.25,
+      "maximum_beta": 1.0,
+      "maximum_margin": 0.0,
+      "sleeve_budgets": {"tactical-allocation": 1.0}
+    },
+    {
+      "portfolio_id": "active-income-portfolio",
+      "product_id": "active_income",
+      "maximum_gross": 1.5,
+      "maximum_net": 0.5,
+      "maximum_turnover": 1.0,
+      "maximum_beta": 0.5,
+      "maximum_margin": 0.5,
+      "sleeve_budgets": {
+        "directional": 0.5,
+        "relative-value": 0.25,
+        "funding": 0.15,
+        "microstructure": 0.1
+      }
+    }
+  ]
+}

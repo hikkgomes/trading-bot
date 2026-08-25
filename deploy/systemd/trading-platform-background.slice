@@ -1,0 +1,9 @@
+[Unit]
+Description=Trading platform research and reporting services
+
+[Slice]
+CPUWeight=100
+IOWeight=100
+MemoryHigh=2G
+MemoryMax=2816M
+TasksMax=128

@@ -1,0 +1,27 @@
+[Unit]
+Description=Trading platform Linux agent service %i
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=trading-agent
+Group=trading-agent
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=/etc/trading-platform/%i.env
+Environment=PYTHONUNBUFFERED=1
+Environment=TRADING_PLATFORM_AGENT_WORKTREE_ROOT=/opt/trading-bot/runtime/agent-worktrees
+ExecStart=/opt/trading-bot/.venv-agent/bin/python -m src.services.supervisor --config /opt/trading-bot/config/platform.json --node linux-optiplex --service %i
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateNetwork=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot/runtime/agent-worktrees
+Slice=trading-platform-agent.slice
+
+[Install]
+WantedBy=multi-user.target

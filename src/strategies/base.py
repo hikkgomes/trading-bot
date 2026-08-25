@@ -135,6 +135,48 @@ class Strategy(ABC):
         """Optional training hook (ML strategies). No-op for rule strategies."""
         return self
 
+    def forecast(
+        self,
+        df: pd.DataFrame,
+        *,
+        strategy_version_id: str,
+        product_id: str,
+        instrument_id: str,
+        valid_from: str,
+        valid_until: str,
+        horizon_seconds: int,
+        target_volatility: float = 0.1,
+        maximum_position: float = 0.25,
+    ):
+        """Convert the latest causal signal into the shared alpha contract."""
+
+        from src.domain.forecasts import AlphaForecast, ForecastDirection
+
+        signal = int(self.generate_signals(df).iloc[-1]) if len(df.index) else 0
+        direction = (
+            ForecastDirection.LONG
+            if signal > 0
+            else ForecastDirection.SHORT
+            if signal < 0
+            else ForecastDirection.FLAT
+        )
+        score = min(1.0, abs(float(signal)))
+        return AlphaForecast(
+            strategy_version_id=strategy_version_id,
+            product_id=product_id,
+            instrument_id=instrument_id,
+            direction=direction,
+            score=score,
+            expected_return=score * target_volatility,
+            confidence=score,
+            horizon_seconds=horizon_seconds,
+            valid_from=valid_from,
+            valid_until=valid_until,
+            target_volatility=target_volatility,
+            maximum_position=maximum_position if score else 0.0,
+            metadata={"strategy_name": self.name, "contract": "forecast_or_target_position"},
+        )
+
     @abstractmethod
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         """Return an int Series in {-1, 0, +1} aligned to ``df.index``."""

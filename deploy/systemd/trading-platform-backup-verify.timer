@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly trading platform backup restore verification
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1800
+Unit=trading-platform-backup@verify.service
+
+[Install]
+WantedBy=timers.target

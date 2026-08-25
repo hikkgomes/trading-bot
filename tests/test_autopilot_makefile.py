@@ -51,5 +51,6 @@ def test_autonomous_research_targets_generate_then_validate_typed_batch():
     )
     assert ".PHONY: research-generate" in makefile
     assert "--output runtime/research/generated_hypotheses.json" in makefile
-    assert "--include-generated --generated-only" in makefile
+    assert "--include-generated --include-mutations" in makefile
+    assert "--generated-only" not in makefile
     assert "research-once: research-generate research-cycle" in makefile

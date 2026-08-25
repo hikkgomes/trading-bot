@@ -5,6 +5,20 @@
 VENV ?= .venv
 PY ?= $(VENV)/bin/python
 BOOTSTRAP_PY ?= python3
+PLATFORM_TYPECHECK_FILES = \
+	src/agents/openclaw_bridge.py \
+	src/data/database.py src/data/migrate.py \
+	src/data/parquet_store.py src/data/snapshots.py src/data/universe.py \
+	src/domain/_codec.py src/domain/market_events.py src/domain/strategies.py \
+	src/observability/reports.py \
+	src/research/artefacts.py src/research/canonical.py src/research/catalogue.py \
+	src/research/coordinator.py src/research/evaluation.py src/research/sqlite_import.py \
+	src/research/store.py \
+	src/services/agent_worker.py src/services/backup_service.py src/services/backups.py \
+	src/services/config.py src/services/data_writer.py src/services/live_execution.py \
+	src/services/promotion.py src/services/readiness.py src/services/research_jobs.py \
+	src/services/supervisor.py \
+	src/strategies/base.py src/strategies/manifest.py
 PREFLIGHT_OUTPUT ?= $(if $(REQUIRE_TESTNET),runtime/$(PRODUCT)_testnet_preflight_report.json,$(if $(PRODUCT),runtime/$(PRODUCT)_preflight_report.json,runtime/preflight_report.json))
 BACKUP ?= $(shell ls -t runtime/backups/autopilot_state_*.zip 2>/dev/null | head -1)
 RESTORE_DIR ?= runtime/restore_rehearsal
@@ -43,6 +57,10 @@ test-fast:  ## Run tests excluding ones marked slow
 lint:  ## Lint with ruff
 	$(PY) -m ruff check .
 	$(PY) -m ruff format --check .
+
+.PHONY: typecheck-platform
+typecheck-platform:  ## Type-check the PostgreSQL-authoritative platform boundary
+	$(PY) -m mypy --ignore-missing-imports --follow-imports=skip $(PLATFORM_TYPECHECK_FILES)
 
 .PHONY: lint-autopilot
 lint-autopilot:  ## Lint autonomous runtime + execution surface
@@ -99,10 +117,97 @@ bot-flow:  ## Run one active-income paper cycle using runtime state
 autopilot-validate:  ## Validate the 24/7 autopilot config
 	$(PY) -m src.autopilot.runtime --config config/autopilot.json --validate
 
+.PHONY: platform-validate
+platform-validate:  ## Validate split platform configuration and node assignments
+	$(PY) -m src.services.supervisor --config config/platform.json \
+		--node linux-optiplex --service product-supervisor --validate
+
+.PHONY: platform-install-dry-run
+platform-install-dry-run:  ## Validate the Linux installer without changing the host
+	DRY_RUN=1 REPO="$(CURDIR)" bash scripts/install_platform_services.sh
+
+.PHONY: platform-readiness
+platform-readiness:  ## Check PostgreSQL, canonical tables, Parquet, and paper-only state
+	$(PY) -m src.services.readiness --config config/platform.json
+
+.PHONY: platform-readiness-live
+platform-readiness-live:  ## Check live platform readiness with PostgreSQL schema verification
+	$(PY) -m src.services.readiness --config config/platform.json --live
+
+.PHONY: platform-smoke
+platform-smoke:  ## Run the PostgreSQL closed-event platform smoke for both products
+	$(PY) -m src.services.platform_smoke --database-url "$(TRADING_PLATFORM_DATABASE_URL)"
+
+.PHONY: platform-testnet-rehearsal
+platform-testnet-rehearsal:  ## Verify the platform live/user-stream/accounting/recovery rehearsal path
+	$(PY) -m pytest -q tests/test_platform_testnet_rehearsal.py
+
+.PHONY: platform-ci
+platform-ci:  ## Run the platform configuration, lint, migration, smoke, and test checks
+	$(MAKE) platform-validate
+	$(MAKE) lint-autopilot
+	$(MAKE) lint
+	$(MAKE) db-alembic
+	$(MAKE) db-migration-check
+	$(MAKE) platform-smoke
+	$(MAKE) test
+
+.PHONY: db-migrate
+db-migrate:  ## Apply versioned PostgreSQL migrations
+	$(PY) -m src.data.migrate --database-url "$(TRADING_PLATFORM_DATABASE_URL)"
+
+.PHONY: db-alembic
+db-alembic:  ## Apply immutable Alembic revisions as the database owner
+	TRADING_PLATFORM_DATABASE_URL="$(TRADING_PLATFORM_DATABASE_URL)" $(PY) -m alembic upgrade head
+
+.PHONY: db-migration-check
+db-migration-check:  ## Verify the complete PostgreSQL schema is migrated
+	$(PY) -m src.data.migrate --database-url "$(TRADING_PLATFORM_DATABASE_URL)" --check
+
+.PHONY: strategy-manifest-validate
+strategy-manifest-validate:  ## Validate the complete named strategy manifest
+	$(PY) -c "from src.strategies.manifest import assert_manifest_complete, strategy_manifest; assert_manifest_complete(); print(len(strategy_manifest()))"
+
+.PHONY: sqlite-import
+sqlite-import:  ## Import a verified legacy SQLite memory into PostgreSQL
+	$(PY) -m src.research.sqlite_import --source "$(SOURCE)" \
+		--database-url "$(TRADING_PLATFORM_DATABASE_URL)" $(if $(ARCHIVE),--archive "$(ARCHIVE)",)
+
+.PHONY: platform-backup-postgresql
+platform-backup-postgresql:  ## Create a verified PostgreSQL platform backup
+	$(PY) -m src.services.backup_service --config config/platform.json --mode postgresql
+
+.PHONY: platform-backup-parquet
+platform-backup-parquet:  ## Create a verified Parquet platform backup
+	$(PY) -m src.services.backup_service --config config/platform.json --mode parquet
+
+.PHONY: platform-backup-verify
+platform-backup-verify:  ## Verify every PostgreSQL and Parquet platform backup
+	$(PY) -m src.services.backup_service --config config/platform.json --mode verify
+
+.PHONY: platform-backup-restore-parquet
+platform-backup-restore-parquet:  ## Restore a Parquet backup into a new directory
+	$(PY) -m src.services.backup_service --config config/platform.json \
+		--mode restore-parquet --backup-id "$(BACKUP_ID)" --destination "$(DESTINATION)" \
+		--confirm-restore
+
+.PHONY: platform-backup-restore-postgresql
+platform-backup-restore-postgresql:  ## Restore a PostgreSQL backup into an explicit target database
+	$(PY) -m src.services.backup_service --config config/platform.json \
+		--mode restore-postgresql --backup-id "$(BACKUP_ID)" \
+		$(if $(TARGET_DATABASE_URL),--target-database-url "$(TARGET_DATABASE_URL)",) \
+		--confirm-restore
+
 .PHONY: bootstrap-strategies
 bootstrap-strategies:  ## Write paper-only bootstrap strategy artifacts for missing paper products
 	$(PY) -m src.autopilot.bootstrap_strategies --config config/autopilot.json \
 		--report runtime/bootstrap_strategies.json $(if $(OVERWRITE),--overwrite,)
+
+.PHONY: execution-diagnostic
+execution-diagnostic:  ## Run the isolated paper order, fill, and position diagnostic
+	$(PY) -m src.products.execution_diagnostic \
+		--journal runtime/execution_diagnostic_orders.jsonl \
+		--output runtime/execution_diagnostic.json
 
 .PHONY: readiness
 readiness:  ## Check local server readiness for autopilot operation
@@ -276,7 +381,7 @@ research-cycle: mutation-batch  ## Validate the autonomous population and gate p
 		--config config/autopilot.json \
 		--output runtime/research_cycle.json \
 		--state runtime/research_cycle_state.json \
-		--include-generated --generated-only --include-mutations \
+		--include-generated --include-mutations \
 		--generated-batch runtime/research/generated_hypotheses.json \
 		--mutation-batch runtime/mutation_hypotheses.json \
 		--research-factory-config config/research_factory.json

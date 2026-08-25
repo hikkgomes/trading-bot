@@ -4,7 +4,6 @@
   "quote_asset": "USDT",
   "discovery": {
     "mode": "all_trading_usdt_perpetuals",
-    "maximum_research_symbols": 25,
     "always_include": ["BTCUSDT"],
     "exclude": []
   },

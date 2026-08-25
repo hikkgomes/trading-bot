@@ -1,0 +1,3 @@
+# Linux agent security-domain lock. Keep the environment separate from both
+# runtime and research even when the dependency set is currently shared.
+-r requirements-research-linux.txt

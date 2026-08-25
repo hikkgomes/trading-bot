@@ -5,7 +5,7 @@ subclass decorated with ``@register`` from ``src.strategies.registry``, then
 import it below.
 """
 
-from src.strategies.library import (  # noqa: F401
+from src.strategies.library import (  # noqa: F401,E402,I001
     adx_trend,
     atr_channel_breakout,
     bollinger_reversion,

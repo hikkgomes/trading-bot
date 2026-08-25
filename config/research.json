@@ -1,0 +1,64 @@
+{
+  "schema": "research/v2",
+  "strategy_families": [
+    "named",
+    "generated_dsl",
+    "python",
+    "ml",
+    "relative_value",
+    "microstructure",
+    "agent"
+  ],
+  "search_budgets": {
+    "maximum_candidates_per_day": 100,
+    "maximum_cpu_minutes_per_job": 120,
+    "maximum_memory_mb": 3072,
+    "maximum_threads": 2,
+    "heavy_compute_slots": 1
+  },
+  "data_requirements": {
+    "point_in_time_universe": true,
+    "availability_timestamps": true,
+    "minimum_history_days": 365
+  },
+  "validation": {
+    "chronological_only": true,
+    "costs_required": true,
+    "portfolio_overlap_required": true,
+    "determinism_required": true,
+    "look_ahead_test_required": true
+  },
+  "evidence_policy": {
+    "version": "research-evidence/v1",
+    "minimum_cost_adjusted_return": 0.0001,
+    "minimum_deflated_sharpe": 0.95,
+    "minimum_walk_forward_windows": 3,
+    "minimum_walk_forward_pass_fraction": 0.67,
+    "maximum_backtest_overfitting_probability": 0.25,
+    "maximum_portfolio_correlation": 0.8,
+    "minimum_bootstrap_observations": 30,
+    "bootstrap_method": "moving_block_bootstrap_v1",
+    "multiple_testing_method": "bailey_lopez_de_prado_dsr_v1",
+    "pbo_method": "combinatorial_purged_pbo_v1"
+  },
+  "holdout": {
+    "protected": true,
+    "single_claim_per_strategy_version": true,
+    "adaptive_feedback": false
+  },
+  "model_families": ["scikit_learn", "lightgbm"],
+  "agent_permissions": {
+    "create_dsl": true,
+    "create_python": true,
+    "create_features": true,
+    "create_tests": true,
+    "run_bounded_research": true,
+    "submit_exchange_orders": false
+  },
+  "worker_node": "linux-optiplex",
+  "resource_limits": {
+    "maximum_patch_files": 40,
+    "maximum_patch_bytes": 524288,
+    "maximum_runtime_seconds": 7200
+  }
+}

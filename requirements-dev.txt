@@ -2,3 +2,4 @@
 # top of requirements.txt:  pip install -r requirements.txt -r requirements-dev.txt
 ruff==0.9.6
 pytest==9.0.3
+mypy==2.3.0

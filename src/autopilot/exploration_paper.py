@@ -427,9 +427,9 @@ def _signal_frequency(feedback: dict[str, Any]) -> dict[str, Any]:
     last = feedback.get("last_observed_at")
     observed_days = None
     try:
-        elapsed = dt.datetime.fromisoformat(str(last).replace("Z", "+00:00")) - dt.datetime.fromisoformat(
-            str(first).replace("Z", "+00:00")
-        )
+        elapsed = dt.datetime.fromisoformat(
+            str(last).replace("Z", "+00:00")
+        ) - dt.datetime.fromisoformat(str(first).replace("Z", "+00:00"))
         observed_days = elapsed.total_seconds() / 86_400
     except (TypeError, ValueError):
         pass
@@ -437,11 +437,11 @@ def _signal_frequency(feedback: dict[str, Any]) -> dict[str, Any]:
     return {
         "signals": signals,
         "signals_per_day": (
-            round(signals / observed_days, 6) if observed_days is not None and observed_days > 0 else None
+            round(signals / observed_days, 6)
+            if observed_days is not None and observed_days > 0
+            else None
         ),
-        "median_signal_gap_seconds": (
-            round(float(statistics.median(gaps)), 3) if gaps else None
-        ),
+        "median_signal_gap_seconds": (round(float(statistics.median(gaps)), 3) if gaps else None),
         "p95_signal_gap_seconds": round(float(p95), 3) if p95 is not None else None,
         "regime_coverage": round(
             max(

@@ -13,7 +13,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlparse
 
 import aiohttp
@@ -25,7 +25,9 @@ SCHEMA = "autopilot.market_event/v1"
 STATUS_SCHEMA = "autopilot.event_capture_status/v1"
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "event_capture.json"
 DEFAULT_STATUS = PROJECT_ROOT / "runtime" / "event_capture_status.json"
-ALLOWED_STREAMS = frozenset({"aggTrade", "trade", "bookTicker", "depth20@100ms", "markPrice@1s"})
+ALLOWED_STREAMS = frozenset(
+    {"aggTrade", "trade", "bookTicker", "depth20@100ms", "markPrice@1s", "kline_1m"}
+)
 ALLOWED_HOSTS = frozenset({"fstream.binance.com", "stream.binance.com"})
 MAX_EVENT_BYTES = 1024 * 1024
 
@@ -38,13 +40,14 @@ class EventSource:
     dynamic_universe: bool
     streams: tuple[str, ...]
     include_liquidations: bool
+    max_dynamic_symbols: int
 
 
 @dataclass(frozen=True)
 class EventCaptureConfig:
     path: Path
     root: Path
-    market_universe_report: Path
+    market_universe_report: Path | None
     max_dynamic_symbols: int
     max_file_bytes: int
     max_total_bytes: int
@@ -52,6 +55,7 @@ class EventCaptureConfig:
     flush_seconds: float
     queue_max_events: int
     sources: tuple[EventSource, ...]
+    data_tier_budgets: tuple[tuple[str, int], ...] = ()
 
 
 def _project_path(value: Any, *, field: str) -> Path:
@@ -88,6 +92,7 @@ def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig
         "retention_seconds",
         "flush_seconds",
         "queue_max_events",
+        "data_tiers",
         "sources",
     }
     if unknown := sorted(set(payload) - allowed):
@@ -116,6 +121,7 @@ def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig
                 "dynamic_universe",
                 "streams",
                 "include_liquidations",
+                "max_dynamic_symbols",
             }
         ):
             raise ValueError(f"sources[{index}] has unknown fields: {', '.join(unknown)}")
@@ -151,6 +157,11 @@ def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig
                 dynamic_universe=dynamic,
                 streams=tuple(map(str, streams)),
                 include_liquidations=liquidations,
+                max_dynamic_symbols=_positive_int(
+                    item.get("max_dynamic_symbols", payload.get("max_dynamic_symbols")),
+                    field=f"sources[{index}].max_dynamic_symbols",
+                    maximum=1_000,
+                ),
             )
         )
     max_file_bytes = _positive_int(
@@ -161,11 +172,28 @@ def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig
     )
     if max_total_bytes < max_file_bytes:
         raise ValueError("max_total_bytes must be at least max_file_bytes")
+    raw_tiers = payload.get("data_tiers", {})
+    if not isinstance(raw_tiers, dict):
+        raise ValueError("data_tiers must be an object")
+    data_tier_budgets: list[tuple[str, int]] = []
+    for name, value in sorted(raw_tiers.items()):
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("data_tiers names must be non-empty strings")
+        if isinstance(value, dict):
+            value = value.get("maximum_symbols")
+        data_tier_budgets.append(
+            (
+                name,
+                _positive_int(value, field=f"data_tiers.{name}", maximum=1_000_000),
+            )
+        )
     return EventCaptureConfig(
         path=path.resolve(),
         root=_project_path(payload.get("root"), field="root"),
-        market_universe_report=_project_path(
-            payload.get("market_universe_report"), field="market_universe_report"
+        market_universe_report=(
+            _project_path(payload.get("market_universe_report"), field="market_universe_report")
+            if payload.get("market_universe_report") is not None
+            else None
         ),
         max_dynamic_symbols=_positive_int(
             payload.get("max_dynamic_symbols"), field="max_dynamic_symbols", maximum=100
@@ -180,27 +208,53 @@ def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig
             payload.get("queue_max_events"), field="queue_max_events", maximum=1_000_000
         ),
         sources=tuple(sources),
+        data_tier_budgets=tuple(data_tier_budgets),
     )
 
 
 def _dynamic_symbols(config: EventCaptureConfig) -> tuple[str, ...]:
     path = config.market_universe_report
+    if path is None:
+        return ()
     if not path.exists():
         return ()
     if path.is_symlink() or not path.is_file():
         raise ValueError("market universe report must be a regular non-symlink file")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    symbols = payload.get("eligible_research_symbols") if isinstance(payload, dict) else None
+    symbols = (
+        payload.get("research_universe_symbols") or payload.get("eligible_research_symbols")
+        if isinstance(payload, dict)
+        else None
+    )
     if not isinstance(symbols, list):
         return ()
-    return tuple(str(symbol).upper() for symbol in symbols[: config.max_dynamic_symbols])
+    # The research universe is authoritative and complete. Per-stream source
+    # limits are collection-tier budgets applied by ``stream_names`` below,
+    # not strategy-eligibility filters.
+    return tuple(dict.fromkeys(str(symbol).upper() for symbol in symbols))
 
 
-def stream_names(source: EventSource, dynamic_symbols: tuple[str, ...] = ()) -> tuple[str, ...]:
-    symbols = tuple(
-        dict.fromkeys((*source.symbols, *(dynamic_symbols if source.dynamic_universe else ())))
-    )
-    names = [f"{symbol.lower()}@{stream}" for symbol in symbols for stream in source.streams]
+def stream_names(
+    source: EventSource,
+    dynamic_symbols: tuple[str, ...] = (),
+    *,
+    data_tier_budgets: tuple[tuple[str, int], ...] = (),
+) -> tuple[str, ...]:
+    all_symbols = tuple(dict.fromkeys((*source.symbols, *dynamic_symbols)))
+    budgets = dict(data_tier_budgets)
+    names: list[str] = []
+    for stream in source.streams:
+        if not source.dynamic_universe:
+            stream_symbols = source.symbols
+        else:
+            tier = (
+                "candles_funding_open_interest"
+                if stream in {"kline_1m", "markPrice@1s"}
+                else ("rotating_depth" if stream.startswith("depth") else "trades_best_bid_ask")
+            )
+            maximum = budgets.get(tier, source.max_dynamic_symbols)
+            stream_symbols = tuple(all_symbols[:maximum])
+        names.extend(f"{symbol.lower()}@{stream}" for symbol in stream_symbols)
     if source.include_liquidations:
         names.append("!forceOrder@arr")
     return tuple(names)
@@ -212,14 +266,19 @@ def normalize_event(*, market: str, stream: str, payload: Any, received_ns: int)
     liquidation_order = payload.get("o") if "forceOrder" in stream else None
     symbol = liquidation_order.get("s") if isinstance(liquidation_order, dict) else payload.get("s")
     event_time_ms = payload.get("E") or payload.get("T")
+    kline = payload.get("k") if isinstance(payload.get("k"), dict) else {}
+    close_time_ms = kline.get("T") if kline else event_time_ms
     return {
         "schema": SCHEMA,
         "received_ns": int(received_ns),
+        "receive_time_ns": int(received_ns),
         "received_at": dt.datetime.fromtimestamp(received_ns / 1_000_000_000, dt.UTC).isoformat(),
+        "availability_time_ns": int(received_ns),
         "market": market,
         "stream": stream,
         "symbol": str(symbol).upper() if symbol else None,
         "event_time_ms": int(event_time_ms) if event_time_ms is not None else None,
+        "close_time_ms": int(close_time_ms) if close_time_ms is not None else None,
         "payload": payload,
     }
 
@@ -331,6 +390,19 @@ class EventWriter:
         return {"removed_files": removed, "removed_bytes": removed_bytes, "total_bytes": total}
 
 
+class EventSink(Protocol):
+    events: int
+    bytes: int
+
+    def write(self, event: Mapping[str, Any]) -> None: ...
+
+    def flush(self) -> None: ...
+
+    def close(self) -> None: ...
+
+    def enforce_retention(self, *, now: float | None = None) -> dict[str, int]: ...
+
+
 async def _collect_source(
     session: aiohttp.ClientSession,
     source: EventSource,
@@ -376,30 +448,43 @@ async def capture(
     max_events: int | None = None,
     max_seconds: float | None = None,
     status_path: Path | None = None,
+    sink: EventSink | None = None,
+    dynamic_symbols: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(signum, stop.set)
-        except NotImplementedError:
+        except (NotImplementedError, RuntimeError):
             pass
-    dynamic = _dynamic_symbols(config)
+    dynamic = tuple(dict.fromkeys(str(symbol).upper() for symbol in dynamic_symbols))
     queue: asyncio.Queue = asyncio.Queue(maxsize=config.queue_max_events)
-    writer = EventWriter(config)
+    writer = sink or EventWriter(config)
     started = time.monotonic()
     last_status_write = 0.0
     last_event_ns: int | None = None
     retention = {"removed_files": 0, "removed_bytes": 0, "total_bytes": 0}
     source_status = [
-        {"market": source.market, "streams": len(stream_names(source, dynamic))}
+        {
+            "market": source.market,
+            "streams": len(
+                stream_names(source, dynamic, data_tier_budgets=config.data_tier_budgets)
+            ),
+        }
         for source in config.sources
     ]
     timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=120)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = [
             asyncio.create_task(
-                _collect_source(session, source, stream_names(source, dynamic), queue, stop)
+                _collect_source(
+                    session,
+                    source,
+                    stream_names(source, dynamic, data_tier_budgets=config.data_tier_budgets),
+                    queue,
+                    stop,
+                )
             )
             for source in config.sources
         ]

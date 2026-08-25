@@ -2257,6 +2257,71 @@ def test_ccxt_futures_entry_refuses_outstanding_orders_immediately_before_submit
     ]
 
 
+def test_ccxt_multi_symbol_mode_allows_an_unrelated_position_and_order():
+    class FakeClient:
+        def __init__(self):
+            self.created = []
+            self.open_order_calls = []
+
+        def fetch_ticker(self, symbol):
+            return {"last": 100.0}
+
+        def set_margin_mode(self, margin_mode, symbol):
+            return None
+
+        def set_leverage(self, leverage, symbol):
+            return None
+
+        def set_position_mode(self, hedged, symbol):
+            return None
+
+        def fetch_position_mode(self, symbol):
+            return {"hedged": False}
+
+        def fetch_open_orders(self, symbol, params):
+            self.open_order_calls.append((symbol, params))
+            return []
+
+        def fetch_positions(self, symbols):
+            if symbols == ["BTC/USDT:USDT"]:
+                return [_futures_settings_position()]
+            raise AssertionError("multi-symbol order must not require account flatness")
+
+        def create_order(self, **kwargs):
+            self.created.append(kwargs)
+            return {
+                "status": "closed",
+                "symbol": "BTC/USDT:USDT",
+                "side": "buy",
+                "type": "market",
+                "amount": 0.1,
+                "filled": 0.1,
+                "average": 100.0,
+                "fee": {"cost": 0.01},
+            }
+
+    from src.execution.ccxt_broker import CcxtBroker
+
+    client = FakeClient()
+    broker = CcxtBroker.__new__(CcxtBroker)
+    broker.config = ExchangeConfig(
+        exchange="binanceusdm",
+        market_type="futures",
+        live=True,
+        max_notional_usd=1_000,
+        max_futures_leverage=1,
+        allow_multi_symbol_positions=True,
+    )
+    broker.name = "fake"
+    broker._client = client
+
+    fill = broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=0.1))
+
+    assert fill.qty == pytest.approx(0.1)
+    assert client.open_order_calls == [("BTC/USDT:USDT", {})]
+    assert len(client.created) == 1
+
+
 def test_ccxt_places_binance_usdm_reduce_only_stop_market_and_validates_ack():
     client_id = "tb-sl-0123456789abcdef0123456789ab"
 

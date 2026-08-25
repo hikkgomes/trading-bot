@@ -225,9 +225,7 @@ def _validate_entry_payload(label: str, strategy: dict[str, Any], errors: list[s
         if regime not in {"all", "trend", "high_volatility", "low_volatility"}:
             errors.append(f"{label}: ml_regime is invalid.")
         close_feature = strategy.get("ml_regime_close_feature")
-        if close_feature is not None and (
-            not isinstance(close_feature, str) or not close_feature
-        ):
+        if close_feature is not None and (not isinstance(close_feature, str) or not close_feature):
             errors.append(f"{label}: ml_regime_close_feature must be a non-empty string.")
         payload = strategy.get("frozen_model")
         try:

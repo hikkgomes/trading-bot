@@ -52,4 +52,4 @@ secrets.json
 .claude/*.lock
 
 # ---- Data sets ----
-data/
+/data/

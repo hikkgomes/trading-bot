@@ -1,0 +1,4 @@
+# Linux production runtime lock. Keep this file separate from research so
+# execution services do not install plotting, model-search, or notebook code.
+-r requirements-bot.txt
+alembic==1.18.4
