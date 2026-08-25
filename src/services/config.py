@@ -373,3 +373,28 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
     holdout = _mapping(research.get("holdout"), field="research.holdout")
     if holdout.get("protected") is not True or holdout.get("adaptive_feedback") is not False:
         raise ValueError("protected holdout data must be excluded from adaptive feedback")
+    evidence_policy = _mapping(research.get("evidence_policy"), field="research.evidence_policy")
+    version = evidence_policy.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("research.evidence_policy.version must be non-empty")
+    for field in (
+        "minimum_cost_adjusted_return",
+        "minimum_deflated_sharpe",
+        "minimum_walk_forward_pass_fraction",
+        "maximum_backtest_overfitting_probability",
+        "maximum_portfolio_correlation",
+    ):
+        value = evidence_policy.get(field)
+        if (
+            not isinstance(value, int | float)
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or not 0.0 <= float(value) <= 1.0
+        ):
+            raise ValueError(f"research.evidence_policy.{field} must be finite in [0, 1]")
+    windows = evidence_policy.get("minimum_walk_forward_windows")
+    if not isinstance(windows, int) or isinstance(windows, bool) or windows < 3:
+        raise ValueError("research.evidence_policy.minimum_walk_forward_windows must be >= 3")
+    observations = evidence_policy.get("minimum_bootstrap_observations")
+    if not isinstance(observations, int) or isinstance(observations, bool) or observations < 30:
+        raise ValueError("research.evidence_policy.minimum_bootstrap_observations must be >= 30")

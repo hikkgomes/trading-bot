@@ -31,19 +31,39 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   for user in trading-runtime trading-research trading-agent trading-platform-owner; do
     usermod --append --groups trading-platform "$user"
   done
+  command -v setfacl >/dev/null 2>&1 || {
+    echo "Linux platform installation requires setfacl for service-specific write access." >&2
+    exit 1
+  }
   # Service accounts traverse the source tree and shared data parents. The
   # agent clones into its own writable root and only reads the source tree.
   chgrp trading-platform "$REPO"
-  chmod g+rx "$REPO"
+  chmod 0750 "$REPO"
   install -d -m 0750 -o root -g trading-runtime /etc/trading-platform
-  install -d -m 0750 -o trading-runtime -g trading-platform "$REPO/data"
-  install -d -m 0750 -o trading-runtime -g trading-platform "$REPO/runtime"
+  install -d -m 0750 -o root -g trading-platform "$REPO/data"
+  install -d -m 0750 -o root -g trading-platform "$REPO/runtime"
+  for directory in raw bars features; do
+    install -d -m 2770 -o trading-runtime -g trading-runtime "$REPO/data/$directory"
+  done
   install -d -m 2770 -o trading-runtime -g trading-platform "$REPO/runtime/backups"
   for directory in research artefacts reports; do
-    install -d -m 2770 -o trading-research -g trading-platform "$REPO/data/$directory"
+    install -d -m 2770 -o trading-research -g trading-research "$REPO/data/$directory"
   done
-  install -d -m 2770 -o trading-research -g trading-platform "$REPO/runtime/research"
-  install -d -m 2770 -o trading-agent -g trading-platform "$REPO/runtime/agent-worktrees"
+  install -d -m 2770 -o trading-research -g trading-research "$REPO/runtime/research"
+  install -d -m 2770 -o trading-agent -g trading-agent "$REPO/runtime/agent-worktrees"
+  # Common-group access is limited to traversal. ACLs grant research read
+  # access to market data and keep writes owned by the producing service.
+  setfacl -m u:trading-runtime:rwx,u:trading-research:rx,u:trading-agent:--x "$REPO/data"
+  setfacl -m u:trading-runtime:rwx,u:trading-research:rx "$REPO/runtime"
+  for directory in raw bars features; do
+    setfacl -m u:trading-research:rx "$REPO/data/$directory"
+    setfacl -m d:u:trading-research:rx "$REPO/data/$directory"
+  done
+  setfacl -m u:trading-runtime:rx "$REPO/data/research" "$REPO/data/artefacts" "$REPO/data/reports"
+  setfacl -m d:u:trading-runtime:rx "$REPO/data/research" "$REPO/data/artefacts" "$REPO/data/reports"
+  setfacl -m u:trading-runtime:rx "$REPO/runtime/research"
+  setfacl -m d:u:trading-runtime:rx "$REPO/runtime/research"
+  setfacl -m u:trading-agent:rwx "$REPO/runtime/agent-worktrees"
   install -m 0644 "$REPO/deploy/systemd/trading-platform@.service" \
     /etc/systemd/system/trading-platform@.service
   install -m 0644 "$REPO/deploy/systemd/trading-platform-research@.service" \

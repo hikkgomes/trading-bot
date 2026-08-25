@@ -179,7 +179,7 @@ def _measured_result(
     missing_data_gross = [value for index, value in enumerate(gross) if (index + 1) % 20]
     parameter_stability = _parameter_stability(candidate, context, gross)
     cross_symbol_stability = _cross_symbol_stability(context, gross)
-    portfolio_overlap = _portfolio_overlap(context)
+    portfolio_overlap = _portfolio_overlap(context, gross)
     walk_forward = _purged_walk_forward(gross, context)
     bootstrap_low, bootstrap_high = bootstrap_sharpe_ci(
         gross,
@@ -249,6 +249,7 @@ def _measured_result(
         context.get(name) is not None for name in ("feature_rows", "feature_vector", "market_frame")
     )
     measured = {
+        "evidence_policy_hash": context.get("evidence_policy_hash"),
         "compiled": True,
         "features_valid": bool(context.get("features_valid", feature_inputs)),
         "causality_valid": bool(
@@ -370,6 +371,11 @@ def _measured_result(
             candidate=candidate,
             dataset_snapshot_ids=snapshots,
             executor_version="provider-executors/v3",
+            evidence_policy_hash=(
+                str(context["evidence_policy_hash"])
+                if context.get("evidence_policy_hash") is not None
+                else None
+            ),
         ),
     )
 
@@ -541,7 +547,9 @@ def _cross_symbol_stability(
     }
 
 
-def _portfolio_overlap(context: Mapping[str, Any]) -> dict[str, Any]:
+def _portfolio_overlap(
+    context: Mapping[str, Any], candidate_returns: list[float]
+) -> dict[str, Any]:
     raw = context.get("active_strategy_returns", {})
     if not isinstance(raw, Mapping) or not raw:
         return {
@@ -552,7 +560,7 @@ def _portfolio_overlap(context: Mapping[str, Any]) -> dict[str, Any]:
             "comparisons": [],
             "reason": "missing_active_strategy_returns",
         }
-    candidate = _numeric_series(context.get("candidate_returns", context.get("returns", ())))
+    candidate = _numeric_series(context.get("candidate_returns", candidate_returns))
     comparisons: list[dict[str, Any]] = []
     maximum = 0.0
     for name, values in raw.items():
@@ -921,11 +929,17 @@ def _execute_semantic(candidate: Candidate, context: Mapping[str, Any]) -> Execu
 
 
 def execution_receipt(
-    *, candidate: Candidate, dataset_snapshot_ids: tuple[str, ...], executor_version: str
+    *,
+    candidate: Candidate,
+    dataset_snapshot_ids: tuple[str, ...],
+    executor_version: str,
+    evidence_policy_hash: str | None = None,
 ) -> dict[str, Any]:
     payload = {
         "candidate_id": candidate.candidate_id,
         "dataset_snapshot_ids": list(dataset_snapshot_ids),
         "executor_version": executor_version,
     }
+    if evidence_policy_hash is not None:
+        payload["evidence_policy_hash"] = evidence_policy_hash
     return {**payload, "input_hash": canonical_hash(payload)}

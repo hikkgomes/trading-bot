@@ -203,7 +203,13 @@ class ResearchCoordinator:
                     "stages": {
                         key: value
                         for key, value in stages.items()
-                        if key != CandidateState.PROTECTED_REJECTED.value
+                        if key
+                        not in {
+                            "protected",
+                            CandidateState.PROTECTED_REJECTED.value,
+                            "forward",
+                            "forward_paper",
+                        }
                     },
                 }
             )

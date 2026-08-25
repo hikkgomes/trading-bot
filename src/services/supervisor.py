@@ -772,7 +772,7 @@ def _research_cycle(
 
     all_handlers = DatabaseResearchJobHandlers(
         SqlResearchStore(database.engine),
-        artefact_store=PartitionedBacktestStore(parquet_root),
+        artefact_store=PartitionedBacktestStore(parquet_root / "research"),
         ml_runner=MlExperimentRunner(
             artefact_store=ModelArtefactStore(artefact_root / "models"),
             metadata_store=SqlModelArtefactStore(database.engine),

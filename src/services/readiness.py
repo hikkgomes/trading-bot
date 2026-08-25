@@ -146,15 +146,24 @@ def build_readiness(
                 maximum_age = float(state["maximum_state_age_seconds"])
                 source_ids = state.get("source_snapshot_ids")
                 source_ages: dict[str, float] = {}
+                source_observed_at: list[str] = []
                 if (
                     not isinstance(source_ids, dict)
                     or set(source_ids) != DatabasePortfolioStateWorker.REQUIRED_SOURCES
                 ):
                     raise ValueError("canonical state source identities are incomplete")
                 for source, source_id in source_ids.items():
+                    if (
+                        not isinstance(source_id, str)
+                        or not source_id.startswith("sha256:")
+                        or len(source_id) != 71
+                    ):
+                        raise ValueError(f"{source} source identity is invalid")
                     source_payload = source_store.get(str(source_id))
                     if source_payload.get("product_id") != product_id:
                         raise ValueError(f"{source} source belongs to another product")
+                    if source_payload.get("kind") not in {source, f"{source}_snapshot"}:
+                        raise ValueError(f"{source} source has the wrong kind")
                     source_observed = timestamp(
                         str(source_payload.get("observed_at", source_payload.get("created_at"))),
                         field=f"{source}.observed_at",
@@ -167,13 +176,22 @@ def build_readiness(
                         ).total_seconds(),
                     )
                     source_ages[source] = source_age
+                    source_observed_at.append(source_observed)
                     if source_age > maximum_age:
                         raise ValueError(f"{source} source is stale")
+                if source_observed_at and observed_at != max(source_observed_at):
+                    raise ValueError(
+                        "canonical portfolio state is not at the latest source timestamp"
+                    )
                 policy_ids = state.get("risk_policy_ids")
                 policy_hash = state.get("risk_policy_hash")
                 if not isinstance(policy_ids, list | tuple) or not policy_ids:
                     raise ValueError("risk policy identities are missing")
-                if not isinstance(policy_hash, str) or not policy_hash.startswith("sha256:"):
+                if (
+                    not isinstance(policy_hash, str)
+                    or not policy_hash.startswith("sha256:")
+                    or len(policy_hash) != 71
+                ):
                     raise ValueError("risk policy hash is missing")
                 state_details[product_id] = {
                     "state_id": state_id,

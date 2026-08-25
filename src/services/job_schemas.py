@@ -165,6 +165,10 @@ class ResearchJobRequest:
                 raise JobSchemaError(
                     f"research jobs require exactly one {expected_role} snapshot for {requested_stage}"
                 )
+            if requested_stage != "protected" and "protected_holdout" in dataset_roles.values():
+                raise JobSchemaError(
+                    "adaptive research jobs must not contain protected holdout snapshot identities"
+                )
         unsigned = dict(payload)
         unsigned.pop("content_hash", None)
         expected = canonical_hash(unsigned)
@@ -333,7 +337,7 @@ def validate_job_payload(name: str, payload: Mapping[str, Any]) -> dict[str, Any
     """
 
     if name == "evaluate_candidate":
-        research_request = ResearchJobRequest.from_mapping(payload)
+        research_request = ResearchJobRequest.from_mapping(payload, require_dataset_roles=True)
         return research_request.to_payload()
     if name == "risk_assessment":
         request = RiskAssessmentRequest.from_mapping(payload)

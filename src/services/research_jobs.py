@@ -220,11 +220,15 @@ class DatabaseResearchJobHandlers:
             )
             measured = dict(execution.evidence)
             accepted = self.evidence_policy.accepts("development", measured, ())
-            return accepted, {
+            sealed = {
                 "passed": accepted,
+                "evidence_hash": canonical_hash(measured),
                 "metrics": dict(execution.metrics),
                 "execution_receipt": dict(execution.receipt),
-                "cost_adjusted_return": measured.get("cost_adjusted_return"),
+            }
+            return accepted, {
+                "passed": accepted,
+                "sealed_result": sealed,
             }
 
         result = CanonicalResearchEvaluator(
@@ -485,7 +489,7 @@ def _assert_result_free_research_request(
         raise JobSchemaError(
             "research jobs cannot contain precomputed results: " + ", ".join(present)
         )
-    return ResearchJobRequest.from_mapping(payload)
+    return ResearchJobRequest.from_mapping(payload, require_dataset_roles=True)
 
 
 def _execution_receipt(request: ResearchJobRequest, *, executor_version: str) -> dict[str, Any]:

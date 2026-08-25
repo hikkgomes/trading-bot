@@ -15,7 +15,12 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
     agent = (ROOT / "deploy/systemd/trading-platform-agent@.service").read_text()
 
     assert "trading-platform" in installer
-    assert 'install -d -m 0750 -o trading-runtime -g trading-platform "$REPO/data"' in installer
+    assert 'install -d -m 0750 -o root -g trading-platform "$REPO/data"' in installer
+    assert (
+        'setfacl -m u:trading-runtime:rwx,u:trading-research:rx,u:trading-agent:--x "$REPO/data"'
+        in installer
+    )
+    assert 'setfacl -m u:trading-research:rx "$REPO/data/$directory"' in installer
     assert "/opt/trading-bot/data/artefacts" in research
     assert "/opt/trading-bot/data/reports" in research
     assert "/opt/trading-bot/runtime/research" in research
@@ -29,7 +34,12 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
 )
 def test_installed_service_users_can_traverse_and_write_their_real_paths() -> None:
     checks = {
-        "trading-runtime": ("/opt/trading-bot/data", "/opt/trading-bot/runtime"),
+        "trading-runtime": (
+            "/opt/trading-bot/data/raw",
+            "/opt/trading-bot/data/bars",
+            "/opt/trading-bot/data/features",
+            "/opt/trading-bot/runtime",
+        ),
         "trading-research": (
             "/opt/trading-bot/data/research",
             "/opt/trading-bot/data/artefacts",

@@ -476,9 +476,9 @@ class CanonicalResearchEvaluator:
 
     def evaluate(self, request: EvaluationRequest) -> StageEvaluation:
         candidate = self.store.get_candidate(request.candidate_id)
-        if tuple(request.dataset_snapshot_ids) != tuple(candidate.dataset_snapshot_hashes):
+        if not set(request.dataset_snapshot_ids).issubset(set(candidate.dataset_snapshot_hashes)):
             raise EvaluationContractError(
-                "dataset_snapshot_ids do not match the candidate's immutable dataset identities"
+                "dataset_snapshot_ids are not a subset of the candidate's immutable dataset identities"
             )
         existing_stages = {
             row["stage"]: row for row in self.validation.stages(request.candidate_id)
@@ -517,6 +517,14 @@ class CanonicalResearchEvaluator:
             "evidence_policy_hash": self.evidence_policy.policy_hash,
             "maximum_portfolio_correlation": self.evidence_policy.maximum_portfolio_correlation,
             "minimum_bootstrap_observations": self.evidence_policy.minimum_bootstrap_observations,
+            "walk_forward_windows": self.evidence_policy.minimum_walk_forward_windows,
+            "minimum_walk_forward_pass_fraction": (
+                self.evidence_policy.minimum_walk_forward_pass_fraction
+            ),
+            "maximum_backtest_overfitting_probability": (
+                self.evidence_policy.maximum_backtest_overfitting_probability
+            ),
+            "minimum_deflated_sharpe": self.evidence_policy.minimum_deflated_sharpe,
             "requested_stage": request.requested_stage,
             "evaluated_at": request.evaluated_at,
             "code_hash": request.code_hash or definition.source_hash,

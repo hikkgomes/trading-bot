@@ -33,7 +33,7 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-ReadWritePaths=/opt/trading-bot/data /opt/trading-bot/runtime
+ReadWritePaths=/opt/trading-bot/data/raw /opt/trading-bot/data/bars /opt/trading-bot/data/features /opt/trading-bot/runtime
 Slice=trading-platform-critical.slice
 
 [Install]

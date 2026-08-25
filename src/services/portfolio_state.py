@@ -388,27 +388,37 @@ class DatabasePortfolioStateWorker:
             assembled: dict[str, Any] = {
                 "kind": "canonical_portfolio_risk_state",
                 "product_id": str(claimed.payload["product_id"]),
-                "observed_at": str(claimed.payload["observed_at"]),
                 "source_snapshot_ids": dict(source_ids),
                 "risk_policy_hash": policy_hash,
             }
+            source_observed_at: list[str] = []
             for source, identity in source_ids.items():
                 snapshot = self.store.get(str(identity))
                 if snapshot.get("kind") not in {source, f"{source}_snapshot"}:
                     raise ValueError(f"portfolio state {source} snapshot has the wrong kind")
+                if str(snapshot.get("product_id") or "") != assembled["product_id"]:
+                    raise ValueError(
+                        f"portfolio state {source} snapshot belongs to another product"
+                    )
                 observed_at = snapshot.get("observed_at", snapshot.get("created_at"))
-                if (
-                    observed_at is not None
-                    and timestamp(str(observed_at), field=f"{source}.observed_at")
-                    > assembled["observed_at"]
-                ):
-                    raise ValueError(f"portfolio state {source} snapshot is from the future")
+                if observed_at is None:
+                    raise ValueError(f"portfolio state {source} snapshot has no timestamp")
+                source_observed_at.append(
+                    timestamp(str(observed_at), field=f"{source}.observed_at")
+                )
                 values = snapshot.get("values", snapshot)
                 if not isinstance(values, Mapping):
                     raise ValueError(f"portfolio state {source} snapshot has no values")
                 for key, value in values.items():
                     if key not in {"kind", "product_id", "observed_at", "created_at"}:
                         assembled[str(key)] = value
+            latest_source_at = max(source_observed_at)
+            claimed_observed_at = timestamp(
+                str(claimed.payload.get("observed_at")), field="observed_at"
+            )
+            if claimed_observed_at != latest_source_at:
+                raise ValueError("portfolio state observed_at is not the latest source timestamp")
+            assembled["observed_at"] = latest_source_at
             policy = claimed.payload.get("risk_policy")
             if not isinstance(policy, Mapping):
                 raise ValueError("portfolio state job requires immutable risk policy values")
