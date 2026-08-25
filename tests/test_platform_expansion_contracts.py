@@ -545,7 +545,21 @@ def test_real_registered_candidate_completes_adaptive_canonical_stages(tmp_path)
         "features_valid": True,
         "causality_valid": True,
         "symbol_returns": {"BTCUSDT": strategy_returns},
-        "active_strategy_returns": {"existing_strategy": [0.0 for _ in returns]},
+        "active_strategy_returns": {
+            "existing_strategy": [0.0001 if index % 2 else -0.0001 for index in range(len(returns))]
+        },
+        "negative_control_returns": {
+            name: [0.0 for _ in returns]
+            for name in (
+                "placebo_event_times",
+                "block_permutation",
+                "feature_ablation",
+                "parameter_neighbourhood",
+                "cross_instrument",
+                "predeclared_universe_holdout",
+                "synthetic_autocorrelated_null",
+            )
+        },
     }
     snapshot_id = "sha256:" + "a" * 64
     feature_id = "sha256:" + "b" * 64
@@ -654,7 +668,7 @@ def test_real_registered_candidate_completes_adaptive_canonical_stages(tmp_path)
         }
     )
     executors = ProviderExecutorRegistry.default()
-    policy = EvidencePolicy()
+    policy = EvidencePolicy(minimum_deflated_sharpe=0.0)
 
     evaluator = CanonicalResearchEvaluator(
         store,

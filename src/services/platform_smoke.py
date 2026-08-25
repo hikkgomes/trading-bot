@@ -245,7 +245,11 @@ def _product_fixture(
     ).run_once(now=now)
     order_groups = OrderGroupManager(SqlOrderGroupStore(database.engine))
     data_worker = DatabaseMarketDataWriter(
-        queue=queue, worker_id=workers_ids["data"], root=root / product_id
+        queue=queue,
+        worker_id=workers_ids["data"],
+        root=root / product_id,
+        snapshot_store=snapshots,
+        product_ids_by_market={market: (product_id,)},
     )
     feature_worker = DatabaseFeatureWorker(
         queue=queue,

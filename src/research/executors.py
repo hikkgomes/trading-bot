@@ -322,6 +322,13 @@ def _measured_result(
             "trial_sharpe_std": trial_sharpe_std,
             "trial_sharpes": trial_sharpes,
         },
+        "statistical_procedures": {
+            "bootstrap": str(context.get("bootstrap_method") or "moving_block_bootstrap_v1"),
+            "multiple_testing": str(
+                context.get("multiple_testing_method") or "bailey_lopez_de_prado_dsr_v1"
+            ),
+            "pbo": str(context.get("pbo_method") or "combinatorial_purged_pbo_v1"),
+        },
         "drawdown_stability": {"passed": bool(gross), "maximum_drawdown": _maximum_drawdown(gross)},
         "null_results": {
             "passed": all(item["passed"] for item in negative_controls.values()),
@@ -509,6 +516,14 @@ def _parameter_stability(
             "return": sum(comparable),
             "passed": bool(comparable) and sum(comparable) >= base_total * 0.5,
             "window_returns": _window_sums(comparable, 3),
+            "input_hash": canonical_hash(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "dataset_snapshot_ids": list(context.get("dataset_snapshot_ids", ())),
+                    "neighbour": name,
+                    "returns": comparable,
+                }
+            ),
         }
         results.append(result)
     return {
@@ -531,7 +546,14 @@ def _cross_symbol_stability(
                 per_symbol[str(symbol)] = {
                     "observations": len(numeric),
                     "return": sum(numeric),
-                    "passed": sum(numeric) >= 0.0,
+                    "passed": len(numeric) >= 2 and sum(numeric) >= 0.0,
+                    "input_hash": canonical_hash(
+                        {
+                            "symbol": str(symbol),
+                            "returns": numeric,
+                            "dataset_snapshot_ids": list(context.get("dataset_snapshot_ids", ())),
+                        }
+                    ),
                 }
     if not per_symbol:
         return {
@@ -563,15 +585,33 @@ def _portfolio_overlap(
     candidate = _numeric_series(context.get("candidate_returns", candidate_returns))
     comparisons: list[dict[str, Any]] = []
     maximum = 0.0
+    undefined = False
     for name, values in raw.items():
         other = _numeric_series(values)
         correlation = _correlation(candidate, other)
-        maximum = max(maximum, abs(correlation))
-        comparisons.append({"strategy": str(name), "correlation": correlation})
+        if correlation is None:
+            undefined = True
+        else:
+            maximum = max(maximum, abs(correlation))
+        comparisons.append(
+            {
+                "strategy": str(name),
+                "correlation": correlation,
+                "observations": min(len(candidate), len(other)),
+                "input_hash": canonical_hash(
+                    {
+                        "candidate_returns": candidate,
+                        "active_strategy": str(name),
+                        "active_returns": other,
+                        "dataset_snapshot_ids": list(context.get("dataset_snapshot_ids", ())),
+                    }
+                ),
+            }
+        )
     threshold = float(context.get("maximum_portfolio_correlation", 0.8))
     return {
-        "passed": maximum <= threshold,
-        "maximum_correlation": maximum,
+        "passed": bool(comparisons) and not undefined and maximum <= threshold,
+        "maximum_correlation": None if undefined else maximum,
         "threshold": threshold,
         "active_strategy_count": len(comparisons),
         "comparisons": comparisons,
@@ -610,17 +650,17 @@ def _purged_walk_forward(values: list[float], context: Mapping[str, Any]) -> dic
     }
 
 
-def _correlation(left: list[float], right: list[float]) -> float:
+def _correlation(left: list[float], right: list[float]) -> float | None:
     pairs = tuple(zip(left, right, strict=False))
     if len(pairs) < 2:
-        return 0.0
+        return None
     left_mean = statistics.fmean(item[0] for item in pairs)
     right_mean = statistics.fmean(item[1] for item in pairs)
     numerator = sum((a - left_mean) * (b - right_mean) for a, b in pairs)
     denominator = math.sqrt(
         sum((a - left_mean) ** 2 for a, _ in pairs) * sum((b - right_mean) ** 2 for _, b in pairs)
     )
-    return numerator / denominator if denominator else 0.0
+    return numerator / denominator if denominator else None
 
 
 def _skew_kurtosis(values: list[float]) -> tuple[float, float]:
@@ -681,65 +721,24 @@ def _negative_control_evidence(
     returns: list[float],
     candidate_return: float,
     control_returns: Any = None,
-) -> dict[str, dict[str, float | int | bool]]:
+) -> dict[str, dict[str, float | int | bool | str | None]]:
     aligned = min(len(signals), len(returns))
     signals, returns = signals[:aligned], returns[:aligned]
-    shifted = returns[1:] + returns[:1] if returns else []
-    controls: dict[str, float] = {
-        "block_permutation": sum(
-            signal * value for signal, value in zip(reversed(signals), returns, strict=True)
-        ),
-        "synthetic_autocorrelated_null": sum(
-            signal * (0.0001 if index % 2 == 0 else -0.0001) for index, signal in enumerate(signals)
-        ),
-        "placebo_event_times": sum(
-            signal * value for signal, value in zip(signals, shifted, strict=True)
-        ),
-        "feature_ablation": sum(
-            signal * value
-            for signal, value in zip(
-                signals,
-                _numeric_series(
-                    control_returns.get("feature_ablation", ())
-                    if isinstance(control_returns, Mapping)
-                    else ()
-                )[:aligned],
-                strict=False,
-            )
-        ),
-        "parameter_neighbourhood": sum(
-            signal * value
-            for signal, value in zip(
-                signals,
-                _numeric_series(
-                    control_returns.get("parameter_neighbourhood", ())
-                    if isinstance(control_returns, Mapping)
-                    else ()
-                )[:aligned],
-                strict=False,
-            )
-        ),
-        "predeclared_universe_holdout": sum(
-            signals[index] * returns[index] for index in range(aligned) if index % 2
-        ),
-        "cross_instrument": sum(
-            signals[index] * returns[index] for index in range(aligned) if index % 2 == 0
-        ),
-    }
-    if isinstance(control_returns, Mapping):
-        for name, values in control_returns.items():
-            numeric = _numeric_series(values)
-            if numeric:
-                controls[str(name)] = sum(numeric[:aligned])
-    return {
-        name: {
-            "passed": bool(aligned) and candidate_return >= value,
-            "observations": aligned,
-            "control_return": value,
+    supplied = control_returns if isinstance(control_returns, Mapping) else {}
+    results: dict[str, dict[str, float | int | bool | str | None]] = {}
+    for name in REQUIRED_NEGATIVE_CONTROLS:
+        numeric = _numeric_series(supplied.get(name))
+        comparable = numeric[:aligned]
+        control_return = sum(comparable) if comparable else None
+        results[name] = {
+            "passed": bool(comparable) and candidate_return >= float(control_return),
+            "observations": len(comparable),
+            "control_return": control_return,
+            "input_hash": canonical_hash({"control": name, "returns": comparable})
+            if comparable
+            else None,
         }
-        for name, value in controls.items()
-        if name in REQUIRED_NEGATIVE_CONTROLS
-    }
+    return results
 
 
 def _build_registered_context(

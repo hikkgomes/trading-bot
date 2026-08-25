@@ -250,6 +250,10 @@ class DatabaseFeatureWorker:
         references = payload.get("input_references")
         if not isinstance(references, Mapping):
             raise ValueError("feature input_references must be an object")
+        for name, reference in references.items():
+            if not isinstance(reference, Mapping):
+                raise ValueError(f"feature input reference {name} must be an object")
+            self._verify_input_reference(name=str(name), reference=reference)
         bar = references.get("bar_window")
         if not isinstance(bar, Mapping):
             raise ValueError("feature job requires a bar_window input reference")
@@ -303,15 +307,35 @@ class DatabaseFeatureWorker:
         for name, reference in references.items():
             if name == "bar_window" or not isinstance(reference, Mapping):
                 continue
+            reference_available = dt.datetime.fromisoformat(
+                str(reference.get("availability_time", payload["availability_time"]))
+            )
+            if reference_available > available_at:
+                raise ValueError(f"feature input reference {name} is not available")
+            reference_through = dt.datetime.fromisoformat(
+                str(reference.get("through_close_time", bar["through_close_time"]))
+            )
             auxiliary_rows = self._resolve_auxiliary_rows(
                 reference,
                 instrument_id=str(payload["instrument_id"]),
                 available_at=available_at,
-                through=through,
+                through=reference_through,
                 same_instrument=name != "cross_sectional",
             )
             _merge_auxiliary_inputs(resolved, name=str(name), rows=auxiliary_rows)
         return resolved
+
+    @staticmethod
+    def _verify_input_reference(*, name: str, reference: Mapping[str, Any]) -> None:
+        content_hash = reference.get("content_hash")
+        if (
+            not isinstance(content_hash, str)
+            or canonical_hash(
+                {str(key): value for key, value in reference.items() if key != "content_hash"}
+            )
+            != content_hash
+        ):
+            raise ValueError(f"feature input reference {name} has an invalid content hash")
 
     def _resolve_auxiliary_rows(
         self,

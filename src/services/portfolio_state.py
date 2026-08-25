@@ -109,17 +109,15 @@ class DatabasePortfolioSourceService:
             observed_at=market_at or observed_at,
             values={"market": market, "correlations": {}, "beta": {}},
         )
-        health_at = self._latest_heartbeat(now) or observed_at
+        health_values = self._health(now)
         self.publish(
             product_id=product_id,
             kind="health",
-            observed_at=health_at,
-            values={
-                "data_age_seconds": 0.0,
-                "clock_skew_seconds": 0.0,
-                "exchange_connected": True,
-                "database_healthy": self._database_healthy(),
-            },
+            # Heartbeat timestamps describe liveness, not a new portfolio
+            # input. Keep them out of the snapshot identity so an unchanged
+            # system does not publish a new canonical state every second.
+            observed_at=observed_at,
+            values=health_values,
         )
         drift_values, drift_at = self._drift(str(product["portfolio_id"]), now)
         self.publish(
@@ -178,15 +176,19 @@ class DatabasePortfolioSourceService:
             ).mappings()
         terminal = {"cancelled", "rejected", "expired", "reconciled", "filled"}
         latest: dict[str, dict[str, Any]] = {}
+        seen: set[str] = set()
         latest_at: str | None = None
         for row in rows:
             payload = row["payload"]
             if not isinstance(payload, dict) or str(payload.get("portfolio_id")) != portfolio_id:
                 continue
             order_id = str(payload["order_id"])
-            if order_id not in latest and str(row["status"]) not in terminal:
+            if order_id in seen:
+                continue
+            seen.add(order_id)
+            latest_at = latest_at or str(row["created_at"])
+            if str(row["status"]) not in terminal:
                 latest[order_id] = {**payload, "status": str(row["status"])}
-                latest_at = latest_at or str(row["created_at"])
         return tuple(latest[key] for key in sorted(latest)), latest_at
 
     def _market(self, product_id: str, at: str) -> tuple[dict[str, dict[str, float]], str | None]:
@@ -224,13 +226,46 @@ class DatabasePortfolioSourceService:
             latest_at = latest_at or str(row["created_at"])
         return market, latest_at
 
-    def _latest_heartbeat(self, at: str) -> str | None:
+    def _health(self, at: str) -> dict[str, Any]:
         with self.engine.connect() as connection:
-            return connection.execute(
-                select(service_heartbeat.c.observed_at)
+            rows = connection.execute(
+                select(
+                    service_heartbeat.c.service_name,
+                    service_heartbeat.c.node_id,
+                    service_heartbeat.c.observed_at,
+                    service_heartbeat.c.healthy,
+                    service_heartbeat.c.payload,
+                )
                 .where(service_heartbeat.c.observed_at <= at)
-                .order_by(service_heartbeat.c.observed_at.desc())
-            ).scalar()
+                .order_by(service_heartbeat.c.observed_at.desc(), service_heartbeat.c.id.desc())
+            ).mappings()
+        latest: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            service_name = str(row["service_name"])
+            # The state service must not use its own heartbeat as a source.
+            # Its heartbeat is written immediately before refresh_sources and
+            # would otherwise make every state identity wall-clock dependent.
+            if service_name == "portfolio-state-service":
+                continue
+            key = (service_name, str(row["node_id"]))
+            if key in latest:
+                continue
+            latest[key] = {
+                "healthy": bool(row["healthy"]),
+                "observed_at": str(row["observed_at"]),
+                "payload": dict(row["payload"]) if isinstance(row["payload"], dict) else {},
+            }
+        statuses = {
+            f"{service}@{node}": value["healthy"]
+            for (service, node), value in sorted(latest.items())
+        }
+        return {
+            "data_age_seconds": 0.0,
+            "clock_skew_seconds": 0.0,
+            "exchange_connected": all(statuses.values()) if statuses else True,
+            "database_healthy": self._database_healthy(),
+            "services": statuses,
+        }
 
     def _database_healthy(self) -> bool:
         try:

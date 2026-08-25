@@ -398,3 +398,9 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
     observations = evidence_policy.get("minimum_bootstrap_observations")
     if not isinstance(observations, int) or isinstance(observations, bool) or observations < 30:
         raise ValueError("research.evidence_policy.minimum_bootstrap_observations must be >= 30")
+    procedures = {
+        field: evidence_policy.get(field)
+        for field in ("bootstrap_method", "multiple_testing_method", "pbo_method")
+    }
+    if any(not isinstance(value, str) or not value.strip() for value in procedures.values()):
+        raise ValueError("research.evidence_policy statistical procedures must be named")

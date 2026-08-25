@@ -736,6 +736,9 @@ def _research_cycle(
                 "maximum_backtest_overfitting_probability",
                 "maximum_portfolio_correlation",
                 "minimum_bootstrap_observations",
+                "bootstrap_method",
+                "multiple_testing_method",
+                "pbo_method",
             )
             if key in raw_policy
         }
@@ -932,17 +935,17 @@ def run(args: argparse.Namespace) -> int:
             research_configuration=split_configuration["research"],
         )
     elif args.service == "agent-sandbox":
+        configured_worktree_root = os.environ.get("TRADING_PLATFORM_AGENT_WORKTREE_ROOT")
+        if not configured_worktree_root:
+            raise RuntimeError(
+                "TRADING_PLATFORM_AGENT_WORKTREE_ROOT must be configured for agent-sandbox"
+            )
         work = _agent_cycle(
             database=database,
             node_id=args.node,
             runtime=runtime,
             repository=Path.cwd(),
-            worktree_root=Path(
-                os.environ.get(
-                    "TRADING_PLATFORM_AGENT_WORKTREE_ROOT",
-                    "/var/tmp/trading-platform-agent-worktrees",
-                )
-            ),
+            worktree_root=Path(configured_worktree_root),
             research_configuration=split_configuration["research"],
         )
     else:

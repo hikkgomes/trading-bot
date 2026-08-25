@@ -163,6 +163,21 @@ class EvaluationRequest:
             roles = {str(key): str(value) for key, value in raw_roles.items()}
             if any(value not in allowed_roles for value in roles.values()):
                 raise EvaluationContractError("dataset_roles contains an unsupported role")
+            expected_role = {
+                "screening": "screening",
+                "development": "development",
+                "robustness": "robustness",
+                "protected": "protected_holdout",
+                "forward": "forward_observation",
+            }[stage]
+            if sum(value == expected_role for value in roles.values()) != 1:
+                raise EvaluationContractError(
+                    f"dataset_roles must contain exactly one {expected_role} snapshot"
+                )
+            if stage != "protected" and "protected_holdout" in roles.values():
+                raise EvaluationContractError(
+                    "adaptive evaluation cannot contain a protected_holdout snapshot"
+                )
         return cls(
             candidate_id=candidate_id,
             evaluation_policy_id=policy_id,
@@ -218,14 +233,17 @@ class StageEvaluation:
 class EvidencePolicy:
     """Typed acceptance thresholds for measured research evidence."""
 
-    minimum_cost_adjusted_return: float = 0.0
-    minimum_deflated_sharpe: float = 0.0
+    minimum_cost_adjusted_return: float = 0.0001
+    minimum_deflated_sharpe: float = 0.95
     minimum_walk_forward_windows: int = 3
-    minimum_walk_forward_pass_fraction: float = 0.5
-    maximum_backtest_overfitting_probability: float = 0.5
+    minimum_walk_forward_pass_fraction: float = 0.67
+    maximum_backtest_overfitting_probability: float = 0.25
     maximum_portfolio_correlation: float = 0.8
     minimum_bootstrap_observations: int = 30
     version: str = "research-evidence/v1"
+    bootstrap_method: str = "moving_block_bootstrap_v1"
+    multiple_testing_method: str = "bailey_lopez_de_prado_dsr_v1"
+    pbo_method: str = "combinatorial_purged_pbo_v1"
 
     @property
     def policy_hash(self) -> str:
@@ -239,6 +257,9 @@ class EvidencePolicy:
                 "maximum_backtest_overfitting_probability": self.maximum_backtest_overfitting_probability,
                 "maximum_portfolio_correlation": self.maximum_portfolio_correlation,
                 "minimum_bootstrap_observations": self.minimum_bootstrap_observations,
+                "bootstrap_method": self.bootstrap_method,
+                "multiple_testing_method": self.multiple_testing_method,
+                "pbo_method": self.pbo_method,
             }
         )
 
@@ -430,7 +451,7 @@ class ProtectedHoldoutWorker:
             source_hashes=source_hashes,
             claimed_at=evaluated_at,
         )
-        accepted, measured = self.evaluator(
+        accepted, result = self.evaluator(
             {
                 "claim_id": claim_id,
                 "strategy_version_id": strategy_version_id,
@@ -439,15 +460,18 @@ class ProtectedHoldoutWorker:
                 "source_hashes": dict(source_hashes),
             }
         )
-        if not isinstance(accepted, bool) or not isinstance(measured, Mapping) or not measured:
-            raise EvaluationContractError("protected evaluator returned no measured outcome")
+        if not isinstance(accepted, bool) or not isinstance(result, Mapping):
+            raise EvaluationContractError("protected evaluator returned an invalid sealed outcome")
+        sealed = result.get("sealed_result")
+        if not isinstance(sealed, Mapping) or not sealed:
+            raise EvaluationContractError("protected evaluator returned no sealed outcome")
         outcome_id = self.repository.record_outcome(
             claim_id=claim_id,
             evaluated_at=evaluated_at,
             accepted=accepted,
-            outcome=measured,
+            outcome=sealed,
         )
-        return claim_id, outcome_id, accepted, dict(measured)
+        return claim_id, outcome_id, accepted, dict(sealed)
 
 
 class CanonicalResearchEvaluator:
@@ -475,6 +499,24 @@ class CanonicalResearchEvaluator:
             return ()
 
     def evaluate(self, request: EvaluationRequest) -> StageEvaluation:
+        if request.dataset_roles:
+            expected_role = {
+                "screening": "screening",
+                "development": "development",
+                "robustness": "robustness",
+                "protected": "protected_holdout",
+                "forward": "forward_observation",
+            }[request.requested_stage]
+            if sum(role == expected_role for role in request.dataset_roles.values()) != 1:
+                raise EvaluationContractError(
+                    f"dataset_roles must contain exactly one {expected_role} snapshot"
+                )
+            if request.requested_stage != "protected" and "protected_holdout" in set(
+                request.dataset_roles.values()
+            ):
+                raise EvaluationContractError(
+                    "adaptive evaluation cannot contain a protected_holdout snapshot"
+                )
         candidate = self.store.get_candidate(request.candidate_id)
         if not set(request.dataset_snapshot_ids).issubset(set(candidate.dataset_snapshot_hashes)):
             raise EvaluationContractError(
@@ -507,13 +549,17 @@ class CanonicalResearchEvaluator:
                 for snapshot_id in request.dataset_snapshot_ids
                 if snapshot_id != protected_snapshot_id
             )
+        adaptive_roles = {
+            snapshot_id: request.dataset_roles[snapshot_id]
+            for snapshot_id in stage_snapshot_ids
+            if request.dataset_roles and snapshot_id in request.dataset_roles
+        }
         context = {
             "candidate_id": request.candidate_id,
             "strategy_version_id": definition.strategy_version_id,
             "evaluation_policy_id": request.evaluation_policy_id,
             "dataset_snapshot_ids": list(stage_snapshot_ids),
-            "protected_dataset_snapshot_id": protected_snapshot_id,
-            "dataset_roles": dict(request.dataset_roles or {}),
+            "dataset_roles": adaptive_roles,
             "evidence_policy_hash": self.evidence_policy.policy_hash,
             "maximum_portfolio_correlation": self.evidence_policy.maximum_portfolio_correlation,
             "minimum_bootstrap_observations": self.evidence_policy.minimum_bootstrap_observations,
@@ -525,6 +571,9 @@ class CanonicalResearchEvaluator:
                 self.evidence_policy.maximum_backtest_overfitting_probability
             ),
             "minimum_deflated_sharpe": self.evidence_policy.minimum_deflated_sharpe,
+            "bootstrap_method": self.evidence_policy.bootstrap_method,
+            "multiple_testing_method": self.evidence_policy.multiple_testing_method,
+            "pbo_method": self.evidence_policy.pbo_method,
             "requested_stage": request.requested_stage,
             "evaluated_at": request.evaluated_at,
             "code_hash": request.code_hash or definition.source_hash,
@@ -538,7 +587,10 @@ class CanonicalResearchEvaluator:
             "content_hash": request.content_hash,
         }
         evidence, accepted, reason_code, receipt, metrics = self._calculate_stage(
-            request.requested_stage, candidate, context
+            request.requested_stage,
+            candidate,
+            context,
+            protected_snapshot_id=protected_snapshot_id,
         )
         run_id = self.store.save_run(
             candidate_id=request.candidate_id,
@@ -582,7 +634,12 @@ class CanonicalResearchEvaluator:
         )
 
     def _calculate_stage(
-        self, stage: str, candidate, context: Mapping[str, Any]
+        self,
+        stage: str,
+        candidate,
+        context: Mapping[str, Any],
+        *,
+        protected_snapshot_id: str | None = None,
     ) -> tuple[
         dict[str, Any],
         bool,
@@ -671,13 +728,10 @@ class CanonicalResearchEvaluator:
                     "cost_model_id": str(context["cost_model_id"]),
                 }
                 if self.protected_worker is not None:
-                    claim_id, outcome_id, holdout_accepted, measured_outcome = (
+                    claim_id, outcome_id, holdout_accepted, sealed_outcome = (
                         self.protected_worker.claim_and_evaluate(
                             strategy_version_id=definition.strategy_version_id,
-                            dataset_snapshot_id=str(
-                                context.get("protected_dataset_snapshot_id")
-                                or context["dataset_snapshot_ids"][0]
-                            ),
+                            dataset_snapshot_id=str(protected_snapshot_id or ""),
                             cohort_id=f"protected:{context['candidate_id']}",
                             source_hashes=source_hashes,
                             evaluated_at=str(context["evaluated_at"]),
@@ -686,17 +740,14 @@ class CanonicalResearchEvaluator:
                 else:
                     claim_id = SqlHoldoutRepository(self.store.engine).claim(
                         strategy_version_id=definition.strategy_version_id,
-                        data_snapshot_id=str(
-                            context.get("protected_dataset_snapshot_id")
-                            or context["dataset_snapshot_ids"][0]
-                        ),
+                        data_snapshot_id=str(protected_snapshot_id or ""),
                         cohort_id=f"protected:{context['candidate_id']}",
                         source_hashes=source_hashes,
                         claimed_at=str(context["evaluated_at"]),
                     )
                     outcome_id = None
                     holdout_accepted = False
-                    measured_outcome = {}
+                    sealed_outcome = {}
             except Exception as exc:
                 return (
                     {
@@ -721,16 +772,16 @@ class CanonicalResearchEvaluator:
                 "identity": identity,
                 "frozen_cohort": bool(claims),
                 "holdout_claim": [row["id"] for row in claims],
-                "data_hashes": [
-                    str(
-                        context.get("protected_dataset_snapshot_id")
-                        or context["dataset_snapshot_ids"][0]
-                    )
-                ],
+                "data_commitment": canonical_hash(
+                    {
+                        "dataset_snapshot_id": protected_snapshot_id,
+                        "source_hashes": source_hashes,
+                    }
+                ),
                 "code_hash": context["code_hash"],
                 "holdout_outcome": dict(outcome) if isinstance(outcome, Mapping) else {},
                 "holdout_outcome_id": outcome_id,
-                "measured_holdout_outcome": measured_outcome,
+                "sealed_outcome": dict(sealed_outcome),
                 "context": dict(context),
             }
             accepted = bool(claims) and (

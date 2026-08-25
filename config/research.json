@@ -36,7 +36,10 @@
     "minimum_walk_forward_pass_fraction": 0.67,
     "maximum_backtest_overfitting_probability": 0.25,
     "maximum_portfolio_correlation": 0.8,
-    "minimum_bootstrap_observations": 30
+    "minimum_bootstrap_observations": 30,
+    "bootstrap_method": "moving_block_bootstrap_v1",
+    "multiple_testing_method": "bailey_lopez_de_prado_dsr_v1",
+    "pbo_method": "combinatorial_purged_pbo_v1"
   },
   "holdout": {
     "protected": true,

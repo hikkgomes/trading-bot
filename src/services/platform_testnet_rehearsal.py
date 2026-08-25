@@ -50,7 +50,10 @@ class PlatformTestnetRehearsal:
         has_pending_user_stream: Callable[[], bool],
         has_pending_accounting: Callable[[], bool],
         has_pending_recovery: Callable[[], bool],
+        maximum_drain_cycles: int = 100,
     ) -> None:
+        if isinstance(maximum_drain_cycles, bool) or maximum_drain_cycles <= 0:
+            raise ValueError("maximum_drain_cycles must be positive")
         self.active_assignment = active_assignment
         self.strategy_evaluator = strategy_evaluator
         self.portfolio = portfolio
@@ -62,6 +65,7 @@ class PlatformTestnetRehearsal:
         self.has_pending_user_stream = has_pending_user_stream
         self.has_pending_accounting = has_pending_accounting
         self.has_pending_recovery = has_pending_recovery
+        self.maximum_drain_cycles = maximum_drain_cycles
 
     def run(self, *, now: str) -> PlatformTestnetRehearsalReport:
         now = timestamp(now, field="now")
@@ -76,12 +80,22 @@ class PlatformTestnetRehearsal:
         stages.append(
             {"stage": "live_order_submission", **dict(self.live_execution.run_once(now=now))}
         )
-        while self.has_pending_user_stream():
-            stages.append({"stage": "user_stream", **dict(self.user_stream.run_once(now=now))})
-        while self.has_pending_accounting():
-            stages.append({"stage": "accounting", **dict(self.accounting.run_once(now=now))})
-        while self.has_pending_recovery():
-            stages.append({"stage": "recovery", **dict(self.recovery.run_once(now=now))})
+        for name, pending, worker in (
+            ("user_stream", self.has_pending_user_stream, self.user_stream),
+            ("accounting", self.has_pending_accounting, self.accounting),
+            ("recovery", self.has_pending_recovery, self.recovery),
+        ):
+            for _ in range(self.maximum_drain_cycles):
+                if not pending():
+                    break
+                stages.append({"stage": name, **dict(worker.run_once(now=now))})
+            else:
+                stages.append(
+                    {
+                        "stage": name,
+                        "reason_code": "rehearsal_drain_limit_exceeded",
+                    }
+                )
         required = {
             "active_assignment",
             "strategy_evaluation",
@@ -94,11 +108,10 @@ class PlatformTestnetRehearsal:
         }
         completed = {str(stage.get("stage")) for stage in stages}
         ok = required.issubset(completed) and all(
-            str(stage.get("reason_code", "")).endswith(
+            stage.get("ok") is True
+            or str(stage.get("reason_code", "")).endswith(
                 ("acknowledged", "recorded", "created", "loaded", "filled")
             )
-            or str(stage.get("reason_code", "")).endswith("filled")
-            or str(stage.get("reason_code", "")).endswith("recovery_plan_created")
             for stage in stages
         )
         return PlatformTestnetRehearsalReport(

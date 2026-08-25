@@ -187,23 +187,20 @@ class DatabaseMarketDataWriter:
         candle = raw_data["k"]
         source_event_time = _milliseconds_time(candle.get("t"), field="candle open time")
         source_close_time = _milliseconds_time(candle.get("T"), field="candle close time")
+        bar_reference = {
+            "kind": "partitioned_bar_window",
+            "relative_pattern": (
+                f"bars/{venue.lower()}/{market.lower()}/{symbol.upper()}/"
+                f"{str(candle['i']).lower()}/**/*.parquet"
+            ),
+            "through_close_time": source_close_time,
+            "minimum_history": 1,
+            "source_event_ids": [event.event_id],
+        }
         references: dict[str, Any] = {
             "bar_window": {
-                "kind": "partitioned_bar_window",
-                "relative_pattern": (
-                    f"bars/{venue.lower()}/{market.lower()}/{symbol.upper()}/"
-                    f"{str(candle['i']).lower()}/**/*.parquet"
-                ),
-                "through_close_time": source_close_time,
-                "minimum_history": 1,
-                "source_event_ids": [event.event_id],
-                "content_hash": canonical_hash(
-                    {
-                        "source_event_id": event.event_id,
-                        "source_close_time": source_close_time,
-                        "partition": f"{venue.lower()}/{market.lower()}/{symbol.upper()}/{str(candle['i']).lower()}",
-                    }
-                ),
+                **bar_reference,
+                "content_hash": canonical_hash(bar_reference),
             }
         }
         auxiliary_specs = {
