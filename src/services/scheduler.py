@@ -155,9 +155,10 @@ class DatabaseJobQueue:
                 .values(**values)
                 .on_conflict_do_nothing(index_elements=[job.c.id])
             )
+        statement = statement.returning(job.c.id)
         with self.engine.begin() as connection:
             result = connection.execute(statement)
-            inserted = result.rowcount == 1
+            inserted = result.scalar_one_or_none() is not None
             if inserted:
                 return True
             existing = connection.execute(select(job).where(job.c.id == job_id)).mappings().one()

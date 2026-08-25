@@ -19,13 +19,21 @@ from src.data.database import (
     trade_attribution,
 )
 from src.domain._codec import canonical_hash, json_value, timestamp
+from src.risk.engine import SqlRiskSnapshotStore
 from src.services.scheduler import DatabaseJobQueue
 
 
 class AccountingService:
-    def __init__(self, *, engine: Engine, ledgers: dict[str, Ledger]):
+    def __init__(
+        self,
+        *,
+        engine: Engine,
+        ledgers: dict[str, Ledger],
+        snapshot_store: SqlRiskSnapshotStore | None = None,
+    ):
         self.engine = engine
         self.ledgers = dict(ledgers)
+        self.snapshot_store = snapshot_store
 
     def record_nav(self, snapshot: NavSnapshot) -> str:
         payload = json_value(snapshot.__dict__, field="NAV snapshot")
@@ -39,12 +47,38 @@ class AccountingService:
         account_id: str,
         observed_at: str,
         balances: dict[str, float],
+        product_id: str | None = None,
     ) -> str:
         payload = json_value(
             {"account_id": account_id, "balances": balances}, field="balance snapshot"
         )
         identity = canonical_hash({**payload, "observed_at": observed_at})
         self._append(balance_snapshot, identity, observed_at, payload)
+        if self.snapshot_store is not None and product_id is not None:
+            self.snapshot_store.save(
+                {
+                    "kind": "balances",
+                    "product_id": product_id,
+                    "observed_at": observed_at,
+                    "values": {"balances": dict(balances)},
+                },
+                created_at=observed_at,
+            )
+            self.snapshot_store.save(
+                {
+                    "kind": "account",
+                    "product_id": product_id,
+                    "observed_at": observed_at,
+                    "values": {
+                        "used_margin_fraction": float(payload.get("used_margin_fraction", 0.0)),
+                        "liquidation_buffer_fraction": float(
+                            payload.get("liquidation_buffer_fraction", 1.0)
+                        ),
+                        "unknown_exposure": {},
+                    },
+                },
+                created_at=observed_at,
+            )
         return identity
 
     def record_funding(
@@ -143,6 +177,7 @@ class DatabaseAccountingWorker:
                     account_id=str(payload["account_id"]),
                     observed_at=str(payload["observed_at"]),
                     balances={str(key): float(value) for key, value in payload["balances"].items()},
+                    product_id=(str(payload["product_id"]) if payload.get("product_id") else None),
                 )
             elif kind == "nav":
                 identity = self.service.record_nav(NavSnapshot(**dict(payload["snapshot"])))

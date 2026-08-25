@@ -28,6 +28,7 @@ from src.execution.recovery import SqlRecoveryStore
 from src.observability.decision_trace import SqlDecisionTraceStore
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.research.datasets import CanonicalDatasetResolver, SqlCanonicalDatasetRepository
+from src.research.evaluation import EvidencePolicy
 from src.research.ml import MlExperimentRunner, ModelArtefactStore, SqlModelArtefactStore
 from src.research.store import SqlResearchStore
 from src.risk.engine import SqlRiskDecisionStore, SqlRiskPolicyStore, SqlRiskSnapshotStore
@@ -56,7 +57,10 @@ from src.services.portfolio_engine import (
     DatabaseProductCoordinator,
 )
 from src.services.portfolio_service import SqlPortfolioRepository
-from src.services.portfolio_state import DatabasePortfolioStateWorker
+from src.services.portfolio_state import (
+    DatabasePortfolioSourceService,
+    DatabasePortfolioStateWorker,
+)
 from src.services.promotion import (
     DatabasePromotionWorker,
     PromotionPolicy,
@@ -186,12 +190,20 @@ def _portfolio_state_cycle(
         capabilities=("portfolio_state_publish",),
         observed_at=utc_now(),
     )
+    products = _by_id(configuration["products"], collection="products", identity="product_id")
+    accounts = _by_id(configuration["accounts"], collection="accounts", identity="account_id")
+    source_service = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=SqlRiskSnapshotStore(database.engine),
+        products=products,
+        accounts=accounts,
+    )
     worker = DatabasePortfolioStateWorker(
         queue=queue,
         worker_id=worker_id,
         store=SqlRiskSnapshotStore(database.engine),
+        refresh_sources=source_service.refresh,
     )
-    products = _by_id(configuration["products"], collection="products", identity="product_id")
     policies = _portfolio_state_policies(configuration, products)
 
     def run_once() -> dict[str, Any]:
@@ -429,7 +441,11 @@ def _risk_cycle(
 
 
 def _data_writer_cycle(
-    *, database: PlatformDatabase, node_id: str, root: Path
+    *,
+    database: PlatformDatabase,
+    node_id: str,
+    root: Path,
+    configuration: Mapping[str, Mapping[str, Any]],
 ) -> Callable[[], dict[str, Any]]:
     queue = DatabaseJobQueue(database.engine)
     worker_id = f"{node_id}:data-writer"
@@ -440,10 +456,21 @@ def _data_writer_cycle(
         capabilities=("market_event_write",),
         observed_at=utc_now(),
     )
+    products = _by_id(configuration["products"], collection="products", identity="product_id")
+    accounts = _by_id(configuration["accounts"], collection="accounts", identity="account_id")
+    products_by_market: dict[str, list[str]] = {}
+    for product_id, product in products.items():
+        account = accounts[str(product["account_id"])]
+        market = {"spot": "spot", "usdt_futures": "futures"}.get(str(account["market"]))
+        if market is None:
+            raise ValueError(f"unsupported account market for {product_id}")
+        products_by_market.setdefault(market, []).append(product_id)
     worker = DatabaseMarketDataWriter(
         queue=queue,
         worker_id=worker_id,
         root=root,
+        snapshot_store=SqlRiskSnapshotStore(database.engine),
+        product_ids_by_market=products_by_market,
     )
     return lambda: worker.run_once(now=utc_now())
 
@@ -631,6 +658,7 @@ def _accounting_cycle(*, database: PlatformDatabase, node_id: str) -> Callable[[
     )
     service = AccountingService(
         engine=database.engine,
+        snapshot_store=SqlRiskSnapshotStore(database.engine),
         ledgers={
             product_id: Ledger(
                 product_id=product_id,
@@ -665,6 +693,7 @@ def _research_cycle(
     maximum_runtime_seconds: int,
     parquet_root: Path,
     artefact_root: Path,
+    research_configuration: Mapping[str, Any],
 ) -> Callable[[], dict[str, Any]]:
     job_names_by_service = {
         "research-worker": (
@@ -692,13 +721,52 @@ def _research_cycle(
         observed_at=utc_now(),
     )
     dataset_resolver = CanonicalDatasetResolver(SqlCanonicalDatasetRepository(database.engine))
+    raw_policy = research_configuration.get("evidence_policy", {})
+    if not isinstance(raw_policy, Mapping):
+        raise ValueError("research.evidence_policy must be an object")
+    evidence_policy = EvidencePolicy(
+        **{
+            key: raw_policy[key]
+            for key in (
+                "version",
+                "minimum_cost_adjusted_return",
+                "minimum_deflated_sharpe",
+                "minimum_walk_forward_windows",
+                "minimum_walk_forward_pass_fraction",
+                "maximum_backtest_overfitting_probability",
+                "maximum_portfolio_correlation",
+                "minimum_bootstrap_observations",
+            )
+            if key in raw_policy
+        }
+    )
 
     def load_research_dataset(kind: str, payload: Mapping[str, Any]) -> Any:
+        snapshot_ids = tuple(str(item) for item in payload["dataset_snapshot_ids"])
+        raw_roles = payload.get("dataset_roles")
+        allowed_roles = None
+        if isinstance(raw_roles, Mapping):
+            stage = str(payload.get("requested_stage") or "")
+            role = {
+                "screening": "screening",
+                "development": "development",
+                "robustness": "robustness",
+                "protected": "protected_holdout",
+                "forward": "forward_observation",
+            }.get(stage)
+            if role is not None:
+                snapshot_ids = tuple(
+                    snapshot_id
+                    for snapshot_id in snapshot_ids
+                    if str(raw_roles.get(snapshot_id)) == role
+                )
+                allowed_roles = frozenset({role})
         context = dataset_resolver.resolve_context(
-            snapshot_ids=tuple(str(item) for item in payload["dataset_snapshot_ids"]),
+            snapshot_ids=snapshot_ids,
             feature_manifest_id=str(payload["feature_manifest_id"]),
             cost_model_id=str(payload["cost_model_id"]),
             parameter_set_id=str(payload["parameter_set_id"]),
+            allowed_roles=allowed_roles,
         )
         return context.get(kind, context)
 
@@ -711,6 +779,7 @@ def _research_cycle(
         ),
         dataset_resolver=dataset_resolver,
         dataset_loader=load_research_dataset,
+        evidence_policy=evidence_policy,
     ).handlers()
     worker = ResearchWorker(
         runtime=runtime,
@@ -830,6 +899,7 @@ def run(args: argparse.Namespace) -> int:
             database=database,
             node_id=args.node,
             root=Path(config.paths["parquet"]),
+            configuration=split_configuration,
         )
     elif args.service in {"feature-service", "feature-build-worker"}:
         work = _feature_cycle(
@@ -859,6 +929,7 @@ def run(args: argparse.Namespace) -> int:
             ),
             parquet_root=Path(config.paths["parquet"]),
             artefact_root=Path(config.paths["artefacts"]),
+            research_configuration=split_configuration["research"],
         )
     elif args.service == "agent-sandbox":
         work = _agent_cycle(
@@ -931,7 +1002,13 @@ def run(args: argparse.Namespace) -> int:
             or reason_code == "market_gateway_running"
             or reason_code.endswith("queue_empty")
             or reason_code.endswith("paused")
-            or reason_code in {"service_waiting_for_input", "service_cycle_failed"}
+            or reason_code
+            in {
+                "service_waiting_for_input",
+                "service_cycle_failed",
+                "portfolio_state_waiting_for_source_snapshots",
+                "canonical_portfolio_state_published",
+            }
         ):
             time.sleep(args.interval_seconds)
     if market_gateway is not None:

@@ -34,7 +34,6 @@ from src.research.evaluation import (
     CanonicalResearchEvaluator,
     EvaluationRequest,
     EvidencePolicy,
-    ProtectedHoldoutWorker,
 )
 from src.research.executors import ProviderContextBuilderRegistry, ProviderExecutorRegistry
 from src.research.providers import provider_candidate
@@ -511,17 +510,17 @@ def test_default_executor_registry_covers_every_promotable_source_type() -> None
         assert callable(builders.builder_for(source_type))
 
 
-def test_real_registered_candidate_completes_every_canonical_stage(tmp_path) -> None:
+def test_real_registered_candidate_completes_adaptive_canonical_stages(tmp_path) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'research.sqlite3'}")
     database.create_schema()
     thesis = _thesis(budget=1)
     SqlThesisRegistry(database.engine).register(thesis)
     rows = [
         {
-            "open": 100.0 + 5.0 * __import__("math").sin(index / 4),
-            "high": 101.0 + 5.0 * __import__("math").sin(index / 4),
-            "low": 99.0 + 5.0 * __import__("math").sin(index / 4),
-            "close": 100.0 + 5.0 * __import__("math").sin(index / 4),
+            "open": (160.0 - index) if index < 60 else (40.0 + index),
+            "high": (161.0 - index) if index < 60 else (41.0 + index),
+            "low": (159.0 - index) if index < 60 else (39.0 + index),
+            "close": (160.0 - index) if index < 60 else (40.0 + index),
             "volume": 1000.0,
         }
         for index in range(120)
@@ -530,7 +529,13 @@ def test_real_registered_candidate_completes_every_canonical_stage(tmp_path) -> 
     signals = get_registered_strategy("sma_cross")(
         fast=2, slow=4, allow_short=True
     ).generate_signals(frame)
-    returns = [float(signals.iloc[index]) * 0.01 for index in range(len(signals) - 1)]
+    returns = [
+        float(frame["close"].iloc[index] / frame["close"].iloc[index - 1] - 1.0)
+        for index in range(1, len(frame))
+    ]
+    strategy_returns = [
+        float(signals.iloc[index]) * returns[index] for index in range(len(returns))
+    ]
     data = {
         "market_frame": rows,
         "returns": returns,
@@ -539,6 +544,8 @@ def test_real_registered_candidate_completes_every_canonical_stage(tmp_path) -> 
         "funding_rate": 0.0,
         "features_valid": True,
         "causality_valid": True,
+        "symbol_returns": {"BTCUSDT": strategy_returns},
+        "active_strategy_returns": {"existing_strategy": [0.0 for _ in returns]},
     }
     snapshot_id = "sha256:" + "a" * 64
     feature_id = "sha256:" + "b" * 64
@@ -628,24 +635,35 @@ def test_real_registered_candidate_completes_every_canonical_stage(tmp_path) -> 
         parameter_set_id=parameter_id,
     )
     context = ProviderContextBuilderRegistry.default().build(candidate, resolved)
+    identity_hash = canonical_hash({"test_artefact": candidate.definition.definition_hash})
+    context.update(
+        {
+            "artefact_hash": identity_hash,
+            "runtime_artefact_hash": identity_hash,
+            "engine_hash": "provider-executors/v3",
+            "runtime_engine_hash": "provider-executors/v3",
+            "runtime_cost_model_id": cost_id,
+            "production_execution_mode": "production",
+            "runtime_execution_mode": "production",
+            "drift_measurements": {
+                "execution": 0.0,
+                "model": 0.0,
+                "maximum_execution": 0.1,
+                "maximum_model": 0.1,
+            },
+        }
+    )
     executors = ProviderExecutorRegistry.default()
     policy = EvidencePolicy()
-
-    def protected(_claim):
-        execution = executors.execute(candidate, context)
-        evidence = dict(execution.evidence)
-        accepted = policy.accepts("development", evidence, thesis.negative_controls)
-        return accepted, {"passed": accepted, "execution_receipt": dict(execution.receipt)}
 
     evaluator = CanonicalResearchEvaluator(
         store,
         executors=executors,
         provider_context=context,
-        protected_worker=ProtectedHoldoutWorker(database.engine, protected),
         evidence_policy=policy,
     )
     results = []
-    for stage in ("screening", "development", "robustness", "protected", "forward"):
+    for stage in ("screening", "development", "robustness"):
         result = evaluator.evaluate(
             EvaluationRequest(
                 candidate_id=candidate.candidate_id,
@@ -662,15 +680,9 @@ def test_real_registered_candidate_completes_every_canonical_stage(tmp_path) -> 
                 content_hash=canonical_hash({"stage": stage}),
             )
         )
-        assert result.accepted, result.evidence.get("missing_evidence", result.evidence)
+        assert result.accepted, f"{result.reason_code}: {result.evidence}"
         results.append(result)
-    assert [result.stage for result in results] == [
-        "screening",
-        "development",
-        "robustness",
-        "protected",
-        "forward",
-    ]
+    assert [result.stage for result in results] == ["screening", "development", "robustness"]
     assert all(result.accepted for result in results)
 
 

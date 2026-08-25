@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,10 @@ from src.data.database import (
     feature_manifest,
     universe_snapshot,
 )
+from src.domain._codec import timestamp
+from src.risk.engine import SqlRiskSnapshotStore
 from src.services.config import load_platform_config, load_split_configuration
+from src.services.portfolio_state import DatabasePortfolioStateWorker
 
 
 def _check(name: str, ok: bool, *, detail: Any = None) -> dict[str, Any]:
@@ -36,7 +40,7 @@ def _regular_directory(path: Path) -> tuple[bool, str]:
 
 
 def build_readiness(
-    config_path: Path = Path("config/platform.json"), *, live: bool = False
+    config_path: Path = Path("config/platform.json"), *, live: bool = False, now: str | None = None
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     try:
@@ -94,6 +98,7 @@ def build_readiness(
         checks.append(_check(f"path:{name}", ok, detail=paths[name]))
 
     database = None
+    current = timestamp(now or dt.datetime.now(dt.UTC), field="now")
     try:
         database = PlatformDatabase(config.database_url())
         checks.append(_check("postgresql_authority", database.is_postgresql))
@@ -123,6 +128,72 @@ def build_readiness(
                     connection.execute(select(func.count()).select_from(experiment)).scalar_one()
                 ),
             }
+        source_store = SqlRiskSnapshotStore(database.engine)
+        state_details: dict[str, Any] = {}
+        for product in split["products"]["products"]:
+            product_id = str(product["product_id"])
+            try:
+                state_id, state = source_store.latest(
+                    kind="canonical_portfolio_risk_state", product_id=product_id, at=current
+                )
+                observed_at = timestamp(str(state["observed_at"]), field="state.observed_at")
+                age = max(
+                    0.0,
+                    (
+                        dt.datetime.fromisoformat(current) - dt.datetime.fromisoformat(observed_at)
+                    ).total_seconds(),
+                )
+                maximum_age = float(state["maximum_state_age_seconds"])
+                source_ids = state.get("source_snapshot_ids")
+                source_ages: dict[str, float] = {}
+                if (
+                    not isinstance(source_ids, dict)
+                    or set(source_ids) != DatabasePortfolioStateWorker.REQUIRED_SOURCES
+                ):
+                    raise ValueError("canonical state source identities are incomplete")
+                for source, source_id in source_ids.items():
+                    source_payload = source_store.get(str(source_id))
+                    if source_payload.get("product_id") != product_id:
+                        raise ValueError(f"{source} source belongs to another product")
+                    source_observed = timestamp(
+                        str(source_payload.get("observed_at", source_payload.get("created_at"))),
+                        field=f"{source}.observed_at",
+                    )
+                    source_age = max(
+                        0.0,
+                        (
+                            dt.datetime.fromisoformat(current)
+                            - dt.datetime.fromisoformat(source_observed)
+                        ).total_seconds(),
+                    )
+                    source_ages[source] = source_age
+                    if source_age > maximum_age:
+                        raise ValueError(f"{source} source is stale")
+                policy_ids = state.get("risk_policy_ids")
+                policy_hash = state.get("risk_policy_hash")
+                if not isinstance(policy_ids, list | tuple) or not policy_ids:
+                    raise ValueError("risk policy identities are missing")
+                if not isinstance(policy_hash, str) or not policy_hash.startswith("sha256:"):
+                    raise ValueError("risk policy hash is missing")
+                state_details[product_id] = {
+                    "state_id": state_id,
+                    "age_seconds": age,
+                    "maximum_age_seconds": maximum_age,
+                    "source_ages_seconds": source_ages,
+                    "risk_policy_ids": list(policy_ids),
+                    "risk_policy_hash": policy_hash,
+                }
+                if age > maximum_age:
+                    raise ValueError("canonical portfolio state is stale")
+            except Exception as exc:
+                state_details[product_id] = {"error": f"{type(exc).__name__}: {exc}"}
+        checks.append(
+            _check(
+                "canonical_portfolio_state_authority",
+                all("error" not in detail for detail in state_details.values()),
+                detail=state_details,
+            )
+        )
         checks.append(
             _check("canonical_tables", True, detail={"count": len(table_names), "rows": counts})
         )

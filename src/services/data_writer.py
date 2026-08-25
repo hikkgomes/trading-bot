@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,7 @@ from src.data.parquet_store import (
 )
 from src.domain._codec import canonical_hash
 from src.domain.market_events import ExchangeSequenceTracker, MarketEvent, MarketEventType
+from src.risk.engine import SqlRiskSnapshotStore
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -24,12 +27,19 @@ class DatabaseMarketDataWriter:
         queue: DatabaseJobQueue,
         worker_id: str,
         root: Path,
+        snapshot_store: SqlRiskSnapshotStore | None = None,
+        product_ids_by_market: Mapping[str, Iterable[str]] | None = None,
         lease_seconds: int = 60,
     ) -> None:
         self.queue = queue
         self.worker_id = worker_id
         self.store = PartitionedMarketEventStore(root)
         self.bar_store = PartitionedBarStore(root)
+        self.snapshot_store = snapshot_store
+        self.product_ids_by_market = {
+            str(market): tuple(str(product_id) for product_id in product_ids)
+            for market, product_ids in (product_ids_by_market or {}).items()
+        }
         self.lease_seconds = lease_seconds
         self.sequence_tracker = ExchangeSequenceTracker()
 
@@ -68,6 +78,7 @@ class DatabaseMarketDataWriter:
                 if _is_closed_candle(event)
                 else None
             )
+            market_snapshot_ids = self._publish_market_snapshots(event=event, market=market)
             feature_job_id = self._enqueue_closed_candle_features(
                 event=event,
                 venue=venue,
@@ -95,6 +106,7 @@ class DatabaseMarketDataWriter:
             "bar_path": str(bar_path) if bar_path is not None else None,
             "feature_job_id": feature_job_id,
             "sequence_status": sequence_status,
+            "market_snapshot_ids": list(market_snapshot_ids),
         }
 
     def _write_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -127,11 +139,39 @@ class DatabaseMarketDataWriter:
                 self._enqueue_closed_candle_features(
                     event=event, venue=venue, market=market, symbol=symbol
                 )
+        snapshot_ids = [
+            snapshot_id
+            for event, _venue, market, _symbol in events
+            for snapshot_id in self._publish_market_snapshots(event=event, market=market)
+        ]
         return {
             "segments": len(paths),
             "events": len(events),
             "paths": [str(path) for path in paths],
+            "market_snapshot_ids": snapshot_ids,
         }
+
+    def _publish_market_snapshots(self, *, event: MarketEvent, market: str) -> tuple[str, ...]:
+        if self.snapshot_store is None or not _is_closed_candle(event):
+            return ()
+        values = _market_snapshot_values(event)
+        if values is None:
+            return ()
+        return tuple(
+            self.snapshot_store.save(
+                {
+                    "kind": "market_data_input",
+                    "product_id": product_id,
+                    "instrument_id": event.instrument_id,
+                    "source_event_id": event.event_id,
+                    "source_event_time": event.exchange_timestamp,
+                    "availability_time": event.availability_timestamp,
+                    "values": values,
+                },
+                created_at=event.availability_timestamp,
+            )
+            for product_id in self.product_ids_by_market.get(market, ())
+        )
 
     def _enqueue_closed_candle_features(
         self,
@@ -147,19 +187,63 @@ class DatabaseMarketDataWriter:
         candle = raw_data["k"]
         source_event_time = _milliseconds_time(candle.get("t"), field="candle open time")
         source_close_time = _milliseconds_time(candle.get("T"), field="candle close time")
+        references: dict[str, Any] = {
+            "bar_window": {
+                "kind": "partitioned_bar_window",
+                "relative_pattern": (
+                    f"bars/{venue.lower()}/{market.lower()}/{symbol.upper()}/"
+                    f"{str(candle['i']).lower()}/**/*.parquet"
+                ),
+                "through_close_time": source_close_time,
+                "minimum_history": 1,
+                "source_event_ids": [event.event_id],
+                "content_hash": canonical_hash(
+                    {
+                        "source_event_id": event.event_id,
+                        "source_close_time": source_close_time,
+                        "partition": f"{venue.lower()}/{market.lower()}/{symbol.upper()}/{str(candle['i']).lower()}",
+                    }
+                ),
+            }
+        }
+        auxiliary_specs = {
+            "higher_timeframe": ("higher_timeframe_bars", ("candle",)),
+            "order_book": ("order_book_snapshot", ("best_bid_ask", "depth_update")),
+            "trade_flow": ("trade_flow_snapshot", ("trade", "aggregate_trade")),
+            "funding_open_interest": (
+                "funding_open_interest_snapshot",
+                ("funding_rate", "open_interest", "mark_price"),
+            ),
+            "cross_sectional": ("cross_sectional_snapshot", ("candle",)),
+            "sentiment": ("sentiment_snapshot", ()),
+            "ml_manifest": ("frozen_ml_manifest", ()),
+            "liquidation": ("liquidation_snapshot", ("liquidation",)),
+        }
+        for name, (kind, event_types) in auxiliary_specs.items():
+            pattern = (
+                f"raw/{venue.lower()}/{market.lower()}/candle/**/*.parquet"
+                if name == "cross_sectional"
+                else f"raw/{venue.lower()}/{market.lower()}/**/{symbol.upper()}/**/*.parquet"
+            )
+            reference = {
+                "kind": kind,
+                "relative_pattern": pattern,
+                "event_types": list(event_types),
+                "through_close_time": source_close_time,
+                "availability_time": event.availability_timestamp,
+                "source_event_ids": [],
+            }
+            references[name] = {
+                **reference,
+                "content_hash": canonical_hash(reference),
+            }
         payload = {
             "instrument_id": event.instrument_id,
             "feature_set_version": "core-bars-v1",
             "source_event_time": source_event_time,
             "source_close_time": source_close_time,
             "availability_time": event.availability_timestamp,
-            "inputs": {
-                "open": float(candle["o"]),
-                "high": float(candle["h"]),
-                "low": float(candle["l"]),
-                "close": float(candle["c"]),
-                "volume": float(candle["v"]),
-            },
+            "input_references": references,
             "venue": venue,
             "market": market,
             "symbol": symbol,
@@ -197,3 +281,25 @@ def _is_closed_candle(event: MarketEvent) -> bool:
         and isinstance(candle, dict)
         and candle.get("x") is True
     )
+
+
+def _market_snapshot_values(event: MarketEvent) -> dict[str, float] | None:
+    raw_data = event.payload.get("data")
+    candle = raw_data.get("k") if isinstance(raw_data, Mapping) else None
+    if not isinstance(candle, Mapping):
+        return None
+    values: dict[str, float] = {}
+    for name in ("c", "spread_bps", "visible_depth", "volatility", "funding"):
+        value = candle.get(name)
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(parsed):
+            return None
+        values[{"c": "close"}.get(name, name)] = parsed
+    if values["close"] <= 0 or values["visible_depth"] < 0:
+        return None
+    return values

@@ -26,6 +26,10 @@ class ArtefactDispatcher:
     def default(cls) -> ArtefactDispatcher:
         dispatcher = cls()
         dispatcher.register("registered_python", _registered_python)
+        dispatcher.register("parameter_search", _derived_registered_python)
+        dispatcher.register("mutation", _derived_registered_python)
+        dispatcher.register("crossover", _derived_registered_python)
+        dispatcher.register("agent_generated_python", _agent_registered_python)
         dispatcher.register("generated_dsl", _generated_dsl)
         dispatcher.register("machine_learning", _machine_learning)
         dispatcher.register("cross_sectional", _cross_sectional)
@@ -149,6 +153,26 @@ def _registered_python(
         value = _feature(features, str(term.get("feature") or ""))
         score += (value - float(term.get("centre", 0.0))) / scale * float(term.get("weight", 0.0))
     return _forecast(score, artefact)
+
+
+def _derived_registered_python(
+    features: Mapping[str, float], artefact: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Evaluate derived research families only through a sealed production rule."""
+    metadata = _definition(artefact).get("metadata")
+    if isinstance(metadata, Mapping) and metadata.get("derived_from") is not None:
+        if not isinstance(metadata.get("derived_from"), str):
+            raise ArtefactDispatchError("derived strategy lineage identity is invalid")
+    return _registered_python(features, artefact)
+
+
+def _agent_registered_python(
+    features: Mapping[str, float], artefact: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    metadata = _definition(artefact).get("metadata")
+    if not isinstance(metadata, Mapping) or not metadata.get("sandbox_receipt"):
+        raise ArtefactDispatchError("agent-generated strategy needs a verified sandbox receipt")
+    return _registered_python(features, artefact)
 
 
 def _generated_dsl(features: Mapping[str, float], artefact: Mapping[str, Any]) -> Mapping[str, Any]:

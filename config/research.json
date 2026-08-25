@@ -28,6 +28,16 @@
     "determinism_required": true,
     "look_ahead_test_required": true
   },
+  "evidence_policy": {
+    "version": "research-evidence/v1",
+    "minimum_cost_adjusted_return": 0.0001,
+    "minimum_deflated_sharpe": 0.95,
+    "minimum_walk_forward_windows": 3,
+    "minimum_walk_forward_pass_fraction": 0.67,
+    "maximum_backtest_overfitting_probability": 0.25,
+    "maximum_portfolio_correlation": 0.8,
+    "minimum_bootstrap_observations": 30
+  },
   "holdout": {
     "protected": true,
     "single_claim_per_strategy_version": true,

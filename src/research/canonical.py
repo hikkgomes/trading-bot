@@ -413,6 +413,13 @@ class SqlForwardEvidenceRepository:
                     f"strategy version does not exist: {strategy_version_id}"
                 )
             artefact = _assert_canonical_artifact(connection, artefact_hash)
+            created_at = artefact.get("created_at")
+            if not isinstance(created_at, str):
+                raise CanonicalEvidenceError("canonical artefact creation timestamp is missing")
+            if observed_at <= timestamp(created_at, field="artefact.created_at"):
+                raise CanonicalEvidenceError(
+                    "forward observation must occur after artefact creation"
+                )
             _assert_artefact_binding(
                 artefact,
                 strategy_version_id=strategy_version_id,

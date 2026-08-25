@@ -34,6 +34,11 @@ def test_research_request_has_only_immutable_input_identities() -> None:
         ResearchJobRequest.from_mapping({**_research_request(), "metrics": {"return": 1}})
 
 
+def test_production_research_requests_require_explicit_dataset_roles() -> None:
+    with pytest.raises(JobSchemaError, match="explicit dataset roles"):
+        ResearchJobRequest.from_mapping(_research_request(), require_dataset_roles=True)
+
+
 def test_risk_request_rejects_values_and_result_fields() -> None:
     payload = {
         "assessment_id": "assessment-1",

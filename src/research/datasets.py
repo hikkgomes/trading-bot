@@ -17,6 +17,18 @@ class DatasetResolutionError(RuntimeError):
     pass
 
 
+DATASET_ROLES = frozenset(
+    {
+        "screening",
+        "development",
+        "robustness",
+        "protected_holdout",
+        "forward_observation",
+        "unspecified",
+    }
+)
+
+
 @dataclass(frozen=True)
 class ResolvedDataset:
     snapshot_id: str
@@ -33,6 +45,7 @@ class ResolvedDataset:
     payload: Any
     model_artefact_id: str | None = None
     event_data_segment_ids: tuple[str, ...] = ()
+    role: str = "unspecified"
 
     def __post_init__(self) -> None:
         for attribute in (
@@ -70,6 +83,10 @@ class ResolvedDataset:
                 "event_data_segment_ids must contain unique SHA-256 identities"
             )
         object.__setattr__(self, "event_data_segment_ids", event_ids)
+        role = non_empty(self.role, field="role")
+        if role not in DATASET_ROLES:
+            raise DatasetResolutionError(f"unsupported dataset role: {role}")
+        object.__setattr__(self, "role", role)
         interval = json_value(dict(self.interval), field="dataset interval")
         if set(interval) != {"start", "end"}:
             raise DatasetResolutionError("dataset interval needs start and end")
@@ -103,6 +120,7 @@ class ResolvedDataset:
             "engine_version": self.engine_version,
             "model_artefact_id": self.model_artefact_id,
             "event_data_segment_ids": self.event_data_segment_ids,
+            "role": self.role,
         }
         return {**identities, "identity_hash": canonical_hash(identities)}
 
@@ -134,7 +152,14 @@ class CanonicalDatasetResolver:
         feature_manifest_id: str,
         cost_model_id: str,
         parameter_set_id: str,
+        allowed_roles: frozenset[str] | None = None,
+        forbidden_roles: frozenset[str] = frozenset(),
+        minimum_availability_timestamp: str | None = None,
     ) -> Mapping[str, Any]:
+        allowed_roles = None if allowed_roles is None else frozenset(allowed_roles)
+        unknown_roles = (allowed_roles or frozenset()) | forbidden_roles
+        if not unknown_roles.issubset(DATASET_ROLES):
+            raise DatasetResolutionError("dataset role filter contains an unsupported role")
         resolved = tuple(
             self.resolve(
                 snapshot_id,
@@ -146,6 +171,18 @@ class CanonicalDatasetResolver:
             )
             for snapshot_id in snapshot_ids
         )
+        if allowed_roles is not None and any(item.role not in allowed_roles for item in resolved):
+            raise DatasetResolutionError("dataset role is not permitted for this evaluation stage")
+        if any(item.role in forbidden_roles for item in resolved):
+            raise DatasetResolutionError("forbidden dataset role was resolved outside its boundary")
+        if minimum_availability_timestamp is not None:
+            minimum = timestamp(
+                minimum_availability_timestamp, field="minimum_availability_timestamp"
+            )
+            if any(item.availability_timestamp <= minimum for item in resolved):
+                raise DatasetResolutionError(
+                    "forward observation must become available after artefact creation"
+                )
         intervals = sorted((item.interval["start"], item.interval["end"]) for item in resolved)
         if any(intervals[index][0] < intervals[index - 1][1] for index in range(1, len(intervals))):
             raise DatasetResolutionError("immutable dataset information intervals overlap")
@@ -242,6 +279,7 @@ class SqlCanonicalDatasetRepository:
                 else None
             ),
             event_data_segment_ids=tuple(record.get("event_data_segment_ids", ())),
+            role=str(record.get("role", "unspecified")),
         )
 
 
@@ -260,5 +298,6 @@ _DATASET_METADATA_FIELDS = frozenset(
         "engine_version",
         "model_artefact_id",
         "event_data_segment_ids",
+        "role",
     }
 )

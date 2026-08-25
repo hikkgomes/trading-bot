@@ -607,11 +607,13 @@ class DatabaseUserStreamWorker:
             balances = _balance_update(event)
             accounting_job_id = None
             if balances:
+                product_id = self.account_products.get(record["account_id"])
                 accounting_payload = {
                     "kind": "balance",
                     "account_id": record["account_id"],
                     "observed_at": event.receive_timestamp,
                     "balances": balances,
+                    **({"product_id": product_id} if product_id is not None else {}),
                 }
                 accounting_job_id = "accounting:" + canonical_hash(accounting_payload).removeprefix(
                     "sha256:"

@@ -11,9 +11,9 @@ import json
 import os
 import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 import pyarrow as pa
@@ -149,11 +149,21 @@ class PartitionedMarketEventStore:
                 raise ValueError("market-event partition contains an unsafe token")
             partitions.setdefault(key, []).append(event)
         paths: list[Path] = []
-        for (venue, market, event_type, symbol, date), partition_events in sorted(partitions.items()):
-            ordered = tuple(sorted(partition_events, key=lambda item: (item.sequence, item.event_id)))
+        for (venue, market, event_type, symbol, date), partition_events in sorted(
+            partitions.items()
+        ):
+            ordered = tuple(
+                sorted(partition_events, key=lambda item: (item.sequence, item.event_id))
+            )
             digest = canonical_hash([item.event_id for item in ordered]).removeprefix("sha256:")
             destination = (
-                self.root / "raw" / venue / market / event_type / symbol / f"date={date}"
+                self.root
+                / "raw"
+                / venue
+                / market
+                / event_type
+                / symbol
+                / f"date={date}"
                 / f"batch-{digest}.parquet"
             )
             if destination.exists():
@@ -209,7 +219,9 @@ class DurableMarketBatchSpool:
         self._rows: list[dict[str, object]] = []
         self._bytes = 0
 
-    def append(self, event: MarketEvent, *, venue: str, market: str, symbol: str) -> MarketEventBatchSegment | None:
+    def append(
+        self, event: MarketEvent, *, venue: str, market: str, symbol: str
+    ) -> MarketEventBatchSegment | None:
         row = {
             "venue": venue,
             "market": market,
@@ -226,7 +238,9 @@ class DurableMarketBatchSpool:
     def flush(self) -> MarketEventBatchSegment | None:
         if not self._rows:
             return None
-        body = "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in self._rows)
+        body = "".join(
+            json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in self._rows
+        )
         content_hash = canonical_hash(body)
         destination = self.root / f"segment-{content_hash.removeprefix('sha256:')}.jsonl"
         temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
@@ -245,7 +259,9 @@ class DurableMarketBatchSpool:
         path = segment.path if isinstance(segment, MarketEventBatchSegment) else segment
         if path.is_symlink() or not path.is_file():
             raise ValueError("market batch segment must be a regular file")
-        rows = tuple(json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line)
+        rows = tuple(
+            json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line
+        )
         if not rows:
             raise ValueError("market batch segment is empty")
         return rows
@@ -300,6 +316,20 @@ class PartitionedBarStore:
                 "low": [float(candle["l"])],
                 "close": [float(candle["c"])],
                 "volume": [float(candle["v"])],
+                "spread_bps": [
+                    float(candle["spread_bps"]) if candle.get("spread_bps") is not None else None
+                ],
+                "visible_depth": [
+                    float(candle["visible_depth"])
+                    if candle.get("visible_depth") is not None
+                    else None
+                ],
+                "volatility": [
+                    float(candle["volatility"]) if candle.get("volatility") is not None else None
+                ],
+                "funding": [
+                    float(candle["funding"]) if candle.get("funding") is not None else None
+                ],
             }
         )
         try:

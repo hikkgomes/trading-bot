@@ -20,7 +20,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/trading-bot/data/research /opt/trading-bot/runtime
+ReadWritePaths=/opt/trading-bot/data/research /opt/trading-bot/data/artefacts /opt/trading-bot/data/reports /opt/trading-bot/runtime/research
 Slice=trading-platform-background.slice
 
 [Install]

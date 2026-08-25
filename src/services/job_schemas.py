@@ -107,6 +107,7 @@ class ResearchJobRequest:
     evaluated_at: str
     producer_identity: str
     content_hash: str
+    dataset_roles: dict[str, str] | None = None
 
     ALLOWED: ClassVar[frozenset[str]] = frozenset(
         {
@@ -120,11 +121,14 @@ class ResearchJobRequest:
             "evaluated_at",
             "producer_identity",
             "content_hash",
+            "dataset_roles",
         }
     )
 
     @classmethod
-    def from_mapping(cls, payload: Mapping[str, Any]) -> ResearchJobRequest:
+    def from_mapping(
+        cls, payload: Mapping[str, Any], *, require_dataset_roles: bool = False
+    ) -> ResearchJobRequest:
         _strict_fields(payload, cls.ALLOWED, name="research job")
         if RESULT_FIELDS & set(payload):
             fields = sorted(RESULT_FIELDS & set(payload))
@@ -146,6 +150,21 @@ class ResearchJobRequest:
         evaluated_at = timestamp(_required_text(payload, "evaluated_at"), field="evaluated_at")
         producer = _required_text(payload, "producer_identity")
         content_hash = _hash_id(payload, "content_hash")
+        dataset_roles = _parse_dataset_roles(payload.get("dataset_roles"), snapshots)
+        if require_dataset_roles and dataset_roles is None:
+            raise JobSchemaError("research jobs require explicit dataset roles")
+        if dataset_roles is not None:
+            expected_role = {
+                "screening": "screening",
+                "development": "development",
+                "robustness": "robustness",
+                "protected": "protected_holdout",
+                "forward": "forward_observation",
+            }[requested_stage]
+            if sum(role == expected_role for role in dataset_roles.values()) != 1:
+                raise JobSchemaError(
+                    f"research jobs require exactly one {expected_role} snapshot for {requested_stage}"
+                )
         unsigned = dict(payload)
         unsigned.pop("content_hash", None)
         expected = canonical_hash(unsigned)
@@ -162,6 +181,7 @@ class ResearchJobRequest:
             evaluated_at,
             producer,
             content_hash,
+            dataset_roles,
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -176,7 +196,27 @@ class ResearchJobRequest:
             "evaluated_at": self.evaluated_at,
             "producer_identity": self.producer_identity,
             "content_hash": self.content_hash,
+            **({"dataset_roles": dict(self.dataset_roles)} if self.dataset_roles else {}),
         }
+
+
+def _parse_dataset_roles(value: object, snapshots: tuple[str, ...]) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != set(snapshots):
+        raise JobSchemaError("dataset_roles must map every dataset snapshot identity to one role")
+    allowed = {
+        "screening",
+        "development",
+        "robustness",
+        "protected_holdout",
+        "forward_observation",
+        "unspecified",
+    }
+    result = {str(key): str(role) for key, role in value.items()}
+    if any(role not in allowed for role in result.values()):
+        raise JobSchemaError("dataset_roles contains an unsupported role")
+    return result
 
 
 @dataclass(frozen=True)
@@ -324,6 +364,7 @@ def validate_job_payload(name: str, payload: Mapping[str, Any]) -> dict[str, Any
                     "feature_ids",
                     "feature_set_version",
                     "market_data_snapshot_id",
+                    "input_reference_id",
                     "evaluated_at",
                     "horizon_seconds",
                     "producer_identity",
@@ -348,6 +389,8 @@ def validate_job_payload(name: str, payload: Mapping[str, Any]) -> dict[str, Any
         _hash_ids(clean, "feature_ids")
         if "market_data_snapshot_id" in clean:
             _hash_id(clean, "market_data_snapshot_id")
+        if "input_reference_id" in clean:
+            _hash_id(clean, "input_reference_id")
         return clean
     if name == "portfolio_target_build":
         return _strict_command(

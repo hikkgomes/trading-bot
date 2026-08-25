@@ -138,6 +138,10 @@ platform-readiness-live:  ## Check live platform readiness with PostgreSQL schem
 platform-smoke:  ## Run the PostgreSQL closed-event platform smoke for both products
 	$(PY) -m src.services.platform_smoke --database-url "$(TRADING_PLATFORM_DATABASE_URL)"
 
+.PHONY: platform-testnet-rehearsal
+platform-testnet-rehearsal:  ## Verify the platform live/user-stream/accounting/recovery rehearsal path
+	$(PY) -m pytest -q tests/test_platform_testnet_rehearsal.py
+
 .PHONY: platform-ci
 platform-ci:  ## Run the platform configuration, lint, migration, smoke, and test checks
 	$(MAKE) platform-validate

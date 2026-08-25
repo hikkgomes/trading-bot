@@ -45,7 +45,10 @@ from src.services.portfolio_engine import (
     DatabasePortfolioTargetWorker,
 )
 from src.services.portfolio_service import SqlPortfolioRepository
-from src.services.portfolio_state import DatabasePortfolioStateWorker
+from src.services.portfolio_state import (
+    DatabasePortfolioSourceService,
+    DatabasePortfolioStateWorker,
+)
 from src.services.risk_service import DatabaseRiskWorker
 from src.services.scheduler import DatabaseJobQueue
 from src.services.strategy_evaluator import DatabaseStrategyEvaluator
@@ -55,6 +58,7 @@ _STAGES = (
     "closed_candle",
     "features",
     "strategy_assignment",
+    "state",
     "alpha_forecast",
     "target_position",
     "risk_decision",
@@ -102,7 +106,7 @@ def _product_fixture(
     index: int,
 ) -> dict[str, Any]:
     product_id = str(product["product_id"])
-    observed = dt.datetime(2026, 8, 23, index, tzinfo=dt.UTC)
+    observed = dt.datetime(2026, 8, 23, tzinfo=dt.UTC)
     now = observed.isoformat()
     market = "spot" if product_id == "btc_accumulation" else "futures"
     instrument = Instrument(
@@ -164,7 +168,6 @@ def _product_fixture(
     assignments = SqlActiveStrategyAssignmentRepository(database.engine)
     snapshots = SqlRiskSnapshotStore(database.engine)
     _install_risk_policy(database, str(product["risk_policy_id"]))
-    _publish_state(queue, snapshots, workers_ids["state"], product, instrument, now, prefix)
 
     close_ms = int(observed.timestamp() * 1_000) - 1
     event = normalise_public_event(
@@ -184,6 +187,10 @@ def _product_fixture(
                 "l": "99750",
                 "c": "102000",
                 "v": "25",
+                "spread_bps": "1",
+                "visible_depth": "10000000",
+                "volatility": "0.2",
+                "funding": "0.0",
                 "x": True,
             },
         },
@@ -210,6 +217,32 @@ def _product_fixture(
         accounting_asset=str(product["base_accounting_asset"]),
         store=SqlLedgerStore(database.engine, product_id=product_id),
     )
+    queue.enqueue(
+        job_id=prefix + ":initial-balance",
+        name="accounting_event",
+        payload={
+            "kind": "balance",
+            "product_id": product_id,
+            "account_id": str(product["account_id"]),
+            "observed_at": now,
+            "balances": (
+                {"BTC": 0.01, "USDT": 1000.0}
+                if product_id == "btc_accumulation"
+                else {"USDT": 10000.0}
+            ),
+        },
+        available_at=now,
+    )
+    accounting_service = AccountingService(
+        engine=database.engine,
+        ledgers={product_id: ledger},
+        snapshot_store=snapshots,
+    )
+    initial_accounting = DatabaseAccountingWorker(
+        queue=queue,
+        worker_id=workers_ids["accounting"],
+        service=accounting_service,
+    ).run_once(now=now)
     order_groups = OrderGroupManager(SqlOrderGroupStore(database.engine))
     data_worker = DatabaseMarketDataWriter(
         queue=queue, worker_id=workers_ids["data"], root=root / product_id
@@ -280,9 +313,35 @@ def _product_fixture(
         trace_store=traces,
         order_groups=order_groups,
     )
+    data_result = data_worker.run_once(now=now)
+    feature_result = feature_worker.run_once(now=now)
+    source_service = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=snapshots,
+        products={product_id: product},
+        accounts=accounts,
+    )
+    state_worker = DatabasePortfolioStateWorker(
+        queue=queue,
+        worker_id=workers_ids["state"],
+        store=snapshots,
+        refresh_sources=source_service.refresh,
+    )
+    if (
+        state_worker.schedule_from_latest(
+            products={product_id: product},
+            state_policies={product_id: _smoke_state_policy(product, instrument)},
+            now=now,
+        )
+        != 1
+    ):
+        raise RuntimeError(f"{product_id} smoke did not schedule canonical portfolio state")
+    state_result = state_worker.run_once(now=now)
     results = {
-        "data": data_worker.run_once(now=now),
-        "feature": feature_worker.run_once(now=now),
+        "data": data_result,
+        "feature": feature_result,
+        "initial_accounting": initial_accounting,
+        "state": state_result,
         "strategy": strategy_worker.run_once(now=now),
         "portfolio": portfolio_worker.run_once(now=now),
         "risk": risk_worker.run_once(now=now),
@@ -314,7 +373,7 @@ def _product_fixture(
     accounting = DatabaseAccountingWorker(
         queue=queue,
         worker_id=workers_ids["accounting"],
-        service=AccountingService(engine=database.engine, ledgers={product_id: ledger}),
+        service=accounting_service,
     ).run_once(now=now)
     assessment = risk_store.assessment(str(results["risk"].get("assessment_id", "")))
     fee_entry_id = str(accounting.get("record_id", ""))
@@ -335,6 +394,7 @@ def _product_fixture(
         "closed_candle": int(results["data"].get("reason_code") == "market_event_written"),
         "features": int(results["feature"].get("features", 0)),
         "strategy_assignment": int(assignments.by_id(assignment_id) is not None),
+        "state": int(results["state"].get("reason_code") == "canonical_portfolio_state_published"),
         "alpha_forecast": len(repository.active_forecasts(product_id=product_id, at=now)),
         "target_position": len(
             repository.latest_targets(portfolio_id=str(product["portfolio_id"]))
@@ -372,11 +432,12 @@ def _seed_strategy(
     universe_snapshot_id: str,
     now: str,
     prefix: str,
+    strategy_name: str = "momentum_roc",
 ) -> str:
     product_id = str(product["product_id"])
-    feature_nodes, production_rule = registered_live_contract("momentum_roc")
+    feature_nodes, production_rule = registered_live_contract(strategy_name)
     definition = StrategyDefinition(
-        identity=prefix + ":momentum",
+        identity=prefix + ":" + strategy_name,
         version="smoke-v1",
         family="time_series",
         product=product_id,
@@ -384,7 +445,7 @@ def _seed_strategy(
         data_requirements={"bars": "1m", "closed_only": True},
         feature_graph={"version": "core-bars-v1", "required_nodes": list(feature_nodes)},
         signal_model={
-            "registered_strategy": "momentum_roc",
+            "registered_strategy": strategy_name,
             "parameters": {},
             "production_rule": production_rule,
         },
@@ -505,59 +566,8 @@ def _install_risk_policy(database: PlatformDatabase, policy_id: str) -> None:
     )
 
 
-def _publish_state(
-    queue: DatabaseJobQueue,
-    snapshots: SqlRiskSnapshotStore,
-    worker_id: str,
-    product: dict[str, Any],
-    instrument: Instrument,
-    now: str,
-    prefix: str,
-) -> None:
-    product_id = str(product["product_id"])
-    values = {
-        "balances": {"balances": {"BTC": 0.01, "USDT": 1000.0}},
-        "positions": {"positions": {}},
-        "open_orders": {"open_orders": []},
-        "account": {
-            "used_margin_fraction": 0.0,
-            "liquidation_buffer_fraction": 1.0,
-            "unknown_exposure": {},
-        },
-        "market": {
-            "market": {
-                instrument.instrument_id: {
-                    "price": 102000.0,
-                    "spread_bps": 1.0,
-                    "visible_depth": 1e7,
-                    "volatility": 0.2,
-                    "funding": 0.0,
-                }
-            },
-            "correlations": {},
-            "beta": {instrument.instrument_id: 0.0},
-        },
-        "health": {
-            "data_age_seconds": 0.0,
-            "clock_skew_seconds": 0.0,
-            "exchange_connected": True,
-            "database_healthy": True,
-        },
-        "drift": {"execution_drift": False, "model_drift": False},
-    }
-    source_ids = {
-        name: snapshots.save(
-            {
-                "kind": f"{name}_snapshot",
-                "product_id": product_id,
-                "observed_at": now,
-                "values": item,
-            },
-            created_at=now,
-        )
-        for name, item in values.items()
-    }
-    policy = {
+def _smoke_state_policy(product: dict[str, Any], instrument: Instrument) -> dict[str, Any]:
+    return {
         "maximum_state_age_seconds": 5,
         "product_drawdown_fraction": 0.0,
         "daily_pnl_fraction": 0.0,
@@ -576,22 +586,6 @@ def _publish_state(
         "cluster_fraction_caps": {"btc": 1.0},
         "trades_today": 0,
     }
-    queue.enqueue(
-        job_id=prefix + ":state",
-        name="portfolio_state_publish",
-        payload={
-            "product_id": product_id,
-            "observed_at": now,
-            "source_snapshot_ids": source_ids,
-            "risk_policy": policy,
-        },
-        available_at=now,
-    )
-    result = DatabasePortfolioStateWorker(
-        queue=queue, worker_id=worker_id, store=snapshots
-    ).run_once(now=now)
-    if result.get("reason_code") != "canonical_portfolio_state_published":
-        raise RuntimeError(f"portfolio state smoke failed: {result}")
 
 
 def main(argv: list[str] | None = None) -> None:

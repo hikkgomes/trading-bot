@@ -153,24 +153,67 @@ class DatabaseResearchJobHandlers:
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
     ) -> dict[str, Any]:
         renew()
-        ResearchJobRequest.from_mapping(claimed.payload)
+        ResearchJobRequest.from_mapping(claimed.payload, require_dataset_roles=True)
         request = EvaluationRequest.from_payload(claimed.payload)
         if self.dataset_resolver is None:
             raise JobSchemaError("candidate evaluation requires a canonical dataset resolver")
-        resolved_context = self.dataset_resolver.resolve_context(
-            snapshot_ids=request.dataset_snapshot_ids,
-            feature_manifest_id=str(request.feature_manifest_id),
-            cost_model_id=str(request.cost_model_id),
-            parameter_set_id=str(request.parameter_set_id),
-        )
+        resolver = self.dataset_resolver
         candidate = self.store.get_candidate(request.candidate_id)
-        context = self.context_builders.build(candidate, resolved_context)
+        adaptive_snapshot_ids = request.snapshot_ids_for_stage(request.requested_stage)
+        if request.requested_stage == "protected":
+            adaptive_snapshot_ids = tuple(
+                snapshot_id
+                for snapshot_id in request.dataset_snapshot_ids
+                if snapshot_id
+                != (
+                    request.protected_snapshot_id()
+                    if request.dataset_roles
+                    else request.dataset_snapshot_ids[0]
+                )
+            )
+        if adaptive_snapshot_ids:
+            resolved_context = resolver.resolve_context(
+                snapshot_ids=adaptive_snapshot_ids,
+                feature_manifest_id=str(request.feature_manifest_id),
+                cost_model_id=str(request.cost_model_id),
+                parameter_set_id=str(request.parameter_set_id),
+                allowed_roles=(
+                    frozenset(
+                        {
+                            request.dataset_roles[snapshot_id]
+                            for snapshot_id in adaptive_snapshot_ids
+                        }
+                    )
+                    if request.dataset_roles
+                    else None
+                ),
+                minimum_availability_timestamp=(
+                    request.evaluated_at if request.requested_stage == "forward" else None
+                ),
+            )
+            context = self.context_builders.build(candidate, resolved_context)
+        else:
+            context = {
+                "candidate_id": request.candidate_id,
+                "dataset_snapshot_ids": [],
+                "feature_manifest_id": str(request.feature_manifest_id),
+                "cost_model_id": str(request.cost_model_id),
+                "parameter_set_id": str(request.parameter_set_id),
+            }
 
-        def evaluate_protected(_claim: Mapping[str, Any]) -> tuple[bool, Mapping[str, Any]]:
+        def evaluate_protected(claim: Mapping[str, Any]) -> tuple[bool, Mapping[str, Any]]:
+            protected_context = resolver.resolve_context(
+                snapshot_ids=(str(claim["dataset_snapshot_id"]),),
+                feature_manifest_id=str(request.feature_manifest_id),
+                cost_model_id=str(request.cost_model_id),
+                parameter_set_id=str(request.parameter_set_id),
+                allowed_roles=(frozenset({"protected_holdout"}) if request.dataset_roles else None),
+            )
+            frozen_context = self.context_builders.build(candidate, protected_context)
             execution = self.executors.execute(
                 candidate,
                 {
-                    **context,
+                    **frozen_context,
                     "requested_stage": "protected",
                     "evaluated_at": request.evaluated_at,
                 },

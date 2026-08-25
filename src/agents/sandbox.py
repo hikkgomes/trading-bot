@@ -185,8 +185,22 @@ class IsolatedGitWorktree:
         self.worktree_root.mkdir(parents=True, exist_ok=True)
         self.path = Path(tempfile.mkdtemp(prefix="agent-worktree-", dir=self.worktree_root))
         subprocess.run(
-            ["git", "worktree", "add", "--detach", str(self.path), self.base_ref],
-            cwd=self.repository,
+            [
+                "git",
+                "clone",
+                "--no-local",
+                "--no-hardlinks",
+                str(self.repository),
+                str(self.path),
+            ],
+            cwd=self.worktree_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "--detach", self.base_ref],
+            cwd=self.path,
             check=True,
             capture_output=True,
             text=True,
@@ -196,12 +210,5 @@ class IsolatedGitWorktree:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         if self.path is None:
             return
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(self.path)],
-            cwd=self.repository,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
         if self.path.exists():
             shutil.rmtree(self.path)

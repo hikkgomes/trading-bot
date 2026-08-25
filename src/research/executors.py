@@ -140,6 +140,13 @@ class ProviderExecutorRegistry:
 def _measured_result(
     candidate: Candidate, context: Mapping[str, Any], output: Any
 ) -> ExecutionResult:
+    from src.metrics import (
+        bootstrap_sharpe_ci,
+        deflated_sharpe_ratio,
+        probability_backtest_overfitting,
+        sharpe_ratio,
+    )
+
     snapshots = tuple(str(item) for item in context.get("dataset_snapshot_ids", ()))
     if not snapshots:
         raise ExecutorError("executor requires canonical dataset snapshot identities")
@@ -161,53 +168,117 @@ def _measured_result(
     slippage = turnover * slippage_rate
     funding = sum(abs(signals[index]) for index in range(aligned)) * funding_rate
     net_return = sum(gross) - fees - slippage - funding
-    sharpe = _sharpe(gross)
     window_returns = _window_sums(gross, 3)
-    passed_windows = sum(value >= 0 for value in window_returns)
-    pass_fraction = passed_windows / len(window_returns) if window_returns else 0.0
     negative_controls = _negative_control_evidence(
         signals=signals[:aligned],
         returns=returns[:aligned],
         candidate_return=net_return,
+        control_returns=context.get("negative_control_returns"),
     )
     delayed_gross = [signals[index - 1] * returns[index] for index in range(1, aligned)]
     missing_data_gross = [value for index, value in enumerate(gross) if (index + 1) % 20]
+    parameter_stability = _parameter_stability(candidate, context, gross)
+    cross_symbol_stability = _cross_symbol_stability(context, gross)
+    portfolio_overlap = _portfolio_overlap(context)
+    walk_forward = _purged_walk_forward(gross, context)
+    bootstrap_low, bootstrap_high = bootstrap_sharpe_ci(
+        gross,
+        n_boot=int(context.get("bootstrap_iterations", 1_000)),
+        random_state=int(candidate.candidate_id[7:15], 16),
+    )
+    strategy_window_returns = context.get("strategy_window_returns")
+    if isinstance(strategy_window_returns, list | tuple):
+        pbo_matrix = [
+            _numeric_series(row) for row in strategy_window_returns if _numeric_series(row)
+        ]
+    else:
+        pbo_matrix = []
+    if len(pbo_matrix) < 2:
+        pbo_matrix = [
+            _numeric_series(item.get("window_returns"))
+            for item in parameter_stability["results"]
+            if isinstance(item, Mapping) and _numeric_series(item.get("window_returns"))
+        ]
+        pbo_matrix.insert(0, window_returns)
+    width = min((len(row) for row in pbo_matrix), default=0)
+    pbo_matrix = [row[:width] for row in pbo_matrix if width >= 2]
+    pbo = 1.0 if len(pbo_matrix) < 2 else probability_backtest_overfitting(pbo_matrix)
+    skew, kurtosis = _skew_kurtosis(gross)
+    trial_sharpes = _trial_sharpes(context, parameter_stability, gross)
+    trial_count = max(
+        1,
+        int(
+            context.get(
+                "trial_count", len(trial_sharpes) or parameter_stability["neighbours_tested"] + 1
+            )
+        ),
+    )
+    trial_sharpe_std = float(context.get("trial_sharpe_std", 0.0))
+    if "trial_sharpe_std" not in context and len(trial_sharpes) >= 2:
+        trial_sharpe_std = statistics.pstdev(trial_sharpes)
+    dsr = deflated_sharpe_ratio(
+        sharpe_ratio(gross),
+        n_trials=trial_count,
+        skew=skew,
+        kurt=kurtosis,
+        n_obs=len(gross),
+        sr_std_trials=trial_sharpe_std,
+    )
+    expected_definition_hash = candidate.definition.definition_hash
+    observed_definition_hash = str(context.get("strategy_definition_hash") or "")
+    expected_artefact_hash = str(context.get("artefact_hash") or "")
+    observed_artefact_hash = str(context.get("runtime_artefact_hash") or "")
+    expected_engine_hash = str(context.get("engine_hash") or "")
+    observed_engine_hash = str(context.get("runtime_engine_hash") or "")
+    expected_cost_model = str(context.get("cost_model_id") or context.get("cost_model_hash") or "")
+    observed_cost_model = str(context.get("runtime_cost_model_id") or "")
+    production_mode = str(context.get("production_execution_mode") or "")
+    runtime_mode = str(context.get("runtime_execution_mode") or "")
     randomiser = random.Random(int(candidate.candidate_id[7:23], 16))
     monte_carlo_drawdowns = []
     for _ in range(250):
         permuted = list(gross)
         randomiser.shuffle(permuted)
         monte_carlo_drawdowns.append(_maximum_drawdown(permuted))
+    declared_universe = candidate.definition.universe.get("symbols")
+    scope = tuple(str(item) for item in context.get("instrument_scope", ()))
+    predeclared = isinstance(declared_universe, list | tuple) and bool(declared_universe)
+    if scope:
+        predeclared = predeclared and set(scope).issubset({str(item) for item in declared_universe})
+    feature_inputs = any(
+        context.get(name) is not None for name in ("feature_rows", "feature_vector", "market_frame")
+    )
     measured = {
         "compiled": True,
-        "features_valid": bool(context.get("features_valid", True)),
-        "causality_valid": bool(context.get("causality_valid", True)),
+        "features_valid": bool(context.get("features_valid", feature_inputs)),
+        "causality_valid": bool(
+            context.get(
+                "causality_valid",
+                not bool(context.get("lookahead_detected", False))
+                and not bool(context.get("future_input_detected", False)),
+            )
+        ),
         "signal_frequency": active / observations,
         "turnover": turnover,
-        "chronological": True,
+        "chronological": not bool(context.get("lookahead_detected", False)),
         "cost_adjusted_return": net_return,
         "fees": fees,
         "slippage": slippage,
         "funding": funding,
         "regime_breakdown": {"passed": bool(gross), "regimes": {"all": net_return}},
-        "parameter_stability": {"passed": bool(gross), "neighbours_tested": 2},
+        "parameter_stability": parameter_stability,
         "sample_evidence": {"passed": aligned >= 3, "observations": aligned},
-        "cross_symbol_stability": {
-            "passed": bool(gross),
-            "symbols": len(context.get("instrument_scope", ())) or 1,
-        },
+        "cross_symbol_stability": cross_symbol_stability,
         "universe_evidence": {
-            "passed": bool(context.get("instrument_scope") or candidate.definition.universe),
-            "predeclared": True,
+            "passed": predeclared,
+            "predeclared": predeclared,
+            "declared_symbols": list(declared_universe or ()),
+            "observed_symbols": list(scope),
         },
-        "portfolio_overlap": {"passed": True, "maximum_correlation": 0.0},
-        "walk_forward": {
-            "passed": len(window_returns) >= 3 and pass_fraction >= 0.5,
-            "window_count": len(window_returns),
-            "pass_fraction": pass_fraction,
-        },
-        "purged": True,
-        "embargo": max(1, int(context.get("embargo_rows", 1))),
+        "portfolio_overlap": portfolio_overlap,
+        "walk_forward": walk_forward,
+        "purged": int(walk_forward.get("purged_rows", 0)) > 0,
+        "embargo": int(walk_forward.get("embargo_rows", 0)),
         "cost_stress": {
             "passed": sum(gross) - 2 * fees - 2 * slippage - funding >= 0,
             "multiplier": 2.0,
@@ -236,23 +307,52 @@ def _measured_result(
             "maximum_drawdown": max(monte_carlo_drawdowns, default=0.0),
         },
         "bootstrap_confidence": {
-            "passed": bool(gross),
-            "lower_bound": min(window_returns, default=0.0),
+            "passed": len(gross) >= int(context.get("minimum_bootstrap_observations", 30))
+            and bootstrap_low >= 0.0,
+            "lower_bound": bootstrap_low,
+            "upper_bound": bootstrap_high,
+            "observations": len(gross),
+            "iterations": int(context.get("bootstrap_iterations", 1_000)),
         },
-        "probability_backtest_overfitting": 1.0 - pass_fraction,
-        "deflated_sharpe": sharpe / math.sqrt(max(1.0, math.log1p(observations))),
+        "probability_backtest_overfitting": pbo,
+        "deflated_sharpe": dsr,
+        "multiple_testing": {
+            "trial_count": trial_count,
+            "trial_sharpe_std": trial_sharpe_std,
+            "trial_sharpes": trial_sharpes,
+        },
         "drawdown_stability": {"passed": bool(gross), "maximum_drawdown": _maximum_drawdown(gross)},
         "null_results": {
             "passed": all(item["passed"] for item in negative_controls.values()),
             "tests": len(negative_controls),
         },
         "negative_control_results": negative_controls,
-        "production_equivalent": True,
-        "exact_strategy_identity": True,
-        "exact_artefact_hash": True,
-        "exact_engine_hash": True,
-        "exact_cost_model": bool(context.get("cost_model_id") or context.get("cost_model_hash")),
-        "drift_checks": {"passed": True, "model": False, "execution": False},
+        "production_equivalent": {
+            "passed": bool(production_mode and runtime_mode and runtime_mode == production_mode),
+            "runtime_execution_mode": runtime_mode,
+            "production_execution_mode": production_mode,
+        },
+        "exact_strategy_identity": {
+            "passed": observed_definition_hash == expected_definition_hash,
+            "expected": expected_definition_hash,
+            "observed": observed_definition_hash,
+        },
+        "exact_artefact_hash": {
+            "passed": observed_artefact_hash == expected_artefact_hash,
+            "expected": expected_artefact_hash,
+            "observed": observed_artefact_hash,
+        },
+        "exact_engine_hash": {
+            "passed": observed_engine_hash == expected_engine_hash,
+            "expected": expected_engine_hash,
+            "observed": observed_engine_hash,
+        },
+        "exact_cost_model": {
+            "passed": bool(expected_cost_model) and observed_cost_model == expected_cost_model,
+            "expected": expected_cost_model,
+            "observed": observed_cost_model,
+        },
+        "drift_checks": _drift_checks(context),
         "duration": float(max(1, aligned)),
         "evidence_units": float(max(1, aligned)),
         "output_hash": output_hash,
@@ -264,7 +364,7 @@ def _measured_result(
             "observations": float(observations),
             "cost_adjusted_return": net_return,
             "turnover": turnover,
-            "deflated_sharpe": sharpe / math.sqrt(max(1.0, math.log1p(observations))),
+            "deflated_sharpe": dsr,
         },
         receipt=execution_receipt(
             candidate=candidate,
@@ -313,11 +413,22 @@ def _market_returns(context: Mapping[str, Any], signal_count: int) -> list[float
     ]
 
 
-def _sharpe(values: list[float]) -> float:
-    if len(values) < 2:
-        return 0.0
-    deviation = statistics.stdev(values)
-    return statistics.mean(values) / deviation * math.sqrt(len(values)) if deviation else 0.0
+def _market_price_returns(context: Mapping[str, Any], signal_count: int) -> list[float]:
+    """Calculate neighbour returns from immutable prices, never strategy returns."""
+
+    frame = context.get("market_frame")
+    if frame is None:
+        return []
+    try:
+        closes = _numeric_series(frame["close"])
+    except (KeyError, TypeError):
+        return []
+    returns = [
+        closes[index] / closes[index - 1] - 1.0
+        for index in range(1, len(closes))
+        if closes[index - 1] > 0
+    ]
+    return returns[: max(0, signal_count - 1)]
 
 
 def _window_sums(values: list[float], windows: int) -> list[float]:
@@ -325,6 +436,225 @@ def _window_sums(values: list[float], windows: int) -> list[float]:
         return []
     size = max(1, len(values) // windows)
     return [sum(values[index * size : (index + 1) * size]) for index in range(windows)]
+
+
+def _trial_sharpes(
+    context: Mapping[str, Any], parameter_stability: Mapping[str, Any], base_returns: list[float]
+) -> list[float]:
+    from src.metrics import sharpe_ratio
+
+    raw = context.get("trial_returns")
+    candidates: list[Any] = []
+    if isinstance(raw, list | tuple):
+        candidates.extend(raw)
+    candidates.extend(
+        item.get("window_returns")
+        for item in parameter_stability.get("results", ())
+        if isinstance(item, Mapping)
+    )
+    series = [base_returns, *candidates]
+    return [sharpe_ratio(values) for values in series if _numeric_series(values)]
+
+
+def _parameter_stability(
+    candidate: Candidate, context: Mapping[str, Any], base_returns: list[float]
+) -> dict[str, Any]:
+    raw = context.get("parameter_neighbour_returns", context.get("neighbour_returns", {}))
+    neighbours: dict[str, list[float]] = {}
+    if isinstance(raw, Mapping):
+        for name, values in raw.items():
+            numeric = _numeric_series(values)
+            if numeric:
+                neighbours[str(name)] = numeric
+    if not neighbours:
+        parameters = candidate.definition.signal_model.get("parameters", {})
+        frame = context.get("market_frame")
+        strategy_name = candidate.definition.signal_model.get("registered_strategy")
+        if isinstance(parameters, Mapping) and frame is not None and isinstance(strategy_name, str):
+            try:
+                from src.strategies.registry import get
+
+                strategy_factory = get(strategy_name)
+                for name, value in parameters.items():
+                    if isinstance(value, bool) or not isinstance(value, int | float):
+                        continue
+                    step = 1 if isinstance(value, int) else max(abs(float(value)) * 0.1, 0.01)
+                    for direction in (-1, 1):
+                        varied = dict(parameters)
+                        varied[str(name)] = value + direction * step
+                        if isinstance(value, int):
+                            varied[str(name)] = max(1, int(varied[str(name)]))
+                        signals = strategy_factory(**varied).generate_signals(frame)
+                        numeric_signals = _numeric_series(signals)
+                        returns = _market_price_returns(context, len(numeric_signals))
+                        aligned = min(len(returns), max(0, len(numeric_signals) - 1))
+                        neighbours[f"{name}:{direction:+d}"] = [
+                            numeric_signals[index] * returns[index] for index in range(aligned)
+                        ]
+            except (ExecutorError, KeyError, TypeError, ValueError):
+                neighbours = {}
+    results = []
+    base_total = sum(base_returns)
+    for name, values in sorted(neighbours.items()):
+        comparable = values[: len(base_returns)]
+        result = {
+            "name": name,
+            "observations": len(comparable),
+            "return": sum(comparable),
+            "passed": bool(comparable) and sum(comparable) >= base_total * 0.5,
+            "window_returns": _window_sums(comparable, 3),
+        }
+        results.append(result)
+    return {
+        "passed": bool(base_returns) and bool(results) and all(item["passed"] for item in results),
+        "neighbours_tested": len(results),
+        "results": results,
+        "base_window_returns": _window_sums(base_returns, 3),
+    }
+
+
+def _cross_symbol_stability(
+    context: Mapping[str, Any], base_returns: list[float]
+) -> dict[str, Any]:
+    raw = context.get("symbol_returns", context.get("cross_symbol_returns", {}))
+    per_symbol: dict[str, dict[str, Any]] = {}
+    if isinstance(raw, Mapping):
+        for symbol, values in raw.items():
+            numeric = _numeric_series(values)
+            if numeric:
+                per_symbol[str(symbol)] = {
+                    "observations": len(numeric),
+                    "return": sum(numeric),
+                    "passed": sum(numeric) >= 0.0,
+                }
+    if not per_symbol:
+        return {
+            "passed": False,
+            "symbols": 0,
+            "per_symbol": {},
+            "reason": "missing_symbol_returns",
+        }
+    return {
+        "passed": all(item["passed"] for item in per_symbol.values()),
+        "symbols": len(per_symbol),
+        "per_symbol": per_symbol,
+    }
+
+
+def _portfolio_overlap(context: Mapping[str, Any]) -> dict[str, Any]:
+    raw = context.get("active_strategy_returns", {})
+    if not isinstance(raw, Mapping) or not raw:
+        return {
+            "passed": False,
+            "maximum_correlation": None,
+            "threshold": float(context.get("maximum_portfolio_correlation", 0.8)),
+            "active_strategy_count": 0,
+            "comparisons": [],
+            "reason": "missing_active_strategy_returns",
+        }
+    candidate = _numeric_series(context.get("candidate_returns", context.get("returns", ())))
+    comparisons: list[dict[str, Any]] = []
+    maximum = 0.0
+    for name, values in raw.items():
+        other = _numeric_series(values)
+        correlation = _correlation(candidate, other)
+        maximum = max(maximum, abs(correlation))
+        comparisons.append({"strategy": str(name), "correlation": correlation})
+    threshold = float(context.get("maximum_portfolio_correlation", 0.8))
+    return {
+        "passed": maximum <= threshold,
+        "maximum_correlation": maximum,
+        "threshold": threshold,
+        "active_strategy_count": len(comparisons),
+        "comparisons": comparisons,
+    }
+
+
+def _purged_walk_forward(values: list[float], context: Mapping[str, Any]) -> dict[str, Any]:
+    windows = max(3, int(context.get("walk_forward_windows", 3)))
+    if len(values) < windows:
+        return {"passed": False, "window_count": 0, "pass_fraction": 0.0, "per_window": []}
+    purge = max(0, int(context.get("purge_rows", 1)))
+    embargo = max(0, int(context.get("embargo_rows", 1)))
+    size = max(1, len(values) // windows)
+    per_window: list[dict[str, Any]] = []
+    for index in range(windows):
+        start, end = index * size, (index + 1) * size if index < windows - 1 else len(values)
+        left = start + (purge if index else 0)
+        right = end - (embargo if index < windows - 1 else 0)
+        sample = values[max(start, left) : max(max(start, left), right)]
+        per_window.append(
+            {
+                "window": index,
+                "return": sum(sample),
+                "observations": len(sample),
+                "passed": bool(sample) and sum(sample) >= 0.0,
+            }
+        )
+    passed = sum(1 for item in per_window if item["passed"])
+    return {
+        "passed": len(per_window) >= windows and passed / len(per_window) >= 0.5,
+        "window_count": len(per_window),
+        "pass_fraction": passed / len(per_window) if per_window else 0.0,
+        "purged_rows": purge,
+        "embargo_rows": embargo,
+        "per_window": per_window,
+    }
+
+
+def _correlation(left: list[float], right: list[float]) -> float:
+    pairs = tuple(zip(left, right, strict=False))
+    if len(pairs) < 2:
+        return 0.0
+    left_mean = statistics.fmean(item[0] for item in pairs)
+    right_mean = statistics.fmean(item[1] for item in pairs)
+    numerator = sum((a - left_mean) * (b - right_mean) for a, b in pairs)
+    denominator = math.sqrt(
+        sum((a - left_mean) ** 2 for a, _ in pairs) * sum((b - right_mean) ** 2 for _, b in pairs)
+    )
+    return numerator / denominator if denominator else 0.0
+
+
+def _skew_kurtosis(values: list[float]) -> tuple[float, float]:
+    if len(values) < 3:
+        return 0.0, 3.0
+    mean = statistics.fmean(values)
+    deviation = statistics.pstdev(values)
+    if deviation == 0:
+        return 0.0, 3.0
+    standard = [(value - mean) / deviation for value in values]
+    return statistics.fmean(value**3 for value in standard), statistics.fmean(
+        value**4 for value in standard
+    )
+
+
+def _drift_checks(context: Mapping[str, Any]) -> dict[str, Any]:
+    measurements = context.get("drift_measurements")
+    if not isinstance(measurements, Mapping):
+        return {
+            "passed": False,
+            "source": "runtime_drift_measurements",
+            "reason": "missing_drift_measurements",
+        }
+    try:
+        execution = float(measurements["execution"])
+        model = float(measurements["model"])
+        execution_limit = float(measurements["maximum_execution"])
+        model_limit = float(measurements["maximum_model"])
+    except (KeyError, TypeError, ValueError) as exc:
+        return {
+            "passed": False,
+            "source": "runtime_drift_measurements",
+            "reason": f"invalid_drift_measurements:{type(exc).__name__}",
+        }
+    return {
+        "passed": execution <= execution_limit and model <= model_limit,
+        "execution": execution,
+        "model": model,
+        "maximum_execution": execution_limit,
+        "maximum_model": model_limit,
+        "source": "runtime_drift_measurements",
+    }
 
 
 def _maximum_drawdown(values: list[float]) -> float:
@@ -338,12 +668,16 @@ def _maximum_drawdown(values: list[float]) -> float:
 
 
 def _negative_control_evidence(
-    *, signals: list[float], returns: list[float], candidate_return: float
+    *,
+    signals: list[float],
+    returns: list[float],
+    candidate_return: float,
+    control_returns: Any = None,
 ) -> dict[str, dict[str, float | int | bool]]:
     aligned = min(len(signals), len(returns))
     signals, returns = signals[:aligned], returns[:aligned]
     shifted = returns[1:] + returns[:1] if returns else []
-    controls = {
+    controls: dict[str, float] = {
         "block_permutation": sum(
             signal * value for signal, value in zip(reversed(signals), returns, strict=True)
         ),
@@ -353,9 +687,30 @@ def _negative_control_evidence(
         "placebo_event_times": sum(
             signal * value for signal, value in zip(signals, shifted, strict=True)
         ),
-        "feature_ablation": 0.0,
-        "parameter_neighbourhood": 0.9
-        * sum(signal * value for signal, value in zip(signals, returns, strict=True)),
+        "feature_ablation": sum(
+            signal * value
+            for signal, value in zip(
+                signals,
+                _numeric_series(
+                    control_returns.get("feature_ablation", ())
+                    if isinstance(control_returns, Mapping)
+                    else ()
+                )[:aligned],
+                strict=False,
+            )
+        ),
+        "parameter_neighbourhood": sum(
+            signal * value
+            for signal, value in zip(
+                signals,
+                _numeric_series(
+                    control_returns.get("parameter_neighbourhood", ())
+                    if isinstance(control_returns, Mapping)
+                    else ()
+                )[:aligned],
+                strict=False,
+            )
+        ),
         "predeclared_universe_holdout": sum(
             signals[index] * returns[index] for index in range(aligned) if index % 2
         ),
@@ -363,6 +718,11 @@ def _negative_control_evidence(
             signals[index] * returns[index] for index in range(aligned) if index % 2 == 0
         ),
     }
+    if isinstance(control_returns, Mapping):
+        for name, values in control_returns.items():
+            numeric = _numeric_series(values)
+            if numeric:
+                controls[str(name)] = sum(numeric[:aligned])
     return {
         name: {
             "passed": bool(aligned) and candidate_return >= value,

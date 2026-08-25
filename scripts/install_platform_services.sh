@@ -17,7 +17,7 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     echo "Linux platform service installation requires root." >&2
     exit 1
   fi
-  for group in trading-runtime trading-research trading-agent trading-platform-owner; do
+  for group in trading-runtime trading-research trading-agent trading-platform-owner trading-platform; do
     if ! getent group "$group" >/dev/null; then
       groupadd --system "$group"
     fi
@@ -28,12 +28,22 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
         --shell /usr/sbin/nologin "$user"
     fi
   done
-  install -d -m 0750 -o root -g trading-runtime /etc/trading-platform
-  for directory in data runtime runtime/backups; do
-    install -d -m 0750 -o trading-runtime -g trading-runtime "$REPO/$directory"
+  for user in trading-runtime trading-research trading-agent trading-platform-owner; do
+    usermod --append --groups trading-platform "$user"
   done
-  install -d -m 0750 -o trading-research -g trading-research "$REPO/data/research"
-  install -d -m 0750 -o trading-agent -g trading-agent "$REPO/runtime/agent-worktrees"
+  # Service accounts traverse the source tree and shared data parents. The
+  # agent clones into its own writable root and only reads the source tree.
+  chgrp trading-platform "$REPO"
+  chmod g+rx "$REPO"
+  install -d -m 0750 -o root -g trading-runtime /etc/trading-platform
+  install -d -m 0750 -o trading-runtime -g trading-platform "$REPO/data"
+  install -d -m 0750 -o trading-runtime -g trading-platform "$REPO/runtime"
+  install -d -m 2770 -o trading-runtime -g trading-platform "$REPO/runtime/backups"
+  for directory in research artefacts reports; do
+    install -d -m 2770 -o trading-research -g trading-platform "$REPO/data/$directory"
+  done
+  install -d -m 2770 -o trading-research -g trading-platform "$REPO/runtime/research"
+  install -d -m 2770 -o trading-agent -g trading-platform "$REPO/runtime/agent-worktrees"
   install -m 0644 "$REPO/deploy/systemd/trading-platform@.service" \
     /etc/systemd/system/trading-platform@.service
   install -m 0644 "$REPO/deploy/systemd/trading-platform-research@.service" \
