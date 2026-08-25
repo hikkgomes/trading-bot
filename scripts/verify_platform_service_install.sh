@@ -25,6 +25,24 @@ probe_write() {
     platform-permission-probe "$probe"
 }
 
+probe_json() {
+  local user="$1"
+  local directory="$2"
+  local probe="$directory/.platform-json-probe.$$"
+  runuser -u "$user" -- sh -c 'printf "%s\n" "{}" > "$1" && rm -f "$1"' \
+    platform-json-probe "$probe"
+}
+
+probe_parquet() {
+  local user="$1"
+  local python="$2"
+  local directory="$3"
+  local probe="$directory/.platform-parquet-probe.$$.parquet"
+  runuser -u "$user" -- "$python" -c \
+    'import pathlib, sys; import pyarrow as pa; import pyarrow.parquet as pq; path = pathlib.Path(sys.argv[1]); pq.write_table(pa.table({"probe": [1]}), path); path.unlink()' \
+    "$probe"
+}
+
 for user in trading-runtime trading-research trading-agent; do
   id "$user" >/dev/null 2>&1 || {
     echo "missing service user: $user" >&2
@@ -39,6 +57,8 @@ for path in \
   "$REPO/runtime"; do
   probe_write trading-runtime "$path"
 done
+probe_parquet trading-runtime "$REPO/.venv-runtime/bin/python" "$REPO/data/bars"
+probe_json trading-runtime "$REPO/runtime"
 for path in \
   "$REPO/data/research" \
   "$REPO/data/artefacts" \
@@ -46,7 +66,12 @@ for path in \
   "$REPO/runtime/research"; do
   probe_write trading-research "$path"
 done
+probe_parquet trading-research "$REPO/.venv-research/bin/python" "$REPO/data/research"
+probe_json trading-research "$REPO/data/artefacts"
+probe_json trading-research "$REPO/data/reports"
+probe_json trading-research "$REPO/runtime/research"
 probe_write trading-agent "$REPO/runtime/agent-worktrees"
+probe_json trading-agent "$REPO/runtime/agent-worktrees"
 
 run_cycle() {
   local user="$1"

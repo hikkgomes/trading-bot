@@ -218,7 +218,7 @@ def _portfolio_state_cycle(
         )
         if not scheduled:
             return {
-                "reason_code": "portfolio_state_waiting_for_source_snapshots",
+                "reason_code": worker.last_schedule_reason,
                 "products": len(products),
             }
         return worker.run_once(now=now)
@@ -724,25 +724,7 @@ def _research_cycle(
     raw_policy = research_configuration.get("evidence_policy", {})
     if not isinstance(raw_policy, Mapping):
         raise ValueError("research.evidence_policy must be an object")
-    evidence_policy = EvidencePolicy(
-        **{
-            key: raw_policy[key]
-            for key in (
-                "version",
-                "minimum_cost_adjusted_return",
-                "minimum_deflated_sharpe",
-                "minimum_walk_forward_windows",
-                "minimum_walk_forward_pass_fraction",
-                "maximum_backtest_overfitting_probability",
-                "maximum_portfolio_correlation",
-                "minimum_bootstrap_observations",
-                "bootstrap_method",
-                "multiple_testing_method",
-                "pbo_method",
-            )
-            if key in raw_policy
-        }
-    )
+    evidence_policy = EvidencePolicy.from_configuration(raw_policy)
 
     def load_research_dataset(kind: str, payload: Mapping[str, Any]) -> Any:
         snapshot_ids = tuple(str(item) for item in payload["dataset_snapshot_ids"])
@@ -770,6 +752,11 @@ def _research_cycle(
             cost_model_id=str(payload["cost_model_id"]),
             parameter_set_id=str(payload["parameter_set_id"]),
             allowed_roles=allowed_roles,
+            minimum_availability_timestamp=(
+                str(payload["evaluated_at"])
+                if str(payload.get("requested_stage") or "") == "forward"
+                else None
+            ),
         )
         return context.get(kind, context)
 
@@ -1010,6 +997,7 @@ def run(args: argparse.Namespace) -> int:
                 "service_waiting_for_input",
                 "service_cycle_failed",
                 "portfolio_state_waiting_for_source_snapshots",
+                "portfolio_state_idle",
                 "canonical_portfolio_state_published",
             }
         ):

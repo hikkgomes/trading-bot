@@ -178,6 +178,12 @@ class EvaluationRequest:
                 raise EvaluationContractError(
                     f"dataset_roles must contain exactly one {expected_role} snapshot"
                 )
+            if stage == "protected" and (
+                len(snapshots) != 1 or roles.get(snapshots[0]) != "protected_holdout"
+            ):
+                raise EvaluationContractError(
+                    "protected evaluation requests may contain only the protected_holdout snapshot"
+                )
             if stage != "protected" and "protected_holdout" in roles.values():
                 raise EvaluationContractError(
                     "adaptive evaluation cannot contain a protected_holdout snapshot"
@@ -248,6 +254,28 @@ class EvidencePolicy:
     bootstrap_method: str = "moving_block_bootstrap_v1"
     multiple_testing_method: str = "bailey_lopez_de_prado_dsr_v1"
     pbo_method: str = "combinatorial_purged_pbo_v1"
+
+    @classmethod
+    def from_configuration(cls, configuration: Mapping[str, Any]) -> EvidencePolicy:
+        required = {
+            "version",
+            "minimum_cost_adjusted_return",
+            "minimum_deflated_sharpe",
+            "minimum_walk_forward_windows",
+            "minimum_walk_forward_pass_fraction",
+            "maximum_backtest_overfitting_probability",
+            "maximum_portfolio_correlation",
+            "minimum_bootstrap_observations",
+            "bootstrap_method",
+            "multiple_testing_method",
+            "pbo_method",
+        }
+        missing = sorted(required - set(configuration))
+        if missing:
+            raise EvaluationContractError(
+                "research evidence policy is missing versioned fields: " + ", ".join(missing)
+            )
+        return cls(**{str(key): configuration[key] for key in required})
 
     @property
     def policy_hash(self) -> str:

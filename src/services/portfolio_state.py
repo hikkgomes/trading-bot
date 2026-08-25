@@ -358,6 +358,7 @@ class DatabasePortfolioStateWorker:
         self.publisher = CanonicalPortfolioStatePublisher(store)
         self.lease_seconds = lease_seconds
         self.refresh_sources = refresh_sources
+        self.last_schedule_reason = "portfolio_state_queue_empty"
 
     def schedule_from_latest(
         self,
@@ -370,6 +371,7 @@ class DatabasePortfolioStateWorker:
 
         now = timestamp(now, field="now")
         scheduled = 0
+        missing_sources = False
         for product_id in sorted(products):
             if self.refresh_sources is not None:
                 self.refresh_sources(product_id, now)
@@ -387,6 +389,7 @@ class DatabasePortfolioStateWorker:
                             timestamp(str(observed_at), field=f"{source}.observed_at")
                         )
             except KeyError:
+                missing_sources = True
                 continue
             policy = state_policies.get(product_id)
             if not isinstance(policy, Mapping):
@@ -415,6 +418,13 @@ class DatabasePortfolioStateWorker:
                 producer_identity="portfolio-state-service",
             ):
                 scheduled += 1
+        self.last_schedule_reason = (
+            "portfolio_state_jobs_scheduled"
+            if scheduled
+            else "portfolio_state_waiting_for_source_snapshots"
+            if missing_sources
+            else "portfolio_state_idle"
+        )
         return scheduled
 
     def run_once(self, *, now: str) -> dict[str, Any]:

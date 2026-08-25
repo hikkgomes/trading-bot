@@ -48,9 +48,19 @@ class AccountingService:
         observed_at: str,
         balances: dict[str, float],
         product_id: str | None = None,
+        used_margin_fraction: float = 0.0,
+        liquidation_buffer_fraction: float = 1.0,
+        unknown_exposure: dict[str, float] | None = None,
     ) -> str:
         payload = json_value(
-            {"account_id": account_id, "balances": balances}, field="balance snapshot"
+            {
+                "account_id": account_id,
+                "balances": balances,
+                "used_margin_fraction": float(used_margin_fraction),
+                "liquidation_buffer_fraction": float(liquidation_buffer_fraction),
+                "unknown_exposure": dict(unknown_exposure or {}),
+            },
+            field="balance snapshot",
         )
         identity = canonical_hash({**payload, "observed_at": observed_at})
         self._append(balance_snapshot, identity, observed_at, payload)
@@ -70,11 +80,11 @@ class AccountingService:
                     "product_id": product_id,
                     "observed_at": observed_at,
                     "values": {
-                        "used_margin_fraction": float(payload.get("used_margin_fraction", 0.0)),
+                        "used_margin_fraction": float(payload["used_margin_fraction"]),
                         "liquidation_buffer_fraction": float(
-                            payload.get("liquidation_buffer_fraction", 1.0)
+                            payload["liquidation_buffer_fraction"]
                         ),
-                        "unknown_exposure": {},
+                        "unknown_exposure": dict(payload["unknown_exposure"]),
                     },
                 },
                 created_at=observed_at,
@@ -178,6 +188,14 @@ class DatabaseAccountingWorker:
                     observed_at=str(payload["observed_at"]),
                     balances={str(key): float(value) for key, value in payload["balances"].items()},
                     product_id=(str(payload["product_id"]) if payload.get("product_id") else None),
+                    used_margin_fraction=float(payload.get("used_margin_fraction", 0.0)),
+                    liquidation_buffer_fraction=float(
+                        payload.get("liquidation_buffer_fraction", 1.0)
+                    ),
+                    unknown_exposure={
+                        str(key): float(value)
+                        for key, value in dict(payload.get("unknown_exposure", {})).items()
+                    },
                 )
             elif kind == "nav":
                 identity = self.service.record_nav(NavSnapshot(**dict(payload["snapshot"])))

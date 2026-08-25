@@ -272,7 +272,24 @@ def _measured_result(
         "funding": funding,
         "regime_breakdown": {"passed": bool(gross), "regimes": {"all": net_return}},
         "parameter_stability": parameter_stability,
-        "sample_evidence": {"passed": aligned >= 3, "observations": aligned},
+        "sample_evidence": {
+            "passed": aligned >= 3,
+            "observations": aligned,
+            "run_id": canonical_hash(
+                {
+                    "kind": "sample_evidence/v1",
+                    "candidate_id": candidate.candidate_id,
+                    "dataset_snapshot_ids": list(snapshots),
+                    "returns": gross,
+                }
+            ),
+            "input_hash": canonical_hash(
+                {
+                    "dataset_snapshot_ids": list(snapshots),
+                    "returns": gross,
+                }
+            ),
+        },
         "cross_symbol_stability": cross_symbol_stability,
         "universe_evidence": {
             "passed": predeclared,
@@ -318,13 +335,43 @@ def _measured_result(
             "upper_bound": bootstrap_high,
             "observations": len(gross),
             "iterations": int(context.get("bootstrap_iterations", 1_000)),
+            "method": str(context.get("bootstrap_method") or "moving_block_bootstrap_v1"),
+            "run_id": canonical_hash(
+                {
+                    "kind": "bootstrap_confidence/v1",
+                    "candidate_id": candidate.candidate_id,
+                    "dataset_snapshot_ids": list(snapshots),
+                    "returns": gross,
+                    "iterations": int(context.get("bootstrap_iterations", 1_000)),
+                }
+            ),
+            "input_hash": canonical_hash(
+                {
+                    "dataset_snapshot_ids": list(snapshots),
+                    "returns": gross,
+                }
+            ),
         },
         "probability_backtest_overfitting": pbo,
+        "pbo_input_hash": canonical_hash(
+            {
+                "dataset_snapshot_ids": list(snapshots),
+                "matrix": pbo_matrix,
+                "method": str(context.get("pbo_method") or "combinatorial_purged_pbo_v1"),
+            }
+        ),
         "deflated_sharpe": dsr,
         "multiple_testing": {
             "trial_count": trial_count,
             "trial_sharpe_std": trial_sharpe_std,
             "trial_sharpes": trial_sharpes,
+            "input_hash": canonical_hash(
+                {
+                    "dataset_snapshot_ids": list(snapshots),
+                    "trial_sharpes": trial_sharpes,
+                    "trial_count": trial_count,
+                }
+            ),
         },
         "statistical_procedures": {
             "bootstrap": str(context.get("bootstrap_method") or "moving_block_bootstrap_v1"),
@@ -677,12 +724,22 @@ def _purged_walk_forward(values: list[float], context: Mapping[str, Any]) -> dic
         left = start + (purge if index else 0)
         right = end - (embargo if index < windows - 1 else 0)
         sample = values[max(start, left) : max(max(start, left), right)]
+        window_input = {
+            "window": index,
+            "start": start,
+            "end": end,
+            "purge_rows": purge,
+            "embargo_rows": embargo,
+            "values": sample,
+        }
         per_window.append(
             {
                 "window": index,
                 "return": sum(sample),
                 "observations": len(sample),
                 "passed": bool(sample) and sum(sample) >= 0.0,
+                "run_id": canonical_hash({"kind": "walk_forward_window/v1", **window_input}),
+                "input_hash": canonical_hash(window_input),
             }
         )
     passed = sum(1 for item in per_window if item["passed"])
@@ -693,6 +750,15 @@ def _purged_walk_forward(values: list[float], context: Mapping[str, Any]) -> dic
         "purged_rows": purge,
         "embargo_rows": embargo,
         "per_window": per_window,
+        "input_hash": canonical_hash(
+            {
+                "kind": "purged_embargoed_walk_forward/v1",
+                "values": values,
+                "windows": windows,
+                "purge_rows": purge,
+                "embargo_rows": embargo,
+            }
+        ),
     }
 
 
@@ -748,6 +814,14 @@ def _drift_checks(context: Mapping[str, Any]) -> dict[str, Any]:
         "maximum_execution": execution_limit,
         "maximum_model": model_limit,
         "source": "runtime_drift_measurements",
+        "input_hash": canonical_hash(
+            {
+                "execution": execution,
+                "model": model,
+                "maximum_execution": execution_limit,
+                "maximum_model": model_limit,
+            }
+        ),
     }
 
 

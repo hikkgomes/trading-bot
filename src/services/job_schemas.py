@@ -165,6 +165,12 @@ class ResearchJobRequest:
                 raise JobSchemaError(
                     f"research jobs require exactly one {expected_role} snapshot for {requested_stage}"
                 )
+            if requested_stage == "protected" and (
+                len(snapshots) != 1 or dataset_roles.get(snapshots[0]) != "protected_holdout"
+            ):
+                raise JobSchemaError(
+                    "protected research jobs may contain only the protected_holdout snapshot"
+                )
             if requested_stage != "protected" and "protected_holdout" in dataset_roles.values():
                 raise JobSchemaError(
                     "adaptive research jobs must not contain protected holdout snapshot identities"

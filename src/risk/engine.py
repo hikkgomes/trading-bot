@@ -190,6 +190,8 @@ class SqlRiskSnapshotStore:
             ).scalar_one_or_none()
         if not isinstance(payload, dict):
             raise KeyError(f"risk snapshot does not exist: {snapshot_id}")
+        if canonical_hash(payload) != snapshot_id:
+            raise ValueError("risk snapshot content hash does not match its identity")
         return dict(payload)
 
     def latest(self, *, kind: str, product_id: str, at: str) -> tuple[str, dict[str, object]]:
@@ -211,6 +213,8 @@ class SqlRiskSnapshotStore:
                     and payload.get("kind") == kind
                     and payload.get("product_id") == product_id
                 ):
+                    if canonical_hash(payload) != str(row["id"]):
+                        raise ValueError("risk snapshot content hash does not match its identity")
                     return str(row["id"]), dict(payload)
         raise KeyError(f"no {kind} snapshot exists for product {product_id} at {at}")
 

@@ -17,10 +17,11 @@ from src.data.database import (
     feature_manifest,
     universe_snapshot,
 )
-from src.domain._codec import timestamp
+from src.domain._codec import canonical_hash, timestamp
 from src.risk.engine import SqlRiskSnapshotStore
 from src.services.config import load_platform_config, load_split_configuration
 from src.services.portfolio_state import DatabasePortfolioStateWorker
+from src.services.supervisor import _portfolio_state_policies
 
 
 def _check(name: str, ok: bool, *, detail: Any = None) -> dict[str, Any]:
@@ -130,6 +131,10 @@ def build_readiness(
             }
         source_store = SqlRiskSnapshotStore(database.engine)
         state_details: dict[str, Any] = {}
+        products_by_id = {
+            str(product["product_id"]): dict(product) for product in split["products"]["products"]
+        }
+        expected_policies = _portfolio_state_policies({"risk": split["risk"]}, products_by_id)
         for product in split["products"]["products"]:
             product_id = str(product["product_id"])
             try:
@@ -191,6 +196,14 @@ def build_readiness(
                     or len(policy_hash) != 71
                 ):
                     raise ValueError("risk policy hash is missing")
+                expected_policy = expected_policies[product_id]
+                if policy_hash != canonical_hash(expected_policy):
+                    raise ValueError("canonical state risk policy identity is invalid")
+                expected_policy_ids = {
+                    str(item) for item in expected_policy.get("risk_policy_ids", ())
+                }
+                if {str(item) for item in policy_ids} != expected_policy_ids:
+                    raise ValueError("canonical state risk policy IDs are invalid")
                 state_details[product_id] = {
                     "state_id": state_id,
                     "age_seconds": age,
