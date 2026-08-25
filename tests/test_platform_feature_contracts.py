@@ -168,6 +168,61 @@ def test_market_data_writer_publishes_authoritative_market_snapshot(tmp_path) ->
     }
 
 
+def test_market_data_writer_publishes_partial_book_snapshot(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'book.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="linux-data",
+        node_id="linux-optiplex",
+        role="data-writer",
+        capabilities=("market_event_write",),
+        observed_at=NOW,
+    )
+    event = normalise_public_event(
+        market="futures",
+        stream="btcusdt@bookTicker",
+        receive_timestamp=NOW,
+        payload={
+            "e": "bookTicker",
+            "E": int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000),
+            "s": "BTCUSDT",
+            "b": "99.5",
+            "B": "12",
+            "a": "100.5",
+            "A": "8",
+        },
+    )
+    queue.enqueue(
+        job_id="book-snapshot-1",
+        name="market_event_write",
+        payload={
+            "venue": "binance",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "event": to_primitive(event),
+        },
+        available_at=NOW,
+    )
+    result = DatabaseMarketDataWriter(
+        queue=queue,
+        worker_id="linux-data",
+        root=tmp_path / "data",
+        snapshot_store=SqlRiskSnapshotStore(database.engine),
+        product_ids_by_market={"futures": ("active_income",)},
+    ).run_once(now=NOW)
+
+    assert result["market_snapshot_ids"]
+    _snapshot_id, snapshot = SqlRiskSnapshotStore(database.engine).latest(
+        kind="market_data_input", product_id="active_income", at=NOW
+    )
+    assert snapshot["values"] == {
+        "close": 100.0,
+        "spread_bps": 100.0,
+        "visible_depth": 20.0,
+    }
+
+
 def test_live_sma_chain_uses_100_bars_and_produces_active_and_flat_forecasts(tmp_path) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'platform.sqlite3'}")
     database.create_schema()

@@ -814,6 +814,7 @@ class DatabaseUserStreamWorker:
             ),
             "order_id": order.order_id,
             "fill_id": fill.fill_id,
+            "position_quantity": position.quantity,
             "remaining_quantity": updated.remaining_quantity,
         }
 

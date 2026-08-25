@@ -24,12 +24,14 @@ class PlatformTestnetRehearsalReport:
     schema: str
     ok: bool
     stages: tuple[Mapping[str, Any], ...]
+    proof: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema": self.schema,
             "ok": self.ok,
             "stages": [dict(stage) for stage in self.stages],
+            "proof": list(self.proof),
         }
 
 
@@ -96,6 +98,35 @@ class PlatformTestnetRehearsal:
                         "reason_code": "rehearsal_drain_limit_exceeded",
                     }
                 )
+        proof: set[str] = set()
+        for stage in stages:
+            name = str(stage.get("stage"))
+            reason_code = str(stage.get("reason_code") or "")
+            if name in {
+                "active_assignment",
+                "strategy_evaluation",
+                "portfolio_target",
+                "risk_decision",
+            } and (
+                stage.get("ok") is True
+                or reason_code.endswith(("acknowledged", "recorded", "created", "loaded"))
+            ):
+                proof.add(name)
+            if name == "live_order_submission" and reason_code.endswith("acknowledged"):
+                proof.add("broker_acknowledgement")
+            if name == "user_stream" and reason_code.endswith("recorded"):
+                proof.add("user_stream")
+                order_result = stage.get("order_result")
+                if isinstance(order_result, Mapping):
+                    order_reason = str(order_result.get("reason_code") or "")
+                    if order_reason.endswith("filled"):
+                        proof.add("fill")
+                    if "position_quantity" in order_result:
+                        proof.add("position")
+            if name == "accounting" and reason_code.endswith("recorded"):
+                proof.add("accounting")
+            if name == "recovery" and reason_code.endswith("created"):
+                proof.add("recovery")
         required = {
             "active_assignment",
             "strategy_evaluation",
@@ -106,18 +137,35 @@ class PlatformTestnetRehearsal:
             "accounting",
             "recovery",
         }
+        required_proof = {
+            "active_assignment",
+            "strategy_evaluation",
+            "portfolio_target",
+            "risk_decision",
+            "broker_acknowledgement",
+            "user_stream",
+            "fill",
+            "position",
+            "accounting",
+            "recovery",
+        }
         completed = {str(stage.get("stage")) for stage in stages}
-        ok = required.issubset(completed) and all(
-            stage.get("ok") is True
-            or str(stage.get("reason_code", "")).endswith(
-                ("acknowledged", "recorded", "created", "loaded", "filled")
+        ok = (
+            required.issubset(completed)
+            and required_proof.issubset(proof)
+            and all(
+                stage.get("ok") is True
+                or str(stage.get("reason_code", "")).endswith(
+                    ("acknowledged", "recorded", "created", "loaded", "filled")
+                )
+                for stage in stages
             )
-            for stage in stages
         )
         return PlatformTestnetRehearsalReport(
             schema="platform.testnet-rehearsal/v1",
             ok=ok,
             stages=tuple(stages),
+            proof=tuple(sorted(proof)),
         )
 
 

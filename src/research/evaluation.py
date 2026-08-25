@@ -19,7 +19,7 @@ from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlHoldoutRepository, SqlValidationRepository
 from src.research.executors import ExecutorError, ProviderExecutorRegistry
 from src.research.store import SqlResearchStore
-from src.research.theses import SqlThesisRegistry, ThesisError
+from src.research.theses import REQUIRED_NEGATIVE_CONTROLS, SqlThesisRegistry, ThesisError
 
 STAGES = ("screening", "development", "robustness", "protected", "forward")
 FORBIDDEN_SUBMITTED_FIELDS = frozenset(
@@ -335,7 +335,112 @@ def _walk_forward_passes(value: object, policy: EvidencePolicy) -> bool:
 
 
 def _mapping_passes(value: object, _policy: EvidencePolicy) -> bool:
-    return _passed_mapping(value)
+    if not _passed_mapping(value):
+        return False
+    assert isinstance(value, Mapping)
+    return any(
+        key != "passed"
+        and value[key] not in (None, (), [], {})
+        and not isinstance(value[key], bool)
+        for key in value
+    )
+
+
+def _parameter_stability_passes(value: object, _policy: EvidencePolicy) -> bool:
+    if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    results = value.get("results")
+    tested = value.get("neighbours_tested")
+    if not isinstance(results, list | tuple) or not isinstance(tested, int) or tested < 2:
+        return False
+    if len(results) != tested:
+        return False
+    return all(
+        isinstance(item, Mapping)
+        and item.get("passed") is True
+        and isinstance(item.get("observations"), int)
+        and int(item["observations"]) > 0
+        and _finite(item.get("return")) is not None
+        and _valid_hash(item.get("input_hash"))
+        for item in results
+    )
+
+
+def _cross_symbol_stability_passes(value: object, _policy: EvidencePolicy) -> bool:
+    if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    per_symbol = value.get("per_symbol")
+    symbols = value.get("symbols")
+    if not isinstance(per_symbol, Mapping) or not isinstance(symbols, int) or symbols <= 0:
+        return False
+    return len(per_symbol) == symbols and all(
+        isinstance(item, Mapping)
+        and item.get("passed") is True
+        and isinstance(item.get("observations"), int)
+        and int(item["observations"]) >= 2
+        and _finite(item.get("return")) is not None
+        and _valid_hash(item.get("input_hash"))
+        for item in per_symbol.values()
+    )
+
+
+def _portfolio_overlap_passes(value: object, policy: EvidencePolicy) -> bool:
+    if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    comparisons = value.get("comparisons")
+    count = value.get("active_strategy_count")
+    maximum = _finite(value.get("maximum_correlation"))
+    threshold = _finite(value.get("threshold"))
+    if (
+        not isinstance(comparisons, list | tuple)
+        or not isinstance(count, int)
+        or count <= 0
+        or len(comparisons) != count
+        or maximum is None
+        or threshold is None
+        or threshold < 0.0
+        or threshold > policy.maximum_portfolio_correlation
+        or maximum > threshold
+    ):
+        return False
+    return all(
+        isinstance(item, Mapping)
+        and isinstance(item.get("observations"), int)
+        and int(item["observations"]) >= 2
+        and _finite(item.get("correlation")) is not None
+        and _valid_hash(item.get("input_hash"))
+        for item in comparisons
+    )
+
+
+def _valid_hash(value: object) -> bool:
+    if not isinstance(value, str) or not value.startswith("sha256:") or len(value) != 71:
+        return False
+    try:
+        int(value[7:], 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _statistical_procedures_pass(value: object, policy: EvidencePolicy) -> bool:
+    return isinstance(value, Mapping) and value == {
+        "bootstrap": policy.bootstrap_method,
+        "multiple_testing": policy.multiple_testing_method,
+        "pbo": policy.pbo_method,
+    }
+
+
+def _negative_control_results_pass(value: object, _policy: EvidencePolicy) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return all(
+        _passed_mapping(value.get(name))
+        and isinstance(value[name].get("observations"), int)
+        and int(value[name]["observations"]) > 0
+        and _valid_hash(value[name].get("input_hash"))
+        for name in REQUIRED_NEGATIVE_CONTROLS
+    )
 
 
 def _bootstrap_passes(value: object, policy: EvidencePolicy) -> bool:
@@ -373,11 +478,11 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
         "slippage": _nonnegative,
         "funding": _nonnegative,
         "regime_breakdown": _mapping_passes,
-        "parameter_stability": _mapping_passes,
+        "parameter_stability": _parameter_stability_passes,
         "sample_evidence": _mapping_passes,
-        "cross_symbol_stability": _mapping_passes,
+        "cross_symbol_stability": _cross_symbol_stability_passes,
         "universe_evidence": _mapping_passes,
-        "portfolio_overlap": _mapping_passes,
+        "portfolio_overlap": _portfolio_overlap_passes,
     },
     "robustness": {
         "walk_forward": _walk_forward_passes,
@@ -392,9 +497,10 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
         "bootstrap_confidence": _bootstrap_passes,
         "probability_backtest_overfitting": _pbo_passes,
         "deflated_sharpe": _deflated_sharpe_passes,
+        "statistical_procedures": _statistical_procedures_pass,
         "drawdown_stability": _mapping_passes,
         "null_results": _mapping_passes,
-        "negative_control_results": _mapping,
+        "negative_control_results": _negative_control_results_pass,
     },
     "forward": {
         "production_equivalent": _mapping_passes,

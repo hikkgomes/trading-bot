@@ -9,11 +9,12 @@ from src.services.platform_testnet_rehearsal import (
 
 
 class _Worker:
-    def __init__(self, reason_code: str):
+    def __init__(self, reason_code: str, **values):
         self.reason_code = reason_code
+        self.values = values
 
     def run_once(self, *, now: str):
-        return {"reason_code": self.reason_code, "observed_at": now}
+        return {"reason_code": self.reason_code, "observed_at": now, **self.values}
 
 
 def test_platform_testnet_rehearsal_runs_live_user_stream_accounting_and_recovery() -> None:
@@ -31,7 +32,10 @@ def test_platform_testnet_rehearsal_runs_live_user_stream_accounting_and_recover
         portfolio=_Worker("portfolio_target_created"),
         risk=_Worker("risk_decision_recorded"),
         live_execution=_Worker("live_order_acknowledged"),
-        user_stream=_Worker("user_stream_event_recorded"),
+        user_stream=_Worker(
+            "user_stream_event_recorded",
+            order_result={"reason_code": "exchange_order_filled", "position_quantity": 0.01},
+        ),
         accounting=_Worker("accounting_event_recorded"),
         recovery=_Worker("live_recovery_plan_created"),
         has_pending_user_stream=lambda: consume("user"),
@@ -42,6 +46,18 @@ def test_platform_testnet_rehearsal_runs_live_user_stream_accounting_and_recover
     report = rehearsal.run(now="2026-08-24T00:00:00+00:00")
 
     assert report.ok
+    assert set(report.proof) == {
+        "active_assignment",
+        "accounting",
+        "broker_acknowledgement",
+        "fill",
+        "portfolio_target",
+        "position",
+        "recovery",
+        "risk_decision",
+        "strategy_evaluation",
+        "user_stream",
+    }
     assert [stage["stage"] for stage in report.stages] == [
         "active_assignment",
         "strategy_evaluation",

@@ -156,6 +156,8 @@ class DatabasePortfolioSourceService:
             if not isinstance(payload, dict) or str(payload.get("portfolio_id")) != portfolio_id:
                 continue
             instrument_id = str(payload["instrument_id"])
+            if instrument_id in values:
+                continue
             values[instrument_id] = float(payload.get("quantity", 0.0))
             latest_at = latest_at or str(row["created_at"])
         return values, latest_at
@@ -200,30 +202,53 @@ class DatabasePortfolioSourceService:
             ).mappings()
         market: dict[str, dict[str, float]] = {}
         latest_at: str | None = None
+        fields = {
+            "close": "price",
+            "price": "price",
+            "spread_bps": "spread_bps",
+            "visible_depth": "visible_depth",
+            "volatility": "volatility",
+            "funding": "funding",
+            "funding_rate": "funding",
+        }
+        latest_values: dict[str, dict[str, float]] = {}
+        latest_times: dict[str, str] = {}
         for row in rows:
             payload = row["payload"]
             if not isinstance(payload, dict) or payload.get("kind") != "market_data_input":
                 continue
             if str(payload.get("product_id")) != product_id:
                 continue
-            instrument_id = str(payload["instrument_id"])
-            raw = payload.get("values")
-            if not isinstance(raw, Mapping) or not {
-                "close",
-                "spread_bps",
-                "visible_depth",
-                "volatility",
-                "funding",
-            }.issubset(raw):
+            instrument_id = str(payload.get("instrument_id") or "")
+            if not instrument_id:
                 continue
-            market[instrument_id] = {
-                "price": float(raw["close"]),
-                "spread_bps": float(raw["spread_bps"]),
-                "visible_depth": float(raw["visible_depth"]),
-                "volatility": float(raw["volatility"]),
-                "funding": float(raw["funding"]),
-            }
-            latest_at = latest_at or str(row["created_at"])
+            raw = payload.get("values")
+            if not isinstance(raw, Mapping):
+                continue
+            values = latest_values.setdefault(instrument_id, {})
+            for source_name, target_name in fields.items():
+                if target_name in values or source_name not in raw:
+                    continue
+                try:
+                    value = float(raw[source_name])
+                except (TypeError, ValueError):
+                    continue
+                if value != value or value in (float("inf"), float("-inf")):
+                    continue
+                values[target_name] = value
+            latest_times.setdefault(instrument_id, str(row["created_at"]))
+        required = {"price", "spread_bps", "visible_depth", "volatility", "funding"}
+        for instrument_id, values in latest_values.items():
+            if "price" not in values:
+                continue
+            # A candle or trade can establish price before book, volatility,
+            # or funding events arrive. Keep the source fresh but fail closed
+            # for risk until those optional values have real observations.
+            for field in required - set(values):
+                values[field] = 0.0
+            market[instrument_id] = values
+            row_time = latest_times[instrument_id]
+            latest_at = row_time if latest_at is None else max(latest_at, row_time)
         return market, latest_at
 
     def _health(self, at: str) -> dict[str, Any]:
@@ -239,7 +264,7 @@ class DatabasePortfolioSourceService:
                 .where(service_heartbeat.c.observed_at <= at)
                 .order_by(service_heartbeat.c.observed_at.desc(), service_heartbeat.c.id.desc())
             ).mappings()
-        latest: dict[tuple[str, str], dict[str, Any]] = {}
+        latest: dict[tuple[str, str], bool] = {}
         for row in rows:
             service_name = str(row["service_name"])
             # The state service must not use its own heartbeat as a source.
@@ -250,14 +275,9 @@ class DatabasePortfolioSourceService:
             key = (service_name, str(row["node_id"]))
             if key in latest:
                 continue
-            latest[key] = {
-                "healthy": bool(row["healthy"]),
-                "observed_at": str(row["observed_at"]),
-                "payload": dict(row["payload"]) if isinstance(row["payload"], dict) else {},
-            }
+            latest[key] = bool(row["healthy"])
         statuses = {
-            f"{service}@{node}": value["healthy"]
-            for (service, node), value in sorted(latest.items())
+            f"{service}@{node}": healthy for (service, node), healthy in sorted(latest.items())
         }
         return {
             "data_age_seconds": 0.0,

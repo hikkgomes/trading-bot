@@ -137,12 +137,11 @@ def build_readiness(
                     kind="canonical_portfolio_risk_state", product_id=product_id, at=current
                 )
                 observed_at = timestamp(str(state["observed_at"]), field="state.observed_at")
-                age = max(
-                    0.0,
-                    (
-                        dt.datetime.fromisoformat(current) - dt.datetime.fromisoformat(observed_at)
-                    ).total_seconds(),
-                )
+                age = (
+                    dt.datetime.fromisoformat(current) - dt.datetime.fromisoformat(observed_at)
+                ).total_seconds()
+                if age < 0:
+                    raise ValueError("canonical portfolio state timestamp is in the future")
                 maximum_age = float(state["maximum_state_age_seconds"])
                 source_ids = state.get("source_snapshot_ids")
                 source_ages: dict[str, float] = {}
@@ -168,13 +167,12 @@ def build_readiness(
                         str(source_payload.get("observed_at", source_payload.get("created_at"))),
                         field=f"{source}.observed_at",
                     )
-                    source_age = max(
-                        0.0,
-                        (
-                            dt.datetime.fromisoformat(current)
-                            - dt.datetime.fromisoformat(source_observed)
-                        ).total_seconds(),
-                    )
+                    source_age = (
+                        dt.datetime.fromisoformat(current)
+                        - dt.datetime.fromisoformat(source_observed)
+                    ).total_seconds()
+                    if source_age < 0:
+                        raise ValueError(f"{source} source timestamp is in the future")
                     source_ages[source] = source_age
                     source_observed_at.append(source_observed)
                     if source_age > maximum_age:

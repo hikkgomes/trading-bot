@@ -24,6 +24,10 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
     assert "/opt/trading-bot/data/artefacts" in research
     assert "/opt/trading-bot/data/reports" in research
     assert "/opt/trading-bot/runtime/research" in research
+    assert (
+        "ReadOnlyPaths=/opt/trading-bot/data/raw /opt/trading-bot/data/bars "
+        "/opt/trading-bot/data/features"
+    ) in research
     assert "TRADING_PLATFORM_AGENT_WORKTREE_ROOT=/opt/trading-bot/runtime/agent-worktrees" in agent
     assert "ReadWritePaths=/opt/trading-bot/runtime/agent-worktrees" in agent
 

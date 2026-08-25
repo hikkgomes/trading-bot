@@ -152,7 +152,7 @@ class DatabaseMarketDataWriter:
         }
 
     def _publish_market_snapshots(self, *, event: MarketEvent, market: str) -> tuple[str, ...]:
-        if self.snapshot_store is None or not _is_closed_candle(event):
+        if self.snapshot_store is None:
             return ()
         values = _market_snapshot_values(event)
         if values is None:
@@ -285,21 +285,97 @@ def _is_closed_candle(event: MarketEvent) -> bool:
 
 def _market_snapshot_values(event: MarketEvent) -> dict[str, float] | None:
     raw_data = event.payload.get("data")
-    candle = raw_data.get("k") if isinstance(raw_data, Mapping) else None
-    if not isinstance(candle, Mapping):
+    if not isinstance(raw_data, Mapping):
         return None
     values: dict[str, float] = {}
-    for name in ("c", "spread_bps", "visible_depth", "volatility", "funding"):
-        value = candle.get(name)
-        if value is None or isinstance(value, bool):
+
+    def number(*names: str) -> float | None:
+        for name in names:
+            value = raw_data.get(name)
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(parsed):
+                return parsed
+        return None
+
+    candle = raw_data.get("k")
+    if event.event_type is MarketEventType.CANDLE:
+        if not isinstance(candle, Mapping) or candle.get("x") is not True:
+            return None
+        close = candle.get("c")
+        if close is None or isinstance(close, bool):
             return None
         try:
-            parsed = float(value)
+            values["close"] = float(close)
         except (TypeError, ValueError):
             return None
-        if not math.isfinite(parsed):
+        for name in ("spread_bps", "visible_depth", "volatility", "funding"):
+            value = candle.get(name)
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(parsed):
+                values[name] = parsed
+    elif event.event_type in {MarketEventType.BEST_BID_ASK, MarketEventType.DEPTH_UPDATE}:
+        bid = number("bid_price", "b")
+        ask = number("ask_price", "a")
+        bid_depth = number("bid_depth", "B")
+        ask_depth = number("ask_depth", "A")
+        if event.event_type is MarketEventType.DEPTH_UPDATE:
+            bid_levels = raw_data.get("b", raw_data.get("bids"))
+            ask_levels = raw_data.get("a", raw_data.get("asks"))
+            if isinstance(bid_levels, list) and bid_levels:
+                bid, bid_depth = _book_level(bid_levels[0])
+            if isinstance(ask_levels, list) and ask_levels:
+                ask, ask_depth = _book_level(ask_levels[0])
+        if bid is None or ask is None or bid <= 0 or ask < bid:
             return None
-        values[{"c": "close"}.get(name, name)] = parsed
-    if values["close"] <= 0 or values["visible_depth"] < 0:
+        midpoint = (bid + ask) / 2.0
+        values.update(
+            {
+                "close": midpoint,
+                "spread_bps": (ask - bid) / midpoint * 10_000.0,
+                "visible_depth": max(0.0, bid_depth or 0.0) + max(0.0, ask_depth or 0.0),
+            }
+        )
+    elif event.event_type is MarketEventType.MARK_PRICE:
+        price = number("mark_price", "markPrice", "p")
+        if price is None or price <= 0:
+            return None
+        values["close"] = price
+        funding = number("funding_rate", "fundingRate", "r")
+        if funding is not None:
+            values["funding"] = funding
+    elif event.event_type in {MarketEventType.TRADE, MarketEventType.AGGREGATE_TRADE}:
+        price = number("price", "p")
+        if price is None or price <= 0:
+            return None
+        values["close"] = price
+    else:
+        return None
+
+    if values.get("close", 0.0) <= 0:
+        return None
+    if values.get("visible_depth", 0.0) < 0:
         return None
     return values
+
+
+def _book_level(value: object) -> tuple[float | None, float | None]:
+    if not isinstance(value, list | tuple) or len(value) < 2:
+        return None, None
+    try:
+        price = float(value[0])
+        quantity = float(value[1])
+    except (TypeError, ValueError):
+        return None, None
+    if not math.isfinite(price) or not math.isfinite(quantity):
+        return None, None
+    return price, quantity
