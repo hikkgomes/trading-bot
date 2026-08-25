@@ -532,6 +532,15 @@ def _parameter_stability(
         comparable = values[: len(base_returns)]
         result = {
             "name": name,
+            "run_id": canonical_hash(
+                {
+                    "kind": "parameter_neighbour_backtest/v1",
+                    "candidate_id": candidate.candidate_id,
+                    "dataset_snapshot_ids": list(context.get("dataset_snapshot_ids", ())),
+                    "neighbour": name,
+                    "returns": comparable,
+                }
+            ),
             "observations": len(comparable),
             "return": sum(comparable),
             "passed": bool(comparable) and sum(comparable) >= base_total * 0.5,
@@ -564,6 +573,14 @@ def _cross_symbol_stability(
             numeric = _numeric_series(values)
             if numeric:
                 per_symbol[str(symbol)] = {
+                    "run_id": canonical_hash(
+                        {
+                            "kind": "cross_symbol_backtest/v1",
+                            "symbol": str(symbol),
+                            "returns": numeric,
+                            "dataset_snapshot_ids": list(context.get("dataset_snapshot_ids", ())),
+                        }
+                    ),
                     "observations": len(numeric),
                     "return": sum(numeric),
                     "passed": len(numeric) >= 2 and sum(numeric) >= 0.0,
@@ -616,6 +633,15 @@ def _portfolio_overlap(
         comparisons.append(
             {
                 "strategy": str(name),
+                "run_id": canonical_hash(
+                    {
+                        "kind": "portfolio_overlap/v1",
+                        "candidate_returns": candidate,
+                        "active_strategy": str(name),
+                        "active_returns": other,
+                        "dataset_snapshot_ids": list(context.get("dataset_snapshot_ids", ())),
+                    }
+                ),
                 "correlation": correlation,
                 "observations": min(len(candidate), len(other)),
                 "input_hash": canonical_hash(

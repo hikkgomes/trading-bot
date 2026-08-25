@@ -171,6 +171,10 @@ class CanonicalDatasetResolver:
             )
             for snapshot_id in snapshot_ids
         )
+        if allowed_roles is None and any(item.role == "protected_holdout" for item in resolved):
+            raise DatasetResolutionError(
+                "protected_holdout datasets require an explicit protected boundary"
+            )
         if allowed_roles is not None and any(item.role not in allowed_roles for item in resolved):
             raise DatasetResolutionError("dataset role is not permitted for this evaluation stage")
         if any(item.role in forbidden_roles for item in resolved):

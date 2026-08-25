@@ -16,7 +16,6 @@ ExecStart=/opt/trading-bot/.venv-agent/bin/python -m src.services.supervisor --c
 Restart=always
 RestartSec=10
 NoNewPrivileges=true
-PrivateNetwork=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true

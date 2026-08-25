@@ -213,6 +213,7 @@ class DatabaseMarketDataWriter:
             ),
             "spot_perpetual": ("spot_perpetual_snapshot", ("candle",)),
             "cross_sectional": ("cross_sectional_snapshot", ("candle",)),
+            "correlation_beta": ("correlation_beta_snapshot", ("candle",)),
             "sentiment": ("sentiment_snapshot", ()),
             "ml_manifest": ("frozen_ml_manifest", ()),
             "liquidation": ("liquidation_snapshot", ("liquidation",)),
@@ -220,7 +221,7 @@ class DatabaseMarketDataWriter:
         for name, (kind, event_types) in auxiliary_specs.items():
             pattern = (
                 f"raw/{venue.lower()}/{market.lower()}/candle/**/*.parquet"
-                if name == "cross_sectional"
+                if name in {"cross_sectional", "correlation_beta"}
                 else f"raw/{venue.lower()}/**/candle/{symbol.upper()}/**/*.parquet"
                 if name == "spot_perpetual"
                 else f"raw/{venue.lower()}/{market.lower()}/**/{symbol.upper()}/**/*.parquet"

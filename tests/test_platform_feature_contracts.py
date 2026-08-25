@@ -99,6 +99,31 @@ def test_structured_live_inputs_are_typed_and_fail_closed() -> None:
         )
 
 
+def test_correlation_and_beta_require_point_in_time_return_histories() -> None:
+    graph = FeatureGraphRegistry.default().graph(("beta", "correlation"))
+    values = default_feature_engine().evaluate(
+        graph,
+        information_timestamp=NOW,
+        inputs={
+            "asset_returns": AvailableValue([0.01, 0.02, 0.03], NOW, NOW),
+            "benchmark_returns": AvailableValue([0.01, 0.01, 0.02], NOW, NOW),
+        },
+    )
+
+    assert values["beta"] > 0.0
+    assert 0.0 < values["correlation"] <= 1.0
+
+    with pytest.raises(FeatureGraphError, match="at least 2 historical values"):
+        default_feature_engine().evaluate(
+            graph,
+            information_timestamp=NOW,
+            inputs={
+                "asset_returns": AvailableValue([0.01], NOW, NOW),
+                "benchmark_returns": AvailableValue([0.01], NOW, NOW),
+            },
+        )
+
+
 def test_market_data_writer_publishes_authoritative_market_snapshot(tmp_path) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'platform.sqlite3'}")
     database.create_schema()

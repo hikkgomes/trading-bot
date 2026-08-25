@@ -147,6 +147,10 @@ class EvaluationRequest:
             raise EvaluationContractError("content_hash does not match the evaluation request")
         raw_roles = payload.get("dataset_roles")
         roles: dict[str, str] | None = None
+        if raw_roles is None:
+            raise EvaluationContractError(
+                "evaluate_candidate requests require explicit dataset roles"
+            )
         if raw_roles is not None:
             if not isinstance(raw_roles, Mapping) or set(raw_roles) != set(snapshots):
                 raise EvaluationContractError(
@@ -361,6 +365,7 @@ def _parameter_stability_passes(value: object, _policy: EvidencePolicy) -> bool:
         and isinstance(item.get("observations"), int)
         and int(item["observations"]) > 0
         and _finite(item.get("return")) is not None
+        and _valid_hash(item.get("run_id"))
         and _valid_hash(item.get("input_hash"))
         for item in results
     )
@@ -379,6 +384,7 @@ def _cross_symbol_stability_passes(value: object, _policy: EvidencePolicy) -> bo
         and isinstance(item.get("observations"), int)
         and int(item["observations"]) >= 2
         and _finite(item.get("return")) is not None
+        and _valid_hash(item.get("run_id"))
         and _valid_hash(item.get("input_hash"))
         for item in per_symbol.values()
     )
@@ -408,6 +414,7 @@ def _portfolio_overlap_passes(value: object, policy: EvidencePolicy) -> bool:
         and isinstance(item.get("observations"), int)
         and int(item["observations"]) >= 2
         and _finite(item.get("correlation")) is not None
+        and _valid_hash(item.get("run_id"))
         and _valid_hash(item.get("input_hash"))
         for item in comparisons
     )

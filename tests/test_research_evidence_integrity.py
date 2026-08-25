@@ -75,6 +75,8 @@ def test_development_resolution_cannot_load_protected_data() -> None:
             allowed_roles=frozenset({"development"}),
             **kwargs,
         )
+    with pytest.raises(DatasetResolutionError, match="explicit protected boundary"):
+        resolver.resolve_context(snapshot_ids=(protected.snapshot_id,), **kwargs)
 
 
 def test_research_stages_select_distinct_dataset_roles() -> None:

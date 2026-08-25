@@ -320,7 +320,8 @@ class DatabaseFeatureWorker:
                 instrument_id=str(payload["instrument_id"]),
                 available_at=available_at,
                 through=reference_through,
-                same_instrument=name not in {"cross_sectional", "spot_perpetual"},
+                same_instrument=name
+                not in {"cross_sectional", "correlation_beta", "spot_perpetual"},
             )
             _merge_auxiliary_inputs(
                 resolved,
@@ -586,6 +587,33 @@ def _merge_auxiliary_inputs(
             if instrument_id in panel:
                 panel["__current__"] = panel[instrument_id]
             resolved["cross_sectional_values"] = panel
+        return
+    if name == "correlation_beta":
+        closes_by_instrument: dict[str, list[float]] = {}
+        for row in rows:
+            close = _number(_payload_views(row["payload"]), "c", "close")
+            if close is not None and close > 0:
+                closes_by_instrument.setdefault(str(row.get("instrument_id")), []).append(close)
+        returns_by_instrument = {
+            identity: [
+                closes[index] / closes[index - 1] - 1.0
+                for index in range(1, len(closes))
+                if closes[index - 1] > 0
+            ]
+            for identity, closes in closes_by_instrument.items()
+        }
+        asset_returns = returns_by_instrument.get(instrument_id, [])
+        benchmark_returns = next(
+            (
+                values
+                for identity, values in returns_by_instrument.items()
+                if identity != instrument_id and values
+            ),
+            [],
+        )
+        if asset_returns and benchmark_returns:
+            resolved["asset_returns"] = asset_returns
+            resolved["benchmark_returns"] = benchmark_returns
         return
     if name == "sentiment":
         value = _number(views, "sentiment_score", "score")
