@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import datetime as dt
+
 from sqlalchemy import func, select
 
-from src.data.database import PlatformDatabase, job, service_heartbeat
+from src.data.database import PlatformDatabase, job, risk_snapshot, service_heartbeat
 from src.risk.engine import SqlRiskSnapshotStore
 from src.services.health import DatabaseHeartbeatStore
 from src.services.portfolio_state import DatabasePortfolioStateWorker
@@ -82,24 +84,35 @@ def test_unchanged_portfolio_sources_remain_idle_for_10000_cycles(tmp_path) -> N
         )
     worker = DatabasePortfolioStateWorker(queue=queue, worker_id="state-worker", store=store)
 
-    assert (
-        worker.schedule_from_latest(
-            products={"product": {}}, state_policies={"product": _policy()}, now=NOW
-        )
-        == 1
-    )
-    assert worker.run_once(now=NOW)["reason_code"] == "canonical_portfolio_state_published"
-    assert all(
-        worker.schedule_from_latest(
-            products={"product": {}},
-            state_policies={"product": _policy()},
-            now="2026-08-24T00:00:01+00:00",
-        )
-        == 0
-        for _ in range(10_000)
-    )
+    heartbeat = DatabaseHeartbeatStore(database.engine, retention_per_service=32)
+    for index in range(10_000):
+        now = (dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=index)).isoformat()
+        result = worker.run_once(now=now)
+        if result["reason_code"] == "portfolio_state_queue_empty":
+            scheduled = worker.schedule_from_latest(
+                products={"product": {}}, state_policies={"product": _policy()}, now=now
+            )
+            if scheduled:
+                result = worker.run_once(now=now)
+        if index % 250 == 0:
+            heartbeat.record(
+                service_name="portfolio-state-service",
+                node_id="linux-optiplex",
+                observed_at=now,
+                healthy=True,
+                payload={"reason_code": result["reason_code"]},
+            )
+    assert result["reason_code"] in {
+        "portfolio_state_queue_empty",
+        "canonical_portfolio_state_published",
+    }
     with database.engine.connect() as connection:
         assert connection.execute(select(func.count()).select_from(job)).scalar_one() == 1
+        assert connection.execute(select(func.count()).select_from(risk_snapshot)).scalar_one() == 8
+        assert (
+            connection.execute(select(func.count()).select_from(service_heartbeat)).scalar_one()
+            == 32
+        )
 
 
 def test_heartbeat_retention_is_bounded(tmp_path) -> None:

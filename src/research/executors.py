@@ -234,6 +234,10 @@ def _measured_result(
     observed_cost_model = str(context.get("runtime_cost_model_id") or "")
     production_mode = str(context.get("production_execution_mode") or "")
     runtime_mode = str(context.get("runtime_execution_mode") or "")
+    expected_feature_manifest = str(
+        context.get("feature_manifest_id") or context.get("feature_set_hash") or ""
+    )
+    observed_feature_manifest = str(context.get("runtime_feature_manifest_id") or "")
     randomiser = random.Random(int(candidate.candidate_id[7:23], 16))
     monte_carlo_drawdowns = []
     for _ in range(250):
@@ -336,9 +340,25 @@ def _measured_result(
         },
         "negative_control_results": negative_controls,
         "production_equivalent": {
-            "passed": bool(production_mode and runtime_mode and runtime_mode == production_mode),
+            "passed": bool(
+                production_mode
+                and runtime_mode
+                and runtime_mode == production_mode
+                and expected_engine_hash
+                and observed_engine_hash == expected_engine_hash
+                and expected_feature_manifest
+                and observed_feature_manifest == expected_feature_manifest
+                and expected_cost_model
+                and observed_cost_model == expected_cost_model
+            ),
             "runtime_execution_mode": runtime_mode,
             "production_execution_mode": production_mode,
+            "expected_engine_hash": expected_engine_hash,
+            "observed_engine_hash": observed_engine_hash,
+            "expected_feature_manifest": expected_feature_manifest,
+            "observed_feature_manifest": observed_feature_manifest,
+            "expected_cost_model": expected_cost_model,
+            "observed_cost_model": observed_cost_model,
         },
         "exact_strategy_identity": {
             "passed": observed_definition_hash == expected_definition_hash,

@@ -142,6 +142,10 @@ platform-smoke:  ## Run the PostgreSQL closed-event platform smoke for both prod
 platform-testnet-rehearsal:  ## Verify the platform live/user-stream/accounting/recovery rehearsal path
 	$(PY) -m pytest -q tests/test_platform_testnet_rehearsal.py
 
+.PHONY: platform-permissions-test
+platform-permissions-test:  ## Verify installed service users, writable paths, and one cycle per domain
+	bash scripts/verify_platform_service_install.sh
+
 .PHONY: platform-ci
 platform-ci:  ## Run the platform configuration, lint, migration, smoke, and test checks
 	$(MAKE) platform-validate

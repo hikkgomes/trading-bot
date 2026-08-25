@@ -258,7 +258,7 @@ class FeatureGraphRegistry:
                 (),
                 ("cross_sectional_values",),
                 {},
-                1,
+                2,
             ),
             "beta": (
                 FeatureNodeType.CORRELATION_BETA,
@@ -379,8 +379,13 @@ def _validate_node_inputs(node: FeatureNode, inputs: Mapping[str, AvailableValue
             except (TypeError, ValueError) as exc:
                 raise FeatureGraphError(f"feature input {name} must be numeric series") from exc
         elif expected == "mapping":
-            if not isinstance(value, Mapping) or not value:
-                raise FeatureGraphError(f"feature input {name} must be a non-empty mapping")
+            mapping_size = (
+                len(value) - int("__current__" in value) if isinstance(value, Mapping) else 0
+            )
+            if not isinstance(value, Mapping) or mapping_size < node.minimum_history:
+                raise FeatureGraphError(
+                    f"feature input {name} needs at least {node.minimum_history} mapping values"
+                )
         elif isinstance(value, bool) or not isinstance(value, int | float):
             raise FeatureGraphError(f"feature input {name} must be a numeric scalar")
 
@@ -546,11 +551,17 @@ def _evaluate_default_node(
         )
         return perpetual / spot - 1.0 if spot > 0 else 0.0
     if name == "cross_sectional_rank":
-        values = sorted(
-            float(value) for value in dict(_raw(inputs, "cross_sectional_values")).values()
+        raw_values = dict(_raw(inputs, "cross_sectional_values"))
+        marker = raw_values.pop("__current__", None)
+        current = float(
+            marker
+            if marker is not None
+            else node.parameters.get("current_value", max(raw_values.values()))
         )
-        current = float(node.parameters.get("current_value", values[-1]))
-        return (values.index(current) + 1) / len(values)
+        values = sorted(float(value) for value in raw_values.values())
+        if not values:
+            raise FeatureGraphError("cross-sectional input has no instrument values")
+        return (sum(value <= current for value in values)) / len(values)
     if name == "bid_ask_spread":
         bid, ask = float(_raw(inputs, "bid_price", close)), float(_raw(inputs, "ask_price", close))
         return (ask - bid) / ((ask + bid) / 2) if ask + bid > 0 else 0.0

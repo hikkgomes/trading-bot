@@ -211,6 +211,7 @@ class DatabaseMarketDataWriter:
                 "funding_open_interest_snapshot",
                 ("funding_rate", "open_interest", "mark_price"),
             ),
+            "spot_perpetual": ("spot_perpetual_snapshot", ("candle",)),
             "cross_sectional": ("cross_sectional_snapshot", ("candle",)),
             "sentiment": ("sentiment_snapshot", ()),
             "ml_manifest": ("frozen_ml_manifest", ()),
@@ -220,6 +221,8 @@ class DatabaseMarketDataWriter:
             pattern = (
                 f"raw/{venue.lower()}/{market.lower()}/candle/**/*.parquet"
                 if name == "cross_sectional"
+                else f"raw/{venue.lower()}/**/candle/{symbol.upper()}/**/*.parquet"
+                if name == "spot_perpetual"
                 else f"raw/{venue.lower()}/{market.lower()}/**/{symbol.upper()}/**/*.parquet"
             )
             reference = {

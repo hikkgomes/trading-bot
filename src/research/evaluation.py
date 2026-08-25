@@ -264,6 +264,8 @@ class EvidencePolicy:
         )
 
     def accepts(self, stage: str, evidence: Mapping[str, Any], controls: tuple[str, ...]) -> bool:
+        if evidence.get("evidence_policy_hash") != self.policy_hash:
+            return False
         validators = _STAGE_EVIDENCE_VALIDATORS.get(stage, {})
         if not validators or any(
             not validator(evidence.get(name), self) for name, validator in validators.items()

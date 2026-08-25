@@ -216,6 +216,11 @@ class DatabaseResearchJobHandlers:
                     **frozen_context,
                     "requested_stage": "protected",
                     "evaluated_at": request.evaluated_at,
+                    "evidence_policy_hash": self.evidence_policy.policy_hash,
+                    "minimum_bootstrap_observations": self.evidence_policy.minimum_bootstrap_observations,
+                    "bootstrap_method": self.evidence_policy.bootstrap_method,
+                    "multiple_testing_method": self.evidence_policy.multiple_testing_method,
+                    "pbo_method": self.evidence_policy.pbo_method,
                 },
             )
             measured = dict(execution.evidence)

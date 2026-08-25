@@ -320,9 +320,14 @@ class DatabaseFeatureWorker:
                 instrument_id=str(payload["instrument_id"]),
                 available_at=available_at,
                 through=reference_through,
-                same_instrument=name != "cross_sectional",
+                same_instrument=name not in {"cross_sectional", "spot_perpetual"},
             )
-            _merge_auxiliary_inputs(resolved, name=str(name), rows=auxiliary_rows)
+            _merge_auxiliary_inputs(
+                resolved,
+                name=str(name),
+                rows=auxiliary_rows,
+                instrument_id=str(payload["instrument_id"]),
+            )
         return resolved
 
     @staticmethod
@@ -434,9 +439,9 @@ def _number(views: tuple[Mapping[str, Any], ...], *names: str) -> float | None:
     return None
 
 
-def _levels(views: tuple[Mapping[str, Any], ...], name: str) -> tuple[float, float] | None:
+def _levels(views: tuple[Mapping[str, Any], ...], *names: str) -> tuple[float, float] | None:
     for view in views:
-        raw_levels = view.get(name)
+        raw_levels = next((view.get(name) for name in names if view.get(name) is not None), None)
         if not isinstance(raw_levels, list):
             continue
         levels: list[tuple[float, float]] = []
@@ -455,7 +460,11 @@ def _levels(views: tuple[Mapping[str, Any], ...], name: str) -> tuple[float, flo
 
 
 def _merge_auxiliary_inputs(
-    resolved: dict[str, Any], *, name: str, rows: list[dict[str, Any]]
+    resolved: dict[str, Any],
+    *,
+    name: str,
+    rows: list[dict[str, Any]],
+    instrument_id: str,
 ) -> None:
     if not rows:
         return
@@ -474,8 +483,8 @@ def _merge_auxiliary_inputs(
         ask = _number(views, "ask_price", "a")
         bid_depth = _number(views, "bid_depth", "B")
         ask_depth = _number(views, "ask_depth", "A")
-        bid_levels = _levels(views, "b")
-        ask_levels = _levels(views, "a")
+        bid_levels = _levels(views, "b", "bids")
+        ask_levels = _levels(views, "a", "asks")
         if bid_levels is not None:
             bid, bid_depth = bid_levels
         if ask_levels is not None:
@@ -519,12 +528,34 @@ def _merge_auxiliary_inputs(
             )
         return
     if name == "funding_open_interest":
-        funding = _number(views, "funding_rate", "r", "funding")
-        open_interest = _number(views, "open_interest", "oi")
+        funding = _number(views, "funding_rate", "fundingRate", "r", "funding")
+        open_interest = _number(views, "open_interest", "openInterest", "oi")
         if funding is not None:
             resolved["funding_rate"] = funding
         if open_interest is not None:
             resolved["open_interest"] = open_interest
+        return
+    if name == "spot_perpetual":
+        prices: dict[str, float] = {}
+        for row in rows:
+            price = _number(_payload_views(row["payload"]), "close", "c", "price")
+            if price is not None and price > 0:
+                prices[str(row.get("instrument_id"))] = price
+        current_market = "futures" if ":futures:" in instrument_id else "spot"
+        other_market = "spot" if current_market == "futures" else "futures"
+        current_price = prices.get(instrument_id)
+        other_price = next(
+            (price for identity, price in prices.items() if f":{other_market}:" in identity),
+            None,
+        )
+        if current_price is not None:
+            resolved["perpetual_price" if current_market == "futures" else "spot_price"] = (
+                current_price
+            )
+        if other_price is not None:
+            resolved["spot_price" if current_market == "futures" else "perpetual_price"] = (
+                other_price
+            )
         return
     if name == "cross_sectional":
         explicit = next(
@@ -536,7 +567,10 @@ def _merge_auxiliary_inputs(
             None,
         )
         if isinstance(explicit, Mapping) and explicit:
-            resolved["cross_sectional_values"] = dict(explicit)
+            panel = {str(key): float(value) for key, value in explicit.items()}
+            if instrument_id in panel:
+                panel["__current__"] = panel[instrument_id]
+            resolved["cross_sectional_values"] = panel
             return
         closes_by_instrument: dict[str, list[float]] = {}
         for row in rows:
@@ -549,6 +583,8 @@ def _merge_auxiliary_inputs(
             if len(closes) >= 2 and closes[-2] > 0
         }
         if panel:
+            if instrument_id in panel:
+                panel["__current__"] = panel[instrument_id]
             resolved["cross_sectional_values"] = panel
         return
     if name == "sentiment":

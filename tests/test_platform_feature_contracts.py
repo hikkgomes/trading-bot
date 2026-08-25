@@ -3,9 +3,16 @@ from __future__ import annotations
 import datetime as dt
 import statistics
 
+import pytest
+
 from src.data.binance_market import normalise_public_event
 from src.data.database import PlatformDatabase
-from src.data.feature_graph import AvailableValue, FeatureGraphRegistry, default_feature_engine
+from src.data.feature_graph import (
+    AvailableValue,
+    FeatureGraphError,
+    FeatureGraphRegistry,
+    default_feature_engine,
+)
 from src.data.feature_store import SqlFeatureStore
 from src.domain._codec import to_primitive
 from src.domain.instruments import Instrument, MarketType
@@ -65,6 +72,31 @@ def test_real_atr_adx_and_supertrend_use_historical_ranges() -> None:
     assert values["atr"] > 0.0
     assert 0.0 <= values["adx"] <= 100.0
     assert values["supertrend"] != 0.0
+
+
+def test_structured_live_inputs_are_typed_and_fail_closed() -> None:
+    registry = FeatureGraphRegistry.default()
+    graph = registry.graph(("cross_sectional_rank", "funding", "open_interest"))
+    inputs = {
+        "cross_sectional_values": AvailableValue(
+            {"BTCUSDT": 0.4, "ETHUSDT": -0.2, "__current__": 0.4}, NOW, NOW
+        ),
+        "funding_rate": AvailableValue(0.001, NOW, NOW),
+        "open_interest": AvailableValue(10_000.0, NOW, NOW),
+    }
+    values = default_feature_engine().evaluate(graph, information_timestamp=NOW, inputs=inputs)
+    assert values["cross_sectional_rank"] == 1.0
+    assert values["funding"] == 0.001
+    assert values["open_interest"] == 10_000.0
+    with pytest.raises(FeatureGraphError, match="at least 2 mapping values"):
+        default_feature_engine().evaluate(
+            graph,
+            information_timestamp=NOW,
+            inputs={
+                **inputs,
+                "cross_sectional_values": AvailableValue({"__current__": 0.4}, NOW, NOW),
+            },
+        )
 
 
 def test_market_data_writer_publishes_authoritative_market_snapshot(tmp_path) -> None:
