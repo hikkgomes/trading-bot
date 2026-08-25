@@ -62,6 +62,38 @@ class Candidate:
 
 
 @dataclass(frozen=True)
+class CandidateEvaluationView:
+    """Candidate metadata view limited to the datasets for one adaptive run."""
+
+    candidate_id: str
+    definition: StrategyDefinition
+    thesis_id: str
+    lineage_id: str
+    provider: str
+    dataset_snapshot_hashes: tuple[str, ...]
+    submitted_at: str
+    metadata: Mapping[str, Any]
+
+    @classmethod
+    def from_candidate(
+        cls, candidate: Candidate, dataset_snapshot_hashes: tuple[str, ...]
+    ) -> CandidateEvaluationView:
+        snapshots = tuple(dataset_snapshot_hashes)
+        if not snapshots or not set(snapshots).issubset(set(candidate.dataset_snapshot_hashes)):
+            raise ValueError("evaluation view datasets must be a non-empty candidate subset")
+        return cls(
+            candidate_id=candidate.candidate_id,
+            definition=candidate.definition,
+            thesis_id=candidate.thesis_id,
+            lineage_id=candidate.lineage_id,
+            provider=candidate.provider,
+            dataset_snapshot_hashes=snapshots,
+            submitted_at=candidate.submitted_at,
+            metadata=candidate.metadata,
+        )
+
+
+@dataclass(frozen=True)
 class ResearchResult:
     candidate_id: str
     state: CandidateState

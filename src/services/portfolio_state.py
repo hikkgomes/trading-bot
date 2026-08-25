@@ -69,6 +69,16 @@ class DatabasePortfolioSourceService:
         market, market_at = self._market(product_id, now)
         if balance_payload is None or not market:
             return
+        # An empty position or order book has no authoritative event timestamp.
+        # Reusing the prior derived snapshot keeps an unchanged empty state
+        # content-addressed instead of making it depend on the latest market
+        # event's wall-clock timestamp.
+        positions_at = positions_at or self._previous_observed_at(
+            kind="positions", product_id=product_id, at=now
+        )
+        orders_at = orders_at or self._previous_observed_at(
+            kind="open_orders", product_id=product_id, at=now
+        )
         observed_at = max(
             value for value in (balance_at, positions_at, orders_at, market_at) if value is not None
         )
@@ -109,23 +119,61 @@ class DatabasePortfolioSourceService:
             observed_at=market_at or observed_at,
             values={"market": market, "correlations": {}, "beta": {}},
         )
-        health_values = self._health(now)
+        health_values, health_at = self._health(now)
         self.publish(
             product_id=product_id,
             kind="health",
             # Heartbeat timestamps describe liveness, not a new portfolio
             # input. Keep them out of the snapshot identity so an unchanged
             # system does not publish a new canonical state every second.
-            observed_at=observed_at,
+            observed_at=self._stable_observed_at(
+                kind="health",
+                product_id=product_id,
+                values=health_values,
+                candidate=health_at or observed_at,
+                at=now,
+            ),
             values=health_values,
         )
         drift_values, drift_at = self._drift(str(product["portfolio_id"]), now)
         self.publish(
             product_id=product_id,
             kind="drift",
-            observed_at=drift_at or observed_at,
+            observed_at=drift_at
+            or self._previous_observed_at(kind="drift", product_id=product_id, at=now)
+            or observed_at,
             values=drift_values,
         )
+
+    def _previous_observed_at(self, *, kind: str, product_id: str, at: str) -> str | None:
+        try:
+            _identity, snapshot = self.store.latest(kind=kind, product_id=product_id, at=at)
+        except KeyError:
+            return None
+        value = snapshot.get("observed_at", snapshot.get("created_at"))
+        return timestamp(str(value), field=f"{kind}.observed_at") if value is not None else None
+
+    def _stable_observed_at(
+        self,
+        *,
+        kind: str,
+        product_id: str,
+        values: Mapping[str, Any],
+        candidate: str,
+        at: str,
+    ) -> str:
+        try:
+            _identity, snapshot = self.store.latest(kind=kind, product_id=product_id, at=at)
+        except KeyError:
+            return timestamp(candidate, field=f"{kind}.observed_at")
+        previous_values = snapshot.get("values")
+        if isinstance(previous_values, Mapping) and canonical_hash(
+            dict(previous_values)
+        ) == canonical_hash(dict(values)):
+            previous_at = snapshot.get("observed_at", snapshot.get("created_at"))
+            if previous_at is not None:
+                return timestamp(str(previous_at), field=f"{kind}.observed_at")
+        return timestamp(candidate, field=f"{kind}.observed_at")
 
     def _latest_payload(
         self, table, account_id: str, at: str
@@ -251,7 +299,7 @@ class DatabasePortfolioSourceService:
             latest_at = row_time if latest_at is None else max(latest_at, row_time)
         return market, latest_at
 
-    def _health(self, at: str) -> dict[str, Any]:
+    def _health(self, at: str) -> tuple[dict[str, Any], str | None]:
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(
@@ -265,6 +313,7 @@ class DatabasePortfolioSourceService:
                 .order_by(service_heartbeat.c.observed_at.desc(), service_heartbeat.c.id.desc())
             ).mappings()
         latest: dict[tuple[str, str], bool] = {}
+        latest_observed_at: str | None = None
         for row in rows:
             service_name = str(row["service_name"])
             # The state service must not use its own heartbeat as a source.
@@ -272,6 +321,8 @@ class DatabasePortfolioSourceService:
             # would otherwise make every state identity wall-clock dependent.
             if service_name == "portfolio-state-service":
                 continue
+            observed_at = timestamp(str(row["observed_at"]), field="health.observed_at")
+            latest_observed_at = latest_observed_at or observed_at
             key = (service_name, str(row["node_id"]))
             if key in latest:
                 continue
@@ -279,13 +330,16 @@ class DatabasePortfolioSourceService:
         statuses = {
             f"{service}@{node}": healthy for (service, node), healthy in sorted(latest.items())
         }
-        return {
-            "data_age_seconds": 0.0,
-            "clock_skew_seconds": 0.0,
-            "exchange_connected": all(statuses.values()) if statuses else True,
-            "database_healthy": self._database_healthy(),
-            "services": statuses,
-        }
+        return (
+            {
+                "data_age_seconds": 0.0,
+                "clock_skew_seconds": 0.0,
+                "exchange_connected": all(statuses.values()) if statuses else True,
+                "database_healthy": self._database_healthy(),
+                "services": statuses,
+            },
+            latest_observed_at,
+        )
 
     def _database_healthy(self) -> bool:
         try:

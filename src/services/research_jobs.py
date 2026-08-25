@@ -16,7 +16,7 @@ from src.research.backtest.event_engine import (
     SimulatedOrderSide,
 )
 from src.research.catalogue import registered_strategy_candidates, registered_strategy_theses
-from src.research.coordinator import Candidate, ResearchCoordinator
+from src.research.coordinator import Candidate, CandidateEvaluationView, ResearchCoordinator
 from src.research.datasets import CanonicalDatasetResolver
 from src.research.evaluation import (
     CanonicalResearchEvaluator,
@@ -191,7 +191,10 @@ class DatabaseResearchJobHandlers:
                     request.evaluated_at if request.requested_stage == "forward" else None
                 ),
             )
-            context = self.context_builders.build(candidate, resolved_context)
+            context = self.context_builders.build(
+                CandidateEvaluationView.from_candidate(candidate, adaptive_snapshot_ids),
+                resolved_context,
+            )
         else:
             context = {
                 "candidate_id": request.candidate_id,

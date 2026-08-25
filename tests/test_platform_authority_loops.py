@@ -232,6 +232,14 @@ def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path
         products={"active_income": product},
         accounts={"futures": {}},
     )
+    heartbeat = DatabaseHeartbeatStore(database.engine)
+    heartbeat.record(
+        service_name="data-writer",
+        node_id="linux-optiplex",
+        observed_at=NOW,
+        healthy=True,
+        payload={"reason_code": "market_event_written"},
+    )
     worker = DatabasePortfolioStateWorker(
         queue=queue,
         worker_id="state",
@@ -247,8 +255,26 @@ def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path
         == 1
     )
     assert worker.run_once(now=NOW)["reason_code"] == "canonical_portfolio_state_published"
+    with database.engine.connect() as connection:
+        risk_snapshot_count = connection.execute(
+            select(func.count()).select_from(risk_snapshot)
+        ).scalar_one()
+
+    later = "2026-08-24T00:00:01+00:00"
+    heartbeat.record(
+        service_name="data-writer",
+        node_id="linux-optiplex",
+        observed_at=later,
+        healthy=True,
+        payload={"reason_code": "market_event_written"},
+    )
+    source_service.refresh("active_income", later)
 
     with database.engine.connect() as connection:
+        assert (
+            connection.execute(select(func.count()).select_from(risk_snapshot)).scalar_one()
+            == risk_snapshot_count
+        )
         source_kinds = {
             str(row[0])
             for row in connection.execute(

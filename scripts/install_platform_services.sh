@@ -54,7 +54,7 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   # Common-group access is limited to traversal. ACLs grant research read
   # access to market data and keep writes owned by the producing service.
   setfacl -m u:trading-runtime:rwx,u:trading-research:rx,u:trading-agent:--x "$REPO/data"
-  setfacl -m u:trading-runtime:rwx,u:trading-research:rx "$REPO/runtime"
+  setfacl -m u:trading-runtime:rwx,u:trading-research:rx,u:trading-agent:--x "$REPO/runtime"
   for directory in raw bars features; do
     setfacl -m u:trading-research:rx "$REPO/data/$directory"
     setfacl -m d:u:trading-research:rx "$REPO/data/$directory"
