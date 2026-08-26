@@ -28,6 +28,7 @@ jobs:
           --health-retries=20
     env:
       TRADING_PLATFORM_DATABASE_URL: postgresql+psycopg://trading_platform:trading_platform@127.0.0.1:5432/trading_platform
+      TRADING_PLATFORM_TESTNET_DATABASE_URL: postgresql+psycopg://trading_platform:trading_platform@127.0.0.1:5432/trading_platform
       TRADING_PLATFORM_PRIVILEGE_TEST: "1"
     steps:
       - uses: actions/checkout@v4
