@@ -51,6 +51,7 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
 
 def test_ci_runs_real_service_user_permission_rehearsal() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+    verifier = (ROOT / "scripts/verify_platform_service_install.sh").read_text()
 
     assert "sudo apt-get install -y acl" in workflow
     assert 'sudo cp -a "$GITHUB_WORKSPACE" /opt/trading-bot' in workflow
@@ -62,6 +63,8 @@ def test_ci_runs_real_service_user_permission_rehearsal() -> None:
     assert "scripts/install_platform_services.sh" in workflow
     assert "scripts/verify_platform_service_install.sh" in workflow
     assert 'sudo chown -R "$USER:$(id -gn)" /opt/trading-bot/data' in workflow
+    assert '\'cd "$1" && shift && exec "$@"\'' in verifier
+    assert 'platform-service-cycle "$REPO" env' in verifier
 
 
 @pytest.mark.skipif(

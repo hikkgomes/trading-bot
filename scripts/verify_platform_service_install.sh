@@ -83,7 +83,8 @@ run_cycle() {
     echo "missing service interpreter: $python" >&2
     exit 1
   }
-  runuser -u "$user" -- env \
+  runuser -u "$user" -- sh -c 'cd "$1" && shift && exec "$@"' \
+    platform-service-cycle "$REPO" env \
     TRADING_PLATFORM_DATABASE_URL="$DATABASE_URL" \
     "$@" \
     "$python" -m src.services.supervisor \
