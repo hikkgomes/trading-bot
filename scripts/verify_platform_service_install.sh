@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO="${REPO:-/opt/trading-bot}"
 DATABASE_URL="${TRADING_PLATFORM_DATABASE_URL:-}"
+PLATFORM_CONFIG="${TRADING_PLATFORM_CONFIG:-$REPO/config/platform.json}"
 
 if [[ "$(id -u)" != "0" ]]; then
   echo "platform service verification requires root" >&2
@@ -86,7 +87,7 @@ run_cycle() {
     TRADING_PLATFORM_DATABASE_URL="$DATABASE_URL" \
     "$@" \
     "$python" -m src.services.supervisor \
-    --config "$REPO/config/platform.json" \
+    --config "$PLATFORM_CONFIG" \
     --node linux-optiplex \
     --service "$service" \
     --once

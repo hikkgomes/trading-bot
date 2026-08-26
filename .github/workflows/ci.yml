@@ -68,9 +68,12 @@ jobs:
           sudo apt-get install -y acl
           sudo mv "$GITHUB_WORKSPACE" /opt/trading-bot
           sudo ln -s /opt/trading-bot "$GITHUB_WORKSPACE"
+          jq '.postgresql.require_tls = false' /opt/trading-bot/config/platform.json \
+            > /tmp/trading-platform-ci.json
           sudo env REPO=/opt/trading-bot NODE=linux-optiplex SKIP_SYSTEMD=1 \
             bash scripts/install_platform_services.sh
           sudo env REPO=/opt/trading-bot \
+            TRADING_PLATFORM_CONFIG=/tmp/trading-platform-ci.json \
             TRADING_PLATFORM_DATABASE_URL="$TRADING_PLATFORM_DATABASE_URL" \
             bash scripts/verify_platform_service_install.sh
       - name: Validate platform installer
