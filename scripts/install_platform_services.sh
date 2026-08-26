@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO="${REPO:-/opt/trading-bot}"
 NODE="${NODE:-linux-optiplex}"
+SKIP_SYSTEMD="${SKIP_SYSTEMD:-0}"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   [[ "$NODE" == "linux-optiplex" ]] || { echo "NODE must be linux-optiplex." >&2; exit 1; }
@@ -87,6 +88,10 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     /etc/systemd/system/trading-platform-backup-parquet.timer
   install -m 0644 "$REPO/deploy/systemd/trading-platform-backup-verify.timer" \
     /etc/systemd/system/trading-platform-backup-verify.timer
+  if [[ "$SKIP_SYSTEMD" == "1" ]]; then
+    echo "Installed Linux service users, permissions, and units without enabling systemd."
+    exit 0
+  fi
   systemctl daemon-reload
   critical_services=(market-gateway data-writer feature-service strategy-evaluator portfolio-engine portfolio-state-service risk-engine execution-engine paper-engine product-supervisor accounting-service promotion-engine control-api universe-service)
   research_services=(research-worker ml-worker event-replay-worker feature-build-worker report-worker)

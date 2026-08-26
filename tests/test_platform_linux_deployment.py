@@ -35,6 +35,17 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
     ) in research
     assert "TRADING_PLATFORM_AGENT_WORKTREE_ROOT=/opt/trading-bot/runtime/agent-worktrees" in agent
     assert "ReadWritePaths=/opt/trading-bot/runtime/agent-worktrees" in agent
+    assert 'SKIP_SYSTEMD="${SKIP_SYSTEMD:-0}"' in installer
+    assert 'if [[ "$SKIP_SYSTEMD" == "1" ]]; then' in installer
+
+
+def test_ci_runs_real_service_user_permission_rehearsal() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+
+    assert "sudo apt-get install -y acl" in workflow
+    assert "SKIP_SYSTEMD=1" in workflow
+    assert "scripts/install_platform_services.sh" in workflow
+    assert "scripts/verify_platform_service_install.sh" in workflow
 
 
 @pytest.mark.skipif(

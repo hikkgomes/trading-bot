@@ -62,6 +62,15 @@ jobs:
           .venv-runtime/bin/python -m alembic upgrade head
           .venv/bin/python -m src.data.migrate
           .venv/bin/python -m src.data.migrate --check
+      - name: Verify installed service users and permissions
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y acl
+          sudo env REPO="$GITHUB_WORKSPACE" NODE=linux-optiplex SKIP_SYSTEMD=1 \
+            bash scripts/install_platform_services.sh
+          sudo env REPO="$GITHUB_WORKSPACE" \
+            TRADING_PLATFORM_DATABASE_URL="$TRADING_PLATFORM_DATABASE_URL" \
+            bash scripts/verify_platform_service_install.sh
       - name: Validate platform installer
         run: make platform-install-dry-run
       - name: PostgreSQL privilege boundary
