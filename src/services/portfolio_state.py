@@ -82,6 +82,15 @@ class DatabasePortfolioSourceService:
         observed_at = max(
             value for value in (balance_at, positions_at, orders_at, market_at) if value is not None
         )
+        health_values, health_at = self._health(now)
+        if not health_values:
+            return
+        drift_values, drift_at = self._drift(
+            product_id=product_id,
+            portfolio_id=str(product["portfolio_id"]),
+            account_id=account_id,
+            at=now,
+        )
         self.publish(
             product_id=product_id,
             kind="balances",
@@ -119,7 +128,6 @@ class DatabasePortfolioSourceService:
             observed_at=market_at or observed_at,
             values={"market": market, "correlations": {}, "beta": {}},
         )
-        health_values, health_at = self._health(now)
         self.publish(
             product_id=product_id,
             kind="health",
@@ -135,7 +143,6 @@ class DatabasePortfolioSourceService:
             ),
             values=health_values,
         )
-        drift_values, drift_at = self._drift(str(product["portfolio_id"]), now)
         self.publish(
             product_id=product_id,
             kind="drift",
@@ -287,13 +294,8 @@ class DatabasePortfolioSourceService:
             latest_times.setdefault(instrument_id, str(row["created_at"]))
         required = {"price", "spread_bps", "visible_depth", "volatility", "funding"}
         for instrument_id, values in latest_values.items():
-            if "price" not in values:
+            if not required.issubset(values):
                 continue
-            # A candle or trade can establish price before book, volatility,
-            # or funding events arrive. Keep the source fresh but fail closed
-            # for risk until those optional values have real observations.
-            for field in required - set(values):
-                values[field] = 0.0
             market[instrument_id] = values
             row_time = latest_times[instrument_id]
             latest_at = row_time if latest_at is None else max(latest_at, row_time)
@@ -327,6 +329,8 @@ class DatabasePortfolioSourceService:
             if key in latest:
                 continue
             latest[key] = bool(row["healthy"])
+        if not latest:
+            return {}, None
         statuses = {
             f"{service}@{node}": healthy for (service, node), healthy in sorted(latest.items())
         }
@@ -349,7 +353,14 @@ class DatabasePortfolioSourceService:
         except Exception:
             return False
 
-    def _drift(self, portfolio_id: str, at: str) -> tuple[dict[str, bool], str | None]:
+    def _drift(
+        self,
+        *,
+        product_id: str,
+        portfolio_id: str,
+        account_id: str,
+        at: str,
+    ) -> tuple[dict[str, bool], str | None]:
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(reconciliation_event.c.payload, reconciliation_event.c.created_at)
@@ -360,7 +371,11 @@ class DatabasePortfolioSourceService:
             ).mappings()
         for row in rows:
             payload = row["payload"]
-            if not isinstance(payload, dict) or str(payload.get("portfolio_id")) != portfolio_id:
+            if not isinstance(payload, dict) or not (
+                str(payload.get("product_id")) == product_id
+                or str(payload.get("portfolio_id")) == portfolio_id
+                or str(payload.get("account_id")) == account_id
+            ):
                 continue
             return {
                 "execution_drift": bool(payload.get("execution_drift", False)),

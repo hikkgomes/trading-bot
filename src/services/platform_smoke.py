@@ -41,6 +41,7 @@ from src.services.accounting_service import AccountingService, DatabaseAccountin
 from src.services.config import load_split_configuration
 from src.services.data_writer import DatabaseMarketDataWriter
 from src.services.feature_worker import DatabaseFeatureWorker
+from src.services.health import DatabaseHeartbeatStore
 from src.services.order_execution import DatabaseExecutionWorker, DatabasePaperExecutionWorker
 from src.services.portfolio_engine import (
     DatabasePortfolioTargetBuilder,
@@ -321,6 +322,13 @@ def _product_fixture(
     )
     data_result = data_worker.run_once(now=now)
     feature_result = feature_worker.run_once(now=now)
+    DatabaseHeartbeatStore(database.engine).record(
+        service_name="data-writer",
+        node_id="linux-optiplex",
+        observed_at=now,
+        healthy=data_result["reason_code"] == "market_event_written",
+        payload=data_result,
+    )
     source_service = DatabasePortfolioSourceService(
         engine=database.engine,
         store=snapshots,

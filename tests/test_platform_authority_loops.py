@@ -141,6 +141,37 @@ def test_heartbeat_retention_is_bounded(tmp_path) -> None:
         )
 
 
+def test_portfolio_source_readers_fail_closed_without_complete_market_or_health(
+    tmp_path,
+) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'source-authority.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    store.save(
+        {
+            "kind": "market_data_input",
+            "product_id": "active_income",
+            "instrument_id": "binance:futures:BTCUSDT",
+            "values": {"close": 100.0, "spread_bps": 1.0},
+        },
+        created_at=NOW,
+    )
+    source = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=store,
+        products={},
+        accounts={},
+    )
+
+    market, market_at = source._market("active_income", NOW)
+    health, health_at = source._health(NOW)
+
+    assert market == {}
+    assert market_at is None
+    assert health == {}
+    assert health_at is None
+
+
 def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'normal-events.sqlite3'}")
     database.create_schema()
@@ -179,6 +210,10 @@ def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path
                 "l": "99",
                 "c": "100.5",
                 "v": "10",
+                "spread_bps": "1",
+                "visible_depth": "1000",
+                "volatility": "0.2",
+                "funding": "0.0",
                 "x": True,
             },
         },

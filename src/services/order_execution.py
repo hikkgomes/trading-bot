@@ -582,10 +582,12 @@ class DatabaseUserStreamWorker:
             return {"reason_code": "user_stream_queue_empty"}
         try:
             event = MarketEvent(**dict(claimed.payload["event"]))
+            product_id = self.account_products.get(str(claimed.payload["account_id"]))
             record = {
                 "account_id": str(claimed.payload["account_id"]),
                 "market": str(claimed.payload["market"]),
                 "event": claimed.payload["event"],
+                **({"product_id": product_id} if product_id is not None else {}),
             }
             identity = canonical_hash(record)
             with self.engine.begin() as connection:
@@ -607,7 +609,6 @@ class DatabaseUserStreamWorker:
             balances = _balance_update(event)
             accounting_job_id = None
             if balances:
-                product_id = self.account_products.get(record["account_id"])
                 accounting_payload = {
                     "kind": "balance",
                     "account_id": record["account_id"],

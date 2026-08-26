@@ -45,6 +45,7 @@ from src.risk.engine import (
 from src.services.accounting_service import AccountingService, DatabaseAccountingWorker
 from src.services.data_writer import DatabaseMarketDataWriter
 from src.services.feature_worker import DatabaseFeatureWorker
+from src.services.health import DatabaseHeartbeatStore
 from src.services.order_execution import (
     DatabaseExecutionWorker,
     DatabaseLiveExecutionWorker,
@@ -464,6 +465,13 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
     )
 
     assert data_worker.run_once(now=now)["reason_code"] == "market_event_written"
+    DatabaseHeartbeatStore(database.engine).record(
+        service_name="data-writer",
+        node_id="linux-optiplex",
+        observed_at=now,
+        healthy=True,
+        payload={"reason_code": "market_event_written"},
+    )
     assert feature_worker.run_once(now=now)["features"] > 0
     assert (
         state_worker.schedule_from_latest(
