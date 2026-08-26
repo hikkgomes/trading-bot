@@ -277,7 +277,6 @@ def test_every_promotable_source_type_runs_a_complete_paper_service_chain(
         cost_model_version="paper-chain-costs-v1",
         validation_evidence={"accepted": True},
         holdout_claim={"accepted": True},
-        forward_evidence={"accepted": True},
         promotion_policy={"paper": True},
         position_limits={"maximum_position": 0.1, "target_volatility": 0.1},
         risk_limits={"risk_policy_id": "paper-chain-risk"},

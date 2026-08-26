@@ -493,7 +493,14 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
             return False
         kind = user_events.popleft()
         order_manager.reload()
-        order = order_manager.all()[0] if order_manager.all() else None
+        order = next(
+            (
+                item
+                for item in order_manager.all()
+                if item.portfolio_id == portfolio_id
+            ),
+            None,
+        )
         if kind == "fill":
             if order is None:
                 raise AssertionError("live execution did not create an order before fill event")

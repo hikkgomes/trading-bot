@@ -171,7 +171,6 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
         cost_model_version="costs-v1",
         validation_evidence={},
         holdout_claim={},
-        forward_evidence={},
         promotion_policy={},
         position_limits={"maximum_position": 0.1},
         risk_limits={"policy": "risk-v1"},
@@ -207,6 +206,13 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
         observation={"direction": "flat"},
     )
     assert observation_id.startswith("sha256:")
+    with pytest.raises(CanonicalEvidenceError, match="artefact-bound"):
+        repository.append_summary(
+            strategy_version_id=definition.strategy_version_id,
+            product_id="active_income",
+            observed_at="2026-08-24T00:00:00+00:00",
+            evidence={"accepted": True},
+        )
 
 
 def test_default_executor_does_not_turn_missing_execution_into_evidence() -> None:

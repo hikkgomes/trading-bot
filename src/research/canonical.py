@@ -15,7 +15,6 @@ from src.data.database import (
     dataset_snapshot,
     experiment,
     experiment_run,
-    forward_evidence,
     forward_paper_observation,
     holdout_claim,
     holdout_outcome,
@@ -452,43 +451,11 @@ class SqlForwardEvidenceRepository:
         observed_at: str,
         evidence: Mapping[str, Any],
     ) -> str:
-        """Append an artefact-independent forward-paper evidence summary.
-
-        The summary is created before a deployable artefact. Per-observation
-        rows can then bind the exact artefact without creating a hash cycle.
-        """
-
-        strategy_version_id = str(strategy_version_id).strip()
-        product_id = str(product_id).strip()
-        if not strategy_version_id or not product_id:
-            raise CanonicalEvidenceError(
-                "forward evidence requires strategy and product identities"
-            )
-        observed_at = timestamp(observed_at, field="observed_at")
-        payload = {
-            "strategy_version_id": strategy_version_id,
-            "product_id": product_id,
-            "observed_at": observed_at,
-            "evidence": _object(evidence, field="forward evidence"),
-        }
-        identity = _hash(payload, field="forward evidence")
-        with self.engine.begin() as connection:
-            if (
-                connection.execute(
-                    select(strategy_version.c.id).where(
-                        strategy_version.c.id == strategy_version_id
-                    )
-                ).first()
-                is None
-            ):
-                raise CanonicalEvidenceError(
-                    f"strategy version does not exist: {strategy_version_id}"
-                )
-            return _immutable_insert(
-                connection,
-                forward_evidence,
-                {"id": identity, "created_at": observed_at, "payload": payload},
-            )
+        del strategy_version_id, product_id, observed_at, evidence
+        raise CanonicalEvidenceError(
+            "forward evidence summaries are not canonical; append an artefact-bound "
+            "forward paper observation after artefact creation"
+        )
 
 
 class SqlStrategyArtefactRepository:
@@ -502,6 +469,10 @@ class SqlStrategyArtefactRepository:
         authoritative = payload.get("authoritative_evidence")
         if not isinstance(authoritative, Mapping):
             raise CanonicalEvidenceError("canonical strategy artefact needs authoritative evidence")
+        if "forward_evidence_id" in authoritative or "forward_evidence" in payload:
+            raise CanonicalEvidenceError(
+                "canonical strategy artefacts cannot contain pre-artefact forward evidence fields"
+            )
         required_fields = (
             "strategy_version_id",
             "product_id",

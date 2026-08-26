@@ -172,6 +172,41 @@ def test_portfolio_source_readers_fail_closed_without_complete_market_or_health(
     assert health_at is None
 
 
+def test_portfolio_market_source_derives_realised_volatility_from_closes(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'market-volatility.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    for index, close in enumerate((100.0, 101.0, 103.0)):
+        observed_at = (
+            dt.datetime.fromisoformat(NOW) + dt.timedelta(minutes=index)
+        ).isoformat()
+        store.save(
+            {
+                "kind": "market_data_input",
+                "product_id": "active_income",
+                "instrument_id": "binance:futures:BTCUSDT",
+                "values": {
+                    "close": close,
+                    "spread_bps": 1.0,
+                    "visible_depth": 100.0,
+                    "funding": 0.0,
+                },
+            },
+            created_at=observed_at,
+        )
+    source = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=store,
+        products={},
+        accounts={},
+    )
+
+    market, market_at = source._market("active_income", "2026-08-24T00:02:00+00:00")
+
+    assert market_at == "2026-08-24T00:02:00+00:00"
+    assert market["binance:futures:BTCUSDT"]["volatility"] > 0.0
+
+
 def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'normal-events.sqlite3'}")
     database.create_schema()

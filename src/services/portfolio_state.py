@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import statistics
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -268,6 +269,7 @@ class DatabasePortfolioSourceService:
         }
         latest_values: dict[str, dict[str, float]] = {}
         latest_times: dict[str, str] = {}
+        close_history: dict[str, list[float]] = {}
         for row in rows:
             payload = row["payload"]
             if not isinstance(payload, dict) or payload.get("kind") != "market_data_input":
@@ -281,6 +283,13 @@ class DatabasePortfolioSourceService:
             if not isinstance(raw, Mapping):
                 continue
             values = latest_values.setdefault(instrument_id, {})
+            close = raw.get("close", raw.get("price"))
+            try:
+                close_value = float(close)
+            except (TypeError, ValueError):
+                close_value = 0.0
+            if close_value > 0 and close_value == close_value:
+                close_history.setdefault(instrument_id, []).append(close_value)
             for source_name, target_name in fields.items():
                 if target_name in values or source_name not in raw:
                     continue
@@ -291,9 +300,18 @@ class DatabasePortfolioSourceService:
                 if value != value or value in (float("inf"), float("-inf")):
                     continue
                 values[target_name] = value
-            latest_times.setdefault(instrument_id, str(row["created_at"]))
+                latest_times.setdefault(instrument_id, str(row["created_at"]))
         required = {"price", "spread_bps", "visible_depth", "volatility", "funding"}
         for instrument_id, values in latest_values.items():
+            if "volatility" not in values:
+                closes = list(reversed(close_history.get(instrument_id, [])))
+                returns = [
+                    closes[index] / closes[index - 1] - 1.0
+                    for index in range(1, len(closes))
+                    if closes[index - 1] > 0
+                ]
+                if len(returns) >= 2:
+                    values["volatility"] = statistics.pstdev(returns)
             if not required.issubset(values):
                 continue
             market[instrument_id] = values

@@ -844,7 +844,6 @@ def test_strategy_artefact_is_reproducible_and_content_addressed(tmp_path: Path)
         cost_model_version="costs-v1",
         validation_evidence={"accepted": True},
         holdout_claim={"claim_id": "claim-1"},
-        forward_evidence={"trades": 100},
         promotion_policy={"paper": True, "live_canary": False},
         position_limits={"maximum_position": 0.1},
         risk_limits={"maximum_drawdown": 0.05},
@@ -2634,6 +2633,91 @@ def test_live_feature_jobs_reject_scalar_inputs(tmp_path: Path) -> None:
     ).run_once(now=NOW)
     assert result["reason_code"] == "feature_calculation_failed"
     assert result["error"] == "live feature jobs require immutable input references"
+
+
+def test_live_feature_reference_must_select_the_declared_source_candle(tmp_path: Path) -> None:
+    from src.data.parquet_store import PartitionedBarStore
+
+    first = normalise_public_event(
+        market="futures",
+        stream="btcusdt@kline_1m",
+        receive_timestamp=NOW,
+        payload={
+            "e": "kline",
+            "E": int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000),
+            "s": "BTCUSDT",
+            "k": {
+                "t": int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000) - 59_999,
+                "T": int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000),
+                "i": "1m",
+                "o": "100",
+                "h": "101",
+                "l": "99",
+                "c": "100",
+                "v": "10",
+                "x": True,
+            },
+        },
+    )
+    later = "2026-08-24T00:01:00+00:00"
+    later_ms = int(dt.datetime.fromisoformat(later).timestamp() * 1_000)
+    second = normalise_public_event(
+        market="futures",
+        stream="btcusdt@kline_1m",
+        receive_timestamp=later,
+        payload={
+            "e": "kline",
+            "E": later_ms,
+            "s": "BTCUSDT",
+            "k": {
+                "t": later_ms - 59_999,
+                "T": later_ms,
+                "i": "1m",
+                "o": "100",
+                "h": "103",
+                "l": "99",
+                "c": "102",
+                "v": "12",
+                "x": True,
+            },
+        },
+    )
+    root = tmp_path / "data"
+    bars = PartitionedBarStore(root)
+    bars.put(first, venue="binance", market="futures", symbol="BTCUSDT")
+    bars.put(second, venue="binance", market="futures", symbol="BTCUSDT")
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'feature.sqlite3'}")
+    database.create_schema()
+    worker = DatabaseFeatureWorker(
+        queue=DatabaseJobQueue(database.engine),
+        worker_id="feature-worker",
+        store=SqlFeatureStore(database.engine),
+        job_names=("live_feature_calculation",),
+        parquet_root=root,
+    )
+    payload = {
+        "instrument_id": first.instrument_id,
+        "source_event_time": dt.datetime.fromtimestamp(
+            float(first.payload["data"]["k"]["t"]) / 1_000, dt.UTC
+        ).isoformat(),
+        "source_close_time": first.close_timestamp,
+        "availability_time": second.availability_timestamp,
+        "input_references": {
+            "bar_window": {
+                "kind": "partitioned_bar_window",
+                "relative_pattern": "bars/binance/futures/BTCUSDT/1m/**/*.parquet",
+                "through_close_time": second.close_timestamp,
+                "minimum_history": 1,
+                "source_event_ids": [second.event_id],
+            }
+        },
+    }
+    reference = payload["input_references"]["bar_window"]
+    reference["content_hash"] = canonical_hash(
+        {key: value for key, value in reference.items() if key != "content_hash"}
+    )
+    with pytest.raises(ValueError, match="does not match the source event timestamps"):
+        worker._resolve_input_references(payload)
 
 
 def test_duckdb_historical_query_materialises_safe_parquet_results(tmp_path: Path):

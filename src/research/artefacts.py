@@ -35,7 +35,6 @@ class StrategyArtefact:
     cost_model_version: str
     validation_evidence: Mapping[str, Any]
     holdout_claim: Mapping[str, Any]
-    forward_evidence: Mapping[str, Any]
     promotion_policy: Mapping[str, Any]
     position_limits: Mapping[str, Any]
     risk_limits: Mapping[str, Any]
@@ -66,7 +65,6 @@ class StrategyArtefact:
         for field_name in (
             "validation_evidence",
             "holdout_claim",
-            "forward_evidence",
             "promotion_policy",
             "position_limits",
             "risk_limits",
@@ -120,7 +118,6 @@ class StrategyArtefact:
             "cost_model_version": self.cost_model_version,
             "validation_evidence": dict(self.validation_evidence),
             "holdout_claim": dict(self.holdout_claim),
-            "forward_evidence": dict(self.forward_evidence),
             "promotion_policy": dict(self.promotion_policy),
             "position_limits": dict(self.position_limits),
             "risk_limits": dict(self.risk_limits),
@@ -160,7 +157,6 @@ class StrategyArtefact:
         cost_model_hash: str,
         validation_stage_ids: tuple[str, ...],
         holdout_claim_id: str,
-        forward_evidence_id: str,
         promotion_policy: Mapping[str, Any],
         position_limits: Mapping[str, Any],
         risk_limits: Mapping[str, Any],
@@ -170,7 +166,6 @@ class StrategyArtefact:
         created_at: str,
         validation_evidence: Mapping[str, Any] | None = None,
         holdout_claim: Mapping[str, Any] | None = None,
-        forward_evidence: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
         product_id: str | None = None,
         portfolio_id: str | None = None,
@@ -185,10 +180,8 @@ class StrategyArtefact:
         calls this constructor.
         """
 
-        if not validation_stage_ids or not holdout_claim_id or not forward_evidence_id:
-            raise ValueError(
-                "v2 artefacts need validation, holdout, and forward evidence identities"
-            )
+        if not validation_stage_ids or not holdout_claim_id:
+            raise ValueError("v2 artefacts need validation and holdout evidence identities")
         for field_name, value in (
             ("product_id", product_id or definition.product),
             ("portfolio_id", portfolio_id),
@@ -207,7 +200,6 @@ class StrategyArtefact:
             "engine_version": engine_version,
             "validation_stage_ids": list(validation_stage_ids),
             "holdout_claim_id": holdout_claim_id,
-            "forward_evidence_id": forward_evidence_id,
             "dataset_snapshot_hashes": list(dataset_snapshot_hashes),
             "source_commit_hash": source_commit_hash,
             "dependency_lock_hash": dependency_lock_hash,
@@ -222,7 +214,6 @@ class StrategyArtefact:
             cost_model_version=cost_model_version,
             validation_evidence=validation_evidence or {},
             holdout_claim=holdout_claim or {},
-            forward_evidence=forward_evidence or {},
             promotion_policy=promotion_policy,
             position_limits=position_limits,
             risk_limits=risk_limits,

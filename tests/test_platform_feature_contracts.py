@@ -124,6 +124,83 @@ def test_correlation_and_beta_require_point_in_time_return_histories() -> None:
         )
 
 
+def test_feature_worker_expands_frozen_ml_vector_into_manifest_features(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'ml-features.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="linux-feature",
+        node_id="linux-optiplex",
+        role="feature-worker",
+        capabilities=("historical_feature_calculation",),
+        observed_at=NOW,
+    )
+    queue.register_worker(
+        worker_id="linux-strategy",
+        node_id="linux-optiplex",
+        role="strategy-evaluator",
+        capabilities=("strategy_evaluation",),
+        observed_at=NOW,
+    )
+    queue.enqueue(
+        job_id="ml-feature-job",
+        name="historical_feature_calculation",
+        payload={
+            "feature_set_version": "core-bars-v1",
+            "instrument_id": "binance:futures:BTCUSDT",
+            "source_event_time": NOW,
+            "source_close_time": NOW,
+            "availability_time": NOW,
+            "source_market_event_id": "sha256:" + "b" * 64,
+            "inputs": {
+                "open": 100.0,
+                "high": 105.0,
+                "low": 99.0,
+                "close": 104.0,
+                "volume": 50.0,
+                "feature_vector": {"momentum": 0.2, "funding": -0.01},
+            },
+            "producer_identity": "historical-test",
+        },
+        available_at=NOW,
+    )
+    worker = DatabaseFeatureWorker(
+        queue=queue,
+        worker_id="linux-feature",
+        store=SqlFeatureStore(database.engine),
+        job_names=("historical_feature_calculation",),
+        active_assignments=lambda _instrument_id: (
+            {
+                "id": "sha256:" + "a" * 64,
+                "product_id": "active_income",
+                "instrument_id": "binance:futures:BTCUSDT",
+            },
+        ),
+        feature_graph_for_assignment=lambda _assignment: {
+            "required_nodes": ["frozen_ml_feature_vector"]
+        },
+    )
+
+    result = worker.run_once(now=NOW)
+
+    assert result["reason_code"] == "features_persisted", result
+    values = SqlFeatureStore(database.engine).available(
+        instrument_id="binance:futures:BTCUSDT",
+        at=NOW,
+        feature_set_version="core-bars-v1",
+    )
+    assert {item.feature_name for item in values} >= {"momentum", "funding"}
+    assert "frozen_ml_feature_vector" not in {item.feature_name for item in values}
+    strategy_job = queue.claim(
+        worker_id="linux-strategy",
+        now=NOW,
+        lease_seconds=60,
+        names=("strategy_evaluation",),
+    )
+    assert strategy_job is not None
+    assert len(strategy_job.payload["feature_ids"]) == 2
+
+
 def test_market_data_writer_publishes_authoritative_market_snapshot(tmp_path) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'platform.sqlite3'}")
     database.create_schema()

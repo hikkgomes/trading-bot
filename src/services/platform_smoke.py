@@ -499,7 +499,6 @@ def _seed_strategy(
         cost_model_version="smoke-costs-v1",
         validation_evidence={"accepted": True},
         holdout_claim={"accepted": True},
-        forward_evidence={"accepted": True},
         promotion_policy={"paper": True},
         position_limits={"maximum_position": 0.1, "target_volatility": 0.1},
         risk_limits={"risk_policy_id": product["risk_policy_id"]},
