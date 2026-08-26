@@ -12,6 +12,7 @@ WorkingDirectory=/opt/trading-bot
 EnvironmentFile=/etc/trading-platform/%i.env
 Environment=PYTHONUNBUFFERED=1
 Environment=TRADING_PLATFORM_AGENT_WORKTREE_ROOT=/opt/trading-bot/runtime/agent-worktrees
+Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/agent-worktrees/numba-cache
 ExecStart=/opt/trading-bot/.venv-agent/bin/python -m src.services.supervisor --config /opt/trading-bot/config/platform.json --node linux-optiplex --service %i
 Restart=always
 RestartSec=10

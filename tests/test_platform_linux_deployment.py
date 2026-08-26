@@ -35,6 +35,7 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
         "/opt/trading-bot/data/features"
     ) in research
     assert "TRADING_PLATFORM_AGENT_WORKTREE_ROOT=/opt/trading-bot/runtime/agent-worktrees" in agent
+    assert "NUMBA_CACHE_DIR=/opt/trading-bot/runtime/agent-worktrees/numba-cache" in agent
     assert "ReadWritePaths=/opt/trading-bot/runtime/agent-worktrees" in agent
     assert 'SKIP_SYSTEMD="${SKIP_SYSTEMD:-0}"' in installer
     assert 'if [[ "$SKIP_SYSTEMD" == "1" ]]; then' in installer

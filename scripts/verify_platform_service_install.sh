@@ -97,6 +97,7 @@ run_cycle trading-runtime "$REPO/.venv-runtime/bin/python" product-supervisor
 run_cycle trading-research "$REPO/.venv-research/bin/python" research-worker \
   NUMBA_CACHE_DIR="$REPO/runtime/research/numba-cache"
 run_cycle trading-agent "$REPO/.venv-agent/bin/python" agent-sandbox \
-  TRADING_PLATFORM_AGENT_WORKTREE_ROOT="$REPO/runtime/agent-worktrees"
+  TRADING_PLATFORM_AGENT_WORKTREE_ROOT="$REPO/runtime/agent-worktrees" \
+  NUMBA_CACHE_DIR="$REPO/runtime/agent-worktrees/numba-cache"
 
 echo "verified service-user traversal, writes, and one cycle per service domain"
