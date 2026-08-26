@@ -32,6 +32,8 @@ from src.observability.decision_trace import SqlDecisionTraceStore
 from src.research.artefacts import StrategyArtefact
 from src.research.canonical import (
     SqlActiveStrategyAssignmentRepository,
+    SqlApprovalRepository,
+    SqlPreflightRepository,
     SqlStrategyArtefactRepository,
 )
 from src.risk.engine import SqlRiskDecisionStore, SqlRiskPolicyStore, SqlRiskSnapshotStore
@@ -437,6 +439,7 @@ def _seed_strategy(
     now: str,
     prefix: str,
     strategy_name: str = "momentum_roc",
+    execution_mode: str = "paper",
 ) -> str:
     product_id = str(product["product_id"])
     feature_nodes, production_rule = registered_live_contract(strategy_name)
@@ -506,13 +509,43 @@ def _seed_strategy(
     SqlStrategyArtefactRepository(database.engine).put(
         artefact.artefact_hash, artefact.to_dict(), created_at=now
     )
+    if execution_mode == "live":
+        source_commit_hash = canonical_hash(
+            {"source": "platform-testnet", "product": product_id, "prefix": prefix}
+        )
+        SqlApprovalRepository(database.engine).append(
+            strategy_version_id=definition.strategy_version_id,
+            product_id=product_id,
+            account_id=str(product["account_id"]),
+            artefact_hash=artefact.artefact_hash,
+            source_commit_hash=source_commit_hash,
+            engine_version="strategy-evaluator/v1",
+            capital_cap=0.1,
+            actor="platform-testnet-operator",
+            approved_at=now,
+            payload={"environment": "testnet", "reason": "bounded integration rehearsal"},
+        )
+        SqlPreflightRepository(database.engine).append(
+            {
+                "strategy_version_id": definition.strategy_version_id,
+                "product_id": product_id,
+                "account_id": str(product["account_id"]),
+                "artefact_hash": artefact.artefact_hash,
+                "source_commit_hash": source_commit_hash,
+                "engine_version": "strategy-evaluator/v1",
+                "capital_cap": 0.1,
+                "checked_at": now,
+                "accepted": True,
+                "payload": {"environment": "testnet"},
+            }
+        )
     return SqlActiveStrategyAssignmentRepository(database.engine).assign(
         product_id=product_id,
         portfolio_id=str(product["portfolio_id"]),
         strategy_version_id=definition.strategy_version_id,
         artefact_hash=artefact.artefact_hash,
-        lifecycle_state="forward_paper",
-        execution_mode="paper",
+        lifecycle_state="live_canary" if execution_mode == "live" else "forward_paper",
+        execution_mode=execution_mode,
         capital_limit=0.1,
         risk_budget=0.1,
         assigned_at=now,
