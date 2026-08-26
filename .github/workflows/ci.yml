@@ -66,9 +66,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y acl
-          sudo env REPO="$GITHUB_WORKSPACE" NODE=linux-optiplex SKIP_SYSTEMD=1 \
+          sudo mv "$GITHUB_WORKSPACE" /opt/trading-bot
+          sudo ln -s /opt/trading-bot "$GITHUB_WORKSPACE"
+          sudo env REPO=/opt/trading-bot NODE=linux-optiplex SKIP_SYSTEMD=1 \
             bash scripts/install_platform_services.sh
-          sudo env REPO="$GITHUB_WORKSPACE" \
+          sudo env REPO=/opt/trading-bot \
             TRADING_PLATFORM_DATABASE_URL="$TRADING_PLATFORM_DATABASE_URL" \
             bash scripts/verify_platform_service_install.sh
       - name: Validate platform installer
