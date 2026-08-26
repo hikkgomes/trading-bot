@@ -494,11 +494,7 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
         kind = user_events.popleft()
         order_manager.reload()
         order = next(
-            (
-                item
-                for item in order_manager.all()
-                if item.portfolio_id == portfolio_id
-            ),
+            (item for item in order_manager.all() if item.portfolio_id == portfolio_id),
             None,
         )
         if kind == "fill":

@@ -177,9 +177,7 @@ def test_portfolio_market_source_derives_realised_volatility_from_closes(tmp_pat
     database.create_schema()
     store = SqlRiskSnapshotStore(database.engine)
     for index, close in enumerate((100.0, 101.0, 103.0)):
-        observed_at = (
-            dt.datetime.fromisoformat(NOW) + dt.timedelta(minutes=index)
-        ).isoformat()
+        observed_at = (dt.datetime.fromisoformat(NOW) + dt.timedelta(minutes=index)).isoformat()
         store.save(
             {
                 "kind": "market_data_input",

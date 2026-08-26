@@ -630,9 +630,7 @@ class ProtectedHoldoutWorker:
             # This object is scoped to the callback and is never returned by
             # the worker. Adaptive research only receives the sealed summary.
             callback_payload["protected_context"] = protected_context
-        accepted, result = self.evaluator(
-            callback_payload
-        )
+        accepted, result = self.evaluator(callback_payload)
         if not isinstance(accepted, bool) or not isinstance(result, Mapping):
             raise EvaluationContractError("protected evaluator returned an invalid sealed outcome")
         sealed = result.get("sealed_result")
@@ -956,9 +954,7 @@ class CanonicalResearchEvaluator:
                 "context": dict(context),
             }
             accepted = (
-                bool(claims) and holdout_accepted
-                if self.protected_worker is not None
-                else False
+                bool(claims) and holdout_accepted if self.protected_worker is not None else False
             )
             return (
                 evidence,
