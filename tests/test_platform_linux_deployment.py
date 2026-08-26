@@ -61,6 +61,7 @@ def test_ci_runs_real_service_user_permission_rehearsal() -> None:
     assert "SKIP_SYSTEMD=1" in workflow
     assert "scripts/install_platform_services.sh" in workflow
     assert "scripts/verify_platform_service_install.sh" in workflow
+    assert 'sudo chown -R "$USER:$(id -gn)" /opt/trading-bot/data' in workflow
 
 
 @pytest.mark.skipif(

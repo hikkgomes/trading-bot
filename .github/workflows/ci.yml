@@ -76,6 +76,7 @@ jobs:
             TRADING_PLATFORM_CONFIG=/opt/trading-bot/config/platform.ci.json \
             TRADING_PLATFORM_DATABASE_URL="$TRADING_PLATFORM_DATABASE_URL" \
             bash scripts/verify_platform_service_install.sh
+          sudo chown -R "$USER:$(id -gn)" /opt/trading-bot/data /opt/trading-bot/runtime
       - name: Validate platform installer
         run: make platform-install-dry-run
       - name: PostgreSQL privilege boundary
