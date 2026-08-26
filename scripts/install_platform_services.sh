@@ -51,7 +51,11 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     install -d -m 2770 -o trading-research -g trading-research "$REPO/data/$directory"
   done
   install -d -m 2770 -o trading-research -g trading-research "$REPO/runtime/research"
+  install -d -m 2770 -o trading-research -g trading-research \
+    "$REPO/runtime/research/numba-cache"
   install -d -m 2770 -o trading-agent -g trading-agent "$REPO/runtime/agent-worktrees"
+  install -d -m 2770 -o trading-agent -g trading-agent \
+    "$REPO/runtime/agent-worktrees/numba-cache"
   # Common-group access is limited to traversal. ACLs grant research read
   # access to market data and keep writes owned by the producing service.
   setfacl -m u:trading-runtime:rwx,u:trading-research:rx,u:trading-agent:--x "$REPO/data"
