@@ -47,7 +47,7 @@ def test_ci_runs_real_service_user_permission_rehearsal() -> None:
     assert 'sudo ln -s /opt/trading-bot "$GITHUB_WORKSPACE"' in workflow
     assert "REPO=/opt/trading-bot" in workflow
     assert "jq '.postgresql.require_tls = false'" in workflow
-    assert "TRADING_PLATFORM_CONFIG=/tmp/trading-platform-ci.json" in workflow
+    assert "TRADING_PLATFORM_CONFIG=/opt/trading-bot/config/platform.ci.json" in workflow
     assert "SKIP_SYSTEMD=1" in workflow
     assert "scripts/install_platform_services.sh" in workflow
     assert "scripts/verify_platform_service_install.sh" in workflow
