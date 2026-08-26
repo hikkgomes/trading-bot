@@ -14,9 +14,10 @@ from typing import Any, cast
 from sqlalchemy import select, update
 from sqlalchemy.engine import Engine
 
-from src.data.database import experiment, holdout_claim, holdout_outcome
+from src.data.database import experiment, holdout_claim
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlHoldoutRepository, SqlValidationRepository
+from src.research.datasets import CanonicalDatasetResolver
 from src.research.executors import ExecutorError, ProviderExecutorRegistry
 from src.research.store import SqlResearchStore
 from src.research.theses import REQUIRED_NEGATIVE_CONTROLS, SqlThesisRegistry, ThesisError
@@ -574,9 +575,20 @@ class ProtectedHoldoutWorker:
         self,
         engine: Engine,
         evaluator: Callable[[Mapping[str, Any]], tuple[bool, Mapping[str, Any]]],
+        *,
+        dataset_resolver: CanonicalDatasetResolver | None = None,
+        feature_manifest_id: str | None = None,
+        cost_model_id: str | None = None,
+        parameter_set_id: str | None = None,
     ) -> None:
         self.repository = SqlHoldoutRepository(engine)
         self.evaluator = evaluator
+        self.dataset_resolver = dataset_resolver
+        self.dataset_identities = {
+            "feature_manifest_hash": feature_manifest_id,
+            "cost_model_hash": cost_model_id,
+            "parameter_set_hash": parameter_set_id,
+        }
 
     def claim_and_evaluate(
         self,
@@ -594,27 +606,49 @@ class ProtectedHoldoutWorker:
             source_hashes=source_hashes,
             claimed_at=evaluated_at,
         )
+        protected_context: Mapping[str, Any] | None = None
+        if self.dataset_resolver is not None:
+            if any(value is None for value in self.dataset_identities.values()):
+                raise EvaluationContractError(
+                    "protected holdout resolution requires canonical dataset identities"
+                )
+            protected_context = self.dataset_resolver.resolve_context(
+                snapshot_ids=(dataset_snapshot_id,),
+                feature_manifest_id=str(self.dataset_identities["feature_manifest_hash"]),
+                cost_model_id=str(self.dataset_identities["cost_model_hash"]),
+                parameter_set_id=str(self.dataset_identities["parameter_set_hash"]),
+                allowed_roles=frozenset({"protected_holdout"}),
+            )
+        callback_payload = {
+            "claim_id": claim_id,
+            "strategy_version_id": strategy_version_id,
+            "dataset_snapshot_id": dataset_snapshot_id,
+            "cohort_id": cohort_id,
+            "source_hashes": dict(source_hashes),
+        }
+        if protected_context is not None:
+            # This object is scoped to the callback and is never returned by
+            # the worker. Adaptive research only receives the sealed summary.
+            callback_payload["protected_context"] = protected_context
         accepted, result = self.evaluator(
-            {
-                "claim_id": claim_id,
-                "strategy_version_id": strategy_version_id,
-                "dataset_snapshot_id": dataset_snapshot_id,
-                "cohort_id": cohort_id,
-                "source_hashes": dict(source_hashes),
-            }
+            callback_payload
         )
         if not isinstance(accepted, bool) or not isinstance(result, Mapping):
             raise EvaluationContractError("protected evaluator returned an invalid sealed outcome")
         sealed = result.get("sealed_result")
         if not isinstance(sealed, Mapping) or not sealed:
             raise EvaluationContractError("protected evaluator returned no sealed outcome")
+        if sealed.get("passed") is not accepted:
+            raise EvaluationContractError("protected sealed outcome does not match its decision")
         outcome_id = self.repository.record_outcome(
             claim_id=claim_id,
             evaluated_at=evaluated_at,
             accepted=accepted,
             outcome=sealed,
         )
-        return claim_id, outcome_id, accepted, dict(sealed)
+        # Keep protected metrics and dataset identities in the sealed database
+        # row. The adaptive caller receives only a non-row-level summary.
+        return claim_id, outcome_id, accepted, {"passed": accepted, "outcome_id": outcome_id}
 
 
 class CanonicalResearchEvaluator:
@@ -871,7 +905,7 @@ class CanonicalResearchEvaluator:
                     "cost_model_id": str(context["cost_model_id"]),
                 }
                 if self.protected_worker is not None:
-                    claim_id, outcome_id, holdout_accepted, sealed_outcome = (
+                    _claim_id, outcome_id, holdout_accepted, _sealed_outcome = (
                         self.protected_worker.claim_and_evaluate(
                             strategy_version_id=definition.strategy_version_id,
                             dataset_snapshot_id=str(protected_snapshot_id or ""),
@@ -881,7 +915,7 @@ class CanonicalResearchEvaluator:
                         )
                     )
                 else:
-                    claim_id = SqlHoldoutRepository(self.store.engine).claim(
+                    _claim_id = SqlHoldoutRepository(self.store.engine).claim(
                         strategy_version_id=definition.strategy_version_id,
                         data_snapshot_id=str(protected_snapshot_id or ""),
                         cohort_id=f"protected:{context['candidate_id']}",
@@ -890,7 +924,6 @@ class CanonicalResearchEvaluator:
                     )
                     outcome_id = None
                     holdout_accepted = False
-                    sealed_outcome = {}
             except Exception as exc:
                 return (
                     {
@@ -904,13 +937,6 @@ class CanonicalResearchEvaluator:
                     {},
                 )
             claims = self.protected.claim_for(definition.strategy_version_id)
-            with self.store.engine.connect() as connection:
-                outcome = connection.execute(
-                    select(holdout_outcome.c.payload)
-                    .where(holdout_outcome.c.holdout_claim_id == claim_id)
-                    .order_by(holdout_outcome.c.evaluated_at.desc())
-                    .limit(1)
-                ).scalar_one_or_none()
             evidence = {
                 "identity": identity,
                 "frozen_cohort": bool(claims),
@@ -922,15 +948,17 @@ class CanonicalResearchEvaluator:
                     }
                 ),
                 "code_hash": context["code_hash"],
-                "holdout_outcome": dict(outcome) if isinstance(outcome, Mapping) else {},
                 "holdout_outcome_id": outcome_id,
-                "sealed_outcome": dict(sealed_outcome),
+                "sealed_outcome": {
+                    "passed": bool(holdout_accepted),
+                    "outcome_id": outcome_id,
+                },
                 "context": dict(context),
             }
-            accepted = bool(claims) and (
-                holdout_accepted
+            accepted = (
+                bool(claims) and holdout_accepted
                 if self.protected_worker is not None
-                else bool(evidence.get("holdout_outcome"))
+                else False
             )
             return (
                 evidence,

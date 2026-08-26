@@ -58,6 +58,9 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   for directory in raw bars features; do
     setfacl -m u:trading-research:rx "$REPO/data/$directory"
     setfacl -m d:u:trading-research:rx "$REPO/data/$directory"
+    # Default ACLs cover future files. Repair existing partitions as well so
+    # an installation upgrade does not leave historical Parquet unreadable.
+    setfacl -R -m u:trading-research:r-X "$REPO/data/$directory"
   done
   setfacl -m u:trading-runtime:rx "$REPO/data/research" "$REPO/data/artefacts" "$REPO/data/reports"
   setfacl -m d:u:trading-runtime:rx "$REPO/data/research" "$REPO/data/artefacts" "$REPO/data/reports"

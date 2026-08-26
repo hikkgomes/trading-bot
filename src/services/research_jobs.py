@@ -205,13 +205,9 @@ class DatabaseResearchJobHandlers:
             }
 
         def evaluate_protected(claim: Mapping[str, Any]) -> tuple[bool, Mapping[str, Any]]:
-            protected_context = resolver.resolve_context(
-                snapshot_ids=(str(claim["dataset_snapshot_id"]),),
-                feature_manifest_id=str(request.feature_manifest_id),
-                cost_model_id=str(request.cost_model_id),
-                parameter_set_id=str(request.parameter_set_id),
-                allowed_roles=(frozenset({"protected_holdout"}) if request.dataset_roles else None),
-            )
+            protected_context = claim.get("protected_context")
+            if not isinstance(protected_context, Mapping):
+                raise JobSchemaError("protected holdout worker did not resolve its dataset")
             frozen_context = self.context_builders.build(candidate, protected_context)
             execution = self.executors.execute(
                 candidate,
@@ -243,7 +239,14 @@ class DatabaseResearchJobHandlers:
             self.store,
             executors=self.executors,
             provider_context=context,
-            protected_worker=ProtectedHoldoutWorker(self.store.engine, evaluate_protected),
+            protected_worker=ProtectedHoldoutWorker(
+                self.store.engine,
+                evaluate_protected,
+                dataset_resolver=resolver,
+                feature_manifest_id=str(request.feature_manifest_id),
+                cost_model_id=str(request.cost_model_id),
+                parameter_set_id=str(request.parameter_set_id),
+            ),
             evidence_policy=self.evidence_policy,
         ).evaluate(request)
         return {

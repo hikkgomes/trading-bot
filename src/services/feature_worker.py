@@ -103,6 +103,7 @@ class DatabaseFeatureWorker:
             assignments = tuple(self.active_assignments(str(payload["instrument_id"])))
             required_by_assignment: dict[str, tuple[str, ...]] = {}
             graph_values: dict[str, float] = {}
+            graph_output_features: dict[str, tuple[str, ...]] = {}
             if self.feature_graph_for_assignment is not None:
                 for assignment in assignments:
                     declaration = self.feature_graph_for_assignment(assignment)
@@ -134,11 +135,27 @@ class DatabaseFeatureWorker:
                         information_timestamp=str(payload["availability_time"]),
                         inputs=available,
                     )
-                    graph_values = {
-                        name: float(value)
-                        for name, value in calculated.items()
-                        if isinstance(value, int | float) and not isinstance(value, bool)
-                    }
+                    for name, value in calculated.items():
+                        if isinstance(value, int | float) and not isinstance(value, bool):
+                            graph_values[name] = float(value)
+                            continue
+                        if not isinstance(value, Mapping) or not value:
+                            raise ValueError(f"feature node {name} returned no scalar values")
+                        expanded: dict[str, float] = {}
+                        for feature_name, feature_value in value.items():
+                            if (
+                                isinstance(feature_value, bool)
+                                or not isinstance(feature_value, int | float)
+                                or not math.isfinite(float(feature_value))
+                            ):
+                                raise ValueError(
+                                    f"feature node {name} returned an invalid component"
+                                )
+                            expanded[str(feature_name)] = float(feature_value)
+                        if not expanded:
+                            raise ValueError(f"feature node {name} returned no scalar components")
+                        graph_values.update(expanded)
+                        graph_output_features[name] = tuple(sorted(expanded))
             combined = {value.feature_name: value.value for value in values}
             combined.update(graph_values)
             values = tuple(
@@ -184,13 +201,22 @@ class DatabaseFeatureWorker:
                         created_at=str(payload["availability_time"]),
                     )
                 required = required_by_assignment.get(str(assignment["id"]), ())
-                assignment_feature_ids = (
-                    [identity_by_name[name] for name in required if name in identity_by_name]
-                    if required
-                    else list(identities)
-                )
-                if required and len(assignment_feature_ids) != len(required):
-                    raise ValueError("artefact feature graph did not produce every required node")
+                if required:
+                    required_feature_names: list[str] = []
+                    for name in required:
+                        if name in identity_by_name:
+                            required_feature_names.append(name)
+                        elif name in graph_output_features:
+                            required_feature_names.extend(graph_output_features[name])
+                        else:
+                            raise ValueError(
+                                "artefact feature graph did not produce every required node"
+                            )
+                    assignment_feature_ids = [
+                        identity_by_name[name] for name in required_feature_names
+                    ]
+                else:
+                    assignment_feature_ids = list(identities)
                 evaluation_payload = {
                     "event_id": str(payload["source_market_event_id"]),
                     "product_id": product_id,
@@ -268,6 +294,10 @@ class DatabaseFeatureWorker:
             raise ValueError("feature bar references require a parquet root")
         through = dt.datetime.fromisoformat(str(bar["through_close_time"]))
         available_at = dt.datetime.fromisoformat(str(payload["availability_time"]))
+        raw_source_ids = bar.get("source_event_ids", ())
+        if not isinstance(raw_source_ids, list | tuple):
+            raise ValueError("feature bar reference source_event_ids must be a list")
+        source_event_ids = {str(value) for value in raw_source_ids}
         bar_rows: dict[str, dict[str, Any]] = {}
         for path in self.parquet_store.root.glob(pattern):
             if path.is_symlink() or not path.is_file():
@@ -285,7 +315,25 @@ class DatabaseFeatureWorker:
         minimum_history = int(bar.get("minimum_history", 1))
         if len(ordered) < minimum_history:
             raise ValueError("feature input reference does not contain the required bar history")
-        latest = ordered[-1]
+        target_rows = (
+            [row for row in ordered if str(row.get("event_id")) in source_event_ids]
+            if source_event_ids
+            else ordered
+        )
+        if not target_rows:
+            raise ValueError("feature bar reference does not contain its source event")
+        latest = target_rows[-1]
+        declared_event_id = str(payload.get("source_market_event_id") or "")
+        if declared_event_id and str(latest.get("event_id")) != declared_event_id:
+            raise ValueError("feature bar reference does not match the source event identity")
+        expected_open = dt.datetime.fromisoformat(str(payload["source_event_time"]))
+        expected_close = dt.datetime.fromisoformat(str(payload["source_close_time"]))
+        actual_open = dt.datetime.fromtimestamp(float(latest["open_time_ms"]) / 1_000, dt.UTC)
+        actual_close = dt.datetime.fromtimestamp(float(latest["close_time_ms"]) / 1_000, dt.UTC)
+        if actual_open != expected_open or actual_close != expected_close:
+            raise ValueError("feature bar reference does not match the source event timestamps")
+        if actual_close > through:
+            raise ValueError("feature bar reference source event is outside its time boundary")
         resolved = {
             "open": float(latest["open"]),
             "high": float(latest["high"]),

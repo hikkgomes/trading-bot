@@ -21,6 +21,7 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
         in installer
     )
     assert 'setfacl -m u:trading-research:rx "$REPO/data/$directory"' in installer
+    assert 'setfacl -R -m u:trading-research:r-X "$REPO/data/$directory"' in installer
     assert (
         'setfacl -m u:trading-runtime:rwx,u:trading-research:rx,u:trading-agent:--x "$REPO/runtime"'
         in installer
