@@ -29,6 +29,7 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
     assert "/opt/trading-bot/data/artefacts" in research
     assert "/opt/trading-bot/data/reports" in research
     assert "/opt/trading-bot/runtime/research" in research
+    assert "NUMBA_CACHE_DIR=/opt/trading-bot/runtime/research/numba-cache" in research
     assert (
         "ReadOnlyPaths=/opt/trading-bot/data/raw /opt/trading-bot/data/bars "
         "/opt/trading-bot/data/features"

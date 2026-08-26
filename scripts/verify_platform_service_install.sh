@@ -94,7 +94,8 @@ run_cycle() {
 }
 
 run_cycle trading-runtime "$REPO/.venv-runtime/bin/python" product-supervisor
-run_cycle trading-research "$REPO/.venv-research/bin/python" research-worker
+run_cycle trading-research "$REPO/.venv-research/bin/python" research-worker \
+  NUMBA_CACHE_DIR="$REPO/runtime/research/numba-cache"
 run_cycle trading-agent "$REPO/.venv-agent/bin/python" agent-sandbox \
   TRADING_PLATFORM_AGENT_WORKTREE_ROOT="$REPO/runtime/agent-worktrees"
 
