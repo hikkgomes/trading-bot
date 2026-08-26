@@ -66,8 +66,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y acl
-          sudo mv "$GITHUB_WORKSPACE" /opt/trading-bot
-          sudo ln -s /opt/trading-bot "$GITHUB_WORKSPACE"
+          sudo cp -a "$GITHUB_WORKSPACE" /opt/trading-bot
           jq '.postgresql.require_tls = false' /opt/trading-bot/config/platform.json \
             > /opt/trading-bot/config/platform.ci.json
           sudo env REPO=/opt/trading-bot NODE=linux-optiplex SKIP_SYSTEMD=1 \

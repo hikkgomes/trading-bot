@@ -53,8 +53,8 @@ def test_ci_runs_real_service_user_permission_rehearsal() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text()
 
     assert "sudo apt-get install -y acl" in workflow
-    assert 'sudo mv "$GITHUB_WORKSPACE" /opt/trading-bot' in workflow
-    assert 'sudo ln -s /opt/trading-bot "$GITHUB_WORKSPACE"' in workflow
+    assert 'sudo cp -a "$GITHUB_WORKSPACE" /opt/trading-bot' in workflow
+    assert 'sudo mv "$GITHUB_WORKSPACE" /opt/trading-bot' not in workflow
     assert "REPO=/opt/trading-bot" in workflow
     assert "jq '.postgresql.require_tls = false'" in workflow
     assert "TRADING_PLATFORM_CONFIG=/opt/trading-bot/config/platform.ci.json" in workflow
