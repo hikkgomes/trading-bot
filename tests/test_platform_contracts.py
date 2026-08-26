@@ -2516,36 +2516,78 @@ def test_live_and_historical_feature_workers_produce_the_same_values(tmp_path: P
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'platform.sqlite3'}")
     database.create_schema()
     queue = DatabaseJobQueue(database.engine)
-    for worker_id, job_name in (
-        ("linux-feature", "live_feature_calculation"),
-        ("mac-feature", "historical_feature_calculation"),
+    for worker_id, role, capability in (
+        ("linux-data", "data-writer", "market_event_write"),
+        ("linux-feature", "feature-worker", "live_feature_calculation"),
+        ("mac-feature", "feature-worker", "historical_feature_calculation"),
     ):
         queue.register_worker(
             worker_id=worker_id,
             node_id="linux-optiplex" if worker_id.startswith("linux") else "macbook-research",
-            role="feature-worker",
-            capabilities=(job_name,),
+            role=role,
+            capabilities=(capability,),
             observed_at=NOW,
         )
-        queue.enqueue(
-            job_id=f"feature:{worker_id}",
-            name=job_name,
-            payload={
-                "feature_set_version": "core-bars-v1",
-                "instrument_id": BTC,
-                "source_event_time": NOW,
-                "source_close_time": "2026-08-13T12:01:00+00:00",
-                "availability_time": "2026-08-13T12:01:01+00:00",
-                "inputs": {"open": 100, "high": 105, "low": 99, "close": 104, "volume": 50},
+    event = normalise_public_event(
+        market="futures",
+        stream="btcusdt@kline_1m",
+        receive_timestamp=NOW,
+        payload={
+            "e": "kline",
+            "E": int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000),
+            "s": "BTCUSDT",
+            "k": {
+                "t": int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000) - 59_999,
+                "T": int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000) - 1,
+                "i": "1m",
+                "o": "100",
+                "h": "105",
+                "l": "99",
+                "c": "104",
+                "v": "50",
+                "x": True,
             },
-            available_at=NOW,
-        )
+        },
+    )
+    queue.enqueue(
+        job_id="feature:live",
+        name="market_event_write",
+        payload={
+            "venue": "binance",
+            "market": "futures",
+            "symbol": "BTCUSDT",
+            "event": to_primitive(event),
+        },
+        available_at=NOW,
+    )
+    queue.enqueue(
+        job_id="feature:historical",
+        name="historical_feature_calculation",
+        payload={
+            "feature_set_version": "core-bars-v1",
+            "instrument_id": BTC,
+            "source_event_time": "2026-08-13T11:59:00+00:00",
+            "source_close_time": "2026-08-13T11:59:59+00:00",
+            "availability_time": NOW,
+            "inputs": {"open": 100, "high": 105, "low": 99, "close": 104, "volume": 50},
+        },
+        available_at=NOW,
+    )
+    assert (
+        DatabaseMarketDataWriter(
+            queue=queue,
+            worker_id="linux-data",
+            root=tmp_path / "data",
+        ).run_once(now=NOW)["reason_code"]
+        == "market_event_written"
+    )
     store = SqlFeatureStore(database.engine)
     live = DatabaseFeatureWorker(
         queue=queue,
         worker_id="linux-feature",
         store=store,
         job_names=("live_feature_calculation",),
+        parquet_root=tmp_path / "data",
     ).run_once(now=NOW)
     historical = DatabaseFeatureWorker(
         queue=queue,
@@ -2558,6 +2600,40 @@ def test_live_and_historical_feature_workers_produce_the_same_values(tmp_path: P
     assert (
         len(store.available(instrument_id=BTC, at=LATER, feature_set_version="core-bars-v1")) == 3
     )
+
+
+def test_live_feature_jobs_reject_scalar_inputs(tmp_path: Path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'platform.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="linux-feature",
+        node_id="linux-optiplex",
+        role="feature-worker",
+        capabilities=("live_feature_calculation",),
+        observed_at=NOW,
+    )
+    queue.enqueue(
+        job_id="feature:scalar-live",
+        name="live_feature_calculation",
+        payload={
+            "feature_set_version": "core-bars-v1",
+            "instrument_id": BTC,
+            "source_event_time": NOW,
+            "source_close_time": NOW,
+            "availability_time": NOW,
+            "inputs": {"open": 100, "high": 105, "low": 99, "close": 104, "volume": 50},
+        },
+        available_at=NOW,
+    )
+    result = DatabaseFeatureWorker(
+        queue=queue,
+        worker_id="linux-feature",
+        store=SqlFeatureStore(database.engine),
+        job_names=("live_feature_calculation",),
+    ).run_once(now=NOW)
+    assert result["reason_code"] == "feature_calculation_failed"
+    assert result["error"] == "live feature jobs require immutable input references"
 
 
 def test_duckdb_historical_query_materialises_safe_parquet_results(tmp_path: Path):

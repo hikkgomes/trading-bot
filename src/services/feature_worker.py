@@ -73,6 +73,10 @@ class DatabaseFeatureWorker:
             return {"reason_code": "feature_queue_empty"}
         try:
             payload = claimed.payload
+            if claimed.name == "live_feature_calculation" and not isinstance(
+                payload.get("input_references"), Mapping
+            ):
+                raise ValueError("live feature jobs require immutable input references")
             raw_inputs = payload.get("inputs")
             if payload.get("input_references") is not None:
                 raw_inputs = self._resolve_input_references(payload)
@@ -589,18 +593,20 @@ def _merge_auxiliary_inputs(
             resolved["cross_sectional_values"] = panel
         return
     if name == "correlation_beta":
-        closes_by_instrument: dict[str, list[float]] = {}
+        correlation_closes_by_instrument: dict[str, list[float]] = {}
         for row in rows:
             close = _number(_payload_views(row["payload"]), "c", "close")
             if close is not None and close > 0:
-                closes_by_instrument.setdefault(str(row.get("instrument_id")), []).append(close)
+                correlation_closes_by_instrument.setdefault(
+                    str(row.get("instrument_id")), []
+                ).append(close)
         returns_by_instrument = {
             identity: [
                 closes[index] / closes[index - 1] - 1.0
                 for index in range(1, len(closes))
                 if closes[index - 1] > 0
             ]
-            for identity, closes in closes_by_instrument.items()
+            for identity, closes in correlation_closes_by_instrument.items()
         }
         asset_returns = returns_by_instrument.get(instrument_id, [])
         benchmark_returns = next(
