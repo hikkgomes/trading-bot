@@ -78,6 +78,17 @@ jobs:
           sudo chown -R "$USER:$(id -gn)" /opt/trading-bot/data /opt/trading-bot/runtime
       - name: Validate platform installer
         run: make platform-install-dry-run
+      - name: Bootstrap autonomous platform services
+        run: |
+          ci_config=config/platform.ci.json
+          trap 'rm -f "$ci_config"' EXIT
+          jq '.postgresql.require_tls = false' config/platform.json > "$ci_config"
+          .venv/bin/python -m src.services.supervisor \
+            --config "$ci_config" --node linux-optiplex \
+            --service platform-scheduler --once
+          .venv/bin/python -m src.services.supervisor \
+            --config "$ci_config" --node linux-optiplex \
+            --service account-reconciliation --once
       - name: PostgreSQL privilege boundary
         run: .venv/bin/python -m pytest tests/test_postgresql_privileges.py -q
       - name: Platform smoke

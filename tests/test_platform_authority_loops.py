@@ -226,42 +226,69 @@ def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path
         "portfolio_id": "active-income-portfolio",
         "account_id": "futures",
     }
-    event = normalise_public_event(
-        market="futures",
-        stream="btcusdt@kline_1m",
-        receive_timestamp=NOW,
-        payload={
-            "e": "kline",
-            "E": int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000),
-            "s": "BTCUSDT",
-            "k": {
-                "t": int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000) - 59_999,
-                "T": int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000),
-                "i": "1m",
-                "o": "100",
-                "h": "101",
-                "l": "99",
-                "c": "100.5",
-                "v": "10",
-                "spread_bps": "1",
-                "visible_depth": "1000",
-                "volatility": "0.2",
-                "funding": "0.0",
-                "x": True,
+    event_time_ms = int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000)
+    market_events = (
+        normalise_public_event(
+            market="futures",
+            stream="btcusdt@kline_1m",
+            receive_timestamp=NOW,
+            payload={
+                "e": "kline",
+                "E": event_time_ms,
+                "s": "BTCUSDT",
+                "k": {
+                    "t": event_time_ms - 59_999,
+                    "T": event_time_ms,
+                    "i": "1m",
+                    "o": "100",
+                    "h": "101",
+                    "l": "99",
+                    "c": "100.5",
+                    "v": "10",
+                    "x": True,
+                },
             },
-        },
+        ),
+        normalise_public_event(
+            market="futures",
+            stream="btcusdt@bookTicker",
+            receive_timestamp=NOW,
+            payload={
+                "e": "bookTicker",
+                "E": event_time_ms + 1,
+                "s": "BTCUSDT",
+                "b": "100.49",
+                "B": "500",
+                "a": "100.51",
+                "A": "500",
+            },
+        ),
+        normalise_public_event(
+            market="futures",
+            stream="btcusdt@markPrice@1s",
+            receive_timestamp=NOW,
+            payload={
+                "e": "markPriceUpdate",
+                "E": event_time_ms + 2,
+                "s": "BTCUSDT",
+                "p": "100.5",
+                "r": "0.0001",
+                "T": event_time_ms + 2,
+            },
+        ),
     )
-    queue.enqueue(
-        job_id="normal-market-event",
-        name="market_event_write",
-        payload={
-            "venue": "binance",
-            "market": "futures",
-            "symbol": "BTCUSDT",
-            "event": to_primitive(event),
-        },
-        available_at=NOW,
-    )
+    for index, event in enumerate(market_events):
+        queue.enqueue(
+            job_id=f"normal-market-event-{index}",
+            name="market_event_write",
+            payload={
+                "venue": "binance",
+                "market": "futures",
+                "symbol": "BTCUSDT",
+                "event": to_primitive(event),
+            },
+            available_at=NOW,
+        )
     writer = DatabaseMarketDataWriter(
         queue=queue,
         worker_id="data",
@@ -269,6 +296,8 @@ def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path
         snapshot_store=SqlRiskSnapshotStore(database.engine),
         product_ids_by_market={"futures": ("active_income",)},
     )
+    assert writer.run_once(now=NOW)["reason_code"] == "market_event_written"
+    assert writer.run_once(now=NOW)["reason_code"] == "market_event_written"
     assert writer.run_once(now=NOW)["reason_code"] == "market_event_written"
     queue.enqueue(
         job_id="normal-account-event",

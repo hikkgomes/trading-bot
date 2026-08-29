@@ -16,6 +16,11 @@ PLATFORM_TYPECHECK_FILES = \
 	src/research/store.py \
 	src/services/agent_worker.py src/services/backup_service.py src/services/backups.py \
 	src/services/config.py src/services/data_writer.py src/services/live_execution.py \
+	src/services/account_reconciliation.py src/services/platform_bootstrap.py \
+	src/services/forward_observation.py src/services/paper_diagnostic.py \
+	src/services/platform_live_authority.py \
+	src/services/platform_testnet_connected.py src/services/platform_testnet_rehearsal.py \
+	src/services/scheduler.py \
 	src/services/promotion.py src/services/readiness.py src/services/research_jobs.py \
 	src/services/supervisor.py \
 	src/strategies/base.py src/strategies/manifest.py
@@ -132,7 +137,7 @@ platform-readiness:  ## Check PostgreSQL, canonical tables, Parquet, and paper-o
 
 .PHONY: platform-readiness-live
 platform-readiness-live:  ## Check live platform readiness with PostgreSQL schema verification
-	$(PY) -m src.services.readiness --config config/platform.json --live
+	$(PY) -m src.services.readiness --config config/platform.json --live $(if $(PRODUCT),--product $(PRODUCT),)
 
 .PHONY: platform-smoke
 platform-smoke:  ## Run the PostgreSQL closed-event platform smoke for both products
@@ -142,9 +147,18 @@ platform-smoke:  ## Run the PostgreSQL closed-event platform smoke for both prod
 platform-testnet-rehearsal:  ## Verify the platform live/user-stream/accounting/recovery rehearsal path
 	$(PY) -m pytest -q tests/test_platform_testnet_rehearsal.py tests/test_platform_testnet_rehearsal_integration.py
 
+.PHONY: platform-testnet-connected
+platform-testnet-connected:  ## Run a confirmed connected new-platform Binance testnet open/close rehearsal
+	@test "$(CONFIRM)" = "1" || (echo "Set CONFIRM=1 to place real testnet orders." >&2; exit 1)
+	$(PY) -m src.services.platform_testnet_connected --config config/platform.json --product $(or $(PRODUCT),active_income) --notional-usd $(or $(NOTIONAL_USD),10) --confirm
+
+.PHONY: platform-live-authority
+platform-live-authority:  ## Inspect or record exact manual live authority
+	$(PY) -m src.services.platform_live_authority --config config/platform.json $(ARGS)
+
 .PHONY: platform-permissions-test
 platform-permissions-test:  ## Verify installed service users, writable paths, and one cycle per domain
-	bash scripts/verify_platform_service_install.sh
+	REPO="$(CURDIR)" bash scripts/verify_platform_service_install.sh
 
 .PHONY: platform-ci
 platform-ci:  ## Run the platform configuration, lint, migration, smoke, and test checks

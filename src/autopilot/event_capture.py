@@ -28,7 +28,14 @@ DEFAULT_STATUS = PROJECT_ROOT / "runtime" / "event_capture_status.json"
 ALLOWED_STREAMS = frozenset(
     {"aggTrade", "trade", "bookTicker", "depth20@100ms", "markPrice@1s", "kline_1m"}
 )
-ALLOWED_HOSTS = frozenset({"fstream.binance.com", "stream.binance.com"})
+ALLOWED_HOSTS = frozenset(
+    {
+        "fstream.binance.com",
+        "stream.binance.com",
+        "demo-fstream.binance.com",
+        "stream.testnet.binance.vision",
+    }
+)
 MAX_EVENT_BYTES = 1024 * 1024
 
 

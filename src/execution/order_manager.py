@@ -217,7 +217,6 @@ class SqlOrderStore:
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(exchange_order.c.payload).order_by(
-                    exchange_order.c.created_at,
                     exchange_order.c.order_id,
                     exchange_order.c.sequence,
                 )

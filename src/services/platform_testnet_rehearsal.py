@@ -180,6 +180,13 @@ def validate_testnet_rehearsal_configuration(configuration: Mapping[str, Any]) -
         raise ValueError("platform testnet rehearsal requires the PostgreSQL queue")
     if configuration.get("legacy_autopilot") is True:
         raise ValueError("platform testnet rehearsal cannot use the legacy autopilot path")
+    if (
+        configuration.get("injected_broker") is not None
+        or configuration.get("captured_events") is True
+    ):
+        raise ValueError(
+            "platform testnet rehearsal cannot use an injected broker or captured events"
+        )
     product_id = non_empty(str(configuration.get("product_id") or ""), field="product_id")
     return {
         "schema": "platform.testnet-rehearsal-config/v1",

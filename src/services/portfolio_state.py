@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import statistics
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 from sqlalchemy import select
 
 from src.data.database import (
+    account_snapshot,
     balance_snapshot,
     exchange_order,
     order_intent,
@@ -65,6 +67,26 @@ class DatabasePortfolioSourceService:
         account_id = str(product["account_id"])
         now = timestamp(now, field="now")
         balance_payload, balance_at = self._latest_payload(balance_snapshot, account_id, now)
+        if product.get("execution_mode") == "live":
+            required_authority = {
+                "account_state_known",
+                "account_state_authority",
+                "used_margin_fraction",
+                "liquidation_buffer_fraction",
+                "unknown_exposure",
+                "positions",
+                "regular_orders",
+                "conditional_orders",
+                "account_mode",
+            }
+            if (
+                balance_payload is None
+                or not required_authority.issubset(balance_payload)
+                or balance_payload.get("account_state_known") is not True
+                or balance_payload.get("account_state_authority")
+                not in {"authenticated_rest", "authenticated_reconciled"}
+            ):
+                return
         positions, positions_at = self._positions(str(product["portfolio_id"]), now)
         open_orders, orders_at = self._open_orders(str(product["portfolio_id"]), now)
         market, market_at = self._market(product_id, now)
@@ -92,6 +114,22 @@ class DatabasePortfolioSourceService:
             account_id=account_id,
             at=now,
         )
+        account_values = {
+            "used_margin_fraction": float(balance_payload.get("used_margin_fraction", 0.0)),
+            "liquidation_buffer_fraction": float(
+                balance_payload.get("liquidation_buffer_fraction", 1.0)
+            ),
+            "unknown_exposure": dict(balance_payload.get("unknown_exposure", {})),
+            "account_id": account_id,
+        }
+        if "account_state_known" in balance_payload:
+            account_values["account_state_known"] = bool(balance_payload["account_state_known"])
+        if "account_state_authority" in balance_payload:
+            account_values["account_state_authority"] = str(
+                balance_payload["account_state_authority"]
+            )
+        if "account_fingerprint" in balance_payload:
+            account_values["account_fingerprint"] = str(balance_payload["account_fingerprint"])
         self.publish(
             product_id=product_id,
             kind="balances",
@@ -102,14 +140,7 @@ class DatabasePortfolioSourceService:
             product_id=product_id,
             kind="account",
             observed_at=balance_at or observed_at,
-            values={
-                "used_margin_fraction": float(balance_payload.get("used_margin_fraction", 0.0)),
-                "liquidation_buffer_fraction": float(
-                    balance_payload.get("liquidation_buffer_fraction", 1.0)
-                ),
-                "unknown_exposure": dict(balance_payload.get("unknown_exposure", {})),
-                "account_id": account_id,
-            },
+            values=account_values,
         )
         self.publish(
             product_id=product_id,
@@ -187,6 +218,18 @@ class DatabasePortfolioSourceService:
         self, table, account_id: str, at: str
     ) -> tuple[dict[str, Any] | None, str | None]:
         with self.engine.connect() as connection:
+            if table is balance_snapshot:
+                account_rows = connection.execute(
+                    select(account_snapshot.c.payload, account_snapshot.c.observed_at)
+                    .where(
+                        account_snapshot.c.account_id == account_id,
+                        account_snapshot.c.observed_at <= at,
+                    )
+                    .order_by(account_snapshot.c.observed_at.desc(), account_snapshot.c.id.desc())
+                ).mappings()
+                row = next(iter(account_rows), None)
+                if row is not None and isinstance(row["payload"], dict):
+                    return dict(row["payload"]), str(row["observed_at"])
             rows = connection.execute(
                 select(table.c.payload, table.c.created_at)
                 .where(table.c.created_at <= at)
@@ -249,14 +292,17 @@ class DatabasePortfolioSourceService:
                 latest[order_id] = {**payload, "status": str(row["status"])}
         return tuple(latest[key] for key in sorted(latest)), latest_at
 
-    def _market(self, product_id: str, at: str) -> tuple[dict[str, dict[str, float]], str | None]:
+    def _market(self, product_id: str, at: str) -> tuple[dict[str, dict[str, Any]], str | None]:
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(risk_snapshot.c.payload, risk_snapshot.c.created_at)
                 .where(risk_snapshot.c.created_at <= at)
                 .order_by(risk_snapshot.c.created_at.desc(), risk_snapshot.c.id.desc())
             ).mappings()
-        market: dict[str, dict[str, float]] = {}
+        market: dict[str, dict[str, Any]] = {}
+        product = self.products.get(product_id, {})
+        account = self.accounts.get(str(product.get("account_id")), {})
+        market_type = "spot" if account.get("market") == "spot" else "futures"
         latest_at: str | None = None
         fields = {
             "close": "price",
@@ -267,8 +313,9 @@ class DatabasePortfolioSourceService:
             "funding": "funding",
             "funding_rate": "funding",
         }
-        latest_values: dict[str, dict[str, float]] = {}
+        latest_values: dict[str, dict[str, Any]] = {}
         latest_times: dict[str, str] = {}
+        field_times: dict[str, dict[str, str]] = {}
         close_history: dict[str, list[float]] = {}
         for row in rows:
             payload = row["payload"]
@@ -300,8 +347,11 @@ class DatabasePortfolioSourceService:
                 if value != value or value in (float("inf"), float("-inf")):
                     continue
                 values[target_name] = value
+                field_times.setdefault(instrument_id, {})[target_name] = str(row["created_at"])
                 latest_times.setdefault(instrument_id, str(row["created_at"]))
-        required = {"price", "spread_bps", "visible_depth", "volatility", "funding"}
+        required = {"price", "spread_bps", "visible_depth", "volatility"}
+        if market_type == "futures":
+            required.add("funding")
         for instrument_id, values in latest_values.items():
             if "volatility" not in values:
                 closes = list(reversed(close_history.get(instrument_id, [])))
@@ -312,8 +362,23 @@ class DatabasePortfolioSourceService:
                 ]
                 if len(returns) >= 2:
                     values["volatility"] = statistics.pstdev(returns)
+            if market_type == "spot":
+                # Funding is not a spot market requirement. Supplying a zero
+                # value keeps downstream risk payloads structurally uniform.
+                values.setdefault("funding", 0.0)
+            else:
+                funding_at = field_times.get(instrument_id, {}).get("funding")
+                if funding_at is None:
+                    continue
+                funding_age = (
+                    dt.datetime.fromisoformat(at) - dt.datetime.fromisoformat(funding_at)
+                ).total_seconds()
+                maximum_funding_age = float(product.get("maximum_funding_age_seconds", 28_800))
+                if funding_age < 0 or funding_age > maximum_funding_age:
+                    continue
             if not required.issubset(values):
                 continue
+            values["market_type"] = market_type
             market[instrument_id] = values
             row_time = latest_times[instrument_id]
             latest_at = row_time if latest_at is None else max(latest_at, row_time)
@@ -438,6 +503,8 @@ class DatabasePortfolioStateWorker:
         store: SqlRiskSnapshotStore,
         lease_seconds: int = 60,
         refresh_sources: Callable[[str, str], None] | None = None,
+        job_name: str = "portfolio_state_publish",
+        job_id_prefix: str = "portfolio-state",
     ) -> None:
         self.queue = queue
         self.worker_id = worker_id
@@ -445,6 +512,8 @@ class DatabasePortfolioStateWorker:
         self.publisher = CanonicalPortfolioStatePublisher(store)
         self.lease_seconds = lease_seconds
         self.refresh_sources = refresh_sources
+        self.job_name = job_name
+        self.job_id_prefix = job_id_prefix
         self.last_schedule_reason = "portfolio_state_queue_empty"
 
     def schedule_from_latest(
@@ -497,8 +566,8 @@ class DatabasePortfolioStateWorker:
             }
             identity = canonical_hash(identity_payload).removeprefix("sha256:")
             if self.queue.enqueue_if_absent(
-                job_id=f"portfolio-state:{identity}",
-                name="portfolio_state_publish",
+                job_id=f"{self.job_id_prefix}:{identity}",
+                name=self.job_name,
                 payload=payload,
                 available_at=observed_at,
                 priority=25,
@@ -519,7 +588,7 @@ class DatabasePortfolioStateWorker:
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.lease_seconds,
-            names=("portfolio_state_publish",),
+            names=(self.job_name,),
         )
         if claimed is None:
             return {"reason_code": "portfolio_state_queue_empty"}
@@ -528,13 +597,17 @@ class DatabasePortfolioStateWorker:
             if not isinstance(source_ids, Mapping) or set(source_ids) != self.REQUIRED_SOURCES:
                 raise ValueError("portfolio state source snapshot identities are incomplete")
             policy_hash = str(claimed.payload.get("risk_policy_hash") or "")
-            expected_job_id = "portfolio-state:" + canonical_hash(
-                {
-                    "product_id": str(claimed.payload["product_id"]),
-                    "source_snapshot_ids": dict(source_ids),
-                    "risk_policy_hash": policy_hash,
-                }
-            ).removeprefix("sha256:")
+            expected_job_id = (
+                self.job_id_prefix
+                + ":"
+                + canonical_hash(
+                    {
+                        "product_id": str(claimed.payload["product_id"]),
+                        "source_snapshot_ids": dict(source_ids),
+                        "risk_policy_hash": policy_hash,
+                    }
+                ).removeprefix("sha256:")
+            )
             if claimed.job_id != expected_job_id:
                 raise ValueError("portfolio state job identity is not content-addressed")
             assembled: dict[str, Any] = {
@@ -597,3 +670,43 @@ class DatabasePortfolioStateWorker:
             "job_id": claimed.job_id,
             "state_id": state_id,
         }
+
+
+def portfolio_state_policies(
+    configuration: Mapping[str, Mapping[str, Any]],
+    products: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Build the canonical state policy bound to each configured product."""
+
+    risk = configuration["risk"]
+    global_limits = risk["global"]
+    instrument = risk["instrument"]
+    sleeve = risk["sleeve"]
+    product_limits = risk["products"]
+    result: dict[str, dict[str, Any]] = {}
+    for product_id, product in products.items():
+        risk_policy_id = str(product["risk_policy_id"])
+        limits = product_limits[risk_policy_id]
+        sleeves = tuple(str(item) for item in product.get("sleeves", ()))
+        sleeve_budget = 1.0 / len(sleeves) if sleeves else 1.0
+        result[product_id] = {
+            "maximum_state_age_seconds": min(
+                float(global_limits["maximum_market_data_staleness_seconds"]),
+                float(global_limits["maximum_database_staleness_seconds"]),
+            ),
+            "risk_policy_ids": [risk_policy_id],
+            "portfolio_risk_budget": float(
+                limits.get("maximum_exposure", limits.get("maximum_gross", 1.0))
+            ),
+            "maximum_symbol_fraction": float(instrument["maximum_fraction"]),
+            "maximum_abs_beta": float(sleeve["maximum_abs_beta"]),
+            "maximum_correlation": float(sleeve["maximum_correlation"]),
+            "maximum_turnover_fraction": float(sleeve["maximum_turnover_fraction"]),
+            "maximum_cluster_fraction": float(sleeve["maximum_fraction"]),
+            "maximum_product_drawdown_fraction": float(limits["maximum_drawdown"]),
+            "maximum_depth_participation": float(instrument["maximum_visible_depth_fraction"]),
+            "sleeve_budgets": {name: sleeve_budget for name in sleeves},
+            "clusters": {},
+            "cluster_fraction_caps": {},
+        }
+    return result

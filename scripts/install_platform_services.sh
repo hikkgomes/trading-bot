@@ -1,9 +1,28 @@
 #!/bin/bash
 set -euo pipefail
 
-REPO="${REPO:-/opt/trading-bot}"
+REPO="${REPO:-/home/alfred/trading-bot}"
 NODE="${NODE:-linux-optiplex}"
 SKIP_SYSTEMD="${SKIP_SYSTEMD:-0}"
+
+if [[ "$REPO" != /* || "$REPO" =~ [[:space:]\|] ]]; then
+  echo "REPO must be an absolute path without whitespace or pipes." >&2
+  exit 1
+fi
+
+PROTECT_HOME=true
+if [[ "$REPO" == /home/*/* ]]; then
+  PROTECT_HOME=read-only
+fi
+
+install_platform_unit() {
+  local source="$1"
+  local destination="$2"
+  sed \
+    -e "s|/opt/trading-bot|$REPO|g" \
+    -e "s|ProtectHome=true|ProtectHome=$PROTECT_HOME|g" \
+    "$source" | install -m 0644 /dev/stdin "$destination"
+}
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   [[ "$NODE" == "linux-optiplex" ]] || { echo "NODE must be linux-optiplex." >&2; exit 1; }
@@ -40,7 +59,36 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   # agent clones into its own writable root and only reads the source tree.
   chgrp trading-platform "$REPO"
   chmod 0750 "$REPO"
-  install -d -m 0750 -o root -g trading-runtime /etc/trading-platform
+  if [[ "$REPO" == /home/*/* ]]; then
+    repository_owner="${REPO#/home/}"
+    repository_owner="${repository_owner%%/*}"
+    repository_home="/home/$repository_owner"
+    [[ -d "$repository_home" ]] || {
+      echo "repository home does not exist: $repository_home" >&2
+      exit 1
+    }
+    setfacl -m g:trading-platform:--x "$repository_home"
+  fi
+  setfacl -R -m g:trading-platform:r-X "$REPO/src" "$REPO/config" "$REPO/alembic"
+  setfacl -m g:trading-platform:r "$REPO/alembic.ini"
+  setfacl -R -m u:trading-agent:r-X "$REPO/.git"
+  setfacl -R -m u:trading-runtime:r-X,u:trading-platform-owner:r-X \
+    "$REPO/.venv-runtime"
+  setfacl -R -m u:trading-research:r-X "$REPO/.venv-research"
+  setfacl -R -m u:trading-agent:r-X "$REPO/.venv-agent"
+  install -d -m 0750 -o root -g trading-platform /etc/trading-platform
+  for environment in \
+    runtime:trading-runtime \
+    research:trading-research \
+    agent:trading-agent \
+    migration:trading-platform-owner \
+    backup:trading-runtime; do
+    name="${environment%%:*}"
+    group="${environment#*:}"
+    if [[ ! -e "/etc/trading-platform/$name.env" ]]; then
+      install -m 0640 -o root -g "$group" /dev/null "/etc/trading-platform/$name.env"
+    fi
+  done
   install -d -m 0750 -o root -g trading-platform "$REPO/data"
   install -d -m 0750 -o root -g trading-platform "$REPO/runtime"
   for directory in raw bars features; do
@@ -72,19 +120,19 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   setfacl -m u:trading-runtime:rx "$REPO/runtime/research"
   setfacl -m d:u:trading-runtime:rx "$REPO/runtime/research"
   setfacl -m u:trading-agent:rwx "$REPO/runtime/agent-worktrees"
-  install -m 0644 "$REPO/deploy/systemd/trading-platform@.service" \
+  install_platform_unit "$REPO/deploy/systemd/trading-platform@.service" \
     /etc/systemd/system/trading-platform@.service
-  install -m 0644 "$REPO/deploy/systemd/trading-platform-research@.service" \
+  install_platform_unit "$REPO/deploy/systemd/trading-platform-research@.service" \
     /etc/systemd/system/trading-platform-research@.service
-  install -m 0644 "$REPO/deploy/systemd/trading-platform-agent@.service" \
+  install_platform_unit "$REPO/deploy/systemd/trading-platform-agent@.service" \
     /etc/systemd/system/trading-platform-agent@.service
-  install -m 0644 "$REPO/deploy/systemd/trading-platform-migration.service" \
+  install_platform_unit "$REPO/deploy/systemd/trading-platform-migration.service" \
     /etc/systemd/system/trading-platform-migration.service
   for slice in critical background agent; do
     install -m 0644 "$REPO/deploy/systemd/trading-platform-${slice}.slice" \
       "/etc/systemd/system/trading-platform-${slice}.slice"
   done
-  install -m 0644 "$REPO/deploy/systemd/trading-platform-backup@.service" \
+  install_platform_unit "$REPO/deploy/systemd/trading-platform-backup@.service" \
     /etc/systemd/system/trading-platform-backup@.service
   install -m 0644 "$REPO/deploy/systemd/trading-platform-backup-postgresql.timer" \
     /etc/systemd/system/trading-platform-backup-postgresql.timer
@@ -97,7 +145,7 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     exit 0
   fi
   systemctl daemon-reload
-  critical_services=(market-gateway data-writer feature-service strategy-evaluator portfolio-engine portfolio-state-service risk-engine execution-engine paper-engine product-supervisor accounting-service promotion-engine control-api universe-service)
+  critical_services=(market-gateway data-writer feature-service strategy-evaluator portfolio-engine portfolio-state-service risk-engine execution-engine paper-engine product-supervisor accounting-service account-reconciliation promotion-engine control-api universe-service platform-scheduler)
   research_services=(research-worker ml-worker event-replay-worker feature-build-worker report-worker)
   for service in "${critical_services[@]}"; do
     systemctl enable "trading-platform@${service}.service"

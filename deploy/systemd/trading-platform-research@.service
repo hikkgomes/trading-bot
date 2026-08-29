@@ -1,15 +1,16 @@
 [Unit]
 Description=Trading platform Linux research service %i
-After=network-online.target postgresql.service
+After=network-online.target postgresql.service trading-platform-migration.service
 Wants=network-online.target
-Requires=postgresql.service
+Requires=postgresql.service trading-platform-migration.service
 
 [Service]
 Type=simple
 User=trading-research
 Group=trading-research
 WorkingDirectory=/opt/trading-bot
-EnvironmentFile=/etc/trading-platform/%i.env
+EnvironmentFile=/etc/trading-platform/research.env
+EnvironmentFile=-/etc/trading-platform/%i.env
 Environment=PYTHONUNBUFFERED=1
 Environment=OMP_NUM_THREADS=2
 Environment=OPENBLAS_NUM_THREADS=2

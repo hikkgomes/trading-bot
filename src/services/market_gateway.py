@@ -29,13 +29,24 @@ _CLOCK_ENDPOINTS = {
     "spot": "https://api.binance.com/api/v3/time",
     "futures": "https://fapi.binance.com/fapi/v1/time",
 }
+_TESTNET_CLOCK_ENDPOINTS = {
+    "spot": "https://testnet.binance.vision/api/v3/time",
+    "futures": "https://demo-fapi.binance.com/fapi/v1/time",
+}
 _USER_STREAM_ENDPOINTS = {
     "futures": (
         "https://fapi.binance.com/fapi/v1/listenKey",
         "wss://fstream.binance.com/private/ws",
     ),
 }
+_TESTNET_USER_STREAM_ENDPOINTS = {
+    "futures": (
+        "https://demo-fapi.binance.com/fapi/v1/listenKey",
+        "wss://demo-fstream.binance.com/ws",
+    ),
+}
 _SPOT_USER_STREAM = "wss://ws-api.binance.com:443/ws-api/v3?returnRateLimits=false"
+_SPOT_TESTNET_USER_STREAM = "wss://ws-api.testnet.binance.vision/ws-api/v3?returnRateLimits=false"
 
 
 @dataclass(frozen=True)
@@ -44,6 +55,7 @@ class UserStreamAccount:
     market: str
     api_key: str
     api_secret: str
+    testnet: bool = False
 
     @classmethod
     def from_config(cls, payload: Mapping[str, Any]) -> UserStreamAccount | None:
@@ -65,6 +77,7 @@ class UserStreamAccount:
             market=market,
             api_key=api_key,
             api_secret=api_secret,
+            testnet=str(payload.get("environment") or "production") == "testnet",
         )
 
 
@@ -76,9 +89,13 @@ class DatabaseGatewaySink:
         queue: DatabaseJobQueue,
         *,
         spool: DurableMarketBatchSpool | None = None,
+        user_stream_job_name: str = "user_stream_event",
+        user_stream_job_prefix: str = "user-stream",
     ):
         self.queue = queue
         self.spool = spool
+        self.user_stream_job_name = user_stream_job_name
+        self.user_stream_job_prefix = user_stream_job_prefix
         self.events = 0
         self.bytes = 0
 
@@ -104,8 +121,8 @@ class DatabaseGatewaySink:
         payload = to_primitive(event)
         identity = event.event_id
         self.queue.enqueue_if_absent(
-            job_id=f"user-stream:{identity.removeprefix('sha256:')}",
-            name="user_stream_event",
+            job_id=f"{self.user_stream_job_prefix}:{identity.removeprefix('sha256:')}",
+            name=self.user_stream_job_name,
             payload={
                 "account_id": account_id,
                 "market": market,
@@ -180,6 +197,19 @@ class BinanceUserStreams:
     def __init__(self) -> None:
         self._listen_keys: dict[str, str] = {}
         self._refreshed_at: dict[str, float] = {}
+        self._connected_accounts: set[str] = set()
+        self._connection_lock = threading.Lock()
+
+    def connected(self, account_id: str) -> bool:
+        with self._connection_lock:
+            return account_id in self._connected_accounts
+
+    def _set_connected(self, account_id: str, connected: bool) -> None:
+        with self._connection_lock:
+            if connected:
+                self._connected_accounts.add(account_id)
+            else:
+                self._connected_accounts.discard(account_id)
 
     async def capture(
         self,
@@ -197,34 +227,38 @@ class BinanceUserStreams:
                 maximum_seconds=maximum_seconds,
             )
         listen_key = await self._listen_key(session, account)
-        _, websocket_root = _USER_STREAM_ENDPOINTS[account.market]
+        _, websocket_root = _stream_endpoints(account)
         deadline = time.monotonic() + maximum_seconds
         events = 0
         async with session.ws_connect(
             f"{websocket_root}/{listen_key}", heartbeat=30, receive_timeout=90
         ) as websocket:
-            while (remaining := deadline - time.monotonic()) > 0:
-                try:
-                    message = await asyncio.wait_for(websocket.receive(), timeout=remaining)
-                except TimeoutError:
-                    break
-                if message.type != aiohttp.WSMsgType.TEXT:
-                    if message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+            self._set_connected(account.account_id, True)
+            try:
+                while (remaining := deadline - time.monotonic()) > 0:
+                    try:
+                        message = await asyncio.wait_for(websocket.receive(), timeout=remaining)
+                    except TimeoutError:
                         break
-                    continue
-                received_at = dt.datetime.now(dt.UTC).isoformat()
-                payload = json.loads(message.data)
-                if payload.get("e") == "listenKeyExpired":
-                    self._listen_keys.pop(account.account_id, None)
-                    raise RuntimeError("Binance futures user-stream listen key expired")
-                event = normalise_user_event(
-                    account_id=account.account_id,
-                    market=account.market,
-                    payload=payload,
-                    receive_timestamp=received_at,
-                )
-                sink.write_user(event, account_id=account.account_id, market=account.market)
-                events += 1
+                    if message.type != aiohttp.WSMsgType.TEXT:
+                        if message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+                            break
+                        continue
+                    received_at = dt.datetime.now(dt.UTC).isoformat()
+                    payload = json.loads(message.data)
+                    if payload.get("e") == "listenKeyExpired":
+                        self._listen_keys.pop(account.account_id, None)
+                        raise RuntimeError("Binance futures user-stream listen key expired")
+                    event = normalise_user_event(
+                        account_id=account.account_id,
+                        market=account.market,
+                        payload=payload,
+                        receive_timestamp=received_at,
+                    )
+                    sink.write_user(event, account_id=account.account_id, market=account.market)
+                    events += 1
+            finally:
+                self._set_connected(account.account_id, False)
         return events
 
     async def _capture_spot(
@@ -249,9 +283,8 @@ class BinanceUserStreams:
         ).hexdigest()
         deadline = time.monotonic() + maximum_seconds
         events = 0
-        async with session.ws_connect(
-            _SPOT_USER_STREAM, heartbeat=20, receive_timeout=60
-        ) as websocket:
+        endpoint = _SPOT_TESTNET_USER_STREAM if account.testnet else _SPOT_USER_STREAM
+        async with session.ws_connect(endpoint, heartbeat=20, receive_timeout=60) as websocket:
             await websocket.send_json(
                 {
                     "id": request_id,
@@ -264,35 +297,39 @@ class BinanceUserStreams:
             )
             if confirmation.get("id") != request_id or confirmation.get("status") != 200:
                 raise RuntimeError("Binance spot user-stream subscription was rejected")
-            while (remaining := deadline - time.monotonic()) > 0:
-                try:
-                    message = await asyncio.wait_for(websocket.receive(), timeout=remaining)
-                except TimeoutError:
-                    break
-                if message.type != aiohttp.WSMsgType.TEXT:
-                    if message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+            self._set_connected(account.account_id, True)
+            try:
+                while (remaining := deadline - time.monotonic()) > 0:
+                    try:
+                        message = await asyncio.wait_for(websocket.receive(), timeout=remaining)
+                    except TimeoutError:
                         break
-                    continue
-                wrapper = json.loads(message.data)
-                payload = wrapper.get("event")
-                if not isinstance(payload, Mapping):
-                    continue
-                event_name = str(payload.get("e") or "")
-                if event_name in {"eventStreamTerminated", "serverShutdown"}:
-                    raise RuntimeError(f"Binance spot user stream ended: {event_name}")
-                received_at = dt.datetime.now(dt.UTC).isoformat()
-                event = normalise_user_event(
-                    account_id=account.account_id,
-                    market=account.market,
-                    payload=payload,
-                    receive_timestamp=received_at,
-                )
-                sink.write_user(event, account_id=account.account_id, market=account.market)
-                events += 1
+                    if message.type != aiohttp.WSMsgType.TEXT:
+                        if message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+                            break
+                        continue
+                    wrapper = json.loads(message.data)
+                    payload = wrapper.get("event")
+                    if not isinstance(payload, Mapping):
+                        continue
+                    event_name = str(payload.get("e") or "")
+                    if event_name in {"eventStreamTerminated", "serverShutdown"}:
+                        raise RuntimeError(f"Binance spot user stream ended: {event_name}")
+                    received_at = dt.datetime.now(dt.UTC).isoformat()
+                    event = normalise_user_event(
+                        account_id=account.account_id,
+                        market=account.market,
+                        payload=payload,
+                        receive_timestamp=received_at,
+                    )
+                    sink.write_user(event, account_id=account.account_id, market=account.market)
+                    events += 1
+            finally:
+                self._set_connected(account.account_id, False)
         return events
 
     async def _listen_key(self, session: aiohttp.ClientSession, account: UserStreamAccount) -> str:
-        endpoint, _ = _USER_STREAM_ENDPOINTS[account.market]
+        endpoint, _ = _stream_endpoints(account)
         headers = {"X-MBX-APIKEY": account.api_key}
         current = self._listen_keys.get(account.account_id)
         refreshed_at = self._refreshed_at.get(account.account_id, 0.0)
@@ -311,6 +348,13 @@ class BinanceUserStreams:
         return listen_key
 
 
+def _stream_endpoints(account: UserStreamAccount) -> tuple[str, str]:
+    endpoints = _TESTNET_USER_STREAM_ENDPOINTS if account.testnet else _USER_STREAM_ENDPOINTS
+    if account.market not in endpoints:
+        raise ValueError(f"Binance user-stream endpoints are unavailable for {account.market}")
+    return endpoints[account.market]
+
+
 def funding_event_from_mark_price(event: MarketEvent) -> MarketEvent | None:
     if event.event_type is not MarketEventType.MARK_PRICE:
         return None
@@ -324,9 +368,13 @@ def funding_event_from_mark_price(event: MarketEvent) -> MarketEvent | None:
         receive_timestamp=event.receive_timestamp,
         sequence=event.sequence,
         payload={
-            "source_event_id": event.event_id,
+            "data": {
+                "funding_rate": float(raw_data["r"]),
+                "next_funding_time_ms": raw_data.get("T"),
+            },
             "funding_rate": float(raw_data["r"]),
             "next_funding_time_ms": raw_data.get("T"),
+            "source_event_id": event.event_id,
         },
     )
 
@@ -361,6 +409,9 @@ class DatabaseMarketGateway:
         accounts: tuple[UserStreamAccount, ...] = (),
         universe_symbols: Callable[[], tuple[str, ...]] | None = None,
         maximum_clock_skew_ms: float = 1_000.0,
+        testnet: bool = False,
+        user_stream_job_name: str = "user_stream_event",
+        user_stream_job_prefix: str = "user-stream",
     ) -> None:
         if maximum_clock_skew_ms <= 0:
             raise ValueError("maximum clock skew must be positive")
@@ -369,6 +420,9 @@ class DatabaseMarketGateway:
         self.accounts = accounts
         self.universe_symbols = universe_symbols or (lambda: ())
         self.maximum_clock_skew_ms = maximum_clock_skew_ms
+        self.testnet = testnet
+        self.user_stream_job_name = user_stream_job_name
+        self.user_stream_job_prefix = user_stream_job_prefix
         self.user_streams = BinanceUserStreams()
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -407,6 +461,16 @@ class DatabaseMarketGateway:
             if self._thread.is_alive():
                 raise RuntimeError("persistent market gateway did not stop cleanly")
 
+    def wait_for_user_stream(self, account_id: str, *, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if self._continuous_error is not None:
+                raise RuntimeError("persistent market gateway failed") from self._continuous_error
+            if self.user_streams.connected(account_id):
+                return True
+            time.sleep(0.05)
+        return self.user_streams.connected(account_id)
+
     def _run_continuous_thread(self) -> None:
         loop = asyncio.new_event_loop()
         self._loop = loop
@@ -432,6 +496,8 @@ class DatabaseMarketGateway:
         timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=120)
         sink = DatabaseGatewaySink(
             self.queue,
+            user_stream_job_name=self.user_stream_job_name,
+            user_stream_job_prefix=self.user_stream_job_prefix,
             spool=DurableMarketBatchSpool(
                 self.capture_config.root / "spool",
                 max_rows=min(self.capture_config.queue_max_events, 5_000),
@@ -528,6 +594,8 @@ class DatabaseMarketGateway:
         timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=120)
         sink = DatabaseGatewaySink(
             self.queue,
+            user_stream_job_name=self.user_stream_job_name,
+            user_stream_job_prefix=self.user_stream_job_prefix,
             spool=DurableMarketBatchSpool(
                 self.capture_config.root / "spool",
                 max_rows=min(self.capture_config.queue_max_events, 5_000),
@@ -578,7 +646,8 @@ class DatabaseMarketGateway:
 
     async def _clock_status(self, session: aiohttp.ClientSession) -> dict[str, Any]:
         status: dict[str, Any] = {}
-        for market, endpoint in _CLOCK_ENDPOINTS.items():
+        endpoints = _TESTNET_CLOCK_ENDPOINTS if self.testnet else _CLOCK_ENDPOINTS
+        for market, endpoint in endpoints.items():
             started_ms = time.time_ns() / 1_000_000
             async with session.get(endpoint) as response:
                 response.raise_for_status()

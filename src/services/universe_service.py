@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import decimal
 import math
 import threading
 import time
@@ -81,6 +82,7 @@ class DatabaseUniverseService:
             observations = self.binance.observations(
                 observed_at=now,
                 maximum_symbols=int(payload.get("maximum_symbols", 100)),
+                market_type=str(payload.get("market_type") or "futures"),
             )
             snapshot_id = self.record_snapshot(
                 universe_id=str(payload["universe_id"]),
@@ -108,7 +110,7 @@ class DatabaseUniverseService:
 
 
 class BinanceUniverseClient:
-    """Build point-in-time futures observations from Binance public REST data."""
+    """Build point-in-time spot or futures observations from Binance REST data."""
 
     WEIGHTS = {
         "/fapi/v1/exchangeInfo": 1,
@@ -118,6 +120,11 @@ class BinanceUniverseClient:
         "/fapi/v1/depth": 5,
         "/fapi/v1/openInterest": 1,
         "/fapi/v1/klines": 2,
+        "/api/v3/exchangeInfo": 20,
+        "/api/v3/ticker/24hr": 40,
+        "/api/v3/ticker/bookTicker": 5,
+        "/api/v3/depth": 5,
+        "/api/v3/klines": 2,
     }
 
     def __init__(
@@ -148,7 +155,10 @@ class BinanceUniverseClient:
             self._weight_used += weight
         for attempt in range(self.maximum_retries):
             try:
-                response = self.session.get(f"{self.base_url}{path}", params=params, timeout=20)
+                base_url = self.base_url
+                if path.startswith("/api/") and base_url == "https://fapi.binance.com":
+                    base_url = "https://api.binance.com"
+                response = self.session.get(f"{base_url}{path}", params=params, timeout=20)
                 response.raise_for_status()
                 return response.json()
             except requests.RequestException:
@@ -158,31 +168,40 @@ class BinanceUniverseClient:
         raise RuntimeError("Binance request failed")
 
     def observations(
-        self, *, observed_at: str, maximum_symbols: int
+        self, *, observed_at: str, maximum_symbols: int, market_type: str = "futures"
     ) -> tuple[InstrumentObservation, ...]:
         if maximum_symbols < 1:
             raise ValueError("maximum_symbols must be positive")
+        if market_type not in {"spot", "futures"}:
+            raise ValueError("market_type must be spot or futures")
         self._weight_used = 0
         now_ms = int(dt.datetime.fromisoformat(observed_at).timestamp() * 1000)
-        exchange = self._get("/fapi/v1/exchangeInfo")
-        tickers = {item["symbol"]: item for item in self._get("/fapi/v1/ticker/24hr")}
-        books = {item["symbol"]: item for item in self._get("/fapi/v1/ticker/bookTicker")}
+        prefix = "/api/v3" if market_type == "spot" else "/fapi/v1"
+        exchange = self._get(f"{prefix}/exchangeInfo")
+        tickers = {item["symbol"]: item for item in self._get(f"{prefix}/ticker/24hr")}
+        books = {item["symbol"]: item for item in self._get(f"{prefix}/ticker/bookTicker")}
         premiums = {
             item["symbol"]: item
-            for item in self._get("/fapi/v1/premiumIndex")
+            for item in (self._get("/fapi/v1/premiumIndex") if market_type == "futures" else ())
             if isinstance(item, dict) and "symbol" in item
         }
         symbols = sorted(
             (
                 item
                 for item in exchange["symbols"]
-                if item.get("contractType") == "PERPETUAL" and item.get("quoteAsset") == "USDT"
+                if (
+                    item.get("contractType") == "PERPETUAL"
+                    if market_type == "futures"
+                    else item.get("status") == "TRADING"
+                    and item.get("isSpotTradingAllowed", True) is True
+                )
+                and item.get("quoteAsset") == "USDT"
             ),
             key=lambda item: float(tickers.get(item["symbol"], {}).get("quoteVolume", 0)),
             reverse=True,
         )[:maximum_symbols]
         if not symbols:
-            raise RuntimeError("Binance returned no eligible futures symbols")
+            raise RuntimeError(f"Binance returned no eligible {market_type} symbols")
         result: list[InstrumentObservation] = []
         failures: list[str] = []
         with ThreadPoolExecutor(max_workers=min(self.maximum_concurrency, len(symbols))) as pool:
@@ -194,6 +213,7 @@ class BinanceUniverseClient:
                     books.get(str(raw["symbol"]), {}),
                     premiums.get(str(raw["symbol"]), {}),
                     now_ms,
+                    market_type,
                 ): str(raw["symbol"])
                 for raw in symbols
             }
@@ -203,7 +223,7 @@ class BinanceUniverseClient:
                 except (requests.RequestException, RuntimeError, KeyError, ValueError, TypeError):
                     failures.append(futures[future])
         if not result:
-            raise RuntimeError("Binance returned no eligible futures observations")
+            raise RuntimeError(f"Binance returned no {market_type} observations")
         self.last_status = {
             "complete": not failures,
             "requested_symbols": len(symbols),
@@ -222,22 +242,38 @@ class BinanceUniverseClient:
         book: Mapping[str, Any],
         premium: Mapping[str, Any],
         now_ms: int,
+        market_type: str,
     ) -> InstrumentObservation:
         symbol = str(raw["symbol"])
         filters = {item["filterType"]: item for item in raw.get("filters", [])}
+        price_filter = filters.get("PRICE_FILTER", {})
         lot = filters.get("LOT_SIZE", {})
-        notional = filters.get("MIN_NOTIONAL", {})
+        notional = filters.get("NOTIONAL", filters.get("MIN_NOTIONAL", {}))
         bid = float(book.get("bidPrice") or 0)
         ask = float(book.get("askPrice") or 0)
         mid = (bid + ask) / 2 if bid > 0 and ask > bid else 0
         spread = ((ask - bid) / mid * 10_000) if mid else math.inf
-        depth = self._get("/fapi/v1/depth", symbol=symbol, limit=20)
-        open_interest_response = self._get("/fapi/v1/openInterest", symbol=symbol)
-        klines = self._get("/fapi/v1/klines", symbol=symbol, interval="1h", limit=168)
+        prefix = "/api/v3" if market_type == "spot" else "/fapi/v1"
+        depth = self._get(f"{prefix}/depth", symbol=symbol, limit=20)
+        open_interest_response = (
+            self._get("/fapi/v1/openInterest", symbol=symbol) if market_type == "futures" else {}
+        )
+        klines = self._get(f"{prefix}/klines", symbol=symbol, interval="1h", limit=168)
+        onboard_ms = raw.get("onboardDate")
+        if onboard_ms is None and market_type == "spot":
+            first_klines = self._get(
+                f"{prefix}/klines", symbol=symbol, interval="1d", startTime=0, limit=1
+            )
+            if not isinstance(first_klines, list) or not first_klines:
+                raise RuntimeError(f"Binance returned no listing history for {symbol}")
+            onboard_ms = first_klines[0][0]
         depth_notional = sum(float(price) * float(quantity) for price, quantity in depth["bids"])
         depth_notional += sum(float(price) * float(quantity) for price, quantity in depth["asks"])
-        open_interest = float(open_interest_response["openInterest"]) * max(
-            mid, float(premium.get("markPrice") or 0)
+        open_interest = (
+            float(open_interest_response["openInterest"])
+            * max(mid, float(premium.get("markPrice") or 0))
+            if market_type == "futures"
+            else 0.0
         )
         closes = [float(item[4]) for item in klines]
         returns = [
@@ -249,28 +285,49 @@ class BinanceUniverseClient:
         variance = sum((value - mean) ** 2 for value in returns) / max(1, len(returns) - 1)
         instrument = Instrument(
             venue="binance",
-            market_type=MarketType.FUTURES,
+            market_type=MarketType.FUTURES if market_type == "futures" else MarketType.SPOT,
             base_asset=str(raw["baseAsset"]),
             quote_asset=str(raw["quoteAsset"]),
-            settlement_asset=str(raw.get("marginAsset") or "USDT"),
+            settlement_asset=(
+                str(raw.get("marginAsset") or "USDT") if market_type == "futures" else None
+            ),
             exchange_symbol=symbol,
-            price_precision=int(raw["pricePrecision"]),
-            quantity_precision=int(raw["quantityPrecision"]),
+            price_precision=(
+                int(raw["pricePrecision"])
+                if raw.get("pricePrecision") is not None
+                else _precision(price_filter.get("tickSize"))
+            ),
+            quantity_precision=(
+                int(raw["quantityPrecision"])
+                if raw.get("quantityPrecision") is not None
+                else _precision(lot.get("stepSize"))
+            ),
             minimum_quantity=float(lot.get("minQty") or 0),
-            minimum_notional=float(notional.get("notional") or 0),
+            minimum_notional=float(notional.get("notional") or notional.get("minNotional") or 0),
             status="trading"
             if raw.get("status") == "TRADING"
             else str(raw.get("status", "unknown")),
         )
         return InstrumentObservation(
             instrument=instrument,
-            listing_age_days=max(0.0, (now_ms - int(raw.get("onboardDate", now_ms))) / 86_400_000),
+            listing_age_days=max(0.0, (now_ms - int(onboard_ms or now_ms)) / 86_400_000),
             quote_volume=float(ticker.get("quoteVolume") or 0),
             trade_count=int(ticker.get("count") or 0),
             spread_bps=spread,
             open_interest=open_interest,
-            funding_rate=float(premium.get("lastFundingRate") or 0),
+            funding_rate=float(premium.get("lastFundingRate") or 0)
+            if market_type == "futures"
+            else 0.0,
             realised_volatility=math.sqrt(variance * 24 * 365),
             depth_notional=depth_notional,
             data_completeness=min(1.0, len(klines) / 168),
         )
+
+
+def _precision(value: object) -> int:
+    if value is None:
+        raise ValueError("Binance instrument precision is missing")
+    increment = decimal.Decimal(str(value))
+    if not increment.is_finite() or increment <= 0:
+        raise ValueError("Binance instrument precision is invalid")
+    return max(0, -increment.normalize().as_tuple().exponent)

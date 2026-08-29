@@ -21,6 +21,7 @@ from src.data.database import PlatformDatabase, active_strategy_assignment, stra
 from src.data.feature_store import SqlFeatureStore
 from src.data.parquet_store import PartitionedBacktestStore
 from src.data.universe import SqlUniverseStore
+from src.domain._codec import timestamp
 from src.execution.order_groups import OrderGroupManager, SqlOrderGroupStore
 from src.execution.order_manager import OrderManager, SqlOrderStore
 from src.execution.position_manager import PositionManager, SqlPositionStore
@@ -33,6 +34,7 @@ from src.research.ml import MlExperimentRunner, ModelArtefactStore, SqlModelArte
 from src.research.store import SqlResearchStore
 from src.risk.engine import SqlRiskDecisionStore, SqlRiskPolicyStore, SqlRiskSnapshotStore
 from src.risk.policies import install_product_risk_policies
+from src.services.account_reconciliation import AccountReconciliationService
 from src.services.accounting_service import AccountingService, DatabaseAccountingWorker
 from src.services.agent_worker import DatabaseAgentJobHandlers
 from src.services.artefact_dispatcher import ArtefactDispatcher
@@ -40,6 +42,7 @@ from src.services.config import load_platform_config, load_split_configuration
 from src.services.control_api import DatabaseControlPlane, build_control_server
 from src.services.data_writer import DatabaseMarketDataWriter
 from src.services.feature_worker import DatabaseFeatureWorker
+from src.services.forward_observation import DatabaseForwardObservationWorker
 from src.services.health import DatabaseHeartbeatStore
 from src.services.heavy_compute import HeavyComputeLeaseStore
 from src.services.live_execution import ApprovedLiveExecution
@@ -51,6 +54,8 @@ from src.services.order_execution import (
     DatabaseUserStreamWorker,
 )
 from src.services.order_recovery import DatabaseLiveRecoveryWorker
+from src.services.paper_diagnostic import DatabaseDiagnosticPaperWorker
+from src.services.platform_bootstrap import PlatformBootstrap
 from src.services.portfolio_engine import (
     DatabasePortfolioTargetBuilder,
     DatabasePortfolioTargetWorker,
@@ -60,6 +65,7 @@ from src.services.portfolio_service import SqlPortfolioRepository
 from src.services.portfolio_state import (
     DatabasePortfolioSourceService,
     DatabasePortfolioStateWorker,
+    portfolio_state_policies,
 )
 from src.services.promotion import (
     DatabasePromotionWorker,
@@ -72,7 +78,7 @@ from src.services.research_jobs import DatabaseResearchJobHandlers
 from src.services.research_worker import ResearchWorker
 from src.services.risk_service import DatabaseRiskWorker
 from src.services.runtime import ServiceRuntime, utc_now
-from src.services.scheduler import DatabaseJobQueue
+from src.services.scheduler import DatabaseJobQueue, PlatformScheduler
 from src.services.strategy_evaluator import DatabaseStrategyEvaluator
 from src.services.universe_service import DatabaseUniverseService
 
@@ -204,7 +210,7 @@ def _portfolio_state_cycle(
         store=SqlRiskSnapshotStore(database.engine),
         refresh_sources=source_service.refresh,
     )
-    policies = _portfolio_state_policies(configuration, products)
+    policies = portfolio_state_policies(configuration, products)
 
     def run_once() -> dict[str, Any]:
         now = utc_now()
@@ -224,44 +230,6 @@ def _portfolio_state_cycle(
         return worker.run_once(now=now)
 
     return run_once
-
-
-def _portfolio_state_policies(
-    configuration: Mapping[str, Mapping[str, Any]],
-    products: Mapping[str, Mapping[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    risk = configuration["risk"]
-    global_limits = risk["global"]
-    instrument = risk["instrument"]
-    sleeve = risk["sleeve"]
-    product_limits = risk["products"]
-    result: dict[str, dict[str, Any]] = {}
-    for product_id, product in products.items():
-        risk_policy_id = str(product["risk_policy_id"])
-        limits = product_limits[risk_policy_id]
-        sleeves = tuple(str(item) for item in product.get("sleeves", ()))
-        sleeve_budget = 1.0 / len(sleeves) if sleeves else 1.0
-        result[product_id] = {
-            "maximum_state_age_seconds": min(
-                float(global_limits["maximum_market_data_staleness_seconds"]),
-                float(global_limits["maximum_database_staleness_seconds"]),
-            ),
-            "risk_policy_ids": [risk_policy_id],
-            "portfolio_risk_budget": float(
-                limits.get("maximum_exposure", limits.get("maximum_gross", 1.0))
-            ),
-            "maximum_symbol_fraction": float(instrument["maximum_fraction"]),
-            "maximum_abs_beta": float(sleeve["maximum_abs_beta"]),
-            "maximum_correlation": float(sleeve["maximum_correlation"]),
-            "maximum_turnover_fraction": float(sleeve["maximum_turnover_fraction"]),
-            "maximum_cluster_fraction": float(sleeve["maximum_fraction"]),
-            "maximum_product_drawdown_fraction": float(limits["maximum_drawdown"]),
-            "maximum_depth_participation": float(instrument["maximum_visible_depth_fraction"]),
-            "sleeve_budgets": {name: sleeve_budget for name in sleeves},
-            "clusters": {},
-            "cluster_fraction_caps": {},
-        }
-    return result
 
 
 def _execution_cycle(
@@ -378,7 +346,12 @@ def _execution_cycle(
     return run_once
 
 
-def _paper_cycle(*, database: PlatformDatabase, node_id: str) -> Callable[[], dict[str, Any]]:
+def _paper_cycle(
+    *,
+    database: PlatformDatabase,
+    node_id: str,
+    configuration: Mapping[str, Mapping[str, Any]],
+) -> Callable[[], dict[str, Any]]:
     order_manager, positions, traces = _execution_components(database)
     order_groups = OrderGroupManager(SqlOrderGroupStore(database.engine))
     queue = DatabaseJobQueue(database.engine)
@@ -387,29 +360,48 @@ def _paper_cycle(*, database: PlatformDatabase, node_id: str) -> Callable[[], di
         worker_id=worker_id,
         node_id=node_id,
         role="paper-engine",
-        capabilities=("paper_order_submit", "paper_order_continue"),
+        capabilities=(
+            "paper_order_submit",
+            "paper_order_continue",
+            "diagnostic_paper_open",
+            "diagnostic_paper_close",
+        ),
         observed_at=utc_now(),
+    )
+    products = _by_id(configuration["products"], collection="products", identity="product_id")
+    ledgers = {
+        product_id: Ledger(
+            product_id=product_id,
+            accounting_asset=str(product["base_accounting_asset"]),
+            store=SqlLedgerStore(database.engine, product_id=product_id),
+        )
+        for product_id, product in products.items()
+    }
+    diagnostic_worker = DatabaseDiagnosticPaperWorker(
+        queue=queue,
+        worker_id=worker_id,
+        order_manager=order_manager,
+        positions=positions,
+        products=products,
     )
     worker = DatabasePaperExecutionWorker(
         queue=queue,
         worker_id=worker_id,
         order_manager=order_manager,
         positions=positions,
-        ledgers={
-            product_id: Ledger(
-                product_id=product_id,
-                accounting_asset=asset,
-                store=SqlLedgerStore(database.engine, product_id=product_id),
-            )
-            for product_id, asset in (
-                ("btc_accumulation", "BTC"),
-                ("active_income", "USDT"),
-            )
-        },
+        ledgers=ledgers,
         trace_store=traces,
         order_groups=order_groups,
     )
-    return lambda: worker.run_once(now=utc_now())
+
+    def run_once() -> dict[str, Any]:
+        diagnostic_result = diagnostic_worker.run_once(now=utc_now())
+        paper_result = worker.run_once(now=utc_now())
+        if paper_result["reason_code"] != "paper_order_queue_empty":
+            return {**paper_result, "diagnostic": diagnostic_result}
+        return diagnostic_result
+
+    return run_once
 
 
 def _risk_cycle(
@@ -482,9 +474,16 @@ def _market_gateway_cycle(
     config_root: Path,
     maximum_seconds: float,
 ) -> Callable[[], dict[str, Any]]:
+    products = _by_id(configuration["products"], collection="products", identity="product_id")
+    live_account_ids = {
+        str(product["account_id"])
+        for product in products.values()
+        if product.get("execution_mode") == "live"
+    }
     accounts = tuple(
         account
         for payload in configuration["accounts"]["accounts"]
+        if str(payload["account_id"]) in live_account_ids
         if (account := UserStreamAccount.from_config(payload)) is not None
     )
     universe = DatabaseUniverseService(store=SqlUniverseStore(database.engine))
@@ -532,13 +531,19 @@ def _feature_cycle(
 def _active_assignments(engine) -> Callable[[str], tuple[Mapping[str, Any], ...]]:
     def load(instrument_id: str) -> tuple[Mapping[str, Any], ...]:
         with engine.connect() as connection:
-            rows = connection.execute(
-                select(active_strategy_assignment).where(
-                    active_strategy_assignment.c.active.is_(True)
+            product_ids = tuple(
+                str(value)
+                for value in connection.execute(
+                    select(active_strategy_assignment.c.product_id).distinct()
                 )
-            ).mappings()
-            assignments: list[Mapping[str, Any]] = []
-            for row in rows:
+                .scalars()
+                .all()
+                if value
+            )
+        repository = SqlActiveStrategyAssignmentRepository(engine)
+        assignments: list[Mapping[str, Any]] = []
+        for product_id in product_ids:
+            for row in repository.active_assignments(product_id, at=utc_now()):
                 payload = row["payload"]
                 if isinstance(payload, Mapping):
                     configured = payload.get("instrument_ids") or payload.get("instruments")
@@ -547,7 +552,7 @@ def _active_assignments(engine) -> Callable[[str], tuple[Mapping[str, Any], ...]
                     }:
                         continue
                 assignments.append(dict(row))
-            return tuple(assignments)
+        return tuple(assignments)
 
     return load
 
@@ -610,6 +615,22 @@ def _universe_cycle(*, database: PlatformDatabase, node_id: str) -> Callable[[],
     return lambda: service.run_once(now=utc_now())
 
 
+def _platform_scheduler_cycle(
+    *, database: PlatformDatabase, node_id: str, configuration: Mapping[str, Mapping[str, Any]]
+) -> Callable[[], dict[str, Any]]:
+    scheduler = PlatformScheduler(
+        engine=database.engine,
+        products=_by_id(configuration["products"], collection="products", identity="product_id"),
+        node_id=node_id,
+        bootstrap=PlatformBootstrap(
+            engine=database.engine,
+            configuration=configuration,
+            node_id=node_id,
+        ),
+    )
+    return lambda: scheduler.run_once(now=utc_now())
+
+
 def _promotion_cycle(
     *,
     database: PlatformDatabase,
@@ -622,7 +643,7 @@ def _promotion_cycle(
         worker_id=worker_id,
         node_id=node_id,
         role="promotion-engine",
-        capabilities=("promotion_evaluation",),
+        capabilities=("forward_paper_observation", "promotion_evaluation"),
         observed_at=utc_now(),
     )
     policy_store = SqlPromotionPolicyStore(database.engine)
@@ -637,13 +658,26 @@ def _promotion_cycle(
             PromotionPolicy(**policy_fields),
             created_at=utc_now(),
         )
+    forward_worker = DatabaseForwardObservationWorker(
+        engine=database.engine,
+        queue=queue,
+        worker_id=worker_id,
+    )
     worker = DatabasePromotionWorker(
         queue=queue,
         worker_id=worker_id,
         store=SqlPromotionStore(database.engine),
         policy_store=policy_store,
     )
-    return lambda: worker.run_once(now=utc_now())
+
+    def run_once() -> dict[str, Any]:
+        now = utc_now()
+        forward = forward_worker.run_once(now=now)
+        if forward.get("reason_code") != "forward_observation_queue_empty":
+            return forward
+        return worker.run_once(now=now)
+
+    return run_once
 
 
 def _accounting_cycle(*, database: PlatformDatabase, node_id: str) -> Callable[[], dict[str, Any]]:
@@ -679,8 +713,37 @@ def _accounting_cycle(*, database: PlatformDatabase, node_id: str) -> Callable[[
     return lambda: worker.run_once(now=utc_now())
 
 
-def _report_cycle(*, database: PlatformDatabase, root: Path) -> Callable[[], dict[str, Any]]:
-    worker = DatabaseReportWorker(engine=database.engine, root=root)
+def _account_reconciliation_cycle(
+    *, database: PlatformDatabase, configuration: Mapping[str, Mapping[str, Any]]
+) -> Callable[[], dict[str, Any]]:
+    products = _by_id(configuration["products"], collection="products", identity="product_id")
+    accounts = _by_id(configuration["accounts"], collection="accounts", identity="account_id")
+    service = AccountReconciliationService(
+        engine=database.engine,
+        products=products,
+        accounts=accounts,
+    )
+    return lambda: service.reconcile_once(now=utc_now())
+
+
+def _report_cycle(
+    *, database: PlatformDatabase, root: Path, node_id: str
+) -> Callable[[], dict[str, Any]]:
+    queue = DatabaseJobQueue(database.engine)
+    worker_id = f"{node_id}:report-worker"
+    queue.register_worker(
+        worker_id=worker_id,
+        node_id=node_id,
+        role="report-worker",
+        capabilities=("reporting",),
+        observed_at=utc_now(),
+    )
+    worker = DatabaseReportWorker(
+        engine=database.engine,
+        root=root,
+        queue=queue,
+        worker_id=worker_id,
+    )
     return lambda: worker.run_once(now=utc_now())
 
 
@@ -697,6 +760,7 @@ def _research_cycle(
 ) -> Callable[[], dict[str, Any]]:
     job_names_by_service = {
         "research-worker": (
+            "dataset_snapshot_validate",
             "register_strategy_catalogue",
             "register_candidate",
             "evaluate_candidate",
@@ -728,6 +792,22 @@ def _research_cycle(
 
     def load_research_dataset(kind: str, payload: Mapping[str, Any]) -> Any:
         snapshot_ids = tuple(str(item) for item in payload["dataset_snapshot_ids"])
+        is_forward = str(payload.get("requested_stage") or "") == "forward"
+        if is_forward:
+            artefact_hash = str(payload.get("artefact_hash") or "")
+            artefact_created_at = str(payload.get("artefact_created_at") or "")
+            with database.engine.connect() as connection:
+                stored_created_at = connection.execute(
+                    select(strategy_artefact.c.created_at).where(
+                        strategy_artefact.c.id == artefact_hash
+                    )
+                ).scalar_one_or_none()
+            if stored_created_at is None or timestamp(
+                str(stored_created_at), field="artefact.created_at"
+            ) != timestamp(artefact_created_at, field="artefact_created_at"):
+                raise ValueError(
+                    "forward research must bind the exact immutable artefact timestamp"
+                )
         raw_roles = payload.get("dataset_roles")
         allowed_roles = None
         if isinstance(raw_roles, Mapping):
@@ -753,10 +833,9 @@ def _research_cycle(
             parameter_set_id=str(payload["parameter_set_id"]),
             allowed_roles=allowed_roles,
             minimum_availability_timestamp=(
-                str(payload["evaluated_at"])
-                if str(payload.get("requested_stage") or "") == "forward"
-                else None
+                str(payload["artefact_created_at"]) if is_forward else None
             ),
+            maximum_availability_timestamp=(str(payload["evaluated_at"]) if is_forward else None),
         )
         return context.get(kind, context)
 
@@ -842,6 +921,11 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("platform services require PostgreSQL")
     if args.service == "migration-service" or args.initialise_schema:
         database.migrate()
+        PlatformBootstrap(
+            engine=database.engine,
+            configuration=split_configuration,
+            node_id=args.node,
+        ).ensure(now=utc_now())
     else:
         database.assert_migrated()
     heartbeat_store = DatabaseHeartbeatStore(database.engine)
@@ -877,13 +961,21 @@ def run(args: argparse.Namespace) -> int:
             node_id=args.node,
         )
     elif args.service == "paper-engine":
-        work = _paper_cycle(database=database, node_id=args.node)
+        work = _paper_cycle(
+            database=database,
+            node_id=args.node,
+            configuration=split_configuration,
+        )
     elif args.service == "risk-engine":
         work = _risk_cycle(database=database, node_id=args.node, configuration=split_configuration)
     elif args.service == "strategy-evaluator":
         work = _strategy_evaluator_cycle(database=database, node_id=args.node)
     elif args.service == "universe-service":
         work = _universe_cycle(database=database, node_id=args.node)
+    elif args.service == "platform-scheduler":
+        work = _platform_scheduler_cycle(
+            database=database, node_id=args.node, configuration=split_configuration
+        )
     elif args.service == "data-writer":
         work = _data_writer_cycle(
             database=database,
@@ -906,8 +998,14 @@ def run(args: argparse.Namespace) -> int:
         )
     elif args.service == "accounting-service":
         work = _accounting_cycle(database=database, node_id=args.node)
+    elif args.service == "account-reconciliation":
+        work = _account_reconciliation_cycle(database=database, configuration=split_configuration)
     elif args.service == "report-worker":
-        work = _report_cycle(database=database, root=Path(config.paths["reports"]))
+        work = _report_cycle(
+            database=database,
+            root=Path(config.paths["reports"]),
+            node_id=args.node,
+        )
     elif args.service in {"research-worker", "ml-worker", "event-replay-worker"}:
         work = _research_cycle(
             database=database,

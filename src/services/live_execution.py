@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 from collections.abc import Mapping
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, cast
 
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
+from src.data.database import account_snapshot
 from src.data.database import instrument as instrument_table
-from src.domain._codec import canonical_hash
+from src.domain._codec import canonical_hash, timestamp, to_primitive
 from src.domain.instruments import Instrument, MarketType
 from src.domain.orders import OrderIntent
 from src.execution.ccxt_broker import CcxtBroker
@@ -27,6 +30,50 @@ from src.research.canonical import (
     SqlStrategyArtefactRepository,
     preflight_is_fresh,
 )
+
+_EXECUTION_IDENTITY_FILES = (
+    Path("requirements-runtime.txt"),
+    Path("src/data/binance_user_stream.py"),
+    Path("src/execution/ccxt_broker.py"),
+    Path("src/execution/config.py"),
+    Path("src/execution/live_exchange.py"),
+    Path("src/services/market_gateway.py"),
+    Path("src/services/order_execution.py"),
+    Path("src/services/live_execution.py"),
+)
+
+
+def execution_engine_identity() -> str:
+    root = Path(__file__).resolve().parents[2]
+    return canonical_hash(
+        {str(path): (root / path).read_text(encoding="utf-8") for path in _EXECUTION_IDENTITY_FILES}
+    )
+
+
+def live_authority_configuration_hash(
+    *,
+    product: Mapping[str, Any],
+    account: Mapping[str, Any],
+    instrument_payload: Mapping[str, Any],
+    artefact: Mapping[str, Any],
+    sleeve_id: str,
+    promotion_policy: Mapping[str, Any],
+    risk_configuration: Mapping[str, Any],
+) -> str:
+    return canonical_hash(
+        {
+            "product": dict(product),
+            "account": dict(account),
+            "instrument": dict(instrument_payload),
+            "sleeve_id": sleeve_id,
+            "promotion_policy": dict(promotion_policy),
+            "risk_configuration": dict(risk_configuration),
+            "artefact_hash": str(artefact["artefact_hash"]),
+            "source_commit_hash": str(artefact["source_commit_hash"]),
+            "strategy_engine_version": str(artefact["engine_version"]),
+            "execution_engine_identity": execution_engine_identity(),
+        }
+    )
 
 
 class ApprovedLiveExecution:
@@ -49,7 +96,11 @@ class ApprovedLiveExecution:
         }
         self.order_manager = order_manager
         self.positions = positions
+        self.engine = engine
         self.products = products
+        self.accounts = accounts
+        self.promotion_policies = _records(configuration["promotion"], "policies", "policy_id")
+        self.risk_configuration = dict(configuration["risk"])
         self.assignments = SqlActiveStrategyAssignmentRepository(engine)
         self.artefacts = SqlStrategyArtefactRepository(engine)
         self.approvals = SqlApprovalRepository(engine)
@@ -58,9 +109,11 @@ class ApprovedLiveExecution:
             product_id: str(product["portfolio_id"]) for product_id, product in products.items()
         }
         instruments = _load_instruments(engine)
+        self.instruments = instruments
         self.venues: dict[str, BrokerExecutionVenue] = {}
+        current = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
         for product_id, product in live_products.items():
-            if self.assignments.active(product_id) is None:
+            if self.assignments.active(product_id, execution_mode="live", at=current) is None:
                 raise ValueError(
                     f"live product {product_id} has no active canonical strategy assignment"
                 )
@@ -102,7 +155,7 @@ class ApprovedLiveExecution:
             exchange_positions = {
                 symbol_to_instrument.get(
                     item.symbol,
-                    f"binance:futures:{item.symbol}:{broker.config.quote_asset}",
+                    broker.platform_instrument_id(item.symbol),
                 ): item.qty
                 for item in broker.list_account_futures_positions()
             }
@@ -120,9 +173,10 @@ class ApprovedLiveExecution:
             exchange_orders = {
                 item.client_id or f"exchange:{item.order_id}"
                 for instrument in venue.instruments.values()
+                for conditional in (False, True)
                 for item in broker.list_open_orders(
                     instrument.exchange_symbol,
-                    conditional=False,
+                    conditional=conditional,
                 )
             }
         return reconcile_account(
@@ -136,7 +190,70 @@ class ApprovedLiveExecution:
         product_id = str(payload["product_id"])
         product = self.products[product_id]
         account_id = str(product["account_id"])
-        current_assignment = self.assignments.active(product_id)
+        with self.engine.connect() as connection:
+            account_row = (
+                connection.execute(
+                    select(account_snapshot.c.payload, account_snapshot.c.observed_at)
+                    .where(
+                        account_snapshot.c.account_id == account_id,
+                        account_snapshot.c.observed_at <= order.created_at,
+                    )
+                    .order_by(account_snapshot.c.observed_at.desc(), account_snapshot.c.id.desc())
+                    .limit(1)
+                )
+                .mappings()
+                .first()
+            )
+        account_payload = account_row["payload"] if account_row is not None else None
+        account_observed_at = (
+            timestamp(str(account_row["observed_at"]), field="account_snapshot.observed_at")
+            if account_row is not None
+            else None
+        )
+        account_age = (
+            (
+                dt.datetime.fromisoformat(order.created_at)
+                - dt.datetime.fromisoformat(account_observed_at)
+            ).total_seconds()
+            if account_observed_at is not None
+            else None
+        )
+        complete_account_fields = {
+            "balances",
+            "free_balances",
+            "positions",
+            "regular_orders",
+            "conditional_orders",
+            "used_margin",
+            "maintenance_margin",
+            "used_margin_fraction",
+            "liquidation_buffer_fraction",
+            "account_mode",
+            "unknown_exposure",
+        }
+        if (
+            not isinstance(account_payload, Mapping)
+            or account_payload.get("product_id") != product_id
+            or not complete_account_fields.issubset(account_payload)
+            or account_payload.get("account_state_known") is not True
+            or account_payload.get("account_state_authority")
+            not in {"authenticated_rest", "authenticated_reconciled"}
+            or account_payload.get("unknown_exposure")
+            or account_age is None
+            or account_age < 0
+            or account_age > int(product.get("account_snapshot_max_age_seconds", 60))
+        ):
+            raise PermissionError("live order requires a recent complete account snapshot")
+        expected_fingerprint = str(account_payload.get("account_fingerprint") or "")
+        venue = self.venues[product_id]
+        actual_fingerprint = str(getattr(venue.broker, "account_fingerprint", ""))
+        if not expected_fingerprint or expected_fingerprint != actual_fingerprint:
+            raise PermissionError("live order account fingerprint does not match reconciliation")
+        current_assignment = self.assignments.active(
+            product_id,
+            execution_mode="live",
+            at=order.created_at,
+        )
         if current_assignment is None:
             raise PermissionError("live product has no active canonical assignment")
         requested_strategy_id = str(payload.get("strategy_version_id") or "")
@@ -156,6 +273,7 @@ class ApprovedLiveExecution:
             strategy_version_id=str(current_assignment["strategy_version_id"]),
             artefact_hash=str(current_assignment["artefact_hash"]),
             execution_mode="live",
+            at=order.created_at,
         )
         artifact = self.artefacts.get(str(assignment["artefact_hash"]))
         declared_hash = artifact.get("artefact_hash")
@@ -176,6 +294,7 @@ class ApprovedLiveExecution:
             strategy_version_id=strategy_version_id,
             product_id=product_id,
             account_id=account_id,
+            at=order.created_at,
         )
         if approval is None or approval["status"] != "approved":
             raise PermissionError("canonical live artefact has no current human approval")
@@ -183,11 +302,13 @@ class ApprovedLiveExecution:
             strategy_version_id=strategy_version_id,
             product_id=product_id,
             account_id=account_id,
+            at=order.created_at,
         )
         if preflight is None or not preflight["accepted"]:
             raise PermissionError("canonical live artefact has no accepted preflight")
         if not preflight_is_fresh(
             str(preflight["checked_at"]),
+            reference_at=order.created_at,
             maximum_age_seconds=int(product.get("preflight_max_age_seconds", 3_600)),
         ):
             raise PermissionError("canonical live artefact preflight is stale")
@@ -201,6 +322,47 @@ class ApprovedLiveExecution:
             float(approval["capital_cap"]), float(preflight["capital_cap"])
         ):
             raise PermissionError("active assignment exceeds approved/preflight capital cap")
+        authority_instrument = self.instruments.get(str(assignment.get("instrument_id") or ""))
+        if authority_instrument is None:
+            raise PermissionError("live assignment instrument is not persisted")
+        instrument_payload = dict(to_primitive(authority_instrument))
+        instrument_payload["instrument_id"] = authority_instrument.instrument_id
+        expected_engine_identity = execution_engine_identity()
+        expected_configuration_hash = live_authority_configuration_hash(
+            product=product,
+            account=self.accounts[account_id],
+            instrument_payload=instrument_payload,
+            artefact=artifact,
+            sleeve_id=str(assignment["sleeve_id"]),
+            promotion_policy=self.promotion_policies[str(product["promotion_policy_id"])],
+            risk_configuration=self.risk_configuration,
+        )
+        preflight_payload = preflight.get("payload")
+        approval_payload = approval.get("payload")
+        if (
+            not isinstance(preflight_payload, Mapping)
+            or preflight_payload.get("schema") != "platform.production-preflight/v1"
+            or preflight_payload.get("environment") != self.accounts[account_id]["environment"]
+            or preflight_payload.get("account_fingerprint") != actual_fingerprint
+            or preflight_payload.get("execution_engine_identity") != expected_engine_identity
+            or preflight_payload.get("instrument_id") != authority_instrument.instrument_id
+            or preflight_payload.get("sleeve_id") != assignment["sleeve_id"]
+            or preflight_payload.get("configuration_hash") != expected_configuration_hash
+            or preflight.get("content_hash") != canonical_hash(dict(preflight_payload))
+        ):
+            raise PermissionError("canonical preflight does not match current live authority")
+        if (
+            not isinstance(approval_payload, Mapping)
+            or approval_payload.get("schema") != "platform.strategy-approval/v1"
+            or approval_payload.get("preflight_id") != preflight.get("id")
+            or approval_payload.get("environment") != self.accounts[account_id]["environment"]
+            or approval_payload.get("account_fingerprint") != actual_fingerprint
+            or approval_payload.get("execution_engine_identity") != expected_engine_identity
+            or approval_payload.get("instrument_id") != authority_instrument.instrument_id
+            or approval_payload.get("sleeve_id") != assignment["sleeve_id"]
+            or approval_payload.get("configuration_hash") != expected_configuration_hash
+        ):
+            raise PermissionError("canonical approval does not match current live authority")
         strategies = {
             str(item.get("id") or ""): item
             for item in artifact.get("strategies", [])

@@ -10,7 +10,7 @@ from sqlalchemy import insert, select
 from sqlalchemy.engine import Engine
 
 from src.accounting.ledger import Ledger
-from src.data.database import reconciliation_event
+from src.data.database import account_snapshot, reconciliation_event
 from src.domain._codec import canonical_hash, timestamp
 from src.domain.market_events import MarketEvent, MarketEventType
 from src.domain.orders import Fill, OrderIntent, OrderSide, OrderStatus
@@ -286,6 +286,7 @@ class DatabaseLiveExecutionWorker:
         authorise: Callable[[Mapping[str, Any], OrderIntent], None],
         order_groups: OrderGroupManager | None = None,
         lease_seconds: int = 60,
+        job_name: str = "live_order_submit",
     ) -> None:
         self.queue = queue
         self.worker_id = worker_id
@@ -297,13 +298,14 @@ class DatabaseLiveExecutionWorker:
         self.authorise = authorise
         self.order_groups = order_groups
         self.lease_seconds = lease_seconds
+        self.job_name = job_name
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.lease_seconds,
-            names=("live_order_submit",),
+            names=(self.job_name,),
         )
         if claimed is None:
             return {"reason_code": "live_order_queue_empty"}
@@ -559,6 +561,9 @@ class DatabaseUserStreamWorker:
         account_products: Mapping[str, str] | None = None,
         order_groups: OrderGroupManager | None = None,
         lease_seconds: int = 60,
+        job_name: str = "user_stream_event",
+        accounting_job_name: str = "accounting_event",
+        accounting_job_prefix: str = "accounting",
     ) -> None:
         self.engine = engine
         self.queue = queue
@@ -570,13 +575,16 @@ class DatabaseUserStreamWorker:
         self.account_products = dict(account_products or {})
         self.order_groups = order_groups
         self.lease_seconds = lease_seconds
+        self.job_name = job_name
+        self.accounting_job_name = accounting_job_name
+        self.accounting_job_prefix = accounting_job_prefix
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.lease_seconds,
-            names=("user_stream_event",),
+            names=(self.job_name,),
         )
         if claimed is None:
             return {"reason_code": "user_stream_queue_empty"}
@@ -606,6 +614,14 @@ class DatabaseUserStreamWorker:
                     )
                 elif dict(existing) != record:
                     raise ValueError("user-stream event identity collision")
+            if product_id is not None:
+                _mark_account_authority_unknown(
+                    engine=self.engine,
+                    account_id=record["account_id"],
+                    product_id=product_id,
+                    observed_at=event.receive_timestamp,
+                    event_id=event.event_id,
+                )
             balances = _balance_update(event)
             accounting_job_id = None
             if balances:
@@ -614,14 +630,18 @@ class DatabaseUserStreamWorker:
                     "account_id": record["account_id"],
                     "observed_at": event.receive_timestamp,
                     "balances": balances,
+                    "account_state_known": False,
+                    "account_state_authority": "user_stream_delta",
                     **({"product_id": product_id} if product_id is not None else {}),
                 }
-                accounting_job_id = "accounting:" + canonical_hash(accounting_payload).removeprefix(
-                    "sha256:"
+                accounting_job_id = (
+                    self.accounting_job_prefix
+                    + ":"
+                    + canonical_hash(accounting_payload).removeprefix("sha256:")
                 )
                 self.queue.enqueue_if_absent(
                     job_id=accounting_job_id,
-                    name="accounting_event",
+                    name=self.accounting_job_name,
                     payload=accounting_payload,
                     available_at=event.receive_timestamp,
                     priority=20,
@@ -951,6 +971,52 @@ def _balance_update(event: MarketEvent) -> dict[str, float]:
             locked = float(row.get("l", 0.0))
             balances[asset] = free + locked
     return balances
+
+
+def _mark_account_authority_unknown(
+    *, engine: Engine, account_id: str, product_id: str, observed_at: str, event_id: str
+) -> None:
+    """Invalidate the last REST snapshot until a fresh reconciliation completes."""
+
+    payload = {
+        "account_id": account_id,
+        "product_id": product_id,
+        "balances": {},
+        "free_balances": {},
+        "positions": {},
+        "regular_orders": [],
+        "conditional_orders": [],
+        "used_margin": None,
+        "maintenance_margin": None,
+        "used_margin_fraction": None,
+        "liquidation_buffer_fraction": None,
+        "account_mode": "unknown",
+        "unknown_exposure": {"account_state": "reconciliation_required"},
+        "account_state_known": False,
+        "account_state_authority": "user_stream_delta",
+        "event_id": event_id,
+        "observed_at": observed_at,
+    }
+    snapshot_id = canonical_hash(
+        {"account_id": account_id, "product_id": product_id, "payload": payload}
+    )
+    with engine.begin() as connection:
+        existing = connection.execute(
+            select(account_snapshot.c.payload).where(account_snapshot.c.id == snapshot_id)
+        ).scalar_one_or_none()
+        if existing is None:
+            connection.execute(
+                insert(account_snapshot).values(
+                    id=snapshot_id,
+                    account_id=account_id,
+                    observed_at=observed_at,
+                    source="user_stream_delta",
+                    content_hash=canonical_hash(payload),
+                    payload=payload,
+                )
+            )
+        elif dict(existing) != payload:
+            raise ValueError("account authority invalidation identity collision")
 
 
 def _risk_rejected_trace(

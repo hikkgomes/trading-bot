@@ -52,6 +52,8 @@ ALLOWED_REQUEST_FIELDS = frozenset(
         "producer_identity",
         "content_hash",
         "dataset_roles",
+        "artefact_hash",
+        "artefact_created_at",
     }
 )
 
@@ -77,6 +79,8 @@ class EvaluationRequest:
     producer_identity: str | None = None
     content_hash: str | None = None
     dataset_roles: Mapping[str, str] | None = None
+    artefact_hash: str | None = None
+    artefact_created_at: str | None = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> EvaluationRequest:
@@ -189,6 +193,23 @@ class EvaluationRequest:
                 raise EvaluationContractError(
                     "adaptive evaluation cannot contain a protected_holdout snapshot"
                 )
+        artefact_hash = payload.get("artefact_hash")
+        if artefact_hash is not None:
+            artefact_hash = non_empty(str(artefact_hash), field="artefact_hash")
+            if not artefact_hash.startswith("sha256:") or len(artefact_hash) != 71:
+                raise EvaluationContractError("artefact_hash must be a sha256: identity")
+        artefact_created_at = payload.get("artefact_created_at")
+        if artefact_created_at is not None:
+            artefact_created_at = timestamp(str(artefact_created_at), field="artefact_created_at")
+        if stage == "forward":
+            if artefact_hash is None or artefact_created_at is None:
+                raise EvaluationContractError(
+                    "forward evaluations require the exact artefact hash and creation time"
+                )
+            if artefact_created_at >= evaluated_at:
+                raise EvaluationContractError(
+                    "forward artefact creation must precede evaluation time"
+                )
         return cls(
             candidate_id=candidate_id,
             evaluation_policy_id=policy_id,
@@ -200,6 +221,8 @@ class EvaluationRequest:
             content_hash=content_hash,
             **hashes,
             dataset_roles=roles,
+            artefact_hash=artefact_hash,
+            artefact_created_at=artefact_created_at,
         )
 
     def snapshot_ids_for_stage(self, stage: str) -> tuple[str, ...]:
@@ -760,6 +783,8 @@ class CanonicalResearchEvaluator:
             "evaluator_version": request.evaluator_version,
             "producer_identity": request.producer_identity,
             "content_hash": request.content_hash,
+            "artefact_hash": request.artefact_hash,
+            "artefact_created_at": request.artefact_created_at,
         }
         evidence, accepted, reason_code, receipt, metrics = self._calculate_stage(
             request.requested_stage,

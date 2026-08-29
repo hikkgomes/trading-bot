@@ -39,6 +39,41 @@ def test_production_research_requests_require_explicit_dataset_roles() -> None:
         ResearchJobRequest.from_mapping(_research_request(), require_dataset_roles=True)
 
 
+def test_forward_research_request_requires_creation_before_evaluation() -> None:
+    payload = _research_request()
+    payload.update(
+        {
+            "requested_stage": "forward",
+            "dataset_roles": {payload["dataset_snapshot_ids"][0]: "forward_observation"},
+            "artefact_hash": "sha256:" + "6" * 64,
+            "artefact_created_at": "2026-08-23T00:00:00+00:00",
+        }
+    )
+    payload["content_hash"] = build_content_hash(payload)
+    with pytest.raises(JobSchemaError, match="precede evaluation"):
+        ResearchJobRequest.from_mapping(payload)
+
+
+def test_adaptive_research_cannot_use_forward_observation_data() -> None:
+    payload = _research_request()
+    payload.update(
+        {
+            "requested_stage": "development",
+            "dataset_snapshot_ids": [
+                payload["dataset_snapshot_ids"][0],
+                "sha256:" + "6" * 64,
+            ],
+            "dataset_roles": {
+                payload["dataset_snapshot_ids"][0]: "development",
+                "sha256:" + "6" * 64: "forward_observation",
+            },
+        }
+    )
+    payload["content_hash"] = build_content_hash(payload)
+    with pytest.raises(JobSchemaError, match="forward observation"):
+        ResearchJobRequest.from_mapping(payload)
+
+
 def test_risk_request_rejects_values_and_result_fields() -> None:
     payload = {
         "assessment_id": "assessment-1",

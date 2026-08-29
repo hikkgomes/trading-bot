@@ -213,61 +213,89 @@ def test_market_data_writer_publishes_authoritative_market_snapshot(tmp_path) ->
         observed_at=NOW,
     )
     close_ms = int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000) - 1
-    event = normalise_public_event(
-        market="futures",
-        stream="btcusdt@kline_1m",
-        receive_timestamp=NOW,
-        payload={
-            "e": "kline",
-            "E": close_ms + 1,
-            "s": "BTCUSDT",
-            "k": {
-                "t": close_ms - 59_999,
-                "T": close_ms,
-                "i": "1m",
-                "o": "100",
-                "h": "103",
-                "l": "99",
-                "c": "102",
-                "v": "25",
-                "spread_bps": "1.5",
-                "visible_depth": "1000",
-                "volatility": "0.2",
-                "funding": "0.001",
-                "x": True,
+    market_events = (
+        normalise_public_event(
+            market="futures",
+            stream="btcusdt@kline_1m",
+            receive_timestamp=NOW,
+            payload={
+                "e": "kline",
+                "E": close_ms + 1,
+                "s": "BTCUSDT",
+                "k": {
+                    "t": close_ms - 59_999,
+                    "T": close_ms,
+                    "i": "1m",
+                    "o": "100",
+                    "h": "103",
+                    "l": "99",
+                    "c": "102",
+                    "v": "25",
+                    "x": True,
+                },
             },
-        },
+        ),
+        normalise_public_event(
+            market="futures",
+            stream="btcusdt@bookTicker",
+            receive_timestamp=NOW,
+            payload={
+                "e": "bookTicker",
+                "E": close_ms + 2,
+                "s": "BTCUSDT",
+                "b": "101.99",
+                "B": "500",
+                "a": "102.01",
+                "A": "500",
+            },
+        ),
+        normalise_public_event(
+            market="futures",
+            stream="btcusdt@markPrice@1s",
+            receive_timestamp=NOW,
+            payload={
+                "e": "markPriceUpdate",
+                "E": close_ms + 3,
+                "s": "BTCUSDT",
+                "p": "102",
+                "r": "0.001",
+                "T": close_ms + 3,
+            },
+        ),
     )
-    queue.enqueue(
-        job_id="market-snapshot-1",
-        name="market_event_write",
-        payload={
-            "venue": "binance",
-            "market": "futures",
-            "symbol": "BTCUSDT",
-            "event": to_primitive(event),
-        },
-        available_at=NOW,
-    )
-    result = DatabaseMarketDataWriter(
+    for index, event in enumerate(market_events):
+        queue.enqueue(
+            job_id=f"market-snapshot-{index}",
+            name="market_event_write",
+            payload={
+                "venue": "binance",
+                "market": "futures",
+                "symbol": "BTCUSDT",
+                "event": to_primitive(event),
+            },
+            available_at=NOW,
+        )
+    writer = DatabaseMarketDataWriter(
         queue=queue,
         worker_id="linux-data",
         root=tmp_path / "data",
         snapshot_store=SqlRiskSnapshotStore(database.engine),
         product_ids_by_market={"futures": ("active_income",)},
-    ).run_once(now=NOW)
-
-    assert result["market_snapshot_ids"]
-    _snapshot_id, snapshot = SqlRiskSnapshotStore(database.engine).latest(
-        kind="market_data_input", product_id="active_income", at=NOW
     )
-    assert snapshot["values"] == {
+    results = [writer.run_once(now=NOW) for _ in market_events]
+
+    assert all(result["market_snapshot_ids"] for result in results)
+    snapshots = [
+        SqlRiskSnapshotStore(database.engine).get(result["market_snapshot_ids"][0])
+        for result in results
+    ]
+    assert snapshots[0]["values"] == {"close": 102.0}
+    assert snapshots[1]["values"] == {
         "close": 102.0,
-        "spread_bps": 1.5,
+        "spread_bps": pytest.approx(1.9607843137),
         "visible_depth": 1000.0,
-        "volatility": 0.2,
-        "funding": 0.001,
     }
+    assert snapshots[2]["values"] == {"close": 102.0, "funding": 0.001}
 
 
 def test_market_data_writer_publishes_partial_book_snapshot(tmp_path) -> None:
@@ -359,6 +387,7 @@ def test_live_sma_chain_uses_100_bars_and_produces_active_and_flat_forecasts(tmp
         "portfolio_id": "active-income-portfolio",
         "account_id": "futures",
         "risk_policy_id": "active-income",
+        "promotion_policy_id": "active-income",
         "base_accounting_asset": "USDT",
     }
     _seed_strategy(

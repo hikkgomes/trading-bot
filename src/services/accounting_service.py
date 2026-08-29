@@ -51,6 +51,8 @@ class AccountingService:
         used_margin_fraction: float = 0.0,
         liquidation_buffer_fraction: float = 1.0,
         unknown_exposure: dict[str, float] | None = None,
+        account_state_known: bool = True,
+        account_state_authority: str = "accounting_event",
     ) -> str:
         payload = json_value(
             {
@@ -59,6 +61,8 @@ class AccountingService:
                 "used_margin_fraction": float(used_margin_fraction),
                 "liquidation_buffer_fraction": float(liquidation_buffer_fraction),
                 "unknown_exposure": dict(unknown_exposure or {}),
+                "account_state_known": bool(account_state_known),
+                "account_state_authority": str(account_state_authority),
             },
             field="balance snapshot",
         )
@@ -164,18 +168,20 @@ class DatabaseAccountingWorker:
         worker_id: str,
         service: AccountingService,
         lease_seconds: int = 60,
+        job_name: str = "accounting_event",
     ) -> None:
         self.queue = queue
         self.worker_id = worker_id
         self.service = service
         self.lease_seconds = lease_seconds
+        self.job_name = job_name
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.lease_seconds,
-            names=("accounting_event",),
+            names=(self.job_name,),
         )
         if claimed is None:
             return {"reason_code": "accounting_queue_empty"}
@@ -196,6 +202,10 @@ class DatabaseAccountingWorker:
                         str(key): float(value)
                         for key, value in dict(payload.get("unknown_exposure", {})).items()
                     },
+                    account_state_known=bool(payload.get("account_state_known", False)),
+                    account_state_authority=str(
+                        payload.get("account_state_authority", "user_stream_delta")
+                    ),
                 )
             elif kind == "nav":
                 identity = self.service.record_nav(NavSnapshot(**dict(payload["snapshot"])))

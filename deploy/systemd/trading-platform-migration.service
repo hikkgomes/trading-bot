@@ -6,6 +6,7 @@ Requires=postgresql.service
 
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 User=trading-platform-owner
 Group=trading-platform-owner
 WorkingDirectory=/opt/trading-bot

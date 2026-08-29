@@ -1,8 +1,8 @@
 [Unit]
 Description=Trading platform service %i
-After=network-online.target postgresql.service
+After=network-online.target postgresql.service trading-platform-migration.service
 Wants=network-online.target
-Requires=postgresql.service
+Requires=postgresql.service trading-platform-migration.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -11,7 +11,8 @@ Type=simple
 User=trading-runtime
 Group=trading-runtime
 WorkingDirectory=/opt/trading-bot
-EnvironmentFile=/etc/trading-platform/%i.env
+EnvironmentFile=/etc/trading-platform/runtime.env
+EnvironmentFile=-/etc/trading-platform/%i.env
 Environment=PYTHONUNBUFFERED=1
 ExecStartPre=/opt/trading-bot/.venv-runtime/bin/python -m src.services.supervisor --config /opt/trading-bot/config/platform.json --node linux-optiplex --service %i --validate
 ExecStart=/opt/trading-bot/.venv-runtime/bin/python -m src.services.supervisor --config /opt/trading-bot/config/platform.json --node linux-optiplex --service %i

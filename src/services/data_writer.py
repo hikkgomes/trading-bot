@@ -314,16 +314,6 @@ def _market_snapshot_values(event: MarketEvent) -> dict[str, float] | None:
             values["close"] = float(close)
         except (TypeError, ValueError):
             return None
-        for name in ("spread_bps", "visible_depth", "volatility", "funding"):
-            value = candle.get(name)
-            if value is None or isinstance(value, bool):
-                continue
-            try:
-                parsed = float(value)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(parsed):
-                values[name] = parsed
     elif event.event_type in {MarketEventType.BEST_BID_ASK, MarketEventType.DEPTH_UPDATE}:
         bid = number("bid_price", "b")
         ask = number("ask_price", "a")
@@ -354,6 +344,11 @@ def _market_snapshot_values(event: MarketEvent) -> dict[str, float] | None:
         funding = number("funding_rate", "fundingRate", "r")
         if funding is not None:
             values["funding"] = funding
+    elif event.event_type is MarketEventType.FUNDING_RATE:
+        funding = number("funding_rate", "fundingRate", "r")
+        if funding is None:
+            return None
+        values["funding"] = funding
     elif event.event_type in {MarketEventType.TRADE, MarketEventType.AGGREGATE_TRADE}:
         price = number("price", "p")
         if price is None or price <= 0:
@@ -362,7 +357,7 @@ def _market_snapshot_values(event: MarketEvent) -> dict[str, float] | None:
     else:
         return None
 
-    if values.get("close", 0.0) <= 0:
+    if "close" in values and values["close"] <= 0:
         return None
     if values.get("visible_depth", 0.0) < 0:
         return None

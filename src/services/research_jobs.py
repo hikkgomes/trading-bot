@@ -103,6 +103,7 @@ class DatabaseResearchJobHandlers:
 
     def handlers(self) -> dict[str, Callable]:
         return {
+            "dataset_snapshot_validate": self.validate_dataset_snapshot,
             "register_strategy_catalogue": self.register_strategy_catalogue,
             "register_candidate": self.register_candidate,
             "register_ml_candidate": self.register_ml_candidate,
@@ -110,6 +111,36 @@ class DatabaseResearchJobHandlers:
             "bounded_backtest": self.bounded_backtest,
             "event_replay": self.event_replay,
             "train_ml_experiment": self.train_ml_experiment,
+        }
+
+    def validate_dataset_snapshot(
+        self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
+    ) -> dict[str, Any]:
+        if self.dataset_resolver is None:
+            raise JobSchemaError("dataset validation requires a canonical dataset resolver")
+        required = {
+            "dataset_snapshot_id",
+            "product_id",
+            "feature_manifest_id",
+            "cost_model_id",
+            "parameter_set_id",
+            "producer_identity",
+        }
+        if set(claimed.payload) != required:
+            raise JobSchemaError("dataset validation command has an invalid field set")
+        renew()
+        resolved = self.dataset_resolver.resolve(
+            str(claimed.payload["dataset_snapshot_id"]),
+            expected={
+                "product_id": str(claimed.payload["product_id"]),
+                "feature_manifest_hash": str(claimed.payload["feature_manifest_id"]),
+                "cost_model_hash": str(claimed.payload["cost_model_id"]),
+                "parameter_set_hash": str(claimed.payload["parameter_set_id"]),
+            },
+        )
+        return {
+            "dataset_snapshot_id": resolved.snapshot_id,
+            "dataset_identity_hash": resolved.receipt["identity_hash"],
         }
 
     def register_strategy_catalogue(
@@ -127,6 +158,11 @@ class DatabaseResearchJobHandlers:
             product=str(claimed.payload["product_id"]),
             dataset_snapshot_hashes=tuple(claimed.payload["dataset_snapshot_hashes"]),
             instrument_universe=universe,
+            submitted_at=(
+                str(claimed.payload["catalogue_submitted_at"])
+                if claimed.payload.get("catalogue_submitted_at")
+                else None
+            ),
         )
         identities = ResearchCoordinator(self.store).register(candidates)
         return {"registered_candidates": len(identities), "candidate_ids": list(identities)}
@@ -188,6 +224,11 @@ class DatabaseResearchJobHandlers:
                     else None
                 ),
                 minimum_availability_timestamp=(
+                    str(claimed.payload["artefact_created_at"])
+                    if request.requested_stage == "forward"
+                    else None
+                ),
+                maximum_availability_timestamp=(
                     request.evaluated_at if request.requested_stage == "forward" else None
                 ),
             )
@@ -203,6 +244,11 @@ class DatabaseResearchJobHandlers:
                 "cost_model_id": str(request.cost_model_id),
                 "parameter_set_id": str(request.parameter_set_id),
             }
+        context = {
+            **dict(context),
+            "artefact_hash": request.artefact_hash,
+            "artefact_created_at": request.artefact_created_at,
+        }
 
         def evaluate_protected(claim: Mapping[str, Any]) -> tuple[bool, Mapping[str, Any]]:
             protected_context = claim.get("protected_context")
@@ -512,5 +558,7 @@ def _execution_receipt(request: ResearchJobRequest, *, executor_version: str) ->
         "parameter_set_id": request.parameter_set_id,
         "evaluator_version": request.evaluator_version,
         "executor_version": executor_version,
+        "artefact_hash": request.artefact_hash,
+        "artefact_created_at": request.artefact_created_at,
     }
     return {**payload, "input_hash": canonical_hash(payload)}

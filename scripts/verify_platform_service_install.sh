@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-REPO="${REPO:-/opt/trading-bot}"
+REPO="${REPO:-/home/alfred/trading-bot}"
 DATABASE_URL="${TRADING_PLATFORM_DATABASE_URL:-}"
 PLATFORM_CONFIG="${TRADING_PLATFORM_CONFIG:-$REPO/config/platform.json}"
 
@@ -73,6 +73,11 @@ probe_json trading-research "$REPO/data/reports"
 probe_json trading-research "$REPO/runtime/research"
 probe_write trading-agent "$REPO/runtime/agent-worktrees"
 probe_json trading-agent "$REPO/runtime/agent-worktrees"
+runuser -u trading-agent -- env \
+  GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_KEY_0=safe.directory \
+  GIT_CONFIG_VALUE_0="$REPO/.git" \
+  git -C "$REPO" cat-file -e 'HEAD^{commit}'
 
 run_cycle() {
   local user="$1"

@@ -33,6 +33,33 @@ class CanonicalEvidenceError(RuntimeError):
 
 
 _VALIDATION_STAGES = frozenset({"screening", "development", "robustness", "protected", "forward"})
+_AUTOMATION_APPROVAL_ACTORS = frozenset(
+    {
+        "agent",
+        "automation",
+        "autopilot",
+        "bot",
+        "ci",
+        "cron",
+        "github-actions",
+        "github-actions[bot]",
+        "robot",
+        "scheduler",
+        "service",
+        "system",
+        "trading-bot",
+    }
+)
+
+
+def _human_actor(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise CanonicalEvidenceError(f"{field} must identify a human operator")
+    actor = value.strip()
+    key = actor.casefold().replace("_", "-").replace(" ", "-")
+    if key in _AUTOMATION_APPROVAL_ACTORS or key.endswith("-bot") or key.endswith("[bot]"):
+        raise CanonicalEvidenceError(f"{field} must identify a human operator")
+    return actor
 
 
 def preflight_is_fresh(
@@ -104,14 +131,27 @@ def _immutable_insert(connection, table, values: dict[str, Any]) -> str:
 
 
 def _assert_canonical_artifact(connection, artefact_hash: str) -> dict[str, Any]:
-    payload = connection.execute(
-        select(strategy_artefact.c.payload).where(strategy_artefact.c.id == artefact_hash)
-    ).scalar_one_or_none()
-    if not isinstance(payload, Mapping):
+    row = (
+        connection.execute(
+            select(strategy_artefact.c.payload, strategy_artefact.c.created_at).where(
+                strategy_artefact.c.id == artefact_hash
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if row is None or not isinstance(row["payload"], Mapping):
         raise CanonicalEvidenceError(f"strategy artefact does not exist: {artefact_hash}")
-    payload = dict(payload)
+    payload = dict(row["payload"])
     if payload.get("schema") != "platform.strategy_artefact/v2":
         raise CanonicalEvidenceError("canonical strategy artefact schema is unsupported")
+    payload_created_at = payload.get("created_at")
+    if not isinstance(payload_created_at, str) or timestamp(
+        payload_created_at, field="artefact.created_at"
+    ) != timestamp(str(row["created_at"]), field="artefact.created_at"):
+        raise CanonicalEvidenceError(
+            "canonical strategy artefact creation timestamp does not match immutable storage"
+        )
     content = dict(payload)
     content.pop("artefact_hash", None)
     if payload.get("artefact_hash") != artefact_hash or canonical_hash(content) != artefact_hash:
@@ -379,8 +419,14 @@ class SqlForwardEvidenceRepository:
         observed_at: str,
         artefact_hash: str,
         observation: Mapping[str, Any],
+        evaluation_time: str | None = None,
     ) -> str:
         observed_at = timestamp(observed_at, field="observed_at")
+        evaluation_at = (
+            timestamp(evaluation_time, field="evaluation_time")
+            if evaluation_time is not None
+            else None
+        )
         strategy_version_id = str(strategy_version_id).strip()
         product_id = str(product_id).strip()
         instrument_id = str(instrument_id).strip()
@@ -398,6 +444,8 @@ class SqlForwardEvidenceRepository:
             "artefact_hash": artefact_hash,
             "observation": payload,
         }
+        if evaluation_at is not None:
+            identity_payload["evaluation_time"] = evaluation_at
         observation_hash = _hash(identity_payload, field="forward observation")
         with self.engine.begin() as connection:
             if (
@@ -418,6 +466,10 @@ class SqlForwardEvidenceRepository:
             if observed_at <= timestamp(created_at, field="artefact.created_at"):
                 raise CanonicalEvidenceError(
                     "forward observation must occur after artefact creation"
+                )
+            if evaluation_at is not None and observed_at > evaluation_at:
+                raise CanonicalEvidenceError(
+                    "forward observation must not occur after evaluation time"
                 )
             _assert_artefact_binding(
                 artefact,
@@ -496,6 +548,13 @@ class SqlStrategyArtefactRepository:
         if canonical_hash(content) != artefact_hash:
             raise CanonicalEvidenceError("strategy artefact content hash is invalid")
         created_at = timestamp(created_at, field="created_at")
+        if (
+            timestamp(str(payload.get("created_at") or ""), field="artefact.created_at")
+            != created_at
+        ):
+            raise CanonicalEvidenceError(
+                "strategy artefact payload creation timestamp does not match storage"
+            )
         with self.engine.begin() as connection:
             version_row = connection.execute(
                 select(strategy_version.c.id, strategy_definition.c.product_id)
@@ -523,12 +582,12 @@ class SqlStrategyArtefactRepository:
 
     def get(self, artefact_hash: str) -> dict[str, Any]:
         with self.engine.connect() as connection:
-            payload = connection.execute(
-                select(strategy_artefact.c.payload).where(strategy_artefact.c.id == artefact_hash)
-            ).scalar_one_or_none()
-        if payload is None:
-            raise KeyError(f"strategy artefact does not exist: {artefact_hash}")
-        return dict(payload)
+            try:
+                return _assert_canonical_artifact(connection, artefact_hash)
+            except CanonicalEvidenceError as exc:
+                if "does not exist" in str(exc):
+                    raise KeyError(f"strategy artefact does not exist: {artefact_hash}") from exc
+                raise
 
 
 class SqlApprovalRepository:
@@ -550,8 +609,7 @@ class SqlApprovalRepository:
         status: str = "approved",
         payload: Mapping[str, Any] | None = None,
     ) -> str:
-        if not isinstance(actor, str) or not actor.strip():
-            raise CanonicalEvidenceError("human approval actor must be non-empty")
+        actor = _human_actor(actor, field="human approval actor")
         capital_cap = _finite_nonnegative(capital_cap, field="approval capital cap")
         strategy_version_id = str(strategy_version_id).strip()
         product_id = str(product_id).strip()
@@ -572,7 +630,7 @@ class SqlApprovalRepository:
             "source_commit_hash": source_commit_hash,
             "engine_version": engine_version,
             "capital_cap": capital_cap,
-            "approved_by": actor.strip(),
+            "approved_by": actor,
             "approved_at": approved_at,
             "status": status,
             "payload": _object(payload or {}, field="approval payload"),
@@ -600,19 +658,28 @@ class SqlApprovalRepository:
             return _immutable_insert(connection, strategy_approval, {"id": identity, **record})
 
     def latest(
-        self, *, strategy_version_id: str, product_id: str, account_id: str
+        self,
+        *,
+        strategy_version_id: str,
+        product_id: str,
+        account_id: str,
+        at: str | None = None,
     ) -> dict[str, Any] | None:
         with self.engine.connect() as connection:
+            statement = select(strategy_approval).where(
+                strategy_approval.c.strategy_version_id == strategy_version_id,
+                strategy_approval.c.product_id == product_id,
+                strategy_approval.c.account_id == account_id,
+            )
+            if at is not None:
+                statement = statement.where(
+                    strategy_approval.c.approved_at <= timestamp(at, field="approval timestamp")
+                )
             row = (
                 connection.execute(
-                    select(strategy_approval)
-                    .where(
-                        strategy_approval.c.strategy_version_id == strategy_version_id,
-                        strategy_approval.c.product_id == product_id,
-                        strategy_approval.c.account_id == account_id,
-                    )
-                    .order_by(strategy_approval.c.approved_at.desc())
-                    .limit(1)
+                    statement.order_by(
+                        strategy_approval.c.approved_at.desc(), strategy_approval.c.id.desc()
+                    ).limit(1)
                 )
                 .mappings()
                 .first()
@@ -702,19 +769,29 @@ class SqlPreflightRepository:
             )
 
     def latest(
-        self, *, strategy_version_id: str, product_id: str, account_id: str
+        self,
+        *,
+        strategy_version_id: str,
+        product_id: str,
+        account_id: str,
+        at: str | None = None,
     ) -> dict[str, Any] | None:
         with self.engine.connect() as connection:
+            statement = select(production_preflight).where(
+                production_preflight.c.strategy_version_id == strategy_version_id,
+                production_preflight.c.product_id == product_id,
+                production_preflight.c.account_id == account_id,
+            )
+            if at is not None:
+                statement = statement.where(
+                    production_preflight.c.checked_at <= timestamp(at, field="preflight timestamp")
+                )
             row = (
                 connection.execute(
-                    select(production_preflight)
-                    .where(
-                        production_preflight.c.strategy_version_id == strategy_version_id,
-                        production_preflight.c.product_id == product_id,
-                        production_preflight.c.account_id == account_id,
-                    )
-                    .order_by(production_preflight.c.checked_at.desc())
-                    .limit(1)
+                    statement.order_by(
+                        production_preflight.c.checked_at.desc(),
+                        production_preflight.c.id.desc(),
+                    ).limit(1)
                 )
                 .mappings()
                 .first()
@@ -810,10 +887,25 @@ class SqlActiveStrategyAssignmentRepository:
                     text("SELECT pg_advisory_xact_lock(hashtext(:assignment_key))"),
                     {
                         "assignment_key": (
-                            f"active-assignment:{product_id}:{portfolio_id}:{sleeve_id}:"
+                            f"active-assignment-live:{product_id}"
+                            if execution_mode == "live"
+                            else f"active-assignment:{product_id}:{portfolio_id}:{sleeve_id}:"
                             f"{strategy_version_id}:{instrument_id or universe_id}:{execution_mode}"
                         )
                     },
+                )
+            existing_identity = (
+                connection.execute(
+                    select(active_strategy_assignment).where(
+                        active_strategy_assignment.c.id == identity
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if existing_identity is not None:
+                return _immutable_insert(
+                    connection, active_strategy_assignment, {"id": identity, **record}
                 )
             if (
                 connection.execute(
@@ -833,33 +925,114 @@ class SqlActiveStrategyAssignmentRepository:
                 product_id=product_id,
                 portfolio_id=portfolio_id,
             )
+            artefact_created_at = timestamp(
+                str(artefact["created_at"]), field="artefact.created_at"
+            )
+            if assigned_at < artefact_created_at:
+                raise CanonicalEvidenceError(
+                    "active assignment cannot activate before artefact creation"
+                )
+            assignment_active_until = record["active_until"]
+            if isinstance(assignment_active_until, str) and assignment_active_until <= assigned_at:
+                raise CanonicalEvidenceError("active assignment expiry must be after activation")
             if execution_mode == "live":
-                approved = connection.execute(
-                    select(strategy_approval.c.id).where(
-                        strategy_approval.c.strategy_version_id == strategy_version_id,
-                        strategy_approval.c.product_id == product_id,
-                        strategy_approval.c.artefact_hash == artefact_hash,
-                        strategy_approval.c.status == "approved",
+                account_id = str(artefact.get("account_id") or "")
+                source_commit_hash = str(artefact.get("source_commit_hash") or "")
+                engine_version = str(artefact.get("engine_version") or "")
+                if not account_id or not source_commit_hash or not engine_version:
+                    raise CanonicalEvidenceError(
+                        "live assignment artefact has incomplete authority bindings"
                     )
-                ).first()
+                approval = (
+                    connection.execute(
+                        select(strategy_approval)
+                        .where(
+                            strategy_approval.c.strategy_version_id == strategy_version_id,
+                            strategy_approval.c.product_id == product_id,
+                            strategy_approval.c.account_id == account_id,
+                            strategy_approval.c.approved_at <= assigned_at,
+                        )
+                        .order_by(
+                            strategy_approval.c.approved_at.desc(),
+                            strategy_approval.c.id.desc(),
+                        )
+                        .limit(1)
+                    )
+                    .mappings()
+                    .first()
+                )
                 preflight = (
                     connection.execute(
                         select(production_preflight)
                         .where(
                             production_preflight.c.strategy_version_id == strategy_version_id,
                             production_preflight.c.product_id == product_id,
-                            production_preflight.c.artefact_hash == artefact_hash,
-                            production_preflight.c.accepted.is_(True),
+                            production_preflight.c.account_id == account_id,
+                            production_preflight.c.checked_at <= assigned_at,
                         )
-                        .order_by(production_preflight.c.checked_at.desc())
+                        .order_by(
+                            production_preflight.c.checked_at.desc(),
+                            production_preflight.c.id.desc(),
+                        )
                         .limit(1)
                     )
                     .mappings()
                     .first()
                 )
+                approval_payload = (
+                    approval["payload"]
+                    if approval is not None and isinstance(approval["payload"], Mapping)
+                    else {}
+                )
+                preflight_payload = (
+                    preflight["payload"]
+                    if preflight is not None and isinstance(preflight["payload"], Mapping)
+                    else {}
+                )
+                exact_live_authority = (
+                    instrument_id is not None
+                    and approval_payload.get("schema") == "platform.strategy-approval/v1"
+                    and preflight_payload.get("schema") == "platform.production-preflight/v1"
+                    and approval_payload.get("preflight_id")
+                    == (preflight["id"] if preflight is not None else None)
+                    and approval_payload.get("instrument_id") == instrument_id
+                    and preflight_payload.get("instrument_id") == instrument_id
+                    and approval_payload.get("sleeve_id") == sleeve_id
+                    and preflight_payload.get("sleeve_id") == sleeve_id
+                    and approval_payload.get("environment") == preflight_payload.get("environment")
+                    and approval_payload.get("environment") in {"testnet", "production"}
+                    and isinstance(approval_payload.get("account_fingerprint"), str)
+                    and bool(approval_payload.get("account_fingerprint"))
+                    and approval_payload.get("account_fingerprint")
+                    == preflight_payload.get("account_fingerprint")
+                    and approval_payload.get("execution_engine_identity")
+                    == preflight_payload.get("execution_engine_identity")
+                    and approval_payload.get("configuration_hash")
+                    == preflight_payload.get("configuration_hash")
+                )
+                if exact_live_authority:
+                    _identity(
+                        approval_payload["execution_engine_identity"],
+                        field="live execution engine identity",
+                    )
+                    _identity(
+                        approval_payload["configuration_hash"],
+                        field="live configuration hash",
+                    )
                 if (
-                    approved is None
+                    approval is None
+                    or approval["status"] != "approved"
+                    or approval["artefact_hash"] != artefact_hash
+                    or approval["source_commit_hash"] != source_commit_hash
+                    or approval["engine_version"] != engine_version
+                    or _human_actor(approval["approved_by"], field="approval actor")
+                    != approval["approved_by"]
                     or preflight is None
+                    or not preflight["accepted"]
+                    or preflight["artefact_hash"] != artefact_hash
+                    or preflight["source_commit_hash"] != source_commit_hash
+                    or preflight["engine_version"] != engine_version
+                    or not exact_live_authority
                     or not preflight_is_fresh(
                         str(preflight["checked_at"]),
                         reference_at=assigned_at,
@@ -868,12 +1041,64 @@ class SqlActiveStrategyAssignmentRepository:
                     raise CanonicalEvidenceError(
                         "live assignment requires matching approval and fresh accepted preflight"
                     )
+                if capital_limit > min(
+                    float(approval["capital_cap"]), float(preflight["capital_cap"])
+                ):
+                    raise CanonicalEvidenceError(
+                        "live assignment exceeds approved or preflight capital cap"
+                    )
+                rows = (
+                    connection.execute(
+                        select(active_strategy_assignment)
+                        .where(
+                            active_strategy_assignment.c.product_id == product_id,
+                            active_strategy_assignment.c.execution_mode == "live",
+                        )
+                        .order_by(
+                            active_strategy_assignment.c.assigned_at,
+                            active_strategy_assignment.c.id,
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                if rows and assigned_at < max(str(row["assigned_at"]) for row in rows):
+                    raise CanonicalEvidenceError(
+                        "live assignment cannot predate existing live authority"
+                    )
+                latest: dict[tuple[str, ...], Mapping[str, Any]] = {}
+                for row in rows:
+                    key = (
+                        str(row["product_id"]),
+                        str(row["portfolio_id"]),
+                        str(row["sleeve_id"]),
+                        str(row["strategy_version_id"]),
+                        str(row["assignment_scope_id"]),
+                        str(row["execution_mode"]),
+                    )
+                    latest[key] = row
+                if any(
+                    row["active"]
+                    and (row["active_until"] is None or row["active_until"] > assigned_at)
+                    for row in latest.values()
+                ):
+                    raise CanonicalEvidenceError(
+                        f"product {product_id} already has an active live assignment"
+                    )
             return _immutable_insert(
                 connection, active_strategy_assignment, {"id": identity, **record}
             )
 
-    def active(self, product_id: str) -> dict[str, Any] | None:
-        rows = self.active_assignments(product_id)
+    def active(
+        self,
+        product_id: str,
+        *,
+        execution_mode: str | None = None,
+        at: str | None = None,
+    ) -> dict[str, Any] | None:
+        rows = self.active_assignments(product_id, at=at)
+        if execution_mode is not None:
+            rows = tuple(row for row in rows if row["execution_mode"] == execution_mode)
         return rows[0] if rows else None
 
     def by_id(self, assignment_id: str) -> dict[str, Any] | None:
@@ -955,8 +1180,9 @@ class SqlActiveStrategyAssignmentRepository:
         strategy_version_id: str,
         artefact_hash: str,
         execution_mode: str,
+        at: str | None = None,
     ) -> dict[str, Any]:
-        row = self.active(product_id)
+        row = self.active(product_id, execution_mode=execution_mode, at=at)
         if row is None:
             raise CanonicalEvidenceError(
                 f"no active canonical strategy assignment for {product_id}"
