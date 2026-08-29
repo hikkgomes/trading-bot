@@ -497,6 +497,12 @@ async def capture(
         ]
         try:
             while not stop.is_set():
+                stopped_task = next((task for task in tasks if task.done()), None)
+                if stopped_task is not None:
+                    error = stopped_task.exception()
+                    if error is not None:
+                        raise RuntimeError("market event source stopped") from error
+                    raise RuntimeError("market event source stopped")
                 elapsed = time.monotonic() - started
                 if status_path is not None and elapsed - last_status_write >= 15:
                     retention = writer.enforce_retention()

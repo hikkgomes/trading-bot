@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import json
 from pathlib import Path
@@ -8,6 +9,7 @@ from src.alpha.microstructure import MicrostructureAlphaPolicy
 from src.autopilot.event_capture import (
     DEFAULT_CONFIG,
     EventWriter,
+    capture,
     load_event_capture_config,
     normalize_event,
     stream_names,
@@ -274,3 +276,14 @@ def test_event_capture_config_rejects_non_binance_websocket(tmp_path):
 
     with pytest.raises(ValueError, match="approved Binance"):
         load_event_capture_config(path)
+
+
+def test_event_capture_fails_if_a_source_task_stops(monkeypatch, tmp_path):
+    async def stopped_source(*_args, **_kwargs):
+        raise RuntimeError("connection task failed")
+
+    monkeypatch.setattr("src.autopilot.event_capture._collect_source", stopped_source)
+    config = dataclasses.replace(load_event_capture_config(DEFAULT_CONFIG), root=tmp_path)
+
+    with pytest.raises(RuntimeError, match="market event source stopped"):
+        asyncio.run(capture(config, max_seconds=2))
