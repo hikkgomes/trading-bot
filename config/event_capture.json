@@ -42,7 +42,7 @@
     },
     {
       "market": "spot",
-      "url": "wss://stream.binance.com:9443/stream",
+      "url": "wss://stream.binance.com:443/stream",
       "symbols": ["BTCUSDT"],
       "dynamic_universe": false,
       "streams": ["aggTrade", "bookTicker", "depth20@100ms", "kline_1m"],
