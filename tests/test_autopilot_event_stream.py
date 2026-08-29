@@ -37,6 +37,12 @@ def test_default_event_capture_config_is_bounded_and_uses_approved_streams():
     assert "btcusdt@depth20@100ms" in names
     assert "ethusdt@aggTrade" in names
     assert "!forceOrder@arr" in names
+    bounded = stream_names(
+        futures,
+        tuple(f"SYMBOL{index}USDT" for index in range(100)),
+        data_tier_budgets=config.data_tier_budgets,
+    )
+    assert len(bounded) == 5 * futures.max_dynamic_symbols + 1
     candle_source = next(source for source in config.sources if source.streams == ("kline_1m",))
     assert candle_source.max_dynamic_symbols == 1_000
     assert "ethusdt@kline_1m" in stream_names(candle_source, ("ETHUSDT",))

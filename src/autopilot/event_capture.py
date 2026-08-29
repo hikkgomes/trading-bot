@@ -259,7 +259,7 @@ def stream_names(
                 if stream in {"kline_1m", "markPrice@1s"}
                 else ("rotating_depth" if stream.startswith("depth") else "trades_best_bid_ask")
             )
-            maximum = budgets.get(tier, source.max_dynamic_symbols)
+            maximum = min(source.max_dynamic_symbols, budgets.get(tier, source.max_dynamic_symbols))
             stream_symbols = tuple(all_symbols[:maximum])
         names.extend(f"{symbol.lower()}@{stream}" for symbol in stream_symbols)
     if source.include_liquidations:
