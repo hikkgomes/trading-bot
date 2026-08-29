@@ -164,6 +164,39 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
     ).ensure(now="2026-08-27T12:00:00+00:00")
 
 
+def test_bootstrap_is_idempotent_after_initial_job_completion(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    configuration = load_split_configuration(ROOT / "config")
+    bootstrap = PlatformBootstrap(engine=database.engine, configuration=configuration)
+    bootstrap.ensure(now=NOW)
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="test:universe-worker",
+        node_id="test",
+        role="universe-worker",
+        capabilities=("universe_refresh",),
+        observed_at=NOW,
+    )
+    claimed = queue.claim(
+        worker_id="test:universe-worker",
+        now=NOW,
+        lease_seconds=60,
+        names=("universe_refresh",),
+    )
+    assert claimed is not None
+    queue.complete(claimed, completed_at="2026-08-27T10:00:01+00:00")
+
+    bootstrap.ensure(now="2026-08-27T11:00:00+00:00")
+
+    with database.engine.connect() as connection:
+        assert (
+            connection.execute(
+                select(func.count()).select_from(job).where(job.c.id == claimed.job_id)
+            ).scalar_one()
+            == 1
+        )
+
+
 def test_scheduler_research_jobs_are_processed_automatically(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

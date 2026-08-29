@@ -1097,6 +1097,8 @@ def run(args: argparse.Namespace) -> int:
                 "portfolio_state_waiting_for_source_snapshots",
                 "portfolio_state_idle",
                 "canonical_portfolio_state_published",
+                "platform_scheduler_completed",
+                "account_reconciliation_completed",
             }
         ):
             time.sleep(args.interval_seconds)

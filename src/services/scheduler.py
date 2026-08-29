@@ -723,11 +723,12 @@ class DatabaseJobQueue:
         expected = {
             "name": values["name"],
             "priority": values["priority"],
-            "available_at": values["available_at"],
             "payload": values["payload"],
             "producer_identity": values["producer_identity"],
             "content_hash": values["content_hash"],
         }
+        if existing["state"] == "pending" and existing["attempts"] == 0:
+            expected["available_at"] = values["available_at"]
         actual = {key: existing[key] for key in expected}
         if actual != expected:
             raise ValueError(f"job identity collision: {job_id}")
