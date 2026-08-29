@@ -439,7 +439,14 @@ async def _collect_source(
                         received_ns=time.time_ns(),
                     )
                     await queue.put(event)
-        except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError, ValueError):
+        except (
+            aiohttp.ClientError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            json.JSONDecodeError,
+            ValueError,
+        ):
             if stop.is_set():
                 return
             try:
