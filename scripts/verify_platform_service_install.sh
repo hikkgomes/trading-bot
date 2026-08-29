@@ -76,7 +76,7 @@ probe_json trading-agent "$REPO/runtime/agent-worktrees"
 runuser -u trading-agent -- env \
   GIT_CONFIG_COUNT=1 \
   GIT_CONFIG_KEY_0=safe.directory \
-  GIT_CONFIG_VALUE_0="$REPO/.git" \
+  GIT_CONFIG_VALUE_0="$REPO" \
   git -C "$REPO" cat-file -e 'HEAD^{commit}'
 
 run_cycle() {
