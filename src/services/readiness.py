@@ -583,7 +583,7 @@ def build_readiness(
                 if age < 0:
                     raise ValueError("canonical portfolio state timestamp is in the future")
                 maximum_age = float(state["maximum_state_age_seconds"])
-                readiness_maximum_age = maximum_age if live else max(maximum_age, 120.0)
+                readiness_maximum_age = maximum_age if live else max(maximum_age, 600.0)
                 source_ids = state.get("source_snapshot_ids")
                 source_ages: dict[str, float] = {}
                 source_observed_at: list[str] = []
