@@ -652,11 +652,14 @@ class DatabasePortfolioStateWorker:
             assembled.update(policy)
             state_id = self.publisher.publish(assembled)
         except Exception as exc:
+            retry_at = (
+                dt.datetime.fromisoformat(now) + dt.timedelta(seconds=self.lease_seconds)
+            ).replace(microsecond=0).isoformat()
             self.queue.fail(
                 claimed,
                 completed_at=now,
                 error=f"{type(exc).__name__}: {exc}",
-                retry_at=now,
+                retry_at=retry_at,
             )
             return {
                 "reason_code": "portfolio_state_publish_failed",
@@ -705,6 +708,10 @@ def portfolio_state_policies(
             "maximum_cluster_fraction": float(sleeve["maximum_fraction"]),
             "maximum_product_drawdown_fraction": float(limits["maximum_drawdown"]),
             "maximum_depth_participation": float(instrument["maximum_visible_depth_fraction"]),
+            "product_drawdown_fraction": 0.0,
+            "daily_pnl_fraction": 0.0,
+            "global_drawdown_fraction": 0.0,
+            "trades_today": 0,
             "sleeve_budgets": {name: sleeve_budget for name in sleeves},
             "clusters": {},
             "cluster_fraction_caps": {},

@@ -66,7 +66,7 @@ from src.services.platform_testnet_connected import (
 from src.services.platform_testnet_connected import (
     _execution_engine_identity as connected_execution_engine_identity,
 )
-from src.services.portfolio_state import DatabasePortfolioSourceService
+from src.services.portfolio_state import DatabasePortfolioSourceService, portfolio_state_policies
 from src.services.readiness import _execution_engine_identity, _live_product_checks
 from src.services.runtime import ServiceRuntime
 from src.services.scheduler import DatabaseJobQueue, PlatformScheduler
@@ -195,6 +195,21 @@ def test_bootstrap_is_idempotent_after_initial_job_completion(tmp_path: Path) ->
             ).scalar_one()
             == 1
         )
+
+
+def test_fresh_platform_state_policies_include_required_risk_values() -> None:
+    configuration = load_split_configuration(ROOT / "config")
+    products = {
+        str(item["product_id"]): dict(item) for item in configuration["products"]["products"]
+    }
+
+    policies = portfolio_state_policies(configuration, products)
+
+    for policy in policies.values():
+        assert policy["product_drawdown_fraction"] == 0.0
+        assert policy["daily_pnl_fraction"] == 0.0
+        assert policy["global_drawdown_fraction"] == 0.0
+        assert policy["trades_today"] == 0
 
 
 def test_scheduler_research_jobs_are_processed_automatically(
