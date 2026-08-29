@@ -278,12 +278,17 @@ def test_event_capture_config_rejects_non_binance_websocket(tmp_path):
         load_event_capture_config(path)
 
 
-def test_event_capture_fails_if_a_source_task_stops(monkeypatch, tmp_path):
+def test_event_capture_restarts_a_source_task_that_stops(monkeypatch, tmp_path):
+    calls = 0
+
     async def stopped_source(*_args, **_kwargs):
-        raise RuntimeError("connection task failed")
+        nonlocal calls
+        calls += 1
 
     monkeypatch.setattr("src.autopilot.event_capture._collect_source", stopped_source)
     config = dataclasses.replace(load_event_capture_config(DEFAULT_CONFIG), root=tmp_path)
 
-    with pytest.raises(RuntimeError, match="market event source stopped"):
-        asyncio.run(capture(config, max_seconds=2))
+    result = asyncio.run(capture(config, max_seconds=1.1))
+
+    assert result["ok"] is True
+    assert calls > len(config.sources)

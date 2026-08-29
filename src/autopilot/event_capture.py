@@ -490,26 +490,38 @@ async def capture(
     ]
     timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=120)
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        source_streams = [
+            stream_names(source, dynamic, data_tier_budgets=config.data_tier_budgets)
+            for source in config.sources
+        ]
         tasks = [
             asyncio.create_task(
                 _collect_source(
                     session,
                     source,
-                    stream_names(source, dynamic, data_tier_budgets=config.data_tier_budgets),
+                    names,
                     queue,
                     stop,
                 )
             )
-            for source in config.sources
+            for source, names in zip(config.sources, source_streams, strict=True)
         ]
         try:
             while not stop.is_set():
-                stopped_task = next((task for task in tasks if task.done()), None)
-                if stopped_task is not None:
-                    error = stopped_task.exception()
-                    if error is not None:
-                        raise RuntimeError("market event source stopped") from error
-                    raise RuntimeError("market event source stopped")
+                for index, task in enumerate(tasks):
+                    if not task.done():
+                        continue
+                    if not task.cancelled():
+                        task.exception()
+                    tasks[index] = asyncio.create_task(
+                        _collect_source(
+                            session,
+                            config.sources[index],
+                            source_streams[index],
+                            queue,
+                            stop,
+                        )
+                    )
                 elapsed = time.monotonic() - started
                 if status_path is not None and elapsed - last_status_write >= 15:
                     retention = writer.enforce_retention()
