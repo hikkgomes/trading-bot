@@ -295,7 +295,10 @@ class CcxtBroker(Broker):
                 "secret": self.config.api_secret,
                 "password": self.config.api_password or None,
                 "enableRateLimit": True,
-                "options": {"defaultType": default_type},
+                "options": {
+                    "defaultType": default_type,
+                    "warnOnFetchOpenOrdersWithoutSymbol": False,
+                },
             }
         )
         if self.config.testnet:

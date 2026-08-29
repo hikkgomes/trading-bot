@@ -1291,6 +1291,7 @@ def test_ccxt_futures_testnet_uses_binance_demo_routing(monkeypatch) -> None:
 
     assert client.demo_calls == [True]
     assert client.sandbox_calls == []
+    assert client.options["options"]["warnOnFetchOpenOrdersWithoutSymbol"] is False
 
 
 def test_connected_gateway_uses_testnet_public_endpoints(tmp_path: Path, monkeypatch) -> None:
