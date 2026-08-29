@@ -546,6 +546,8 @@ def _active_assignments(engine) -> Callable[[str], tuple[Mapping[str, Any], ...]
             for row in repository.active_assignments(product_id, at=utc_now()):
                 payload = row["payload"]
                 if isinstance(payload, Mapping):
+                    if payload.get("diagnostic") is True:
+                        continue
                     configured = payload.get("instrument_ids") or payload.get("instruments")
                     if isinstance(configured, list | tuple) and instrument_id not in {
                         str(value) for value in configured

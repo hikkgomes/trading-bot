@@ -113,6 +113,8 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
         )
         instruments = set(connection.execute(select(instrument.c.id)).scalars())
     assert instruments == {"binance:spot:BTCUSDT", "binance:futures:BTCUSDT:USDT"}
+    for instrument_id in instruments:
+        assert _active_assignments(database.engine)(instrument_id) == ()
 
     scheduler = PlatformScheduler(
         engine=database.engine,
