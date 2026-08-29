@@ -526,7 +526,8 @@ class DatabaseMarketGateway:
             }
             try:
                 while True:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(self.capture_config.flush_seconds)
+                    sink.flush()
                     self._continuous_status = {
                         **self._continuous_status,
                         "events_enqueued": sink.events,
