@@ -15,7 +15,7 @@
   "sources": [
     {
       "market": "futures",
-      "url": "wss://fstream.binance.com/stream",
+      "url": "wss://fstream.binance.com/market/stream",
       "symbols": ["BTCUSDT"],
       "dynamic_universe": true,
       "max_dynamic_symbols": 1000,
@@ -24,12 +24,21 @@
     },
     {
       "market": "futures",
-      "url": "wss://fstream.binance.com/stream",
+      "url": "wss://fstream.binance.com/market/stream",
       "symbols": ["BTCUSDT"],
       "dynamic_universe": true,
       "max_dynamic_symbols": 12,
-      "streams": ["aggTrade", "trade", "bookTicker", "depth20@100ms", "markPrice@1s"],
+      "streams": ["aggTrade", "trade", "markPrice@1s"],
       "include_liquidations": true
+    },
+    {
+      "market": "futures",
+      "url": "wss://fstream.binance.com/public/stream",
+      "symbols": ["BTCUSDT"],
+      "dynamic_universe": true,
+      "max_dynamic_symbols": 12,
+      "streams": ["bookTicker", "depth20@100ms"],
+      "include_liquidations": false
     },
     {
       "market": "spot",

@@ -615,7 +615,10 @@ def build_readiness(
                         raise ValueError(f"{source} source timestamp is in the future")
                     source_ages[source] = source_age
                     source_observed_at.append(source_observed)
-                    if source_age > maximum_age:
+                    if (
+                        source in {"account", "balances", "market"}
+                        and source_age > maximum_age
+                    ):
                         raise ValueError(f"{source} source is stale")
                 if source_observed_at and observed_at != max(source_observed_at):
                     raise ValueError(
