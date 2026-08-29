@@ -855,9 +855,22 @@ class CanonicalResearchEvaluator:
             }
         )
         if stage in {"screening", "development", "robustness", "forward"}:
+            context_error = self.provider_context.get("provider_context_error")
+            if isinstance(context_error, str) and context_error:
+                return (
+                    {
+                        "identity": identity,
+                        "context": dict(context),
+                        "executor_error": context_error,
+                    },
+                    False,
+                    "candidate_execution_failed",
+                    None,
+                    {},
+                )
             try:
                 execution = self.executors.execute(candidate, {**self.provider_context, **context})
-            except (ExecutorError, ValueError, TypeError) as exc:
+            except (ExecutorError, KeyError, ValueError, TypeError) as exc:
                 return (
                     {
                         "identity": identity,

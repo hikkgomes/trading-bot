@@ -24,7 +24,11 @@ from src.research.evaluation import (
     EvidencePolicy,
     ProtectedHoldoutWorker,
 )
-from src.research.executors import ProviderContextBuilderRegistry, ProviderExecutorRegistry
+from src.research.executors import (
+    ExecutorError,
+    ProviderContextBuilderRegistry,
+    ProviderExecutorRegistry,
+)
 from src.research.ml import MlExperimentRunner
 from src.research.providers import provider_candidate
 from src.research.store import SqlResearchStore
@@ -232,10 +236,16 @@ class DatabaseResearchJobHandlers:
                     request.evaluated_at if request.requested_stage == "forward" else None
                 ),
             )
-            context = self.context_builders.build(
-                CandidateEvaluationView.from_candidate(candidate, adaptive_snapshot_ids),
-                resolved_context,
-            )
+            try:
+                context = self.context_builders.build(
+                    CandidateEvaluationView.from_candidate(candidate, adaptive_snapshot_ids),
+                    resolved_context,
+                )
+            except (ExecutorError, KeyError, TypeError, ValueError) as exc:
+                context = {
+                    **dict(resolved_context),
+                    "provider_context_error": f"{type(exc).__name__}: {exc}",
+                }
         else:
             context = {
                 "candidate_id": request.candidate_id,
