@@ -583,6 +583,7 @@ def build_readiness(
                 if age < 0:
                     raise ValueError("canonical portfolio state timestamp is in the future")
                 maximum_age = float(state["maximum_state_age_seconds"])
+                readiness_maximum_age = maximum_age if live else max(maximum_age, 120.0)
                 source_ids = state.get("source_snapshot_ids")
                 source_ages: dict[str, float] = {}
                 source_observed_at: list[str] = []
@@ -617,7 +618,7 @@ def build_readiness(
                     source_observed_at.append(source_observed)
                     if (
                         source in {"account", "balances", "market"}
-                        and source_age > maximum_age
+                        and source_age > readiness_maximum_age
                     ):
                         raise ValueError(f"{source} source is stale")
                 if source_observed_at and observed_at != max(source_observed_at):
@@ -646,11 +647,12 @@ def build_readiness(
                     "state_id": state_id,
                     "age_seconds": age,
                     "maximum_age_seconds": maximum_age,
+                    "readiness_maximum_age_seconds": readiness_maximum_age,
                     "source_ages_seconds": source_ages,
                     "risk_policy_ids": list(policy_ids),
                     "risk_policy_hash": policy_hash,
                 }
-                if age > maximum_age:
+                if age > readiness_maximum_age:
                     raise ValueError("canonical portfolio state is stale")
             except Exception as exc:
                 state_details[state_product_id] = {"error": f"{type(exc).__name__}: {exc}"}
