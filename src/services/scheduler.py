@@ -30,6 +30,7 @@ from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.research.store import SqlResearchStore
 from src.research.theses import StrategyThesisFactory
+from src.services.alerting import AlertSeverity, SqlAlertService, configured_alert_service
 from src.services.job_schemas import JobSchemaError, validate_job_payload
 
 
@@ -822,8 +823,9 @@ class PlatformScheduler:
 
 
 class DatabaseJobQueue:
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: Engine, *, alerts: SqlAlertService | None = None):
         self.engine = engine
+        self.alerts = alerts or configured_alert_service(engine)
 
     def register_worker(
         self,
@@ -1137,6 +1139,7 @@ class DatabaseJobQueue:
     ) -> None:
         completed_at = timestamp(completed_at, field="completed_at")
         attempt_id = f"{claimed.job_id}:{claimed.attempt}"
+        terminal_failure = False
         with self.engine.begin() as connection:
             current = connection.execute(
                 select(
@@ -1153,6 +1156,7 @@ class DatabaseJobQueue:
             ):
                 raise ValueError("worker no longer owns the job lease")
             terminal = int(current.attempts) >= int(current.max_attempts)
+            terminal_failure = bool(retry_at and terminal and error)
             next_state = "dead_letter" if terminal else "pending"
             connection.execute(
                 update(job)
@@ -1182,9 +1186,46 @@ class DatabaseJobQueue:
                 .where(worker.c.id == claimed.worker_id)
                 .values(last_heartbeat=completed_at, status="ready")
             )
+        if terminal_failure:
+            self._emit_terminal_failure(
+                job_id=claimed.job_id,
+                job_name=claimed.name,
+                attempt=claimed.attempt,
+                error=error or "terminal job failure",
+                observed_at=completed_at,
+            )
+
+    def _emit_terminal_failure(
+        self,
+        *,
+        job_id: str,
+        job_name: str,
+        attempt: int,
+        error: str,
+        observed_at: str,
+    ) -> None:
+        try:
+            self.alerts.emit(
+                event_type="queue_terminal_failure",
+                severity=AlertSeverity.CRITICAL,
+                dedupe_key=f"queue:{job_id}:terminal",
+                target=job_name,
+                message="queue job reached its terminal retry limit",
+                emitted_at=observed_at,
+                payload={
+                    "job_id": job_id,
+                    "job_name": job_name,
+                    "attempt": attempt,
+                    "error": error[:500],
+                },
+                cooldown_seconds=0,
+            )
+        except Exception:
+            pass
 
     def recover_expired(self, *, now: str) -> int:
         now = timestamp(now, field="now")
+        terminal_failures: list[dict[str, Any]] = []
         with self.engine.begin() as connection:
             expired = (
                 connection.execute(
@@ -1199,6 +1240,13 @@ class DatabaseJobQueue:
                 return 0
             for row in expired:
                 terminal = int(row["attempts"]) >= int(row["max_attempts"])
+                if terminal:
+                    terminal_failures.append(
+                        {
+                            "job_id": str(row["id"]),
+                            "attempt": int(row["attempts"]),
+                        }
+                    )
                 connection.execute(
                     update(job)
                     .where(job.c.id == row["id"])
@@ -1225,4 +1273,16 @@ class DatabaseJobQueue:
                 )
                 .values(completed_at=now, status="expired", error="worker_lease_expired")
             )
-            return len(expired)
+        for item in terminal_failures:
+            with self.engine.connect() as connection:
+                name = connection.execute(
+                    select(job.c.name).where(job.c.id == item["job_id"])
+                ).scalar_one()
+            self._emit_terminal_failure(
+                job_id=item["job_id"],
+                job_name=str(name),
+                attempt=item["attempt"],
+                error="worker lease expired at retry limit",
+                observed_at=now,
+            )
+        return len(expired)
