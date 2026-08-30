@@ -6,6 +6,7 @@ from dataclasses import replace
 from src.data.database import PlatformDatabase
 from src.domain._codec import canonical_hash
 from src.research.coordinator import ResearchCoordinator
+from src.research.datasets import RESEARCH_BUNDLE_ROLES, CanonicalResearchDatasetBuilder
 from src.research.generation import (
     CAMPAIGNS,
     GenerationAllocator,
@@ -19,6 +20,8 @@ from src.research.generation import (
 )
 from src.research.store import SqlResearchStore
 from src.research.theses import SqlThesisRegistry, ThesisError, ThesisRegistry
+from src.services.research_jobs import DatabaseResearchJobHandlers
+from src.services.scheduler import ClaimedJob
 
 NOW = dt.datetime(2026, 8, 23, tzinfo=dt.UTC).isoformat()
 
@@ -143,6 +146,63 @@ def test_hypothesis_generator_records_and_skips_an_exact_duplicate(tmp_path) -> 
     )
     assert generated == ()
     assert feedback_store.load(campaign=CAMPAIGNS[0].name)[0].outcome == "duplicate_exact"
+
+
+def test_generation_worker_persists_a_typed_dataset_plan(tmp_path) -> None:
+    database = _database(tmp_path)
+    identity = {
+        "universe": canonical_hash({"universe": "btc"}),
+        "feature": canonical_hash({"feature": "v1"}),
+        "cost": canonical_hash({"cost": "v1"}),
+        "parameters": canonical_hash({"parameters": "v1"}),
+    }
+    intervals = {
+        role: {
+            "start": f"2026-08-{20 + index:02d}T00:00:00+00:00",
+            "end": f"2026-08-{21 + index:02d}T00:00:00+00:00",
+        }
+        for index, role in enumerate(RESEARCH_BUNDLE_ROLES)
+    }
+    bundle = CanonicalResearchDatasetBuilder(database.engine).build(
+        "btc_accumulation",
+        intervals=intervals,
+        payload_by_role={role: {"bars": [{"close": 100.0}]} for role in RESEARCH_BUNDLE_ROLES},
+        universe_snapshot_id=identity["universe"],
+        feature_manifest_id=identity["feature"],
+        cost_model_id=identity["cost"],
+        parameter_set_id=identity["parameters"],
+        instrument_scope=("BTCUSDT",),
+        availability_timestamp="2026-08-30T00:00:00+00:00",
+        created_at=NOW,
+    )
+    claimed = ClaimedJob(
+        job_id="generation-job",
+        name="generate_hypotheses",
+        payload={
+            "product_id": "btc_accumulation",
+            "instrument_universe": ["BTCUSDT"],
+            "dataset_snapshot_hashes": list(bundle.stage_snapshot_ids.values()),
+            "dataset_bundle_id": bundle.bundle_id,
+            "universe_snapshot_id": bundle.universe_snapshot_id,
+            "submitted_at": "2026-08-30T00:00:00+00:00",
+            "generation_budget": 1,
+        },
+        worker_id="generation-worker",
+        attempt=1,
+        lease_expires_at="2026-08-30T00:01:00+00:00",
+    )
+    result = DatabaseResearchJobHandlers(SqlResearchStore(database.engine)).generate_hypotheses(
+        claimed,
+        lambda: claimed,
+    )
+    assert result["candidate_count"] == 1
+    candidate = SqlResearchStore(database.engine).get_candidate(result["candidate_ids"][0])
+    assert candidate.dataset_bundle_id == bundle.bundle_id
+    assert candidate.dataset_plan is not None
+    assert (
+        candidate.dataset_plan.protected_holdout_snapshot_id
+        == bundle.stage_snapshot_ids["protected_holdout"]
+    )
 
 
 def test_in_memory_thesis_budget_is_shared_by_descendants() -> None:
