@@ -219,6 +219,7 @@ class GenerationFeedback:
     def __post_init__(self) -> None:
         non_empty(self.campaign, field="campaign")
         if self.outcome not in {
+            "generated",
             "accepted",
             "rejected",
             "duplicate_exact",
@@ -438,8 +439,6 @@ class SqlHypothesisMemory:
                 ).order_by(strategy_identity.c.created_at, strategy_identity.c.id)
             ).mappings()
             for row in rows:
-                if str(row["id"]) == candidate.candidate_id:
-                    continue
                 if str(row["behavior_hash"]) == candidate.definition.definition_hash:
                     return DuplicateMatch(str(row["id"]), "exact", 0.0, signature)
                 distance = semantic_distance(candidate.definition, row["submitted_spec"])
@@ -454,6 +453,105 @@ class GeneratedHypothesis:
     thesis: ResearchThesis
     candidate: Candidate
     semantic_signature: str
+
+
+class HypothesisGenerator:
+    """Compile bounded campaign allocations into normal queue candidates."""
+
+    def __init__(
+        self,
+        *,
+        product: str,
+        instrument_universe: tuple[str, ...],
+        allocator: GenerationAllocator | None = None,
+        memory: HypothesisMemory | None = None,
+        feedback_store: GenerationFeedbackStore | None = None,
+    ) -> None:
+        self.product = non_empty(product, field="product")
+        if not instrument_universe:
+            raise GenerationError("hypothesis generation requires an instrument universe")
+        self.instrument_universe = tuple(sorted(set(instrument_universe)))
+        if any(not item for item in self.instrument_universe):
+            raise GenerationError("instrument universe contains an empty symbol")
+        self.allocator = allocator or GenerationAllocator()
+        self.memory = memory
+        self.feedback_store = feedback_store
+
+    def generate(
+        self,
+        *,
+        dataset_snapshot_hashes: tuple[str, ...],
+        submitted_at: str,
+        total_budget: int,
+        campaigns: Sequence[CampaignSpec] | None = None,
+        dataset_bundle_id: str | None = None,
+        universe_snapshot_id: str | None = None,
+        parent_thesis_ids: tuple[str, ...] = (),
+    ) -> tuple[GeneratedHypothesis, ...]:
+        selected = tuple(
+            campaign for campaign in (campaigns or CAMPAIGNS) if campaign.product == self.product
+        )
+        allocations = self.allocator.allocate(
+            selected,
+            total_budget=total_budget,
+            feedback=self.feedback_store.load() if self.feedback_store is not None else (),
+        )
+        by_name = {campaign.name: campaign for campaign in selected}
+        generated: list[GeneratedHypothesis] = []
+        for allocation in allocations:
+            campaign = by_name[allocation.campaign]
+            variants = min(allocation.trials, len(campaign.thresholds))
+            for variant in range(variants):
+                hypothesis = build_hypothesis(
+                    campaign,
+                    variant=variant,
+                    instrument_universe=self.instrument_universe,
+                    dataset_snapshot_hashes=dataset_snapshot_hashes,
+                    submitted_at=submitted_at,
+                    dataset_bundle_id=dataset_bundle_id,
+                    universe_snapshot_id=universe_snapshot_id,
+                    parent_thesis_ids=parent_thesis_ids,
+                )
+                match = self.memory.find(hypothesis.candidate) if self.memory is not None else None
+                if match is not None:
+                    self._record_duplicate(hypothesis, match, submitted_at)
+                    continue
+                generated.append(hypothesis)
+                self._record_outcome(hypothesis, "generated", submitted_at)
+        return tuple(generated)
+
+    def _record_duplicate(
+        self, hypothesis: GeneratedHypothesis, match: DuplicateMatch, observed_at: str
+    ) -> None:
+        self._record_outcome(
+            hypothesis,
+            "duplicate_exact" if match.kind == "exact" else "duplicate_near",
+            observed_at,
+            candidate_id=match.candidate_id,
+            distance=match.distance,
+        )
+
+    def _record_outcome(
+        self,
+        hypothesis: GeneratedHypothesis,
+        outcome: str,
+        observed_at: str,
+        *,
+        candidate_id: str | None = None,
+        distance: float | None = None,
+    ) -> None:
+        if self.feedback_store is None:
+            return
+        self.feedback_store.append(
+            GenerationFeedback(
+                campaign=hypothesis.campaign.name,
+                outcome=outcome,
+                observed_at=observed_at,
+                candidate_id=candidate_id,
+                semantic_signature=hypothesis.semantic_signature,
+                distance=distance,
+            )
+        )
 
 
 def campaign_thesis(

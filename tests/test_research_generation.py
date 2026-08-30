@@ -10,6 +10,7 @@ from src.research.generation import (
     CAMPAIGNS,
     GenerationAllocator,
     GenerationFeedback,
+    HypothesisGenerator,
     SqlGenerationFeedbackStore,
     SqlHypothesisMemory,
     build_hypothesis,
@@ -98,7 +99,8 @@ def test_hypothesis_memory_detects_exact_and_near_duplicates(tmp_path) -> None:
     )
     assert 0.0 < semantic_distance(first.candidate.definition, second.candidate.definition) <= 0.2
     exact = memory.find(first.candidate)
-    assert exact is None
+    assert exact is not None
+    assert exact.kind == "exact"
 
 
 def test_generated_thesis_and_candidate_are_product_and_universe_bound() -> None:
@@ -114,6 +116,33 @@ def test_generated_thesis_and_candidate_are_product_and_universe_bound() -> None
     assert hypothesis.candidate.definition.universe["type"] == "point_in_time"
     assert hypothesis.candidate.definition.signal_model["rule"]["direction"] == "signed"
     assert hypothesis.semantic_signature == hypothesis_signature(hypothesis.candidate.definition)
+
+
+def test_hypothesis_generator_records_and_skips_an_exact_duplicate(tmp_path) -> None:
+    database = _database(tmp_path)
+    feedback_store = SqlGenerationFeedbackStore(database.engine)
+    first = build_hypothesis(
+        CAMPAIGNS[0],
+        variant=0,
+        instrument_universe=("BTCUSDT",),
+        dataset_snapshot_hashes=(canonical_hash({"snapshot": "screening"}),),
+        submitted_at=NOW,
+    )
+    SqlThesisRegistry(database.engine).register(first.thesis)
+    ResearchCoordinator(SqlResearchStore(database.engine)).submit(first.candidate)
+    generated = HypothesisGenerator(
+        product="btc_accumulation",
+        instrument_universe=("BTCUSDT",),
+        memory=SqlHypothesisMemory(database.engine),
+        feedback_store=feedback_store,
+    ).generate(
+        dataset_snapshot_hashes=first.candidate.dataset_snapshot_hashes,
+        submitted_at=NOW,
+        total_budget=1,
+        campaigns=(CAMPAIGNS[0],),
+    )
+    assert generated == ()
+    assert feedback_store.load(campaign=CAMPAIGNS[0].name)[0].outcome == "duplicate_exact"
 
 
 def test_in_memory_thesis_budget_is_shared_by_descendants() -> None:
