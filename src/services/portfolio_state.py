@@ -652,13 +652,22 @@ class DatabasePortfolioStateWorker:
             assembled.update(policy)
             state_id = self.publisher.publish(assembled)
         except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if str(exc) == "exchange and database health are required for new exposure":
+                self.queue.complete(claimed, completed_at=now)
+                return {
+                    "reason_code": "portfolio_state_publish_rejected",
+                    "job_id": claimed.job_id,
+                    "error_type": type(exc).__name__,
+                    "error": error,
+                }
             retry_at = (
                 dt.datetime.fromisoformat(now) + dt.timedelta(seconds=self.lease_seconds)
             ).replace(microsecond=0).isoformat()
             self.queue.fail(
                 claimed,
                 completed_at=now,
-                error=f"{type(exc).__name__}: {exc}",
+                error=error,
                 retry_at=retry_at,
             )
             return {
