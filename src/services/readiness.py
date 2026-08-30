@@ -19,6 +19,7 @@ from src.data.database import (
     PlatformDatabase,
     account_snapshot,
     cost_model_manifest,
+    dataset_bundle,
     dataset_snapshot,
     experiment,
     feature_manifest,
@@ -28,7 +29,10 @@ from src.data.database import (
     service_heartbeat,
     strategy_approval,
     strategy_artefact,
+    strategy_definition,
+    strategy_version,
     universe_snapshot,
+    validation_stage,
 )
 from src.data.database import (
     instrument as instrument_table,
@@ -44,6 +48,7 @@ from src.services.live_execution import (
     live_authority_configuration_hash,
 )
 from src.services.portfolio_state import DatabasePortfolioStateWorker, portfolio_state_policies
+from src.services.scheduler import AUTONOMOUS_SCHEDULES
 
 
 def _check(name: str, ok: bool, *, detail: Any = None) -> dict[str, Any]:
@@ -534,6 +539,11 @@ def build_readiness(
                         select(func.count()).select_from(dataset_snapshot)
                     ).scalar_one()
                 ),
+                "dataset_bundles": int(
+                    connection.execute(
+                        select(func.count()).select_from(dataset_bundle)
+                    ).scalar_one()
+                ),
                 "feature_manifests": int(
                     connection.execute(
                         select(func.count()).select_from(feature_manifest)
@@ -558,6 +568,47 @@ def build_readiness(
                     ).scalar_one()
                 ),
             }
+            bundle_rows = connection.execute(select(dataset_bundle.c.payload)).scalars().all()
+            ready_roles_by_product: dict[str, set[str]] = {}
+            for raw_bundle in bundle_rows:
+                if not isinstance(raw_bundle, Mapping):
+                    continue
+                if raw_bundle.get("lifecycle_state") != "ready":
+                    continue
+                product_key = str(raw_bundle.get("product_id") or "")
+                stages = raw_bundle.get("stage_snapshot_ids")
+                if product_key and isinstance(stages, Mapping):
+                    ready_roles_by_product.setdefault(product_key, set()).update(
+                        str(role) for role in stages
+                    )
+            schedule_rows = connection.execute(select(platform_schedule)).mappings().all()
+            activity_rows = connection.execute(
+                select(strategy_definition.c.product_id, experiment.c.submitted_at)
+                .select_from(
+                    experiment.join(
+                        strategy_version,
+                        experiment.c.strategy_version_id == strategy_version.c.id,
+                    ).join(
+                        strategy_definition,
+                        strategy_version.c.definition_id == strategy_definition.c.id,
+                    )
+                )
+            ).all()
+            stage_activity_rows = connection.execute(
+                select(strategy_definition.c.product_id, validation_stage.c.evaluated_at)
+                .select_from(
+                    validation_stage.join(
+                        experiment,
+                        validation_stage.c.experiment_id == experiment.c.id,
+                    ).join(
+                        strategy_version,
+                        experiment.c.strategy_version_id == strategy_version.c.id,
+                    ).join(
+                        strategy_definition,
+                        strategy_version.c.definition_id == strategy_definition.c.id,
+                    )
+                )
+            ).all()
         source_store = SqlRiskSnapshotStore(database.engine)
         state_details: dict[str, Any] = {}
         products_by_id = {
@@ -666,11 +717,105 @@ def build_readiness(
         checks.append(
             _check("canonical_tables", True, detail={"count": len(table_names), "rows": counts})
         )
+        required_schedule_names = {spec.name for spec in AUTONOMOUS_SCHEDULES}
+        schedule_details: dict[str, dict[str, Any]] = {}
+        schedule_fresh = True
+        maximum_heartbeat_age = float(config.metrics.get("stale_after_seconds", 60))
+        for row in schedule_rows:
+            name = str(row["job_name"])
+            updated_at = timestamp(str(row["updated_at"]), field=f"schedule.{name}.updated_at")
+            age = (
+                dt.datetime.fromisoformat(current)
+                - dt.datetime.fromisoformat(updated_at)
+            ).total_seconds()
+            maximum_age = max(
+                maximum_heartbeat_age * 2.0,
+                float(row["interval_seconds"]) * 2.0,
+            )
+            fresh = 0 <= age <= maximum_age
+            schedule_fresh = schedule_fresh and fresh
+            schedule_details[name] = {
+                "state": str(row["state"]),
+                "updated_at": updated_at,
+                "age_seconds": age,
+                "maximum_age_seconds": maximum_age,
+                "fresh": fresh,
+            }
+        schedule_authority_ok = (
+            {str(row["job_name"]) for row in schedule_rows} == required_schedule_names
+            and schedule_fresh
+        )
         checks.append(
             _check(
                 "autonomous_scheduler_authority",
-                counts["schedules"] >= 11,
-                detail={"schedule_rows": counts["schedules"], "required": 11},
+                schedule_authority_ok,
+                detail={
+                    "schedule_rows": counts["schedules"],
+                    "required_schedule_names": sorted(required_schedule_names),
+                    "schedule_details": schedule_details,
+                },
+            )
+        )
+        required_products = {
+            str(product["product_id"])
+            for product in split["products"]["products"]
+            if product_id is None or str(product["product_id"]) == product_id
+        }
+        required_roles = {
+            "screening",
+            "development",
+            "robustness",
+            "protected_holdout",
+            "forward_observation",
+        }
+        dataset_details = {
+            product_key: {
+                "roles": sorted(ready_roles_by_product.get(product_key, set())),
+                "missing_roles": sorted(
+                    required_roles - ready_roles_by_product.get(product_key, set())
+                ),
+            }
+            for product_key in sorted(required_products)
+        }
+        checks.append(
+            _check(
+                "canonical_dataset_role_authority",
+                all(not detail["missing_roles"] for detail in dataset_details.values()),
+                detail={"dataset_bundles": counts["dataset_bundles"], "products": dataset_details},
+            )
+        )
+        latest_activity: dict[str, str] = {}
+        for raw_product, observed in (*activity_rows, *stage_activity_rows):
+            product_key = str(raw_product)
+            observed_at = timestamp(str(observed), field="research_activity.observed_at")
+            if observed_at > latest_activity.get(product_key, ""):
+                latest_activity[product_key] = observed_at
+        progress_details: dict[str, dict[str, Any]] = {}
+        progress_ok = True
+        maximum_progress_age = 86_400.0
+        for product_key in sorted(required_products):
+            observed_at = latest_activity.get(product_key)
+            age = (
+                (
+                    dt.datetime.fromisoformat(current)
+                    - dt.datetime.fromisoformat(observed_at)
+                ).total_seconds()
+                if observed_at is not None
+                else None
+            )
+            progressed = age is not None and 0 <= age <= maximum_progress_age
+            progress_ok = progress_ok and progressed
+            progress_details[product_key] = {
+                "latest_activity_at": observed_at,
+                "age_seconds": age,
+                "maximum_age_seconds": maximum_progress_age,
+                "progressed": progressed,
+            }
+        checks.append(
+            _check(
+                "research_progress_authority",
+                progress_ok,
+                detail={"products": progress_details},
             )
         )
         checks.append(

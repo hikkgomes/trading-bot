@@ -17,6 +17,7 @@ from src.data.database import (
     alert,
     alpha_forecast,
     balance_snapshot,
+    dataset_bundle,
     exchange_order,
     experiment,
     fill,
@@ -25,6 +26,7 @@ from src.data.database import (
     holdout_claim,
     holdout_outcome,
     job,
+    job_attempt,
     nav_snapshot,
     position,
     production_preflight,
@@ -115,6 +117,7 @@ class DatabasePlatformReport:
             "strategy_approvals": self._rows(strategy_approval),
             "production_preflights": self._rows(production_preflight),
             "promotion_events": self._rows(promotion_event),
+            "dataset_bundles": self._rows(dataset_bundle),
             "rejection_reasons": [
                 item.get("reason_code") for item in results if item.get("reason_code")
             ],
@@ -134,6 +137,7 @@ class DatabasePlatformReport:
         stages = list(research["validation_stages"])
         identities = list(research["strategy_identities"])
         jobs = self._rows(job)
+        attempts = self._rows(job_attempt)
         rejection_by_stage: dict[str, int] = {}
         rejection_reasons: dict[str, int] = {}
         first_blocked: dict[str, int] = {}
@@ -207,11 +211,28 @@ class DatabasePlatformReport:
             "cumulative_trial_count": self._count(thesis_trial),
             "protected_holdout_count": len(research["holdout_outcomes"]),
             "forward_paper_count": len(research["forward_paper_observations"]),
-            "strategy_promotions": len(research["promotion_events"]),
+            "strategy_promotions": sum(
+                _promotion_advanced(row.get("payload"))
+                for row in research["promotion_events"]
+            ),
             "first_blocked_stage": first_blocked,
-            "jobs_waiting": sum(row.get("state") == "queued" for row in jobs),
-            "jobs_deferred": sum(row.get("state") == "deferred" for row in jobs),
-            "jobs_failed": sum(row.get("state") == "failed" for row in jobs),
+            "jobs_waiting": sum(row.get("state") == "pending" for row in jobs),
+            "jobs_running": sum(row.get("state") == "running" for row in jobs),
+            "jobs_completed": sum(row.get("state") == "completed" for row in jobs),
+            "jobs_dead_letter": sum(row.get("state") == "dead_letter" for row in jobs),
+            "jobs_failed_attempts": sum(
+                row.get("status") in {"failed", "expired"} for row in attempts
+            ),
+            "jobs_terminal_failures": [
+                {
+                    "job_id": row.get("id"),
+                    "name": row.get("name"),
+                    "attempts": row.get("attempts"),
+                    "terminal_reason": row.get("terminal_reason"),
+                }
+                for row in jobs
+                if row.get("state") == "dead_letter"
+            ],
             "candidates_never_evaluated": sorted(
                 str(row["id"]) for row in experiments if str(row["id"]) not in evaluated_ids
             ),
@@ -321,3 +342,12 @@ class DatabasePlatformReport:
     def _count(self, table) -> int:
         with self.engine.connect() as connection:
             return int(connection.execute(select(func.count()).select_from(table)).scalar_one())
+
+
+def _promotion_advanced(payload: object) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    return int(
+        payload.get("accepted") is True
+        and str(payload.get("prior_state")) != str(payload.get("next_state"))
+    )
