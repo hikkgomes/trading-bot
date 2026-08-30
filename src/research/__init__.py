@@ -3,6 +3,7 @@
 from src.research.artefacts import StrategyArtefact, StrategyArtefactStore
 from src.research.canonical import (
     CanonicalEvidenceError,
+    ForwardPaperSummary,
     SqlActiveStrategyAssignmentRepository,
     SqlApprovalRepository,
     SqlForwardEvidenceRepository,
@@ -12,6 +13,7 @@ from src.research.canonical import (
     SqlValidationRepository,
 )
 from src.research.coordinator import Candidate, ResearchCoordinator, ResearchResult
+from src.research.datasets import CandidateDatasetPlan
 from src.research.evaluation import (
     CanonicalResearchEvaluator,
     EvaluationRequest,
@@ -24,6 +26,7 @@ from src.research.theses import ThesisRegistry
 
 __all__ = [
     "Candidate",
+    "CandidateDatasetPlan",
     "CanonicalEvidenceError",
     "CanonicalResearchEvaluator",
     "EvaluationRequest",
@@ -34,6 +37,7 @@ __all__ = [
     "SqlActiveStrategyAssignmentRepository",
     "SqlApprovalRepository",
     "SqlForwardEvidenceRepository",
+    "ForwardPaperSummary",
     "SqlHoldoutRepository",
     "SqlPreflightRepository",
     "SqlStrategyArtefactRepository",

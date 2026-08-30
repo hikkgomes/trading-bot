@@ -8,6 +8,7 @@ from typing import Any
 from src.domain._codec import canonical_hash
 from src.domain.strategies import StrategyDefinition, StrategySourceType
 from src.research.coordinator import Candidate
+from src.research.datasets import CandidateDatasetPlan
 
 
 def provider_candidate(
@@ -32,6 +33,7 @@ def provider_candidate(
     validation_policy: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
     dataset_bundle_id: str | None = None,
+    dataset_plan: CandidateDatasetPlan | None = None,
 ) -> Candidate:
     definition = StrategyDefinition(
         identity=identity,
@@ -59,4 +61,5 @@ def provider_candidate(
         submitted_at=submitted_at,
         metadata=metadata or {},
         dataset_bundle_id=dataset_bundle_id,
+        dataset_plan=dataset_plan,
     )

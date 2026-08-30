@@ -10,6 +10,7 @@ from typing import Any, Protocol
 
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.domain.strategies import StrategyDefinition
+from src.research.datasets import CandidateDatasetPlan
 
 
 class CandidateState(StrEnum):
@@ -31,6 +32,7 @@ class Candidate:
     submitted_at: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
     dataset_bundle_id: str | None = None
+    dataset_plan: CandidateDatasetPlan | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("thesis_id", "lineage_id"):
@@ -44,6 +46,8 @@ class Candidate:
             for item in self.dataset_snapshot_hashes
         ):
             raise ValueError("dataset_snapshot_hashes must contain SHA-256 hashes")
+        if len(set(self.dataset_snapshot_hashes)) != len(self.dataset_snapshot_hashes):
+            raise ValueError("dataset_snapshot_hashes must not contain duplicates")
         object.__setattr__(self, "submitted_at", timestamp(self.submitted_at, field="submitted_at"))
         if not isinstance(self.metadata, Mapping):
             raise ValueError("metadata must be an object")
@@ -53,6 +57,11 @@ class Candidate:
             if not value.startswith("sha256:") or len(value) != 71:
                 raise ValueError("dataset_bundle_id must be a SHA-256 identity")
             object.__setattr__(self, "dataset_bundle_id", value)
+        if self.dataset_plan is not None:
+            if self.dataset_plan.product_id != self.definition.product:
+                raise ValueError("candidate dataset plan product does not match definition")
+            if set(self.dataset_snapshot_hashes) != set(self.dataset_plan.all_snapshot_ids):
+                raise ValueError("candidate dataset identities do not match its typed plan")
 
     @property
     def candidate_id(self) -> str:
@@ -65,6 +74,8 @@ class Candidate:
         }
         if self.dataset_bundle_id is not None:
             payload["dataset_bundle_id"] = self.dataset_bundle_id
+        if self.dataset_plan is not None:
+            payload["dataset_plan"] = self.dataset_plan.to_payload()
         return canonical_hash(payload)
 
 
@@ -81,6 +92,7 @@ class CandidateEvaluationView:
     submitted_at: str
     metadata: Mapping[str, Any]
     dataset_bundle_id: str | None = None
+    dataset_plan: CandidateDatasetPlan | None = None
 
     @classmethod
     def from_candidate(
@@ -99,6 +111,7 @@ class CandidateEvaluationView:
             submitted_at=candidate.submitted_at,
             metadata=candidate.metadata,
             dataset_bundle_id=candidate.dataset_bundle_id,
+            dataset_plan=candidate.dataset_plan,
         )
 
 

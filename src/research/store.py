@@ -21,6 +21,7 @@ from src.data.database import (
 from src.domain._codec import canonical_hash, json_value, timestamp, to_primitive
 from src.domain.strategies import StrategyDefinition, StrategySourceType
 from src.research.coordinator import Candidate, CandidateState, ResearchResult
+from src.research.datasets import CandidateDatasetPlan
 
 
 def _mapping(value: object, *, field: str) -> Mapping[str, Any]:
@@ -60,7 +61,10 @@ class SqlResearchStore:
         definition_id = candidate.definition.definition_hash
         version_id = candidate.definition.strategy_version_id
         definition_payload = to_primitive(candidate.definition)
-        metadata_payload = json_value(dict(candidate.metadata), field="candidate metadata")
+        metadata_values = dict(candidate.metadata)
+        if candidate.dataset_plan is not None:
+            metadata_values["_dataset_plan"] = candidate.dataset_plan.to_payload()
+        metadata_payload = json_value(metadata_values, field="candidate metadata")
         parent_hashes = metadata_payload.get("parent_hashes", [])
         with self.engine.begin() as connection:
             trial = (
@@ -228,6 +232,9 @@ class SqlResearchStore:
             )
             .where(strategy_version.c.id == row["strategy_version_id"])
         ).scalar_one()
+        metadata = dict(row["metadata"] or {})
+        raw_plan = metadata.pop("_dataset_plan", None)
+        dataset_plan = CandidateDatasetPlan.from_payload(raw_plan) if raw_plan is not None else None
         return Candidate(
             definition=_definition_from_dict(definition_payload),
             thesis_id=trial["thesis_id"],
@@ -235,8 +242,9 @@ class SqlResearchStore:
             provider=row["provider"],
             dataset_snapshot_hashes=tuple(row["dataset_snapshot_hashes"]),
             submitted_at=row["submitted_at"],
-            metadata=row["metadata"],
+            metadata=metadata,
             dataset_bundle_id=row.get("dataset_bundle_id"),
+            dataset_plan=dataset_plan,
         )
 
     def claim_trial(self, candidate: Candidate) -> None:

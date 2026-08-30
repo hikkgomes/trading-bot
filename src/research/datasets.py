@@ -55,6 +55,131 @@ def _identity(value: object, *, field: str) -> str:
 
 
 @dataclass(frozen=True)
+class CandidateDatasetPlan:
+    """Typed stage plan bound to one product and one point-in-time universe."""
+
+    screening_snapshot_ids: tuple[str, ...]
+    development_snapshot_ids: tuple[str, ...]
+    robustness_snapshot_ids: tuple[str, ...]
+    protected_holdout_snapshot_id: str
+    product_id: str
+    universe_snapshot_id: str
+    feature_manifest_id: str
+    cost_model_id: str
+    parameter_set_id: str
+    forward_snapshot_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "product_id", non_empty(self.product_id, field="product_id"))
+        for field_name in (
+            "universe_snapshot_id",
+            "feature_manifest_id",
+            "cost_model_id",
+            "parameter_set_id",
+            "protected_holdout_snapshot_id",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _identity(getattr(self, field_name), field=field_name),
+            )
+        for field_name in (
+            "screening_snapshot_ids",
+            "development_snapshot_ids",
+            "robustness_snapshot_ids",
+            "forward_snapshot_ids",
+        ):
+            values = tuple(
+                _identity(value, field=f"{field_name}[]") for value in getattr(self, field_name)
+            )
+            if not values and field_name != "forward_snapshot_ids":
+                raise DatasetResolutionError(f"{field_name} cannot be empty")
+            object.__setattr__(self, field_name, values)
+        all_ids = self.all_snapshot_ids
+        if len(all_ids) != len(set(all_ids)):
+            raise DatasetResolutionError("candidate dataset stages must not overlap")
+
+    @property
+    def all_snapshot_ids(self) -> tuple[str, ...]:
+        return (
+            *self.screening_snapshot_ids,
+            *self.development_snapshot_ids,
+            *self.robustness_snapshot_ids,
+            self.protected_holdout_snapshot_id,
+            *self.forward_snapshot_ids,
+        )
+
+    @property
+    def content_hash(self) -> str:
+        return canonical_hash(self.to_payload())
+
+    def snapshot_ids_for_stage(self, stage: str) -> tuple[str, ...]:
+        values = {
+            "screening": self.screening_snapshot_ids,
+            "development": self.development_snapshot_ids,
+            "robustness": self.robustness_snapshot_ids,
+            "protected": (self.protected_holdout_snapshot_id,),
+            "forward": self.forward_snapshot_ids,
+        }
+        try:
+            return values[stage]
+        except KeyError as exc:
+            raise DatasetResolutionError(f"unsupported candidate dataset stage: {stage}") from exc
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "screening_snapshot_ids": list(self.screening_snapshot_ids),
+            "development_snapshot_ids": list(self.development_snapshot_ids),
+            "robustness_snapshot_ids": list(self.robustness_snapshot_ids),
+            "protected_holdout_snapshot_id": self.protected_holdout_snapshot_id,
+            "forward_snapshot_ids": list(self.forward_snapshot_ids),
+            "product_id": self.product_id,
+            "universe_snapshot_id": self.universe_snapshot_id,
+            "feature_manifest_id": self.feature_manifest_id,
+            "cost_model_id": self.cost_model_id,
+            "parameter_set_id": self.parameter_set_id,
+        }
+
+    @classmethod
+    def from_bundle(cls, bundle: DatasetBundle) -> CandidateDatasetPlan:
+        if bundle.lifecycle_state is not DatasetLifecycleState.READY:
+            raise DatasetResolutionError("only ready dataset bundles can create candidate plans")
+        try:
+            protected = bundle.stage_snapshot_ids["protected_holdout"]
+        except KeyError as exc:
+            raise DatasetResolutionError("dataset bundle has no protected holdout") from exc
+        return cls(
+            screening_snapshot_ids=(bundle.stage_snapshot_ids["screening"],),
+            development_snapshot_ids=(bundle.stage_snapshot_ids["development"],),
+            robustness_snapshot_ids=(bundle.stage_snapshot_ids["robustness"],),
+            protected_holdout_snapshot_id=protected,
+            forward_snapshot_ids=(bundle.stage_snapshot_ids["forward_observation"],),
+            product_id=bundle.product_id,
+            universe_snapshot_id=bundle.universe_snapshot_id,
+            feature_manifest_id=bundle.feature_manifest_id,
+            cost_model_id=bundle.cost_model_id,
+            parameter_set_id=bundle.parameter_set_id,
+        )
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> CandidateDatasetPlan:
+        if not isinstance(payload, Mapping):
+            raise DatasetResolutionError("candidate dataset plan must be an object")
+        return cls(
+            screening_snapshot_ids=tuple(payload["screening_snapshot_ids"]),
+            development_snapshot_ids=tuple(payload["development_snapshot_ids"]),
+            robustness_snapshot_ids=tuple(payload["robustness_snapshot_ids"]),
+            protected_holdout_snapshot_id=str(payload["protected_holdout_snapshot_id"]),
+            forward_snapshot_ids=tuple(payload.get("forward_snapshot_ids", ())),
+            product_id=str(payload["product_id"]),
+            universe_snapshot_id=str(payload["universe_snapshot_id"]),
+            feature_manifest_id=str(payload["feature_manifest_id"]),
+            cost_model_id=str(payload["cost_model_id"]),
+            parameter_set_id=str(payload["parameter_set_id"]),
+        )
+
+
+@dataclass(frozen=True)
 class DatasetBundle:
     """Immutable stage-to-snapshot mapping used by one research candidate."""
 
