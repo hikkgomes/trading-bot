@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,8 @@ from src.domain._codec import canonical_hash
 from src.domain.market_events import ExchangeSequenceTracker, MarketEvent, MarketEventType
 from src.risk.engine import SqlRiskSnapshotStore
 from src.services.scheduler import DatabaseJobQueue
+
+_PARTITION_TOKEN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 class DatabaseMarketDataWriter:
@@ -118,11 +121,21 @@ class DatabaseMarketDataWriter:
         if canonical_hash(body) != str(payload["segment_hash"]):
             raise ValueError("market batch segment content hash is invalid")
         events = []
+        dropped_rows = 0
         for row in rows:
             event = row.get("event")
             if not isinstance(event, dict):
                 raise ValueError("market batch row has no event")
             canonical_event = MarketEvent(**event)
+            partition_values = (
+                str(row.get("venue") or "").lower(),
+                str(row.get("market") or "").lower(),
+                canonical_event.event_type.value,
+                str(row.get("symbol") or "").upper(),
+            )
+            if any(not _PARTITION_TOKEN.fullmatch(value) for value in partition_values):
+                dropped_rows += 1
+                continue
             events.append(
                 (
                     canonical_event,
@@ -132,7 +145,7 @@ class DatabaseMarketDataWriter:
                 )
             )
             self.sequence_tracker.observe(canonical_event)
-        paths = self.store.put_batch(events)
+        paths = self.store.put_batch(events) if events else ()
         for event, venue, market, symbol in events:
             if _is_closed_candle(event):
                 self.bar_store.put(event, venue=venue, market=market, symbol=symbol)
@@ -147,6 +160,7 @@ class DatabaseMarketDataWriter:
         return {
             "segments": len(paths),
             "events": len(events),
+            "dropped_rows": dropped_rows,
             "paths": [str(path) for path in paths],
             "market_snapshot_ids": snapshot_ids,
         }

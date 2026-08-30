@@ -218,11 +218,6 @@ class SqlUniverseStore:
                 )
             )
         else:
-            existing_payload = dict(existing["payload"])
-            immutable_existing_payload = {
-                key: value for key, value in existing_payload.items() if key != "status"
-            }
-            immutable_payload = {key: value for key, value in payload.items() if key != "status"}
             expected = {
                 "id": item.instrument_id,
                 "venue": item.venue,
@@ -232,10 +227,17 @@ class SqlUniverseStore:
                 "quote_asset": item.quote_asset,
                 "settlement_asset": item.settlement_asset,
             }
-            if any(existing[field] != value for field, value in expected.items()) or (
-                immutable_existing_payload != immutable_payload
-            ):
+            if any(existing[field] != value for field, value in expected.items()):
                 raise ValueError(f"instrument identity collision: {item.instrument_id}")
+            # Exchange filters and status are operational metadata. Refresh
+            # them when the exchange publishes a new value while keeping the
+            # canonical instrument identity immutable.
+            if dict(existing["payload"]) != payload:
+                connection.execute(
+                    instrument_table.update()
+                    .where(instrument_table.c.id == item.instrument_id)
+                    .values(payload=payload)
+                )
         status_id = canonical_hash(
             {"instrument_id": item.instrument_id, "observed_at": observed_at, "status": item.status}
         )
