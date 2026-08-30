@@ -195,13 +195,20 @@ class ApprovedLiveExecution:
         product_id = str(payload["product_id"])
         product = self.products[product_id]
         account_id = str(product["account_id"])
+        authority_at = timestamp(
+            str(payload.get("authorisation_at") or order.created_at),
+            field="live authorisation time",
+        )
+        order_created_at = timestamp(order.created_at, field="order.created_at")
+        if authority_at < order_created_at:
+            raise PermissionError("live order cannot be authorised before it was created")
         with self.engine.connect() as connection:
             account_row = (
                 connection.execute(
                     select(account_snapshot.c.payload, account_snapshot.c.observed_at)
                     .where(
                         account_snapshot.c.account_id == account_id,
-                        account_snapshot.c.observed_at <= order.created_at,
+                        account_snapshot.c.observed_at <= authority_at,
                     )
                     .order_by(account_snapshot.c.observed_at.desc(), account_snapshot.c.id.desc())
                     .limit(1)
@@ -217,7 +224,7 @@ class ApprovedLiveExecution:
         )
         account_age = (
             (
-                dt.datetime.fromisoformat(order.created_at)
+                dt.datetime.fromisoformat(authority_at)
                 - dt.datetime.fromisoformat(account_observed_at)
             ).total_seconds()
             if account_observed_at is not None
@@ -261,7 +268,7 @@ class ApprovedLiveExecution:
         current_assignment = self.assignments.active(
             product_id,
             execution_mode="live",
-            at=order.created_at,
+            at=authority_at,
         )
         if current_assignment is None:
             raise PermissionError("live product has no active canonical assignment")
@@ -282,7 +289,7 @@ class ApprovedLiveExecution:
             strategy_version_id=str(current_assignment["strategy_version_id"]),
             artefact_hash=str(current_assignment["artefact_hash"]),
             execution_mode="live",
-            at=order.created_at,
+            at=authority_at,
         )
         artifact = self.artefacts.get(str(assignment["artefact_hash"]))
         declared_hash = artifact.get("artefact_hash")
@@ -303,7 +310,7 @@ class ApprovedLiveExecution:
             strategy_version_id=strategy_version_id,
             product_id=product_id,
             account_id=account_id,
-            at=order.created_at,
+            at=authority_at,
         )
         if approval is None or approval["status"] != "approved":
             raise PermissionError("canonical live artefact has no current human approval")
@@ -311,13 +318,13 @@ class ApprovedLiveExecution:
             strategy_version_id=strategy_version_id,
             product_id=product_id,
             account_id=account_id,
-            at=order.created_at,
+            at=authority_at,
         )
         if preflight is None or not preflight["accepted"]:
             raise PermissionError("canonical live artefact has no accepted preflight")
         if not preflight_is_fresh(
             str(preflight["checked_at"]),
-            reference_at=order.created_at,
+            reference_at=authority_at,
             maximum_age_seconds=int(product.get("preflight_max_age_seconds", 3_600)),
         ):
             raise PermissionError("canonical live artefact preflight is stale")

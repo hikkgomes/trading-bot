@@ -1706,7 +1706,7 @@ def test_live_queue_uses_a_mandatory_authoriser_and_the_canonical_broker_contrac
         broker=PaperBroker(price_source=lambda _: 100_000),
         instruments={instrument.instrument_id: instrument},
     )
-    authorised: list[str] = []
+    authorised: list[tuple[str, str]] = []
     submitter = DatabaseLiveExecutionWorker(
         queue=queue,
         worker_id=worker_id,
@@ -1721,15 +1721,17 @@ def test_live_queue_uses_a_mandatory_authoriser_and_the_canonical_broker_contrac
         },
         trace_store=traces,
         venues={"active_income": venue},
-        authorise=lambda _payload, order: authorised.append(order.order_id),
+        authorise=lambda payload, order: authorised.append(
+            (str(payload["authorisation_at"]), order.order_id)
+        ),
     )
 
     planned = planner.run_once(now=NOW)
-    submitted = submitter.run_once(now=NOW)
+    submitted = submitter.run_once(now=LATER)
 
     assert planned["reason_code"] == "live_orders_enqueued"
     assert submitted["reason_code"] == "live_order_acknowledged"
-    assert authorised == [submitted["order_id"]]
+    assert authorised == [(LATER, submitted["order_id"])]
     assert positions.get("active_income", BTC).quantity == 0
 
 

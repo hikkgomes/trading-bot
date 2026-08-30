@@ -66,6 +66,7 @@ class DatabaseExecutionWorker:
         self.lease_seconds = lease_seconds
 
     def run_once(self, *, now: str) -> dict[str, Any]:
+        now = timestamp(now, field="now")
         claimed = self.queue.claim(
             worker_id=self.worker_id,
             now=now,
@@ -306,6 +307,7 @@ class DatabaseLiveExecutionWorker:
         self.control_plane = control_plane
 
     def run_once(self, *, now: str) -> dict[str, Any]:
+        now = timestamp(now, field="now")
         claimed = self.queue.claim(
             worker_id=self.worker_id,
             now=now,
@@ -347,7 +349,7 @@ class DatabaseLiveExecutionWorker:
                 )
             ):
                 raise PermissionError("control plane blocks new live risk")
-            self.authorise(payload, order)
+            self.authorise({**payload, "authorisation_at": now}, order)
             venue = self.venues[product_id]
             if venue.order_manager is not self.order_manager:
                 raise ValueError("live venue must share the durable order manager")
