@@ -338,6 +338,13 @@ def test_market_making_live_promotion_requires_capability_and_replay() -> None:
         live_approval=True,
         fresh_preflight=True,
         market_making=True,
+        forward_summary_id="summary-v1",
+        forward_decision_id="decision-v1",
+        forward_independent_decisions=60,
+        forward_net_pnl=1.0,
+        forward_effective_trades=60,
+        forward_fill_rate=1.0,
+        forward_data_uptime=1.0,
     )
     missing_capability = decide_promotion(
         strategy_version_id="market-maker:v1",
@@ -345,6 +352,7 @@ def test_market_making_live_promotion_requires_capability_and_replay() -> None:
         evidence=base,
         policy=policy,
         evaluated_at=NOW,
+        requested_transition="live_canary",
     )
     missing_replay = decide_promotion(
         strategy_version_id="market-maker:v1",
@@ -352,6 +360,7 @@ def test_market_making_live_promotion_requires_capability_and_replay() -> None:
         evidence=PromotionEvidence(**{**base.__dict__, "market_making_live_capability": True}),
         policy=policy,
         evaluated_at=NOW,
+        requested_transition="live_canary",
     )
     accepted = decide_promotion(
         strategy_version_id="market-maker:v1",
@@ -366,6 +375,7 @@ def test_market_making_live_promotion_requires_capability_and_replay() -> None:
         ),
         policy=policy,
         evaluated_at=NOW,
+        requested_transition="live_canary",
     )
     assert missing_capability.reason_code == "market_making_live_capability_missing"
     assert missing_replay.reason_code == "market_making_event_replay_insufficient"

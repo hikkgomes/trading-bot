@@ -7,11 +7,13 @@ import pytest
 
 from src.data.database import PlatformDatabase
 from src.data.universe import InstrumentObservation, SqlUniverseStore, UniverseEligibilityPolicy
+from src.domain._codec import canonical_hash
 from src.domain.instruments import Instrument, MarketType
 from src.execution.config import ExchangeConfig
 from src.research.canonical import (
     CanonicalEvidenceError,
     SqlApprovalRepository,
+    SqlForwardEvidenceRepository,
     SqlPreflightRepository,
 )
 from src.services.config import load_split_configuration
@@ -135,6 +137,71 @@ def _fixture(tmp_path: Path, monkeypatch) -> tuple[PlatformDatabase, PlatformLiv
 
     paper_assignment = SqlActiveStrategyAssignmentRepository(database.engine).by_id(assignment_id)
     assert paper_assignment is not None
+    forward = SqlForwardEvidenceRepository(database.engine)
+    observation_at = "2026-08-29T10:00:01+00:00"
+    facts = {
+        "schema": "platform.forward_evidence_facts/v1",
+        "window_start": NOW,
+        "source_event_ids": [str(paper_assignment["artefact_hash"])],
+        "metrics": {
+            "net_pnl": 1.0,
+            "benchmark_pnl": 0.0,
+            "drawdown": 0.0,
+            "execution_drift": 0.0,
+            "model_drift": 0.0,
+            "portfolio_capacity": 1.0,
+            "risk_budget_available": 1.0,
+            "data_gaps": 0,
+            "effective_trades": 1,
+            "fill_rate": 1.0,
+            "slippage": 0.0,
+            "data_uptime": 1.0,
+            "rejected_orders": 0,
+        },
+        "forecast_hash": canonical_hash({"source": "authority-test"}),
+        "target_hash": None,
+    }
+    facts["facts_hash"] = canonical_hash(facts)
+    observation_id = forward.append(
+        strategy_version_id=str(paper_assignment["strategy_version_id"]),
+        product_id="active_income",
+        instrument_id=instrument.instrument_id,
+        observed_at=observation_at,
+        artefact_hash=str(paper_assignment["artefact_hash"]),
+        observation={"decision_id": "authority-test-decision", "facts": facts},
+    )
+    summary_id = forward.append_summary(
+        strategy_version_id=str(paper_assignment["strategy_version_id"]),
+        product_id="active_income",
+        observed_at=observation_at,
+        artefact_hash=str(paper_assignment["artefact_hash"]),
+        evidence={
+            "observed_from": observation_at,
+            "observed_until": observation_at,
+            "elapsed_days": 1.0,
+            "independent_decisions": 1,
+            "net_pnl": 1.0,
+            "benchmark_pnl": 0.0,
+            "excess_benchmark_pnl": 1.0,
+            "drawdown": 0.0,
+            "execution_drift": 0.0,
+            "model_drift": 0.0,
+            "portfolio_capacity": 1.0,
+            "risk_budget_available": 1.0,
+            "data_gaps": 0,
+            "effective_trades": 1,
+            "fill_rate": 1.0,
+            "slippage": 0.0,
+            "data_uptime": 1.0,
+            "rejected_orders": 0,
+            "observation_ids": [observation_id],
+        },
+    )
+    forward.append_decision(
+        summary_id=summary_id,
+        decided_at="2026-08-29T10:00:01+00:00",
+        accepted=True,
+    )
     authority = PlatformLiveAuthority(
         engine=database.engine,
         configuration=configuration,

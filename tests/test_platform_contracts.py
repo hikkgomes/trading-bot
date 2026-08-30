@@ -3048,6 +3048,13 @@ def test_live_canary_promotion_requires_approval_preflight_capacity_and_evidence
         risk_budget_available=0.03,
         live_approval=True,
         fresh_preflight=True,
+        forward_summary_id="summary-v1",
+        forward_decision_id="decision-v1",
+        forward_independent_decisions=60,
+        forward_net_pnl=1.0,
+        forward_data_uptime=1.0,
+        forward_effective_trades=60,
+        forward_fill_rate=1.0,
     )
 
     decision = decide_promotion(
