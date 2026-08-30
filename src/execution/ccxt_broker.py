@@ -1171,7 +1171,7 @@ class CcxtBroker(Broker):
             return
         if self.config.allow_multi_symbol_positions:
             regular = self.list_open_orders(symbol, conditional=False)
-            conditional: tuple[OpenOrderIdentity, ...] = ()
+            conditional = self.list_open_orders(symbol, conditional=True)
         else:
             regular = self.list_account_open_orders(conditional=False)
             conditional = self.list_account_open_orders(conditional=True)

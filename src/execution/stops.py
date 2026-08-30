@@ -19,6 +19,9 @@ from src.domain.orders import OrderSide
 
 class StopStatus(StrEnum):
     ACTIVE = "active"
+    PROTECTED = "protected"
+    REPLACE_PENDING = "replace_pending"
+    CONFIRMATION_FAILED = "confirmation_failed"
     TRIGGERED = "triggered"
     CANCELLED = "cancelled"
     RECONCILED = "reconciled"
@@ -36,6 +39,10 @@ class ProtectiveStop:
     status: StopStatus = StopStatus.ACTIVE
     native_order_id: str | None = None
     triggered_at: str | None = None
+    entry_order_id: str | None = None
+    native_client_id: str | None = None
+    protected_quantity: float = 0.0
+    failure_reason: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "exit_side", OrderSide(self.exit_side))
@@ -57,9 +64,28 @@ class ProtectiveStop:
             object.__setattr__(
                 self, "triggered_at", timestamp(self.triggered_at, field="triggered_at")
             )
+        if self.entry_order_id is not None:
+            object.__setattr__(
+                self, "entry_order_id", non_empty(self.entry_order_id, field="entry_order_id")
+            )
+        if self.native_client_id is not None:
+            object.__setattr__(
+                self,
+                "native_client_id",
+                non_empty(self.native_client_id, field="native_client_id"),
+            )
+        if self.protected_quantity < 0 or self.protected_quantity > self.quantity + 1e-12:
+            raise ValueError("protected quantity must be between zero and stop quantity")
+        if self.failure_reason is not None:
+            object.__setattr__(self, "failure_reason", non_empty(self.failure_reason, field="failure_reason"))
 
     def is_triggered_by(self, price: float) -> bool:
-        if self.status is not StopStatus.ACTIVE:
+        if self.status not in {
+            StopStatus.ACTIVE,
+            StopStatus.PROTECTED,
+            StopStatus.REPLACE_PENDING,
+            StopStatus.CONFIRMATION_FAILED,
+        }:
             return False
         return (
             price <= self.trigger_price
@@ -170,16 +196,84 @@ class StopManager:
         self._stops[stop.stop_id] = stop
         return stop
 
+    def get(self, stop_id: str) -> ProtectiveStop:
+        return self._stops[stop_id]
+
+    def for_entry_order(self, entry_order_id: str) -> tuple[ProtectiveStop, ...]:
+        return tuple(
+            self._stops[key]
+            for key in sorted(self._stops)
+            if self._stops[key].entry_order_id == entry_order_id
+        )
+
     def active(self) -> tuple[ProtectiveStop, ...]:
         return tuple(
             self._stops[key]
             for key in sorted(self._stops)
-            if self._stops[key].status is StopStatus.ACTIVE
+            if self._stops[key].status
+            in {
+                StopStatus.ACTIVE,
+                StopStatus.PROTECTED,
+                StopStatus.REPLACE_PENDING,
+                StopStatus.CONFIRMATION_FAILED,
+            }
         )
+
+    def mark_protected(
+        self,
+        stop_id: str,
+        *,
+        native_order_id: str,
+        native_client_id: str,
+        protected_quantity: float,
+    ) -> ProtectiveStop:
+        current = self._stops[stop_id]
+        updated = replace(
+            current,
+            status=StopStatus.PROTECTED,
+            native_order_id=non_empty(native_order_id, field="native_order_id"),
+            native_client_id=non_empty(native_client_id, field="native_client_id"),
+            protected_quantity=protected_quantity,
+            failure_reason=None,
+        )
+        self.store.append(updated)
+        self._stops[stop_id] = updated
+        return updated
+
+    def mark_failure(self, stop_id: str, *, reason: str) -> ProtectiveStop:
+        current = self._stops[stop_id]
+        updated = replace(
+            current,
+            status=StopStatus.CONFIRMATION_FAILED,
+            failure_reason=non_empty(reason, field="failure_reason"),
+        )
+        self.store.append(updated)
+        self._stops[stop_id] = updated
+        return updated
+
+    def resize(self, stop_id: str, *, quantity: float) -> ProtectiveStop:
+        current = self._stops[stop_id]
+        if quantity <= 0:
+            raise ValueError("resized stop quantity must be positive")
+        updated = replace(
+            current,
+            quantity=quantity,
+            protected_quantity=0.0,
+            native_order_id=None,
+            status=StopStatus.REPLACE_PENDING,
+        )
+        self.store.append(updated)
+        self._stops[stop_id] = updated
+        return updated
 
     def triggered(self, stop_id: str, *, triggered_at: str) -> ProtectiveStop:
         current = self._stops[stop_id]
-        if current.status is not StopStatus.ACTIVE:
+        if current.status not in {
+            StopStatus.ACTIVE,
+            StopStatus.PROTECTED,
+            StopStatus.REPLACE_PENDING,
+            StopStatus.CONFIRMATION_FAILED,
+        }:
             raise ValueError("only active stops can trigger")
         updated = replace(
             current,
@@ -192,7 +286,14 @@ class StopManager:
 
     def cancel(self, stop_id: str) -> ProtectiveStop:
         current = self._stops[stop_id]
-        if current.status is not StopStatus.ACTIVE:
+        if current.status is StopStatus.CANCELLED:
+            return current
+        if current.status not in {
+            StopStatus.ACTIVE,
+            StopStatus.PROTECTED,
+            StopStatus.REPLACE_PENDING,
+            StopStatus.CONFIRMATION_FAILED,
+        }:
             raise ValueError("only active stops can be cancelled")
         updated = replace(current, status=StopStatus.CANCELLED)
         self.store.append(updated)

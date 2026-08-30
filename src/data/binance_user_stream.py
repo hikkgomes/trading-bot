@@ -20,7 +20,8 @@ def normalise_user_event(
         raise ValueError("Binance user-stream market must be spot or futures")
     event_name = str(payload.get("e") or "")
     order = payload.get("o") if isinstance(payload.get("o"), Mapping) else {}
-    symbol = str(payload.get("s") or order.get("s") or "").upper()
+    algo = payload.get("a") if isinstance(payload.get("a"), Mapping) else {}
+    symbol = str(payload.get("s") or order.get("s") or algo.get("s") or "").upper()
     if event_name in {"executionReport", "ORDER_TRADE_UPDATE"}:
         execution_type = str(payload.get("x") or order.get("x") or "")
         event_type = (
@@ -30,6 +31,12 @@ def normalise_user_event(
         )
         if not symbol:
             raise ValueError("Binance order update has no symbol")
+        settlement = ":USDT" if market == "futures" else ""
+        identity = f"binance:{market}:{symbol}{settlement}"
+    elif event_name == "ALGO_UPDATE":
+        event_type = MarketEventType.ALGO_UPDATE
+        if not symbol:
+            raise ValueError("Binance algo update has no symbol")
         settlement = ":USDT" if market == "futures" else ""
         identity = f"binance:{market}:{symbol}{settlement}"
     elif event_name in {"outboundAccountPosition", "ACCOUNT_UPDATE", "balanceUpdate"}:

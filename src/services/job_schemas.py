@@ -8,6 +8,7 @@ validate the boundary without importing research or execution code.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -463,6 +464,46 @@ def validate_job_payload(name: str, payload: Mapping[str, Any]) -> dict[str, Any
             ),
             hash_fields=frozenset({"event_id", "forecast_id", "content_hash"}),
         )
+    if name == "emergency_reduction":
+        allowed = frozenset(
+            {
+                "product_id",
+                "portfolio_id",
+                "instrument_id",
+                "stop_id",
+                "position_quantity",
+                "reason_code",
+                "evaluated_at",
+                "producer_identity",
+                "content_hash",
+            }
+        )
+        _strict_fields(payload, allowed, name="emergency reduction")
+        for field in (
+            "product_id",
+            "portfolio_id",
+            "instrument_id",
+            "stop_id",
+            "reason_code",
+            "producer_identity",
+        ):
+            _required_text(payload, field)
+        position_quantity = payload.get("position_quantity")
+        if isinstance(position_quantity, bool):
+            raise JobSchemaError("position_quantity must be numeric")
+        try:
+            numeric_quantity = float(position_quantity)
+        except (TypeError, ValueError) as exc:
+            raise JobSchemaError("position_quantity must be numeric") from exc
+        if not math.isfinite(numeric_quantity) or abs(numeric_quantity) <= 0:
+            raise JobSchemaError("position_quantity must be finite and non-zero")
+        evaluated_at = timestamp(_required_text(payload, "evaluated_at"), field="evaluated_at")
+        content_hash = _hash_id(payload, "content_hash")
+        unsigned = dict(payload)
+        unsigned.pop("content_hash", None)
+        if content_hash != canonical_hash(unsigned):
+            raise JobSchemaError("emergency reduction content_hash does not match its payload")
+        return {**dict(payload), "position_quantity": numeric_quantity, "evaluated_at": evaluated_at}
     return json_value(dict(payload), field=f"{name} payload")
 
 

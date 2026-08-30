@@ -288,6 +288,8 @@ class DatabaseLiveExecutionWorker:
         order_groups: OrderGroupManager | None = None,
         lease_seconds: int = 60,
         job_name: str = "live_order_submit",
+        prepare_protective_stop: Callable[[str, OrderIntent, str], object] | None = None,
+        control_plane: Any | None = None,
     ) -> None:
         self.queue = queue
         self.worker_id = worker_id
@@ -300,6 +302,8 @@ class DatabaseLiveExecutionWorker:
         self.order_groups = order_groups
         self.lease_seconds = lease_seconds
         self.job_name = job_name
+        self.prepare_protective_stop = prepare_protective_stop
+        self.control_plane = control_plane
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
@@ -333,11 +337,22 @@ class DatabaseLiveExecutionWorker:
                 reconciled = self.positions.get(order.portfolio_id, order.instrument_id)
                 if abs(reconciled.quantity) > 1e-12:
                     raise ValueError("dependent opening order is blocked until position is flat")
-            self.authorise(payload, order)
             product_id = str(payload["product_id"])
+            if (
+                self.control_plane is not None
+                and not order.reduce_only
+                and self.control_plane.blocks_new_risk(
+                    product_id=product_id,
+                    strategy_id=str(payload.get("strategy_version_id") or "") or None,
+                )
+            ):
+                raise PermissionError("control plane blocks new live risk")
+            self.authorise(payload, order)
             venue = self.venues[product_id]
             if venue.order_manager is not self.order_manager:
                 raise ValueError("live venue must share the durable order manager")
+            if not order.reduce_only and self.prepare_protective_stop is not None:
+                self.prepare_protective_stop(product_id, order, now)
             _before_group_submission(self.order_groups, order)
             acknowledgement = venue.submit(order)
             updated = self.order_manager.get(order.order_id)
@@ -565,6 +580,8 @@ class DatabaseUserStreamWorker:
         job_name: str = "user_stream_event",
         accounting_job_name: str = "accounting_event",
         accounting_job_prefix: str = "accounting",
+        on_live_fill: Callable[[str, OrderIntent, float, str], object] | None = None,
+        on_algo_update: Callable[[str, MarketEvent], object] | None = None,
     ) -> None:
         self.engine = engine
         self.queue = queue
@@ -579,6 +596,8 @@ class DatabaseUserStreamWorker:
         self.job_name = job_name
         self.accounting_job_name = accounting_job_name
         self.accounting_job_prefix = accounting_job_prefix
+        self.on_live_fill = on_live_fill
+        self.on_algo_update = on_algo_update
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
@@ -650,6 +669,7 @@ class DatabaseUserStreamWorker:
             order_result = self._apply_order_event(
                 event=event,
                 account_id=record["account_id"],
+                product_id=product_id,
             )
         except Exception as exc:
             self.queue.fail(
@@ -674,7 +694,14 @@ class DatabaseUserStreamWorker:
             "order_result": order_result,
         }
 
-    def _apply_order_event(self, *, event: MarketEvent, account_id: str) -> dict[str, Any] | None:
+    def _apply_order_event(
+        self, *, event: MarketEvent, account_id: str, product_id: str | None
+    ) -> dict[str, Any] | None:
+        if event.event_type is MarketEventType.ALGO_UPDATE:
+            if self.on_algo_update is None or product_id is None:
+                return {"reason_code": "protective_algo_handler_not_configured"}
+            result = self.on_algo_update(product_id, event)
+            return result if isinstance(result, dict) else {"reason_code": "algo_update_applied"}
         if event.event_type not in {MarketEventType.ORDER_UPDATE, MarketEventType.FILL_UPDATE}:
             return None
         if self.order_manager is None or self.positions is None or self.trace_store is None:
@@ -712,15 +739,16 @@ class DatabaseUserStreamWorker:
             )
             return {"reason_code": recovery_payload["reason_code"], "recovery_job_id": job_id}
         order = matches[0]
-        if order.status is OrderStatus.FILLED:
-            return {"reason_code": "exchange_order_already_filled", "order_id": order.order_id}
         if event.event_type is MarketEventType.FILL_UPDATE:
             return self._apply_fill_event(
                 event=event,
                 account_id=account_id,
                 order=order,
                 values=values,
+                product_id=product_id,
             )
+        if order.status is OrderStatus.FILLED:
+            return {"reason_code": "exchange_order_already_filled", "order_id": order.order_id}
         return self._apply_status_event(order=order, values=values, event=event)
 
     def _apply_fill_event(
@@ -730,6 +758,7 @@ class DatabaseUserStreamWorker:
         account_id: str,
         order: OrderIntent,
         values: Mapping[str, Any],
+        product_id: str | None,
     ) -> dict[str, Any]:
         if self.order_manager is None or self.positions is None or self.trace_store is None:
             raise RuntimeError("user-stream worker requires durable execution stores")
@@ -752,7 +781,14 @@ class DatabaseUserStreamWorker:
             }
         )
         if any(fill.fill_id == fill_id for fill in order_manager.fills_for(order.order_id)):
-            return {"reason_code": "exchange_fill_already_recorded", "fill_id": fill_id}
+            position = positions.get(order.portfolio_id, order.instrument_id)
+            if self.on_live_fill is not None and product_id is not None:
+                self.on_live_fill(product_id, order, position.quantity, event.receive_timestamp)
+            return {
+                "reason_code": "exchange_fill_already_recorded",
+                "fill_id": fill_id,
+                "position_quantity": position.quantity,
+            }
         product_id = self.account_products.get(account_id)
         ledger = self.ledgers.get(product_id) if product_id is not None else None
         if fee and ledger is not None and fee_asset != ledger.accounting_asset:
@@ -828,6 +864,8 @@ class DatabaseUserStreamWorker:
             )
         )
         _after_group_fill(self.order_groups, order_manager, updated)
+        if self.on_live_fill is not None and product_id is not None:
+            self.on_live_fill(product_id, order, position.quantity, event.receive_timestamp)
         return {
             "reason_code": (
                 "exchange_order_partially_filled"

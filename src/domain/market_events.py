@@ -23,6 +23,7 @@ class MarketEventType(StrEnum):
     ACCOUNT_BALANCE = "account_balance"
     ORDER_UPDATE = "order_update"
     FILL_UPDATE = "fill_update"
+    ALGO_UPDATE = "algo_update"
 
 
 @dataclass
