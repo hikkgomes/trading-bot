@@ -13,7 +13,6 @@ from src.data.database import (
     account_snapshot,
     balance_snapshot,
     cost_model_manifest,
-    dataset_snapshot,
     feature_manifest,
     feature_set,
     platform_bootstrap,
@@ -28,6 +27,10 @@ from src.research.artefacts import StrategyArtefact
 from src.research.canonical import (
     SqlActiveStrategyAssignmentRepository,
     SqlStrategyArtefactRepository,
+)
+from src.research.datasets import (
+    RESEARCH_BUNDLE_ROLES,
+    CanonicalResearchDatasetBuilder,
 )
 from src.risk.engine import SqlRiskPolicyStore
 from src.risk.policies import install_product_risk_policies
@@ -166,6 +169,44 @@ def _diagnostic_dataset(
             "embargo_rows": 1,
         },
     }
+
+
+def _diagnostic_stage_payloads(data: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    """Partition the deterministic bootstrap sample into role-local inputs."""
+
+    bars = list(data.get("market_frame", ()))
+    returns = list(data.get("returns", ()))
+    steps = data.get("bar_steps")
+    step_rows = list(steps.get("steps", ())) if isinstance(steps, Mapping) else []
+    rows = data.get("ml_rows")
+    ml_rows = list(rows.get("rows", ())) if isinstance(rows, Mapping) else []
+    chunks: dict[str, Mapping[str, Any]] = {}
+    size = max(1, len(bars) // len(RESEARCH_BUNDLE_ROLES))
+    for index, role in enumerate(RESEARCH_BUNDLE_ROLES):
+        start = index * size
+        end = len(bars) if index == len(RESEARCH_BUNDLE_ROLES) - 1 else (index + 1) * size
+        payload = dict(data)
+        payload["role"] = role
+        payload["market_frame"] = bars[start:end]
+        payload["returns"] = returns[start:end]
+        step_payload = dict(steps) if isinstance(steps, Mapping) else {}
+        payload["bar_steps"] = {
+            **step_payload,
+            "steps": step_rows[start:end],
+        }
+        ml_payload = dict(rows) if isinstance(rows, Mapping) else {}
+        payload["ml_rows"] = {
+            **ml_payload,
+            "rows": ml_rows[start:end],
+        }
+        event_replay = data.get("event_replay")
+        if isinstance(event_replay, Mapping):
+            payload["event_replay"] = {
+                **dict(event_replay),
+                "events": list(event_replay.get("events", ()))[start:end],
+            }
+        chunks[role] = payload
+    return chunks
 
 
 class PlatformBootstrap:
@@ -337,35 +378,32 @@ class PlatformBootstrap:
             instrument=instrument,
             start=interval_start,
         )
-        data_hash = canonical_hash(data)
-        snapshot_id = canonical_hash(
-            {
-                "product_id": product_id,
-                "universe_snapshot_id": universe_snapshot_id,
-                "data": data_hash,
-            }
+        stage_payloads = _diagnostic_stage_payloads(data)
+        total_seconds = (interval_end - interval_start).total_seconds()
+        stage_intervals: dict[str, dict[str, str]] = {}
+        for index, role in enumerate(RESEARCH_BUNDLE_ROLES):
+            start = interval_start + dt.timedelta(seconds=total_seconds * index / 5)
+            end = interval_start + dt.timedelta(seconds=total_seconds * (index + 1) / 5)
+            stage_intervals[role] = {"start": start.isoformat(), "end": end.isoformat()}
+        dataset_bundle = CanonicalResearchDatasetBuilder(self.engine).build(
+            product_id,
+            intervals=stage_intervals,
+            payload_by_role=stage_payloads,
+            universe_snapshot_id=universe_snapshot_id,
+            feature_manifest_id=feature_manifest_id,
+            cost_model_id=cost_model_id,
+            parameter_set_id=parameter_set_id,
+            instrument_scope=(instrument.instrument_id,),
+            availability_timestamp={
+                **{role: observed_at for role in RESEARCH_BUNDLE_ROLES[:-1]},
+                "forward_observation": (
+                    dt.datetime.fromisoformat(observed_at) + dt.timedelta(hours=1)
+                ).isoformat(),
+            },
+            created_at=observed_at,
+            engine_version="platform-bootstrap/v1",
         )
-        dataset_payload = {
-            "snapshot_id": snapshot_id,
-            "content_hash": data_hash,
-            "interval": {"start": interval_start.isoformat(), "end": interval_end.isoformat()},
-            "universe_snapshot_id": universe_snapshot_id,
-            "availability_timestamp": observed_at,
-            "feature_manifest_id": feature_manifest_id,
-            "cost_model_id": cost_model_id,
-            "parameter_set_id": parameter_set_id,
-            "product_id": product_id,
-            "instrument_scope": [instrument.instrument_id],
-            "engine_version": "platform-bootstrap/v1",
-            "role": "screening",
-            "payload": data,
-        }
-        with self.engine.begin() as connection:
-            _record(
-                connection,
-                dataset_snapshot,
-                {"id": snapshot_id, "created_at": observed_at, "payload": dataset_payload},
-            )
+        snapshot_id = dataset_bundle.stage_snapshot_ids["screening"]
         DatabaseJobQueue(self.engine).enqueue_if_absent(
             job_id=f"initial-universe-refresh:{product_id}",
             name="universe_refresh",

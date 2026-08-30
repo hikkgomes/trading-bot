@@ -168,6 +168,16 @@ class DatabaseResearchJobHandlers:
         candidates = registered_strategy_candidates(
             product=str(claimed.payload["product_id"]),
             dataset_snapshot_hashes=tuple(claimed.payload["dataset_snapshot_hashes"]),
+            dataset_bundle_id=(
+                str(claimed.payload["dataset_bundle_id"])
+                if claimed.payload.get("dataset_bundle_id")
+                else None
+            ),
+            universe_snapshot_id=(
+                str(claimed.payload["universe_snapshot_id"])
+                if claimed.payload.get("universe_snapshot_id")
+                else None
+            ),
             instrument_universe=universe,
             submitted_at=(
                 str(claimed.payload["catalogue_submitted_at"])

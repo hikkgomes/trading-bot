@@ -115,6 +115,15 @@ universe_member = Table(
     Column("payload", JSON, nullable=False),
 )
 dataset_snapshot = _id_payload_table("dataset_snapshot")
+dataset_bundle = Table(
+    "dataset_bundle",
+    metadata,
+    Column("id", String(160), primary_key=True),
+    Column("product_id", String(80), nullable=False, index=True),
+    Column("created_at", UtcTimestamp(), nullable=False, index=True),
+    Column("content_hash", String(80), nullable=False, unique=True),
+    Column("payload", JSON, nullable=False),
+)
 feature_set = _id_payload_table("feature_set")
 feature_manifest = _id_payload_table("feature_manifest")
 cost_model_manifest = _id_payload_table("cost_model_manifest")
@@ -183,6 +192,7 @@ experiment = Table(
     Column("state", String(80), nullable=False, index=True),
     Column("submitted_at", UtcTimestamp(), nullable=False),
     Column("dataset_snapshot_hashes", JSON, nullable=False),
+    Column("dataset_bundle_id", ForeignKey("dataset_bundle.id"), index=True),
     Column("metadata", JSON, nullable=False),
 )
 experiment_run = _id_payload_table("experiment_run")
@@ -613,6 +623,7 @@ class PlatformDatabase:
                 "003_platform_expansion_authority.py",
                 "004_research_thesis_authority.py",
                 "005_platform_bootstrap_authority.py",
+                "006_research_dataset_bundles.py",
             )
             applied: list[str] = []
             with self.engine.begin() as connection:
@@ -662,7 +673,7 @@ class PlatformDatabase:
         if self.is_postgresql:
             with self.engine.connect() as connection:
                 revision = connection.execute(text("SELECT version_num FROM alembic_version"))
-                if revision.scalar_one_or_none() != "platform_v2_0005":
+                if revision.scalar_one_or_none() != "platform_v2_0006":
                     raise RuntimeError("database is not at the current Alembic revision")
 
     def dispose(self) -> None:

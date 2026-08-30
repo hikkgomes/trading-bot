@@ -27,7 +27,7 @@ from src.strategies.manifest import (
     manifest_source_type,
     registered_live_contract,
 )
-from src.strategies.registry import available, describe
+from src.strategies.registry import available, describe, get
 
 
 def registered_strategy_theses(
@@ -140,6 +140,8 @@ def registered_strategy_candidates(
     dataset_snapshot_hashes: Iterable[str],
     instrument_universe: Iterable[str] = ("BTCUSDT",),
     submitted_at: str | None = None,
+    dataset_bundle_id: str | None = None,
+    universe_snapshot_id: str | None = None,
 ) -> tuple[Candidate, ...]:
     """Create common-contract candidates for every registered strategy.
 
@@ -161,7 +163,13 @@ def registered_strategy_candidates(
         entry = manifest.get(name)
         if entry is None:
             raise ValueError(f"registered strategy is missing from the manifest: {name}")
-        feature_nodes, production_rule = registered_live_contract(name)
+        feature_nodes, _ = registered_live_contract(name)
+        strategy_class = get(name)
+        parameters = strategy_class.default_params()
+        universe_definition = {"type": "fixed", "symbols": list(universe)}
+        if universe_snapshot_id is not None:
+            universe_definition["type"] = "point_in_time"
+            universe_definition["universe_snapshot_id"] = universe_snapshot_id
         evidence_type = (
             "btc_allocation"
             if product == "btc_accumulation"
@@ -172,10 +180,14 @@ def registered_strategy_candidates(
             version="registered-v1",
             family=entry.family,
             product=product,
-            universe={"predeclared": list(universe)},
+            universe=universe_definition,
             data_requirements={"closed_ohlcv_bars": True},
             feature_graph={"version": "canonical-features/v2", "required_nodes": feature_nodes},
-            signal_model={"registered_strategy": name, "production_rule": production_rule},
+            signal_model={
+                "registered_strategy": name,
+                "parameters": parameters,
+                "behaviour_contract": "registered_strategy/v1",
+            },
             position_model={"kind": "volatility_scaled"},
             execution_preferences={"policy": "market"},
             risk_policy={"product_policy": product},
@@ -191,7 +203,7 @@ def registered_strategy_candidates(
                 "canonical_source_type": manifest_source_type(name),
                 "executable_registry_entry": True,
             },
-        )
+            )
         candidates.append(
             Candidate(
                 definition=definition,
@@ -200,6 +212,7 @@ def registered_strategy_candidates(
                 provider="registered_strategy_catalogue",
                 dataset_snapshot_hashes=tuple(dataset_snapshot_hashes),
                 submitted_at=now,
+                dataset_bundle_id=dataset_bundle_id,
             )
         )
     return tuple(candidates)

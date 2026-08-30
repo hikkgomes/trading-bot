@@ -30,6 +30,7 @@ class Candidate:
     dataset_snapshot_hashes: tuple[str, ...]
     submitted_at: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    dataset_bundle_id: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("thesis_id", "lineage_id"):
@@ -47,18 +48,24 @@ class Candidate:
         if not isinstance(self.metadata, Mapping):
             raise ValueError("metadata must be an object")
         object.__setattr__(self, "metadata", json_value(dict(self.metadata), field="metadata"))
+        if self.dataset_bundle_id is not None:
+            value = non_empty(self.dataset_bundle_id, field="dataset_bundle_id")
+            if not value.startswith("sha256:") or len(value) != 71:
+                raise ValueError("dataset_bundle_id must be a SHA-256 identity")
+            object.__setattr__(self, "dataset_bundle_id", value)
 
     @property
     def candidate_id(self) -> str:
-        return canonical_hash(
-            {
-                "definition_hash": self.definition.definition_hash,
-                "thesis_id": self.thesis_id,
-                "lineage_id": self.lineage_id,
-                "provider": self.provider,
-                "dataset_snapshot_hashes": self.dataset_snapshot_hashes,
-            }
-        )
+        payload = {
+            "definition_hash": self.definition.definition_hash,
+            "thesis_id": self.thesis_id,
+            "lineage_id": self.lineage_id,
+            "provider": self.provider,
+            "dataset_snapshot_hashes": self.dataset_snapshot_hashes,
+        }
+        if self.dataset_bundle_id is not None:
+            payload["dataset_bundle_id"] = self.dataset_bundle_id
+        return canonical_hash(payload)
 
 
 @dataclass(frozen=True)
@@ -73,6 +80,7 @@ class CandidateEvaluationView:
     dataset_snapshot_hashes: tuple[str, ...]
     submitted_at: str
     metadata: Mapping[str, Any]
+    dataset_bundle_id: str | None = None
 
     @classmethod
     def from_candidate(
@@ -90,6 +98,7 @@ class CandidateEvaluationView:
             dataset_snapshot_hashes=snapshots,
             submitted_at=candidate.submitted_at,
             metadata=candidate.metadata,
+            dataset_bundle_id=candidate.dataset_bundle_id,
         )
 
 

@@ -31,6 +31,7 @@ def provider_candidate(
     risk_policy: Mapping[str, Any] | None = None,
     validation_policy: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
+    dataset_bundle_id: str | None = None,
 ) -> Candidate:
     definition = StrategyDefinition(
         identity=identity,
@@ -57,4 +58,5 @@ def provider_candidate(
         dataset_snapshot_hashes=dataset_snapshot_hashes,
         submitted_at=submitted_at,
         metadata=metadata or {},
+        dataset_bundle_id=dataset_bundle_id,
     )

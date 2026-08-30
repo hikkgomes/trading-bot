@@ -187,6 +187,7 @@ class SqlResearchStore:
                     state=CandidateState.QUEUED.value,
                     submitted_at=candidate.submitted_at,
                     dataset_snapshot_hashes=list(candidate.dataset_snapshot_hashes),
+                    dataset_bundle_id=candidate.dataset_bundle_id,
                     metadata=metadata_payload,
                 )
             )
@@ -235,6 +236,7 @@ class SqlResearchStore:
             dataset_snapshot_hashes=tuple(row["dataset_snapshot_hashes"]),
             submitted_at=row["submitted_at"],
             metadata=row["metadata"],
+            dataset_bundle_id=row.get("dataset_bundle_id"),
         )
 
     def claim_trial(self, candidate: Candidate) -> None:

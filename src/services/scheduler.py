@@ -13,6 +13,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 
 from src.data.database import (
+    dataset_bundle,
     dataset_snapshot,
     experiment,
     job,
@@ -548,27 +549,35 @@ class PlatformScheduler:
             }
         if schedule_name == "register_strategy_catalogue":
             with self.engine.connect() as connection:
-                rows = connection.execute(
-                    select(
-                        dataset_snapshot.c.id,
-                        dataset_snapshot.c.created_at,
-                        dataset_snapshot.c.payload,
-                    ).order_by(dataset_snapshot.c.created_at.desc())
-                ).mappings()
-                snapshot_ids = []
-                for row in rows:
-                    payload = row["payload"]
-                    if (
-                        isinstance(payload, Mapping)
-                        and str(payload.get("product_id")) == product_id
-                    ):
-                        snapshot_ids = [str(row["id"])]
-                        break
+                row = connection.execute(
+                    select(dataset_bundle.c.id, dataset_bundle.c.created_at, dataset_bundle.c.payload)
+                    .where(dataset_bundle.c.product_id == product_id)
+                    .order_by(dataset_bundle.c.created_at.desc(), dataset_bundle.c.id.desc())
+                    .limit(1)
+                ).mappings().first()
+            bundle_payload = row["payload"] if row is not None else None
+            stage_ids = (
+                bundle_payload.get("stage_snapshot_ids")
+                if isinstance(bundle_payload, Mapping)
+                else None
+            )
+            snapshot_ids = (
+                list(dict.fromkeys(str(value) for value in stage_ids.values()))
+                if isinstance(stage_ids, Mapping)
+                else []
+            )
             return {
                 **base,
                 "instrument_universe": self._universe_symbols(product, now),
                 "dataset_snapshot_hashes": snapshot_ids,
-                "catalogue_submitted_at": (str(row["created_at"]) if snapshot_ids else now),
+                "dataset_bundle_id": str(row["id"]) if row is not None else None,
+                "universe_snapshot_id": (
+                    str(bundle_payload["universe_snapshot_id"])
+                    if isinstance(bundle_payload, Mapping)
+                    and bundle_payload.get("universe_snapshot_id")
+                    else None
+                ),
+                "catalogue_submitted_at": (str(row["created_at"]) if row is not None else now),
             }
         return base
 
