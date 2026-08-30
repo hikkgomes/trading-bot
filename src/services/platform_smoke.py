@@ -173,7 +173,18 @@ def _product_fixture(
         ),
         policy=UniverseEligibilityPolicy(),
     )
-    assignment_id = _seed_strategy(database, product, instrument, universe_snapshot_id, now, prefix)
+    assignment_id = _seed_strategy(
+        database,
+        product,
+        instrument,
+        universe_snapshot_id,
+        now,
+        prefix,
+        # The smoke has one closed candle.  Use a registered rule whose
+        # behaviour is meaningful with that minimum frame while still
+        # exercising the shared research/runtime dispatcher.
+        strategy_name="condition_grid",
+    )
     assignments = SqlActiveStrategyAssignmentRepository(database.engine)
     snapshots = SqlRiskSnapshotStore(database.engine)
     _install_risk_policy(database, str(product["risk_policy_id"]))
@@ -327,6 +338,7 @@ def _product_fixture(
         feature_store=feature_store,
         portfolio=repository,
         assignments=assignments,
+        snapshot_store=snapshots,
     )
     portfolio_worker = DatabasePortfolioTargetWorker(
         queue=queue,
@@ -507,6 +519,20 @@ def _seed_strategy(
 ) -> str:
     product_id = str(product["product_id"])
     feature_nodes, _ = registered_feature_contract(strategy_name)
+    strategy_parameters = get_registered_strategy(strategy_name).default_params()
+    if strategy_name == "condition_grid":
+        strategy_parameters = {
+            **strategy_parameters,
+            "conditions": [
+                {
+                    "feature": "close",
+                    "kind": "value_ge",
+                    "threshold": 0.0,
+                    "description": "smoke price is positive",
+                }
+            ],
+            "direction": "long",
+        }
     definition = StrategyDefinition(
         identity=prefix + ":" + strategy_name,
         version="smoke-v1",
@@ -517,7 +543,7 @@ def _seed_strategy(
         feature_graph={"version": "core-bars-v1", "required_nodes": list(feature_nodes)},
         signal_model={
             "registered_strategy": strategy_name,
-            "parameters": get_registered_strategy(strategy_name).default_params(),
+            "parameters": strategy_parameters,
             "behaviour_contract": "registered_strategy/v1",
         },
         position_model={"kind": "volatility_scaled"},
