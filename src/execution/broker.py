@@ -206,6 +206,11 @@ class Broker(ABC):
     ) -> BrokerOrderState:
         raise NotImplementedError(f"{self.name} cannot query exchange order state")
 
+    def cancel_order(
+        self, *, symbol: str, exchange_order_id: str, client_order_id: str
+    ) -> BrokerOrderState:
+        raise NotImplementedError(f"{self.name} cannot cancel exchange orders")
+
     def normalize_order_qty(
         self,
         symbol: str,

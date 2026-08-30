@@ -130,6 +130,48 @@ class CcxtBroker(Broker):
             average_price=average,
         )
 
+    def cancel_order(
+        self, *, symbol: str, exchange_order_id: str, client_order_id: str
+    ) -> BrokerOrderState:
+        if not exchange_order_id and not client_order_id:
+            raise RuntimeError("exchange order cancellation requires an order identity")
+        cancel = getattr(self._client, "cancel_order", None)
+        if not callable(cancel):
+            raise RuntimeError("ccxt client cannot cancel exchange orders")
+        lookup_id = exchange_order_id or client_order_id
+        params = {"origClientOrderId": client_order_id} if not exchange_order_id else {}
+        try:
+            payload = cancel(lookup_id, self._ccxt_symbol(symbol), params)
+        except Exception as exc:
+            raise RuntimeError(f"could not cancel exchange order {lookup_id}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("exchange cancellation response is not an object")
+        info_value = payload.get("info")
+        info = info_value if isinstance(info_value, dict) else {}
+        resolved_id = str(payload.get("id") or info.get("orderId") or exchange_order_id).strip()
+        resolved_client = str(
+            payload.get("clientOrderId") or info.get("clientOrderId") or client_order_id
+        ).strip()
+        if not resolved_id or not resolved_client:
+            raise RuntimeError("exchange cancellation response has no complete order identity")
+        if exchange_order_id and resolved_id != exchange_order_id:
+            raise RuntimeError("exchange cancellation response changed the exchange order ID")
+        if client_order_id and resolved_client != client_order_id:
+            raise RuntimeError("exchange cancellation response changed the client order ID")
+        status = str(payload.get("status") or info.get("status") or "canceled").lower()
+        filled = float(payload.get("filled") or info.get("executedQty") or 0.0)
+        average_raw = payload.get("average") or payload.get("price")
+        average = float(average_raw) if average_raw not in {None, ""} and filled > 0 else None
+        if not math.isfinite(filled) or filled < 0:
+            raise RuntimeError("exchange cancellation response has invalid fill quantity")
+        return BrokerOrderState(
+            exchange_order_id=resolved_id,
+            client_order_id=resolved_client,
+            status=status,
+            filled_quantity=filled,
+            average_price=average,
+        )
+
     @property
     def account_fingerprint(self) -> str:
         """Non-secret identity of the credential and venue this broker uses."""

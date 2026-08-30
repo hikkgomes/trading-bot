@@ -7,9 +7,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from src.domain.instruments import Instrument
-from src.domain.orders import OrderIntent
+from src.domain.orders import OrderIntent, OrderStatus
 from src.execution.broker import (
     Broker,
+    BrokerOrderState,
     Order,
 )
 from src.execution.broker import (
@@ -92,6 +93,30 @@ class BrokerExecutionVenue:
             exchange_order_id=exchange_order_id,
             status="acknowledged",
         )
+
+    def cancel(self, intent: OrderIntent) -> BrokerOrderState:
+        """Cancel a previously acknowledged regular order and verify the result."""
+        instrument = self.instruments.get(intent.instrument_id)
+        if instrument is None:
+            raise ValueError(f"instrument is not approved for cancellation: {intent.instrument_id}")
+        exchange_order_id = str(intent.metadata.get("exchange_order_id") or "")
+        client_order_id = str(intent.metadata.get("client_order_id") or "")
+        if not exchange_order_id and not client_order_id:
+            raise ValueError(f"order {intent.order_id} has no exchange cancellation identity")
+        current = self.order_manager.get(intent.order_id)
+        if current.status in {OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED}:
+            self.order_manager.request_cancel(intent.order_id)
+        state = self.broker.cancel_order(
+            symbol=instrument.exchange_symbol,
+            exchange_order_id=exchange_order_id,
+            client_order_id=client_order_id,
+        )
+        if str(state.status).lower() in {"open", "new", "accepted", "partially_filled"}:
+            self.order_manager.recovery_required(intent.order_id)
+            raise RuntimeError(f"exchange order {intent.order_id} remains open after cancellation")
+        if self.order_manager.get(intent.order_id).status is OrderStatus.CANCEL_PENDING:
+            self.order_manager.cancelled(intent.order_id)
+        return state
 
 
 def bounded_client_order_id(intent: OrderIntent) -> str:
