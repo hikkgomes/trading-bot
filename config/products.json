@@ -44,6 +44,7 @@
       "risk_policy_id": "active-income",
       "accounting_policy": "usdt_nav",
       "execution_costs": {"fee_bps": 5.0, "slippage_bps": 2.0},
+      "protective_stop_fraction": 0.02,
       "execution_mode": "paper"
     }
   ]

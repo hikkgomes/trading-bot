@@ -165,6 +165,7 @@ class DatabasePortfolioTargetBuilder:
                 product_drawdown_fraction=float(clean["product_drawdown_fraction"]),
                 available_margin_fraction=max(0.0, 1.0 - float(clean["used_margin_fraction"])),
                 risk_budget=float(clean["portfolio_risk_budget"]),
+                protective_stop_fraction=float(product.get("protective_stop_fraction", 0.02)),
             )
         if not targets:
             raise ValueError("portfolio optimiser produced no targets")

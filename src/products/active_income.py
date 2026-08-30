@@ -33,6 +33,7 @@ class ActiveIncomePortfolio:
         product_drawdown_fraction: float = 0.0,
         available_margin_fraction: float = 1.0,
         risk_budget: float = 1.0,
+        protective_stop_fraction: float = 0.02,
     ) -> tuple[TargetPosition, ...]:
         return optimise_targets(
             aggregate_forecasts(forecasts),
@@ -51,4 +52,5 @@ class ActiveIncomePortfolio:
             product_drawdown_fraction=product_drawdown_fraction,
             available_margin_fraction=available_margin_fraction,
             risk_budget=risk_budget,
+            protective_stop_fraction=protective_stop_fraction,
         )

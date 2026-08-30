@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
+from src.domain._codec import finite
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.domain.portfolios import TargetPosition
 
@@ -81,6 +82,7 @@ def optimise_targets(
     product_drawdown_fraction: float = 0.0,
     available_margin_fraction: float = 1.0,
     risk_budget: float = 1.0,
+    protective_stop_fraction: float | None = None,
 ) -> tuple[TargetPosition, ...]:
     """Allocate compatible forecasts to simultaneous target positions.
 
@@ -101,6 +103,12 @@ def optimise_targets(
         raise ValueError("available_margin_fraction must be in [0, 1]")
     if not 0 <= product_drawdown_fraction <= 1:
         raise ValueError("product_drawdown_fraction must be in [0, 1]")
+    if protective_stop_fraction is not None:
+        protective_stop_fraction = finite(
+            protective_stop_fraction, field="protective_stop_fraction", minimum=0.0
+        )
+        if not 0 < protective_stop_fraction < 1:
+            raise ValueError("protective_stop_fraction must be in (0, 1)")
     candidates = [
         forecast
         for forecast in forecasts
@@ -206,6 +214,11 @@ def optimise_targets(
     for forecast, fraction in selected:
         price = float(prices[forecast.instrument_id])
         notional = constraints.equity * fraction
+        protective_stop = (
+            _protective_stop_metadata(price, fraction, protective_stop_fraction)
+            if protective_stop_fraction is not None
+            else {}
+        )
         targets.append(
             TargetPosition(
                 portfolio_id=constraints.portfolio_id,
@@ -248,6 +261,7 @@ def optimise_targets(
                         if forecast.metadata.get("recovery_policy")
                         else {}
                     ),
+                    **protective_stop,
                 },
             )
         )
@@ -280,3 +294,18 @@ def optimise_targets(
             )
         )
     return tuple(targets)
+
+
+def _protective_stop_metadata(
+    price: float, signed_fraction: float, stop_fraction: float
+) -> dict[str, float]:
+    if price <= 0:
+        raise ValueError("protective stop reference price must be positive")
+    trigger = price * (
+        1.0 - stop_fraction if signed_fraction > 0 else 1.0 + stop_fraction
+    )
+    return {
+        "reference_price": price,
+        "protective_stop_price": trigger,
+        "protective_stop_fraction": stop_fraction,
+    }
