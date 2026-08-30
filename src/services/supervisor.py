@@ -759,6 +759,7 @@ def _research_cycle(
     parquet_root: Path,
     artefact_root: Path,
     research_configuration: Mapping[str, Any],
+    configuration: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> Callable[[], dict[str, Any]]:
     job_names_by_service = {
         "research-worker": (
@@ -851,6 +852,7 @@ def _research_cycle(
         dataset_resolver=dataset_resolver,
         dataset_loader=load_research_dataset,
         evidence_policy=evidence_policy,
+        configuration=configuration,
     ).handlers()
     worker = ResearchWorker(
         runtime=runtime,
@@ -1020,6 +1022,7 @@ def run(args: argparse.Namespace) -> int:
             parquet_root=Path(config.paths["parquet"]),
             artefact_root=Path(config.paths["artefacts"]),
             research_configuration=split_configuration["research"],
+            configuration=split_configuration,
         )
     elif args.service == "agent-sandbox":
         configured_worktree_root = os.environ.get("TRADING_PLATFORM_AGENT_WORKTREE_ROOT")

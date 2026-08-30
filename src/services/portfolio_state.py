@@ -662,8 +662,10 @@ class DatabasePortfolioStateWorker:
                     "error": error,
                 }
             retry_at = (
-                dt.datetime.fromisoformat(now) + dt.timedelta(seconds=self.lease_seconds)
-            ).replace(microsecond=0).isoformat()
+                (dt.datetime.fromisoformat(now) + dt.timedelta(seconds=self.lease_seconds))
+                .replace(microsecond=0)
+                .isoformat()
+            )
             self.queue.fail(
                 claimed,
                 completed_at=now,

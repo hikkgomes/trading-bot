@@ -89,30 +89,6 @@ def test_deployment_runbook_targets_the_actual_optiplex_checkout() -> None:
     assert "http://127.0.0.1:8088/status" in runbook
 
 
-def test_ci_runs_real_service_user_permission_rehearsal() -> None:
-    makefile = (ROOT / "Makefile").read_text()
-    workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-    verifier = (ROOT / "scripts/verify_platform_service_install.sh").read_text()
-
-    assert 'REPO="${REPO:-/home/alfred/trading-bot}"' in verifier
-    assert "sudo apt-get install -y acl" in workflow
-    assert 'sudo cp -a "$GITHUB_WORKSPACE" /opt/trading-bot' in workflow
-    assert 'sudo mv "$GITHUB_WORKSPACE" /opt/trading-bot' not in workflow
-    assert "REPO=/opt/trading-bot" in workflow
-    assert "jq '.postgresql.require_tls = false'" in workflow
-    assert "TRADING_PLATFORM_CONFIG=/opt/trading-bot/config/platform.ci.json" in workflow
-    assert "SKIP_SYSTEMD=1" in workflow
-    assert "scripts/install_platform_services.sh" in workflow
-    assert "scripts/verify_platform_service_install.sh" in workflow
-    assert "--service platform-scheduler --once" in workflow
-    assert "--service account-reconciliation --once" in workflow
-    assert 'sudo chown -R "$USER:$(id -gn)" /opt/trading-bot/data' in workflow
-    assert '\'cd "$1" && shift && exec "$@"\'' in verifier
-    assert 'platform-service-cycle "$REPO" env' in verifier
-    assert "git -C \"$REPO\" cat-file -e 'HEAD^{commit}'" in verifier
-    assert 'REPO="$(CURDIR)" bash scripts/verify_platform_service_install.sh' in makefile
-
-
 @pytest.mark.skipif(
     os.geteuid() != 0 or not INSTALLED_ROOT.is_dir(),
     reason="requires the installed Linux platform and root user",

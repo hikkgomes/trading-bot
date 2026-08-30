@@ -5,9 +5,13 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from sqlalchemy import select
+
+from src.data.database import validation_stage
 from src.data.parquet_store import PartitionedBacktestStore
 from src.domain._codec import canonical_hash
 from src.domain.strategies import StrategySourceType
+from src.research.artefacts import StrategyArtefact
 from src.research.backtest.bar_engine import BarPortfolioEngine, BarStep
 from src.research.backtest.event_engine import (
     EventReplayEngine,
@@ -15,6 +19,7 @@ from src.research.backtest.event_engine import (
     SimulatedLimitOrder,
     SimulatedOrderSide,
 )
+from src.research.canonical import SqlStrategyArtefactRepository
 from src.research.catalogue import registered_strategy_candidates, registered_strategy_theses
 from src.research.coordinator import Candidate, CandidateEvaluationView, ResearchCoordinator
 from src.research.datasets import CanonicalDatasetResolver
@@ -95,6 +100,7 @@ class DatabaseResearchJobHandlers:
         executors: ProviderExecutorRegistry | None = None,
         context_builders: ProviderContextBuilderRegistry | None = None,
         evidence_policy: EvidencePolicy | None = None,
+        configuration: Mapping[str, Mapping[str, Any]] | None = None,
     ):
         self.store = store
         self.artefact_store = artefact_store
@@ -104,6 +110,7 @@ class DatabaseResearchJobHandlers:
         self.executors = executors or ProviderExecutorRegistry.default()
         self.context_builders = context_builders or ProviderContextBuilderRegistry.default()
         self.evidence_policy = evidence_policy or EvidencePolicy()
+        self.configuration = configuration
 
     def handlers(self) -> dict[str, Callable]:
         return {
@@ -317,7 +324,7 @@ class DatabaseResearchJobHandlers:
             ),
             evidence_policy=self.evidence_policy,
         ).evaluate(request)
-        return {
+        response = {
             "candidate_id": result.candidate_id,
             "stage": result.stage,
             "accepted": result.accepted,
@@ -325,6 +332,153 @@ class DatabaseResearchJobHandlers:
             "run_id": result.run_id,
             "evidence_hash": result.evidence_hash,
         }
+        if result.stage == "protected" and result.accepted:
+            response["artefact_hash"] = self._publish_strategy_artefact(
+                candidate=candidate,
+                request=request,
+                evidence=result.evidence,
+            )
+        return response
+
+    def _publish_strategy_artefact(
+        self,
+        *,
+        candidate: Candidate,
+        request: EvaluationRequest,
+        evidence: Mapping[str, Any],
+    ) -> str:
+        if self.configuration is None or self.dataset_resolver is None:
+            raise JobSchemaError("accepted protected research requires platform configuration")
+        if (
+            candidate.metadata.get("diagnostic") is True
+            or candidate.definition.metadata.get("diagnostic") is True
+            or candidate.metadata.get("promotable") is False
+            or candidate.definition.metadata.get("promotable") is False
+        ):
+            raise JobSchemaError("diagnostic research cannot create a promotable artefact")
+
+        products = {
+            str(item["product_id"]): dict(item)
+            for item in self.configuration["products"]["products"]
+        }
+        policies = {
+            str(item["policy_id"]): dict(item)
+            for item in self.configuration["promotion"]["policies"]
+        }
+        product = products[candidate.definition.product]
+        policy_id = str(product["promotion_policy_id"])
+        with self.store.engine.connect() as connection:
+            stages = connection.execute(
+                select(
+                    validation_stage.c.id,
+                    validation_stage.c.stage,
+                    validation_stage.c.payload,
+                )
+                .where(
+                    validation_stage.c.experiment_id == candidate.candidate_id,
+                    validation_stage.c.accepted.is_(True),
+                    validation_stage.c.stage.in_(
+                        ("screening", "development", "robustness", "protected")
+                    ),
+                )
+                .order_by(validation_stage.c.evaluated_at, validation_stage.c.stage)
+            ).all()
+        stages_by_name = {str(row.stage): str(row.id) for row in stages}
+        required_stages = ("screening", "development", "robustness", "protected")
+        if set(stages_by_name) != set(required_stages):
+            raise JobSchemaError("promotable artefact requires every accepted research stage")
+        snapshot_ids = list(request.dataset_snapshot_ids)
+        for row in stages:
+            payload = row.payload if isinstance(row.payload, Mapping) else {}
+            stage_evidence = payload.get("evidence")
+            context = stage_evidence.get("context") if isinstance(stage_evidence, Mapping) else None
+            if isinstance(context, Mapping):
+                snapshot_ids.extend(str(value) for value in context.get("dataset_snapshot_ids", ()))
+        dataset_snapshot_hashes = tuple(dict.fromkeys(snapshot_ids))
+        resolved = tuple(
+            self.dataset_resolver.resolve(
+                snapshot_id,
+                expected={
+                    "feature_manifest_hash": str(request.feature_manifest_id),
+                    "cost_model_hash": str(request.cost_model_id),
+                    "parameter_set_hash": str(request.parameter_set_id),
+                    "product_id": candidate.definition.product,
+                },
+            )
+            for snapshot_id in dataset_snapshot_hashes
+        )
+        raw_claims = evidence.get("holdout_claim")
+        if not isinstance(raw_claims, list) or len(raw_claims) != 1:
+            raise JobSchemaError("promotable artefact requires one protected holdout claim")
+
+        dependency_hash = canonical_hash(
+            {
+                "evaluator_version": request.evaluator_version,
+                "producer_identity": request.producer_identity,
+                "feature_manifest_id": request.feature_manifest_id,
+                "cost_model_id": request.cost_model_id,
+                "parameter_set_id": request.parameter_set_id,
+            }
+        )
+        artefact = StrategyArtefact.from_authoritative_evidence(
+            definition=candidate.definition,
+            dependency_hash=dependency_hash,
+            dependency_lock_hash=dependency_hash,
+            source_commit_hash=candidate.definition.source_hash,
+            dataset_snapshot_hashes=dataset_snapshot_hashes,
+            feature_set_version=str(request.feature_manifest_id),
+            feature_set_hash=str(request.feature_manifest_id),
+            cost_model_version=str(request.cost_model_id),
+            cost_model_hash=str(request.cost_model_id),
+            validation_stage_ids=tuple(stages_by_name[name] for name in required_stages),
+            holdout_claim_id=str(raw_claims[0]),
+            promotion_policy=policies[policy_id],
+            position_limits=dict(self.configuration["risk"]["strategy"]),
+            risk_limits={
+                "global": dict(self.configuration["risk"]["global"]),
+                "account": dict(self.configuration["risk"]["accounts"][str(product["account_id"])]),
+                "product": dict(
+                    self.configuration["risk"]["products"][str(product["risk_policy_id"])]
+                ),
+            },
+            model_hashes=tuple(
+                dict.fromkeys(
+                    item.model_artefact_id
+                    for item in resolved
+                    if item.model_artefact_id is not None
+                )
+            ),
+            supported_products=(candidate.definition.product,),
+            supported_instruments=tuple(
+                dict.fromkeys(symbol for item in resolved for symbol in item.instrument_scope)
+            ),
+            created_at=request.evaluated_at,
+            validation_evidence={
+                "stage_ids": [stages_by_name[name] for name in required_stages],
+                "protected_evidence_hash": canonical_hash(dict(evidence)),
+            },
+            holdout_claim={
+                "claim_id": str(raw_claims[0]),
+                "outcome_id": evidence.get("holdout_outcome_id"),
+            },
+            metadata={
+                "candidate_id": candidate.candidate_id,
+                "thesis_id": candidate.thesis_id,
+                "lineage_id": candidate.lineage_id,
+                "diagnostic": False,
+                "promotable": True,
+            },
+            product_id=candidate.definition.product,
+            portfolio_id=str(product["portfolio_id"]),
+            account_id=str(product["account_id"]),
+            promotion_policy_id=policy_id,
+            engine_version=request.evaluator_version,
+        )
+        return SqlStrategyArtefactRepository(self.store.engine).put(
+            artefact.artefact_hash,
+            artefact.to_dict(),
+            created_at=request.evaluated_at,
+        )
 
     def bounded_backtest(
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]

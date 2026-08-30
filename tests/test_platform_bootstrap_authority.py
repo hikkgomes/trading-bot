@@ -33,6 +33,7 @@ from src.data.universe import (
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.instruments import Instrument, MarketType
 from src.domain.market_events import MarketEventType
+from src.domain.orders import OrderSide
 from src.execution.broker import FuturesPositionIdentity, OpenOrderIdentity
 from src.execution.ccxt_broker import CcxtBroker
 from src.execution.config import ExchangeConfig
@@ -60,6 +61,7 @@ from src.services.platform_smoke import _product_fixture, _seed_strategy
 from src.services.platform_testnet_connected import (
     ConnectedTestnetError,
     _connected_gateway,
+    _emergency_restore_position,
     _verify_recovery_lookup,
     validate_connected_testnet_configuration,
 )
@@ -1191,6 +1193,48 @@ def test_connected_rehearsal_rejects_test_doubles() -> None:
                 "injected_broker": object(),
             }
         )
+
+
+def test_connected_rehearsal_accepts_btc_spot_product() -> None:
+    result = validate_connected_testnet_configuration(
+        {
+            "environment": "testnet",
+            "queue_backend": "postgresql",
+            "product_id": "btc_accumulation",
+        }
+    )
+
+    assert result["product_id"] == "btc_accumulation"
+
+
+def test_connected_rehearsal_emergency_close_restores_futures_position() -> None:
+    class Broker:
+        closed = []
+
+        @classmethod
+        def close_position(cls, symbol):
+            cls.closed.append(symbol)
+
+        @staticmethod
+        def account_snapshot(*, expected_symbols):
+            assert expected_symbols == ("BTCUSDT",)
+            return {
+                "positions": {},
+                "regular_orders": [],
+                "conditional_orders": [],
+                "unknown_exposure": {},
+            }
+
+    _emergency_restore_position(
+        broker=Broker(),
+        symbol="BTCUSDT",
+        market="usdt_futures",
+        opening_side=OrderSide.BUY,
+        open_quantity=0.001,
+        initial_positions={},
+    )
+
+    assert Broker.closed == ["BTCUSDT"]
 
 
 def test_connected_rehearsal_uses_exchange_and_client_order_recovery() -> None:

@@ -27,6 +27,9 @@ from src.data.feature_store import SqlFeatureStore
 from src.domain._codec import canonical_hash
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.domain.orders import OrderIntent, OrderSide, OrderStatus, OrderType
+from src.execution.broker import Order as BrokerOrder
+from src.execution.broker import OrderSide as BrokerOrderSide
+from src.execution.broker import OrderType as BrokerOrderType
 from src.execution.order_manager import OrderManager, SqlOrderStore
 from src.execution.position_manager import PositionManager, SqlPositionStore
 from src.observability.decision_trace import SqlDecisionTraceStore
@@ -84,8 +87,8 @@ def validate_connected_testnet_configuration(configuration: Mapping[str, Any]) -
             "connected rehearsal cannot use an injected broker or captured events"
         )
     product_id = str(configuration.get("product_id") or "")
-    if product_id != "active_income":
-        raise ConnectedTestnetError("connected rehearsal is restricted to active_income")
+    if product_id not in {"btc_accumulation", "active_income"}:
+        raise ConnectedTestnetError("connected rehearsal requires a configured trading product")
     notional = float(configuration.get("notional_usd", 10.0))
     if notional <= 0 or notional > 100.0:
         raise ConnectedTestnetError("connected rehearsal notional must be in (0, 100]")
@@ -154,15 +157,16 @@ def run_connected_testnet_rehearsal(
         ).reconcile_once(now=now)
         if any(
             item.get("unknown_exposure")
-            or item.get("positions")
             or item.get("regular_orders")
             or item.get("conditional_orders")
+            or (account.get("market") != "spot" and item.get("positions"))
             for item in initial_account["accounts"]
         ):
             raise ConnectedTestnetError(
-                "testnet account must be flat and order-free before rehearsal"
+                "testnet account must have no unknown exposure or open orders before rehearsal"
             )
         account_detail = initial_account["accounts"][0]
+        initial_positions = dict(account_detail.get("positions") or {})
         state = _refresh_reconciled_state(
             database=database,
             queue=queue,
@@ -204,6 +208,8 @@ def run_connected_testnet_rehearsal(
         if quantity <= 0:
             raise ConnectedTestnetError("canonical portfolio target has no actionable quantity")
         opening_side = OrderSide.BUY if target_quantity > 0 else OrderSide.SELL
+        if account.get("market") == "spot" and opening_side is OrderSide.SELL:
+            raise ConnectedTestnetError("BTC spot rehearsal requires a positive canonical target")
         with database.engine.connect() as connection:
             accounting_before = int(
                 connection.execute(
@@ -236,6 +242,8 @@ def run_connected_testnet_rehearsal(
             approved_live=approved_live,
         )
         gateway.start()
+        open_quantity = 0.0
+        close_completed = False
         try:
             if not gateway.wait_for_user_stream(
                 str(account["account_id"]),
@@ -298,6 +306,7 @@ def run_connected_testnet_rehearsal(
                 strategy_version_id=str(assignment["strategy_version_id"]),
                 artefact_hash=str(assignment["artefact_hash"]),
             )
+            close_completed = True
             if order_manager.get(closed["order_id"]).status is not OrderStatus.FILLED:
                 raise ConnectedTestnetError("testnet close order was not filled")
             close_recovery = _verify_recovery_lookup(
@@ -305,6 +314,23 @@ def run_connected_testnet_rehearsal(
                 symbol=instrument.exchange_symbol,
                 submission=closed,
             )
+        except Exception as exc:
+            if open_quantity > 0 and not close_completed:
+                try:
+                    _emergency_restore_position(
+                        broker=broker,
+                        symbol=instrument.exchange_symbol,
+                        market=str(account["market"]),
+                        opening_side=opening_side,
+                        open_quantity=open_quantity,
+                        initial_positions=initial_positions,
+                    )
+                except Exception as cleanup_exc:
+                    raise ConnectedTestnetError(
+                        "connected rehearsal failed and emergency position restoration failed: "
+                        f"{cleanup_exc}"
+                    ) from exc
+            raise
         finally:
             gateway.stop()
         reconciliation = approved_live.reconcile(product_id)
@@ -318,12 +344,14 @@ def run_connected_testnet_rehearsal(
         final_details = final_account["accounts"]
         if any(
             item["unknown_exposure"]
-            or item["positions"]
             or item["regular_orders"]
             or item["conditional_orders"]
+            or not _positions_match(dict(item.get("positions") or {}), initial_positions)
             for item in final_details
         ):
-            raise ConnectedTestnetError("testnet account is not flat and order-free after close")
+            raise ConnectedTestnetError(
+                "testnet account did not restore its initial position and order state"
+            )
         with database.engine.connect() as connection:
             accounting_after = int(
                 connection.execute(
@@ -795,6 +823,45 @@ def _verify_recovery_lookup(*, venue, symbol: str, submission: Mapping[str, Any]
         "exchange_order_id": exchange_order_id,
         "client_order_id": client_order_id,
     }
+
+
+def _positions_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    keys = set(left) | set(right)
+    return all(abs(float(left.get(key, 0.0)) - float(right.get(key, 0.0))) <= 1e-10 for key in keys)
+
+
+def _emergency_restore_position(
+    *,
+    broker,
+    symbol: str,
+    market: str,
+    opening_side: OrderSide,
+    open_quantity: float,
+    initial_positions: Mapping[str, Any],
+) -> None:
+    if market == "spot":
+        broker.place_order(
+            BrokerOrder(
+                symbol=symbol,
+                side=(
+                    BrokerOrderSide.SELL if opening_side is OrderSide.BUY else BrokerOrderSide.BUY
+                ),
+                qty=open_quantity,
+                type=BrokerOrderType.MARKET,
+            )
+        )
+    else:
+        broker.close_position(symbol)
+    snapshot = broker.account_snapshot(expected_symbols=(symbol,))
+    if (
+        snapshot.get("unknown_exposure")
+        or snapshot.get("regular_orders")
+        or snapshot.get("conditional_orders")
+        or not _positions_match(dict(snapshot.get("positions") or {}), initial_positions)
+    ):
+        raise ConnectedTestnetError(
+            "emergency close did not restore the initial exchange account state"
+        )
 
 
 def _live_worker(
