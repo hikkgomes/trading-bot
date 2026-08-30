@@ -42,6 +42,8 @@ _EXECUTION_IDENTITY_FILES = (
     Path("src/services/order_execution.py"),
     Path("src/services/live_execution.py"),
     Path("src/services/exposure_budget.py"),
+    Path("src/services/protective_stops.py"),
+    Path("src/execution/stops.py"),
 )
 
 
@@ -252,6 +254,10 @@ class ApprovedLiveExecution:
         actual_fingerprint = str(getattr(venue.broker, "account_fingerprint", ""))
         if not expected_fingerprint or expected_fingerprint != actual_fingerprint:
             raise PermissionError("live order account fingerprint does not match reconciliation")
+        if not order.reduce_only and self.accounts[account_id].get("market") != "spot":
+            supports_stops = getattr(venue.broker, "supports_native_protective_stops", None)
+            if not callable(supports_stops) or not supports_stops():
+                raise PermissionError("live futures entry requires native protective stops")
         current_assignment = self.assignments.active(
             product_id,
             execution_mode="live",
