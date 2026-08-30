@@ -1303,7 +1303,8 @@ def test_btc_supervisor_rebuys_from_actual_stablecoin_balance_and_accounts_in_bt
             ),
             positions=positions,
             ledger=ledger,
-        )
+        ),
+        policy=BtcAllocationPolicy(core_btc_fraction=0.70, max_tactical_fraction=0.30),
     )
 
     result = supervisor.process_forecasts(

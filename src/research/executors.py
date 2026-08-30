@@ -159,16 +159,24 @@ def _measured_result(
     changes = [abs(signals[index] - signals[index - 1]) for index in range(1, observations)]
     turnover = sum(changes) / max(1, observations - 1)
     active = sum(1 for value in signals if abs(value) > 1e-12)
-    fee_rate = max(0.0, float(context.get("fee_bps", 1.0))) / 10_000.0
-    slippage_rate = max(0.0, float(context.get("slippage_bps", 1.0))) / 10_000.0
-    funding_rate = float(context.get("funding_rate", 0.0))
-    aligned = min(len(returns), max(0, observations - 1))
-    gross = [signals[index] * returns[index] for index in range(aligned)]
-    fees = turnover * fee_rate
-    slippage = turnover * slippage_rate
-    funding_pnl = -sum(signals[index] * funding_rate for index in range(aligned))
-    funding = max(0.0, -funding_pnl)
-    net_return = sum(gross) - fees - slippage + funding_pnl
+    from src.research.returns import PositionReturnLedger, ReturnLedgerError
+
+    try:
+        return_report = PositionReturnLedger(
+            fee_rate=max(0.0, float(context.get("fee_bps", 1.0))) / 10_000.0,
+            slippage_rate=max(0.0, float(context.get("slippage_bps", 1.0))) / 10_000.0,
+            funding_rate=float(context.get("funding_rate", 0.0)),
+        ).measure(signals, returns)
+    except (ReturnLedgerError, TypeError, ValueError) as exc:
+        raise ExecutorError(f"position return ledger input is invalid: {exc}") from exc
+    aligned = return_report.effective_observations
+    gross = list(return_report.gross_returns)
+    fees = return_report.fees
+    slippage = return_report.slippage
+    funding_pnl = return_report.funding_pnl
+    funding = return_report.funding_cost
+    turnover = return_report.turnover
+    net_return = return_report.net_pnl
     accounting = _product_accounting(context)
     if accounting is not None:
         net_return = float(accounting["return_fraction"])
@@ -279,6 +287,12 @@ def _measured_result(
         ),
         "signal_frequency": active / observations,
         "turnover": turnover,
+        "return_ledger": {
+            "gross_pnl": return_report.gross_pnl,
+            "net_pnl": return_report.net_pnl,
+            "net_returns": list(return_report.net_returns),
+            "maximum_drawdown": return_report.maximum_drawdown,
+        },
         "chronological": not bool(context.get("lookahead_detected", False)),
         "cost_adjusted_return": net_return,
         "fees": fees,
@@ -395,7 +409,10 @@ def _measured_result(
             ),
             "pbo": str(context.get("pbo_method") or "combinatorial_purged_pbo_v1"),
         },
-        "drawdown_stability": {"passed": bool(gross), "maximum_drawdown": _maximum_drawdown(gross)},
+        "drawdown_stability": {
+            "passed": bool(return_report.net_returns),
+            "maximum_drawdown": return_report.maximum_drawdown,
+        },
         "null_results": {
             "passed": all(item["passed"] for item in negative_controls.values()),
             "tests": len(negative_controls),

@@ -21,6 +21,7 @@ from src.research.evaluation import (
     StageEvaluation,
 )
 from src.research.providers import provider_candidate
+from src.research.returns import PositionReturnLedger, PositionReturnReport, ReturnLedgerError
 from src.research.store import SqlResearchStore
 from src.research.theses import ThesisRegistry
 
@@ -47,4 +48,7 @@ __all__ = [
     "StrategyArtefactStore",
     "ThesisRegistry",
     "provider_candidate",
+    "PositionReturnLedger",
+    "PositionReturnReport",
+    "ReturnLedgerError",
 ]

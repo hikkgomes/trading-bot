@@ -6,6 +6,7 @@ from sqlalchemy import select
 from src.data.database import PlatformDatabase, job
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.portfolio.optimiser import PortfolioConstraints, optimise_targets
+from src.products.btc_accumulation import BtcAllocationPolicy, target_btc_allocation
 from src.research.accounting import BtcAccumulationAccounting, FuturesIncomeAccounting
 from src.research.artefacts import StrategyArtefact
 from src.research.catalogue import registered_strategy_candidates
@@ -17,6 +18,7 @@ from src.research.datasets import (
 )
 from src.research.evaluation import EvidencePolicy, EvidenceStatus
 from src.research.executors import _cross_symbol_stability, _portfolio_overlap
+from src.research.returns import PositionReturnLedger
 from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.scheduler import DatabaseJobQueue
 from src.strategies.behaviour import RegisteredStrategyBehaviour
@@ -202,6 +204,18 @@ def test_btc_accounting_measures_sell_rebuy_in_btc_and_counts_costs() -> None:
     assert report.cycles == 1
 
 
+def test_btc_allocation_is_neutral_without_an_explicit_reserve() -> None:
+    neutral = target_btc_allocation(())
+    reserved = target_btc_allocation(
+        (), policy=BtcAllocationPolicy(core_btc_fraction=0.8, max_tactical_fraction=0.0)
+    )
+
+    assert neutral.target_btc_fraction == pytest.approx(1.0)
+    assert neutral.stablecoin_fraction == pytest.approx(0.0)
+    assert reserved.target_btc_fraction == pytest.approx(0.8)
+    assert reserved.stablecoin_fraction == pytest.approx(0.2)
+
+
 def test_futures_accounting_keeps_short_pnl_and_funding_signed() -> None:
     report = FuturesIncomeAccounting().evaluate(
         initial_cash=1_000.0,
@@ -268,6 +282,24 @@ def test_short_forecast_is_ranked_and_allocated_after_funding() -> None:
     assert len(targets) == 1
     assert targets[0].target_fraction < 0
     assert targets[0].metadata["net_expected_return"] == pytest.approx(0.11)
+
+
+def test_position_return_ledger_accumulates_signed_costs_once() -> None:
+    report = PositionReturnLedger(
+        fee_rate=0.01,
+        slippage_rate=0.005,
+        funding_rate=0.01,
+    ).measure(
+        positions=(1.0, -1.0, -1.0),
+        market_returns=(0.10, -0.05),
+    )
+
+    assert report.gross_pnl == pytest.approx(0.15)
+    assert report.turnover == pytest.approx(2.0)
+    assert report.fees == pytest.approx(0.02)
+    assert report.slippage == pytest.approx(0.01)
+    assert report.funding_pnl == pytest.approx(0.0)
+    assert report.net_pnl == pytest.approx(0.12)
 
 
 def test_dataset_bundle_supports_explicit_pending_lifecycle_and_verifies_stages(tmp_path) -> None:

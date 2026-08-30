@@ -10,8 +10,14 @@ from src.domain.forecasts import AlphaForecast, ForecastDirection
 
 @dataclass(frozen=True)
 class BtcAllocationPolicy:
-    core_btc_fraction: float = 0.70
-    max_tactical_fraction: float = 0.30
+    """Spot BTC policy with a neutral 100% BTC default.
+
+    A stablecoin reserve or tactical step-aside is an explicit product policy,
+    never an implicit consequence of a missing forecast.
+    """
+
+    core_btc_fraction: float = 1.0
+    max_tactical_fraction: float = 0.0
 
     def __post_init__(self) -> None:
         if not 0 <= self.core_btc_fraction <= 1:
