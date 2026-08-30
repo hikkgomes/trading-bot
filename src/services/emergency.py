@@ -11,6 +11,7 @@ from src.domain._codec import canonical_hash, timestamp
 from src.domain.orders import OrderIntent, OrderSide, OrderStatus, OrderType
 from src.execution.order_manager import OrderManager
 from src.execution.position_manager import PositionManager
+from src.services.alerting import AlertSeverity, SqlAlertService
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -27,6 +28,7 @@ class DatabaseEmergencyFlattenWorker:
         venues: Mapping[str, Any],
         products: Mapping[str, Mapping[str, Any]],
         lease_seconds: int = 60,
+        alerts: SqlAlertService | None = None,
     ) -> None:
         self.queue = queue
         self.worker_id = worker_id
@@ -35,6 +37,7 @@ class DatabaseEmergencyFlattenWorker:
         self.venues = dict(venues)
         self.products = {str(key): dict(value) for key, value in products.items()}
         self.lease_seconds = lease_seconds
+        self.alerts = alerts
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
@@ -57,6 +60,14 @@ class DatabaseEmergencyFlattenWorker:
                 for product_id in product_ids:
                     flattened.extend(self._reduce_product(product_id, claimed.payload, now))
         except Exception as exc:
+            self._emit_alert(
+                event_type="emergency_action_failed",
+                dedupe_key=f"emergency:{claimed.job_id}:failed",
+                target=str(claimed.payload.get("target") or "global"),
+                message=f"emergency action failed: {type(exc).__name__}",
+                emitted_at=now,
+                payload={"job_id": claimed.job_id, "error_type": type(exc).__name__},
+            )
             self.queue.fail(
                 claimed,
                 completed_at=now,
@@ -70,6 +81,18 @@ class DatabaseEmergencyFlattenWorker:
                 "error": str(exc),
             }
         self.queue.complete(claimed, completed_at=now)
+        self._emit_alert(
+            event_type="emergency_action_completed",
+            dedupe_key=f"emergency:{claimed.job_id}:completed",
+            target=str(claimed.payload.get("target") or "global"),
+            message="emergency action completed",
+            emitted_at=now,
+            payload={
+                "job_id": claimed.job_id,
+                "cancelled_entries": cancelled,
+                "flattened_orders": len(flattened),
+            },
+        )
         return {
             "reason_code": "emergency_action_completed",
             "job_id": claimed.job_id,
@@ -198,6 +221,32 @@ class DatabaseEmergencyFlattenWorker:
             return abs(quantity)
         core_fraction = _bounded_fraction(self.products[product_id].get("btc_core_fraction", 1.0))
         return abs(quantity) * (1.0 - core_fraction)
+
+    def _emit_alert(
+        self,
+        *,
+        event_type: str,
+        dedupe_key: str,
+        target: str,
+        message: str,
+        emitted_at: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        if self.alerts is None:
+            return
+        try:
+            self.alerts.emit(
+                event_type=event_type,
+                severity=AlertSeverity.CRITICAL,
+                dedupe_key=dedupe_key,
+                target=target,
+                message=message,
+                emitted_at=emitted_at,
+                payload=payload,
+                cooldown_seconds=0,
+            )
+        except Exception:
+            pass
 
 
 def _reference_price(venue: Any, instrument_id: str) -> float:

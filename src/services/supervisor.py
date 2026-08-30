@@ -26,6 +26,7 @@ from src.execution.order_groups import OrderGroupManager, SqlOrderGroupStore
 from src.execution.order_manager import OrderManager, SqlOrderStore
 from src.execution.position_manager import PositionManager, SqlPositionStore
 from src.execution.recovery import SqlRecoveryStore
+from src.execution.stops import SqlStopStore, StopManager
 from src.observability.decision_trace import SqlDecisionTraceStore
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.research.datasets import CanonicalDatasetResolver, SqlCanonicalDatasetRepository
@@ -37,10 +38,12 @@ from src.risk.policies import install_product_risk_policies
 from src.services.account_reconciliation import AccountReconciliationService
 from src.services.accounting_service import AccountingService, DatabaseAccountingWorker
 from src.services.agent_worker import DatabaseAgentJobHandlers
+from src.services.alerting import SqlAlertService, configured_alert_service
 from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.config import load_platform_config, load_split_configuration
 from src.services.control_api import DatabaseControlPlane, build_control_server
 from src.services.data_writer import DatabaseMarketDataWriter
+from src.services.emergency import DatabaseEmergencyFlattenWorker
 from src.services.feature_worker import DatabaseFeatureWorker
 from src.services.forward_observation import (
     DatabaseForwardObservationWorker,
@@ -76,6 +79,7 @@ from src.services.promotion import (
     SqlPromotionPolicyStore,
     SqlPromotionStore,
 )
+from src.services.protective_stops import LiveProtectiveStopService
 from src.services.report_worker import DatabaseReportWorker
 from src.services.research_jobs import DatabaseResearchJobHandlers
 from src.services.research_worker import ResearchWorker
@@ -240,11 +244,19 @@ def _execution_cycle(
     database: PlatformDatabase,
     configuration: Mapping[str, Mapping[str, Any]],
     node_id: str,
+    alerts: SqlAlertService | None = None,
+    control_plane: DatabaseControlPlane | None = None,
 ) -> Callable[[], dict[str, Any]]:
     products = _by_id(configuration["products"], collection="products", identity="product_id")
     order_manager, positions, traces = _execution_components(database)
     order_groups = OrderGroupManager(SqlOrderGroupStore(database.engine))
     queue = DatabaseJobQueue(database.engine)
+    control_plane = control_plane or DatabaseControlPlane(
+        database.engine,
+        DatabaseHeartbeatStore(database.engine),
+        configuration=dict(configuration),
+        alerts=alerts,
+    )
     worker_id = f"{node_id}:execution-engine"
     queue.register_worker(
         worker_id=worker_id,
@@ -288,25 +300,29 @@ def _execution_cycle(
         str(account["account_id"]): str(account["products"][0])
         for account in configuration["accounts"]["accounts"]
     }
-    user_stream_worker = DatabaseUserStreamWorker(
-        engine=database.engine,
-        queue=queue,
-        worker_id=worker_id,
-        order_manager=order_manager,
-        positions=positions,
-        ledgers=execution_ledgers,
-        trace_store=traces,
-        account_products=account_products,
-        order_groups=order_groups,
-    )
     live_worker = None
     recovery_worker = None
+    emergency_worker = None
+    protective_service = None
+    live_product_ids: frozenset[str] = frozenset()
+    approved_live = None
     if any(product["execution_mode"] == "live" for product in products.values()):
         approved_live = ApprovedLiveExecution(
             engine=database.engine,
             configuration=configuration,
             order_manager=order_manager,
             positions=positions,
+        )
+        live_product_ids = frozenset(approved_live.venues)
+        protective_service = LiveProtectiveStopService(
+            stop_manager=StopManager(SqlStopStore(database.engine)),
+            venues=approved_live.venues,
+            products=products,
+            accounts=approved_live.accounts,
+            queue=queue,
+            order_manager=order_manager,
+            positions=positions,
+            alerts=alerts,
         )
         live_worker = DatabaseLiveExecutionWorker(
             queue=queue,
@@ -322,6 +338,17 @@ def _execution_cycle(
             venues=approved_live.venues,
             authorise=approved_live.authorise,
             order_groups=order_groups,
+            prepare_protective_stop=protective_service.prepare_entry,
+            control_plane=control_plane,
+        )
+        emergency_worker = DatabaseEmergencyFlattenWorker(
+            queue=queue,
+            worker_id=worker_id,
+            order_manager=order_manager,
+            positions=positions,
+            venues=approved_live.venues,
+            products=products,
+            alerts=alerts,
         )
         recovery_worker = DatabaseLiveRecoveryWorker(
             queue=queue,
@@ -331,19 +358,62 @@ def _execution_cycle(
             account_products=account_products,
         )
 
+    def on_live_fill(product_id: str, order, quantity: float, at: str) -> object:
+        if protective_service is None or product_id not in live_product_ids:
+            return None
+        return protective_service.on_fill(product_id, order, quantity, at)
+
+    def on_algo_update(product_id: str, event) -> object:
+        if protective_service is None or product_id not in live_product_ids:
+            return {"reason_code": "protective_algo_handler_not_configured"}
+        return protective_service.on_algo_update(product_id, event)
+
+    user_stream_worker = DatabaseUserStreamWorker(
+        engine=database.engine,
+        queue=queue,
+        worker_id=worker_id,
+        order_manager=order_manager,
+        positions=positions,
+        ledgers=execution_ledgers,
+        trace_store=traces,
+        account_products=account_products,
+        order_groups=order_groups,
+        on_live_fill=on_live_fill if protective_service is not None else None,
+        on_algo_update=on_algo_update if protective_service is not None else None,
+    )
+
     def run_once() -> dict[str, Any]:
-        result = worker.run_once(now=utc_now())
+        now = utc_now()
+        if emergency_worker is not None:
+            result = emergency_worker.run_once(now=now)
+            if result["reason_code"] != "emergency_queue_empty":
+                return result
+        result = worker.run_once(now=now)
         if result["reason_code"] != "execution_queue_empty":
             return result
         if live_worker is not None:
-            result = live_worker.run_once(now=utc_now())
+            result = live_worker.run_once(now=now)
             if result["reason_code"] != "live_order_queue_empty":
                 return result
-        result = user_stream_worker.run_once(now=utc_now())
+        result = user_stream_worker.run_once(now=now)
         if result["reason_code"] != "user_stream_queue_empty":
             return result
         if recovery_worker is not None:
-            return recovery_worker.run_once(now=utc_now())
+            result = recovery_worker.run_once(now=now)
+            if result["reason_code"] != "live_recovery_queue_empty":
+                return result
+        if protective_service is not None and approved_live is not None:
+            reconciled = {
+                product_id: protective_service.reconcile(product_id, now)
+                for product_id in sorted(approved_live.venues)
+            }
+            if any(reconciled.values()):
+                return {
+                    "reason_code": "protective_stops_reconciled",
+                    "stops": {
+                        product_id: list(results) for product_id, results in reconciled.items()
+                    },
+                }
         return result
 
     return run_once
@@ -745,7 +815,10 @@ def _accounting_cycle(*, database: PlatformDatabase, node_id: str) -> Callable[[
 
 
 def _account_reconciliation_cycle(
-    *, database: PlatformDatabase, configuration: Mapping[str, Mapping[str, Any]]
+    *,
+    database: PlatformDatabase,
+    configuration: Mapping[str, Mapping[str, Any]],
+    alerts: SqlAlertService | None = None,
 ) -> Callable[[], dict[str, Any]]:
     products = _by_id(configuration["products"], collection="products", identity="product_id")
     accounts = _by_id(configuration["accounts"], collection="accounts", identity="account_id")
@@ -754,7 +827,27 @@ def _account_reconciliation_cycle(
         products=products,
         accounts=accounts,
     )
-    return lambda: service.reconcile_once(now=utc_now())
+    def run_once() -> dict[str, Any]:
+        try:
+            return service.reconcile_once(now=utc_now())
+        except Exception as exc:
+            if alerts is not None:
+                try:
+                    alerts.emit(
+                        event_type="account_reconciliation_failed",
+                        severity="critical",
+                        dedupe_key="account-reconciliation:failed",
+                        target="account-reconciliation",
+                        message="account reconciliation failed",
+                        emitted_at=utc_now(),
+                        payload={"error_type": type(exc).__name__},
+                        cooldown_seconds=60,
+                    )
+                except Exception:
+                    pass
+            raise
+
+    return run_once
 
 
 def _report_cycle(
@@ -963,6 +1056,13 @@ def run(args: argparse.Namespace) -> int:
     else:
         database.assert_migrated()
     heartbeat_store = DatabaseHeartbeatStore(database.engine)
+    alerts = configured_alert_service(database.engine, configuration=config.alerting)
+    control_plane = DatabaseControlPlane(
+        database.engine,
+        heartbeat_store,
+        configuration=split_configuration,
+        alerts=alerts,
+    )
     runtime = ServiceRuntime(
         config=config,
         node_id=args.node,
@@ -993,6 +1093,8 @@ def run(args: argparse.Namespace) -> int:
             database=database,
             configuration=split_configuration,
             node_id=args.node,
+            alerts=alerts,
+            control_plane=control_plane,
         )
     elif args.service == "paper-engine":
         work = _paper_cycle(
@@ -1033,7 +1135,9 @@ def run(args: argparse.Namespace) -> int:
     elif args.service == "accounting-service":
         work = _accounting_cycle(database=database, node_id=args.node)
     elif args.service == "account-reconciliation":
-        work = _account_reconciliation_cycle(database=database, configuration=split_configuration)
+        work = _account_reconciliation_cycle(
+            database=database, configuration=split_configuration, alerts=alerts
+        )
     elif args.service == "report-worker":
         work = _report_cycle(
             database=database,
@@ -1076,10 +1180,9 @@ def run(args: argparse.Namespace) -> int:
     market_gateway = work if isinstance(work, DatabaseMarketGateway) else None
     if args.service != "control-api":
         unpaused_work = work
-        control_plane = DatabaseControlPlane(database.engine, heartbeat_store)
 
         def work() -> dict[str, Any]:
-            if control_plane.is_paused("global") or control_plane.is_paused(args.service):
+            if control_plane.service_is_paused(args.service):
                 return {"reason_code": "service_paused", "service": args.service}
             return unpaused_work()
 
@@ -1091,6 +1194,7 @@ def run(args: argparse.Namespace) -> int:
                 database.engine,
                 heartbeat_store,
                 configuration=split_configuration,
+                alerts=alerts,
             ),
             bearer_token=token,
         )

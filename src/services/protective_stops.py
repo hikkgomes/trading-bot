@@ -13,6 +13,7 @@ from src.execution.broker import ProtectiveOrder, ProtectiveOrderStatus
 from src.execution.order_manager import OrderManager
 from src.execution.position_manager import PositionManager
 from src.execution.stops import ProtectiveStop, StopManager, StopStatus
+from src.services.alerting import AlertSeverity, SqlAlertService
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -33,6 +34,7 @@ class LiveProtectiveStopService:
         queue: DatabaseJobQueue | None = None,
         order_manager: OrderManager | None = None,
         positions: PositionManager | None = None,
+        alerts: SqlAlertService | None = None,
     ) -> None:
         self.stop_manager = stop_manager
         self.venues = dict(venues)
@@ -41,6 +43,7 @@ class LiveProtectiveStopService:
         self.queue = queue
         self.order_manager = order_manager
         self.positions = positions
+        self.alerts = alerts
 
     def prepare_entry(self, product_id: str, order: OrderIntent, at: str) -> ProtectiveStop | None:
         """Persist the stop intent before the entry can reach the exchange."""
@@ -331,6 +334,18 @@ class LiveProtectiveStopService:
                 raise ProtectiveStopError(reason)
             stop = self.stop_manager.for_entry_order(order.order_id)[0]
         self.stop_manager.mark_failure(stop.stop_id, reason=reason)
+        self._emit_alert(
+            event_type="protective_stop_failed",
+            dedupe_key=f"protective-stop:{product_id}:{stop.stop_id}:{reason}",
+            target=product_id,
+            message=reason,
+            emitted_at=at,
+            payload={
+                "stop_id": stop.stop_id,
+                "instrument_id": stop.instrument_id,
+                "position_quantity": position_quantity,
+            },
+        )
         self._enqueue_reduction(
             product_id=product_id,
             stop=stop,
@@ -402,6 +417,32 @@ class LiveProtectiveStopService:
             available_at=payload["evaluated_at"],
             priority=200,
         )
+
+    def _emit_alert(
+        self,
+        *,
+        event_type: str,
+        dedupe_key: str,
+        target: str,
+        message: str,
+        emitted_at: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        if self.alerts is None:
+            return
+        try:
+            self.alerts.emit(
+                event_type=event_type,
+                severity=AlertSeverity.CRITICAL,
+                dedupe_key=dedupe_key,
+                target=target,
+                message=message,
+                emitted_at=emitted_at,
+                payload=payload,
+                cooldown_seconds=0,
+            )
+        except Exception:
+            pass
 
     def _enqueue_recovery(self, payload: Mapping[str, Any], at: str) -> None:
         if self.queue is None:

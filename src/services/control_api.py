@@ -16,6 +16,7 @@ from sqlalchemy.engine import Engine
 from src.data.database import control_event
 from src.domain._codec import json_value, non_empty, timestamp, to_primitive
 from src.observability.reports import DatabasePlatformReport
+from src.services.alerting import AlertSeverity, SqlAlertService
 from src.services.health import DatabaseHeartbeatStore
 from src.services.scheduler import DatabaseJobQueue
 
@@ -44,10 +45,12 @@ class DatabaseControlPlane:
         heartbeat_store: DatabaseHeartbeatStore,
         *,
         configuration: dict[str, dict[str, Any]] | None = None,
+        alerts: SqlAlertService | None = None,
     ):
         self.engine = engine
         self.heartbeat_store = heartbeat_store
         self.configuration = json_value(configuration or {}, field="control configuration")
+        self.alerts = alerts
 
     def set_paused(
         self,
@@ -124,6 +127,28 @@ class DatabaseControlPlane:
                 requested_by=requested_by,
                 changed_at=changed_at,
             )
+        if self.alerts is not None:
+            try:
+                self.alerts.emit(
+                    event_type="control_mode_changed",
+                    severity=(
+                        AlertSeverity.CRITICAL
+                        if mode is ControlMode.EMERGENCY_FLATTEN
+                        else AlertSeverity.WARNING
+                    ),
+                    dedupe_key=f"control:{control_id}",
+                    target=target,
+                    message=f"control mode changed to {mode.value}",
+                    emitted_at=changed_at,
+                    payload={
+                        "mode": mode.value,
+                        "reason_code": reason_code,
+                        "requested_by": requested_by,
+                    },
+                    cooldown_seconds=0,
+                )
+            except Exception:
+                pass
         return ControlState(target, mode is not ControlMode.RUN, reason_code, changed_at, mode.value)
 
     def cancel_all_entry_orders(
