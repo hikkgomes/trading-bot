@@ -218,6 +218,7 @@ def registered_strategy_candidates(
                 "manifest_family": entry.family,
                 "canonical_source_type": manifest_source_type(name),
                 "executable_registry_entry": True,
+                "promotable": True,
                 "source_provenance": registered_strategy_provenance(name),
             },
         )

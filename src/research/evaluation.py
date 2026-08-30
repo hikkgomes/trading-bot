@@ -20,6 +20,7 @@ from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlHoldoutRepository, SqlValidationRepository
 from src.research.datasets import CanonicalDatasetResolver
 from src.research.executors import ExecutorError, ProviderExecutorRegistry
+from src.research.objectives import objective_is_available, objective_passes
 from src.research.store import SqlResearchStore
 from src.research.theses import SqlThesisRegistry, ThesisError
 
@@ -327,19 +328,38 @@ class EvidencePolicy:
             }
         )
 
-    def accepts(self, stage: str, evidence: Mapping[str, Any], controls: tuple[str, ...]) -> bool:
+    def accepts(
+        self,
+        stage: str,
+        evidence: Mapping[str, Any],
+        controls: tuple[str, ...],
+        *,
+        product_id: str | None = None,
+    ) -> bool:
         if evidence.get("evidence_policy_hash") != self.policy_hash:
             return False
-        statuses = self.statuses(stage, evidence, controls)
+        statuses = self.statuses(stage, evidence, controls, product_id=product_id)
         if not statuses or any(
             status not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
             for status in statuses.values()
         ):
             return False
+        if product_id is not None and stage in {"development", "robustness", "forward"}:
+            if not objective_passes(
+                evidence,
+                product_id=product_id,
+                minimum_excess_fraction=self.minimum_cost_adjusted_return,
+            ):
+                return False
         return True
 
     def statuses(
-        self, stage: str, evidence: Mapping[str, Any], controls: tuple[str, ...]
+        self,
+        stage: str,
+        evidence: Mapping[str, Any],
+        controls: tuple[str, ...],
+        *,
+        product_id: str | None = None,
     ) -> dict[str, EvidenceStatus]:
         validators = _STAGE_EVIDENCE_VALIDATORS.get(stage, {})
         statuses: dict[str, EvidenceStatus] = {}
@@ -354,6 +374,19 @@ class EvidencePolicy:
             else:
                 statuses[name] = (
                     EvidenceStatus.PASS if validator(value, self) else EvidenceStatus.FAIL
+                )
+        if product_id is not None and stage in {"development", "robustness", "forward"}:
+            if not objective_is_available(evidence, product_id=product_id):
+                statuses["objective_excess_fraction"] = EvidenceStatus.UNAVAILABLE
+            else:
+                statuses["objective_excess_fraction"] = (
+                    EvidenceStatus.PASS
+                    if objective_passes(
+                        evidence,
+                        product_id=product_id,
+                        minimum_excess_fraction=self.minimum_cost_adjusted_return,
+                    )
+                    else EvidenceStatus.FAIL
                 )
         return statuses
 
@@ -819,6 +852,7 @@ class CanonicalResearchEvaluator:
         context = {
             "candidate_id": request.candidate_id,
             "strategy_version_id": definition.strategy_version_id,
+            "product_id": definition.product,
             "evaluation_policy_id": request.evaluation_policy_id,
             "dataset_snapshot_ids": list(stage_snapshot_ids),
             "dataset_roles": adaptive_roles,
@@ -1166,16 +1200,29 @@ class CanonicalResearchEvaluator:
             ),
         }[stage]
         controls = self._negative_controls(candidate.thesis_id)
+        requires_objective = _requires_product_objective(candidate)
+        if requires_objective and stage in {"development", "robustness", "forward"}:
+            required_fields = (*required_fields, "objective_excess_fraction")
         policy_fields = _STAGE_EVIDENCE_VALIDATORS[stage]
-        evidence_status = self.evidence_policy.statuses(stage, evidence, controls)
+        evidence_status = self.evidence_policy.statuses(
+            stage,
+            evidence,
+            controls,
+            product_id=candidate.definition.product if requires_objective else None,
+        )
         missing = [
             field
             for field in required_fields
-            if field not in policy_fields
+            if field not in policy_fields and field != "objective_excess_fraction"
             or evidence_status.get(field)
             not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
         ]
-        accepted = not missing and self.evidence_policy.accepts(stage, evidence, controls)
+        accepted = not missing and self.evidence_policy.accepts(
+            stage,
+            evidence,
+            controls,
+            product_id=candidate.definition.product if requires_objective else None,
+        )
         evidence["missing_evidence"] = missing
         evidence["evidence_status"] = {
             field: status.value for field, status in evidence_status.items()
@@ -1196,3 +1243,13 @@ class CanonicalResearchEvaluator:
             receipt,
             metrics,
         )
+
+
+def _requires_product_objective(candidate: Any) -> bool:
+    product = str(candidate.definition.product)
+    if product not in {"btc_accumulation", "active_income"}:
+        return False
+    metadata = candidate.definition.metadata
+    if metadata.get("diagnostic") is True or metadata.get("promotable") is False:
+        return False
+    return metadata.get("promotable") is True or metadata.get("executable_registry_entry") is True

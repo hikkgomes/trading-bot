@@ -416,6 +416,7 @@ class DatabaseResearchJobHandlers:
                 candidate,
                 {
                     **frozen_context,
+                    "product_id": candidate.definition.product,
                     "requested_stage": "protected",
                     "evaluated_at": request.evaluated_at,
                     "evidence_policy_hash": self.evidence_policy.policy_hash,
@@ -426,7 +427,21 @@ class DatabaseResearchJobHandlers:
                 },
             )
             measured = dict(execution.evidence)
-            accepted = self.evidence_policy.accepts("development", measured, ())
+            requires_objective = (
+                candidate.definition.product in {"btc_accumulation", "active_income"}
+                and candidate.definition.metadata.get("diagnostic") is not True
+                and candidate.definition.metadata.get("promotable") is not False
+                and (
+                    candidate.definition.metadata.get("promotable") is True
+                    or candidate.definition.metadata.get("executable_registry_entry") is True
+                )
+            )
+            accepted = self.evidence_policy.accepts(
+                "development",
+                measured,
+                (),
+                product_id=candidate.definition.product if requires_objective else None,
+            )
             sealed = {
                 "passed": accepted,
                 "evidence_hash": canonical_hash(measured),

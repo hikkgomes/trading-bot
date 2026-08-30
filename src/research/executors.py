@@ -177,7 +177,7 @@ def _measured_result(
     funding = return_report.funding_cost
     turnover = return_report.turnover
     net_return = return_report.net_pnl
-    accounting = _product_accounting(context)
+    accounting = _product_accounting(context, fallback_return=return_report)
     if accounting is not None:
         net_return = float(accounting["return_fraction"])
     window_returns = _window_sums(gross, 3)
@@ -466,12 +466,26 @@ def _measured_result(
         "observations": observations,
         "behaviour_hash": context.get("behaviour_hash"),
     }
+    product_id = str(context.get("product_id") or "")
+    if product_id in {"btc_accumulation", "active_income"}:
+        measured.update(
+            {
+                "objective_status": "unavailable",
+                "objective_unit": "BTC" if product_id == "btc_accumulation" else "USDT",
+                "objective_value": None,
+                "benchmark_value": None,
+                "objective_excess": None,
+                "objective_excess_fraction": None,
+            }
+        )
     if accounting is not None:
         measured["accounting"] = accounting
+        measured["objective_status"] = "measured"
         measured["objective_unit"] = accounting["objective_unit"]
-        measured["objective_value"] = accounting["final_value"]
+        measured["objective_value"] = accounting["objective_value"]
         measured["benchmark_value"] = accounting["benchmark_value"]
-        measured["objective_excess"] = accounting["excess_value"]
+        measured["objective_excess"] = accounting["objective_excess"]
+        measured["objective_excess_fraction"] = accounting["objective_excess_fraction"]
         measured["accounting_return"] = accounting["return_fraction"]
     return ExecutionResult(
         evidence=measured,
@@ -484,7 +498,7 @@ def _measured_result(
             **(
                 {
                     "accounting_return": float(accounting["return_fraction"]),
-                    "objective_excess": float(accounting["excess_value"]),
+                    "objective_excess": float(accounting["objective_excess"]),
                 }
                 if accounting is not None
                 else {}
@@ -508,7 +522,11 @@ def _measured_result(
     )
 
 
-def _product_accounting(context: Mapping[str, Any]) -> dict[str, Any] | None:
+def _product_accounting(
+    context: Mapping[str, Any],
+    *,
+    fallback_return: Any | None = None,
+) -> dict[str, Any] | None:
     """Evaluate explicit product event evidence when a dataset supplies it."""
 
     product_id = str(context.get("product_id") or "")
@@ -544,9 +562,14 @@ def _product_accounting(context: Mapping[str, Any]) -> dict[str, Any] | None:
             "schema": "platform.btc_accounting/v1",
             "objective_unit": report.objective_unit,
             "initial_value": report.initial_btc_nav,
-            "final_value": report.final_btc_nav,
+            "objective_value": report.final_btc_nav,
             "benchmark_value": report.passive_btc_nav,
-            "excess_value": report.excess_btc,
+            "objective_excess": report.excess_btc,
+            "objective_excess_fraction": (
+                report.excess_btc / report.initial_btc_nav
+                if report.initial_btc_nav > 0
+                else 0.0
+            ),
             "return_fraction": report.return_fraction,
             "fees": report.fees_btc,
             "time_outside_btc_fraction": report.time_outside_btc_fraction,
@@ -559,7 +582,41 @@ def _product_accounting(context: Mapping[str, Any]) -> dict[str, Any] | None:
     if product_id == "active_income":
         events = context.get("futures_events", context.get("trade_events"))
         if events is None:
-            return None
+            if fallback_return is None:
+                return None
+            initial_equity = float(
+                context.get("initial_cash", context.get("initial_equity", 1.0))
+            )
+            if not math.isfinite(initial_equity) or initial_equity <= 0.0:
+                raise ExecutorError(
+                    "active-income return-ledger accounting requires positive initial equity"
+                )
+            net_pnl = float(fallback_return.net_pnl) * initial_equity
+            return {
+                "schema": "platform.futures_accounting/return_ledger_v1",
+                "objective_unit": "USDT",
+                "initial_value": initial_equity,
+                "objective_value": initial_equity + net_pnl,
+                "benchmark_value": initial_equity,
+                "objective_excess": net_pnl,
+                "objective_excess_fraction": net_pnl / initial_equity,
+                "return_fraction": net_pnl / initial_equity,
+                "realised_pnl": net_pnl,
+                "unrealised_pnl": 0.0,
+                "fees": float(fallback_return.fees),
+                "funding_pnl": float(fallback_return.funding_pnl),
+                "spread_cost": 0.0,
+                "slippage_cost": float(fallback_return.slippage),
+                "fills": int(fallback_return.effective_observations),
+                "partial_fills": 0,
+                "capacity_violations": 0,
+                "max_leverage": 1.0,
+                "max_margin_fraction": 0.0,
+                "liquidation": False,
+                "effective_observations": int(fallback_return.effective_observations),
+                "event_receipts": (),
+                "source": "canonical_return_ledger",
+            }
         from src.research.accounting import FuturesIncomeAccounting, ProductAccountingError
 
         try:
@@ -576,9 +633,10 @@ def _product_accounting(context: Mapping[str, Any]) -> dict[str, Any] | None:
             "schema": "platform.futures_accounting/v1",
             "objective_unit": report.objective_unit,
             "initial_value": report.initial_equity,
-            "final_value": report.final_equity,
+            "objective_value": report.final_equity,
             "benchmark_value": report.initial_equity,
-            "excess_value": report.net_pnl,
+            "objective_excess": report.net_pnl,
+            "objective_excess_fraction": report.return_fraction,
             "return_fraction": report.return_fraction,
             "realised_pnl": report.realised_pnl,
             "unrealised_pnl": report.unrealised_pnl,
