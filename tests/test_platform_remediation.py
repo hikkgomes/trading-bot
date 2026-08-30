@@ -7,7 +7,11 @@ from src.data.database import PlatformDatabase, job
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.portfolio.optimiser import PortfolioConstraints, optimise_targets
 from src.products.btc_accumulation import BtcAllocationPolicy, target_btc_allocation
-from src.research.accounting import BtcAccumulationAccounting, FuturesIncomeAccounting
+from src.research.accounting import (
+    BtcAccumulationAccounting,
+    FuturesIncomeAccounting,
+    ProductAccountingError,
+)
 from src.research.artefacts import StrategyArtefact
 from src.research.catalogue import registered_strategy_candidates
 from src.research.datasets import (
@@ -18,6 +22,7 @@ from src.research.datasets import (
 )
 from src.research.evaluation import EvidencePolicy, EvidenceStatus
 from src.research.executors import _cross_symbol_stability, _portfolio_overlap
+from src.research.objectives import objective_passes
 from src.research.returns import PositionReturnLedger
 from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.scheduler import DatabaseJobQueue
@@ -202,6 +207,68 @@ def test_btc_accounting_measures_sell_rebuy_in_btc_and_counts_costs() -> None:
     assert report.excess_btc == pytest.approx(0.124)
     assert report.fees_btc == pytest.approx(0.001)
     assert report.cycles == 1
+    assert report.round_trip_btc_gain == pytest.approx(0.124)
+    assert report.worst_reentry_slippage == pytest.approx(-0.2)
+
+
+def test_btc_accounting_converts_bnb_fee_and_enforces_core_reserve() -> None:
+    report = BtcAccumulationAccounting().evaluate(
+        initial_stablecoin=1_000.0,
+        initial_price=100.0,
+        trade_events=(
+            {
+                "timestamp": NOW,
+                "side": "buy",
+                "quantity": 1.0,
+                "price": 100.0,
+                "fee": 0.01,
+                "fee_asset": "BNB",
+                "fee_conversion_price": 200.0,
+            },
+        ),
+        marks=({"timestamp": NOW, "price": 100.0},),
+    )
+
+    assert report.fees_btc == pytest.approx(0.02)
+    assert report.event_receipts[0]["fee_quote"] == pytest.approx(2.0)
+    assert report.event_receipts[0]["fee_conversion"] == "explicit_fee_conversion_price"
+    with pytest.raises(ProductAccountingError, match="core BTC reserve"):
+        BtcAccumulationAccounting().evaluate(
+            initial_btc=1.0,
+            initial_price=100.0,
+            reserve_fraction=0.8,
+            trade_events=({"timestamp": NOW, "side": "sell", "quantity": 0.5, "price": 100.0},),
+        )
+    with pytest.raises(ProductAccountingError, match="deterministic BTC or quote conversion"):
+        BtcAccumulationAccounting().evaluate(
+            initial_btc=1.0,
+            initial_price=100.0,
+            trade_events=(
+                {
+                    "timestamp": NOW,
+                    "side": "sell",
+                    "quantity": 0.1,
+                    "price": 100.0,
+                    "fee": 0.01,
+                    "fee_asset": "BNB",
+                },
+            ),
+        )
+
+
+def test_product_objective_rejects_positive_usdt_result_that_loses_btc() -> None:
+    assert not objective_passes(
+        {
+            "objective_status": "measured",
+            "objective_unit": "BTC",
+            "objective_value": 0.9,
+            "benchmark_value": 1.0,
+            "objective_excess": -0.1,
+            "objective_excess_fraction": -0.1,
+        },
+        product_id="btc_accumulation",
+        minimum_excess_fraction=0.0,
+    )
 
 
 def test_btc_allocation_is_neutral_without_an_explicit_reserve() -> None:
@@ -249,6 +316,63 @@ def test_futures_accounting_keeps_short_pnl_and_funding_signed() -> None:
     assert report.funding_pnl == pytest.approx(0.9)
     assert report.net_pnl == pytest.approx(10.9)
     assert report.liquidation is False
+
+
+def test_futures_accounting_applies_funding_only_at_scheduled_timestamps() -> None:
+    scheduled = "2026-08-30T10:02:00+00:00"
+    report = FuturesIncomeAccounting().evaluate(
+        initial_cash=1_000.0,
+        events=(
+            {
+                "type": "fill",
+                "timestamp": NOW,
+                "symbol": "BTCUSDT",
+                "side": "buy",
+                "quantity": 1.0,
+                "price": 100.0,
+            },
+            {
+                "type": "funding",
+                "timestamp": "2026-08-30T10:01:00+00:00",
+                "symbol": "BTCUSDT",
+                "mark_price": 100.0,
+                "funding_rate": 0.01,
+            },
+            {
+                "type": "funding",
+                "timestamp": scheduled,
+                "symbol": "BTCUSDT",
+                "mark_price": 100.0,
+                "funding_rate": 0.01,
+            },
+        ),
+        funding_timestamps=(scheduled,),
+    )
+
+    assert report.funding_pnl == pytest.approx(-1.0)
+    assert report.event_receipts[1]["funding_applied"] is False
+    assert report.event_receipts[2]["funding_applied"] is True
+
+
+def test_futures_accounting_reports_leverage_and_margin_policy_violations() -> None:
+    report = FuturesIncomeAccounting().evaluate(
+        initial_cash=100.0,
+        leverage=2.0,
+        max_margin_fraction=0.5,
+        events=(
+            {
+                "type": "fill",
+                "timestamp": NOW,
+                "symbol": "BTCUSDT",
+                "side": "buy",
+                "quantity": 2.0,
+                "price": 100.0,
+            },
+        ),
+    )
+
+    assert report.capacity_violations >= 1
+    assert report.max_leverage == pytest.approx(2.0)
 
 
 def test_short_forecast_is_ranked_and_allocated_after_funding() -> None:

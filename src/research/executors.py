@@ -610,6 +610,7 @@ def _product_accounting(
                 "fills": int(fallback_return.effective_observations),
                 "partial_fills": 0,
                 "capacity_violations": 0,
+                "capacity_passed": True,
                 "max_leverage": 1.0,
                 "max_margin_fraction": 0.0,
                 "liquidation": False,
@@ -626,6 +627,8 @@ def _product_accounting(
                 leverage=float(context.get("leverage", 1.0)),
                 maintenance_margin_fraction=float(context.get("maintenance_margin_fraction", 0.0)),
                 max_participation_fraction=float(context.get("max_participation_fraction", 1.0)),
+                funding_timestamps=context.get("funding_timestamps"),
+                max_margin_fraction=float(context.get("max_margin_fraction", 1.0)),
             )
         except (ProductAccountingError, TypeError, ValueError) as exc:
             raise ExecutorError(f"futures accounting evidence is invalid: {exc}") from exc
@@ -647,6 +650,7 @@ def _product_accounting(
             "fills": report.fills,
             "partial_fills": report.partial_fills,
             "capacity_violations": report.capacity_violations,
+            "capacity_passed": report.capacity_violations == 0,
             "max_leverage": report.max_leverage,
             "max_margin_fraction": report.max_margin_fraction,
             "liquidation": report.liquidation,

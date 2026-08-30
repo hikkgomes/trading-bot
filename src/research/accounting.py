@@ -76,6 +76,50 @@ def _fee(event: Mapping[str, Any]) -> float:
     return 0.0
 
 
+def _fee_values(
+    event: Mapping[str, Any], *, fee_asset: str, fee: float, price: float
+) -> tuple[float, float, str]:
+    """Return fee in BTC, quote currency, and the deterministic conversion source."""
+
+    if fee <= 0.0:
+        return 0.0, 0.0, "zero_fee"
+    if price <= 0.0:
+        raise ProductAccountingError("trade price must be positive for fee conversion")
+    if fee_asset == "BTC":
+        return fee, fee * price, "base_asset"
+    if fee_asset in {"USDT", "USDC", "BUSD"}:
+        return fee / price, fee, "quote_asset"
+    for key in ("fee_btc", "fee_in_btc", "commission_btc"):
+        if event.get(key) is not None:
+            fee_btc = _number(event[key], field_name=key, minimum=0.0)
+            return fee_btc, fee_btc * price, f"explicit_{key}"
+    for key in (
+        "fee_quote",
+        "fee_quote_value",
+        "fee_in_quote",
+        "commission_quote",
+        "commission_quote_value",
+    ):
+        if event.get(key) is not None:
+            quote_value = _number(event[key], field_name=key, minimum=0.0)
+            return quote_value / price, quote_value, f"explicit_{key}"
+    for key in (
+        "fee_conversion_price",
+        "fee_asset_price",
+        "fee_asset_to_quote_price",
+        "fee_quote_price",
+    ):
+        if event.get(key) is not None:
+            conversion_price = _number(event[key], field_name=key, minimum=0.0)
+            if conversion_price <= 0.0:
+                raise ProductAccountingError(f"{key} must be positive")
+            quote_value = fee * conversion_price
+            return quote_value / price, quote_value, f"explicit_{key}"
+    raise ProductAccountingError(
+        f"fee asset {fee_asset} needs a deterministic BTC or quote conversion"
+    )
+
+
 @dataclass(frozen=True)
 class BtcAccountingSnapshot:
     observed_at: str
@@ -102,6 +146,13 @@ class BtcAccountingReport:
     regime_pnl: Mapping[str, float]
     nav_series: tuple[BtcAccountingSnapshot, ...]
     event_receipts: tuple[Mapping[str, Any], ...] = ()
+    maximum_btc_drawdown: float = 0.0
+    btc_saved_in_drawdown_periods: float = 0.0
+    round_trip_btc_gain: float = 0.0
+    maximum_tactical_allocation: float = 0.0
+    average_stablecoin_exposure_fraction: float = 0.0
+    worst_reentry_slippage: float = 0.0
+    failed_reentries: int = 0
 
     @property
     def btc_vs_passive_hold(self) -> float:
@@ -142,7 +193,8 @@ class BtcAccumulationAccounting:
         if first_price <= 0:
             raise ProductAccountingError("initial_price must be positive")
         if reserve_fraction is not None:
-            if _number(reserve_fraction, field_name="reserve_fraction", minimum=0.0) > 1:
+            reserve_fraction = _number(reserve_fraction, field_name="reserve_fraction", minimum=0.0)
+            if reserve_fraction > 1:
                 raise ProductAccountingError("reserve_fraction must be at most 1")
         initial_nav = btc + stable / first_price
         passive = initial_nav
@@ -151,7 +203,7 @@ class BtcAccumulationAccounting:
         mark_index = 0
         current_price = first_price
         snapshots: list[BtcAccountingSnapshot] = []
-        fee_btc = 0.0
+        fee_btc_total = 0.0
         missed = 0.0
         seconds_total = 0.0
         seconds_outside = 0.0
@@ -160,6 +212,16 @@ class BtcAccumulationAccounting:
         previous_snapshot: BtcAccountingSnapshot | None = None
         current_regime = "unclassified"
         receipts: list[Mapping[str, Any]] = []
+        core_btc = initial_nav * (reserve_fraction or 0.0)
+        maximum_drawdown = 0.0
+        peak_nav = initial_nav
+        btc_saved_in_drawdown = 0.0
+        round_trip_gain = 0.0
+        maximum_tactical_allocation = 0.0
+        exposure_time = 0.0
+        reentry_slippages: list[float] = []
+        pending_sell: tuple[float, float] | None = None
+        failed_reentries = 0
 
         for observed_at in all_times:
             while trade_index < len(trades) and trades[trade_index][0] == observed_at:
@@ -170,31 +232,63 @@ class BtcAccumulationAccounting:
                 price = _price(event)
                 quantity = _quantity(event)
                 fee = _fee(event)
-                fee_asset = str(event.get("fee_asset", event.get("commission_asset", "USDT"))).upper()
+                if price <= 0:
+                    raise ProductAccountingError("BTC trade price must be positive")
+                fee_asset = (
+                    str(event.get("fee_asset", event.get("commission_asset", "USDT")))
+                    .strip()
+                    .upper()
+                    or "USDT"
+                )
+                converted_fee_btc, fee_quote, fee_conversion = _fee_values(
+                    event, fee_asset=fee_asset, fee=fee, price=price
+                )
                 quote = quantity * price
                 if side == "buy":
                     if fee_asset == "BTC":
-                        btc += quantity - fee
+                        btc += quantity - converted_fee_btc
                         stable -= quote
                     else:
                         btc += quantity
-                        stable -= quote + fee
+                        stable -= quote + fee_quote
+                    if core_btc and btc < core_btc - 1e-12:
+                        raise ProductAccountingError("BTC buy or sell path breached core BTC reserve")
                     if btc < -1e-12 or stable < -1e-12:
                         raise ProductAccountingError("BTC buy exceeds available balance")
                     if saw_sell:
                         cycles += 1
                         saw_sell = False
+                    if pending_sell is not None:
+                        sold_quantity, sold_price = pending_sell
+                        paired_quantity = min(quantity, sold_quantity)
+                        round_trip_gain += (
+                            paired_quantity * sold_price / price
+                            - paired_quantity
+                            - converted_fee_btc
+                        )
+                        reentry_slippages.append(price / sold_price - 1.0)
+                        pending_sell = (
+                            sold_quantity - paired_quantity,
+                            sold_price,
+                        )
+                        if pending_sell[0] <= 1e-12:
+                            pending_sell = None
                 else:
                     if fee_asset == "BTC":
-                        btc -= quantity + fee
+                        btc -= quantity + converted_fee_btc
                         stable += quote
                     else:
                         btc -= quantity
-                        stable += quote - fee
+                        stable += quote - fee_quote
+                    if core_btc and btc < core_btc - 1e-12:
+                        raise ProductAccountingError("BTC sell path breached core BTC reserve")
                     if btc < -1e-12 or stable < -1e-12:
                         raise ProductAccountingError("BTC sell exceeds available balance")
                     saw_sell = True
-                fee_btc += fee if fee_asset == "BTC" else fee / price
+                    pending_sell = (quantity, price)
+                if str(event.get("reentry_status") or "").casefold() == "failed":
+                    failed_reentries += 1
+                fee_btc_total += converted_fee_btc
                 receipts.append(
                     {
                         "event_hash": canonical_hash(dict(event)),
@@ -202,7 +296,9 @@ class BtcAccumulationAccounting:
                         "side": side,
                         "quantity_btc": quantity,
                         "price": price,
-                        "fee_btc": fee if fee_asset == "BTC" else fee / price,
+                        "fee_btc": converted_fee_btc,
+                        "fee_quote": fee_quote,
+                        "fee_conversion": fee_conversion,
                         "fee_asset": fee_asset,
                     }
                 )
@@ -234,8 +330,23 @@ class BtcAccumulationAccounting:
                     seconds_outside += seconds
                 if current_price > previous_snapshot.stablecoin_per_btc and outside > 0:
                     missed += outside - previous_snapshot.stablecoin_balance / current_price
+                if current_price < previous_snapshot.stablecoin_per_btc and outside > 0:
+                    btc_saved_in_drawdown += (
+                        previous_snapshot.stablecoin_balance / current_price - outside
+                    )
+                exposure = (
+                    snapshot.stablecoin_balance / snapshot.stablecoin_per_btc / snapshot.btc_nav
+                    if snapshot.btc_nav > 0
+                    else 0.0
+                )
+                exposure_time += seconds * exposure
             snapshots.append(snapshot)
             previous_snapshot = snapshot
+            peak_nav = max(peak_nav, nav)
+            if peak_nav > 0:
+                maximum_drawdown = max(maximum_drawdown, (peak_nav - nav) / peak_nav)
+            tactical = stable / current_price / nav if nav > 0 else 0.0
+            maximum_tactical_allocation = max(maximum_tactical_allocation, tactical)
 
         if not snapshots:
             snapshots.append(
@@ -260,7 +371,7 @@ class BtcAccumulationAccounting:
             passive_btc_nav=passive,
             excess_btc=latest.btc_nav - passive,
             return_fraction=(latest.btc_nav / initial_nav - 1.0 if initial_nav > 0 else 0.0),
-            fees_btc=fee_btc,
+            fees_btc=fee_btc_total,
             time_outside_btc_fraction=(
                 seconds_outside / seconds_total if seconds_total > 0 else 0.0
             ),
@@ -274,6 +385,15 @@ class BtcAccumulationAccounting:
             regime_pnl=regime_pnl,
             nav_series=tuple(snapshots),
             event_receipts=tuple(receipts),
+            maximum_btc_drawdown=maximum_drawdown,
+            btc_saved_in_drawdown_periods=max(0.0, btc_saved_in_drawdown),
+            round_trip_btc_gain=round_trip_gain,
+            maximum_tactical_allocation=maximum_tactical_allocation,
+            average_stablecoin_exposure_fraction=(
+                exposure_time / seconds_total if seconds_total > 0 else 0.0
+            ),
+            worst_reentry_slippage=max(reentry_slippages, default=0.0),
+            failed_reentries=failed_reentries,
         )
 
     @staticmethod
@@ -339,6 +459,8 @@ class FuturesIncomeAccounting:
         leverage: float = 1.0,
         maintenance_margin_fraction: float = 0.0,
         max_participation_fraction: float = 1.0,
+        funding_timestamps: Iterable[str] | None = None,
+        max_margin_fraction: float = 1.0,
     ) -> FuturesAccountingReport:
         starting_cash = _number(initial_cash, field_name="initial_cash", minimum=0.0)
         cash = starting_cash
@@ -353,6 +475,23 @@ class FuturesIncomeAccounting:
             field_name="max_participation_fraction",
             minimum=0.0,
         )
+        if isinstance(funding_timestamps, str):
+            raise ProductAccountingError("funding_timestamps must be an iterable of timestamps")
+        funding_schedule = (
+            None
+            if funding_timestamps is None
+            else frozenset(
+                timestamp(str(value), field="funding_timestamps[]")
+                for value in funding_timestamps
+            )
+        )
+        margin_limit = _number(
+            max_margin_fraction,
+            field_name="max_margin_fraction",
+            minimum=0.0,
+        )
+        if margin_limit > 1.0:
+            raise ProductAccountingError("max_margin_fraction must be at most 1")
         ordered = _events(events)
         if not ordered:
             raise ProductAccountingError("futures accounting requires events")
@@ -367,7 +506,7 @@ class FuturesIncomeAccounting:
         partials = 0
         capacity_violations = 0
         max_leverage = 0.0
-        max_margin_fraction = 0.0
+        observed_max_margin_fraction = 0.0
         liquidation = False
         observations = 0
         receipts: list[Mapping[str, Any]] = []
@@ -375,6 +514,8 @@ class FuturesIncomeAccounting:
         for observed_at, event in ordered:
             kind = _event_kind(event)
             symbol = str(event.get("instrument_id", event.get("symbol", "BTCUSDT")))
+            funding_applied: bool | None = None
+            funding_amount = 0.0
             if kind in {"fill", "trade", "execution", "order_fill"}:
                 side = str(event.get("side", "")).casefold()
                 if side not in {"buy", "sell"}:
@@ -419,11 +560,14 @@ class FuturesIncomeAccounting:
                 marks[symbol] = mark
                 quantity = positions.get(symbol, (0.0, 0.0))[0]
                 rate = _number(event.get("funding_rate", event.get("rate", 0.0)), field_name="funding_rate")
-                amount = -quantity * mark * rate
-                if event.get("funding_pnl") is not None:
-                    amount = _number(event["funding_pnl"], field_name="funding_pnl")
-                funding_pnl += amount
-                cash += amount
+                funding_applied = funding_schedule is None or observed_at in funding_schedule
+                if funding_applied:
+                    amount = -quantity * mark * rate
+                    if event.get("funding_pnl") is not None:
+                        amount = _number(event["funding_pnl"], field_name="funding_pnl")
+                    funding_amount = amount
+                    funding_pnl += amount
+                    cash += amount
                 observations += 1
             elif kind in {"fee", "commission"}:
                 amount = _fee(event)
@@ -438,21 +582,28 @@ class FuturesIncomeAccounting:
             margin = notional / leverage
             if equity > 0:
                 max_leverage = max(max_leverage, notional / equity)
-            max_margin_fraction = max(
-                max_margin_fraction,
+                if notional > equity * leverage + 1e-12:
+                    capacity_violations += 1
+            observed_max_margin_fraction = max(
+                observed_max_margin_fraction,
                 margin / equity if equity > 0 else 0.0,
             )
+            if equity > 0 and margin / equity > margin_limit + 1e-12:
+                capacity_violations += 1
             if equity <= maintenance * margin and notional > 0:
                 liquidation = True
-            receipts.append(
-                {
-                    "event_hash": canonical_hash(dict(event)),
-                    "occurred_at": observed_at,
-                    "event_type": kind,
-                    "equity": equity,
-                    "unrealised_pnl": unrealised,
-                }
-            )
+            receipt = {
+                "event_hash": canonical_hash(dict(event)),
+                "occurred_at": observed_at,
+                "event_type": kind,
+                "equity": equity,
+                "unrealised_pnl": unrealised,
+            }
+            if funding_applied is not None:
+                receipt.update(
+                    {"funding_applied": funding_applied, "funding_pnl": funding_amount}
+                )
+            receipts.append(receipt)
 
         final_equity, unrealised, _ = self._equity(cash, positions, marks)
         return FuturesAccountingReport(
@@ -470,7 +621,7 @@ class FuturesIncomeAccounting:
             partial_fills=partials,
             capacity_violations=capacity_violations,
             max_leverage=max_leverage,
-            max_margin_fraction=max_margin_fraction,
+            max_margin_fraction=observed_max_margin_fraction,
             liquidation=liquidation,
             effective_observations=observations + fills,
             event_receipts=tuple(receipts),
@@ -524,3 +675,5 @@ class FuturesIncomeAccounting:
 
 FuturesAccounting = FuturesIncomeAccounting
 BtcAccounting = BtcAccumulationAccounting
+FuturesResearchAccounting = FuturesIncomeAccounting
+BtcResearchAccounting = BtcAccumulationAccounting
