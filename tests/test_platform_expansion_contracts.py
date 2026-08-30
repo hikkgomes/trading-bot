@@ -382,6 +382,74 @@ def test_market_making_live_promotion_requires_capability_and_replay() -> None:
     assert accepted.next_state is LifecycleState.LIVE_CANARY
 
 
+def test_product_promotion_uses_the_declared_objective_instead_of_generic_pnl() -> None:
+    policy = PromotionPolicy(
+        automatic_paper_promotion=True,
+        automatic_live_canary_promotion=False,
+        canary_capital_limit=0.01,
+        required_forward_evidence_days=30,
+        maximum_drawdown=0.1,
+        maximum_execution_drift=0.1,
+        maximum_model_drift=0.1,
+        minimum_forward_objective_excess_fraction=0.001,
+    )
+    evidence = PromotionEvidence(
+        strategy_artefact_hash="sha256:" + "3" * 64,
+        source_commit_hash="sha256:" + "4" * 64,
+        validation_accepted=True,
+        protected_holdout_accepted=True,
+        forward_evidence_days=30,
+        forward_evidence_accepted=True,
+        drawdown=0.01,
+        execution_drift=0.0,
+        model_drift=0.0,
+        portfolio_capacity=1.0,
+        requested_capital=0.1,
+        risk_budget_available=1.0,
+        live_approval=True,
+        fresh_preflight=True,
+        product_id="btc_accumulation",
+        forward_summary_id="summary-objective",
+        forward_decision_id="decision-objective",
+        forward_independent_decisions=8,
+        forward_net_pnl=100.0,
+        forward_objective_unit="BTC",
+        forward_objective_value=0.9,
+        forward_benchmark_value=1.0,
+        forward_objective_excess=-0.1,
+        forward_objective_excess_fraction=-0.1,
+        forward_data_uptime=1.0,
+        forward_effective_trades=8,
+        forward_fill_rate=1.0,
+    )
+
+    rejected = decide_promotion(
+        strategy_version_id="btc-objective:v1",
+        current_state=LifecycleState.FORWARD_PAPER,
+        evidence=evidence,
+        policy=policy,
+        evaluated_at=NOW,
+    )
+    accepted = decide_promotion(
+        strategy_version_id="btc-objective:v2",
+        current_state=LifecycleState.FORWARD_PAPER,
+        evidence=PromotionEvidence(
+            **{
+                **evidence.__dict__,
+                "forward_objective_value": 1.1,
+                "forward_objective_excess": 0.1,
+                "forward_objective_excess_fraction": 0.1,
+            }
+        ),
+        policy=policy,
+        evaluated_at=NOW,
+    )
+
+    assert rejected.accepted is False
+    assert rejected.reason_code == "forward_objective_excess_threshold"
+    assert accepted.next_state is LifecycleState.LIVE_READY
+
+
 def test_thesis_registry_shares_budget_across_lineage_variants() -> None:
     registry = ThesisRegistry()
     thesis_id = registry.register(_thesis(budget=2))

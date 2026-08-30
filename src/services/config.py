@@ -366,6 +366,19 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
             or not math.isfinite(float(minimum_net_pnl))
         ):
             raise ValueError(f"promotion policy {policy_id}.minimum_forward_net_pnl must be finite")
+        minimum_objective_excess_fraction = policy.get(
+            "minimum_forward_objective_excess_fraction", 0.0
+        )
+        if (
+            not isinstance(minimum_objective_excess_fraction, int | float)
+            or isinstance(minimum_objective_excess_fraction, bool)
+            or not math.isfinite(float(minimum_objective_excess_fraction))
+            or float(minimum_objective_excess_fraction) < 0
+        ):
+            raise ValueError(
+                f"promotion policy {policy_id}.minimum_forward_objective_excess_fraction "
+                "must be finite and non-negative"
+            )
         maximum_data_gaps = policy.get("maximum_forward_data_gaps", 0)
         if (
             not isinstance(maximum_data_gaps, int)

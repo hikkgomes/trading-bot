@@ -27,6 +27,7 @@ from src.data.database import (
 )
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlActiveStrategyAssignmentRepository, preflight_is_fresh
+from src.research.objectives import objective_unit
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -122,6 +123,7 @@ class PromotionPolicy:
     maximum_model_drift: float
     minimum_forward_independent_decisions: int = 1
     minimum_forward_net_pnl: float = 0.0
+    minimum_forward_objective_excess_fraction: float = 0.0
     maximum_forward_data_gaps: int = 0
     automatic_live_ready_promotion: bool = True
     paper_capital_limit: float = 1.0
@@ -163,6 +165,11 @@ class PromotionEvidence:
     forward_net_pnl: float = 0.0
     forward_benchmark_pnl: float = 0.0
     forward_excess_benchmark_pnl: float = 0.0
+    forward_objective_unit: str | None = None
+    forward_objective_value: float | None = None
+    forward_benchmark_value: float | None = None
+    forward_objective_excess: float | None = None
+    forward_objective_excess_fraction: float | None = None
     forward_data_gaps: int = 0
     canary_evidence_accepted: bool = False
     forward_effective_trades: int = 0
@@ -204,6 +211,7 @@ class SqlPromotionPolicyStore:
                 "maximum_model_drift": policy.maximum_model_drift,
                 "minimum_forward_independent_decisions": policy.minimum_forward_independent_decisions,
                 "minimum_forward_net_pnl": policy.minimum_forward_net_pnl,
+                "minimum_forward_objective_excess_fraction": policy.minimum_forward_objective_excess_fraction,
                 "maximum_forward_data_gaps": policy.maximum_forward_data_gaps,
                 "automatic_live_ready_promotion": policy.automatic_live_ready_promotion,
                 "paper_capital_limit": policy.paper_capital_limit,
@@ -546,6 +554,31 @@ class SqlCanonicalPromotionEvidence:
             forward_net_pnl=float(summary_payload.get("net_pnl", 0.0)),
             forward_benchmark_pnl=float(summary_payload.get("benchmark_pnl", 0.0)),
             forward_excess_benchmark_pnl=float(summary_payload.get("excess_benchmark_pnl", 0.0)),
+            forward_objective_unit=(
+                str(summary_payload["objective_unit"])
+                if summary_payload.get("objective_unit") is not None
+                else None
+            ),
+            forward_objective_value=(
+                float(summary_payload["objective_value"])
+                if summary_payload.get("objective_value") is not None
+                else None
+            ),
+            forward_benchmark_value=(
+                float(summary_payload["benchmark_value"])
+                if summary_payload.get("benchmark_value") is not None
+                else None
+            ),
+            forward_objective_excess=(
+                float(summary_payload["objective_excess"])
+                if summary_payload.get("objective_excess") is not None
+                else None
+            ),
+            forward_objective_excess_fraction=(
+                float(summary_payload["objective_excess_fraction"])
+                if summary_payload.get("objective_excess_fraction") is not None
+                else None
+            ),
             forward_data_gaps=int(summary_payload.get("data_gaps", 0)),
             canary_evidence_accepted=bool(summary_payload.get("canary_evidence_accepted") is True),
             forward_effective_trades=int(summary_payload.get("effective_trades", 0)),
@@ -861,6 +894,24 @@ def decide_promotion(
 def _forward_evidence_failures(
     evidence: PromotionEvidence, policy: PromotionPolicy
 ) -> tuple[str, ...]:
+    requires_objective = evidence.product_id in {"btc_accumulation", "active_income"}
+    expected_unit = objective_unit(str(evidence.product_id)) if requires_objective else None
+    objective_missing = requires_objective and (
+        evidence.forward_objective_unit != expected_unit
+        or evidence.forward_objective_value is None
+        or evidence.forward_benchmark_value is None
+        or evidence.forward_objective_excess is None
+        or evidence.forward_objective_excess_fraction is None
+    )
+    objective_failure = (
+        objective_missing
+        or (
+            requires_objective
+            and evidence.forward_objective_excess_fraction is not None
+            and evidence.forward_objective_excess_fraction
+            <= policy.minimum_forward_objective_excess_fraction
+        )
+    )
     checks = (
         (evidence.forward_summary_id is None, "forward_summary_missing"),
         (
@@ -871,7 +922,18 @@ def _forward_evidence_failures(
             evidence.forward_independent_decisions < policy.minimum_forward_independent_decisions,
             "forward_decisions_insufficient",
         ),
-        (evidence.forward_net_pnl <= policy.minimum_forward_net_pnl, "forward_net_pnl_threshold"),
+        (
+            objective_failure
+            if requires_objective
+            else evidence.forward_net_pnl <= policy.minimum_forward_net_pnl,
+            "forward_objective_evidence_missing"
+            if objective_missing
+            else (
+                "forward_objective_excess_threshold"
+                if requires_objective
+                else "forward_net_pnl_threshold"
+            ),
+        ),
         (evidence.forward_data_gaps > policy.maximum_forward_data_gaps, "forward_data_gaps"),
         (not evidence.forward_evidence_accepted, "forward_evidence_not_accepted"),
         (

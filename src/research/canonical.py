@@ -35,6 +35,7 @@ from src.data.database import (
     validation_stage,
 )
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
+from src.research.objectives import objective_unit
 
 
 class CanonicalEvidenceError(RuntimeError):
@@ -506,6 +507,11 @@ class ForwardPaperSummary:
     slippage: float = 0.0
     data_uptime: float = 0.0
     rejected_orders: int = 0
+    objective_unit: str | None = None
+    objective_value: float | None = None
+    benchmark_value: float | None = None
+    objective_excess: float | None = None
+    objective_excess_fraction: float | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -533,6 +539,11 @@ class ForwardPaperSummary:
             "slippage": self.slippage,
             "data_uptime": self.data_uptime,
             "rejected_orders": self.rejected_orders,
+            "objective_unit": self.objective_unit,
+            "objective_value": self.objective_value,
+            "benchmark_value": self.benchmark_value,
+            "objective_excess": self.objective_excess,
+            "objective_excess_fraction": self.objective_excess_fraction,
         }
 
 
@@ -674,6 +685,24 @@ class SqlForwardEvidenceRepository:
             )
         )
         payload["net_pnl"] = _finite_number(payload.get("net_pnl", 0.0), field="summary net_pnl")
+        objective_fields = (
+            "objective_value",
+            "benchmark_value",
+            "objective_excess",
+            "objective_excess_fraction",
+        )
+        has_objective = payload.get("objective_unit") is not None or any(
+            payload.get(field) is not None for field in objective_fields
+        )
+        if has_objective:
+            expected_unit = objective_unit(product_id)
+            if expected_unit is None or payload.get("objective_unit") != expected_unit:
+                raise CanonicalEvidenceError("forward summary objective unit is invalid")
+            for field_name in objective_fields:
+                payload[field_name] = _finite_number(
+                    payload.get(field_name), field=f"summary {field_name}"
+                )
+            payload["objective_unit"] = expected_unit
         for field_name in (
             "drawdown",
             "execution_drift",
@@ -826,6 +855,12 @@ class SqlForwardEvidenceRepository:
                     return _finite_nonnegative(metrics[name], field=f"forward observation {name}")
             return default
 
+        def optional_value(payload: Mapping[str, Any], name: str) -> float | None:
+            source = payload["observation"]
+            metrics = source["facts"]["metrics"]
+            raw = metrics.get(name)
+            return None if raw is None else _finite_number(raw, field=f"forward observation {name}")
+
         observed_from = min(str(row["observed_at"]) for row in materialised)
         observed_until = max(str(row["observed_at"]) for row in materialised)
         elapsed = max(
@@ -851,6 +886,34 @@ class SqlForwardEvidenceRepository:
         benchmark_returns = [
             value(payload, "benchmark_pnl", "benchmark_return") for payload in payloads
         ]
+        objective_units = tuple(
+            str(
+                payload["observation"]["facts"]["metrics"].get("objective_unit")
+            )
+            for payload in payloads
+            if payload["observation"]["facts"]["metrics"].get("objective_unit") is not None
+        )
+        objective_values = [
+            optional_value(payload, "objective_value") for payload in payloads
+        ]
+        benchmark_values = [
+            optional_value(payload, "benchmark_value") for payload in payloads
+        ]
+        objective_excesses = [
+            optional_value(payload, "objective_excess") for payload in payloads
+        ]
+        objective_excess_fractions = [
+            optional_value(payload, "objective_excess_fraction") for payload in payloads
+        ]
+        complete_objective = all(
+            value is not None
+            for value in (
+                objective_values[-1] if objective_values else None,
+                benchmark_values[-1] if benchmark_values else None,
+                objective_excesses[-1] if objective_excesses else None,
+                objective_excess_fractions[-1] if objective_excess_fractions else None,
+            )
+        )
         first_return = returns[0] if returns else 0.0
         last_return = returns[-1] if returns else 0.0
         summary = ForwardPaperSummary(
@@ -892,6 +955,13 @@ class SqlForwardEvidenceRepository:
                 else 0.0
             ),
             rejected_orders=int(sum(value(payload, "rejected_orders") for payload in payloads)),
+            objective_unit=objective_units[-1] if objective_units and complete_objective else None,
+            objective_value=objective_values[-1] if complete_objective else None,
+            benchmark_value=benchmark_values[-1] if complete_objective else None,
+            objective_excess=objective_excesses[-1] if complete_objective else None,
+            objective_excess_fraction=(
+                objective_excess_fractions[-1] if complete_objective else None
+            ),
         )
         summary_id = self.append_summary(
             strategy_version_id=strategy_version_id,
@@ -1030,6 +1100,7 @@ class SqlForwardEvidenceRepository:
         minimum_days: int,
         minimum_decisions: int = 1,
         minimum_net_pnl: float = 0.0,
+        minimum_objective_excess_fraction: float | None = None,
         maximum_drawdown: float = 1.0,
         maximum_data_gaps: int = 0,
         minimum_effective_trades: int = 0,
@@ -1043,6 +1114,11 @@ class SqlForwardEvidenceRepository:
         if isinstance(minimum_decisions, bool) or minimum_decisions < 0:
             raise CanonicalEvidenceError("minimum forward decisions must be non-negative")
         minimum_net_pnl = _finite_number(minimum_net_pnl, field="minimum forward net_pnl")
+        if minimum_objective_excess_fraction is not None:
+            minimum_objective_excess_fraction = _finite_number(
+                minimum_objective_excess_fraction,
+                field="minimum forward objective excess fraction",
+            )
         maximum_drawdown = _finite_nonnegative(maximum_drawdown, field="maximum forward drawdown")
         if isinstance(maximum_data_gaps, bool) or maximum_data_gaps < 0:
             raise CanonicalEvidenceError("maximum forward data gaps must be non-negative")
@@ -1069,6 +1145,23 @@ class SqlForwardEvidenceRepository:
             ).scalar_one_or_none()
         if not isinstance(payload, Mapping):
             raise CanonicalEvidenceError("forward summary does not exist")
+        product_id = str(payload.get("product_id") or "")
+        objective_required = minimum_objective_excess_fraction is not None
+        objective_failed = False
+        if objective_required:
+            expected_unit = objective_unit(product_id)
+            objective_failed = (
+                expected_unit is None
+                or payload.get("objective_unit") != expected_unit
+                or not all(payload.get(field) is not None for field in (
+                    "objective_value",
+                    "benchmark_value",
+                    "objective_excess",
+                    "objective_excess_fraction",
+                ))
+                or float(payload.get("objective_excess_fraction", 0.0))
+                <= float(minimum_objective_excess_fraction)
+            )
         checks = (
             (
                 float(payload.get("elapsed_days", 0.0)) < minimum_days,
@@ -1079,8 +1172,14 @@ class SqlForwardEvidenceRepository:
                 "forward_decisions_insufficient",
             ),
             (
-                float(payload.get("net_pnl", 0.0)) <= minimum_net_pnl,
-                "forward_net_pnl_threshold",
+                objective_failed
+                if objective_required
+                else float(payload.get("net_pnl", 0.0)) <= minimum_net_pnl,
+                (
+                    "forward_objective_excess_threshold"
+                    if objective_required
+                    else "forward_net_pnl_threshold"
+                ),
             ),
             (float(payload.get("drawdown", 0.0)) > maximum_drawdown, "forward_drawdown_limit"),
             (int(payload.get("data_gaps", 0)) > maximum_data_gaps, "forward_data_gaps"),

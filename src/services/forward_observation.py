@@ -305,6 +305,11 @@ class DatabaseForwardSummaryWorker:
                     policy.get("minimum_forward_independent_decisions", self.minimum_decisions)
                 ),
                 minimum_net_pnl=float(policy.get("minimum_forward_net_pnl", 0.0)),
+                minimum_objective_excess_fraction=(
+                    float(policy["minimum_forward_objective_excess_fraction"])
+                    if policy.get("minimum_forward_objective_excess_fraction") is not None
+                    else None
+                ),
                 maximum_drawdown=float(policy.get("maximum_drawdown", 1.0)),
                 maximum_data_gaps=int(policy.get("maximum_forward_data_gaps", 0)),
                 minimum_effective_trades=int(policy.get("minimum_forward_effective_trades", 0)),

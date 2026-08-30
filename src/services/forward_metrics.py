@@ -44,6 +44,11 @@ class ForwardEvidenceMetrics:
     rejected_orders: int
     source_event_ids: tuple[str, ...]
     window_start: str
+    objective_unit: str | None = None
+    objective_value: float | None = None
+    benchmark_value: float | None = None
+    objective_excess: float | None = None
+    objective_excess_fraction: float | None = None
 
     def to_payload(
         self, *, forecast: Mapping[str, Any], target: Mapping[str, Any] | None
@@ -66,6 +71,11 @@ class ForwardEvidenceMetrics:
                 "slippage": self.slippage,
                 "data_uptime": self.data_uptime,
                 "rejected_orders": self.rejected_orders,
+                "objective_unit": self.objective_unit,
+                "objective_value": self.objective_value,
+                "benchmark_value": self.benchmark_value,
+                "objective_excess": self.objective_excess,
+                "objective_excess_fraction": self.objective_excess_fraction,
             },
             "forecast_hash": canonical_hash(dict(forecast)),
             "target_hash": canonical_hash(dict(target)) if target is not None else None,
@@ -115,6 +125,12 @@ class ForwardEvidenceCollector:
             start=created_at,
             at=evaluated_at,
         )
+        all_market_rows = self._market_rows(
+            product_id=product_id,
+            instrument_id=instrument_id,
+            start=created_at,
+            at=evaluated_at,
+        )
         market_rows = self._market_rows(
             product_id=product_id,
             instrument_id=instrument_id,
@@ -133,6 +149,14 @@ class ForwardEvidenceCollector:
         slippage = self._slippage(fills)
         execution_drift = self._execution_drift(fills)
         model_drift = self._model_drift(net_pnl, forecast, bool(fills))
+        objective = self._objective_metrics(
+            product_id=product_id,
+            assignment=assignment,
+            artefact_created_at=created_at,
+            evaluation_time=evaluated_at,
+            ledger_rows=all_ledger_rows,
+            market_rows=all_market_rows,
+        )
         attempted = len(orders)
         completed = sum(1 for row in orders if self._order_filled(row["id"]))
         rejected = sum(1 for row in orders if self._order_rejected(row["id"]))
@@ -146,6 +170,8 @@ class ForwardEvidenceCollector:
                     *(str(row["id"]) for row in fills),
                     *(str(row["id"]) for row in market_rows),
                     *(str(row["id"]) for row in ledger_rows),
+                    *(str(row["id"]) for row in all_market_rows),
+                    *objective[5],
                 ]
             )
         )
@@ -171,6 +197,11 @@ class ForwardEvidenceCollector:
             rejected_orders=rejected,
             source_event_ids=source_ids,
             window_start=window_start,
+            objective_unit=objective[0],
+            objective_value=objective[1],
+            benchmark_value=objective[2],
+            objective_excess=objective[3],
+            objective_excess_fraction=objective[4],
         )
 
     def latest_observed_at(
@@ -377,19 +408,25 @@ class ForwardEvidenceCollector:
             worst = max(worst, (peak - running) / base)
         return max(0.0, worst)
 
-    def _starting_equity(self, product_id: str, assignment: Mapping[str, Any]) -> float:
+    def _starting_equity(
+        self,
+        product_id: str,
+        assignment: Mapping[str, Any],
+        *,
+        at: str | None = None,
+    ) -> float:
         account_id = str(assignment.get("account_id") or "")
         with self.engine.connect() as connection:
-            row = (
-                connection.execute(
-                    select(account_snapshot.c.payload)
-                    .where(account_snapshot.c.account_id == account_id)
-                    .order_by(account_snapshot.c.observed_at)
-                    .limit(1)
-                )
-                .scalars()
-                .first()
+            statement = select(account_snapshot.c.payload).where(
+                account_snapshot.c.account_id == account_id
             )
+            if at is not None:
+                statement = statement.where(account_snapshot.c.observed_at <= at)
+            row = connection.execute(
+                statement.order_by(
+                    account_snapshot.c.observed_at.desc(), account_snapshot.c.id.desc()
+                ).limit(1)
+            ).scalar_one_or_none()
         if isinstance(row, Mapping):
             balances = row.get("balances")
             if isinstance(balances, Mapping):
@@ -398,6 +435,92 @@ class ForwardEvidenceCollector:
                 if value > 0:
                     return value
         return max(_positive_or_zero(assignment.get("capital_limit")), 1.0)
+
+    def _account_snapshot_rows(
+        self, *, account_id: str, at: str
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not account_id:
+            return ()
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(
+                    account_snapshot.c.id,
+                    account_snapshot.c.observed_at,
+                    account_snapshot.c.payload,
+                )
+                .where(
+                    account_snapshot.c.account_id == account_id,
+                    account_snapshot.c.observed_at <= at,
+                )
+                .order_by(account_snapshot.c.observed_at, account_snapshot.c.id)
+            ).mappings()
+            return tuple(row for row in rows if isinstance(row["payload"], Mapping))
+
+    @staticmethod
+    def _market_prices(rows: tuple[Mapping[str, Any], ...]) -> tuple[float, ...]:
+        prices: list[float] = []
+        for row in rows:
+            payload = row["payload"]
+            values = payload.get("values") if isinstance(payload, Mapping) else None
+            if not isinstance(values, Mapping):
+                continue
+            price = _positive_or_zero(values.get("close", values.get("price")))
+            if price > 0.0:
+                prices.append(price)
+        return tuple(prices)
+
+    def _objective_metrics(
+        self,
+        *,
+        product_id: str,
+        assignment: Mapping[str, Any],
+        artefact_created_at: str,
+        evaluation_time: str,
+        ledger_rows: tuple[Mapping[str, Any], ...],
+        market_rows: tuple[Mapping[str, Any], ...],
+    ) -> tuple[str, float | None, float | None, float | None, float | None, tuple[str, ...]]:
+        if product_id == "active_income":
+            initial = self._starting_equity(product_id, assignment, at=artefact_created_at)
+            excess = self._ledger_pnl(ledger_rows)
+            return (
+                "USDT",
+                initial + excess,
+                initial,
+                excess,
+                excess / initial if initial > 0.0 else None,
+                (),
+            )
+        if product_id != "btc_accumulation":
+            return (product_id, None, None, None, None, ())
+        snapshots = self._account_snapshot_rows(
+            account_id=str(assignment.get("account_id") or ""), at=evaluation_time
+        )
+        prices = self._market_prices(market_rows)
+        source_ids = tuple(str(row["id"]) for row in snapshots)
+        if not snapshots or not prices:
+            return ("BTC", None, None, None, None, source_ids)
+        before_creation = tuple(
+            row for row in snapshots if str(row["observed_at"]) <= artefact_created_at
+        )
+        first_snapshot = before_creation[-1] if before_creation else snapshots[0]
+        last_snapshot = snapshots[-1]
+        initial = self._btc_nav(first_snapshot["payload"], prices[0])
+        final = self._btc_nav(last_snapshot["payload"], prices[-1])
+        if initial is None or final is None or initial <= 0.0:
+            return ("BTC", None, None, None, None, source_ids)
+        excess = final - initial
+        return ("BTC", final, initial, excess, excess / initial, source_ids)
+
+    @staticmethod
+    def _btc_nav(payload: Mapping[str, Any], price: float) -> float | None:
+        balances = payload.get("balances")
+        if not isinstance(balances, Mapping) or price <= 0.0:
+            return None
+        btc = _positive_or_zero(balances.get("BTC"))
+        stable = _positive_or_zero(
+            balances.get("USDT", balances.get("USDC", balances.get("BUSD")))
+        )
+        return btc + stable / price
 
     @staticmethod
     def _slippage(rows: tuple[Mapping[str, Any], ...]) -> float:
