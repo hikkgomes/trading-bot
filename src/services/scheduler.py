@@ -234,6 +234,11 @@ class PlatformScheduler:
                     "register_ml_candidate",
                     self._ml_candidate_payload(product_id, product, catalogue),
                 ),
+                (
+                    f"scheduled:{schedule_name}:{product_id}:hypotheses:{due_at}",
+                    "generate_hypotheses",
+                    self._hypothesis_generation_payload(product_id, product, catalogue),
+                ),
             )
         if schedule_name in {"bounded_backtest", "event_replay", "ml_research"}:
             return self._research_jobs(schedule_name, product_id, now, due_at)
@@ -483,6 +488,23 @@ class PlatformScheduler:
             "validation_policy": {"promotable": False},
             "metadata": {"diagnostic": True, "promotable": False},
         }
+
+    @staticmethod
+    def _hypothesis_generation_payload(
+        product_id: str,
+        product: Mapping[str, Any],
+        catalogue: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        payload = {
+            "product_id": product_id,
+            "instrument_universe": list(catalogue["instrument_universe"]),
+            "dataset_snapshot_hashes": list(catalogue["dataset_snapshot_hashes"]),
+            "dataset_bundle_id": catalogue.get("dataset_bundle_id"),
+            "universe_snapshot_id": catalogue.get("universe_snapshot_id"),
+            "submitted_at": str(catalogue["catalogue_submitted_at"]),
+            "generation_budget": int(product.get("generation_budget", 6)),
+        }
+        return {key: value for key, value in payload.items() if value is not None}
 
     def _candidate_snapshot(
         self,

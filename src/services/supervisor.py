@@ -674,8 +674,7 @@ def _promotion_cycle(
         worker_id=worker_id,
     )
     policies_by_id = {
-        str(policy["policy_id"]): dict(policy)
-        for policy in configuration["promotion"]["policies"]
+        str(policy["policy_id"]): dict(policy) for policy in configuration["promotion"]["policies"]
     }
     policies_by_product = {
         str(product["product_id"]): policies_by_id[str(product["promotion_policy_id"])]
@@ -795,6 +794,7 @@ def _research_cycle(
         "research-worker": (
             "dataset_snapshot_validate",
             "register_strategy_catalogue",
+            "generate_hypotheses",
             "register_candidate",
             "evaluate_candidate",
             "bounded_backtest",

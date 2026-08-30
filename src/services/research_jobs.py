@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
 from sqlalchemy import select
@@ -22,7 +23,12 @@ from src.research.backtest.event_engine import (
 from src.research.canonical import SqlStrategyArtefactRepository
 from src.research.catalogue import registered_strategy_candidates, registered_strategy_theses
 from src.research.coordinator import Candidate, CandidateEvaluationView, ResearchCoordinator
-from src.research.datasets import CanonicalDatasetResolver
+from src.research.datasets import (
+    CandidateDatasetPlan,
+    CanonicalDatasetResolver,
+    DatasetLifecycleState,
+    SqlDatasetBundleRepository,
+)
 from src.research.evaluation import (
     CanonicalResearchEvaluator,
     EvaluationRequest,
@@ -34,10 +40,17 @@ from src.research.executors import (
     ProviderContextBuilderRegistry,
     ProviderExecutorRegistry,
 )
+from src.research.generation import (
+    CAMPAIGNS,
+    GenerationFeedback,
+    HypothesisGenerator,
+    SqlGenerationFeedbackStore,
+    SqlHypothesisMemory,
+)
 from src.research.ml import MlExperimentRunner
 from src.research.providers import provider_candidate
 from src.research.store import SqlResearchStore
-from src.research.theses import SqlThesisRegistry, StrategyThesisFactory
+from src.research.theses import SqlThesisRegistry, StrategyThesisFactory, ThesisError
 from src.services.job_schemas import JobSchemaError, ResearchJobRequest
 from src.services.scheduler import ClaimedJob
 
@@ -116,6 +129,7 @@ class DatabaseResearchJobHandlers:
         return {
             "dataset_snapshot_validate": self.validate_dataset_snapshot,
             "register_strategy_catalogue": self.register_strategy_catalogue,
+            "generate_hypotheses": self.generate_hypotheses,
             "register_candidate": self.register_candidate,
             "register_ml_candidate": self.register_ml_candidate,
             "evaluate_candidate": self.evaluate_candidate,
@@ -195,6 +209,110 @@ class DatabaseResearchJobHandlers:
         candidate = self._candidate(claimed.payload)
         candidate_id = ResearchCoordinator(self.store).submit(candidate)
         return {"candidate_id": candidate_id, "source_type": candidate.definition.source_type.value}
+
+    def generate_hypotheses(
+        self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
+    ) -> dict[str, Any]:
+        """Compile safe campaigns into the same candidate queue as all providers."""
+
+        payload = claimed.payload
+        required = {
+            "product_id",
+            "instrument_universe",
+            "dataset_snapshot_hashes",
+            "submitted_at",
+            "generation_budget",
+        }
+        if not required.issubset(payload):
+            raise JobSchemaError("hypothesis generation command is incomplete")
+        product_id = str(payload["product_id"])
+        universe = tuple(str(item) for item in payload["instrument_universe"])
+        snapshot_ids = tuple(str(item) for item in payload["dataset_snapshot_hashes"])
+        feedback_store = SqlGenerationFeedbackStore(self.store.engine)
+        if not snapshot_ids:
+            for campaign in CAMPAIGNS:
+                if campaign.product == product_id:
+                    feedback_store.append(
+                        GenerationFeedback(
+                            campaign=campaign.name,
+                            outcome="data_unavailable",
+                            observed_at=str(payload["submitted_at"]),
+                            reason_code="canonical_dataset_bundle_unavailable",
+                        )
+                    )
+            return {"product_id": product_id, "state": "waiting_for_dataset"}
+        generator = HypothesisGenerator(
+            product=product_id,
+            instrument_universe=universe,
+            memory=SqlHypothesisMemory(self.store.engine),
+            feedback_store=feedback_store,
+        )
+        hypotheses = generator.generate(
+            dataset_snapshot_hashes=snapshot_ids,
+            submitted_at=str(payload["submitted_at"]),
+            total_budget=int(payload["generation_budget"]),
+            dataset_bundle_id=(
+                str(payload["dataset_bundle_id"]) if payload.get("dataset_bundle_id") else None
+            ),
+            universe_snapshot_id=(
+                str(payload["universe_snapshot_id"])
+                if payload.get("universe_snapshot_id")
+                else None
+            ),
+        )
+        bundle_id = payload.get("dataset_bundle_id")
+        plan = None
+        if bundle_id:
+            bundle = SqlDatasetBundleRepository(self.store.engine).get(str(bundle_id))
+            if bundle.lifecycle_state is not DatasetLifecycleState.READY:
+                raise JobSchemaError("hypothesis generation requires a ready dataset bundle")
+            plan = CandidateDatasetPlan.from_bundle(bundle)
+        thesis_registry = SqlThesisRegistry(self.store.engine)
+        coordinator = ResearchCoordinator(self.store)
+        registered: list[str] = []
+        for hypothesis in hypotheses:
+            renew()
+            candidate = hypothesis.candidate
+            if plan is not None:
+                if plan.product_id != candidate.definition.product:
+                    raise JobSchemaError("generated candidate and dataset bundle products differ")
+                candidate = replace(
+                    candidate,
+                    dataset_snapshot_hashes=plan.all_snapshot_ids,
+                    dataset_bundle_id=bundle.bundle_id,
+                    dataset_plan=plan,
+                )
+                hypothesis = replace(hypothesis, candidate=candidate)
+            try:
+                thesis_registry.register(hypothesis.thesis)
+                candidate_id = coordinator.submit(hypothesis.candidate)
+            except ThesisError as exc:
+                feedback_store.append(
+                    GenerationFeedback(
+                        campaign=hypothesis.campaign.name,
+                        outcome="resource_budget_exhausted",
+                        observed_at=str(payload["submitted_at"]),
+                        reason_code=str(exc),
+                        semantic_signature=hypothesis.semantic_signature,
+                    )
+                )
+                continue
+            feedback_store.append(
+                GenerationFeedback(
+                    campaign=hypothesis.campaign.name,
+                    outcome="accepted",
+                    observed_at=str(payload["submitted_at"]),
+                    candidate_id=candidate_id,
+                    semantic_signature=hypothesis.semantic_signature,
+                )
+            )
+            registered.append(candidate_id)
+        return {
+            "product_id": product_id,
+            "state": "generated",
+            "candidate_ids": registered,
+            "candidate_count": len(registered),
+        }
 
     def register_ml_candidate(
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
