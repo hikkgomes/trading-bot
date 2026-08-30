@@ -161,6 +161,7 @@ strategy_identity = Table(
     CheckConstraint("is_duplicate IS NOT NULL", name="ck_strategy_identity_duplicate"),
 )
 strategy_lineage = _id_payload_table("strategy_lineage")
+generation_feedback = _id_payload_table("generation_feedback")
 research_thesis = Table(
     "research_thesis",
     metadata,
@@ -659,6 +660,7 @@ class PlatformDatabase:
                 "006_research_dataset_bundles.py",
                 "007_bounded_job_retries.py",
                 "008_forward_paper_summaries.py",
+                "009_generation_feedback.py",
             )
             applied: list[str] = []
             with self.engine.begin() as connection:
@@ -708,7 +710,7 @@ class PlatformDatabase:
         if self.is_postgresql:
             with self.engine.connect() as connection:
                 revision = connection.execute(text("SELECT version_num FROM alembic_version"))
-                if revision.scalar_one_or_none() != "platform_v2_0008":
+                if revision.scalar_one_or_none() != "platform_v2_0009":
                     raise RuntimeError("database is not at the current Alembic revision")
 
     def dispose(self) -> None:
