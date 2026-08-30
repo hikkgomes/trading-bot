@@ -237,6 +237,7 @@ def plan_order_group(
     current_quantities: Mapping[str, float],
     decided_at: str,
     recovery_policy: str = "unwind",
+    prices: Mapping[str, float] | None = None,
 ) -> OrderGroupPlan:
     materialised = tuple(targets)
     if len(materialised) < 2:
@@ -260,6 +261,7 @@ def plan_order_group(
         materialised,
         current_quantities=current_quantities,
         decided_at=decided_at,
+        prices=prices,
     )
     if len(raw_orders) < 2:
         raise ValueError("multi-leg targets must produce at least two orders")

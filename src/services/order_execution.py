@@ -251,6 +251,7 @@ class DatabaseExecutionWorker:
                 current_quantities=current,
                 decided_at=decided_at,
                 recovery_policy=recovery_policies.pop(),
+                prices=prices,
             )
             assert self.order_groups is not None
             try:

@@ -38,6 +38,7 @@ def _intent(
     decided_at: str,
     order_type: OrderType,
     limit_price: float | None,
+    reference_price: float | None,
     depends_on_order_id: str | None = None,
 ) -> OrderIntent:
     return OrderIntent(
@@ -68,6 +69,7 @@ def _intent(
             "target_fraction": target.target_fraction,
             "risk_budget": target.risk_budget,
             "target_metadata": dict(target.metadata),
+            **({"reference_price": reference_price} if reference_price is not None else {}),
         },
     )
 
@@ -153,6 +155,9 @@ def plan_orders(
                 decided_at=decided_at,
                 order_type=order_type,
                 limit_price=float(limit_price) if limit_price is not None else None,
+                reference_price=price if price > 0 else (
+                    float(limit_price) if limit_price is not None else None
+                ),
                 depends_on_order_id=(reversal_close_id if phase == "open_after_reversal" else None),
             )
             intents.append(intent)

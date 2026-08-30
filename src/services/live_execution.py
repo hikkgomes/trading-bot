@@ -30,6 +30,7 @@ from src.research.canonical import (
     SqlStrategyArtefactRepository,
     preflight_is_fresh,
 )
+from src.services.exposure_budget import ExposureBudgetGuard
 
 _EXECUTION_IDENTITY_FILES = (
     Path("requirements-runtime.txt"),
@@ -40,6 +41,7 @@ _EXECUTION_IDENTITY_FILES = (
     Path("src/services/market_gateway.py"),
     Path("src/services/order_execution.py"),
     Path("src/services/live_execution.py"),
+    Path("src/services/exposure_budget.py"),
 )
 
 
@@ -105,6 +107,7 @@ class ApprovedLiveExecution:
         self.artefacts = SqlStrategyArtefactRepository(engine)
         self.approvals = SqlApprovalRepository(engine)
         self.preflights = SqlPreflightRepository(engine)
+        self.exposure_guard = ExposureBudgetGuard()
         self.product_portfolios = {
             product_id: str(product["portfolio_id"]) for product_id, product in products.items()
         }
@@ -386,6 +389,17 @@ class ApprovedLiveExecution:
         allowed_instruments = set(artifact.get("supported_instruments", []))
         if instrument.instrument_id not in allowed_instruments:
             raise PermissionError("live order instrument is not bound to the canonical artefact")
+        self.exposure_guard.enforce(
+            product_id=product_id,
+            product=product,
+            account=self.accounts[account_id],
+            assignment=assignment,
+            risk_configuration=self.risk_configuration,
+            account_payload=account_payload,
+            order=order,
+            positions=self.positions.all(),
+            orders=self.order_manager.all(),
+        )
 
 
 def _records(
