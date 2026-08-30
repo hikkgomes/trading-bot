@@ -50,14 +50,8 @@ def registered_strategy_theses(
     }
 
 
-def registered_strategy_source_hash(name: str) -> str:
-    """Hash executable strategy provenance, not its display name.
-
-    The hash includes the registered class source, imported local indicator and
-    feature modules, defaults, runtime lock, Python version, and Git commit.
-    A source change therefore produces a new strategy identity and cannot
-    silently reuse approval or evidence from an older implementation.
-    """
+def _registered_strategy_identity_payload(name: str) -> dict[str, object]:
+    """Build the executable identity without repository-history metadata."""
 
     strategy = __import__("src.strategies.registry", fromlist=["get"]).get(name)
     repository = Path(__file__).resolve().parents[2]
@@ -102,17 +96,7 @@ def registered_strategy_source_hash(name: str) -> str:
         path = repository / filename
         if path.is_file():
             lock_files[filename] = hashlib.sha256(path.read_bytes()).hexdigest()
-    try:
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repository,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        commit = "unknown"
-    payload = {
+    return {
         "strategy": name,
         "module_files": module_files,
         "default_params": strategy.default_params(),
@@ -129,9 +113,41 @@ def registered_strategy_source_hash(name: str) -> str:
         },
         "runtime_lock": lock_files,
         "python": sys.version,
-        "git_commit": commit,
     }
-    return "sha256:" + hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+
+
+def _repository_commit(repository: Path) -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def registered_strategy_provenance(name: str) -> dict[str, object]:
+    """Return immutable executable identity plus non-authoritative provenance."""
+
+    repository = Path(__file__).resolve().parents[2]
+    identity_payload = _registered_strategy_identity_payload(name)
+    source_hash = "sha256:" + hashlib.sha256(
+        repr(identity_payload).encode("utf-8")
+    ).hexdigest()
+    return {
+        "source_hash": source_hash,
+        "git_commit": _repository_commit(repository),
+        "identity_schema": "registered_strategy_executable/v2",
+    }
+
+
+def registered_strategy_source_hash(name: str) -> str:
+    """Hash executable strategy identity, independent of the current Git commit."""
+
+    return str(registered_strategy_provenance(name)["source_hash"])
 
 
 def registered_strategy_candidates(
@@ -202,6 +218,7 @@ def registered_strategy_candidates(
                 "manifest_family": entry.family,
                 "canonical_source_type": manifest_source_type(name),
                 "executable_registry_entry": True,
+                "source_provenance": registered_strategy_provenance(name),
             },
         )
         candidates.append(
