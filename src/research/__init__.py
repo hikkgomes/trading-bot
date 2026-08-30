@@ -20,6 +20,22 @@ from src.research.evaluation import (
     ProtectedHoldoutWorker,
     StageEvaluation,
 )
+from src.research.generation import (
+    CAMPAIGNS,
+    CampaignAllocation,
+    CampaignSpec,
+    DuplicateMatch,
+    GeneratedHypothesis,
+    GenerationAllocator,
+    GenerationError,
+    GenerationFeedback,
+    SqlGenerationFeedbackStore,
+    SqlHypothesisMemory,
+    build_hypothesis,
+    campaign_thesis,
+    hypothesis_signature,
+    semantic_distance,
+)
 from src.research.providers import provider_candidate
 from src.research.returns import PositionReturnLedger, PositionReturnReport, ReturnLedgerError
 from src.research.store import SqlResearchStore
@@ -51,4 +67,18 @@ __all__ = [
     "PositionReturnLedger",
     "PositionReturnReport",
     "ReturnLedgerError",
+    "CAMPAIGNS",
+    "CampaignAllocation",
+    "CampaignSpec",
+    "DuplicateMatch",
+    "GeneratedHypothesis",
+    "GenerationAllocator",
+    "GenerationFeedback",
+    "GenerationError",
+    "SqlGenerationFeedbackStore",
+    "SqlHypothesisMemory",
+    "build_hypothesis",
+    "campaign_thesis",
+    "hypothesis_signature",
+    "semantic_distance",
 ]

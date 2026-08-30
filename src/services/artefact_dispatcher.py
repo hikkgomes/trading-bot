@@ -257,7 +257,13 @@ def _generated_dsl(features: Mapping[str, float], artefact: Mapping[str, Any]) -
     }.get(operator)
     if passed is None:
         raise ArtefactDispatchError("generated DSL operator is unsupported")
-    return _forecast(1.0 if passed else 0.0, artefact)
+    direction = str(rule.get("direction") or "long")
+    if direction not in {"long", "short", "signed", "market_neutral", "hedged"}:
+        raise ArtefactDispatchError("generated DSL direction is unsupported")
+    score = 1.0 if passed else 0.0
+    if direction == "short":
+        score = -score
+    return _forecast(score, artefact)
 
 
 def _machine_learning(

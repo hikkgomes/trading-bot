@@ -567,12 +567,8 @@ def _product_accounting(context: Mapping[str, Any]) -> dict[str, Any] | None:
                 events=events,
                 initial_cash=float(context.get("initial_cash", context.get("initial_equity", 0.0))),
                 leverage=float(context.get("leverage", 1.0)),
-                maintenance_margin_fraction=float(
-                    context.get("maintenance_margin_fraction", 0.0)
-                ),
-                max_participation_fraction=float(
-                    context.get("max_participation_fraction", 1.0)
-                ),
+                maintenance_margin_fraction=float(context.get("maintenance_margin_fraction", 0.0)),
+                max_participation_fraction=float(context.get("max_participation_fraction", 1.0)),
             )
         except (ProductAccountingError, TypeError, ValueError) as exc:
             raise ExecutorError(f"futures accounting evidence is invalid: {exc}") from exc
@@ -1206,7 +1202,11 @@ def execute_generated_dsl(candidate: Candidate, context: Mapping[str, Any]) -> E
     }
     if operator not in operations:
         raise ExecutorError("DSL rule operator is unsupported")
-    signals = tuple(1 if operations[operator](float(row[feature])) else 0 for row in rows)
+    direction = str(rule.get("direction") or "long")
+    if direction not in {"long", "short", "signed", "market_neutral", "hedged"}:
+        raise ExecutorError("DSL rule direction is unsupported")
+    sign = -1 if direction == "short" else 1
+    signals = tuple(sign if operations[operator](float(row[feature])) else 0 for row in rows)
     return _measured_result(candidate, context, signals)
 
 
