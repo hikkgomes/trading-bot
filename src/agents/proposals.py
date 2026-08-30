@@ -9,6 +9,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
+from src.domain.strategies import ResearchThesis
 from src.services.job_schemas import JobSchemaError, ResearchJobRequest
 
 
@@ -57,6 +58,32 @@ FORBIDDEN_CODE_MARKERS = (
     "TRADING_LIVE",
     "runtime/approvals.json",
 )
+FORBIDDEN_PROPOSAL_MARKERS = (
+    "secret",
+    "credential",
+    "password",
+    "api_key",
+    "api_secret",
+    "approval",
+    "protected",
+    "holdout",
+    "live",
+    "order",
+    "risk_decision",
+    "promotion",
+)
+
+
+def _assert_safe_provenance(value: Any, *, path: str = "provenance") -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if any(marker in lowered for marker in FORBIDDEN_PROPOSAL_MARKERS):
+                raise ValueError(f"agent proposal contains forbidden key: {path}.{key}")
+            _assert_safe_provenance(item, path=f"{path}.{key}")
+    elif isinstance(value, list | tuple):
+        for index, item in enumerate(value):
+            _assert_safe_provenance(item, path=f"{path}[{index}]")
 
 
 @dataclass(frozen=True)
@@ -67,6 +94,7 @@ class AgentProposal:
     product_id: str
     created_at: str
     thesis: str
+    economic_thesis: ResearchThesis | None = None
     files: Mapping[str, str] = field(default_factory=dict)
     research_jobs: tuple[Mapping[str, Any], ...] = ()
     provenance: Mapping[str, Any] = field(default_factory=dict)
@@ -80,6 +108,10 @@ class AgentProposal:
         object.__setattr__(self, "thesis", non_empty(self.thesis, field="thesis"))
         if len(self.thesis.encode()) > 32_768:
             raise ValueError("agent proposal thesis is too large")
+        if self.economic_thesis is not None and not isinstance(
+            self.economic_thesis, ResearchThesis
+        ):
+            raise ValueError("agent economic thesis must be typed")
         if not isinstance(self.files, Mapping):
             raise ValueError("agent proposal files must be an object")
         normalised_files: dict[str, str] = {}
@@ -148,6 +180,7 @@ class AgentProposal:
         )
         if not isinstance(self.provenance, Mapping):
             raise ValueError("agent proposal provenance must be an object")
+        _assert_safe_provenance(self.provenance)
         object.__setattr__(
             self, "provenance", json_value(dict(self.provenance), field="provenance")
         )

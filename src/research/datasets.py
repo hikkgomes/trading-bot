@@ -455,6 +455,26 @@ class SqlDatasetBundleRepository:
     def __init__(self, engine: Engine):
         self.engine = engine
 
+    def latest_ready(self, product_id: str, *, at: str) -> DatasetBundle | None:
+        at = timestamp(at, field="at")
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(dataset_bundle.c.id)
+                .where(
+                    dataset_bundle.c.product_id == product_id,
+                    dataset_bundle.c.created_at <= at,
+                )
+                .order_by(dataset_bundle.c.created_at.desc(), dataset_bundle.c.id.desc())
+            ).scalars()
+            for bundle_id in rows:
+                try:
+                    bundle = self.get(str(bundle_id))
+                except (DatasetResolutionError, KeyError):
+                    continue
+                if bundle.lifecycle_state is DatasetLifecycleState.READY:
+                    return bundle
+        return None
+
     def get(self, bundle_id: str) -> DatasetBundle:
         bundle_id = _identity(bundle_id, field="bundle_id")
         with self.engine.connect() as connection:

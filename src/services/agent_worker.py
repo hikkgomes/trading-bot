@@ -6,7 +6,12 @@ from collections.abc import Callable
 from typing import Any
 
 from src.agents.code_worker import AgentCodeWorkflow
+from src.agents.compiler import AgentCompilationError, compile_openclaw_candidate_payload
 from src.agents.store import SqlAgentStore
+from src.research.coordinator import ResearchCoordinator
+from src.research.datasets import SqlDatasetBundleRepository
+from src.research.store import SqlResearchStore
+from src.research.theses import SqlThesisRegistry, ThesisError
 from src.services.job_schemas import JobSchemaError, ResearchJobRequest
 from src.services.runtime import utc_now
 from src.services.scheduler import ClaimedJob, DatabaseJobQueue
@@ -50,6 +55,52 @@ class DatabaseAgentJobHandlers:
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
     ) -> dict[str, Any]:
         proposal = self.store.proposal(str(claimed.payload["proposal_id"]))
+        compiled_candidate_id = None
+        if proposal.economic_thesis is not None:
+            bundle = SqlDatasetBundleRepository(self.queue.engine).latest_ready(
+                proposal.product_id,
+                at=proposal.created_at,
+            )
+            if bundle is None:
+                self.store.save_disposition(
+                    proposal_id=proposal.proposal_id,
+                    created_at=utc_now(),
+                    payload={
+                        "accepted": False,
+                        "reason_code": "canonical_dataset_bundle_unavailable",
+                        "live_eligible": False,
+                    },
+                )
+                return {
+                    "proposal_id": proposal.proposal_id,
+                    "state": "waiting_for_dataset",
+                }
+            try:
+                candidate = compile_openclaw_candidate_payload(
+                    proposal,
+                    bundle=bundle,
+                    submitted_at=proposal.created_at,
+                )
+                SqlThesisRegistry(self.queue.engine).register(proposal.economic_thesis)
+                compiled_candidate_id = ResearchCoordinator(
+                    SqlResearchStore(self.queue.engine)
+                ).submit(candidate)
+            except (AgentCompilationError, ThesisError, ValueError) as exc:
+                self.store.save_disposition(
+                    proposal_id=proposal.proposal_id,
+                    created_at=utc_now(),
+                    payload={
+                        "accepted": False,
+                        "reason_code": "openclaw_candidate_compilation_rejected",
+                        "detail": str(exc),
+                        "live_eligible": False,
+                    },
+                )
+                return {
+                    "proposal_id": proposal.proposal_id,
+                    "state": "rejected",
+                    "reason_code": "openclaw_candidate_compilation_rejected",
+                }
         queued: list[str] = []
         for index, item in enumerate(proposal.research_jobs):
             name = str(item.get("name") or "")
@@ -80,10 +131,15 @@ class DatabaseAgentJobHandlers:
                 "accepted": True,
                 "reason_code": "bounded_research_jobs_enqueued",
                 "job_ids": queued,
+                "candidate_id": compiled_candidate_id,
                 "live_eligible": False,
             },
         )
-        return {"proposal_id": proposal.proposal_id, "research_job_ids": queued}
+        return {
+            "proposal_id": proposal.proposal_id,
+            "research_job_ids": queued,
+            "candidate_id": compiled_candidate_id,
+        }
 
     def agent_code_workflow(
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]

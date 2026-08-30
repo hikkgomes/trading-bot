@@ -6,6 +6,7 @@ from typing import Any
 
 from src.agents.proposals import AgentAction, AgentProposal, AgentRole
 from src.agents.store import SqlAgentStore
+from src.agents.thesis import AgentThesisError, parse_openclaw_thesis
 from src.services.scheduler import DatabaseJobQueue
 
 CODE_ACTIONS = frozenset(
@@ -46,13 +47,27 @@ def build_agent_proposal(payload: dict[str, Any]) -> AgentProposal:
         raise ValueError("OpenClaw agent proposal schema is unsupported")
     if payload.get("source") != "openclaw":
         raise ValueError("agent proposal source must be openclaw")
+    raw_thesis = payload.get("thesis")
+    economic_thesis = None
+    if isinstance(raw_thesis, dict):
+        economic_thesis = parse_openclaw_thesis(
+            raw_thesis,
+            product_id=str(payload.get("product_id") or ""),
+            created_at=str(payload.get("created_at") or ""),
+        )
+        thesis = economic_thesis.market_rationale
+    elif isinstance(raw_thesis, str):
+        thesis = raw_thesis
+    else:
+        raise AgentThesisError("OpenClaw thesis must be text or a typed object")
     return AgentProposal(
         proposal_id=str(payload.get("proposal_id") or ""),
         role=AgentRole(str(payload.get("role") or "")),
         action=AgentAction(str(payload.get("action") or "")),
         product_id=str(payload.get("product_id") or ""),
         created_at=str(payload.get("created_at") or ""),
-        thesis=str(payload.get("thesis") or ""),
+        thesis=thesis,
+        economic_thesis=economic_thesis,
         files=payload.get("files") if isinstance(payload.get("files"), dict) else {},
         research_jobs=tuple(payload.get("research_jobs") or ()),
         provenance=payload.get("provenance") if isinstance(payload.get("provenance"), dict) else {},
@@ -67,7 +82,11 @@ class OpenClawAgentBridge:
     def ingest(self, payload: dict[str, Any]) -> AgentProposal:
         proposal = build_agent_proposal(payload)
         self.store.save_proposal(proposal)
-        job_name = "agent_code_workflow" if proposal.action in CODE_ACTIONS else "agent_research"
+        job_name = (
+            "agent_research"
+            if proposal.economic_thesis is not None
+            else ("agent_code_workflow" if proposal.action in CODE_ACTIONS else "agent_research")
+        )
         self.queue.enqueue_if_absent(
             job_id=f"agent:{proposal.proposal_id}",
             name=job_name,

@@ -8,6 +8,7 @@ from sqlalchemy import insert, select
 from sqlalchemy.engine import Engine
 
 from src.agents.proposals import AgentAction, AgentProposal, AgentRole
+from src.agents.thesis import parse_openclaw_thesis
 from src.data.database import (
     agent_action,
     agent_disposition,
@@ -100,5 +101,14 @@ class SqlAgentStore:
         values.pop("content_hash", None)
         values["role"] = AgentRole(values["role"])
         values["action"] = AgentAction(values["action"])
+        if values.get("economic_thesis") is not None:
+            thesis_payload = dict(values["economic_thesis"])
+            thesis_payload.pop("created_at", None)
+            thesis_payload.pop("creator_identity", None)
+            values["economic_thesis"] = parse_openclaw_thesis(
+                thesis_payload,
+                product_id=str(values["product_id"]),
+                created_at=str(values["created_at"]),
+            )
         values["research_jobs"] = tuple(values.get("research_jobs") or ())
         return AgentProposal(**values)

@@ -21,6 +21,12 @@ ALLOWED_CONTEXT_KEYS = frozenset(
         "research_queue",
         "strategy_lineage",
         "public_market_summaries",
+        "data_availability",
+        "family_coverage",
+        "duplicate_feedback",
+        "failure_regimes",
+        "generation_feedback",
+        "research_progress",
     }
 )
 FORBIDDEN_CONTEXT_MARKERS = (
