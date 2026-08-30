@@ -201,7 +201,7 @@ def test_bootstrap_is_idempotent_after_initial_job_completion(tmp_path: Path) ->
         )
 
 
-def test_fresh_platform_state_policies_include_required_risk_values() -> None:
+def test_fresh_platform_state_policies_leave_measured_risk_to_runtime() -> None:
     configuration = load_split_configuration(ROOT / "config")
     products = {
         str(item["product_id"]): dict(item) for item in configuration["products"]["products"]
@@ -210,10 +210,10 @@ def test_fresh_platform_state_policies_include_required_risk_values() -> None:
     policies = portfolio_state_policies(configuration, products)
 
     for policy in policies.values():
-        assert policy["product_drawdown_fraction"] == 0.0
-        assert policy["daily_pnl_fraction"] == 0.0
-        assert policy["global_drawdown_fraction"] == 0.0
-        assert policy["trades_today"] == 0
+        assert "product_drawdown_fraction" not in policy
+        assert "daily_pnl_fraction" not in policy
+        assert "global_drawdown_fraction" not in policy
+        assert "trades_today" not in policy
 
 
 def test_scheduler_research_jobs_are_processed_automatically(

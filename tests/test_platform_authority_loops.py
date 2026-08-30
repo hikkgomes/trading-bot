@@ -370,7 +370,7 @@ def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path
     with database.engine.connect() as connection:
         assert (
             connection.execute(select(func.count()).select_from(risk_snapshot)).scalar_one()
-            == risk_snapshot_count
+            == risk_snapshot_count + 1
         )
         source_kinds = {
             str(row[0])

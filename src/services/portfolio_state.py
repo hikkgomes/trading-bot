@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import statistics
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -22,6 +23,7 @@ from src.data.database import (
 from src.domain._codec import canonical_hash, timestamp
 from src.risk.engine import SqlRiskSnapshotStore
 from src.services.portfolio_engine import _canonical_portfolio_state
+from src.services.risk_state import PortfolioRiskCalculator
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -40,6 +42,7 @@ class DatabasePortfolioSourceService:
         self.store = store
         self.products = {str(key): dict(value) for key, value in products.items()}
         self.accounts = {str(key): dict(value) for key, value in accounts.items()}
+        self.risk_calculator = PortfolioRiskCalculator(engine)
 
     def publish(
         self,
@@ -114,6 +117,20 @@ class DatabasePortfolioSourceService:
             account_id=account_id,
             at=now,
         )
+        balances = balance_payload.get("balances", {})
+        if not isinstance(balances, Mapping):
+            return
+        measurements = self.risk_calculator.calculate(
+            product_id=product_id,
+            account_id=account_id,
+            product=product,
+            account=self.accounts.get(account_id, {}),
+            balances=balances,
+            positions=positions,
+            open_orders=open_orders,
+            market=market,
+            at=now,
+        )
         account_values = {
             "used_margin_fraction": float(balance_payload.get("used_margin_fraction", 0.0)),
             "liquidation_buffer_fraction": float(
@@ -146,7 +163,17 @@ class DatabasePortfolioSourceService:
             product_id=product_id,
             kind="positions",
             observed_at=positions_at or observed_at,
-            values={"positions": positions},
+            values={
+                "positions": positions,
+                "product_drawdown_fraction": measurements.product_drawdown_fraction,
+                "daily_pnl_fraction": measurements.daily_pnl_fraction,
+                "global_drawdown_fraction": measurements.global_drawdown_fraction,
+                "trades_today": measurements.trades_today,
+                "clusters": measurements.clusters,
+                "cluster_fraction_caps": measurements.cluster_fraction_caps,
+                "open_exposure_fraction": measurements.open_exposure_fraction,
+                "pending_exposure_fraction": measurements.pending_exposure_fraction,
+            },
         )
         self.publish(
             product_id=product_id,
@@ -158,7 +185,11 @@ class DatabasePortfolioSourceService:
             product_id=product_id,
             kind="market",
             observed_at=market_at or observed_at,
-            values={"market": market, "correlations": {}, "beta": {}},
+            values={
+                "market": market,
+                "correlations": measurements.correlations,
+                "beta": measurements.beta,
+            },
         )
         self.publish(
             product_id=product_id,
@@ -397,7 +428,7 @@ class DatabasePortfolioSourceService:
                 .where(service_heartbeat.c.observed_at <= at)
                 .order_by(service_heartbeat.c.observed_at.desc(), service_heartbeat.c.id.desc())
             ).mappings()
-        latest: dict[tuple[str, str], bool] = {}
+        latest: dict[tuple[str, str], tuple[bool, Mapping[str, Any]]] = {}
         latest_observed_at: str | None = None
         for row in rows:
             service_name = str(row["service_name"])
@@ -411,21 +442,56 @@ class DatabasePortfolioSourceService:
             key = (service_name, str(row["node_id"]))
             if key in latest:
                 continue
-            latest[key] = bool(row["healthy"])
+            payload = row["payload"] if isinstance(row["payload"], Mapping) else {}
+            latest[key] = (bool(row["healthy"]), payload)
         if not latest:
             return {}, None
         statuses = {
-            f"{service}@{node}": healthy for (service, node), healthy in sorted(latest.items())
+            f"{service}@{node}": healthy[0] for (service, node), healthy in sorted(latest.items())
         }
+        market_age = self._latest_market_age(at)
+        clock_skew = max(
+            (
+                abs(_number(payload.get("clock_skew_seconds")))
+                for _healthy, payload in latest.values()
+                if payload.get("clock_skew_seconds") is not None
+            ),
+            default=0.0,
+        )
         return (
             {
-                "data_age_seconds": 0.0,
-                "clock_skew_seconds": 0.0,
+                "data_age_seconds": market_age,
+                "clock_skew_seconds": clock_skew,
                 "exchange_connected": all(statuses.values()) if statuses else True,
                 "database_healthy": self._database_healthy(),
                 "services": statuses,
             },
             latest_observed_at,
+        )
+
+    def _latest_market_age(self, at: str) -> float:
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(risk_snapshot.c.created_at, risk_snapshot.c.payload)
+                .where(risk_snapshot.c.created_at <= at)
+                .order_by(risk_snapshot.c.created_at.desc(), risk_snapshot.c.id.desc())
+            ).mappings()
+            observed_at = next(
+                (
+                    row["created_at"]
+                    for row in rows
+                    if isinstance(row["payload"], Mapping)
+                    and row["payload"].get("kind") == "market_data_input"
+                ),
+                None,
+            )
+        if observed_at is None:
+            return float("inf")
+        return max(
+            0.0,
+            (
+                dt.datetime.fromisoformat(at) - dt.datetime.fromisoformat(str(observed_at))
+            ).total_seconds(),
         )
 
     def _database_healthy(self) -> bool:
@@ -649,7 +715,24 @@ class DatabasePortfolioStateWorker:
                 raise ValueError("portfolio state job requires immutable risk policy values")
             if str(claimed.payload.get("risk_policy_hash") or "") != canonical_hash(dict(policy)):
                 raise ValueError("portfolio state risk policy hash is invalid")
+            measured_fields = {
+                key: assembled[key]
+                for key in {
+                    "product_drawdown_fraction",
+                    "daily_pnl_fraction",
+                    "global_drawdown_fraction",
+                    "trades_today",
+                    "correlations",
+                    "beta",
+                    "clusters",
+                    "cluster_fraction_caps",
+                    "open_exposure_fraction",
+                    "pending_exposure_fraction",
+                }
+                if key in assembled
+            }
             assembled.update(policy)
+            assembled.update(measured_fields)
             state_id = self.publisher.publish(assembled)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -719,12 +802,14 @@ def portfolio_state_policies(
             "maximum_cluster_fraction": float(sleeve["maximum_fraction"]),
             "maximum_product_drawdown_fraction": float(limits["maximum_drawdown"]),
             "maximum_depth_participation": float(instrument["maximum_visible_depth_fraction"]),
-            "product_drawdown_fraction": 0.0,
-            "daily_pnl_fraction": 0.0,
-            "global_drawdown_fraction": 0.0,
-            "trades_today": 0,
             "sleeve_budgets": {name: sleeve_budget for name in sleeves},
-            "clusters": {},
-            "cluster_fraction_caps": {},
         }
     return result
+
+
+def _number(value: object) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return result if math.isfinite(result) else 0.0
