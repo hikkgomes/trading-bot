@@ -397,12 +397,23 @@ def _canonical_portfolio_state(state: Mapping[str, Any], *, product_id: str) -> 
         for value in clean["source_snapshot_ids"].values()
     ):
         raise ValueError("canonical portfolio/risk state source identities are incomplete")
-    market_required = {"price", "spread_bps", "visible_depth", "volatility", "funding"}
+    market_required = {"price", "spread_bps", "visible_depth", "volatility"}
     for instrument_id, values in clean["market"].items():
         if not isinstance(values, Mapping) or not market_required.issubset(values):
             raise ValueError(f"canonical market state is incomplete for {instrument_id}")
+        market_type = str(values.get("market_type") or "")
+        if not market_type:
+            market_type = "spot" if ":spot:" in str(instrument_id) else "futures"
+        if market_type == "spot":
+            values.setdefault("funding", 0.0)
+        elif market_type == "futures" and "funding" not in values:
+            raise ValueError(f"canonical futures market state has no funding for {instrument_id}")
+        elif market_type not in {"spot", "futures"}:
+            raise ValueError(f"canonical market type is unsupported for {instrument_id}")
     if clean["unknown_exposure"]:
         raise ValueError("unknown exposure rejects new portfolio targets")
+    if clean.get("account_state_known") is False:
+        raise ValueError("account state authority is unknown")
     if not clean["exchange_connected"] or not clean["database_healthy"]:
         raise ValueError("exchange and database health are required for new exposure")
     if clean["execution_drift"] or clean["model_drift"]:
@@ -431,18 +442,22 @@ class DatabasePortfolioTargetWorker:
         worker_id: str,
         build_target: Callable[[Mapping[str, Any]], TargetRiskReferences],
         lease_seconds: int = 60,
+        job_name: str = "portfolio_target_build",
+        risk_job_name: str = "risk_assessment",
     ) -> None:
         self.queue = queue
         self.worker_id = worker_id
         self.build_target = build_target
         self.lease_seconds = lease_seconds
+        self.job_name = job_name
+        self.risk_job_name = risk_job_name
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.lease_seconds,
-            names=("portfolio_target_build",),
+            names=(self.job_name,),
         )
         if claimed is None:
             return {"reason_code": "portfolio_target_queue_empty"}
@@ -473,7 +488,7 @@ class DatabasePortfolioTargetWorker:
             risk_job_id = f"risk:{risk_payload['assessment_id'].removeprefix('sha256:')}"
             self.queue.enqueue_if_absent(
                 job_id=risk_job_id,
-                name="risk_assessment",
+                name=self.risk_job_name,
                 payload=risk_payload,
                 available_at=str(payload["evaluated_at"]),
                 priority=18,

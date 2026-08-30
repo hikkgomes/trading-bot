@@ -155,6 +155,7 @@ class CanonicalDatasetResolver:
         allowed_roles: frozenset[str] | None = None,
         forbidden_roles: frozenset[str] = frozenset(),
         minimum_availability_timestamp: str | None = None,
+        maximum_availability_timestamp: str | None = None,
     ) -> Mapping[str, Any]:
         allowed_roles = None if allowed_roles is None else frozenset(allowed_roles)
         unknown_roles = (allowed_roles or frozenset()) | forbidden_roles
@@ -171,6 +172,10 @@ class CanonicalDatasetResolver:
             )
             for snapshot_id in snapshot_ids
         )
+        if allowed_roles is None and any(item.role == "protected_holdout" for item in resolved):
+            raise DatasetResolutionError(
+                "protected_holdout datasets require an explicit protected boundary"
+            )
         if allowed_roles is not None and any(item.role not in allowed_roles for item in resolved):
             raise DatasetResolutionError("dataset role is not permitted for this evaluation stage")
         if any(item.role in forbidden_roles for item in resolved):
@@ -182,6 +187,14 @@ class CanonicalDatasetResolver:
             if any(item.availability_timestamp <= minimum for item in resolved):
                 raise DatasetResolutionError(
                     "forward observation must become available after artefact creation"
+                )
+        if maximum_availability_timestamp is not None:
+            maximum = timestamp(
+                maximum_availability_timestamp, field="maximum_availability_timestamp"
+            )
+            if any(item.availability_timestamp > maximum for item in resolved):
+                raise DatasetResolutionError(
+                    "forward observation is not available by evaluation time"
                 )
         intervals = sorted((item.interval["start"], item.interval["end"]) for item in resolved)
         if any(intervals[index][0] < intervals[index - 1][1] for index in range(1, len(intervals))):

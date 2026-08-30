@@ -5,9 +5,13 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from sqlalchemy import select
+
+from src.data.database import validation_stage
 from src.data.parquet_store import PartitionedBacktestStore
 from src.domain._codec import canonical_hash
 from src.domain.strategies import StrategySourceType
+from src.research.artefacts import StrategyArtefact
 from src.research.backtest.bar_engine import BarPortfolioEngine, BarStep
 from src.research.backtest.event_engine import (
     EventReplayEngine,
@@ -15,8 +19,9 @@ from src.research.backtest.event_engine import (
     SimulatedLimitOrder,
     SimulatedOrderSide,
 )
+from src.research.canonical import SqlStrategyArtefactRepository
 from src.research.catalogue import registered_strategy_candidates, registered_strategy_theses
-from src.research.coordinator import Candidate, ResearchCoordinator
+from src.research.coordinator import Candidate, CandidateEvaluationView, ResearchCoordinator
 from src.research.datasets import CanonicalDatasetResolver
 from src.research.evaluation import (
     CanonicalResearchEvaluator,
@@ -24,11 +29,15 @@ from src.research.evaluation import (
     EvidencePolicy,
     ProtectedHoldoutWorker,
 )
-from src.research.executors import ProviderContextBuilderRegistry, ProviderExecutorRegistry
+from src.research.executors import (
+    ExecutorError,
+    ProviderContextBuilderRegistry,
+    ProviderExecutorRegistry,
+)
 from src.research.ml import MlExperimentRunner
 from src.research.providers import provider_candidate
 from src.research.store import SqlResearchStore
-from src.research.theses import SqlThesisRegistry
+from src.research.theses import SqlThesisRegistry, StrategyThesisFactory
 from src.services.job_schemas import JobSchemaError, ResearchJobRequest
 from src.services.scheduler import ClaimedJob
 
@@ -91,6 +100,7 @@ class DatabaseResearchJobHandlers:
         executors: ProviderExecutorRegistry | None = None,
         context_builders: ProviderContextBuilderRegistry | None = None,
         evidence_policy: EvidencePolicy | None = None,
+        configuration: Mapping[str, Mapping[str, Any]] | None = None,
     ):
         self.store = store
         self.artefact_store = artefact_store
@@ -100,9 +110,11 @@ class DatabaseResearchJobHandlers:
         self.executors = executors or ProviderExecutorRegistry.default()
         self.context_builders = context_builders or ProviderContextBuilderRegistry.default()
         self.evidence_policy = evidence_policy or EvidencePolicy()
+        self.configuration = configuration
 
     def handlers(self) -> dict[str, Callable]:
         return {
+            "dataset_snapshot_validate": self.validate_dataset_snapshot,
             "register_strategy_catalogue": self.register_strategy_catalogue,
             "register_candidate": self.register_candidate,
             "register_ml_candidate": self.register_ml_candidate,
@@ -110,6 +122,36 @@ class DatabaseResearchJobHandlers:
             "bounded_backtest": self.bounded_backtest,
             "event_replay": self.event_replay,
             "train_ml_experiment": self.train_ml_experiment,
+        }
+
+    def validate_dataset_snapshot(
+        self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
+    ) -> dict[str, Any]:
+        if self.dataset_resolver is None:
+            raise JobSchemaError("dataset validation requires a canonical dataset resolver")
+        required = {
+            "dataset_snapshot_id",
+            "product_id",
+            "feature_manifest_id",
+            "cost_model_id",
+            "parameter_set_id",
+            "producer_identity",
+        }
+        if set(claimed.payload) != required:
+            raise JobSchemaError("dataset validation command has an invalid field set")
+        renew()
+        resolved = self.dataset_resolver.resolve(
+            str(claimed.payload["dataset_snapshot_id"]),
+            expected={
+                "product_id": str(claimed.payload["product_id"]),
+                "feature_manifest_hash": str(claimed.payload["feature_manifest_id"]),
+                "cost_model_hash": str(claimed.payload["cost_model_id"]),
+                "parameter_set_hash": str(claimed.payload["parameter_set_id"]),
+            },
+        )
+        return {
+            "dataset_snapshot_id": resolved.snapshot_id,
+            "dataset_identity_hash": resolved.receipt["identity_hash"],
         }
 
     def register_strategy_catalogue(
@@ -127,6 +169,11 @@ class DatabaseResearchJobHandlers:
             product=str(claimed.payload["product_id"]),
             dataset_snapshot_hashes=tuple(claimed.payload["dataset_snapshot_hashes"]),
             instrument_universe=universe,
+            submitted_at=(
+                str(claimed.payload["catalogue_submitted_at"])
+                if claimed.payload.get("catalogue_submitted_at")
+                else None
+            ),
         )
         identities = ResearchCoordinator(self.store).register(candidates)
         return {"registered_candidates": len(identities), "candidate_ids": list(identities)}
@@ -146,6 +193,18 @@ class DatabaseResearchJobHandlers:
         if candidate.definition.source_type is not StrategySourceType.MACHINE_LEARNING:
             raise ValueError("ML worker accepts only machine-learning candidates")
         renew()
+        universe = candidate.definition.universe.get("symbols", ())
+        if not isinstance(universe, list | tuple) or not universe:
+            raise ValueError("ML candidate requires an explicit symbol universe")
+        thesis = StrategyThesisFactory.default().build(
+            name="frozen_logistic_model",
+            family="machine_learning",
+            product=candidate.definition.product,
+            instrument_universe=tuple(str(item) for item in universe),
+        )
+        if thesis.thesis_id != candidate.thesis_id:
+            raise ValueError("ML candidate thesis identity does not match its definition")
+        SqlThesisRegistry(self.store.engine).register(thesis)
         candidate_id = ResearchCoordinator(self.store).submit(candidate)
         return {"candidate_id": candidate_id, "source_type": candidate.definition.source_type.value}
 
@@ -188,10 +247,24 @@ class DatabaseResearchJobHandlers:
                     else None
                 ),
                 minimum_availability_timestamp=(
+                    str(claimed.payload["artefact_created_at"])
+                    if request.requested_stage == "forward"
+                    else None
+                ),
+                maximum_availability_timestamp=(
                     request.evaluated_at if request.requested_stage == "forward" else None
                 ),
             )
-            context = self.context_builders.build(candidate, resolved_context)
+            try:
+                context = self.context_builders.build(
+                    CandidateEvaluationView.from_candidate(candidate, adaptive_snapshot_ids),
+                    resolved_context,
+                )
+            except (ExecutorError, KeyError, TypeError, ValueError) as exc:
+                context = {
+                    **dict(resolved_context),
+                    "provider_context_error": f"{type(exc).__name__}: {exc}",
+                }
         else:
             context = {
                 "candidate_id": request.candidate_id,
@@ -200,15 +273,16 @@ class DatabaseResearchJobHandlers:
                 "cost_model_id": str(request.cost_model_id),
                 "parameter_set_id": str(request.parameter_set_id),
             }
+        context = {
+            **dict(context),
+            "artefact_hash": request.artefact_hash,
+            "artefact_created_at": request.artefact_created_at,
+        }
 
         def evaluate_protected(claim: Mapping[str, Any]) -> tuple[bool, Mapping[str, Any]]:
-            protected_context = resolver.resolve_context(
-                snapshot_ids=(str(claim["dataset_snapshot_id"]),),
-                feature_manifest_id=str(request.feature_manifest_id),
-                cost_model_id=str(request.cost_model_id),
-                parameter_set_id=str(request.parameter_set_id),
-                allowed_roles=(frozenset({"protected_holdout"}) if request.dataset_roles else None),
-            )
+            protected_context = claim.get("protected_context")
+            if not isinstance(protected_context, Mapping):
+                raise JobSchemaError("protected holdout worker did not resolve its dataset")
             frozen_context = self.context_builders.build(candidate, protected_context)
             execution = self.executors.execute(
                 candidate,
@@ -216,6 +290,11 @@ class DatabaseResearchJobHandlers:
                     **frozen_context,
                     "requested_stage": "protected",
                     "evaluated_at": request.evaluated_at,
+                    "evidence_policy_hash": self.evidence_policy.policy_hash,
+                    "minimum_bootstrap_observations": self.evidence_policy.minimum_bootstrap_observations,
+                    "bootstrap_method": self.evidence_policy.bootstrap_method,
+                    "multiple_testing_method": self.evidence_policy.multiple_testing_method,
+                    "pbo_method": self.evidence_policy.pbo_method,
                 },
             )
             measured = dict(execution.evidence)
@@ -235,10 +314,17 @@ class DatabaseResearchJobHandlers:
             self.store,
             executors=self.executors,
             provider_context=context,
-            protected_worker=ProtectedHoldoutWorker(self.store.engine, evaluate_protected),
+            protected_worker=ProtectedHoldoutWorker(
+                self.store.engine,
+                evaluate_protected,
+                dataset_resolver=resolver,
+                feature_manifest_id=str(request.feature_manifest_id),
+                cost_model_id=str(request.cost_model_id),
+                parameter_set_id=str(request.parameter_set_id),
+            ),
             evidence_policy=self.evidence_policy,
         ).evaluate(request)
-        return {
+        response = {
             "candidate_id": result.candidate_id,
             "stage": result.stage,
             "accepted": result.accepted,
@@ -246,6 +332,153 @@ class DatabaseResearchJobHandlers:
             "run_id": result.run_id,
             "evidence_hash": result.evidence_hash,
         }
+        if result.stage == "protected" and result.accepted:
+            response["artefact_hash"] = self._publish_strategy_artefact(
+                candidate=candidate,
+                request=request,
+                evidence=result.evidence,
+            )
+        return response
+
+    def _publish_strategy_artefact(
+        self,
+        *,
+        candidate: Candidate,
+        request: EvaluationRequest,
+        evidence: Mapping[str, Any],
+    ) -> str:
+        if self.configuration is None or self.dataset_resolver is None:
+            raise JobSchemaError("accepted protected research requires platform configuration")
+        if (
+            candidate.metadata.get("diagnostic") is True
+            or candidate.definition.metadata.get("diagnostic") is True
+            or candidate.metadata.get("promotable") is False
+            or candidate.definition.metadata.get("promotable") is False
+        ):
+            raise JobSchemaError("diagnostic research cannot create a promotable artefact")
+
+        products = {
+            str(item["product_id"]): dict(item)
+            for item in self.configuration["products"]["products"]
+        }
+        policies = {
+            str(item["policy_id"]): dict(item)
+            for item in self.configuration["promotion"]["policies"]
+        }
+        product = products[candidate.definition.product]
+        policy_id = str(product["promotion_policy_id"])
+        with self.store.engine.connect() as connection:
+            stages = connection.execute(
+                select(
+                    validation_stage.c.id,
+                    validation_stage.c.stage,
+                    validation_stage.c.payload,
+                )
+                .where(
+                    validation_stage.c.experiment_id == candidate.candidate_id,
+                    validation_stage.c.accepted.is_(True),
+                    validation_stage.c.stage.in_(
+                        ("screening", "development", "robustness", "protected")
+                    ),
+                )
+                .order_by(validation_stage.c.evaluated_at, validation_stage.c.stage)
+            ).all()
+        stages_by_name = {str(row.stage): str(row.id) for row in stages}
+        required_stages = ("screening", "development", "robustness", "protected")
+        if set(stages_by_name) != set(required_stages):
+            raise JobSchemaError("promotable artefact requires every accepted research stage")
+        snapshot_ids = list(request.dataset_snapshot_ids)
+        for row in stages:
+            payload = row.payload if isinstance(row.payload, Mapping) else {}
+            stage_evidence = payload.get("evidence")
+            context = stage_evidence.get("context") if isinstance(stage_evidence, Mapping) else None
+            if isinstance(context, Mapping):
+                snapshot_ids.extend(str(value) for value in context.get("dataset_snapshot_ids", ()))
+        dataset_snapshot_hashes = tuple(dict.fromkeys(snapshot_ids))
+        resolved = tuple(
+            self.dataset_resolver.resolve(
+                snapshot_id,
+                expected={
+                    "feature_manifest_hash": str(request.feature_manifest_id),
+                    "cost_model_hash": str(request.cost_model_id),
+                    "parameter_set_hash": str(request.parameter_set_id),
+                    "product_id": candidate.definition.product,
+                },
+            )
+            for snapshot_id in dataset_snapshot_hashes
+        )
+        raw_claims = evidence.get("holdout_claim")
+        if not isinstance(raw_claims, list) or len(raw_claims) != 1:
+            raise JobSchemaError("promotable artefact requires one protected holdout claim")
+
+        dependency_hash = canonical_hash(
+            {
+                "evaluator_version": request.evaluator_version,
+                "producer_identity": request.producer_identity,
+                "feature_manifest_id": request.feature_manifest_id,
+                "cost_model_id": request.cost_model_id,
+                "parameter_set_id": request.parameter_set_id,
+            }
+        )
+        artefact = StrategyArtefact.from_authoritative_evidence(
+            definition=candidate.definition,
+            dependency_hash=dependency_hash,
+            dependency_lock_hash=dependency_hash,
+            source_commit_hash=candidate.definition.source_hash,
+            dataset_snapshot_hashes=dataset_snapshot_hashes,
+            feature_set_version=str(request.feature_manifest_id),
+            feature_set_hash=str(request.feature_manifest_id),
+            cost_model_version=str(request.cost_model_id),
+            cost_model_hash=str(request.cost_model_id),
+            validation_stage_ids=tuple(stages_by_name[name] for name in required_stages),
+            holdout_claim_id=str(raw_claims[0]),
+            promotion_policy=policies[policy_id],
+            position_limits=dict(self.configuration["risk"]["strategy"]),
+            risk_limits={
+                "global": dict(self.configuration["risk"]["global"]),
+                "account": dict(self.configuration["risk"]["accounts"][str(product["account_id"])]),
+                "product": dict(
+                    self.configuration["risk"]["products"][str(product["risk_policy_id"])]
+                ),
+            },
+            model_hashes=tuple(
+                dict.fromkeys(
+                    item.model_artefact_id
+                    for item in resolved
+                    if item.model_artefact_id is not None
+                )
+            ),
+            supported_products=(candidate.definition.product,),
+            supported_instruments=tuple(
+                dict.fromkeys(symbol for item in resolved for symbol in item.instrument_scope)
+            ),
+            created_at=request.evaluated_at,
+            validation_evidence={
+                "stage_ids": [stages_by_name[name] for name in required_stages],
+                "protected_evidence_hash": canonical_hash(dict(evidence)),
+            },
+            holdout_claim={
+                "claim_id": str(raw_claims[0]),
+                "outcome_id": evidence.get("holdout_outcome_id"),
+            },
+            metadata={
+                "candidate_id": candidate.candidate_id,
+                "thesis_id": candidate.thesis_id,
+                "lineage_id": candidate.lineage_id,
+                "diagnostic": False,
+                "promotable": True,
+            },
+            product_id=candidate.definition.product,
+            portfolio_id=str(product["portfolio_id"]),
+            account_id=str(product["account_id"]),
+            promotion_policy_id=policy_id,
+            engine_version=request.evaluator_version,
+        )
+        return SqlStrategyArtefactRepository(self.store.engine).put(
+            artefact.artefact_hash,
+            artefact.to_dict(),
+            created_at=request.evaluated_at,
+        )
 
     def bounded_backtest(
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
@@ -501,5 +734,7 @@ def _execution_receipt(request: ResearchJobRequest, *, executor_version: str) ->
         "parameter_set_id": request.parameter_set_id,
         "evaluator_version": request.evaluator_version,
         "executor_version": executor_version,
+        "artefact_hash": request.artefact_hash,
+        "artefact_created_at": request.artefact_created_at,
     }
     return {**payload, "input_hash": canonical_hash(payload)}

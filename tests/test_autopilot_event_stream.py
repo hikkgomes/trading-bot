@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import json
 from pathlib import Path
@@ -8,6 +9,7 @@ from src.alpha.microstructure import MicrostructureAlphaPolicy
 from src.autopilot.event_capture import (
     DEFAULT_CONFIG,
     EventWriter,
+    capture,
     load_event_capture_config,
     normalize_event,
     stream_names,
@@ -32,12 +34,17 @@ def test_default_event_capture_config_is_bounded_and_uses_approved_streams():
 
     assert config.max_total_bytes == 5 * 1024**3
     assert config.retention_seconds == 7 * 86400
-    futures = next(source for source in config.sources if "depth20@100ms" in source.streams)
-    names = stream_names(futures, ("ETHUSDT",))
-    assert "btcusdt@depth20@100ms" in names
-    assert "ethusdt@aggTrade" in names
-    assert "!forceOrder@arr" in names
+    public = next(source for source in config.sources if "depth20@100ms" in source.streams)
+    assert public.url == "wss://fstream.binance.com/public/stream"
+    public_names = stream_names(public, ("ETHUSDT",))
+    assert "btcusdt@depth20@100ms" in public_names
+    market = next(source for source in config.sources if "aggTrade" in source.streams)
+    assert market.url == "wss://fstream.binance.com/market/stream"
+    market_names = stream_names(market, ("ETHUSDT",))
+    assert "ethusdt@aggTrade" in market_names
+    assert "!forceOrder@arr" in market_names
     candle_source = next(source for source in config.sources if source.streams == ("kline_1m",))
+    assert candle_source.url == "wss://fstream.binance.com/market/stream"
     assert candle_source.max_dynamic_symbols == 1_000
     assert "ethusdt@kline_1m" in stream_names(candle_source, ("ETHUSDT",))
 
@@ -269,3 +276,19 @@ def test_event_capture_config_rejects_non_binance_websocket(tmp_path):
 
     with pytest.raises(ValueError, match="approved Binance"):
         load_event_capture_config(path)
+
+
+def test_event_capture_restarts_a_source_task_that_stops(monkeypatch, tmp_path):
+    calls = 0
+
+    async def stopped_source(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr("src.autopilot.event_capture._collect_source", stopped_source)
+    config = dataclasses.replace(load_event_capture_config(DEFAULT_CONFIG), root=tmp_path)
+
+    result = asyncio.run(capture(config, max_seconds=1.1))
+
+    assert result["ok"] is True
+    assert calls > len(config.sources)

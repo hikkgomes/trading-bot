@@ -234,6 +234,10 @@ def _measured_result(
     observed_cost_model = str(context.get("runtime_cost_model_id") or "")
     production_mode = str(context.get("production_execution_mode") or "")
     runtime_mode = str(context.get("runtime_execution_mode") or "")
+    expected_feature_manifest = str(
+        context.get("feature_manifest_id") or context.get("feature_set_hash") or ""
+    )
+    observed_feature_manifest = str(context.get("runtime_feature_manifest_id") or "")
     randomiser = random.Random(int(candidate.candidate_id[7:23], 16))
     monte_carlo_drawdowns = []
     for _ in range(250):
@@ -268,7 +272,24 @@ def _measured_result(
         "funding": funding,
         "regime_breakdown": {"passed": bool(gross), "regimes": {"all": net_return}},
         "parameter_stability": parameter_stability,
-        "sample_evidence": {"passed": aligned >= 3, "observations": aligned},
+        "sample_evidence": {
+            "passed": aligned >= 3,
+            "observations": aligned,
+            "run_id": canonical_hash(
+                {
+                    "kind": "sample_evidence/v1",
+                    "candidate_id": candidate.candidate_id,
+                    "dataset_snapshot_ids": list(snapshots),
+                    "returns": gross,
+                }
+            ),
+            "input_hash": canonical_hash(
+                {
+                    "dataset_snapshot_ids": list(snapshots),
+                    "returns": gross,
+                }
+            ),
+        },
         "cross_symbol_stability": cross_symbol_stability,
         "universe_evidence": {
             "passed": predeclared,
@@ -314,13 +335,43 @@ def _measured_result(
             "upper_bound": bootstrap_high,
             "observations": len(gross),
             "iterations": int(context.get("bootstrap_iterations", 1_000)),
+            "method": str(context.get("bootstrap_method") or "moving_block_bootstrap_v1"),
+            "run_id": canonical_hash(
+                {
+                    "kind": "bootstrap_confidence/v1",
+                    "candidate_id": candidate.candidate_id,
+                    "dataset_snapshot_ids": list(snapshots),
+                    "returns": gross,
+                    "iterations": int(context.get("bootstrap_iterations", 1_000)),
+                }
+            ),
+            "input_hash": canonical_hash(
+                {
+                    "dataset_snapshot_ids": list(snapshots),
+                    "returns": gross,
+                }
+            ),
         },
         "probability_backtest_overfitting": pbo,
+        "pbo_input_hash": canonical_hash(
+            {
+                "dataset_snapshot_ids": list(snapshots),
+                "matrix": pbo_matrix,
+                "method": str(context.get("pbo_method") or "combinatorial_purged_pbo_v1"),
+            }
+        ),
         "deflated_sharpe": dsr,
         "multiple_testing": {
             "trial_count": trial_count,
             "trial_sharpe_std": trial_sharpe_std,
             "trial_sharpes": trial_sharpes,
+            "input_hash": canonical_hash(
+                {
+                    "dataset_snapshot_ids": list(snapshots),
+                    "trial_sharpes": trial_sharpes,
+                    "trial_count": trial_count,
+                }
+            ),
         },
         "statistical_procedures": {
             "bootstrap": str(context.get("bootstrap_method") or "moving_block_bootstrap_v1"),
@@ -336,9 +387,25 @@ def _measured_result(
         },
         "negative_control_results": negative_controls,
         "production_equivalent": {
-            "passed": bool(production_mode and runtime_mode and runtime_mode == production_mode),
+            "passed": bool(
+                production_mode
+                and runtime_mode
+                and runtime_mode == production_mode
+                and expected_engine_hash
+                and observed_engine_hash == expected_engine_hash
+                and expected_feature_manifest
+                and observed_feature_manifest == expected_feature_manifest
+                and expected_cost_model
+                and observed_cost_model == expected_cost_model
+            ),
             "runtime_execution_mode": runtime_mode,
             "production_execution_mode": production_mode,
+            "expected_engine_hash": expected_engine_hash,
+            "observed_engine_hash": observed_engine_hash,
+            "expected_feature_manifest": expected_feature_manifest,
+            "observed_feature_manifest": observed_feature_manifest,
+            "expected_cost_model": expected_cost_model,
+            "observed_cost_model": observed_cost_model,
         },
         "exact_strategy_identity": {
             "passed": observed_definition_hash == expected_definition_hash,
@@ -512,6 +579,15 @@ def _parameter_stability(
         comparable = values[: len(base_returns)]
         result = {
             "name": name,
+            "run_id": canonical_hash(
+                {
+                    "kind": "parameter_neighbour_backtest/v1",
+                    "candidate_id": candidate.candidate_id,
+                    "dataset_snapshot_ids": list(context.get("dataset_snapshot_ids", ())),
+                    "neighbour": name,
+                    "returns": comparable,
+                }
+            ),
             "observations": len(comparable),
             "return": sum(comparable),
             "passed": bool(comparable) and sum(comparable) >= base_total * 0.5,
@@ -544,6 +620,14 @@ def _cross_symbol_stability(
             numeric = _numeric_series(values)
             if numeric:
                 per_symbol[str(symbol)] = {
+                    "run_id": canonical_hash(
+                        {
+                            "kind": "cross_symbol_backtest/v1",
+                            "symbol": str(symbol),
+                            "returns": numeric,
+                            "dataset_snapshot_ids": list(context.get("dataset_snapshot_ids", ())),
+                        }
+                    ),
                     "observations": len(numeric),
                     "return": sum(numeric),
                     "passed": len(numeric) >= 2 and sum(numeric) >= 0.0,
@@ -596,6 +680,15 @@ def _portfolio_overlap(
         comparisons.append(
             {
                 "strategy": str(name),
+                "run_id": canonical_hash(
+                    {
+                        "kind": "portfolio_overlap/v1",
+                        "candidate_returns": candidate,
+                        "active_strategy": str(name),
+                        "active_returns": other,
+                        "dataset_snapshot_ids": list(context.get("dataset_snapshot_ids", ())),
+                    }
+                ),
                 "correlation": correlation,
                 "observations": min(len(candidate), len(other)),
                 "input_hash": canonical_hash(
@@ -631,12 +724,22 @@ def _purged_walk_forward(values: list[float], context: Mapping[str, Any]) -> dic
         left = start + (purge if index else 0)
         right = end - (embargo if index < windows - 1 else 0)
         sample = values[max(start, left) : max(max(start, left), right)]
+        window_input = {
+            "window": index,
+            "start": start,
+            "end": end,
+            "purge_rows": purge,
+            "embargo_rows": embargo,
+            "values": sample,
+        }
         per_window.append(
             {
                 "window": index,
                 "return": sum(sample),
                 "observations": len(sample),
                 "passed": bool(sample) and sum(sample) >= 0.0,
+                "run_id": canonical_hash({"kind": "walk_forward_window/v1", **window_input}),
+                "input_hash": canonical_hash(window_input),
             }
         )
     passed = sum(1 for item in per_window if item["passed"])
@@ -647,6 +750,15 @@ def _purged_walk_forward(values: list[float], context: Mapping[str, Any]) -> dic
         "purged_rows": purge,
         "embargo_rows": embargo,
         "per_window": per_window,
+        "input_hash": canonical_hash(
+            {
+                "kind": "purged_embargoed_walk_forward/v1",
+                "values": values,
+                "windows": windows,
+                "purge_rows": purge,
+                "embargo_rows": embargo,
+            }
+        ),
     }
 
 
@@ -702,6 +814,14 @@ def _drift_checks(context: Mapping[str, Any]) -> dict[str, Any]:
         "maximum_execution": execution_limit,
         "maximum_model": model_limit,
         "source": "runtime_drift_measurements",
+        "input_hash": canonical_hash(
+            {
+                "execution": execution,
+                "model": model,
+                "maximum_execution": execution_limit,
+                "maximum_model": model_limit,
+            }
+        ),
     }
 
 

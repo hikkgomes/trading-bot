@@ -48,9 +48,23 @@ class AccountingService:
         observed_at: str,
         balances: dict[str, float],
         product_id: str | None = None,
+        used_margin_fraction: float = 0.0,
+        liquidation_buffer_fraction: float = 1.0,
+        unknown_exposure: dict[str, float] | None = None,
+        account_state_known: bool = True,
+        account_state_authority: str = "accounting_event",
     ) -> str:
         payload = json_value(
-            {"account_id": account_id, "balances": balances}, field="balance snapshot"
+            {
+                "account_id": account_id,
+                "balances": balances,
+                "used_margin_fraction": float(used_margin_fraction),
+                "liquidation_buffer_fraction": float(liquidation_buffer_fraction),
+                "unknown_exposure": dict(unknown_exposure or {}),
+                "account_state_known": bool(account_state_known),
+                "account_state_authority": str(account_state_authority),
+            },
+            field="balance snapshot",
         )
         identity = canonical_hash({**payload, "observed_at": observed_at})
         self._append(balance_snapshot, identity, observed_at, payload)
@@ -70,11 +84,11 @@ class AccountingService:
                     "product_id": product_id,
                     "observed_at": observed_at,
                     "values": {
-                        "used_margin_fraction": float(payload.get("used_margin_fraction", 0.0)),
+                        "used_margin_fraction": float(payload["used_margin_fraction"]),
                         "liquidation_buffer_fraction": float(
-                            payload.get("liquidation_buffer_fraction", 1.0)
+                            payload["liquidation_buffer_fraction"]
                         ),
-                        "unknown_exposure": {},
+                        "unknown_exposure": dict(payload["unknown_exposure"]),
                     },
                 },
                 created_at=observed_at,
@@ -154,18 +168,20 @@ class DatabaseAccountingWorker:
         worker_id: str,
         service: AccountingService,
         lease_seconds: int = 60,
+        job_name: str = "accounting_event",
     ) -> None:
         self.queue = queue
         self.worker_id = worker_id
         self.service = service
         self.lease_seconds = lease_seconds
+        self.job_name = job_name
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.lease_seconds,
-            names=("accounting_event",),
+            names=(self.job_name,),
         )
         if claimed is None:
             return {"reason_code": "accounting_queue_empty"}
@@ -178,6 +194,18 @@ class DatabaseAccountingWorker:
                     observed_at=str(payload["observed_at"]),
                     balances={str(key): float(value) for key, value in payload["balances"].items()},
                     product_id=(str(payload["product_id"]) if payload.get("product_id") else None),
+                    used_margin_fraction=float(payload.get("used_margin_fraction", 0.0)),
+                    liquidation_buffer_fraction=float(
+                        payload.get("liquidation_buffer_fraction", 1.0)
+                    ),
+                    unknown_exposure={
+                        str(key): float(value)
+                        for key, value in dict(payload.get("unknown_exposure", {})).items()
+                    },
+                    account_state_known=bool(payload.get("account_state_known", False)),
+                    account_state_authority=str(
+                        payload.get("account_state_authority", "user_stream_delta")
+                    ),
                 )
             elif kind == "nav":
                 identity = self.service.record_nav(NavSnapshot(**dict(payload["snapshot"])))

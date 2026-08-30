@@ -22,10 +22,12 @@ LINUX_SERVICES = frozenset(
         "paper-engine",
         "product-supervisor",
         "accounting-service",
+        "account-reconciliation",
         "promotion-engine",
         "control-api",
         "strategy-evaluator",
         "universe-service",
+        "platform-scheduler",
         "research-worker",
         "ml-worker",
         "event-replay-worker",
@@ -348,6 +350,13 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
             raise ValueError(f"product {product_id} refers to an unknown risk policy")
         if product.get("execution_mode") not in {"paper", "live"}:
             raise ValueError(f"product {product_id} has an invalid execution mode")
+        if product.get("execution_mode") == "paper":
+            starting_balances = accounts[account_id].get("paper_starting_balances")
+            starting_positions = accounts[account_id].get("paper_starting_positions")
+            if not isinstance(starting_balances, dict) or not starting_balances:
+                raise ValueError(f"paper account {account_id} needs paper_starting_balances")
+            if not isinstance(starting_positions, dict):
+                raise ValueError(f"paper account {account_id} needs paper_starting_positions")
         preflight_age = product.get("preflight_max_age_seconds", 3_600)
         if (
             not isinstance(preflight_age, int)
@@ -355,6 +364,19 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
             or preflight_age <= 0
         ):
             raise ValueError(f"product {product_id} has an invalid preflight age")
+        for field in (
+            "account_snapshot_max_age_seconds",
+            "maximum_funding_age_seconds",
+            "connected_testnet_max_age_seconds",
+        ):
+            default = {
+                "account_snapshot_max_age_seconds": 60,
+                "maximum_funding_age_seconds": 28_800,
+                "connected_testnet_max_age_seconds": 86_400,
+            }[field]
+            value = product.get(field, default)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"product {product_id} has an invalid {field}")
         costs = _mapping(product.get("execution_costs"), field=f"{product_id}.execution_costs")
         for name in ("fee_bps", "slippage_bps"):
             value = costs.get(name)

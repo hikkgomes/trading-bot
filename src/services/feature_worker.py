@@ -73,6 +73,10 @@ class DatabaseFeatureWorker:
             return {"reason_code": "feature_queue_empty"}
         try:
             payload = claimed.payload
+            if claimed.name == "live_feature_calculation" and not isinstance(
+                payload.get("input_references"), Mapping
+            ):
+                raise ValueError("live feature jobs require immutable input references")
             raw_inputs = payload.get("inputs")
             if payload.get("input_references") is not None:
                 raw_inputs = self._resolve_input_references(payload)
@@ -99,6 +103,7 @@ class DatabaseFeatureWorker:
             assignments = tuple(self.active_assignments(str(payload["instrument_id"])))
             required_by_assignment: dict[str, tuple[str, ...]] = {}
             graph_values: dict[str, float] = {}
+            graph_output_features: dict[str, tuple[str, ...]] = {}
             if self.feature_graph_for_assignment is not None:
                 for assignment in assignments:
                     declaration = self.feature_graph_for_assignment(assignment)
@@ -130,11 +135,27 @@ class DatabaseFeatureWorker:
                         information_timestamp=str(payload["availability_time"]),
                         inputs=available,
                     )
-                    graph_values = {
-                        name: float(value)
-                        for name, value in calculated.items()
-                        if isinstance(value, int | float) and not isinstance(value, bool)
-                    }
+                    for name, value in calculated.items():
+                        if isinstance(value, int | float) and not isinstance(value, bool):
+                            graph_values[name] = float(value)
+                            continue
+                        if not isinstance(value, Mapping) or not value:
+                            raise ValueError(f"feature node {name} returned no scalar values")
+                        expanded: dict[str, float] = {}
+                        for feature_name, feature_value in value.items():
+                            if (
+                                isinstance(feature_value, bool)
+                                or not isinstance(feature_value, int | float)
+                                or not math.isfinite(float(feature_value))
+                            ):
+                                raise ValueError(
+                                    f"feature node {name} returned an invalid component"
+                                )
+                            expanded[str(feature_name)] = float(feature_value)
+                        if not expanded:
+                            raise ValueError(f"feature node {name} returned no scalar components")
+                        graph_values.update(expanded)
+                        graph_output_features[name] = tuple(sorted(expanded))
             combined = {value.feature_name: value.value for value in values}
             combined.update(graph_values)
             values = tuple(
@@ -180,13 +201,22 @@ class DatabaseFeatureWorker:
                         created_at=str(payload["availability_time"]),
                     )
                 required = required_by_assignment.get(str(assignment["id"]), ())
-                assignment_feature_ids = (
-                    [identity_by_name[name] for name in required if name in identity_by_name]
-                    if required
-                    else list(identities)
-                )
-                if required and len(assignment_feature_ids) != len(required):
-                    raise ValueError("artefact feature graph did not produce every required node")
+                if required:
+                    required_feature_names: list[str] = []
+                    for name in required:
+                        if name in identity_by_name:
+                            required_feature_names.append(name)
+                        elif name in graph_output_features:
+                            required_feature_names.extend(graph_output_features[name])
+                        else:
+                            raise ValueError(
+                                "artefact feature graph did not produce every required node"
+                            )
+                    assignment_feature_ids = [
+                        identity_by_name[name] for name in required_feature_names
+                    ]
+                else:
+                    assignment_feature_ids = list(identities)
                 evaluation_payload = {
                     "event_id": str(payload["source_market_event_id"]),
                     "product_id": product_id,
@@ -264,6 +294,10 @@ class DatabaseFeatureWorker:
             raise ValueError("feature bar references require a parquet root")
         through = dt.datetime.fromisoformat(str(bar["through_close_time"]))
         available_at = dt.datetime.fromisoformat(str(payload["availability_time"]))
+        raw_source_ids = bar.get("source_event_ids", ())
+        if not isinstance(raw_source_ids, list | tuple):
+            raise ValueError("feature bar reference source_event_ids must be a list")
+        source_event_ids = {str(value) for value in raw_source_ids}
         bar_rows: dict[str, dict[str, Any]] = {}
         for path in self.parquet_store.root.glob(pattern):
             if path.is_symlink() or not path.is_file():
@@ -281,7 +315,25 @@ class DatabaseFeatureWorker:
         minimum_history = int(bar.get("minimum_history", 1))
         if len(ordered) < minimum_history:
             raise ValueError("feature input reference does not contain the required bar history")
-        latest = ordered[-1]
+        target_rows = (
+            [row for row in ordered if str(row.get("event_id")) in source_event_ids]
+            if source_event_ids
+            else ordered
+        )
+        if not target_rows:
+            raise ValueError("feature bar reference does not contain its source event")
+        latest = target_rows[-1]
+        declared_event_id = str(payload.get("source_market_event_id") or "")
+        if declared_event_id and str(latest.get("event_id")) != declared_event_id:
+            raise ValueError("feature bar reference does not match the source event identity")
+        expected_open = dt.datetime.fromisoformat(str(payload["source_event_time"]))
+        expected_close = dt.datetime.fromisoformat(str(payload["source_close_time"]))
+        actual_open = dt.datetime.fromtimestamp(float(latest["open_time_ms"]) / 1_000, dt.UTC)
+        actual_close = dt.datetime.fromtimestamp(float(latest["close_time_ms"]) / 1_000, dt.UTC)
+        if actual_open != expected_open or actual_close != expected_close:
+            raise ValueError("feature bar reference does not match the source event timestamps")
+        if actual_close > through:
+            raise ValueError("feature bar reference source event is outside its time boundary")
         resolved = {
             "open": float(latest["open"]),
             "high": float(latest["high"]),
@@ -320,9 +372,15 @@ class DatabaseFeatureWorker:
                 instrument_id=str(payload["instrument_id"]),
                 available_at=available_at,
                 through=reference_through,
-                same_instrument=name != "cross_sectional",
+                same_instrument=name
+                not in {"cross_sectional", "correlation_beta", "spot_perpetual"},
             )
-            _merge_auxiliary_inputs(resolved, name=str(name), rows=auxiliary_rows)
+            _merge_auxiliary_inputs(
+                resolved,
+                name=str(name),
+                rows=auxiliary_rows,
+                instrument_id=str(payload["instrument_id"]),
+            )
         return resolved
 
     @staticmethod
@@ -434,9 +492,9 @@ def _number(views: tuple[Mapping[str, Any], ...], *names: str) -> float | None:
     return None
 
 
-def _levels(views: tuple[Mapping[str, Any], ...], name: str) -> tuple[float, float] | None:
+def _levels(views: tuple[Mapping[str, Any], ...], *names: str) -> tuple[float, float] | None:
     for view in views:
-        raw_levels = view.get(name)
+        raw_levels = next((view.get(name) for name in names if view.get(name) is not None), None)
         if not isinstance(raw_levels, list):
             continue
         levels: list[tuple[float, float]] = []
@@ -455,7 +513,11 @@ def _levels(views: tuple[Mapping[str, Any], ...], name: str) -> tuple[float, flo
 
 
 def _merge_auxiliary_inputs(
-    resolved: dict[str, Any], *, name: str, rows: list[dict[str, Any]]
+    resolved: dict[str, Any],
+    *,
+    name: str,
+    rows: list[dict[str, Any]],
+    instrument_id: str,
 ) -> None:
     if not rows:
         return
@@ -474,8 +536,8 @@ def _merge_auxiliary_inputs(
         ask = _number(views, "ask_price", "a")
         bid_depth = _number(views, "bid_depth", "B")
         ask_depth = _number(views, "ask_depth", "A")
-        bid_levels = _levels(views, "b")
-        ask_levels = _levels(views, "a")
+        bid_levels = _levels(views, "b", "bids")
+        ask_levels = _levels(views, "a", "asks")
         if bid_levels is not None:
             bid, bid_depth = bid_levels
         if ask_levels is not None:
@@ -519,12 +581,34 @@ def _merge_auxiliary_inputs(
             )
         return
     if name == "funding_open_interest":
-        funding = _number(views, "funding_rate", "r", "funding")
-        open_interest = _number(views, "open_interest", "oi")
+        funding = _number(views, "funding_rate", "fundingRate", "r", "funding")
+        open_interest = _number(views, "open_interest", "openInterest", "oi")
         if funding is not None:
             resolved["funding_rate"] = funding
         if open_interest is not None:
             resolved["open_interest"] = open_interest
+        return
+    if name == "spot_perpetual":
+        prices: dict[str, float] = {}
+        for row in rows:
+            price = _number(_payload_views(row["payload"]), "close", "c", "price")
+            if price is not None and price > 0:
+                prices[str(row.get("instrument_id"))] = price
+        current_market = "futures" if ":futures:" in instrument_id else "spot"
+        other_market = "spot" if current_market == "futures" else "futures"
+        current_price = prices.get(instrument_id)
+        other_price = next(
+            (price for identity, price in prices.items() if f":{other_market}:" in identity),
+            None,
+        )
+        if current_price is not None:
+            resolved["perpetual_price" if current_market == "futures" else "spot_price"] = (
+                current_price
+            )
+        if other_price is not None:
+            resolved["spot_price" if current_market == "futures" else "perpetual_price"] = (
+                other_price
+            )
         return
     if name == "cross_sectional":
         explicit = next(
@@ -536,7 +620,10 @@ def _merge_auxiliary_inputs(
             None,
         )
         if isinstance(explicit, Mapping) and explicit:
-            resolved["cross_sectional_values"] = dict(explicit)
+            panel = {str(key): float(value) for key, value in explicit.items()}
+            if instrument_id in panel:
+                panel["__current__"] = panel[instrument_id]
+            resolved["cross_sectional_values"] = panel
             return
         closes_by_instrument: dict[str, list[float]] = {}
         for row in rows:
@@ -549,7 +636,38 @@ def _merge_auxiliary_inputs(
             if len(closes) >= 2 and closes[-2] > 0
         }
         if panel:
+            if instrument_id in panel:
+                panel["__current__"] = panel[instrument_id]
             resolved["cross_sectional_values"] = panel
+        return
+    if name == "correlation_beta":
+        correlation_closes_by_instrument: dict[str, list[float]] = {}
+        for row in rows:
+            close = _number(_payload_views(row["payload"]), "c", "close")
+            if close is not None and close > 0:
+                correlation_closes_by_instrument.setdefault(
+                    str(row.get("instrument_id")), []
+                ).append(close)
+        returns_by_instrument = {
+            identity: [
+                closes[index] / closes[index - 1] - 1.0
+                for index in range(1, len(closes))
+                if closes[index - 1] > 0
+            ]
+            for identity, closes in correlation_closes_by_instrument.items()
+        }
+        asset_returns = returns_by_instrument.get(instrument_id, [])
+        benchmark_returns = next(
+            (
+                values
+                for identity, values in returns_by_instrument.items()
+                if identity != instrument_id and values
+            ),
+            [],
+        )
+        if asset_returns and benchmark_returns:
+            resolved["asset_returns"] = asset_returns
+            resolved["benchmark_returns"] = benchmark_returns
         return
     if name == "sentiment":
         value = _number(views, "sentiment_score", "score")

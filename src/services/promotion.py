@@ -14,7 +14,6 @@ from sqlalchemy.engine import Engine
 
 from src.data.database import (
     experiment,
-    forward_evidence,
     forward_paper_observation,
     holdout_claim,
     holdout_outcome,
@@ -257,12 +256,10 @@ class SqlCanonicalPromotionEvidence:
                 raise ValueError("canonical strategy artefact has no authoritative evidence map")
             validation_stage_ids = authoritative.get("validation_stage_ids")
             holdout_claim_id = str(authoritative.get("holdout_claim_id") or "")
-            forward_evidence_id = str(authoritative.get("forward_evidence_id") or "")
             if (
                 not isinstance(validation_stage_ids, list)
                 or not validation_stage_ids
                 or not holdout_claim_id
-                or not forward_evidence_id
             ):
                 raise ValueError("canonical strategy artefact has incomplete evidence identities")
             binding_fields = {
@@ -336,25 +333,9 @@ class SqlCanonicalPromotionEvidence:
                 row
                 for row in connection.execute(select(forward_paper_observation)).mappings()
                 if row["strategy_version_id"] == request.strategy_version_id
+                and row["product_id"] == product_id
                 and row["artefact_hash"] == artefact_hash
             ]
-            if not any(str(row["id"]) == forward_evidence_id for row in forward_rows):
-                forward_record = (
-                    connection.execute(
-                        select(forward_evidence).where(forward_evidence.c.id == forward_evidence_id)
-                    )
-                    .mappings()
-                    .first()
-                )
-                if forward_record is None or not isinstance(forward_record["payload"], dict):
-                    raise ValueError("canonical forward evidence is missing or misbound")
-                forward_payload = forward_record["payload"]
-                if (
-                    forward_payload.get("strategy_version_id") != request.strategy_version_id
-                    or forward_payload.get("product_id") != product_id
-                ):
-                    raise ValueError("canonical forward evidence is bound to another product")
-                forward_rows = [forward_record]
             approvals = [
                 row
                 for row in connection.execute(select(strategy_approval)).mappings()

@@ -5,12 +5,18 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import insert
 
-from src.data.database import PlatformDatabase, strategy_definition, strategy_version
+from src.data.database import (
+    PlatformDatabase,
+    alpha_forecast,
+    strategy_definition,
+    strategy_version,
+)
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.strategies import StrategyDefinition, StrategySourceType
 from src.research.artefacts import StrategyArtefact
 from src.research.canonical import (
     CanonicalEvidenceError,
+    SqlActiveStrategyAssignmentRepository,
     SqlForwardEvidenceRepository,
     SqlStrategyArtefactRepository,
 )
@@ -21,7 +27,9 @@ from src.research.datasets import (
 )
 from src.research.evaluation import EvaluationRequest
 from src.research.executors import ExecutorError, ProviderExecutorRegistry
+from src.services.forward_observation import DatabaseForwardObservationWorker
 from src.services.job_schemas import JobSchemaError
+from src.services.scheduler import DatabaseJobQueue
 
 
 class _DatasetRepository:
@@ -75,6 +83,8 @@ def test_development_resolution_cannot_load_protected_data() -> None:
             allowed_roles=frozenset({"development"}),
             **kwargs,
         )
+    with pytest.raises(DatasetResolutionError, match="explicit protected boundary"):
+        resolver.resolve_context(snapshot_ids=(protected.snapshot_id,), **kwargs)
 
 
 def test_research_stages_select_distinct_dataset_roles() -> None:
@@ -117,6 +127,13 @@ def test_forward_resolution_requires_post_artefact_availability() -> None:
         resolver.resolve_context(
             snapshot_ids=(forward.snapshot_id,),
             minimum_availability_timestamp="2026-08-24T00:00:00+00:00",
+            **kwargs,
+        )
+    with pytest.raises(DatasetResolutionError, match="evaluation time"):
+        resolver.resolve_context(
+            snapshot_ids=(forward.snapshot_id,),
+            minimum_availability_timestamp="2026-08-23T00:00:00+00:00",
+            maximum_availability_timestamp="2026-08-23T23:59:59+00:00",
             **kwargs,
         )
 
@@ -169,7 +186,6 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
         cost_model_version="costs-v1",
         validation_evidence={},
         holdout_claim={},
-        forward_evidence={},
         promotion_policy={},
         position_limits={"maximum_position": 0.1},
         risk_limits={"policy": "risk-v1"},
@@ -196,6 +212,19 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
             artefact_hash=artefact.artefact_hash,
             observation={"direction": "flat"},
         )
+    with pytest.raises(CanonicalEvidenceError, match="activate before artefact creation"):
+        SqlActiveStrategyAssignmentRepository(database.engine).assign(
+            product_id="active_income",
+            portfolio_id="portfolio-active-income",
+            strategy_version_id=definition.strategy_version_id,
+            artefact_hash=artefact.artefact_hash,
+            lifecycle_state="forward_paper",
+            execution_mode="paper",
+            capital_limit=100.0,
+            assigned_at="2026-08-22T23:59:59+00:00",
+            assigned_by="test",
+            instrument_id="BTCUSDT",
+        )
     observation_id = repository.append(
         strategy_version_id=definition.strategy_version_id,
         product_id="active_income",
@@ -205,6 +234,69 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
         observation={"direction": "flat"},
     )
     assert observation_id.startswith("sha256:")
+
+    assignment_id = SqlActiveStrategyAssignmentRepository(database.engine).assign(
+        product_id="active_income",
+        portfolio_id="portfolio-active-income",
+        strategy_version_id=definition.strategy_version_id,
+        artefact_hash=artefact.artefact_hash,
+        lifecycle_state="forward_paper",
+        execution_mode="paper",
+        capital_limit=100.0,
+        assigned_at="2026-08-24T01:00:00+00:00",
+        assigned_by="test",
+        instrument_id="BTCUSDT",
+    )
+    forecast_payload = {
+        "strategy_version_id": definition.strategy_version_id,
+        "product_id": "active_income",
+        "instrument_id": "BTCUSDT",
+        "direction": "long",
+    }
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(alpha_forecast).values(
+                id=canonical_hash(forecast_payload),
+                created_at="2026-08-25T00:00:00+00:00",
+                payload=forecast_payload,
+            )
+        )
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="test:forward-observer",
+        node_id="test",
+        role="promotion-engine",
+        capabilities=("forward_paper_observation",),
+        observed_at="2026-08-26T00:00:00+00:00",
+    )
+    queue.enqueue(
+        job_id="test:forward-observation",
+        name="forward_paper_observation",
+        payload={
+            "assignment_id": assignment_id,
+            "strategy_version_id": definition.strategy_version_id,
+            "product_id": "active_income",
+            "instrument_id": "BTCUSDT",
+            "artefact_hash": artefact.artefact_hash,
+            "evaluation_time": "2026-08-26T00:00:00+00:00",
+        },
+        available_at="2026-08-26T00:00:00+00:00",
+    )
+    recorded = DatabaseForwardObservationWorker(
+        engine=database.engine,
+        queue=queue,
+        worker_id="test:forward-observer",
+    ).run_once(now="2026-08-26T00:00:00+00:00")
+
+    assert recorded["reason_code"] == "forward_observation_recorded"
+    assert recorded["observed_at"] == "2026-08-25T00:00:00+00:00"
+    with pytest.raises(CanonicalEvidenceError, match="artefact-bound"):
+        repository.append_summary(
+            strategy_version_id=definition.strategy_version_id,
+            product_id="active_income",
+            observed_at="2026-08-24T00:00:00+00:00",
+            evidence={"accepted": True},
+        )
 
 
 def test_default_executor_does_not_turn_missing_execution_into_evidence() -> None:

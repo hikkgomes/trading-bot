@@ -1,22 +1,26 @@
 [Unit]
 Description=Trading platform Linux agent service %i
-After=network-online.target postgresql.service
+After=network-online.target postgresql.service trading-platform-migration.service
 Wants=network-online.target
-Requires=postgresql.service
+Requires=postgresql.service trading-platform-migration.service
 
 [Service]
 Type=simple
 User=trading-agent
 Group=trading-agent
 WorkingDirectory=/opt/trading-bot
-EnvironmentFile=/etc/trading-platform/%i.env
+EnvironmentFile=/etc/trading-platform/agent.env
+EnvironmentFile=-/etc/trading-platform/%i.env
 Environment=PYTHONUNBUFFERED=1
 Environment=TRADING_PLATFORM_AGENT_WORKTREE_ROOT=/opt/trading-bot/runtime/agent-worktrees
+Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/agent-worktrees/numba-cache
+Environment=GIT_CONFIG_COUNT=1
+Environment=GIT_CONFIG_KEY_0=safe.directory
+Environment=GIT_CONFIG_VALUE_0=/opt/trading-bot
 ExecStart=/opt/trading-bot/.venv-agent/bin/python -m src.services.supervisor --config /opt/trading-bot/config/platform.json --node linux-optiplex --service %i
 Restart=always
 RestartSec=10
 NoNewPrivileges=true
-PrivateNetwork=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true

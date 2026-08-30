@@ -108,6 +108,8 @@ class ResearchJobRequest:
     producer_identity: str
     content_hash: str
     dataset_roles: dict[str, str] | None = None
+    artefact_hash: str | None = None
+    artefact_created_at: str | None = None
 
     ALLOWED: ClassVar[frozenset[str]] = frozenset(
         {
@@ -122,6 +124,8 @@ class ResearchJobRequest:
             "producer_identity",
             "content_hash",
             "dataset_roles",
+            "artefact_hash",
+            "artefact_created_at",
         }
     )
 
@@ -151,6 +155,24 @@ class ResearchJobRequest:
         producer = _required_text(payload, "producer_identity")
         content_hash = _hash_id(payload, "content_hash")
         dataset_roles = _parse_dataset_roles(payload.get("dataset_roles"), snapshots)
+        artefact_hash = (
+            _hash_id(payload, "artefact_hash") if payload.get("artefact_hash") is not None else None
+        )
+        artefact_created_at = (
+            timestamp(_required_text(payload, "artefact_created_at"), field="artefact_created_at")
+            if payload.get("artefact_created_at") is not None
+            else None
+        )
+        if requested_stage == "forward" and (artefact_hash is None or artefact_created_at is None):
+            raise JobSchemaError(
+                "forward research jobs require the exact artefact hash and immutable creation time"
+            )
+        if (
+            requested_stage == "forward"
+            and artefact_created_at is not None
+            and artefact_created_at >= evaluated_at
+        ):
+            raise JobSchemaError("forward artefact creation must precede evaluation time")
         if require_dataset_roles and dataset_roles is None:
             raise JobSchemaError("research jobs require explicit dataset roles")
         if dataset_roles is not None:
@@ -165,9 +187,19 @@ class ResearchJobRequest:
                 raise JobSchemaError(
                     f"research jobs require exactly one {expected_role} snapshot for {requested_stage}"
                 )
+            if requested_stage == "protected" and (
+                len(snapshots) != 1 or dataset_roles.get(snapshots[0]) != "protected_holdout"
+            ):
+                raise JobSchemaError(
+                    "protected research jobs may contain only the protected_holdout snapshot"
+                )
             if requested_stage != "protected" and "protected_holdout" in dataset_roles.values():
                 raise JobSchemaError(
                     "adaptive research jobs must not contain protected holdout snapshot identities"
+                )
+            if requested_stage != "forward" and "forward_observation" in dataset_roles.values():
+                raise JobSchemaError(
+                    "adaptive research jobs must not contain forward observation snapshot identities"
                 )
         unsigned = dict(payload)
         unsigned.pop("content_hash", None)
@@ -186,6 +218,8 @@ class ResearchJobRequest:
             producer,
             content_hash,
             dataset_roles,
+            artefact_hash,
+            artefact_created_at,
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -201,6 +235,12 @@ class ResearchJobRequest:
             "producer_identity": self.producer_identity,
             "content_hash": self.content_hash,
             **({"dataset_roles": dict(self.dataset_roles)} if self.dataset_roles else {}),
+            **({"artefact_hash": self.artefact_hash} if self.artefact_hash else {}),
+            **(
+                {"artefact_created_at": self.artefact_created_at}
+                if self.artefact_created_at
+                else {}
+            ),
         }
 
 

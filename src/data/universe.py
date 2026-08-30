@@ -81,17 +81,21 @@ def eligibility_reason(
     policy: UniverseEligibilityPolicy,
 ) -> str:
     instrument = observation.instrument
+    futures = instrument.market_type is MarketType.FUTURES
     checks = (
         (instrument.status != "trading", "listing_not_trading"),
-        (instrument.market_type is not MarketType.FUTURES, "not_futures"),
+        (instrument.market_type not in {MarketType.SPOT, MarketType.FUTURES}, "market_unknown"),
         (instrument.quote_asset != "USDT", "not_usdt_quoted"),
         (observation.listing_age_days < policy.minimum_listing_age_days, "listing_too_new"),
         (observation.quote_volume < policy.minimum_quote_volume, "quote_volume_too_low"),
         (observation.trade_count < policy.minimum_trade_count, "trade_count_too_low"),
         (observation.spread_bps > policy.maximum_spread_bps, "spread_too_wide"),
-        (observation.open_interest < policy.minimum_open_interest, "open_interest_too_low"),
         (
-            abs(observation.funding_rate) > policy.maximum_absolute_funding_rate,
+            futures and observation.open_interest < policy.minimum_open_interest,
+            "open_interest_too_low",
+        ),
+        (
+            futures and abs(observation.funding_rate) > policy.maximum_absolute_funding_rate,
             "funding_out_of_bounds",
         ),
         (
@@ -214,11 +218,6 @@ class SqlUniverseStore:
                 )
             )
         else:
-            existing_payload = dict(existing["payload"])
-            immutable_existing_payload = {
-                key: value for key, value in existing_payload.items() if key != "status"
-            }
-            immutable_payload = {key: value for key, value in payload.items() if key != "status"}
             expected = {
                 "id": item.instrument_id,
                 "venue": item.venue,
@@ -228,10 +227,17 @@ class SqlUniverseStore:
                 "quote_asset": item.quote_asset,
                 "settlement_asset": item.settlement_asset,
             }
-            if any(existing[field] != value for field, value in expected.items()) or (
-                immutable_existing_payload != immutable_payload
-            ):
+            if any(existing[field] != value for field, value in expected.items()):
                 raise ValueError(f"instrument identity collision: {item.instrument_id}")
+            # Exchange filters and status are operational metadata. Refresh
+            # them when the exchange publishes a new value while keeping the
+            # canonical instrument identity immutable.
+            if dict(existing["payload"]) != payload:
+                connection.execute(
+                    instrument_table.update()
+                    .where(instrument_table.c.id == item.instrument_id)
+                    .values(payload=payload)
+                )
         status_id = canonical_hash(
             {"instrument_id": item.instrument_id, "observed_at": observed_at, "status": item.status}
         )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,8 @@ from src.domain._codec import canonical_hash
 from src.domain.market_events import ExchangeSequenceTracker, MarketEvent, MarketEventType
 from src.risk.engine import SqlRiskSnapshotStore
 from src.services.scheduler import DatabaseJobQueue
+
+_PARTITION_TOKEN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 class DatabaseMarketDataWriter:
@@ -118,11 +121,21 @@ class DatabaseMarketDataWriter:
         if canonical_hash(body) != str(payload["segment_hash"]):
             raise ValueError("market batch segment content hash is invalid")
         events = []
+        dropped_rows = 0
         for row in rows:
             event = row.get("event")
             if not isinstance(event, dict):
                 raise ValueError("market batch row has no event")
             canonical_event = MarketEvent(**event)
+            partition_values = (
+                str(row.get("venue") or "").lower(),
+                str(row.get("market") or "").lower(),
+                canonical_event.event_type.value,
+                str(row.get("symbol") or "").upper(),
+            )
+            if any(not _PARTITION_TOKEN.fullmatch(value) for value in partition_values):
+                dropped_rows += 1
+                continue
             events.append(
                 (
                     canonical_event,
@@ -132,7 +145,7 @@ class DatabaseMarketDataWriter:
                 )
             )
             self.sequence_tracker.observe(canonical_event)
-        paths = self.store.put_batch(events)
+        paths = self.store.put_batch(events) if events else ()
         for event, venue, market, symbol in events:
             if _is_closed_candle(event):
                 self.bar_store.put(event, venue=venue, market=market, symbol=symbol)
@@ -147,12 +160,13 @@ class DatabaseMarketDataWriter:
         return {
             "segments": len(paths),
             "events": len(events),
+            "dropped_rows": dropped_rows,
             "paths": [str(path) for path in paths],
             "market_snapshot_ids": snapshot_ids,
         }
 
     def _publish_market_snapshots(self, *, event: MarketEvent, market: str) -> tuple[str, ...]:
-        if self.snapshot_store is None or not _is_closed_candle(event):
+        if self.snapshot_store is None:
             return ()
         values = _market_snapshot_values(event)
         if values is None:
@@ -211,7 +225,9 @@ class DatabaseMarketDataWriter:
                 "funding_open_interest_snapshot",
                 ("funding_rate", "open_interest", "mark_price"),
             ),
+            "spot_perpetual": ("spot_perpetual_snapshot", ("candle",)),
             "cross_sectional": ("cross_sectional_snapshot", ("candle",)),
+            "correlation_beta": ("correlation_beta_snapshot", ("candle",)),
             "sentiment": ("sentiment_snapshot", ()),
             "ml_manifest": ("frozen_ml_manifest", ()),
             "liquidation": ("liquidation_snapshot", ("liquidation",)),
@@ -219,7 +235,9 @@ class DatabaseMarketDataWriter:
         for name, (kind, event_types) in auxiliary_specs.items():
             pattern = (
                 f"raw/{venue.lower()}/{market.lower()}/candle/**/*.parquet"
-                if name == "cross_sectional"
+                if name in {"cross_sectional", "correlation_beta"}
+                else f"raw/{venue.lower()}/**/candle/{symbol.upper()}/**/*.parquet"
+                if name == "spot_perpetual"
                 else f"raw/{venue.lower()}/{market.lower()}/**/{symbol.upper()}/**/*.parquet"
             )
             reference = {
@@ -282,21 +300,92 @@ def _is_closed_candle(event: MarketEvent) -> bool:
 
 def _market_snapshot_values(event: MarketEvent) -> dict[str, float] | None:
     raw_data = event.payload.get("data")
-    candle = raw_data.get("k") if isinstance(raw_data, Mapping) else None
-    if not isinstance(candle, Mapping):
+    if not isinstance(raw_data, Mapping):
         return None
     values: dict[str, float] = {}
-    for name in ("c", "spread_bps", "visible_depth", "volatility", "funding"):
-        value = candle.get(name)
-        if value is None or isinstance(value, bool):
+
+    def number(*names: str) -> float | None:
+        for name in names:
+            value = raw_data.get(name)
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(parsed):
+                return parsed
+        return None
+
+    candle = raw_data.get("k")
+    if event.event_type is MarketEventType.CANDLE:
+        if not isinstance(candle, Mapping) or candle.get("x") is not True:
+            return None
+        close = candle.get("c")
+        if close is None or isinstance(close, bool):
             return None
         try:
-            parsed = float(value)
+            values["close"] = float(close)
         except (TypeError, ValueError):
             return None
-        if not math.isfinite(parsed):
+    elif event.event_type in {MarketEventType.BEST_BID_ASK, MarketEventType.DEPTH_UPDATE}:
+        bid = number("bid_price", "b")
+        ask = number("ask_price", "a")
+        bid_depth = number("bid_depth", "B")
+        ask_depth = number("ask_depth", "A")
+        if event.event_type is MarketEventType.DEPTH_UPDATE:
+            bid_levels = raw_data.get("b", raw_data.get("bids"))
+            ask_levels = raw_data.get("a", raw_data.get("asks"))
+            if isinstance(bid_levels, list) and bid_levels:
+                bid, bid_depth = _book_level(bid_levels[0])
+            if isinstance(ask_levels, list) and ask_levels:
+                ask, ask_depth = _book_level(ask_levels[0])
+        if bid is None or ask is None or bid <= 0 or ask < bid:
             return None
-        values[{"c": "close"}.get(name, name)] = parsed
-    if values["close"] <= 0 or values["visible_depth"] < 0:
+        midpoint = (bid + ask) / 2.0
+        values.update(
+            {
+                "close": midpoint,
+                "spread_bps": (ask - bid) / midpoint * 10_000.0,
+                "visible_depth": max(0.0, bid_depth or 0.0) + max(0.0, ask_depth or 0.0),
+            }
+        )
+    elif event.event_type is MarketEventType.MARK_PRICE:
+        price = number("mark_price", "markPrice", "p")
+        if price is None or price <= 0:
+            return None
+        values["close"] = price
+        funding = number("funding_rate", "fundingRate", "r")
+        if funding is not None:
+            values["funding"] = funding
+    elif event.event_type is MarketEventType.FUNDING_RATE:
+        funding = number("funding_rate", "fundingRate", "r")
+        if funding is None:
+            return None
+        values["funding"] = funding
+    elif event.event_type in {MarketEventType.TRADE, MarketEventType.AGGREGATE_TRADE}:
+        price = number("price", "p")
+        if price is None or price <= 0:
+            return None
+        values["close"] = price
+    else:
+        return None
+
+    if "close" in values and values["close"] <= 0:
+        return None
+    if values.get("visible_depth", 0.0) < 0:
         return None
     return values
+
+
+def _book_level(value: object) -> tuple[float | None, float | None]:
+    if not isinstance(value, list | tuple) or len(value) < 2:
+        return None, None
+    try:
+        price = float(value[0])
+        quantity = float(value[1])
+    except (TypeError, ValueError):
+        return None, None
+    if not math.isfinite(price) or not math.isfinite(quantity):
+        return None, None
+    return price, quantity

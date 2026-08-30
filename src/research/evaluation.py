@@ -14,12 +14,13 @@ from typing import Any, cast
 from sqlalchemy import select, update
 from sqlalchemy.engine import Engine
 
-from src.data.database import experiment, holdout_claim, holdout_outcome
+from src.data.database import experiment, holdout_claim
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlHoldoutRepository, SqlValidationRepository
+from src.research.datasets import CanonicalDatasetResolver
 from src.research.executors import ExecutorError, ProviderExecutorRegistry
 from src.research.store import SqlResearchStore
-from src.research.theses import SqlThesisRegistry, ThesisError
+from src.research.theses import REQUIRED_NEGATIVE_CONTROLS, SqlThesisRegistry, ThesisError
 
 STAGES = ("screening", "development", "robustness", "protected", "forward")
 FORBIDDEN_SUBMITTED_FIELDS = frozenset(
@@ -51,6 +52,8 @@ ALLOWED_REQUEST_FIELDS = frozenset(
         "producer_identity",
         "content_hash",
         "dataset_roles",
+        "artefact_hash",
+        "artefact_created_at",
     }
 )
 
@@ -76,6 +79,8 @@ class EvaluationRequest:
     producer_identity: str | None = None
     content_hash: str | None = None
     dataset_roles: Mapping[str, str] | None = None
+    artefact_hash: str | None = None
+    artefact_created_at: str | None = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> EvaluationRequest:
@@ -147,6 +152,10 @@ class EvaluationRequest:
             raise EvaluationContractError("content_hash does not match the evaluation request")
         raw_roles = payload.get("dataset_roles")
         roles: dict[str, str] | None = None
+        if raw_roles is None:
+            raise EvaluationContractError(
+                "evaluate_candidate requests require explicit dataset roles"
+            )
         if raw_roles is not None:
             if not isinstance(raw_roles, Mapping) or set(raw_roles) != set(snapshots):
                 raise EvaluationContractError(
@@ -174,9 +183,32 @@ class EvaluationRequest:
                 raise EvaluationContractError(
                     f"dataset_roles must contain exactly one {expected_role} snapshot"
                 )
+            if stage == "protected" and (
+                len(snapshots) != 1 or roles.get(snapshots[0]) != "protected_holdout"
+            ):
+                raise EvaluationContractError(
+                    "protected evaluation requests may contain only the protected_holdout snapshot"
+                )
             if stage != "protected" and "protected_holdout" in roles.values():
                 raise EvaluationContractError(
                     "adaptive evaluation cannot contain a protected_holdout snapshot"
+                )
+        artefact_hash = payload.get("artefact_hash")
+        if artefact_hash is not None:
+            artefact_hash = non_empty(str(artefact_hash), field="artefact_hash")
+            if not artefact_hash.startswith("sha256:") or len(artefact_hash) != 71:
+                raise EvaluationContractError("artefact_hash must be a sha256: identity")
+        artefact_created_at = payload.get("artefact_created_at")
+        if artefact_created_at is not None:
+            artefact_created_at = timestamp(str(artefact_created_at), field="artefact_created_at")
+        if stage == "forward":
+            if artefact_hash is None or artefact_created_at is None:
+                raise EvaluationContractError(
+                    "forward evaluations require the exact artefact hash and creation time"
+                )
+            if artefact_created_at >= evaluated_at:
+                raise EvaluationContractError(
+                    "forward artefact creation must precede evaluation time"
                 )
         return cls(
             candidate_id=candidate_id,
@@ -189,6 +221,8 @@ class EvaluationRequest:
             content_hash=content_hash,
             **hashes,
             dataset_roles=roles,
+            artefact_hash=artefact_hash,
+            artefact_created_at=artefact_created_at,
         )
 
     def snapshot_ids_for_stage(self, stage: str) -> tuple[str, ...]:
@@ -245,6 +279,28 @@ class EvidencePolicy:
     multiple_testing_method: str = "bailey_lopez_de_prado_dsr_v1"
     pbo_method: str = "combinatorial_purged_pbo_v1"
 
+    @classmethod
+    def from_configuration(cls, configuration: Mapping[str, Any]) -> EvidencePolicy:
+        required = {
+            "version",
+            "minimum_cost_adjusted_return",
+            "minimum_deflated_sharpe",
+            "minimum_walk_forward_windows",
+            "minimum_walk_forward_pass_fraction",
+            "maximum_backtest_overfitting_probability",
+            "maximum_portfolio_correlation",
+            "minimum_bootstrap_observations",
+            "bootstrap_method",
+            "multiple_testing_method",
+            "pbo_method",
+        }
+        missing = sorted(required - set(configuration))
+        if missing:
+            raise EvaluationContractError(
+                "research evidence policy is missing versioned fields: " + ", ".join(missing)
+            )
+        return cls(**{str(key): configuration[key] for key in required})
+
     @property
     def policy_hash(self) -> str:
         return canonical_hash(
@@ -264,6 +320,8 @@ class EvidencePolicy:
         )
 
     def accepts(self, stage: str, evidence: Mapping[str, Any], controls: tuple[str, ...]) -> bool:
+        if evidence.get("evidence_policy_hash") != self.policy_hash:
+            return False
         validators = _STAGE_EVIDENCE_VALIDATORS.get(stage, {})
         if not validators or any(
             not validator(evidence.get(name), self) for name, validator in validators.items()
@@ -333,7 +391,115 @@ def _walk_forward_passes(value: object, policy: EvidencePolicy) -> bool:
 
 
 def _mapping_passes(value: object, _policy: EvidencePolicy) -> bool:
-    return _passed_mapping(value)
+    if not _passed_mapping(value):
+        return False
+    assert isinstance(value, Mapping)
+    return any(
+        key != "passed"
+        and value[key] not in (None, (), [], {})
+        and not isinstance(value[key], bool)
+        for key in value
+    )
+
+
+def _parameter_stability_passes(value: object, _policy: EvidencePolicy) -> bool:
+    if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    results = value.get("results")
+    tested = value.get("neighbours_tested")
+    if not isinstance(results, list | tuple) or not isinstance(tested, int) or tested < 2:
+        return False
+    if len(results) != tested:
+        return False
+    return all(
+        isinstance(item, Mapping)
+        and item.get("passed") is True
+        and isinstance(item.get("observations"), int)
+        and int(item["observations"]) > 0
+        and _finite(item.get("return")) is not None
+        and _valid_hash(item.get("run_id"))
+        and _valid_hash(item.get("input_hash"))
+        for item in results
+    )
+
+
+def _cross_symbol_stability_passes(value: object, _policy: EvidencePolicy) -> bool:
+    if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    per_symbol = value.get("per_symbol")
+    symbols = value.get("symbols")
+    if not isinstance(per_symbol, Mapping) or not isinstance(symbols, int) or symbols <= 0:
+        return False
+    return len(per_symbol) == symbols and all(
+        isinstance(item, Mapping)
+        and item.get("passed") is True
+        and isinstance(item.get("observations"), int)
+        and int(item["observations"]) >= 2
+        and _finite(item.get("return")) is not None
+        and _valid_hash(item.get("run_id"))
+        and _valid_hash(item.get("input_hash"))
+        for item in per_symbol.values()
+    )
+
+
+def _portfolio_overlap_passes(value: object, policy: EvidencePolicy) -> bool:
+    if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    comparisons = value.get("comparisons")
+    count = value.get("active_strategy_count")
+    maximum = _finite(value.get("maximum_correlation"))
+    threshold = _finite(value.get("threshold"))
+    if (
+        not isinstance(comparisons, list | tuple)
+        or not isinstance(count, int)
+        or count <= 0
+        or len(comparisons) != count
+        or maximum is None
+        or threshold is None
+        or threshold < 0.0
+        or threshold > policy.maximum_portfolio_correlation
+        or maximum > threshold
+    ):
+        return False
+    return all(
+        isinstance(item, Mapping)
+        and isinstance(item.get("observations"), int)
+        and int(item["observations"]) >= 2
+        and _finite(item.get("correlation")) is not None
+        and _valid_hash(item.get("run_id"))
+        and _valid_hash(item.get("input_hash"))
+        for item in comparisons
+    )
+
+
+def _valid_hash(value: object) -> bool:
+    if not isinstance(value, str) or not value.startswith("sha256:") or len(value) != 71:
+        return False
+    try:
+        int(value[7:], 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _statistical_procedures_pass(value: object, policy: EvidencePolicy) -> bool:
+    return isinstance(value, Mapping) and value == {
+        "bootstrap": policy.bootstrap_method,
+        "multiple_testing": policy.multiple_testing_method,
+        "pbo": policy.pbo_method,
+    }
+
+
+def _negative_control_results_pass(value: object, _policy: EvidencePolicy) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    return all(
+        _passed_mapping(value.get(name))
+        and isinstance(value[name].get("observations"), int)
+        and int(value[name]["observations"]) > 0
+        and _valid_hash(value[name].get("input_hash"))
+        for name in REQUIRED_NEGATIVE_CONTROLS
+    )
 
 
 def _bootstrap_passes(value: object, policy: EvidencePolicy) -> bool:
@@ -371,11 +537,11 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
         "slippage": _nonnegative,
         "funding": _nonnegative,
         "regime_breakdown": _mapping_passes,
-        "parameter_stability": _mapping_passes,
+        "parameter_stability": _parameter_stability_passes,
         "sample_evidence": _mapping_passes,
-        "cross_symbol_stability": _mapping_passes,
+        "cross_symbol_stability": _cross_symbol_stability_passes,
         "universe_evidence": _mapping_passes,
-        "portfolio_overlap": _mapping_passes,
+        "portfolio_overlap": _portfolio_overlap_passes,
     },
     "robustness": {
         "walk_forward": _walk_forward_passes,
@@ -390,9 +556,10 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
         "bootstrap_confidence": _bootstrap_passes,
         "probability_backtest_overfitting": _pbo_passes,
         "deflated_sharpe": _deflated_sharpe_passes,
+        "statistical_procedures": _statistical_procedures_pass,
         "drawdown_stability": _mapping_passes,
         "null_results": _mapping_passes,
-        "negative_control_results": _mapping,
+        "negative_control_results": _negative_control_results_pass,
     },
     "forward": {
         "production_equivalent": _mapping_passes,
@@ -431,9 +598,20 @@ class ProtectedHoldoutWorker:
         self,
         engine: Engine,
         evaluator: Callable[[Mapping[str, Any]], tuple[bool, Mapping[str, Any]]],
+        *,
+        dataset_resolver: CanonicalDatasetResolver | None = None,
+        feature_manifest_id: str | None = None,
+        cost_model_id: str | None = None,
+        parameter_set_id: str | None = None,
     ) -> None:
         self.repository = SqlHoldoutRepository(engine)
         self.evaluator = evaluator
+        self.dataset_resolver = dataset_resolver
+        self.dataset_identities = {
+            "feature_manifest_hash": feature_manifest_id,
+            "cost_model_hash": cost_model_id,
+            "parameter_set_hash": parameter_set_id,
+        }
 
     def claim_and_evaluate(
         self,
@@ -451,27 +629,47 @@ class ProtectedHoldoutWorker:
             source_hashes=source_hashes,
             claimed_at=evaluated_at,
         )
-        accepted, result = self.evaluator(
-            {
-                "claim_id": claim_id,
-                "strategy_version_id": strategy_version_id,
-                "dataset_snapshot_id": dataset_snapshot_id,
-                "cohort_id": cohort_id,
-                "source_hashes": dict(source_hashes),
-            }
-        )
+        protected_context: Mapping[str, Any] | None = None
+        if self.dataset_resolver is not None:
+            if any(value is None for value in self.dataset_identities.values()):
+                raise EvaluationContractError(
+                    "protected holdout resolution requires canonical dataset identities"
+                )
+            protected_context = self.dataset_resolver.resolve_context(
+                snapshot_ids=(dataset_snapshot_id,),
+                feature_manifest_id=str(self.dataset_identities["feature_manifest_hash"]),
+                cost_model_id=str(self.dataset_identities["cost_model_hash"]),
+                parameter_set_id=str(self.dataset_identities["parameter_set_hash"]),
+                allowed_roles=frozenset({"protected_holdout"}),
+            )
+        callback_payload = {
+            "claim_id": claim_id,
+            "strategy_version_id": strategy_version_id,
+            "dataset_snapshot_id": dataset_snapshot_id,
+            "cohort_id": cohort_id,
+            "source_hashes": dict(source_hashes),
+        }
+        if protected_context is not None:
+            # This object is scoped to the callback and is never returned by
+            # the worker. Adaptive research only receives the sealed summary.
+            callback_payload["protected_context"] = protected_context
+        accepted, result = self.evaluator(callback_payload)
         if not isinstance(accepted, bool) or not isinstance(result, Mapping):
             raise EvaluationContractError("protected evaluator returned an invalid sealed outcome")
         sealed = result.get("sealed_result")
         if not isinstance(sealed, Mapping) or not sealed:
             raise EvaluationContractError("protected evaluator returned no sealed outcome")
+        if sealed.get("passed") is not accepted:
+            raise EvaluationContractError("protected sealed outcome does not match its decision")
         outcome_id = self.repository.record_outcome(
             claim_id=claim_id,
             evaluated_at=evaluated_at,
             accepted=accepted,
             outcome=sealed,
         )
-        return claim_id, outcome_id, accepted, dict(sealed)
+        # Keep protected metrics and dataset identities in the sealed database
+        # row. The adaptive caller receives only a non-row-level summary.
+        return claim_id, outcome_id, accepted, {"passed": accepted, "outcome_id": outcome_id}
 
 
 class CanonicalResearchEvaluator:
@@ -585,6 +783,8 @@ class CanonicalResearchEvaluator:
             "evaluator_version": request.evaluator_version,
             "producer_identity": request.producer_identity,
             "content_hash": request.content_hash,
+            "artefact_hash": request.artefact_hash,
+            "artefact_created_at": request.artefact_created_at,
         }
         evidence, accepted, reason_code, receipt, metrics = self._calculate_stage(
             request.requested_stage,
@@ -655,9 +855,22 @@ class CanonicalResearchEvaluator:
             }
         )
         if stage in {"screening", "development", "robustness", "forward"}:
+            context_error = self.provider_context.get("provider_context_error")
+            if isinstance(context_error, str) and context_error:
+                return (
+                    {
+                        "identity": identity,
+                        "context": dict(context),
+                        "executor_error": context_error,
+                    },
+                    False,
+                    "candidate_execution_failed",
+                    None,
+                    {},
+                )
             try:
                 execution = self.executors.execute(candidate, {**self.provider_context, **context})
-            except (ExecutorError, ValueError, TypeError) as exc:
+            except (ExecutorError, KeyError, ValueError, TypeError) as exc:
                 return (
                     {
                         "identity": identity,
@@ -728,7 +941,7 @@ class CanonicalResearchEvaluator:
                     "cost_model_id": str(context["cost_model_id"]),
                 }
                 if self.protected_worker is not None:
-                    claim_id, outcome_id, holdout_accepted, sealed_outcome = (
+                    _claim_id, outcome_id, holdout_accepted, _sealed_outcome = (
                         self.protected_worker.claim_and_evaluate(
                             strategy_version_id=definition.strategy_version_id,
                             dataset_snapshot_id=str(protected_snapshot_id or ""),
@@ -738,7 +951,7 @@ class CanonicalResearchEvaluator:
                         )
                     )
                 else:
-                    claim_id = SqlHoldoutRepository(self.store.engine).claim(
+                    _claim_id = SqlHoldoutRepository(self.store.engine).claim(
                         strategy_version_id=definition.strategy_version_id,
                         data_snapshot_id=str(protected_snapshot_id or ""),
                         cohort_id=f"protected:{context['candidate_id']}",
@@ -747,7 +960,6 @@ class CanonicalResearchEvaluator:
                     )
                     outcome_id = None
                     holdout_accepted = False
-                    sealed_outcome = {}
             except Exception as exc:
                 return (
                     {
@@ -761,13 +973,6 @@ class CanonicalResearchEvaluator:
                     {},
                 )
             claims = self.protected.claim_for(definition.strategy_version_id)
-            with self.store.engine.connect() as connection:
-                outcome = connection.execute(
-                    select(holdout_outcome.c.payload)
-                    .where(holdout_outcome.c.holdout_claim_id == claim_id)
-                    .order_by(holdout_outcome.c.evaluated_at.desc())
-                    .limit(1)
-                ).scalar_one_or_none()
             evidence = {
                 "identity": identity,
                 "frozen_cohort": bool(claims),
@@ -779,15 +984,15 @@ class CanonicalResearchEvaluator:
                     }
                 ),
                 "code_hash": context["code_hash"],
-                "holdout_outcome": dict(outcome) if isinstance(outcome, Mapping) else {},
                 "holdout_outcome_id": outcome_id,
-                "sealed_outcome": dict(sealed_outcome),
+                "sealed_outcome": {
+                    "passed": bool(holdout_accepted),
+                    "outcome_id": outcome_id,
+                },
                 "context": dict(context),
             }
-            accepted = bool(claims) and (
-                holdout_accepted
-                if self.protected_worker is not None
-                else bool(evidence.get("holdout_outcome"))
+            accepted = (
+                bool(claims) and holdout_accepted if self.protected_worker is not None else False
             )
             return (
                 evidence,

@@ -49,6 +49,7 @@ class DatabaseRiskWorker:
         | None = None,
         execution_modes: Mapping[str, str] | None = None,
         lease_seconds: int = 60,
+        job_name: str = "risk_assessment",
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -59,13 +60,14 @@ class DatabaseRiskWorker:
         self.snapshot_loader = snapshot_loader
         self.execution_modes = dict(execution_modes or {})
         self.lease_seconds = lease_seconds
+        self.job_name = job_name
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.lease_seconds,
-            names=("risk_assessment",),
+            names=(self.job_name,),
         )
         if claimed is None:
             return {"reason_code": "risk_queue_empty"}

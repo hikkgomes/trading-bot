@@ -68,6 +68,16 @@ class DatabaseStrategyEvaluator:
                 raise ValueError(f"no active strategy assignment for {product_id}")
             if assignment["id"] != payload["assignment_id"]:
                 raise ValueError("strategy assignment changed after feature publication")
+            assignment_payload = assignment.get("payload")
+            if (
+                isinstance(assignment_payload, Mapping)
+                and assignment_payload.get("diagnostic") is True
+            ):
+                self.queue.complete(claimed, completed_at=now)
+                return {
+                    "reason_code": "diagnostic_strategy_evaluation_skipped",
+                    "job_id": claimed.job_id,
+                }
             at = timestamp(payload["evaluated_at"], field="evaluated_at")
             values = self.feature_store.by_ids(payload["feature_ids"])
             if any(

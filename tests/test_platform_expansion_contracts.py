@@ -195,6 +195,42 @@ def test_dispatcher_verifies_hashes_and_emits_execution_receipt() -> None:
         ArtefactDispatcher.default().evaluate({"bar_return": 0.01}, {**artefact, "x": 1})
 
 
+def test_dispatcher_executes_every_autonomous_candidate_source_type() -> None:
+    dispatcher = ArtefactDispatcher.default()
+    for source_type in (
+        "parameter_search",
+        "mutation",
+        "crossover",
+        "agent_generated_python",
+    ):
+        definition = {
+            "source_type": source_type,
+            "signal_model": {
+                "production_rule": {
+                    "kind": "linear_feature_score/v1",
+                    "terms": [{"feature": "bar_return", "scale": 1.0, "weight": 1.0}],
+                }
+            },
+            "metadata": (
+                {"sandbox_receipt": "sha256:" + "a" * 64}
+                if source_type == "agent_generated_python"
+                else {"derived_from": "sha256:" + "b" * 64}
+            ),
+        }
+        definition_hash = canonical_hash(
+            {key: value for key, value in definition.items() if key != "metadata"}
+        )
+        artefact = {
+            "definition": definition,
+            "definition_hash": definition_hash,
+            "position_limits": {"maximum_position": 0.2},
+        }
+        artefact["artefact_hash"] = canonical_hash(artefact)
+        result = dispatcher.evaluate({"bar_return": 0.01}, artefact)
+        assert result["direction"] == "long"
+        assert result["execution_receipt"]["source_type"] == source_type
+
+
 def test_every_registered_catalogue_candidate_has_an_executable_live_graph() -> None:
     candidates = registered_strategy_candidates(
         product="active_income",
@@ -498,6 +534,9 @@ def test_default_executor_registry_covers_every_promotable_source_type() -> None
     builders = ProviderContextBuilderRegistry.default()
     for source_type in (
         StrategySourceType.REGISTERED_PYTHON,
+        StrategySourceType.PARAMETER_SEARCH,
+        StrategySourceType.MUTATION,
+        StrategySourceType.CROSSOVER,
         StrategySourceType.GENERATED_DSL,
         StrategySourceType.MACHINE_LEARNING,
         StrategySourceType.CROSS_SECTIONAL,

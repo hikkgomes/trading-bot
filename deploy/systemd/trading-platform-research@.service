@@ -1,18 +1,20 @@
 [Unit]
 Description=Trading platform Linux research service %i
-After=network-online.target postgresql.service
+After=network-online.target postgresql.service trading-platform-migration.service
 Wants=network-online.target
-Requires=postgresql.service
+Requires=postgresql.service trading-platform-migration.service
 
 [Service]
 Type=simple
 User=trading-research
 Group=trading-research
 WorkingDirectory=/opt/trading-bot
-EnvironmentFile=/etc/trading-platform/%i.env
+EnvironmentFile=/etc/trading-platform/research.env
+EnvironmentFile=-/etc/trading-platform/%i.env
 Environment=PYTHONUNBUFFERED=1
 Environment=OMP_NUM_THREADS=2
 Environment=OPENBLAS_NUM_THREADS=2
+Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/research/numba-cache
 ExecStart=/opt/trading-bot/.venv-research/bin/python -m src.services.supervisor --config /opt/trading-bot/config/platform.json --node linux-optiplex --service %i
 Restart=always
 RestartSec=10
@@ -21,6 +23,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/opt/trading-bot/data/research /opt/trading-bot/data/artefacts /opt/trading-bot/data/reports /opt/trading-bot/runtime/research
+ReadOnlyPaths=/opt/trading-bot/data/raw /opt/trading-bot/data/bars /opt/trading-bot/data/features
 Slice=trading-platform-background.slice
 
 [Install]

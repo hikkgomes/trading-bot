@@ -1,7 +1,254 @@
-# Deployment and Operations Runbook
+# PostgreSQL Platform Deployment
 
-This is the authoritative runbook for a fresh light-Linux deployment. The
-repository defaults to paper trading. Keep it that way until the promotion
+This is the authoritative clean-install runbook for the OptiPlex Linux
+production node. The PostgreSQL platform supervisor, not the legacy autopilot,
+owns production execution, research scheduling, account reconciliation, and
+readiness.
+
+## 1. Install the host and Python environments
+
+Use a clean Debian or Ubuntu host. Do not copy workstation `data`, `runtime`,
+or `outputs` directories.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y acl git jq make postgresql postgresql-client python3 python3-venv rsync
+python3 -c 'import sys; assert sys.version_info >= (3, 11), sys.version; print(sys.version)'
+sudo systemctl enable --now postgresql
+git clone "$REPOSITORY_URL" /home/alfred/trading-bot
+cd /home/alfred/trading-bot
+python3 -m venv .venv-runtime
+python3 -m venv .venv-research
+python3 -m venv .venv-agent
+.venv-runtime/bin/pip install -r requirements-runtime.txt
+.venv-research/bin/pip install -r requirements-research-linux.txt -r requirements-dev.txt
+.venv-agent/bin/pip install -r requirements-agent.txt
+ln -s .venv-research .venv
+make platform-validate
+make platform-install-dry-run
+sudo REPO=/home/alfred/trading-bot NODE=linux-optiplex bash scripts/install_platform_services.sh
+```
+
+`REPOSITORY_URL` must identify the reviewed repository. The root installer
+creates separate Unix users, exact writable directories, environment-file
+placeholders, systemd units, and timers. It does not start trading services.
+
+## 2. Create PostgreSQL roles and migrate
+
+Create one schema owner. It needs `CREATEDB` and `CREATEROLE` because the
+immutable authority migration creates the restricted group roles
+`trading_platform_owner`, `trading_runtime`, `trading_research`, and
+`trading_agent`.
+
+```bash
+sudo -u postgres createuser --createdb --createrole --pwprompt trading_platform_migrator
+sudo -u postgres createdb -O trading_platform_migrator trading_platform
+sudoedit /etc/trading-platform/migration.env
+sudo systemctl start trading-platform-migration.service
+sudo -u postgres createuser --pwprompt trading_runtime_service
+sudo -u postgres createuser --pwprompt trading_research_worker
+sudo -u postgres createuser --pwprompt trading_agent_worker
+sudo -u postgres createuser --pwprompt trading_backup_service
+sudo -u postgres psql -d trading_platform -c 'GRANT trading_runtime TO trading_runtime_service, trading_research_worker, trading_agent_worker, trading_backup_service'
+sudo -u postgres psql -d trading_platform -c 'GRANT trading_research TO trading_research_worker'
+sudo -u postgres psql -d trading_platform -c 'GRANT trading_agent TO trading_agent_worker'
+```
+
+Set `migration.env` before starting the migration unit:
+
+```text
+TRADING_PLATFORM_DATABASE_URL=postgresql+psycopg://trading_platform_migrator:<URL_ENCODED_PASSWORD>@127.0.0.1:5432/trading_platform?sslmode=require
+TRADING_LIVE=0
+EXCHANGE_TESTNET=1
+```
+
+The migration unit applies Alembic and runs the idempotent platform bootstrap.
+Do not run schema changes with a worker login. Do not insert bootstrap or queue
+rows manually.
+
+## 3. Configure service environments
+
+Each domain reads only its own root-owned file. Use the matching password and
+URL-encode reserved password characters.
+
+```bash
+sudoedit /etc/trading-platform/runtime.env
+sudoedit /etc/trading-platform/research.env
+sudoedit /etc/trading-platform/agent.env
+sudoedit /etc/trading-platform/backup.env
+```
+
+Required database URLs are:
+
+```text
+# runtime.env
+TRADING_PLATFORM_DATABASE_URL=postgresql+psycopg://trading_runtime_service:<URL_ENCODED_PASSWORD>@127.0.0.1:5432/trading_platform?sslmode=require
+TRADING_LIVE=0
+EXCHANGE_TESTNET=1
+TRADING_CONTROL_TOKEN=<RANDOM_64_HEX_CONTROL_TOKEN>
+
+# research.env
+TRADING_PLATFORM_DATABASE_URL=postgresql+psycopg://trading_research_worker:<URL_ENCODED_PASSWORD>@127.0.0.1:5432/trading_platform?sslmode=require
+TRADING_LIVE=0
+
+# agent.env
+TRADING_PLATFORM_DATABASE_URL=postgresql+psycopg://trading_agent_worker:<URL_ENCODED_PASSWORD>@127.0.0.1:5432/trading_platform?sslmode=require
+TRADING_LIVE=0
+
+# backup.env
+TRADING_PLATFORM_DATABASE_URL=postgresql+psycopg://trading_backup_service:<URL_ENCODED_PASSWORD>@127.0.0.1:5432/trading_platform?sslmode=require
+```
+
+Only `runtime.env` may contain `BINANCE_API_KEY`, `BINANCE_API_SECRET`, and the
+rehearsal signing key. Research and agent services must not receive exchange
+credentials. Optional `/etc/trading-platform/<service>.env` files can add
+non-secret settings for one service.
+
+## 4. Start in dependency order
+
+```bash
+sudo systemctl start trading-platform@platform-scheduler.service
+sudo systemctl start trading-platform@universe-service.service trading-platform@market-gateway.service trading-platform@data-writer.service
+sudo systemctl start trading-platform@feature-service.service trading-platform@strategy-evaluator.service
+sudo systemctl start trading-platform@portfolio-state-service.service trading-platform@portfolio-engine.service trading-platform@risk-engine.service
+sudo systemctl start trading-platform@paper-engine.service trading-platform@execution-engine.service trading-platform@accounting-service.service
+sudo systemctl start trading-platform@account-reconciliation.service trading-platform@promotion-engine.service trading-platform@product-supervisor.service trading-platform@control-api.service
+sudo systemctl start trading-platform-research@research-worker.service trading-platform-research@ml-worker.service trading-platform-research@event-replay-worker.service
+sudo systemctl start trading-platform-research@feature-build-worker.service trading-platform-research@report-worker.service
+sudo systemctl start trading-platform-agent@agent-sandbox.service
+sudo systemctl enable --now trading-platform-backup-postgresql.timer trading-platform-backup-parquet.timer trading-platform-backup-verify.timer
+```
+
+The scheduler creates recurring universe, catalogue, candidate, evaluation,
+backtest, replay, ML, forward-paper, promotion, report, and maintenance work.
+Bootstrap creates canonical BTC instruments, risk policies, explicit paper
+balances, manifests, diagnostic datasets, and one non-promotable diagnostic
+assignment per product. The paper engine drains each diagnostic assignment
+through a durable open-and-close round trip.
+
+## 5. Verify paper operation
+
+Run checks with the runtime service URL, not the migration URL.
+
+```bash
+export TRADING_PLATFORM_DATABASE_URL='postgresql+psycopg://trading_runtime_service:<URL_ENCODED_PASSWORD>@127.0.0.1:5432/trading_platform?sslmode=require'
+make db-migration-check
+make platform-readiness
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $TRADING_CONTROL_TOKEN" \
+  http://127.0.0.1:8088/status
+```
+
+Readiness must show fresh heartbeats, universe and account snapshots, queued or
+completed autonomous research, canonical market state for both products, and
+completed diagnostic paper round trips.
+
+`platform-smoke` writes synthetic strategies, assignments, orders, fills, and
+accounting records. Run it only against a separate disposable PostgreSQL
+database, never against `trading_platform` or its runtime service URL.
+
+```bash
+sudo -u postgres createdb -O trading_platform_migrator trading_platform_smoke
+export TRADING_PLATFORM_DATABASE_URL='postgresql+psycopg://trading_platform_migrator:<URL_ENCODED_PASSWORD>@127.0.0.1:5432/trading_platform_smoke?sslmode=require'
+.venv-runtime/bin/python -m alembic upgrade head
+make platform-smoke
+sudo -u postgres dropdb trading_platform_smoke
+```
+
+## 6. Connected testnet and live enablement
+
+Use a dedicated Binance USD-M Demo account, which is Binance's current futures
+test environment. Stop the standard order path before changing live authority:
+
+```bash
+sudo systemctl stop \
+  trading-platform@market-gateway.service \
+  trading-platform@strategy-evaluator.service \
+  trading-platform@portfolio-engine.service \
+  trading-platform@risk-engine.service \
+  trading-platform@paper-engine.service \
+  trading-platform@execution-engine.service \
+  trading-platform@accounting-service.service
+```
+
+Set `environment` to `testnet` for `binance-futures-main` in
+`/home/alfred/trading-bot/config/accounts.json`. Set `execution_mode` to `live`
+only for `active_income` in
+`/home/alfred/trading-bot/config/products.json`. Set these values only in
+`/etc/trading-platform/runtime.env`:
+
+```text
+TRADING_LIVE=1
+EXCHANGE_TESTNET=1
+BINANCE_API_KEY=<DEDICATED_BINANCE_DEMO_KEY>
+BINANCE_API_SECRET=<DEDICATED_BINANCE_DEMO_SECRET>
+TRADING_PLATFORM_REHEARSAL_SIGNING_KEY=<RANDOM_SECRET>
+```
+
+Select one reviewed, promotable canonical artefact and its exact persisted
+instrument. Do not use a bootstrap diagnostic artefact. Inspect the exact
+selection before recording authority:
+
+```bash
+cd /home/alfred/trading-bot
+make platform-live-authority ARGS="inspect --product active_income --artefact-hash <SHA256_ARTEFACT_HASH> --instrument-id binance:futures:BTCUSDT:USDT --sleeve-id directional"
+make platform-live-authority ARGS="preflight --product active_income --artefact-hash <SHA256_ARTEFACT_HASH> --instrument-id binance:futures:BTCUSDT:USDT --sleeve-id directional --capital-cap <CAP_FROM_INSPECT>"
+```
+
+Read both JSON results. A human operator must then explicitly approve the exact
+artefact and preflight. Copy the returned IDs without changing any other field:
+
+```bash
+make platform-live-authority ARGS="approve --product active_income --artefact-hash <SHA256_ARTEFACT_HASH> --instrument-id binance:futures:BTCUSDT:USDT --sleeve-id directional --expected-preflight-id <PREFLIGHT_ID> --capital-cap <CAP_FROM_INSPECT> --approved-by <HUMAN_NAME> --confirm"
+make platform-live-authority ARGS="assign --product active_income --artefact-hash <SHA256_ARTEFACT_HASH> --instrument-id binance:futures:BTCUSDT:USDT --sleeve-id directional --expected-preflight-id <PREFLIGHT_ID> --expected-approval-id <APPROVAL_ID> --capital-limit <CAP_FROM_INSPECT> --risk-budget <CAP_FROM_INSPECT> --assigned-by <HUMAN_NAME> --confirm"
+make platform-testnet-connected CONFIRM=1 PRODUCT=active_income NOTIONAL_USD=10
+make platform-readiness-live PRODUCT=active_income
+```
+
+The connected command places real testnet orders. It rejects a production
+account, injected broker, captured event, or non-PostgreSQL queue. Live readiness
+stays blocked until the exact assignment has current approval and preflight, the
+connected open-close report has a valid signature, reconciliation is fresh, the
+account and execution identities match, and no unknown exposure exists.
+
+For testnet-only rehearsal, return `active_income` to `execution_mode=paper`, set
+`TRADING_LIVE=0`, remove both exchange credentials from `runtime.env`, and start
+the stopped services. Production enablement is a separate change. Set the
+reviewed production account identity and `EXCHANGE_TESTNET=0`, then create a new
+preflight and human approval for that exact production configuration. Run live
+readiness before starting the standard order path. A testnet approval cannot
+authorise a production account.
+
+## 7. Backups and rollback
+
+The three enabled timers create PostgreSQL and Parquet backups and verify them.
+Check them before live enablement:
+
+```bash
+systemctl list-timers 'trading-platform-backup-*'
+sudo systemctl start trading-platform-backup@postgresql.service
+sudo systemctl start trading-platform-backup@parquet.service
+sudo systemctl start trading-platform-backup@verify.service
+```
+
+Alembic downgrades are forbidden. For an application rollback, stop platform
+services and deploy a reviewed revision that supports the current schema. For a
+data rollback, restore a verified backup into a new database, run readiness
+against that database, then update the four worker URLs. Never restore over the
+active database.
+
+## Archived legacy autopilot instructions
+
+The sections below are retained for historical recovery and research context.
+They are not a production deployment path. Do not use their user-systemd
+autopilot services, cron jobs, or file-based live authority for the PostgreSQL
+platform.
+
+## Historical autopilot deployment and operations runbook
+
+This section is retained for historical recovery and research context only. It
+is not an authoritative production deployment path. The repository defaults to
+paper trading. Keep it that way until the promotion
 sequence below has completed for one specific strategy artifact and a human has
 approved it.
 

@@ -223,7 +223,16 @@ def _cross_sectional(
 def _relative_value(
     features: Mapping[str, float], artefact: Mapping[str, Any]
 ) -> Mapping[str, Any]:
-    return _forecast(-_feature(features, "spread_zscore", "basis_zscore", "basis"), artefact)
+    return _forecast(
+        -_feature(
+            features,
+            "spot_perpetual_basis",
+            "spread_zscore",
+            "basis_zscore",
+            "basis",
+        ),
+        artefact,
+    )
 
 
 def _microstructure(

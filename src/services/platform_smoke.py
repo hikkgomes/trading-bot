@@ -32,13 +32,17 @@ from src.observability.decision_trace import SqlDecisionTraceStore
 from src.research.artefacts import StrategyArtefact
 from src.research.canonical import (
     SqlActiveStrategyAssignmentRepository,
+    SqlApprovalRepository,
+    SqlPreflightRepository,
     SqlStrategyArtefactRepository,
 )
 from src.risk.engine import SqlRiskDecisionStore, SqlRiskPolicyStore, SqlRiskSnapshotStore
+from src.services.account_reconciliation import AccountReconciliationService
 from src.services.accounting_service import AccountingService, DatabaseAccountingWorker
 from src.services.config import load_split_configuration
 from src.services.data_writer import DatabaseMarketDataWriter
 from src.services.feature_worker import DatabaseFeatureWorker
+from src.services.health import DatabaseHeartbeatStore
 from src.services.order_execution import DatabaseExecutionWorker, DatabasePaperExecutionWorker
 from src.services.portfolio_engine import (
     DatabasePortfolioTargetBuilder,
@@ -106,6 +110,10 @@ def _product_fixture(
     index: int,
 ) -> dict[str, Any]:
     product_id = str(product["product_id"])
+    product = {
+        **product,
+        "risk_policy_id": f"platform-smoke:{product_id}:risk-v1",
+    }
     observed = dt.datetime(2026, 8, 23, tzinfo=dt.UTC)
     now = observed.isoformat()
     market = "spot" if product_id == "btc_accumulation" else "futures"
@@ -187,25 +195,67 @@ def _product_fixture(
                 "l": "99750",
                 "c": "102000",
                 "v": "25",
-                "spread_bps": "1",
-                "visible_depth": "10000000",
-                "volatility": "0.2",
-                "funding": "0.0",
                 "x": True,
             },
         },
     )
-    queue.enqueue(
-        job_id=prefix + ":event",
-        name="market_event_write",
-        payload={
-            "venue": "binance",
-            "market": market,
-            "symbol": "BTCUSDT",
-            "event": to_primitive(event),
-        },
-        available_at=now,
-    )
+    market_events = [
+        event,
+        normalise_public_event(
+            market=market,
+            stream="btcusdt@bookTicker",
+            receive_timestamp=now,
+            payload={
+                "e": "bookTicker",
+                "E": close_ms + 1,
+                "s": "BTCUSDT",
+                "b": "101999",
+                "B": "10000",
+                "a": "102001",
+                "A": "10000",
+            },
+        ),
+        normalise_public_event(
+            market=market,
+            stream="btcusdt@trade",
+            receive_timestamp=now,
+            payload={
+                "e": "trade",
+                "E": close_ms + 2,
+                "s": "BTCUSDT",
+                "p": "102000",
+                "q": "25",
+            },
+        ),
+    ]
+    if market == "futures":
+        market_events.append(
+            normalise_public_event(
+                market=market,
+                stream="btcusdt@markPrice@1s",
+                receive_timestamp=now,
+                payload={
+                    "e": "markPriceUpdate",
+                    "E": close_ms + 3,
+                    "s": "BTCUSDT",
+                    "p": "102000",
+                    "r": "0.0001",
+                    "T": close_ms + 3,
+                },
+            )
+        )
+    for index, market_event in enumerate(market_events):
+        queue.enqueue(
+            job_id=prefix + f":event:{index}",
+            name="market_event_write",
+            payload={
+                "venue": "binance",
+                "market": market,
+                "symbol": "BTCUSDT",
+                "event": to_primitive(market_event),
+            },
+            available_at=now,
+        )
     repository = SqlPortfolioRepository(database.engine, require_pipeline_identity=True)
     feature_store = SqlFeatureStore(database.engine)
     positions = PositionManager(SqlPositionStore(database.engine))
@@ -217,6 +267,11 @@ def _product_fixture(
         accounting_asset=str(product["base_accounting_asset"]),
         store=SqlLedgerStore(database.engine, product_id=product_id),
     )
+    account_reconciliation = AccountReconciliationService(
+        engine=database.engine,
+        products={product_id: product},
+        accounts=accounts,
+    ).reconcile_once(now=now)
     queue.enqueue(
         job_id=prefix + ":initial-balance",
         name="accounting_event",
@@ -260,7 +315,7 @@ def _product_fixture(
         active_assignments=lambda instrument_id: tuple(
             item
             for item in assignments.active_assignments(product_id)
-            if item.get("instrument_id") == instrument_id
+            if item["id"] == assignment_id and item.get("instrument_id") == instrument_id
         ),
         snapshot_store=snapshots,
         feature_graph_for_assignment=lambda _assignment: {"required_nodes": ["bar_return"]},
@@ -317,8 +372,16 @@ def _product_fixture(
         trace_store=traces,
         order_groups=order_groups,
     )
-    data_result = data_worker.run_once(now=now)
+    data_results = [data_worker.run_once(now=now) for _ in market_events]
+    data_result = data_results[-1]
     feature_result = feature_worker.run_once(now=now)
+    DatabaseHeartbeatStore(database.engine).record(
+        service_name="data-writer",
+        node_id="linux-optiplex",
+        observed_at=now,
+        healthy=data_result["reason_code"] == "market_event_written",
+        payload=data_result,
+    )
     source_service = DatabasePortfolioSourceService(
         engine=database.engine,
         store=snapshots,
@@ -344,6 +407,7 @@ def _product_fixture(
     results = {
         "data": data_result,
         "feature": feature_result,
+        "account_reconciliation": account_reconciliation,
         "initial_accounting": initial_accounting,
         "state": state_result,
         "strategy": strategy_worker.run_once(now=now),
@@ -395,7 +459,7 @@ def _product_fixture(
             ).scalar_one()
         )
     counts = {
-        "closed_candle": int(results["data"].get("reason_code") == "market_event_written"),
+        "closed_candle": int(any(item.get("bar_path") for item in data_results)),
         "features": int(results["feature"].get("features", 0)),
         "strategy_assignment": int(assignments.by_id(assignment_id) is not None),
         "state": int(results["state"].get("reason_code") == "canonical_portfolio_state_published"),
@@ -437,6 +501,8 @@ def _seed_strategy(
     now: str,
     prefix: str,
     strategy_name: str = "momentum_roc",
+    execution_mode: str = "paper",
+    sleeve_id: str = "default",
 ) -> str:
     product_id = str(product["product_id"])
     feature_nodes, production_rule = registered_live_contract(strategy_name)
@@ -488,7 +554,6 @@ def _seed_strategy(
         cost_model_version="smoke-costs-v1",
         validation_evidence={"accepted": True},
         holdout_claim={"accepted": True},
-        forward_evidence={"accepted": True},
         promotion_policy={"paper": True},
         position_limits={"maximum_position": 0.1, "target_volatility": 0.1},
         risk_limits={"risk_policy_id": product["risk_policy_id"]},
@@ -500,19 +565,74 @@ def _seed_strategy(
         product_id=product_id,
         portfolio_id=str(product["portfolio_id"]),
         account_id=str(product["account_id"]),
-        promotion_policy_id="smoke-paper",
+        promotion_policy_id=str(product["promotion_policy_id"]),
         engine_version="strategy-evaluator/v1",
     )
     SqlStrategyArtefactRepository(database.engine).put(
         artefact.artefact_hash, artefact.to_dict(), created_at=now
     )
+    if execution_mode == "live":
+        source_commit_hash = str(artefact.source_commit_hash)
+        account_fingerprint = "account-v1:" + canonical_hash(
+            {"account_id": product["account_id"], "purpose": "platform-smoke"}
+        ).removeprefix("sha256:")
+        execution_identity = canonical_hash({"execution": "platform-smoke"})
+        configuration_hash = canonical_hash(
+            {
+                "product_id": product_id,
+                "instrument_id": instrument.instrument_id,
+                "sleeve_id": sleeve_id,
+            }
+        )
+        preflight_id = SqlPreflightRepository(database.engine).append(
+            {
+                "schema": "platform.production-preflight/v1",
+                "strategy_version_id": definition.strategy_version_id,
+                "product_id": product_id,
+                "account_id": str(product["account_id"]),
+                "artefact_hash": artefact.artefact_hash,
+                "source_commit_hash": source_commit_hash,
+                "engine_version": "strategy-evaluator/v1",
+                "capital_cap": 0.1,
+                "checked_at": now,
+                "accepted": True,
+                "environment": "testnet",
+                "account_fingerprint": account_fingerprint,
+                "execution_engine_identity": execution_identity,
+                "configuration_hash": configuration_hash,
+                "instrument_id": instrument.instrument_id,
+                "sleeve_id": sleeve_id,
+            }
+        )
+        SqlApprovalRepository(database.engine).append(
+            strategy_version_id=definition.strategy_version_id,
+            product_id=product_id,
+            account_id=str(product["account_id"]),
+            artefact_hash=artefact.artefact_hash,
+            source_commit_hash=source_commit_hash,
+            engine_version="strategy-evaluator/v1",
+            capital_cap=0.1,
+            actor="platform-testnet-operator",
+            approved_at=now,
+            payload={
+                "schema": "platform.strategy-approval/v1",
+                "preflight_id": preflight_id,
+                "environment": "testnet",
+                "account_fingerprint": account_fingerprint,
+                "execution_engine_identity": execution_identity,
+                "configuration_hash": configuration_hash,
+                "instrument_id": instrument.instrument_id,
+                "sleeve_id": sleeve_id,
+            },
+        )
     return SqlActiveStrategyAssignmentRepository(database.engine).assign(
         product_id=product_id,
         portfolio_id=str(product["portfolio_id"]),
+        sleeve_id=sleeve_id,
         strategy_version_id=definition.strategy_version_id,
         artefact_hash=artefact.artefact_hash,
-        lifecycle_state="forward_paper",
-        execution_mode="paper",
+        lifecycle_state="live_canary" if execution_mode == "live" else "forward_paper",
+        execution_mode=execution_mode,
         capital_limit=0.1,
         risk_budget=0.1,
         assigned_at=now,
@@ -524,7 +644,13 @@ def _seed_strategy(
 
 
 def _install_risk_policy(database: PlatformDatabase, policy_id: str) -> None:
-    SqlRiskPolicyStore(database.engine).save(
+    store = SqlRiskPolicyStore(database.engine)
+    try:
+        store.resolve((policy_id,))
+        return
+    except KeyError:
+        pass
+    store.save(
         policy_id,
         {
             "strategy": {

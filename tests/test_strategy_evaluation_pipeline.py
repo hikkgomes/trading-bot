@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from src.data.database import PlatformDatabase
 from src.domain.forecasts import AlphaForecast, ForecastDirection
@@ -9,6 +11,7 @@ from src.risk.engine import SqlRiskSnapshotStore
 from src.services.job_schemas import build_content_hash, validate_job_payload
 from src.services.portfolio_engine import DatabasePortfolioTargetBuilder
 from src.services.portfolio_service import SqlPortfolioRepository
+from src.services.strategy_evaluator import DatabaseStrategyEvaluator
 
 
 def test_strategy_evaluation_command_binds_event_features_and_assignment() -> None:
@@ -26,6 +29,44 @@ def test_strategy_evaluation_command_binds_event_features_and_assignment() -> No
     payload["content_hash"] = build_content_hash(payload)
     clean = validate_job_payload("strategy_evaluation", payload)
     assert clean["feature_ids"] == payload["feature_ids"]
+
+
+def test_strategy_evaluator_completes_queued_diagnostic_assignment() -> None:
+    payload = {
+        "event_id": "sha256:" + "1" * 64,
+        "product_id": "active_income",
+        "instrument_id": "binance:futures:BTCUSDT:USDT",
+        "assignment_id": "sha256:" + "2" * 64,
+        "feature_ids": ["sha256:" + "3" * 64],
+        "feature_set_version": "core-bars-v1",
+        "evaluated_at": "2026-08-23T00:00:00+00:00",
+        "horizon_seconds": 60,
+        "producer_identity": "feature-service",
+    }
+    payload["content_hash"] = build_content_hash(payload)
+    claimed = SimpleNamespace(job_id="diagnostic-evaluation", payload=payload)
+    queue = MagicMock()
+    queue.claim.return_value = claimed
+    assignments = MagicMock()
+    assignments.by_id.return_value = {
+        "id": payload["assignment_id"],
+        "active": True,
+        "product_id": payload["product_id"],
+        "payload": {"diagnostic": True, "promotable": False},
+    }
+    worker = DatabaseStrategyEvaluator(
+        queue=queue,
+        worker_id="linux-strategy",
+        feature_store=MagicMock(),
+        portfolio=MagicMock(),
+        assignments=assignments,
+    )
+
+    result = worker.run_once(now=payload["evaluated_at"])
+
+    assert result["reason_code"] == "diagnostic_strategy_evaluation_skipped"
+    queue.complete.assert_called_once_with(claimed, completed_at=payload["evaluated_at"])
+    queue.fail.assert_not_called()
 
 
 def test_target_builder_consumes_canonical_market_and_balance_snapshots(tmp_path) -> None:

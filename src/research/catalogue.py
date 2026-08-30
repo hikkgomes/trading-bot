@@ -139,13 +139,14 @@ def registered_strategy_candidates(
     product: str,
     dataset_snapshot_hashes: Iterable[str],
     instrument_universe: Iterable[str] = ("BTCUSDT",),
+    submitted_at: str | None = None,
 ) -> tuple[Candidate, ...]:
     """Create common-contract candidates for every registered strategy.
 
     Parameter search remains a research concern. This adapter prevents the
     named strategy library from being excluded merely because it is not DSL.
     """
-    now = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+    now = submitted_at or dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
     assert_manifest_complete()
     descriptions = describe()
     manifest = manifest_by_name()

@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import datetime as dt
+
 from sqlalchemy import func, select
 
-from src.data.database import PlatformDatabase, job, service_heartbeat
+from src.data.binance_market import normalise_public_event
+from src.data.database import PlatformDatabase, job, risk_snapshot, service_heartbeat
+from src.domain._codec import to_primitive
 from src.risk.engine import SqlRiskSnapshotStore
+from src.services.accounting_service import AccountingService, DatabaseAccountingWorker
+from src.services.data_writer import DatabaseMarketDataWriter
 from src.services.health import DatabaseHeartbeatStore
-from src.services.portfolio_state import DatabasePortfolioStateWorker
+from src.services.portfolio_state import (
+    DatabasePortfolioSourceService,
+    DatabasePortfolioStateWorker,
+)
 from src.services.scheduler import DatabaseJobQueue
 
 NOW = "2026-08-24T00:00:00+00:00"
@@ -82,24 +91,35 @@ def test_unchanged_portfolio_sources_remain_idle_for_10000_cycles(tmp_path) -> N
         )
     worker = DatabasePortfolioStateWorker(queue=queue, worker_id="state-worker", store=store)
 
-    assert (
-        worker.schedule_from_latest(
-            products={"product": {}}, state_policies={"product": _policy()}, now=NOW
-        )
-        == 1
-    )
-    assert worker.run_once(now=NOW)["reason_code"] == "canonical_portfolio_state_published"
-    assert all(
-        worker.schedule_from_latest(
-            products={"product": {}},
-            state_policies={"product": _policy()},
-            now="2026-08-24T00:00:01+00:00",
-        )
-        == 0
-        for _ in range(10_000)
-    )
+    heartbeat = DatabaseHeartbeatStore(database.engine, retention_per_service=32)
+    for index in range(10_000):
+        now = (dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=index)).isoformat()
+        result = worker.run_once(now=now)
+        if result["reason_code"] == "portfolio_state_queue_empty":
+            scheduled = worker.schedule_from_latest(
+                products={"product": {}}, state_policies={"product": _policy()}, now=now
+            )
+            if scheduled:
+                result = worker.run_once(now=now)
+        if index % 250 == 0:
+            heartbeat.record(
+                service_name="portfolio-state-service",
+                node_id="linux-optiplex",
+                observed_at=now,
+                healthy=True,
+                payload={"reason_code": result["reason_code"]},
+            )
+    assert result["reason_code"] in {
+        "portfolio_state_queue_empty",
+        "canonical_portfolio_state_published",
+    }
     with database.engine.connect() as connection:
         assert connection.execute(select(func.count()).select_from(job)).scalar_one() == 1
+        assert connection.execute(select(func.count()).select_from(risk_snapshot)).scalar_one() == 8
+        assert (
+            connection.execute(select(func.count()).select_from(service_heartbeat)).scalar_one()
+            == 32
+        )
 
 
 def test_heartbeat_retention_is_bounded(tmp_path) -> None:
@@ -119,3 +139,245 @@ def test_heartbeat_retention_is_bounded(tmp_path) -> None:
             connection.execute(select(func.count()).select_from(service_heartbeat)).scalar_one()
             == 32
         )
+
+
+def test_portfolio_source_readers_fail_closed_without_complete_market_or_health(
+    tmp_path,
+) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'source-authority.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    store.save(
+        {
+            "kind": "market_data_input",
+            "product_id": "active_income",
+            "instrument_id": "binance:futures:BTCUSDT",
+            "values": {"close": 100.0, "spread_bps": 1.0},
+        },
+        created_at=NOW,
+    )
+    source = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=store,
+        products={},
+        accounts={},
+    )
+
+    market, market_at = source._market("active_income", NOW)
+    health, health_at = source._health(NOW)
+
+    assert market == {}
+    assert market_at is None
+    assert health == {}
+    assert health_at is None
+
+
+def test_portfolio_market_source_derives_realised_volatility_from_closes(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'market-volatility.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    for index, close in enumerate((100.0, 101.0, 103.0)):
+        observed_at = (dt.datetime.fromisoformat(NOW) + dt.timedelta(minutes=index)).isoformat()
+        store.save(
+            {
+                "kind": "market_data_input",
+                "product_id": "active_income",
+                "instrument_id": "binance:futures:BTCUSDT",
+                "values": {
+                    "close": close,
+                    "spread_bps": 1.0,
+                    "visible_depth": 100.0,
+                    "funding": 0.0,
+                },
+            },
+            created_at=observed_at,
+        )
+    source = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=store,
+        products={},
+        accounts={},
+    )
+
+    market, market_at = source._market("active_income", "2026-08-24T00:02:00+00:00")
+
+    assert market_at == "2026-08-24T00:02:00+00:00"
+    assert market["binance:futures:BTCUSDT"]["volatility"] > 0.0
+
+
+def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'normal-events.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    for worker_id, role, capability in (
+        ("data", "data-writer", "market_event_write"),
+        ("accounting", "accounting-service", "accounting_event"),
+        ("state", "portfolio-state-service", "portfolio_state_publish"),
+    ):
+        queue.register_worker(
+            worker_id=worker_id,
+            node_id="linux-optiplex",
+            role=role,
+            capabilities=(capability,),
+            observed_at=NOW,
+        )
+    product = {
+        "product_id": "active_income",
+        "portfolio_id": "active-income-portfolio",
+        "account_id": "futures",
+    }
+    event_time_ms = int(dt.datetime.fromisoformat(NOW).timestamp() * 1_000)
+    market_events = (
+        normalise_public_event(
+            market="futures",
+            stream="btcusdt@kline_1m",
+            receive_timestamp=NOW,
+            payload={
+                "e": "kline",
+                "E": event_time_ms,
+                "s": "BTCUSDT",
+                "k": {
+                    "t": event_time_ms - 59_999,
+                    "T": event_time_ms,
+                    "i": "1m",
+                    "o": "100",
+                    "h": "101",
+                    "l": "99",
+                    "c": "100.5",
+                    "v": "10",
+                    "x": True,
+                },
+            },
+        ),
+        normalise_public_event(
+            market="futures",
+            stream="btcusdt@bookTicker",
+            receive_timestamp=NOW,
+            payload={
+                "e": "bookTicker",
+                "E": event_time_ms + 1,
+                "s": "BTCUSDT",
+                "b": "100.49",
+                "B": "500",
+                "a": "100.51",
+                "A": "500",
+            },
+        ),
+        normalise_public_event(
+            market="futures",
+            stream="btcusdt@markPrice@1s",
+            receive_timestamp=NOW,
+            payload={
+                "e": "markPriceUpdate",
+                "E": event_time_ms + 2,
+                "s": "BTCUSDT",
+                "p": "100.5",
+                "r": "0.0001",
+                "T": event_time_ms + 2,
+            },
+        ),
+    )
+    for index, event in enumerate(market_events):
+        queue.enqueue(
+            job_id=f"normal-market-event-{index}",
+            name="market_event_write",
+            payload={
+                "venue": "binance",
+                "market": "futures",
+                "symbol": "BTCUSDT",
+                "event": to_primitive(event),
+            },
+            available_at=NOW,
+        )
+    writer = DatabaseMarketDataWriter(
+        queue=queue,
+        worker_id="data",
+        root=tmp_path / "data",
+        snapshot_store=SqlRiskSnapshotStore(database.engine),
+        product_ids_by_market={"futures": ("active_income",)},
+    )
+    assert writer.run_once(now=NOW)["reason_code"] == "market_event_written"
+    assert writer.run_once(now=NOW)["reason_code"] == "market_event_written"
+    assert writer.run_once(now=NOW)["reason_code"] == "market_event_written"
+    queue.enqueue(
+        job_id="normal-account-event",
+        name="accounting_event",
+        payload={
+            "kind": "balance",
+            "product_id": "active_income",
+            "account_id": "futures",
+            "observed_at": NOW,
+            "balances": {"USDT": 10_000.0},
+        },
+        available_at=NOW,
+    )
+    accounting = DatabaseAccountingWorker(
+        queue=queue,
+        worker_id="accounting",
+        service=AccountingService(
+            engine=database.engine,
+            ledgers={},
+            snapshot_store=SqlRiskSnapshotStore(database.engine),
+        ),
+    )
+    assert accounting.run_once(now=NOW)["reason_code"] == "accounting_event_recorded"
+
+    snapshots = SqlRiskSnapshotStore(database.engine)
+    source_service = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=snapshots,
+        products={"active_income": product},
+        accounts={"futures": {}},
+    )
+    heartbeat = DatabaseHeartbeatStore(database.engine)
+    heartbeat.record(
+        service_name="data-writer",
+        node_id="linux-optiplex",
+        observed_at=NOW,
+        healthy=True,
+        payload={"reason_code": "market_event_written"},
+    )
+    worker = DatabasePortfolioStateWorker(
+        queue=queue,
+        worker_id="state",
+        store=snapshots,
+        refresh_sources=source_service.refresh,
+    )
+    assert (
+        worker.schedule_from_latest(
+            products={"active_income": product},
+            state_policies={"active_income": _policy()},
+            now=NOW,
+        )
+        == 1
+    )
+    assert worker.run_once(now=NOW)["reason_code"] == "canonical_portfolio_state_published"
+    with database.engine.connect() as connection:
+        risk_snapshot_count = connection.execute(
+            select(func.count()).select_from(risk_snapshot)
+        ).scalar_one()
+
+    later = "2026-08-24T00:00:01+00:00"
+    heartbeat.record(
+        service_name="data-writer",
+        node_id="linux-optiplex",
+        observed_at=later,
+        healthy=True,
+        payload={"reason_code": "market_event_written"},
+    )
+    source_service.refresh("active_income", later)
+
+    with database.engine.connect() as connection:
+        assert (
+            connection.execute(select(func.count()).select_from(risk_snapshot)).scalar_one()
+            == risk_snapshot_count
+        )
+        source_kinds = {
+            str(row[0])
+            for row in connection.execute(
+                select(risk_snapshot.c.payload["kind"]).where(
+                    risk_snapshot.c.payload["product_id"].as_string() == "active_income"
+                )
+            )
+        }
+    assert DatabasePortfolioStateWorker.REQUIRED_SOURCES.issubset(source_kinds)

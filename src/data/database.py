@@ -49,6 +49,7 @@ class UtcTimestamp(TypeDecorator[str]):
             value = value.replace(tzinfo=dt.UTC)
         return value.astimezone(dt.UTC).replace(microsecond=0).isoformat()
 
+
 metadata = MetaData()
 
 
@@ -116,6 +117,7 @@ universe_member = Table(
 dataset_snapshot = _id_payload_table("dataset_snapshot")
 feature_set = _id_payload_table("feature_set")
 feature_manifest = _id_payload_table("feature_manifest")
+cost_model_manifest = _id_payload_table("cost_model_manifest")
 
 strategy_definition = Table(
     "strategy_definition",
@@ -507,6 +509,50 @@ service_heartbeat = Table(
     Column("healthy", Boolean, nullable=False),
     Column("payload", JSON, nullable=False),
 )
+platform_schedule = Table(
+    "platform_schedule",
+    metadata,
+    Column("id", String(200), primary_key=True),
+    Column("job_name", String(160), nullable=False),
+    Column("interval_seconds", Integer, nullable=False),
+    Column("next_run_at", UtcTimestamp(), nullable=False, index=True),
+    Column("last_run_at", UtcTimestamp(), index=True),
+    Column("last_job_id", String(200)),
+    Column("state", String(40), nullable=False),
+    Column("payload", JSON, nullable=False),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("updated_at", UtcTimestamp(), nullable=False),
+    UniqueConstraint("job_name", name="uq_platform_schedule_job_name"),
+)
+platform_bootstrap = Table(
+    "platform_bootstrap",
+    metadata,
+    Column("id", String(160), primary_key=True),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("content_hash", String(80), nullable=False, unique=True),
+    Column("payload", JSON, nullable=False),
+)
+account_snapshot = Table(
+    "account_snapshot",
+    metadata,
+    Column("id", String(200), primary_key=True),
+    Column("account_id", String(160), nullable=False, index=True),
+    Column("observed_at", UtcTimestamp(), nullable=False, index=True),
+    Column("source", String(80), nullable=False),
+    Column("content_hash", String(80), nullable=False, unique=True),
+    Column("payload", JSON, nullable=False),
+)
+platform_rehearsal_report = Table(
+    "platform_rehearsal_report",
+    metadata,
+    Column("id", String(200), primary_key=True),
+    Column("product_id", String(80), nullable=False, index=True),
+    Column("account_id", String(160), nullable=False, index=True),
+    Column("created_at", UtcTimestamp(), nullable=False, index=True),
+    Column("content_hash", String(80), nullable=False, unique=True),
+    Column("accepted", Boolean, nullable=False),
+    Column("payload", JSON, nullable=False),
+)
 alert = _id_payload_table("alert")
 control_event = _id_payload_table("control_event")
 promotion_event = _id_payload_table("promotion_event")
@@ -566,6 +612,7 @@ class PlatformDatabase:
                 "002_platform_v2_authority.py",
                 "003_platform_expansion_authority.py",
                 "004_research_thesis_authority.py",
+                "005_platform_bootstrap_authority.py",
             )
             applied: list[str] = []
             with self.engine.begin() as connection:
@@ -615,7 +662,7 @@ class PlatformDatabase:
         if self.is_postgresql:
             with self.engine.connect() as connection:
                 revision = connection.execute(text("SELECT version_num FROM alembic_version"))
-                if revision.scalar_one_or_none() != "platform_v2_0004":
+                if revision.scalar_one_or_none() != "platform_v2_0005":
                     raise RuntimeError("database is not at the current Alembic revision")
 
     def dispose(self) -> None:

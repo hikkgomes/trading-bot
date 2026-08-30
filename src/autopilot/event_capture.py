@@ -28,7 +28,14 @@ DEFAULT_STATUS = PROJECT_ROOT / "runtime" / "event_capture_status.json"
 ALLOWED_STREAMS = frozenset(
     {"aggTrade", "trade", "bookTicker", "depth20@100ms", "markPrice@1s", "kline_1m"}
 )
-ALLOWED_HOSTS = frozenset({"fstream.binance.com", "stream.binance.com"})
+ALLOWED_HOSTS = frozenset(
+    {
+        "fstream.binance.com",
+        "stream.binance.com",
+        "demo-fstream.binance.com",
+        "stream.testnet.binance.vision",
+    }
+)
 MAX_EVENT_BYTES = 1024 * 1024
 
 
@@ -432,7 +439,14 @@ async def _collect_source(
                         received_ns=time.time_ns(),
                     )
                     await queue.put(event)
-        except (aiohttp.ClientError, TimeoutError, json.JSONDecodeError, ValueError):
+        except (
+            aiohttp.ClientError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            json.JSONDecodeError,
+            ValueError,
+        ):
             if stop.is_set():
                 return
             try:
@@ -476,20 +490,38 @@ async def capture(
     ]
     timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=120)
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        source_streams = [
+            stream_names(source, dynamic, data_tier_budgets=config.data_tier_budgets)
+            for source in config.sources
+        ]
         tasks = [
             asyncio.create_task(
                 _collect_source(
                     session,
                     source,
-                    stream_names(source, dynamic, data_tier_budgets=config.data_tier_budgets),
+                    names,
                     queue,
                     stop,
                 )
             )
-            for source in config.sources
+            for source, names in zip(config.sources, source_streams, strict=True)
         ]
         try:
             while not stop.is_set():
+                for index, task in enumerate(tasks):
+                    if not task.done():
+                        continue
+                    if not task.cancelled():
+                        task.exception()
+                    tasks[index] = asyncio.create_task(
+                        _collect_source(
+                            session,
+                            config.sources[index],
+                            source_streams[index],
+                            queue,
+                            stop,
+                        )
+                    )
                 elapsed = time.monotonic() - started
                 if status_path is not None and elapsed - last_status_write >= 15:
                     retention = writer.enforce_retention()

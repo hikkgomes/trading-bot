@@ -82,9 +82,31 @@ class CcxtBroker(Broker):
     def query_order(
         self, *, symbol: str, exchange_order_id: str, client_order_id: str
     ) -> BrokerOrderState:
-        cached = getattr(self, "_submission_responses", {}).get(exchange_order_id)
+        if not exchange_order_id and not client_order_id:
+            raise RuntimeError("exchange order lookup requires an exchange or client order ID")
+        responses = getattr(self, "_submission_responses", {})
+        cached = responses.get(exchange_order_id)
+        if cached is None and client_order_id:
+
+            def response_client_id(response: dict) -> str:
+                raw_info = response.get("info")
+                info = raw_info if isinstance(raw_info, dict) else {}
+                return str(response.get("clientOrderId") or info.get("clientOrderId") or "")
+
+            cached = next(
+                (
+                    response
+                    for response in responses.values()
+                    if response_client_id(response) == client_order_id
+                ),
+                None,
+            )
         fetch = getattr(self._client, "fetch_order", None)
-        payload = fetch(exchange_order_id, self._ccxt_symbol(symbol)) if callable(fetch) else cached
+        if callable(fetch):
+            params = {"origClientOrderId": client_order_id} if not exchange_order_id else {}
+            payload = fetch(exchange_order_id, self._ccxt_symbol(symbol), params)
+        else:
+            payload = cached
         if not isinstance(payload, dict):
             raise RuntimeError("exchange order state is unavailable")
         raw_info = payload.get("info")
@@ -93,8 +115,13 @@ class CcxtBroker(Broker):
         filled = float(payload.get("filled") or info.get("executedQty") or 0.0)
         average_raw = payload.get("average") or payload.get("price")
         average = float(average_raw) if average_raw not in {None, ""} and filled > 0 else None
+        resolved_exchange_order_id = str(
+            payload.get("id") or info.get("orderId") or exchange_order_id
+        )
+        if not resolved_exchange_order_id:
+            raise RuntimeError("exchange order state has no exchange order ID")
         return BrokerOrderState(
-            exchange_order_id=exchange_order_id,
+            exchange_order_id=resolved_exchange_order_id,
             client_order_id=str(
                 payload.get("clientOrderId") or info.get("clientOrderId") or client_order_id
             ),
@@ -108,6 +135,133 @@ class CcxtBroker(Broker):
         """Non-secret identity of the credential and venue this broker uses."""
 
         return self.config.account_fingerprint
+
+    def account_snapshot(self, *, expected_symbols: tuple[str, ...] = ()) -> dict:
+        """Read the complete authenticated account state used by live gates."""
+        balance = self._client.fetch_balance()
+        if not isinstance(balance, dict):
+            raise RuntimeError("authenticated balance response is not an object")
+        totals = balance.get("total")
+        free = balance.get("free")
+        if not isinstance(totals, dict) or not isinstance(free, dict):
+            raise RuntimeError("authenticated balance response lacks total/free balances")
+        balances = {
+            str(asset): self._finite_number(value, "Account balance", non_negative=True)
+            for asset, value in totals.items()
+            if value is not None
+        }
+        free_balances = {
+            str(asset): self._finite_number(value, "Free account balance", non_negative=True)
+            for asset, value in free.items()
+            if value is not None
+        }
+        raw_info = balance.get("info")
+        info = raw_info if isinstance(raw_info, dict) else {}
+
+        def number(*names: str, default: float | None = None) -> float:
+            for name in names:
+                value = info.get(name)
+                if value is None:
+                    value = balance.get(name)
+                if value is None:
+                    continue
+                return self._finite_number(value, f"Account field {name}", non_negative=True)
+            if default is None:
+                raise RuntimeError(
+                    "authenticated account response is missing a required margin field"
+                )
+            return default
+
+        quote_total = self._finite_number(
+            balances.get(self.config.quote_asset, 0.0),
+            "Account quote balance",
+            non_negative=True,
+        )
+        margin_default = 0.0 if self.config.market_type == "spot" else None
+        used_margin = number("totalInitialMargin", "initialMargin", default=margin_default)
+        maintenance_margin = number("totalMaintMargin", "maintMargin", default=margin_default)
+        margin_balance = number(
+            "totalMarginBalance",
+            "marginBalance",
+            "equity",
+            default=quote_total if self.config.market_type == "spot" else None,
+        )
+        if margin_balance <= 0 and (used_margin > 0 or maintenance_margin > 0):
+            raise RuntimeError("authenticated account margin balance is not positive")
+        used_fraction = used_margin / margin_balance if margin_balance > 0 else 0.0
+        liquidation_buffer = (
+            max(0.0, 1.0 - maintenance_margin / margin_balance) if margin_balance > 0 else 0.0
+        )
+        positions: dict[str, float] = {}
+        unknown_positions: dict[str, float] = {}
+        if self.config.market_type == "futures":
+            position_rows = self.list_account_futures_positions()
+            positions = {}
+            for item in position_rows:
+                if abs(float(item.qty)) <= 1e-12:
+                    continue
+                positions[self.platform_instrument_id(item.symbol)] = float(item.qty)
+            unknown_positions = {
+                f"position:{item.symbol}": float(item.qty)
+                for item in position_rows
+                if abs(float(item.qty)) > 1e-12
+                and not any(self._symbols_match(item.symbol, symbol) for symbol in expected_symbols)
+            }
+            conditional_orders = list(self.list_account_open_orders(conditional=True))
+            regular_orders = list(self.list_account_open_orders(conditional=False))
+        else:
+            regular_orders = list(self.list_account_open_orders(conditional=False))
+            for symbol in expected_symbols:
+                position = self.get_position(symbol)
+                if abs(position.qty) > 1e-12:
+                    positions[f"binance:spot:{symbol}"] = float(position.qty)
+            conditional_orders = list(self.list_account_open_orders(conditional=True))
+            expected_assets = {
+                self.config.quote_asset.upper(),
+                *(self._base_asset(symbol) for symbol in expected_symbols),
+            }
+            unknown_positions = {
+                f"asset:{asset}": quantity
+                for asset, quantity in balances.items()
+                if abs(quantity) > 1e-12 and asset.upper() not in expected_assets
+            }
+        unknown_orders = {
+            f"{item.symbol}:{item.order_id}": item.status
+            for item in [*regular_orders, *conditional_orders]
+            if not any(self._symbols_match(item.symbol, symbol) for symbol in expected_symbols)
+        }
+        position_mode = "one_way"
+        fetch_position_mode = getattr(self._client, "fetch_position_mode", None)
+        if self.config.market_type == "futures":
+            if not callable(fetch_position_mode):
+                raise RuntimeError(
+                    "authenticated futures account response lacks a position-mode reader"
+                )
+            mode_payload = fetch_position_mode()
+            if not isinstance(mode_payload, dict):
+                raise RuntimeError("authenticated futures account mode is not an object")
+            if mode_payload.get("hedged") is not None:
+                position_mode = "hedged" if bool(mode_payload["hedged"]) else "one_way"
+            elif str(mode_payload.get("mode") or "") in {"hedged", "one_way"}:
+                position_mode = str(mode_payload["mode"])
+            else:
+                raise RuntimeError("authenticated futures account mode is missing")
+        return {
+            "balances": balances,
+            "free_balances": free_balances,
+            "positions": positions,
+            "regular_orders": [item.__dict__ for item in regular_orders],
+            "conditional_orders": [item.__dict__ for item in conditional_orders],
+            "used_margin": used_margin,
+            "maintenance_margin": maintenance_margin,
+            "used_margin_fraction": used_fraction,
+            "liquidation_buffer_fraction": liquidation_buffer,
+            "account_mode": position_mode,
+            "unknown_exposure": {**unknown_positions, **unknown_orders},
+            "account_state_known": True,
+            "account_state_authority": "authenticated_rest",
+            "account_fingerprint": self.account_fingerprint,
+        }
 
     def _build_client(self):
         try:
@@ -141,11 +295,20 @@ class CcxtBroker(Broker):
                 "secret": self.config.api_secret,
                 "password": self.config.api_password or None,
                 "enableRateLimit": True,
-                "options": {"defaultType": default_type},
+                "options": {
+                    "defaultType": default_type,
+                    "warnOnFetchOpenOrdersWithoutSymbol": False,
+                },
             }
         )
-        if self.config.testnet and hasattr(client, "set_sandbox_mode"):
-            client.set_sandbox_mode(True)
+        if self.config.testnet:
+            if str(self.config.exchange).lower() == "binanceusdm":
+                enable_demo = getattr(client, "enable_demo_trading", None)
+                if not callable(enable_demo):
+                    raise RuntimeError("Binance USD-M testnet requires CCXT demo trading support")
+                enable_demo(True)
+            elif hasattr(client, "set_sandbox_mode"):
+                client.set_sandbox_mode(True)
         if self.config.live:
             missing_precision_methods = [
                 name
@@ -764,9 +927,7 @@ class CcxtBroker(Broker):
     ) -> tuple[OpenOrderIdentity, ...]:
         exchange_name = str(self.config.exchange).lower()
         futures_supported = self.config.market_type == "futures" and exchange_name == "binanceusdm"
-        spot_supported = (
-            self.config.market_type == "spot" and exchange_name == "binance" and not conditional
-        )
+        spot_supported = self.config.market_type == "spot" and exchange_name == "binance"
         if not (futures_supported or spot_supported):
             raise RuntimeError(
                 "Open-order inventory verification is only validated for Binance spot regular "
@@ -796,10 +957,15 @@ class CcxtBroker(Broker):
         orders: list[OpenOrderIdentity] = []
         seen: set[tuple[str, str, str]] = set()
         for index, item in enumerate(payload):
+            is_conditional = conditional
+            if self.config.market_type == "spot":
+                is_conditional = self._is_conditional_spot_order(item)
+                if is_conditional != conditional:
+                    continue
             order = self._parse_open_order_identity(
                 item,
                 requested_symbol=symbol,
-                conditional=conditional,
+                conditional=is_conditional,
                 index=index,
             )
             identity = (order.symbol, order.order_id, order.client_id)
@@ -812,6 +978,28 @@ class CcxtBroker(Broker):
         return tuple(
             sorted(orders, key=lambda order: (order.symbol, order.order_id, order.client_id))
         )
+
+    @staticmethod
+    def _is_conditional_spot_order(payload: dict) -> bool:
+        """Identify Binance spot stop/OCO legs in the regular open-order feed."""
+        info_value = payload.get("info")
+        info = info_value if isinstance(info_value, dict) else {}
+        raw_type = payload.get("type") or info.get("type") or info.get("origType")
+        order_type = str(raw_type or "").upper()
+        if order_type in {
+            "STOP",
+            "STOP_LOSS",
+            "STOP_LOSS_LIMIT",
+            "TAKE_PROFIT",
+            "TAKE_PROFIT_LIMIT",
+            "TRAILING_STOP_MARKET",
+        }:
+            return True
+        for field in ("stopPrice", "triggerPrice", "trailingDelta"):
+            value = payload.get(field, info.get(field))
+            if value not in (None, "", 0, "0", 0.0):
+                return True
+        return False
 
     def list_account_futures_positions(self) -> tuple[FuturesPositionIdentity, ...]:
         """Read and sanitize every non-flat Binance USD-M account position."""
@@ -1597,6 +1785,14 @@ class CcxtBroker(Broker):
         if left_settlement is not None and right_settlement is not None:
             return left_settlement == right_settlement
         return True
+
+    def platform_instrument_id(self, symbol: str) -> str:
+        """Return the canonical platform identity for a Binance symbol."""
+
+        base, quote, settlement = self._split_symbol(symbol)
+        if self.config.market_type == "futures":
+            return f"binance:futures:{base}{quote}:{settlement or quote}"
+        return f"binance:spot:{base}{quote}"
 
     def _canonical_inventory_symbol(self, value, *, label: str) -> str:
         raw = self._sanitized_open_order_field(value, label=label)
