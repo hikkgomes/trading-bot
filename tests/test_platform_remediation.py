@@ -9,6 +9,12 @@ from src.portfolio.optimiser import PortfolioConstraints, optimise_targets
 from src.research.accounting import BtcAccumulationAccounting, FuturesIncomeAccounting
 from src.research.artefacts import StrategyArtefact
 from src.research.catalogue import registered_strategy_candidates
+from src.research.datasets import (
+    CanonicalResearchDatasetBuilder,
+    DatasetLifecycleState,
+    DatasetResolutionError,
+    SqlDatasetBundleRepository,
+)
 from src.research.evaluation import EvidencePolicy, EvidenceStatus
 from src.research.executors import _cross_symbol_stability, _portfolio_overlap
 from src.services.artefact_dispatcher import ArtefactDispatcher
@@ -262,3 +268,79 @@ def test_short_forecast_is_ranked_and_allocated_after_funding() -> None:
     assert len(targets) == 1
     assert targets[0].target_fraction < 0
     assert targets[0].metadata["net_expected_return"] == pytest.approx(0.11)
+
+
+def test_dataset_bundle_supports_explicit_pending_lifecycle_and_verifies_stages(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'datasets.sqlite3'}")
+    database.create_schema()
+    identity = "sha256:" + "a" * 64
+    builder = CanonicalResearchDatasetBuilder(database.engine)
+    bundle = builder.build(
+        "active_income",
+        intervals={
+            "screening": {
+                "start": "2026-08-29T00:00:00+00:00",
+                "end": "2026-08-29T06:00:00+00:00",
+            },
+            "development": {
+                "start": "2026-08-29T06:00:00+00:00",
+                "end": "2026-08-29T12:00:00+00:00",
+            },
+        },
+        payload_by_role={"screening": {"rows": 1}, "development": {"rows": 2}},
+        universe_snapshot_id=identity,
+        feature_manifest_id=identity,
+        cost_model_id=identity,
+        parameter_set_id=identity,
+        instrument_scope=("BTCUSDT",),
+        availability_timestamp=NOW,
+        created_at=NOW,
+        lifecycle_state=DatasetLifecycleState.DATA_PENDING,
+    )
+
+    assert bundle.lifecycle_state is DatasetLifecycleState.DATA_PENDING
+    assert set(bundle.stage_snapshot_ids) == {"screening", "development"}
+    assert SqlDatasetBundleRepository(database.engine).get(bundle.bundle_id) == bundle
+
+
+def test_ready_dataset_bundle_rejects_overlapping_intervals(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'datasets.sqlite3'}")
+    database.create_schema()
+    identity = "sha256:" + "b" * 64
+    kwargs = {
+        "universe_snapshot_id": identity,
+        "feature_manifest_id": identity,
+        "cost_model_id": identity,
+        "parameter_set_id": identity,
+        "instrument_scope": ("BTCUSDT",),
+        "availability_timestamp": NOW,
+        "created_at": NOW,
+    }
+    with pytest.raises(DatasetResolutionError, match="overlap"):
+        CanonicalResearchDatasetBuilder(database.engine).build(
+            "active_income",
+            intervals={
+                role: {
+                    "start": "2026-08-29T00:00:00+00:00",
+                    "end": "2026-08-29T12:00:00+00:00",
+                }
+                for role in (
+                    "screening",
+                    "development",
+                    "robustness",
+                    "protected_holdout",
+                    "forward_observation",
+                )
+            },
+            payload_by_role={
+                role: {"role": role}
+                for role in (
+                    "screening",
+                    "development",
+                    "robustness",
+                    "protected_holdout",
+                    "forward_observation",
+                )
+            },
+            **kwargs,
+        )

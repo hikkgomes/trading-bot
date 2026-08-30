@@ -86,22 +86,30 @@ class DatasetBundle:
                 field_name,
                 _identity(getattr(self, field_name), field=field_name),
             )
-        object.__setattr__(self, "engine_version", non_empty(self.engine_version, field="engine_version"))
+        object.__setattr__(
+            self, "engine_version", non_empty(self.engine_version, field="engine_version")
+        )
         scope = tuple(non_empty(item, field="instrument_scope") for item in self.instrument_scope)
         if not scope:
             raise DatasetResolutionError("dataset bundle instrument_scope cannot be empty")
         object.__setattr__(self, "instrument_scope", scope)
-        stages = {str(key): _identity(value, field=f"stage_snapshot_ids[{key}]") for key, value in self.stage_snapshot_ids.items()}
-        if set(stages) != set(RESEARCH_BUNDLE_ROLES):
-            raise DatasetResolutionError(
-                "dataset bundle must contain exactly one snapshot for every research role"
-            )
-        object.__setattr__(self, "stage_snapshot_ids", stages)
         state = DatasetLifecycleState(self.lifecycle_state)
+        if not isinstance(self.stage_snapshot_ids, Mapping):
+            raise DatasetResolutionError("dataset bundle stage_snapshot_ids must be an object")
+        stages = {
+            str(key): _identity(value, field=f"stage_snapshot_ids[{key}]")
+            for key, value in self.stage_snapshot_ids.items()
+        }
+        if not set(stages).issubset(set(RESEARCH_BUNDLE_ROLES)):
+            raise DatasetResolutionError("dataset bundle contains an unsupported research role")
+        object.__setattr__(self, "stage_snapshot_ids", stages)
         if state is DatasetLifecycleState.READY and len(stages) != len(RESEARCH_BUNDLE_ROLES):
             raise DatasetResolutionError("ready dataset bundles must be complete")
         object.__setattr__(self, "lifecycle_state", state)
-        partitions = tuple(_identity(item, field="source_partition_hashes") for item in self.source_partition_hashes)
+        partitions = tuple(
+            _identity(item, field="source_partition_hashes")
+            for item in self.source_partition_hashes
+        )
         if len(partitions) != len(set(partitions)):
             raise DatasetResolutionError("source_partition_hashes must be unique")
         object.__setattr__(self, "source_partition_hashes", partitions)
@@ -155,25 +163,35 @@ class CanonicalResearchDatasetBuilder:
         created_at: str,
         engine_version: str | None = None,
         source_partition_hashes: tuple[str, ...] = (),
+        lifecycle_state: DatasetLifecycleState = DatasetLifecycleState.READY,
     ) -> DatasetBundle:
         product_id = non_empty(product_id, field="product_id")
-        missing = sorted(self.REQUIRED_ROLES - set(payload_by_role))
-        if missing:
+        state = DatasetLifecycleState(lifecycle_state)
+        roles = set(payload_by_role)
+        unsupported = sorted(roles - self.REQUIRED_ROLES)
+        if unsupported:
+            raise DatasetResolutionError(
+                "dataset bundle contains unsupported roles: " + ", ".join(unsupported)
+            )
+        missing = sorted(self.REQUIRED_ROLES - roles)
+        if state is DatasetLifecycleState.READY and missing:
             raise DatasetResolutionError(
                 "dataset bundle cannot be built; missing roles: " + ", ".join(missing)
             )
-        if set(intervals) != self.REQUIRED_ROLES:
-            raise DatasetResolutionError("dataset bundle intervals must cover every research role")
+        if set(intervals) != roles:
+            raise DatasetResolutionError(
+                "dataset bundle intervals must match the supplied research roles"
+            )
         normalised_intervals = {
             role: self._interval(intervals[role], field=f"intervals.{role}")
-            for role in RESEARCH_BUNDLE_ROLES
+            for role in sorted(roles)
         }
         ordered = sorted(normalised_intervals.items(), key=lambda item: item[1]["start"])
         for (_, left), (_, right) in zip(ordered, ordered[1:], strict=False):
             if left["end"] > right["start"]:
                 raise DatasetResolutionError("dataset bundle information intervals overlap")
         created = timestamp(created_at, field="created_at")
-        availability = self._availability(availability_timestamp, created)
+        availability = self._availability(availability_timestamp, created, roles=roles)
         universe_id = _identity(universe_snapshot_id, field="universe_snapshot_id")
         manifest_id = _identity(feature_manifest_id, field="feature_manifest_id")
         costs_id = _identity(cost_model_id, field="cost_model_id")
@@ -184,8 +202,12 @@ class CanonicalResearchDatasetBuilder:
             raise DatasetResolutionError("instrument_scope cannot be empty")
         snapshots: dict[str, str] = {}
         snapshot_payloads: dict[str, dict[str, Any]] = {}
-        for role in RESEARCH_BUNDLE_ROLES:
+        for role in sorted(roles):
             data = json_value(payload_by_role[role], field=f"{role} dataset payload")
+            if availability[role] < normalised_intervals[role]["end"]:
+                raise DatasetResolutionError(
+                    f"{role} dataset became available before its information interval ended"
+                )
             content_hash = canonical_hash(data)
             metadata = {
                 "product_id": product_id,
@@ -215,7 +237,7 @@ class CanonicalResearchDatasetBuilder:
             "parameter_set_id": parameters_id,
             "engine_version": engine,
             "instrument_scope": list(scope),
-            "lifecycle_state": DatasetLifecycleState.READY.value,
+            "lifecycle_state": state.value,
             "source_partition_hashes": list(source_partition_hashes),
         }
         bundle_id = canonical_hash(bundle_payload)
@@ -230,10 +252,11 @@ class CanonicalResearchDatasetBuilder:
             parameter_set_id=parameters_id,
             engine_version=engine,
             instrument_scope=scope,
+            lifecycle_state=state,
             source_partition_hashes=tuple(source_partition_hashes),
         )
         with self.engine.begin() as connection:
-            for role in RESEARCH_BUNDLE_ROLES:
+            for role in sorted(roles):
                 self._insert_immutable(
                     connection,
                     dataset_snapshot,
@@ -270,22 +293,30 @@ class CanonicalResearchDatasetBuilder:
         return {"start": start, "end": end}
 
     @staticmethod
-    def _availability(value: str | Mapping[str, str], created: str) -> dict[str, str]:
+    def _availability(
+        value: str | Mapping[str, str], created: str, *, roles: set[str]
+    ) -> dict[str, str]:
         if isinstance(value, Mapping):
+            if set(value) != roles:
+                raise DatasetResolutionError(
+                    "availability timestamps must match the supplied research roles"
+                )
             result = {
                 role: timestamp(str(value[role]), field=f"availability.{role}")
-                for role in RESEARCH_BUNDLE_ROLES
+                for role in sorted(roles)
             }
         else:
             shared = timestamp(value, field="availability_timestamp")
-            result = {role: shared for role in RESEARCH_BUNDLE_ROLES}
+            result = {role: shared for role in sorted(roles)}
         if any(item < created for item in result.values()):
             raise DatasetResolutionError("dataset availability cannot precede bundle creation")
         return result
 
     @staticmethod
     def _insert_immutable(connection, table, values: Mapping[str, Any]) -> None:
-        existing = connection.execute(select(table).where(table.c.id == values["id"])).mappings().first()
+        existing = (
+            connection.execute(select(table).where(table.c.id == values["id"])).mappings().first()
+        )
         if existing is None:
             connection.execute(insert(table).values(**dict(values)))
             return
@@ -302,14 +333,39 @@ class SqlDatasetBundleRepository:
     def get(self, bundle_id: str) -> DatasetBundle:
         bundle_id = _identity(bundle_id, field="bundle_id")
         with self.engine.connect() as connection:
-            payload = connection.execute(
-                select(dataset_bundle.c.payload, dataset_bundle.c.content_hash).where(
-                    dataset_bundle.c.id == bundle_id
+            payload = (
+                connection.execute(
+                    select(dataset_bundle.c.payload, dataset_bundle.c.content_hash).where(
+                        dataset_bundle.c.id == bundle_id
+                    )
                 )
-            ).mappings().first()
-        if payload is None or not isinstance(payload["payload"], Mapping):
-            raise KeyError(f"dataset bundle does not exist: {bundle_id}")
-        record = dict(payload["payload"])
+                .mappings()
+                .first()
+            )
+            if payload is None or not isinstance(payload["payload"], Mapping):
+                raise KeyError(f"dataset bundle does not exist: {bundle_id}")
+            record = dict(payload["payload"])
+            stage_ids = record.get("stage_snapshot_ids")
+            if not isinstance(stage_ids, Mapping):
+                raise DatasetResolutionError("dataset bundle stage mapping is invalid")
+            for role, snapshot_id in stage_ids.items():
+                snapshot_payload = connection.execute(
+                    select(dataset_snapshot.c.payload).where(dataset_snapshot.c.id == snapshot_id)
+                ).scalar_one_or_none()
+                if not isinstance(snapshot_payload, Mapping):
+                    raise DatasetResolutionError(
+                        f"dataset bundle stage snapshot is missing: {role}:{snapshot_id}"
+                    )
+                if (
+                    snapshot_payload.get("snapshot_id") != snapshot_id
+                    or snapshot_payload.get("role") != role
+                    or snapshot_payload.get("product_id") != record.get("product_id")
+                    or canonical_hash(snapshot_payload.get("payload"))
+                    != snapshot_payload.get("content_hash")
+                ):
+                    raise DatasetResolutionError(
+                        f"dataset bundle stage snapshot is not canonical: {role}:{snapshot_id}"
+                    )
         bundle = DatasetBundle(
             bundle_id=str(record.get("bundle_id") or bundle_id),
             product_id=str(record["product_id"]),
