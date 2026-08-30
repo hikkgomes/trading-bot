@@ -167,7 +167,7 @@ class Strategy(ABC):
             instrument_id=instrument_id,
             direction=direction,
             score=score,
-            expected_return=score * target_volatility,
+            expected_return=float(signal) * target_volatility,
             confidence=score,
             horizon_seconds=horizon_seconds,
             valid_from=valid_from,

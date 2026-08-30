@@ -25,7 +25,7 @@ from src.strategies.manifest import (
     manifest_by_name,
     manifest_description,
     manifest_source_type,
-    registered_live_contract,
+    registered_feature_contract,
 )
 from src.strategies.registry import available, describe, get
 
@@ -163,7 +163,7 @@ def registered_strategy_candidates(
         entry = manifest.get(name)
         if entry is None:
             raise ValueError(f"registered strategy is missing from the manifest: {name}")
-        feature_nodes, _ = registered_live_contract(name)
+        feature_nodes, _ = registered_feature_contract(name)
         strategy_class = get(name)
         parameters = strategy_class.default_params()
         universe_definition = {"type": "fixed", "symbols": list(universe)}
@@ -203,7 +203,7 @@ def registered_strategy_candidates(
                 "canonical_source_type": manifest_source_type(name),
                 "executable_registry_entry": True,
             },
-            )
+        )
         candidates.append(
             Candidate(
                 definition=definition,

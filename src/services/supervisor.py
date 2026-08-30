@@ -596,6 +596,7 @@ def _strategy_evaluator_cycle(
         feature_store=SqlFeatureStore(database.engine),
         portfolio=SqlPortfolioRepository(database.engine, require_pipeline_identity=True),
         assignments=SqlActiveStrategyAssignmentRepository(database.engine),
+        snapshot_store=SqlRiskSnapshotStore(database.engine),
         artefact_dispatcher=ArtefactDispatcher.default(),
     )
     return lambda: worker.run_once(now=utc_now())

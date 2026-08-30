@@ -13,6 +13,7 @@ from src.data.feature_store import SqlFeatureStore
 from src.domain._codec import canonical_hash, timestamp
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
+from src.risk.engine import SqlRiskSnapshotStore
 from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.job_schemas import validate_job_payload
 from src.services.portfolio_service import SqlPortfolioRepository
@@ -30,6 +31,7 @@ class DatabaseStrategyEvaluator:
         feature_store: SqlFeatureStore,
         portfolio: SqlPortfolioRepository,
         assignments: SqlActiveStrategyAssignmentRepository,
+        snapshot_store: SqlRiskSnapshotStore | None = None,
         engine_version: str = "strategy-evaluator/v1",
         forecast_fn: Callable[[Mapping[str, float], Mapping[str, Any]], Mapping[str, Any]]
         | None = None,
@@ -41,6 +43,7 @@ class DatabaseStrategyEvaluator:
         self.feature_store = feature_store
         self.portfolio = portfolio
         self.assignments = assignments
+        self.snapshot_store = snapshot_store
         self.engine_version = engine_version
         self.forecast_fn = (
             forecast_fn or (artefact_dispatcher or ArtefactDispatcher.default()).evaluate
@@ -92,6 +95,14 @@ class DatabaseStrategyEvaluator:
             if feature_ids != expected_features:
                 raise ValueError("feature batch is not the exact immutable input requested")
             features = {value.feature_name: value.value for value in values}
+            snapshot_id = payload.get("market_data_snapshot_id")
+            if self.snapshot_store is not None and snapshot_id is not None:
+                snapshot = self.snapshot_store.get(str(snapshot_id))
+                snapshot_values = snapshot.get("values")
+                if isinstance(snapshot_values, Mapping):
+                    market_frame = snapshot_values.get("market_frame")
+                    if isinstance(market_frame, list | tuple) and market_frame:
+                        features["market_frame"] = market_frame
             artefact_hash = str(assignment["artefact_hash"])
             with self.portfolio.engine.connect() as connection:
                 artefact = connection.execute(

@@ -7,13 +7,18 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from src.domain._codec import canonical_hash
+from src.strategies.behaviour import (
+    RegisteredStrategyBehaviour,
+    StrategyBehaviourError,
+    behaviour_hash_for_definition,
+)
 
 
 class ArtefactDispatchError(RuntimeError):
     pass
 
 
-Evaluator = Callable[[Mapping[str, float], Mapping[str, Any]], Mapping[str, Any]]
+Evaluator = Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]]
 
 
 class ArtefactDispatcher:
@@ -44,7 +49,7 @@ class ArtefactDispatcher:
         self._evaluators[source_type] = evaluator
 
     def evaluate(
-        self, features: Mapping[str, float], artefact: Mapping[str, Any]
+        self, features: Mapping[str, Any], artefact: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         _verify_artefact(artefact)
         definition = artefact.get("definition")
@@ -69,10 +74,13 @@ class ArtefactDispatcher:
             raise ArtefactDispatchError("production evaluator returned an incomplete forecast")
         receipt = {
             "artefact_hash": artefact.get("artefact_hash"),
+            "deployment_hash": artefact.get("artefact_hash"),
             "definition_hash": artefact.get("definition_hash"),
             "source_type": source_type,
-            "feature_values_hash": canonical_hash(dict(features)),
+            "feature_values_hash": canonical_hash(_feature_input_payload(features)),
         }
+        if values.get("behaviour_hash") is not None:
+            receipt["behaviour_hash"] = values["behaviour_hash"]
         values["execution_receipt"] = {**receipt, "receipt_hash": canonical_hash(receipt)}
         return values
 
@@ -94,6 +102,14 @@ def _verify_artefact(artefact: Mapping[str, Any]) -> None:
     authoritative.pop("metadata", None)
     if canonical_hash(authoritative) != declared:
         raise ArtefactDispatchError("strategy definition hash is invalid")
+    declared_behaviour = artefact.get("behaviour_hash")
+    if declared_behaviour is not None:
+        try:
+            expected_behaviour = behaviour_hash_for_definition(_definition(artefact))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArtefactDispatchError("strategy behaviour identity is invalid") from exc
+        if declared_behaviour != expected_behaviour:
+            raise ArtefactDispatchError("strategy behaviour hash is invalid")
 
 
 def _forecast(
@@ -133,10 +149,12 @@ def _feature(features: Mapping[str, float], *names: str) -> float:
 
 
 def _registered_python(
-    features: Mapping[str, float], artefact: Mapping[str, Any]
+    features: Mapping[str, Any], artefact: Mapping[str, Any]
 ) -> Mapping[str, Any]:
     model = _definition(artefact).get("signal_model")
     model = model if isinstance(model, Mapping) else {}
+    if model.get("registered_strategy"):
+        return _registered_strategy_behaviour(features, artefact)
     rule = model.get("production_rule")
     if not isinstance(rule, Mapping) or rule.get("kind") != "linear_feature_score/v1":
         raise ArtefactDispatchError("registered strategy has no immutable production rule")
@@ -153,6 +171,54 @@ def _registered_python(
         value = _feature(features, str(term.get("feature") or ""))
         score += (value - float(term.get("centre", 0.0))) / scale * float(term.get("weight", 0.0))
     return _forecast(score, artefact)
+
+
+def _registered_strategy_behaviour(
+    features: Mapping[str, Any], artefact: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    try:
+        behaviour = RegisteredStrategyBehaviour.from_definition(_definition(artefact))
+        frame = features.get("market_frame")
+        if frame is not None:
+            signal = behaviour.latest_signal(frame)
+            input_hash = behaviour.frame_input_hash(frame)
+            input_status = "market_frame"
+        else:
+            raw_signal = features.get("registered_signal", 0)
+            signal = behaviour._signal(raw_signal)
+            input_hash = canonical_hash(
+                {"behaviour_hash": behaviour.behaviour_hash, "registered_signal": signal}
+            )
+            input_status = (
+                "registered_signal" if "registered_signal" in features else "history_unavailable"
+            )
+    except StrategyBehaviourError as exc:
+        raise ArtefactDispatchError(str(exc)) from exc
+    forecast = dict(_forecast(float(signal), artefact))
+    forecast["expected_return"] = float(signal) * float(forecast["target_volatility"])
+    forecast["behaviour_hash"] = behaviour.behaviour_hash
+    forecast["behaviour_input_hash"] = input_hash
+    forecast["behaviour_input_status"] = input_status
+    return forecast
+
+
+def _feature_input_payload(features: Mapping[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for name, value in features.items():
+        if name == "market_frame" and hasattr(value, "to_dict"):
+            rows = value.to_dict(orient="records")
+            payload[name] = [
+                {
+                    str(key): float(item)
+                    if isinstance(item, int | float) and not isinstance(item, bool)
+                    else item
+                    for key, item in row.items()
+                }
+                for row in rows
+            ]
+        else:
+            payload[str(name)] = value
+    return payload
 
 
 def _derived_registered_python(

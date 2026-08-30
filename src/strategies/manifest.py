@@ -145,49 +145,44 @@ _EVIDENCE = {
 
 REQUIRED_STRATEGY_UNIVERSE = tuple(name for family in _FAMILIES.values() for name in family)
 
-_REGISTERED_LIVE_RULES: dict[str, tuple[tuple[str, float, float, float], ...]] = {
-    "sma_cross": (("sma_fast", 1.0, 0.0, 1.0), ("sma_slow", -1.0, 0.0, 1.0)),
-    "macd_trend": (("macd", 1.0, 0.0, 1.0),),
-    "supertrend": (("supertrend", 1.0, 0.0, 1.0),),
-    "adx_trend": (("adx", 1.0, 0.0, 1.0),),
-    "momentum_roc": (("bar_return", 1.0, 0.0, 0.01),),
-    "donchian_breakout": (("breakout", 1.0, 0.0, 0.01),),
-    "keltner_breakout": (("keltner", 1.0, 0.0, 1.0),),
-    "atr_channel_breakout": (("supertrend", 1.0, 0.0, 1.0),),
-    "bollinger_squeeze": (("bollinger", 1.0, 0.0, 2.0),),
-    "multi_tf_trend": (("multi_timeframe", 1.0, 0.0, 0.01),),
-    "regression_channel": (("bar_return", 1.0, 0.0, 0.01),),
-    "swing_structure": (("breakout", 1.0, 0.0, 0.01),),
-    "btc_cycle_guard": (("realised_volatility", -1.0, 0.0, 1.0),),
-    "rsi_reversion": (("rsi", -1.0, 50.0, 50.0),),
-    "bollinger_reversion": (("bollinger", -1.0, 0.0, 2.0),),
-    "zscore_reversion": (("bollinger", -1.0, 0.0, 2.0),),
-    "stochastic_reversion": (("rsi", -1.0, 50.0, 50.0),),
-    "candlestick_reversal": (("bar_return", -1.0, 0.0, 0.01),),
-    "rsi_divergence": (("rsi", -1.0, 50.0, 50.0),),
-    "fear_greed_contrarian": (("sentiment", -1.0, 0.0, 1.0),),
-    "condition_grid": (
-        ("rsi", -0.5, 50.0, 50.0),
-        ("adx", 0.5, 0.0, 1.0),
-    ),
-    "regime_filter": (("bar_return", 1.0, 0.0, 0.01),),
+_REGISTERED_FEATURE_NODES: dict[str, tuple[str, ...]] = {
+    "sma_cross": ("sma_fast", "sma_slow"),
+    "macd_trend": ("macd",),
+    "supertrend": ("supertrend",),
+    "adx_trend": ("adx",),
+    "momentum_roc": ("bar_return",),
+    "donchian_breakout": ("breakout",),
+    "keltner_breakout": ("keltner",),
+    "atr_channel_breakout": ("supertrend",),
+    "bollinger_squeeze": ("bollinger",),
+    "multi_tf_trend": ("multi_timeframe",),
+    "regression_channel": ("bar_return",),
+    "swing_structure": ("breakout",),
+    "btc_cycle_guard": ("realised_volatility",),
+    "rsi_reversion": ("rsi",),
+    "bollinger_reversion": ("bollinger",),
+    "zscore_reversion": ("bollinger",),
+    "stochastic_reversion": ("rsi",),
+    "candlestick_reversal": ("bar_return",),
+    "rsi_divergence": ("rsi",),
+    "fear_greed_contrarian": ("sentiment",),
+    "condition_grid": ("rsi", "adx"),
+    "regime_filter": ("bar_return",),
 }
 
 
-def registered_live_contract(name: str) -> tuple[tuple[str, ...], dict[str, object]]:
+def registered_feature_contract(name: str) -> tuple[tuple[str, ...], dict[str, object]]:
     try:
-        terms = _REGISTERED_LIVE_RULES[name]
+        nodes = _REGISTERED_FEATURE_NODES[name]
     except KeyError as exc:
         raise ValueError(f"registered strategy has no live feature contract: {name}") from exc
-    nodes = tuple(dict.fromkeys(term[0] for term in terms))
-    rule: dict[str, object] = {
-        "kind": "linear_feature_score/v1",
-        "terms": [
-            {"feature": feature, "weight": weight, "centre": centre, "scale": scale}
-            for feature, weight, centre, scale in terms
-        ],
-    }
-    return nodes, rule
+    return nodes, {"kind": "registered_strategy/v1", "registered_strategy": name}
+
+
+def registered_live_contract(name: str) -> tuple[tuple[str, ...], dict[str, object]]:
+    """Compatibility name for the feature contract, without a second rule engine."""
+
+    return registered_feature_contract(name)
 
 
 def strategy_manifest() -> tuple[StrategyManifestEntry, ...]:
@@ -236,7 +231,7 @@ def assert_manifest_complete() -> None:
             "declared strategies have no concrete implementation: "
             + ", ".join(sorted(missing_ordinary))
         )
-    missing_live_contracts = ordinary - set(_REGISTERED_LIVE_RULES)
+    missing_live_contracts = ordinary - set(_REGISTERED_FEATURE_NODES)
     if missing_live_contracts:
         raise ValueError(
             "declared registered strategies have no live contract: "

@@ -188,6 +188,15 @@ class DatabaseFeatureWorker:
                 product_id = str(assignment["product_id"])
                 market_data_snapshot_id = None
                 if self.snapshot_store is not None:
+                    market_frame = raw_inputs.get("market_frame")
+                    if not isinstance(market_frame, list | tuple):
+                        market_frame = [
+                            {
+                                name: float(scalar_inputs[name])
+                                for name in ("open", "high", "low", "close", "volume")
+                                if name in scalar_inputs
+                            }
+                        ]
                     market_data_snapshot_id = self.snapshot_store.save(
                         {
                             "kind": "market_data_input",
@@ -196,7 +205,10 @@ class DatabaseFeatureWorker:
                             "instrument_id": str(payload["instrument_id"]),
                             "source_event_time": str(payload["source_event_time"]),
                             "availability_time": str(payload["availability_time"]),
-                            "values": scalar_inputs,
+                            "values": {
+                                **scalar_inputs,
+                                "market_frame": list(market_frame),
+                            },
                         },
                         created_at=str(payload["availability_time"]),
                     )
@@ -345,6 +357,16 @@ class DatabaseFeatureWorker:
             "low_history": [float(row["low"]) for row in ordered],
             "close_history": [float(row["close"]) for row in ordered],
             "volume_history": [float(row["volume"]) for row in ordered],
+            "market_frame": [
+                {
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(row["volume"]),
+                }
+                for row in ordered
+            ],
             **{
                 name: float(latest[name])
                 for name in ("spread_bps", "visible_depth", "volatility", "funding")

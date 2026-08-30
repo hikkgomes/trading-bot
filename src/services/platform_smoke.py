@@ -56,7 +56,8 @@ from src.services.portfolio_state import (
 from src.services.risk_service import DatabaseRiskWorker
 from src.services.scheduler import DatabaseJobQueue
 from src.services.strategy_evaluator import DatabaseStrategyEvaluator
-from src.strategies.manifest import registered_live_contract
+from src.strategies.manifest import registered_feature_contract
+from src.strategies.registry import get as get_registered_strategy
 
 _STAGES = (
     "closed_candle",
@@ -505,7 +506,7 @@ def _seed_strategy(
     sleeve_id: str = "default",
 ) -> str:
     product_id = str(product["product_id"])
-    feature_nodes, production_rule = registered_live_contract(strategy_name)
+    feature_nodes, _ = registered_feature_contract(strategy_name)
     definition = StrategyDefinition(
         identity=prefix + ":" + strategy_name,
         version="smoke-v1",
@@ -516,8 +517,8 @@ def _seed_strategy(
         feature_graph={"version": "core-bars-v1", "required_nodes": list(feature_nodes)},
         signal_model={
             "registered_strategy": strategy_name,
-            "parameters": {},
-            "production_rule": production_rule,
+            "parameters": get_registered_strategy(strategy_name).default_params(),
+            "behaviour_contract": "registered_strategy/v1",
         },
         position_model={"kind": "volatility_scaled"},
         execution_preferences={"policy": "market"},

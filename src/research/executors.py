@@ -19,6 +19,7 @@ from typing import Any
 from src.domain._codec import canonical_hash, json_value
 from src.domain.strategies import StrategySourceType
 from src.research.coordinator import Candidate
+from src.strategies.behaviour import RegisteredStrategyBehaviour, StrategyBehaviourError
 from src.strategies.semantic import SEMANTIC_STRATEGIES
 
 
@@ -441,6 +442,7 @@ def _measured_result(
         "evidence_units": float(max(1, aligned)),
         "output_hash": output_hash,
         "observations": observations,
+        "behaviour_hash": context.get("behaviour_hash"),
     }
     return ExecutionResult(
         evidence=measured,
@@ -457,6 +459,11 @@ def _measured_result(
             evidence_policy_hash=(
                 str(context["evidence_policy_hash"])
                 if context.get("evidence_policy_hash") is not None
+                else None
+            ),
+            behaviour_hash=(
+                str(context["behaviour_hash"])
+                if context.get("behaviour_hash") is not None
                 else None
             ),
         ),
@@ -581,9 +588,6 @@ def _parameter_stability(
         strategy_name = candidate.definition.signal_model.get("registered_strategy")
         if isinstance(parameters, Mapping) and frame is not None and isinstance(strategy_name, str):
             try:
-                from src.strategies.registry import get
-
-                strategy_factory = get(strategy_name)
                 for name, value in parameters.items():
                     if isinstance(value, bool) or not isinstance(value, int | float):
                         continue
@@ -593,14 +597,19 @@ def _parameter_stability(
                         varied[str(name)] = value + direction * step
                         if isinstance(value, int):
                             varied[str(name)] = max(1, int(varied[str(name)]))
-                        signals = strategy_factory(**varied).generate_signals(frame)
+                        varied_behaviour = RegisteredStrategyBehaviour(
+                            name=strategy_name,
+                            parameters=varied,
+                            source_hash=candidate.definition.source_hash,
+                        )
+                        signals = varied_behaviour.generate_signals(frame)
                         numeric_signals = _numeric_series(signals)
                         returns = _market_price_returns(context, len(numeric_signals))
                         aligned = min(len(returns), max(0, len(numeric_signals) - 1))
                         neighbours[f"{name}:{direction:+d}"] = [
                             numeric_signals[index] * returns[index] for index in range(aligned)
                         ]
-            except (ExecutorError, KeyError, TypeError, ValueError):
+            except (ExecutorError, KeyError, TypeError, ValueError, StrategyBehaviourError):
                 neighbours = {}
     results = []
     base_total = sum(base_returns)
@@ -1031,17 +1040,19 @@ def _build_semantic_context(candidate: Candidate, context: Mapping[str, Any]) ->
 
 
 def execute_registered_python(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
-    from src.strategies import library  # noqa: F401
-    from src.strategies.registry import get
-
     frame = context.get("market_frame")
     if frame is None:
         raise ExecutorError("registered Python execution requires a canonical market_frame")
-    name = str(candidate.definition.signal_model.get("registered_strategy") or "")
-    params = candidate.definition.signal_model.get("parameters", {})
-    strategy = get(name)(**dict(params))
-    signals = strategy.generate_signals(frame)
-    return _measured_result(candidate, context, tuple(int(value) for value in signals))
+    try:
+        behaviour = RegisteredStrategyBehaviour.from_definition(candidate.definition)
+        signals = behaviour.generate_signals(frame)
+    except StrategyBehaviourError as exc:
+        raise ExecutorError(str(exc)) from exc
+    return _measured_result(
+        candidate,
+        {**context, "behaviour_hash": behaviour.behaviour_hash},
+        signals,
+    )
 
 
 def execute_generated_dsl(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
@@ -1124,6 +1135,7 @@ def execution_receipt(
     dataset_snapshot_ids: tuple[str, ...],
     executor_version: str,
     evidence_policy_hash: str | None = None,
+    behaviour_hash: str | None = None,
 ) -> dict[str, Any]:
     payload = {
         "candidate_id": candidate.candidate_id,
@@ -1132,4 +1144,6 @@ def execution_receipt(
     }
     if evidence_policy_hash is not None:
         payload["evidence_policy_hash"] = evidence_policy_hash
+    if behaviour_hash is not None:
+        payload["behaviour_hash"] = behaviour_hash
     return {**payload, "input_hash": canonical_hash(payload)}

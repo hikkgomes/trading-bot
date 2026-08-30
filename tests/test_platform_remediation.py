@@ -3,9 +3,13 @@ from __future__ import annotations
 from sqlalchemy import select
 
 from src.data.database import PlatformDatabase, job
+from src.research.artefacts import StrategyArtefact
+from src.research.catalogue import registered_strategy_candidates
 from src.research.evaluation import EvidencePolicy, EvidenceStatus
 from src.research.executors import _cross_symbol_stability, _portfolio_overlap
+from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.scheduler import DatabaseJobQueue
+from src.strategies.behaviour import RegisteredStrategyBehaviour
 
 NOW = "2026-08-30T10:00:00+00:00"
 
@@ -102,3 +106,59 @@ def test_single_symbol_and_empty_portfolio_overlap_are_not_applicable() -> None:
     assert cross_symbol["passed"] is True
     assert overlap["status"] == "not_applicable"
     assert overlap["passed"] is True
+
+
+def test_registered_strategy_behaviour_is_shared_by_research_and_dispatch() -> None:
+    candidates = registered_strategy_candidates(
+        product="active_income",
+        dataset_snapshot_hashes=("sha256:" + "b" * 64,),
+        instrument_universe=("BTCUSDT",),
+    )
+    candidate = next(item for item in candidates if item.definition.identity == "sma_cross")
+    frame = [
+        {
+            "open": float(index),
+            "high": float(index) + 1.0,
+            "low": float(index) - 1.0,
+            "close": float(index) + 0.5,
+            "volume": 100.0,
+        }
+        for index in range(1, 40)
+    ]
+    artefact = StrategyArtefact(
+        definition=candidate.definition,
+        dependency_hash="sha256:" + "c" * 64,
+        dataset_snapshot_hashes=candidate.dataset_snapshot_hashes,
+        feature_set_version="features-v1",
+        cost_model_version="costs-v1",
+        validation_evidence={"accepted": True},
+        holdout_claim={"accepted": True},
+        promotion_policy={"paper": True},
+        position_limits={"maximum_position": 0.2, "target_volatility": 0.2},
+        risk_limits={"policy": "active-income"},
+        model_hashes=(),
+        supported_products=("active_income",),
+        supported_instruments=("BTCUSDT",),
+        created_at=NOW,
+        product_id="active_income",
+        portfolio_id="portfolio-active-income",
+        account_id="account-usdt",
+        promotion_policy_id="promotion-v1",
+        engine_version="strategy-v1",
+    )
+    expected_signal = RegisteredStrategyBehaviour.from_definition(
+        candidate.definition
+    ).latest_signal(frame)
+    dispatched = ArtefactDispatcher.default().evaluate({"market_frame": frame}, artefact.to_dict())
+
+    assert (
+        dispatched["direction"]
+        == {
+            -1: "short",
+            0: "flat",
+            1: "long",
+        }[expected_signal]
+    )
+    assert dispatched["behaviour_hash"] == artefact.behaviour_hash
+    assert dispatched["execution_receipt"]["deployment_hash"] == artefact.artefact_hash
+    assert dispatched["execution_receipt"]["behaviour_hash"] == artefact.behaviour_hash

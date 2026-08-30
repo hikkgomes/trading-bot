@@ -12,6 +12,7 @@ from typing import Any
 
 from src.domain._codec import canonical_hash, json_value, timestamp, to_primitive
 from src.domain.strategies import StrategyDefinition
+from src.strategies.behaviour import behaviour_hash_for_definition
 
 
 def _hashes(values: tuple[str, ...], *, field_name: str, allow_empty: bool = False) -> None:
@@ -54,6 +55,7 @@ class StrategyArtefact:
     account_id: str | None = None
     promotion_policy_id: str | None = None
     engine_version: str | None = None
+    behaviour_hash: str | None = None
 
     def __post_init__(self) -> None:
         _hashes((self.dependency_hash,), field_name="dependency_hash")
@@ -80,6 +82,7 @@ class StrategyArtefact:
             ("dependency_lock_hash", self.dependency_hash),
             ("feature_set_hash", canonical_hash({"feature_set_version": self.feature_set_version})),
             ("cost_model_hash", canonical_hash({"cost_model_version": self.cost_model_version})),
+            ("behaviour_hash", behaviour_hash_for_definition(self.definition)),
         ):
             value = getattr(self, field_name) or fallback
             _hashes((value,), field_name=field_name)
@@ -98,6 +101,7 @@ class StrategyArtefact:
             "account_id",
             "promotion_policy_id",
             "engine_version",
+            "behaviour_hash",
         ):
             value = getattr(self, field_name)
             if value is not None:
@@ -137,6 +141,7 @@ class StrategyArtefact:
             "account_id": self.account_id,
             "promotion_policy_id": self.promotion_policy_id,
             "engine_version": self.engine_version,
+            "behaviour_hash": self.behaviour_hash,
         }
         if include_hash:
             payload["artefact_hash"] = self.artefact_hash
@@ -172,6 +177,7 @@ class StrategyArtefact:
         account_id: str | None = None,
         promotion_policy_id: str | None = None,
         engine_version: str | None = None,
+        behaviour_hash: str | None = None,
     ) -> StrategyArtefact:
         """Build v2 only from immutable evidence identities and hashes.
 
@@ -233,6 +239,7 @@ class StrategyArtefact:
             account_id=account_id,
             promotion_policy_id=promotion_policy_id,
             engine_version=engine_version,
+            behaviour_hash=behaviour_hash,
         )
 
 
