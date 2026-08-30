@@ -462,6 +462,8 @@ job = Table(
     Column("lease_owner", String(160), index=True),
     Column("lease_expires_at", UtcTimestamp(), index=True),
     Column("attempts", Integer, nullable=False, default=0),
+    Column("max_attempts", Integer, nullable=False, default=3),
+    Column("terminal_reason", Text),
     Column("producer_identity", String(200), nullable=False, default="platform"),
     Column("content_hash", String(80), nullable=False),
     Column("payload", JSON, nullable=False),
@@ -624,6 +626,7 @@ class PlatformDatabase:
                 "004_research_thesis_authority.py",
                 "005_platform_bootstrap_authority.py",
                 "006_research_dataset_bundles.py",
+                "007_bounded_job_retries.py",
             )
             applied: list[str] = []
             with self.engine.begin() as connection:
@@ -673,7 +676,7 @@ class PlatformDatabase:
         if self.is_postgresql:
             with self.engine.connect() as connection:
                 revision = connection.execute(text("SELECT version_num FROM alembic_version"))
-                if revision.scalar_one_or_none() != "platform_v2_0006":
+                if revision.scalar_one_or_none() != "platform_v2_0007":
                     raise RuntimeError("database is not at the current Alembic revision")
 
     def dispose(self) -> None:

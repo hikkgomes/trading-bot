@@ -646,7 +646,10 @@ class DatabaseJobQueue:
         available_at: str,
         priority: int = 0,
         producer_identity: str | None = None,
+        max_attempts: int = 3,
     ) -> None:
+        if isinstance(max_attempts, bool) or max_attempts < 1:
+            raise ValueError("max_attempts must be a positive integer")
         try:
             clean_payload = validate_job_payload(name, payload)
         except JobSchemaError:
@@ -666,6 +669,8 @@ class DatabaseJobQueue:
             "lease_owner": None,
             "lease_expires_at": None,
             "attempts": 0,
+            "max_attempts": max_attempts,
+            "terminal_reason": None,
             "producer_identity": producer,
             "content_hash": canonical_hash(clean_payload),
             "payload": json_value(clean_payload, field="payload"),
@@ -684,7 +689,10 @@ class DatabaseJobQueue:
         available_at: str,
         priority: int = 0,
         producer_identity: str | None = None,
+        max_attempts: int = 3,
     ) -> bool:
+        if isinstance(max_attempts, bool) or max_attempts < 1:
+            raise ValueError("max_attempts must be a positive integer")
         try:
             clean_payload = validate_job_payload(name, payload)
         except JobSchemaError:
@@ -704,6 +712,8 @@ class DatabaseJobQueue:
             "lease_owner": None,
             "lease_expires_at": None,
             "attempts": 0,
+            "max_attempts": max_attempts,
+            "terminal_reason": None,
             "producer_identity": producer,
             "content_hash": canonical_hash(clean_payload),
             "payload": json_value(clean_payload, field="payload"),
@@ -735,6 +745,7 @@ class DatabaseJobQueue:
             "payload": values["payload"],
             "producer_identity": values["producer_identity"],
             "content_hash": values["content_hash"],
+            "max_attempts": values["max_attempts"],
         }
         if existing["state"] == "pending" and existing["attempts"] == 0:
             expected["available_at"] = values["available_at"]
@@ -849,7 +860,12 @@ class DatabaseJobQueue:
         attempt_id = f"{claimed.job_id}:{claimed.attempt}"
         with self.engine.begin() as connection:
             current = connection.execute(
-                select(job.c.state, job.c.lease_owner).where(job.c.id == claimed.job_id)
+                select(
+                    job.c.state,
+                    job.c.lease_owner,
+                    job.c.attempts,
+                    job.c.max_attempts,
+                ).where(job.c.id == claimed.job_id)
             ).first()
             if (
                 current is None
@@ -909,7 +925,12 @@ class DatabaseJobQueue:
         attempt_id = f"{claimed.job_id}:{claimed.attempt}"
         with self.engine.begin() as connection:
             current = connection.execute(
-                select(job.c.state, job.c.lease_owner).where(job.c.id == claimed.job_id)
+                select(
+                    job.c.state,
+                    job.c.lease_owner,
+                    job.c.attempts,
+                    job.c.max_attempts,
+                ).where(job.c.id == claimed.job_id)
             ).first()
             if (
                 current is None
@@ -917,16 +938,19 @@ class DatabaseJobQueue:
                 or current.lease_owner != claimed.worker_id
             ):
                 raise ValueError("worker no longer owns the job lease")
+            terminal = int(current.attempts) >= int(current.max_attempts)
+            next_state = "dead_letter" if terminal else "pending"
             connection.execute(
                 update(job)
                 .where(job.c.id == claimed.job_id)
                 .values(
-                    state="pending" if retry_at else "completed",
+                    state=next_state if retry_at else "completed",
                     available_at=timestamp(retry_at, field="retry_at")
                     if retry_at
                     else completed_at,
                     lease_owner=None,
                     lease_expires_at=None,
+                    terminal_reason=error if terminal else None,
                 )
             )
             connection.execute(
@@ -948,28 +972,39 @@ class DatabaseJobQueue:
     def recover_expired(self, *, now: str) -> int:
         now = timestamp(now, field="now")
         with self.engine.begin() as connection:
-            expired = (
-                connection.execute(
-                    select(job.c.id).where(job.c.state == "running", job.c.lease_expires_at < now)
+            expired = connection.execute(
+                select(job.c.id, job.c.attempts, job.c.max_attempts).where(
+                    job.c.state == "running", job.c.lease_expires_at < now
                 )
-                .scalars()
-                .all()
-            )
+            ).mappings().all()
             if not expired:
                 return 0
-            connection.execute(
-                update(job)
-                .where(job.c.id.in_(expired))
-                .values(state="pending", lease_owner=None, lease_expires_at=None)
-            )
+            for row in expired:
+                terminal = int(row["attempts"]) >= int(row["max_attempts"])
+                connection.execute(
+                    update(job)
+                    .where(job.c.id == row["id"])
+                    .values(
+                        state="dead_letter" if terminal else "pending",
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        terminal_reason="worker_lease_expired" if terminal else None,
+                    )
+                )
             connection.execute(
                 update(worker_lease)
-                .where(worker_lease.c.job_id.in_(expired), worker_lease.c.status == "active")
+                .where(
+                    worker_lease.c.job_id.in_([row["id"] for row in expired]),
+                    worker_lease.c.status == "active",
+                )
                 .values(status="expired")
             )
             connection.execute(
                 update(job_attempt)
-                .where(job_attempt.c.job_id.in_(expired), job_attempt.c.status == "running")
+                .where(
+                    job_attempt.c.job_id.in_([row["id"] for row in expired]),
+                    job_attempt.c.status == "running",
+                )
                 .values(completed_at=now, status="expired", error="worker_lease_expired")
             )
             return len(expired)
