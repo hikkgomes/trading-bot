@@ -19,7 +19,6 @@ from typing import Any
 from src.domain._codec import canonical_hash, json_value
 from src.domain.strategies import StrategySourceType
 from src.research.coordinator import Candidate
-from src.research.theses import REQUIRED_NEGATIVE_CONTROLS
 from src.strategies.semantic import SEMANTIC_STRATEGIES
 
 
@@ -174,6 +173,7 @@ def _measured_result(
         returns=returns[:aligned],
         candidate_return=net_return,
         control_returns=context.get("negative_control_returns"),
+        controls=_negative_control_names(candidate, context),
     )
     delayed_gross = [signals[index - 1] * returns[index] for index in range(1, aligned)]
     missing_data_gross = [value for index, value in enumerate(gross) if (index + 1) % 20]
@@ -202,7 +202,16 @@ def _measured_result(
         pbo_matrix.insert(0, window_returns)
     width = min((len(row) for row in pbo_matrix), default=0)
     pbo_matrix = [row[:width] for row in pbo_matrix if width >= 2]
-    pbo = 1.0 if len(pbo_matrix) < 2 else probability_backtest_overfitting(pbo_matrix)
+    pbo: float | dict[str, Any]
+    if len(pbo_matrix) < 2:
+        pbo = {
+            "status": "not_applicable",
+            "passed": True,
+            "reason": "no_valid_configuration_cohort",
+            "cohort_size": len(pbo_matrix),
+        }
+    else:
+        pbo = probability_backtest_overfitting(pbo_matrix)
     skew, kurtosis = _skew_kurtosis(gross)
     trial_sharpes = _trial_sharpes(context, parameter_stability, gross)
     trial_count = max(
@@ -539,6 +548,27 @@ def _trial_sharpes(
 def _parameter_stability(
     candidate: Candidate, context: Mapping[str, Any], base_returns: list[float]
 ) -> dict[str, Any]:
+    parameters = candidate.definition.signal_model.get("parameters", {})
+    declared_tunable = context.get("tunable_parameters")
+    if isinstance(declared_tunable, list | tuple):
+        tunable = tuple(str(name) for name in declared_tunable)
+    elif isinstance(parameters, Mapping):
+        tunable = tuple(
+            str(name)
+            for name, value in parameters.items()
+            if isinstance(value, int | float) and not isinstance(value, bool)
+        )
+    else:
+        tunable = ()
+    if not tunable:
+        return {
+            "status": "not_applicable",
+            "passed": True,
+            "reason": "no_tunable_parameters",
+            "neighbours_tested": 0,
+            "results": [],
+            "base_window_returns": _window_sums(base_returns, 3),
+        }
     raw = context.get("parameter_neighbour_returns", context.get("neighbour_returns", {}))
     neighbours: dict[str, list[float]] = {}
     if isinstance(raw, Mapping):
@@ -547,7 +577,6 @@ def _parameter_stability(
             if numeric:
                 neighbours[str(name)] = numeric
     if not neighbours:
-        parameters = candidate.definition.signal_model.get("parameters", {})
         frame = context.get("market_frame")
         strategy_name = candidate.definition.signal_model.get("registered_strategy")
         if isinstance(parameters, Mapping) and frame is not None and isinstance(strategy_name, str):
@@ -603,6 +632,7 @@ def _parameter_stability(
         }
         results.append(result)
     return {
+        "status": "pass" if results and all(item["passed"] for item in results) else "fail",
         "passed": bool(base_returns) and bool(results) and all(item["passed"] for item in results),
         "neighbours_tested": len(results),
         "results": results,
@@ -640,16 +670,42 @@ def _cross_symbol_stability(
                     ),
                 }
     if not per_symbol:
+        scope = tuple(
+            str(item)
+            for item in context.get("instrument_scope", context.get("expected_symbols", ()))
+            if item
+        )
+        if len(scope) == 1:
+            return {
+                "status": "not_applicable",
+                "passed": True,
+                "symbols": 0,
+                "per_symbol": {},
+                "reason": "single_instrument",
+            }
         return {
+            "status": "unavailable",
             "passed": False,
             "symbols": 0,
             "per_symbol": {},
             "reason": "missing_symbol_returns",
         }
+    scope = tuple(
+        str(item)
+        for item in context.get("instrument_scope", context.get("expected_symbols", ()))
+        if item
+    )
+    missing_symbols = sorted(set(scope) - set(per_symbol)) if len(scope) > 1 else []
     return {
-        "passed": all(item["passed"] for item in per_symbol.values()),
+        "status": (
+            "pass"
+            if all(item["passed"] for item in per_symbol.values()) and not missing_symbols
+            else "fail"
+        ),
+        "passed": all(item["passed"] for item in per_symbol.values()) and not missing_symbols,
         "symbols": len(per_symbol),
         "per_symbol": per_symbol,
+        "missing_symbols": missing_symbols,
     }
 
 
@@ -659,12 +715,13 @@ def _portfolio_overlap(
     raw = context.get("active_strategy_returns", {})
     if not isinstance(raw, Mapping) or not raw:
         return {
-            "passed": False,
+            "status": "not_applicable",
+            "passed": True,
             "maximum_correlation": None,
             "threshold": float(context.get("maximum_portfolio_correlation", 0.8)),
             "active_strategy_count": 0,
             "comparisons": [],
-            "reason": "missing_active_strategy_returns",
+            "reason": "no_active_strategy",
         }
     candidate = _numeric_series(context.get("candidate_returns", candidate_returns))
     comparisons: list[dict[str, Any]] = []
@@ -703,6 +760,9 @@ def _portfolio_overlap(
         )
     threshold = float(context.get("maximum_portfolio_correlation", 0.8))
     return {
+        "status": "pass"
+        if bool(comparisons) and not undefined and maximum <= threshold
+        else "fail",
         "passed": bool(comparisons) and not undefined and maximum <= threshold,
         "maximum_correlation": None if undefined else maximum,
         "threshold": threshold,
@@ -841,12 +901,13 @@ def _negative_control_evidence(
     returns: list[float],
     candidate_return: float,
     control_returns: Any = None,
+    controls: tuple[str, ...] = (),
 ) -> dict[str, dict[str, float | int | bool | str | None]]:
     aligned = min(len(signals), len(returns))
     signals, returns = signals[:aligned], returns[:aligned]
     supplied = control_returns if isinstance(control_returns, Mapping) else {}
     results: dict[str, dict[str, float | int | bool | str | None]] = {}
-    for name in REQUIRED_NEGATIVE_CONTROLS:
+    for name in controls:
         numeric = _numeric_series(supplied.get(name))
         comparable = numeric[:aligned]
         control_return = sum(comparable) if comparable else None
@@ -859,6 +920,16 @@ def _negative_control_evidence(
             else None,
         }
     return results
+
+
+def _negative_control_names(candidate: Candidate, context: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = context.get("negative_controls")
+    if raw is None:
+        policy = candidate.definition.validation_policy
+        raw = policy.get("negative_controls") if isinstance(policy, Mapping) else None
+    if not isinstance(raw, list | tuple):
+        return ()
+    return tuple(dict.fromkeys(str(name) for name in raw if str(name)))
 
 
 def _build_registered_context(

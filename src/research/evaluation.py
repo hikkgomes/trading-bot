@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, cast
 
 from sqlalchemy import select, update
@@ -20,7 +21,7 @@ from src.research.canonical import SqlHoldoutRepository, SqlValidationRepository
 from src.research.datasets import CanonicalDatasetResolver
 from src.research.executors import ExecutorError, ProviderExecutorRegistry
 from src.research.store import SqlResearchStore
-from src.research.theses import REQUIRED_NEGATIVE_CONTROLS, SqlThesisRegistry, ThesisError
+from src.research.theses import SqlThesisRegistry, ThesisError
 
 STAGES = ("screening", "development", "robustness", "protected", "forward")
 FORBIDDEN_SUBMITTED_FIELDS = frozenset(
@@ -263,13 +264,20 @@ class StageEvaluation:
     evidence: Mapping[str, Any]
 
 
+class EvidenceStatus(StrEnum):
+    PASS = "pass"
+    FAIL = "fail"
+    NOT_APPLICABLE = "not_applicable"
+    UNAVAILABLE = "unavailable"
+
+
 @dataclass(frozen=True)
 class EvidencePolicy:
     """Typed acceptance thresholds for measured research evidence."""
 
     minimum_cost_adjusted_return: float = 0.0001
     minimum_deflated_sharpe: float = 0.95
-    minimum_walk_forward_windows: int = 3
+    minimum_walk_forward_windows: int = 5
     minimum_walk_forward_pass_fraction: float = 0.67
     maximum_backtest_overfitting_probability: float = 0.25
     maximum_portfolio_correlation: float = 0.8
@@ -322,22 +330,70 @@ class EvidencePolicy:
     def accepts(self, stage: str, evidence: Mapping[str, Any], controls: tuple[str, ...]) -> bool:
         if evidence.get("evidence_policy_hash") != self.policy_hash:
             return False
-        validators = _STAGE_EVIDENCE_VALIDATORS.get(stage, {})
-        if not validators or any(
-            not validator(evidence.get(name), self) for name, validator in validators.items()
+        statuses = self.statuses(stage, evidence, controls)
+        if not statuses or any(
+            status not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
+            for status in statuses.values()
         ):
             return False
-        if stage == "robustness":
-            results = evidence.get("negative_control_results")
-            if not isinstance(results, Mapping) or any(
-                not _passed_mapping(results.get(control)) for control in controls
-            ):
-                return False
         return True
+
+    def statuses(
+        self, stage: str, evidence: Mapping[str, Any], controls: tuple[str, ...]
+    ) -> dict[str, EvidenceStatus]:
+        validators = _STAGE_EVIDENCE_VALIDATORS.get(stage, {})
+        statuses: dict[str, EvidenceStatus] = {}
+        for name, validator in validators.items():
+            value = evidence.get(name)
+            if name == "negative_control_results" and stage == "robustness":
+                statuses[name] = _negative_control_status(value, controls)
+            elif _is_not_applicable(value):
+                statuses[name] = EvidenceStatus.NOT_APPLICABLE
+            elif _is_unavailable(value):
+                statuses[name] = EvidenceStatus.UNAVAILABLE
+            else:
+                statuses[name] = (
+                    EvidenceStatus.PASS if validator(value, self) else EvidenceStatus.FAIL
+                )
+        return statuses
 
 
 def _passed_mapping(value: object) -> bool:
     return isinstance(value, Mapping) and value.get("passed") is True
+
+
+def _is_not_applicable(value: object) -> bool:
+    return isinstance(value, Mapping) and value.get("status") == EvidenceStatus.NOT_APPLICABLE
+
+
+def _is_unavailable(value: object) -> bool:
+    return value is None or (
+        isinstance(value, Mapping) and value.get("status") == EvidenceStatus.UNAVAILABLE
+    )
+
+
+def _negative_control_status(value: object, controls: tuple[str, ...]) -> EvidenceStatus:
+    if not controls:
+        return EvidenceStatus.NOT_APPLICABLE
+    if not isinstance(value, Mapping):
+        return EvidenceStatus.UNAVAILABLE
+    statuses = [
+        EvidenceStatus.NOT_APPLICABLE
+        if _is_not_applicable(value.get(control))
+        else EvidenceStatus.UNAVAILABLE
+        if _is_unavailable(value.get(control))
+        else EvidenceStatus.PASS
+        if _passed_mapping(value.get(control))
+        else EvidenceStatus.FAIL
+        for control in controls
+    ]
+    if any(status is EvidenceStatus.UNAVAILABLE for status in statuses):
+        return EvidenceStatus.UNAVAILABLE
+    if any(status is EvidenceStatus.FAIL for status in statuses):
+        return EvidenceStatus.FAIL
+    if all(status is EvidenceStatus.NOT_APPLICABLE for status in statuses):
+        return EvidenceStatus.NOT_APPLICABLE
+    return EvidenceStatus.PASS
 
 
 def _true(value: object, _policy: EvidencePolicy) -> bool:
@@ -372,6 +428,8 @@ def _deflated_sharpe_passes(value: object, policy: EvidencePolicy) -> bool:
 
 
 def _pbo_passes(value: object, policy: EvidencePolicy) -> bool:
+    if _is_not_applicable(value):
+        return True
     measured = _finite(value)
     return measured is not None and 0 <= measured <= policy.maximum_backtest_overfitting_probability
 
@@ -403,6 +461,8 @@ def _mapping_passes(value: object, _policy: EvidencePolicy) -> bool:
 
 
 def _parameter_stability_passes(value: object, _policy: EvidencePolicy) -> bool:
+    if _is_not_applicable(value):
+        return True
     if not isinstance(value, Mapping) or value.get("passed") is not True:
         return False
     results = value.get("results")
@@ -424,6 +484,8 @@ def _parameter_stability_passes(value: object, _policy: EvidencePolicy) -> bool:
 
 
 def _cross_symbol_stability_passes(value: object, _policy: EvidencePolicy) -> bool:
+    if _is_not_applicable(value):
+        return True
     if not isinstance(value, Mapping) or value.get("passed") is not True:
         return False
     per_symbol = value.get("per_symbol")
@@ -443,6 +505,8 @@ def _cross_symbol_stability_passes(value: object, _policy: EvidencePolicy) -> bo
 
 
 def _portfolio_overlap_passes(value: object, policy: EvidencePolicy) -> bool:
+    if _is_not_applicable(value):
+        return True
     if not isinstance(value, Mapping) or value.get("passed") is not True:
         return False
     comparisons = value.get("comparisons")
@@ -498,7 +562,7 @@ def _negative_control_results_pass(value: object, _policy: EvidencePolicy) -> bo
         and isinstance(value[name].get("observations"), int)
         and int(value[name]["observations"]) > 0
         and _valid_hash(value[name].get("input_hash"))
-        for name in REQUIRED_NEGATIVE_CONTROLS
+        for name in value
     )
 
 
@@ -772,6 +836,7 @@ class CanonicalResearchEvaluator:
             "bootstrap_method": self.evidence_policy.bootstrap_method,
             "multiple_testing_method": self.evidence_policy.multiple_testing_method,
             "pbo_method": self.evidence_policy.pbo_method,
+            "negative_controls": list(self._negative_controls(candidate.thesis_id)),
             "requested_stage": request.requested_stage,
             "evaluated_at": request.evaluated_at,
             "code_hash": request.code_hash or definition.source_hash,
@@ -1102,14 +1167,19 @@ class CanonicalResearchEvaluator:
         }[stage]
         controls = self._negative_controls(candidate.thesis_id)
         policy_fields = _STAGE_EVIDENCE_VALIDATORS[stage]
+        evidence_status = self.evidence_policy.statuses(stage, evidence, controls)
         missing = [
             field
             for field in required_fields
             if field not in policy_fields
-            or not policy_fields[field](evidence.get(field), self.evidence_policy)
+            or evidence_status.get(field)
+            not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
         ]
         accepted = not missing and self.evidence_policy.accepts(stage, evidence, controls)
         evidence["missing_evidence"] = missing
+        evidence["evidence_status"] = {
+            field: status.value for field, status in evidence_status.items()
+        }
         receipt: Mapping[str, Any] | None = None
         for row in authoritative_runs:
             raw_receipt = cast(Mapping[str, Any], row["payload"]).get("receipt")
