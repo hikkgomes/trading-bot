@@ -368,7 +368,7 @@ active_strategy_assignment = Table(
     ),
     CheckConstraint(
         "lifecycle_state IN "
-        "('registered', 'development', 'forward_paper', 'live_canary', 'live', 'suspended', 'retired')",
+        "('registered', 'development', 'forward_paper', 'live_ready', 'live_canary', 'live', 'suspended', 'retired')",
         name="ck_assignment_lifecycle_state",
     ),
 )
@@ -661,6 +661,7 @@ class PlatformDatabase:
                 "007_bounded_job_retries.py",
                 "008_forward_paper_summaries.py",
                 "009_generation_feedback.py",
+                "010_live_ready_lifecycle.py",
             )
             applied: list[str] = []
             with self.engine.begin() as connection:
@@ -710,7 +711,7 @@ class PlatformDatabase:
         if self.is_postgresql:
             with self.engine.connect() as connection:
                 revision = connection.execute(text("SELECT version_num FROM alembic_version"))
-                if revision.scalar_one_or_none() != "platform_v2_0009":
+                if revision.scalar_one_or_none() != "platform_v2_0010":
                     raise RuntimeError("database is not at the current Alembic revision")
 
     def dispose(self) -> None:

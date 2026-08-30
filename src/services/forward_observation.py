@@ -307,6 +307,11 @@ class DatabaseForwardSummaryWorker:
                 minimum_net_pnl=float(policy.get("minimum_forward_net_pnl", 0.0)),
                 maximum_drawdown=float(policy.get("maximum_drawdown", 1.0)),
                 maximum_data_gaps=int(policy.get("maximum_forward_data_gaps", 0)),
+                minimum_effective_trades=int(policy.get("minimum_forward_effective_trades", 0)),
+                minimum_fill_rate=float(policy.get("minimum_forward_fill_rate", 0.0)),
+                maximum_slippage=float(policy.get("maximum_forward_slippage", 1.0)),
+                minimum_data_uptime=float(policy.get("minimum_forward_data_uptime", 0.0)),
+                maximum_rejected_orders=int(policy.get("maximum_forward_rejected_orders", 0)),
             )
         except Exception as exc:
             self.queue.fail(

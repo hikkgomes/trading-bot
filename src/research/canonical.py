@@ -90,6 +90,60 @@ def preflight_is_fresh(
     return 0 <= age <= maximum_age_seconds
 
 
+def latest_accepted_forward_summary(
+    engine: Engine,
+    *,
+    strategy_version_id: str,
+    product_id: str,
+    artefact_hash: str,
+    at: str | None = None,
+) -> dict[str, Any] | None:
+    """Return the latest summary only when its latest decision is accepted."""
+
+    with engine.connect() as connection:
+        statement = select(forward_paper_summary).where(
+            forward_paper_summary.c.strategy_version_id == strategy_version_id,
+            forward_paper_summary.c.product_id == product_id,
+            forward_paper_summary.c.artefact_hash == artefact_hash,
+        )
+        if at is not None:
+            statement = statement.where(
+                forward_paper_summary.c.created_at <= timestamp(at, field="forward summary time")
+            )
+        summary = (
+            connection.execute(
+                statement.order_by(
+                    forward_paper_summary.c.created_at.desc(),
+                    forward_paper_summary.c.id.desc(),
+                ).limit(1)
+            )
+            .mappings()
+            .first()
+        )
+        if summary is None:
+            return None
+        decision_statement = select(forward_paper_decision).where(
+            forward_paper_decision.c.summary_id == summary["id"],
+        )
+        if at is not None:
+            decision_statement = decision_statement.where(
+                forward_paper_decision.c.decided_at <= timestamp(at, field="forward decision time")
+            )
+        decision = (
+            connection.execute(
+                decision_statement.order_by(
+                    forward_paper_decision.c.decided_at.desc(),
+                    forward_paper_decision.c.id.desc(),
+                ).limit(1)
+            )
+            .mappings()
+            .first()
+        )
+    if decision is None or decision["accepted"] is not True:
+        return None
+    return {"summary": dict(summary), "decision": dict(decision)}
+
+
 def _finite_nonnegative(value: object, *, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         raise CanonicalEvidenceError(f"{field} must be numeric")
@@ -978,6 +1032,11 @@ class SqlForwardEvidenceRepository:
         minimum_net_pnl: float = 0.0,
         maximum_drawdown: float = 1.0,
         maximum_data_gaps: int = 0,
+        minimum_effective_trades: int = 0,
+        minimum_fill_rate: float = 0.0,
+        maximum_slippage: float = 1.0,
+        minimum_data_uptime: float = 0.0,
+        maximum_rejected_orders: int = 0,
     ) -> tuple[str, bool, str | None]:
         if isinstance(minimum_days, bool) or minimum_days < 0:
             raise CanonicalEvidenceError("minimum forward days must be non-negative")
@@ -987,6 +1046,21 @@ class SqlForwardEvidenceRepository:
         maximum_drawdown = _finite_nonnegative(maximum_drawdown, field="maximum forward drawdown")
         if isinstance(maximum_data_gaps, bool) or maximum_data_gaps < 0:
             raise CanonicalEvidenceError("maximum forward data gaps must be non-negative")
+        if isinstance(minimum_effective_trades, bool) or minimum_effective_trades < 0:
+            raise CanonicalEvidenceError("minimum effective forward trades must be non-negative")
+        minimum_fill_rate = _finite_nonnegative(
+            minimum_fill_rate, field="minimum forward fill rate"
+        )
+        if minimum_fill_rate > 1:
+            raise CanonicalEvidenceError("minimum forward fill rate must be at most one")
+        maximum_slippage = _finite_nonnegative(maximum_slippage, field="maximum forward slippage")
+        minimum_data_uptime = _finite_nonnegative(
+            minimum_data_uptime, field="minimum forward data uptime"
+        )
+        if minimum_data_uptime > 1:
+            raise CanonicalEvidenceError("minimum forward data uptime must be at most one")
+        if isinstance(maximum_rejected_orders, bool) or maximum_rejected_orders < 0:
+            raise CanonicalEvidenceError("maximum rejected forward orders must be non-negative")
         with self.engine.connect() as connection:
             payload = connection.execute(
                 select(forward_paper_summary.c.payload).where(
@@ -1010,6 +1084,26 @@ class SqlForwardEvidenceRepository:
             ),
             (float(payload.get("drawdown", 0.0)) > maximum_drawdown, "forward_drawdown_limit"),
             (int(payload.get("data_gaps", 0)) > maximum_data_gaps, "forward_data_gaps"),
+            (
+                int(payload.get("effective_trades", 0)) < minimum_effective_trades,
+                "forward_effective_trades_insufficient",
+            ),
+            (
+                float(payload.get("fill_rate", 0.0)) < minimum_fill_rate,
+                "forward_fill_rate_insufficient",
+            ),
+            (
+                float(payload.get("slippage", 0.0)) > maximum_slippage,
+                "forward_slippage_limit",
+            ),
+            (
+                float(payload.get("data_uptime", 0.0)) < minimum_data_uptime,
+                "forward_data_uptime_insufficient",
+            ),
+            (
+                int(payload.get("rejected_orders", 0)) > maximum_rejected_orders,
+                "forward_rejected_orders_limit",
+            ),
         )
         reason = next((reason for failed, reason in checks if failed), None)
         decision_id = self.append_decision(
@@ -1340,6 +1434,7 @@ class SqlActiveStrategyAssignmentRepository:
             "registered",
             "development",
             "forward_paper",
+            "live_ready",
             "live_canary",
             "live",
             "suspended",
@@ -1500,6 +1595,15 @@ class SqlActiveStrategyAssignmentRepository:
                     if preflight is not None and isinstance(preflight["payload"], Mapping)
                     else {}
                 )
+                forward = latest_accepted_forward_summary(
+                    connection.engine,
+                    strategy_version_id=strategy_version_id,
+                    product_id=product_id,
+                    artefact_hash=artefact_hash,
+                    at=assigned_at,
+                )
+                forward_summary = forward["summary"] if forward is not None else None
+                forward_decision = forward["decision"] if forward is not None else None
                 exact_live_authority = (
                     instrument_id is not None
                     and approval_payload.get("schema") == "platform.strategy-approval/v1"
@@ -1520,6 +1624,10 @@ class SqlActiveStrategyAssignmentRepository:
                     == preflight_payload.get("execution_engine_identity")
                     and approval_payload.get("configuration_hash")
                     == preflight_payload.get("configuration_hash")
+                    and approval_payload.get("forward_summary_id")
+                    == (forward_summary["id"] if forward_summary is not None else None)
+                    and approval_payload.get("forward_decision_id")
+                    == (forward_decision["id"] if forward_decision is not None else None)
                 )
                 if exact_live_authority:
                     _identity(

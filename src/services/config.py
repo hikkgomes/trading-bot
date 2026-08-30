@@ -298,7 +298,11 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
     )
     policies = _unique_records(configuration["promotion"], collection="policies", key="policy_id")
     for policy_id, policy in policies.items():
-        for field in ("automatic_paper_promotion", "automatic_live_canary_promotion"):
+        for field in (
+            "automatic_paper_promotion",
+            "automatic_live_canary_promotion",
+            "automatic_live_ready_promotion",
+        ):
             if not isinstance(policy.get(field), bool):
                 raise ValueError(f"promotion policy {policy_id}.{field} must be a boolean")
         required_days = policy.get("required_forward_evidence_days")
@@ -315,6 +319,8 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
             "maximum_drawdown",
             "maximum_execution_drift",
             "maximum_model_drift",
+            "paper_capital_limit",
+            "maximum_forward_slippage",
         ):
             value = policy.get(field)
             if (
@@ -325,6 +331,23 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
             ):
                 raise ValueError(
                     f"promotion policy {policy_id}.{field} must be finite and non-negative"
+                )
+        for field in ("minimum_forward_fill_rate", "minimum_forward_data_uptime"):
+            value = policy.get(field, 0.0)
+            if (
+                not isinstance(value, int | float)
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or not 0 <= float(value) <= 1
+            ):
+                raise ValueError(
+                    f"promotion policy {policy_id}.{field} must be a number between zero and one"
+                )
+        for field in ("minimum_forward_effective_trades", "maximum_forward_rejected_orders"):
+            value = policy.get(field, 0)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(
+                    f"promotion policy {policy_id}.{field} must be a non-negative integer"
                 )
         minimum_decisions = policy.get("minimum_forward_independent_decisions", 1)
         if (
@@ -342,9 +365,7 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
             or isinstance(minimum_net_pnl, bool)
             or not math.isfinite(float(minimum_net_pnl))
         ):
-            raise ValueError(
-                f"promotion policy {policy_id}.minimum_forward_net_pnl must be finite"
-            )
+            raise ValueError(f"promotion policy {policy_id}.minimum_forward_net_pnl must be finite")
         maximum_data_gaps = policy.get("maximum_forward_data_gaps", 0)
         if (
             not isinstance(maximum_data_gaps, int)

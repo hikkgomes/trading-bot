@@ -3057,21 +3057,32 @@ def test_live_canary_promotion_requires_approval_preflight_capacity_and_evidence
         policy=policy,
         evaluated_at=NOW,
     )
+    canary_decision = decide_promotion(
+        strategy_version_id="trend:v1-canary",
+        current_state=LifecycleState.FORWARD_PAPER,
+        evidence=evidence,
+        policy=policy,
+        evaluated_at=NOW,
+        requested_transition="live_canary",
+    )
     blocked = decide_promotion(
         strategy_version_id="trend:v2",
         current_state=LifecycleState.FORWARD_PAPER,
         evidence=PromotionEvidence(**{**evidence.__dict__, "live_approval": False}),
         policy=policy,
         evaluated_at=NOW,
+        requested_transition="live_canary",
     )
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'platform.sqlite3'}")
     database.create_schema()
     store = SqlPromotionStore(database.engine)
     store.append(decision)
+    store.append(canary_decision)
     store.append(blocked)
 
-    assert decision.next_state is LifecycleState.LIVE_CANARY
-    assert decision.capital_limit == pytest.approx(0.01)
+    assert decision.next_state is LifecycleState.LIVE_READY
+    assert canary_decision.next_state is LifecycleState.LIVE_CANARY
+    assert canary_decision.capital_limit == pytest.approx(0.01)
     assert blocked.accepted is False
     assert blocked.reason_code == "live_approval_missing"
     assert store.latest("trend:v1") == decision

@@ -26,6 +26,7 @@ from src.research.canonical import (
     SqlApprovalRepository,
     SqlPreflightRepository,
     SqlStrategyArtefactRepository,
+    latest_accepted_forward_summary,
     preflight_is_fresh,
 )
 from src.services.account_reconciliation import AccountReconciliationService
@@ -229,6 +230,17 @@ class PlatformLiveAuthority:
         )
         if capital_cap > float(preflight["capital_cap"]):
             raise PlatformLiveAuthorityError("approval capital exceeds the preflight cap")
+        forward = latest_accepted_forward_summary(
+            self.engine,
+            strategy_version_id=str(artefact["strategy_version_id"]),
+            product_id=product_id,
+            artefact_hash=artefact_hash,
+            at=approved_at,
+        )
+        if forward is None:
+            raise PlatformLiveAuthorityError(
+                "approval requires the latest accepted forward summary"
+            )
         approval_id = self.approvals.append(
             strategy_version_id=str(artefact["strategy_version_id"]),
             product_id=product_id,
@@ -248,6 +260,8 @@ class PlatformLiveAuthority:
                 "account_fingerprint": str(preflight["payload"]["account_fingerprint"]),
                 "execution_engine_identity": execution_engine_identity(),
                 "configuration_hash": str(preflight["payload"]["configuration_hash"]),
+                "forward_summary_id": str(forward["summary"]["id"]),
+                "forward_decision_id": str(forward["decision"]["id"]),
             },
         )
         return {
@@ -554,6 +568,13 @@ class PlatformLiveAuthority:
             at=at,
         )
         payload = row["payload"] if row is not None and isinstance(row["payload"], Mapping) else {}
+        forward = latest_accepted_forward_summary(
+            self.engine,
+            strategy_version_id=str(artefact["strategy_version_id"]),
+            product_id=str(product["product_id"]),
+            artefact_hash=str(artefact["artefact_hash"]),
+            at=at,
+        )
         if (
             row is None
             or latest is None
@@ -580,6 +601,9 @@ class PlatformLiveAuthority:
                 promotion_policy=self.policies[str(product["promotion_policy_id"])],
                 risk_configuration=self.risk_configuration,
             )
+            or forward is None
+            or payload.get("forward_summary_id") != str(forward["summary"]["id"])
+            or payload.get("forward_decision_id") != str(forward["decision"]["id"])
         ):
             raise PlatformLiveAuthorityError("approval is not current exact authority")
         return dict(row)

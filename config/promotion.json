@@ -13,6 +13,13 @@
       "maximum_drawdown": 0.1,
       "maximum_execution_drift": 0.1,
       "maximum_model_drift": 0.1,
+      "automatic_live_ready_promotion": true,
+      "paper_capital_limit": 1000.0,
+      "minimum_forward_effective_trades": 8,
+      "minimum_forward_fill_rate": 0.95,
+      "maximum_forward_slippage": 0.005,
+      "minimum_forward_data_uptime": 0.99,
+      "maximum_forward_rejected_orders": 0,
       "retirement_conditions": ["evidence_expired", "risk_breach", "persistent_drift"],
       "capital_increase_policy": "manual_approval_required"
     },
@@ -28,6 +35,13 @@
       "maximum_drawdown": 0.08,
       "maximum_execution_drift": 0.1,
       "maximum_model_drift": 0.1,
+      "automatic_live_ready_promotion": true,
+      "paper_capital_limit": 10000.0,
+      "minimum_forward_effective_trades": 60,
+      "minimum_forward_fill_rate": 0.95,
+      "maximum_forward_slippage": 0.005,
+      "minimum_forward_data_uptime": 0.99,
+      "maximum_forward_rejected_orders": 0,
       "retirement_conditions": ["evidence_expired", "risk_breach", "persistent_drift"],
       "capital_increase_policy": "manual_approval_required"
     }

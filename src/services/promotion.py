@@ -34,6 +34,7 @@ class LifecycleState(StrEnum):
     REGISTERED = "registered"
     DEVELOPMENT = "development"
     FORWARD_PAPER = "forward_paper"
+    LIVE_READY = "live_ready"
     LIVE_CANARY = "live_canary"
     LIVE = "live"
     SUSPENDED = "suspended"
@@ -48,6 +49,7 @@ class PromotionRequest:
     requested_transition: str
     requested_capital: float
     evaluated_at: str
+    instrument_id: str | None = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> PromotionRequest:
@@ -58,6 +60,7 @@ class PromotionRequest:
             "requested_transition",
             "requested_capital",
             "evaluated_at",
+            "instrument_id",
         }
         forbidden = sorted(
             set(payload)
@@ -78,6 +81,7 @@ class PromotionRequest:
         )
         if transition not in {
             "forward_paper",
+            "live_ready",
             "live_canary",
             "live",
             "suspend",
@@ -99,6 +103,11 @@ class PromotionRequest:
             requested_transition=transition,
             requested_capital=capital,
             evaluated_at=timestamp(str(payload.get("evaluated_at") or ""), field="evaluated_at"),
+            instrument_id=(
+                non_empty(str(payload["instrument_id"]), field="instrument_id")
+                if payload.get("instrument_id") is not None
+                else None
+            ),
         )
 
 
@@ -114,6 +123,13 @@ class PromotionPolicy:
     minimum_forward_independent_decisions: int = 1
     minimum_forward_net_pnl: float = 0.0
     maximum_forward_data_gaps: int = 0
+    automatic_live_ready_promotion: bool = True
+    paper_capital_limit: float = 1.0
+    minimum_forward_effective_trades: int = 0
+    minimum_forward_fill_rate: float = 0.0
+    maximum_forward_slippage: float = 1.0
+    minimum_forward_data_uptime: float = 0.0
+    maximum_forward_rejected_orders: int = 0
 
 
 @dataclass(frozen=True)
@@ -149,6 +165,12 @@ class PromotionEvidence:
     forward_excess_benchmark_pnl: float = 0.0
     forward_data_gaps: int = 0
     canary_evidence_accepted: bool = False
+    forward_effective_trades: int = 0
+    forward_fill_rate: float = 1.0
+    forward_slippage: float = 0.0
+    forward_data_uptime: float = 0.0
+    forward_rejected_orders: int = 0
+    supported_instruments: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -183,6 +205,13 @@ class SqlPromotionPolicyStore:
                 "minimum_forward_independent_decisions": policy.minimum_forward_independent_decisions,
                 "minimum_forward_net_pnl": policy.minimum_forward_net_pnl,
                 "maximum_forward_data_gaps": policy.maximum_forward_data_gaps,
+                "automatic_live_ready_promotion": policy.automatic_live_ready_promotion,
+                "paper_capital_limit": policy.paper_capital_limit,
+                "minimum_forward_effective_trades": policy.minimum_forward_effective_trades,
+                "minimum_forward_fill_rate": policy.minimum_forward_fill_rate,
+                "maximum_forward_slippage": policy.maximum_forward_slippage,
+                "minimum_forward_data_uptime": policy.minimum_forward_data_uptime,
+                "maximum_forward_rejected_orders": policy.maximum_forward_rejected_orders,
             },
             field="promotion policy",
         )
@@ -516,11 +545,21 @@ class SqlCanonicalPromotionEvidence:
             forward_independent_decisions=int(summary_payload.get("independent_decisions", 0)),
             forward_net_pnl=float(summary_payload.get("net_pnl", 0.0)),
             forward_benchmark_pnl=float(summary_payload.get("benchmark_pnl", 0.0)),
-            forward_excess_benchmark_pnl=float(
-                summary_payload.get("excess_benchmark_pnl", 0.0)
-            ),
+            forward_excess_benchmark_pnl=float(summary_payload.get("excess_benchmark_pnl", 0.0)),
             forward_data_gaps=int(summary_payload.get("data_gaps", 0)),
             canary_evidence_accepted=bool(summary_payload.get("canary_evidence_accepted") is True),
+            forward_effective_trades=int(summary_payload.get("effective_trades", 0)),
+            forward_fill_rate=float(summary_payload.get("fill_rate", 1.0)),
+            forward_slippage=float(summary_payload.get("slippage", 0.0)),
+            forward_data_uptime=float(summary_payload.get("data_uptime", 0.0)),
+            forward_rejected_orders=int(summary_payload.get("rejected_orders", 0)),
+            supported_instruments=tuple(
+                sorted(
+                    str(value)
+                    for value in artefact.get("supported_instruments", ())
+                    if str(value).strip()
+                )
+            ),
         )
         policy_id = str(artefact.get("promotion_policy_id") or "")
         policy = self.policy_store.get(policy_id) if policy_id else self.policy_store.first()
@@ -538,15 +577,19 @@ def decide_promotion(
 ) -> PromotionDecision:
     strategy_version_id = non_empty(strategy_version_id, field="strategy_version_id")
     evaluated_at = timestamp(evaluated_at, field="evaluated_at")
-    if requested_transition is not None:
-        requested_transition = non_empty(
-            requested_transition, field="requested_transition"
-        )
+    requested_transition = (
+        non_empty(requested_transition, field="requested_transition")
+        if requested_transition is not None
+        else None
+    )
     if requested_transition == "suspend":
+        next_state = (
+            current_state if current_state is LifecycleState.RETIRED else LifecycleState.SUSPENDED
+        )
         return _decision(
             strategy_version_id,
             current_state,
-            LifecycleState.SUSPENDED,
+            next_state,
             current_state is not LifecycleState.RETIRED,
             "suspended_by_request",
             evaluated_at,
@@ -590,22 +633,11 @@ def decide_promotion(
         return _decision(
             strategy_version_id,
             current_state,
-            LifecycleState.FORWARD_PAPER,
+            LifecycleState.LIVE_READY,
             True,
-            "resumed_to_forward_paper",
+            "resumed_to_live_ready",
             evaluated_at,
-            0.0,
-            evidence,
-        )
-    if requested_transition == "forward_paper" and current_state is LifecycleState.FORWARD_PAPER:
-        return _decision(
-            strategy_version_id,
-            current_state,
-            current_state,
-            True,
-            "forward_paper_maintained",
-            evaluated_at,
-            0.0,
+            policy.paper_capital_limit,
             evidence,
         )
     if requested_transition in {"live", "live_canary"} and current_state in {
@@ -622,7 +654,10 @@ def decide_promotion(
             0.0,
             evidence,
         )
-    if requested_transition == "live" and current_state is LifecycleState.FORWARD_PAPER:
+    if requested_transition == "live" and current_state in {
+        LifecycleState.FORWARD_PAPER,
+        LifecycleState.LIVE_READY,
+    }:
         return _decision(
             strategy_version_id,
             current_state,
@@ -639,6 +674,7 @@ def decide_promotion(
             if current_state
             in {
                 LifecycleState.FORWARD_PAPER,
+                LifecycleState.LIVE_READY,
                 LifecycleState.LIVE_CANARY,
                 LifecycleState.LIVE,
             }
@@ -677,90 +713,10 @@ def decide_promotion(
             evidence,
         )
     if current_state in {LifecycleState.REGISTERED, LifecycleState.DEVELOPMENT}:
-        if not evidence.validation_accepted:
-            return _decision(
-                strategy_version_id,
-                current_state,
-                current_state,
-                False,
-                "validation_not_accepted",
-                evaluated_at,
-                0.0,
-                evidence,
-            )
-        if not evidence.protected_holdout_accepted:
-            return _decision(
-                strategy_version_id,
-                current_state,
-                current_state,
-                False,
-                "protected_holdout_not_accepted",
-                evaluated_at,
-                0.0,
-                evidence,
-            )
-        if not policy.automatic_paper_promotion:
-            return _decision(
-                strategy_version_id,
-                current_state,
-                current_state,
-                False,
-                "automatic_paper_promotion_disabled",
-                evaluated_at,
-                0.0,
-                evidence,
-            )
-        return _decision(
-            strategy_version_id,
-            current_state,
-            LifecycleState.FORWARD_PAPER,
-            True,
-            "forward_paper_promoted",
-            evaluated_at,
-            0.0,
-            evidence,
-        )
-    if current_state is LifecycleState.FORWARD_PAPER:
         checks = (
-            (
-                evidence.forward_evidence_days < policy.required_forward_evidence_days,
-                "forward_evidence_duration_insufficient",
-            ),
-            (
-                evidence.forward_summary_id is not None
-                and evidence.forward_independent_decisions
-                < policy.minimum_forward_independent_decisions,
-                "forward_decisions_insufficient",
-            ),
-            (
-                evidence.forward_summary_id is not None
-                and evidence.forward_net_pnl <= policy.minimum_forward_net_pnl,
-                "forward_net_pnl_threshold",
-            ),
-            (
-                evidence.forward_summary_id is not None
-                and evidence.forward_data_gaps > policy.maximum_forward_data_gaps,
-                "forward_data_gaps",
-            ),
-            (not evidence.forward_evidence_accepted, "forward_evidence_not_accepted"),
-            (
-                not policy.automatic_live_canary_promotion
-                and requested_transition != "live_canary",
-                "automatic_live_canary_disabled",
-            ),
-            (not evidence.live_approval, "live_approval_missing"),
-            (not evidence.fresh_preflight, "fresh_preflight_missing"),
-            (evidence.portfolio_capacity <= 0, "portfolio_capacity_unavailable"),
-            (evidence.risk_budget_available <= 0, "risk_budget_unavailable"),
-            (
-                evidence.market_making and not evidence.market_making_live_capability,
-                "market_making_live_capability_missing",
-            ),
-            (
-                evidence.market_making
-                and (not evidence.event_replay_passed or evidence.event_replay_fills < 500),
-                "market_making_event_replay_insufficient",
-            ),
+            (not evidence.validation_accepted, "validation_not_accepted"),
+            (not evidence.protected_holdout_accepted, "protected_holdout_not_accepted"),
+            (not policy.automatic_paper_promotion, "automatic_paper_promotion_disabled"),
         )
         reason = next((reason for failed, reason in checks if failed), None)
         if reason:
@@ -774,31 +730,96 @@ def decide_promotion(
                 0.0,
                 evidence,
             )
-        capital = min(
-            policy.canary_capital_limit,
-            evidence.requested_capital,
-            evidence.portfolio_capacity,
-            evidence.risk_budget_available,
-        )
         return _decision(
             strategy_version_id,
             current_state,
-            LifecycleState.LIVE_CANARY,
+            LifecycleState.FORWARD_PAPER,
             True,
-            "live_canary_promoted",
+            "forward_paper_promoted",
             evaluated_at,
-            capital,
+            policy.paper_capital_limit,
+            evidence,
+        )
+    if current_state in {LifecycleState.FORWARD_PAPER, LifecycleState.LIVE_READY}:
+        failures = _forward_evidence_failures(evidence, policy)
+        if failures:
+            return _decision(
+                strategy_version_id,
+                current_state,
+                current_state,
+                False,
+                failures[0],
+                evaluated_at,
+                0.0,
+                evidence,
+            )
+        if requested_transition == "live_canary":
+            reason = _live_authority_failure(evidence)
+            if reason:
+                return _decision(
+                    strategy_version_id,
+                    current_state,
+                    current_state,
+                    False,
+                    reason,
+                    evaluated_at,
+                    0.0,
+                    evidence,
+                )
+            capital = min(
+                policy.canary_capital_limit,
+                evidence.requested_capital or policy.canary_capital_limit,
+                evidence.portfolio_capacity,
+                evidence.risk_budget_available,
+            )
+            return _decision(
+                strategy_version_id,
+                current_state,
+                LifecycleState.LIVE_CANARY,
+                True,
+                "live_canary_promoted",
+                evaluated_at,
+                capital,
+                evidence,
+            )
+        if current_state is LifecycleState.LIVE_READY:
+            return _decision(
+                strategy_version_id,
+                current_state,
+                current_state,
+                True,
+                "live_ready_maintained",
+                evaluated_at,
+                policy.paper_capital_limit,
+                evidence,
+            )
+        if policy.automatic_live_ready_promotion and requested_transition in {
+            None,
+            "forward_paper",
+            "live_ready",
+        }:
+            return _decision(
+                strategy_version_id,
+                current_state,
+                LifecycleState.LIVE_READY,
+                True,
+                "live_ready_promoted",
+                evaluated_at,
+                policy.paper_capital_limit,
+                evidence,
+            )
+        return _decision(
+            strategy_version_id,
+            current_state,
+            current_state,
+            True,
+            "forward_paper_maintained",
+            evaluated_at,
+            policy.paper_capital_limit,
             evidence,
         )
     if current_state is LifecycleState.LIVE_CANARY and requested_transition == "live":
-        checks = (
-            (not evidence.canary_evidence_accepted, "canary_evidence_not_accepted"),
-            (not evidence.live_approval, "live_approval_missing"),
-            (not evidence.fresh_preflight, "fresh_preflight_missing"),
-            (evidence.portfolio_capacity <= 0, "portfolio_capacity_unavailable"),
-            (evidence.risk_budget_available <= 0, "risk_budget_unavailable"),
-        )
-        reason = next((reason for failed, reason in checks if failed), None)
+        reason = _live_authority_failure(evidence, require_canary=True)
         if reason:
             return _decision(
                 strategy_version_id,
@@ -835,6 +856,71 @@ def decide_promotion(
         min(evidence.requested_capital, evidence.risk_budget_available),
         evidence,
     )
+
+
+def _forward_evidence_failures(
+    evidence: PromotionEvidence, policy: PromotionPolicy
+) -> tuple[str, ...]:
+    checks = (
+        (evidence.forward_summary_id is None, "forward_summary_missing"),
+        (
+            evidence.forward_evidence_days < policy.required_forward_evidence_days,
+            "forward_evidence_duration_insufficient",
+        ),
+        (
+            evidence.forward_independent_decisions < policy.minimum_forward_independent_decisions,
+            "forward_decisions_insufficient",
+        ),
+        (evidence.forward_net_pnl <= policy.minimum_forward_net_pnl, "forward_net_pnl_threshold"),
+        (evidence.forward_data_gaps > policy.maximum_forward_data_gaps, "forward_data_gaps"),
+        (not evidence.forward_evidence_accepted, "forward_evidence_not_accepted"),
+        (
+            evidence.forward_effective_trades < policy.minimum_forward_effective_trades,
+            "forward_effective_trades_insufficient",
+        ),
+        (
+            evidence.forward_fill_rate < policy.minimum_forward_fill_rate,
+            "forward_fill_rate_insufficient",
+        ),
+        (
+            evidence.forward_slippage > policy.maximum_forward_slippage,
+            "forward_slippage_limit",
+        ),
+        (
+            evidence.forward_data_uptime < policy.minimum_forward_data_uptime,
+            "forward_data_uptime_insufficient",
+        ),
+        (
+            evidence.forward_rejected_orders > policy.maximum_forward_rejected_orders,
+            "forward_rejected_orders_limit",
+        ),
+        (evidence.forward_data_uptime <= 0, "forward_data_uptime_unavailable"),
+        (evidence.portfolio_capacity <= 0, "portfolio_capacity_unavailable"),
+        (evidence.risk_budget_available <= 0, "risk_budget_unavailable"),
+        (
+            evidence.market_making and not evidence.market_making_live_capability,
+            "market_making_live_capability_missing",
+        ),
+        (
+            evidence.market_making
+            and (not evidence.event_replay_passed or evidence.event_replay_fills < 500),
+            "market_making_event_replay_insufficient",
+        ),
+    )
+    return tuple(reason for failed, reason in checks if failed)
+
+
+def _live_authority_failure(
+    evidence: PromotionEvidence, *, require_canary: bool = False
+) -> str | None:
+    checks = (
+        (require_canary and not evidence.canary_evidence_accepted, "canary_evidence_not_accepted"),
+        (not evidence.live_approval, "live_approval_missing"),
+        (not evidence.fresh_preflight, "fresh_preflight_missing"),
+        (evidence.portfolio_capacity <= 0, "portfolio_capacity_unavailable"),
+        (evidence.risk_budget_available <= 0, "risk_budget_unavailable"),
+    )
+    return next((reason for failed, reason in checks if failed), None)
 
 
 def _decision(
@@ -996,33 +1082,34 @@ class DatabasePromotionWorker:
                 assignments = SqlActiveStrategyAssignmentRepository(self.store.engine)
                 if decision.accepted and decision.next_state in {
                     LifecycleState.FORWARD_PAPER,
-                    LifecycleState.LIVE_CANARY,
-                    LifecycleState.LIVE,
+                    LifecycleState.LIVE_READY,
                 }:
                     if not evidence.product_id or not evidence.portfolio_id:
                         raise ValueError(
                             "accepted promotion evidence lacks product/portfolio identity"
                         )
-                    assignments.assign(
-                        product_id=evidence.product_id,
-                        portfolio_id=evidence.portfolio_id,
-                        strategy_version_id=decision.strategy_version_id,
-                        artefact_hash=evidence.strategy_artefact_hash,
-                        lifecycle_state=decision.next_state.value,
-                        execution_mode=(
-                            "live"
-                            if decision.next_state
-                            in {LifecycleState.LIVE_CANARY, LifecycleState.LIVE}
-                            else "paper"
-                        ),
-                        capital_limit=decision.capital_limit,
-                        assigned_at=decision.evaluated_at,
-                        assigned_by=self.worker_id,
-                        payload={
-                            "promotion_event_id": identity,
-                            "source": "canonical_promotion_worker",
-                        },
-                    )
+                    instrument_ids = evidence.supported_instruments or (None,)
+                    for instrument_id in instrument_ids:
+                        assignments.assign(
+                            product_id=evidence.product_id,
+                            portfolio_id=evidence.portfolio_id,
+                            strategy_version_id=decision.strategy_version_id,
+                            artefact_hash=evidence.strategy_artefact_hash,
+                            lifecycle_state=decision.next_state.value,
+                            execution_mode="paper",
+                            capital_limit=decision.capital_limit,
+                            assigned_at=decision.evaluated_at,
+                            assigned_by=self.worker_id,
+                            instrument_id=instrument_id,
+                            risk_budget=min(
+                                decision.capital_limit,
+                                evidence.risk_budget_available,
+                            ),
+                            payload={
+                                "promotion_event_id": identity,
+                                "source": "canonical_promotion_worker",
+                            },
+                        )
                 elif decision.next_state in {LifecycleState.SUSPENDED, LifecycleState.RETIRED}:
                     if evidence.product_id:
                         assignments.deactivate(evidence.product_id)
