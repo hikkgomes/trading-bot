@@ -400,6 +400,7 @@ def test_live_sma_chain_uses_100_bars_and_produces_active_and_flat_forecasts(tmp
         strategy_name="sma_cross",
     )
     assignments = SqlActiveStrategyAssignmentRepository(database.engine)
+    snapshots = SqlRiskSnapshotStore(database.engine)
     graph_enabled = False
     writer = DatabaseMarketDataWriter(
         queue=queue,
@@ -413,6 +414,7 @@ def test_live_sma_chain_uses_100_bars_and_produces_active_and_flat_forecasts(tmp
         store=feature_store,
         job_names=("live_feature_calculation",),
         parquet_root=tmp_path / "data",
+        snapshot_store=snapshots,
         active_assignments=lambda instrument_id: tuple(
             item
             for item in assignments.active_assignments("active_income")
@@ -428,12 +430,13 @@ def test_live_sma_chain_uses_100_bars_and_produces_active_and_flat_forecasts(tmp
         feature_store=feature_store,
         portfolio=SqlPortfolioRepository(database.engine, require_pipeline_identity=True),
         assignments=assignments,
+        snapshot_store=snapshots,
     )
     forecasts = []
     last_time = start
     for index in range(150):
         last_time = start + dt.timedelta(minutes=index + 1)
-        close = 100.0 + index * 0.1 if index < 100 else 110.0
+        close = 120.0 - index * 0.1 if index < 99 else 200.0
         close_ms = int(last_time.timestamp() * 1_000)
         event = normalise_public_event(
             market="futures",

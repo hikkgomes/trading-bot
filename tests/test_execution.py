@@ -2318,7 +2318,10 @@ def test_ccxt_multi_symbol_mode_allows_an_unrelated_position_and_order():
     fill = broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=0.1))
 
     assert fill.qty == pytest.approx(0.1)
-    assert client.open_order_calls == [("BTC/USDT:USDT", {})]
+    assert client.open_order_calls == [
+        ("BTC/USDT:USDT", {}),
+        ("BTC/USDT:USDT", {"trigger": True}),
+    ]
     assert len(client.created) == 1
 
 
