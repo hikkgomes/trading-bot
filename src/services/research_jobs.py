@@ -32,7 +32,7 @@ from src.research.executors import (
 from src.research.ml import MlExperimentRunner
 from src.research.providers import provider_candidate
 from src.research.store import SqlResearchStore
-from src.research.theses import SqlThesisRegistry
+from src.research.theses import SqlThesisRegistry, StrategyThesisFactory
 from src.services.job_schemas import JobSchemaError, ResearchJobRequest
 from src.services.scheduler import ClaimedJob
 
@@ -186,6 +186,18 @@ class DatabaseResearchJobHandlers:
         if candidate.definition.source_type is not StrategySourceType.MACHINE_LEARNING:
             raise ValueError("ML worker accepts only machine-learning candidates")
         renew()
+        universe = candidate.definition.universe.get("symbols", ())
+        if not isinstance(universe, list | tuple) or not universe:
+            raise ValueError("ML candidate requires an explicit symbol universe")
+        thesis = StrategyThesisFactory.default().build(
+            name="frozen_logistic_model",
+            family="machine_learning",
+            product=candidate.definition.product,
+            instrument_universe=tuple(str(item) for item in universe),
+        )
+        if thesis.thesis_id != candidate.thesis_id:
+            raise ValueError("ML candidate thesis identity does not match its definition")
+        SqlThesisRegistry(self.store.engine).register(thesis)
         candidate_id = ResearchCoordinator(self.store).submit(candidate)
         return {"candidate_id": candidate_id, "source_type": candidate.definition.source_type.value}
 
