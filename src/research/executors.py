@@ -161,13 +161,17 @@ def _measured_result(
     active = sum(1 for value in signals if abs(value) > 1e-12)
     fee_rate = max(0.0, float(context.get("fee_bps", 1.0))) / 10_000.0
     slippage_rate = max(0.0, float(context.get("slippage_bps", 1.0))) / 10_000.0
-    funding_rate = max(0.0, float(context.get("funding_rate", 0.0)))
+    funding_rate = float(context.get("funding_rate", 0.0))
     aligned = min(len(returns), max(0, observations - 1))
     gross = [signals[index] * returns[index] for index in range(aligned)]
     fees = turnover * fee_rate
     slippage = turnover * slippage_rate
-    funding = sum(abs(signals[index]) for index in range(aligned)) * funding_rate
-    net_return = sum(gross) - fees - slippage - funding
+    funding_pnl = -sum(signals[index] * funding_rate for index in range(aligned))
+    funding = max(0.0, -funding_pnl)
+    net_return = sum(gross) - fees - slippage + funding_pnl
+    accounting = _product_accounting(context)
+    if accounting is not None:
+        net_return = float(accounting["return_fraction"])
     window_returns = _window_sums(gross, 3)
     negative_controls = _negative_control_evidence(
         signals=signals[:aligned],
@@ -280,6 +284,7 @@ def _measured_result(
         "fees": fees,
         "slippage": slippage,
         "funding": funding,
+        "funding_pnl": funding_pnl,
         "regime_breakdown": {"passed": bool(gross), "regimes": {"all": net_return}},
         "parameter_stability": parameter_stability,
         "sample_evidence": {
@@ -444,6 +449,13 @@ def _measured_result(
         "observations": observations,
         "behaviour_hash": context.get("behaviour_hash"),
     }
+    if accounting is not None:
+        measured["accounting"] = accounting
+        measured["objective_unit"] = accounting["objective_unit"]
+        measured["objective_value"] = accounting["final_value"]
+        measured["benchmark_value"] = accounting["benchmark_value"]
+        measured["objective_excess"] = accounting["excess_value"]
+        measured["accounting_return"] = accounting["return_fraction"]
     return ExecutionResult(
         evidence=measured,
         metrics={
@@ -451,6 +463,15 @@ def _measured_result(
             "cost_adjusted_return": net_return,
             "turnover": turnover,
             "deflated_sharpe": dsr,
+            "funding_pnl": funding_pnl,
+            **(
+                {
+                    "accounting_return": float(accounting["return_fraction"]),
+                    "objective_excess": float(accounting["excess_value"]),
+                }
+                if accounting is not None
+                else {}
+            ),
         },
         receipt=execution_receipt(
             candidate=candidate,
@@ -468,6 +489,100 @@ def _measured_result(
             ),
         ),
     )
+
+
+def _product_accounting(context: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Evaluate explicit product event evidence when a dataset supplies it."""
+
+    product_id = str(context.get("product_id") or "")
+    if product_id == "btc_accumulation":
+        events = context.get("btc_trade_events", context.get("trade_events"))
+        marks = context.get("btc_marks", context.get("marks"))
+        if events is None and marks is None:
+            return None
+        from src.research.accounting import BtcAccumulationAccounting, ProductAccountingError
+
+        try:
+            report = BtcAccumulationAccounting().evaluate(
+                trade_events=events or (),
+                marks=marks or (),
+                initial_btc=float(context.get("initial_btc", context.get("btc_balance", 0.0))),
+                initial_stablecoin=float(
+                    context.get("initial_stablecoin", context.get("stablecoin_balance", 0.0))
+                ),
+                initial_price=(
+                    float(context["initial_price"])
+                    if context.get("initial_price") is not None
+                    else None
+                ),
+                reserve_fraction=(
+                    float(context["reserve_fraction"])
+                    if context.get("reserve_fraction") is not None
+                    else None
+                ),
+            )
+        except (ProductAccountingError, TypeError, ValueError) as exc:
+            raise ExecutorError(f"BTC accounting evidence is invalid: {exc}") from exc
+        return {
+            "schema": "platform.btc_accounting/v1",
+            "objective_unit": report.objective_unit,
+            "initial_value": report.initial_btc_nav,
+            "final_value": report.final_btc_nav,
+            "benchmark_value": report.passive_btc_nav,
+            "excess_value": report.excess_btc,
+            "return_fraction": report.return_fraction,
+            "fees": report.fees_btc,
+            "time_outside_btc_fraction": report.time_outside_btc_fraction,
+            "stablecoin_exposure_fraction": report.stablecoin_exposure_fraction,
+            "missed_btc_appreciation": report.missed_btc_appreciation,
+            "cycles": report.cycles,
+            "regime_pnl": dict(report.regime_pnl),
+            "event_receipts": [dict(item) for item in report.event_receipts],
+        }
+    if product_id == "active_income":
+        events = context.get("futures_events", context.get("trade_events"))
+        if events is None:
+            return None
+        from src.research.accounting import FuturesIncomeAccounting, ProductAccountingError
+
+        try:
+            report = FuturesIncomeAccounting().evaluate(
+                events=events,
+                initial_cash=float(context.get("initial_cash", context.get("initial_equity", 0.0))),
+                leverage=float(context.get("leverage", 1.0)),
+                maintenance_margin_fraction=float(
+                    context.get("maintenance_margin_fraction", 0.0)
+                ),
+                max_participation_fraction=float(
+                    context.get("max_participation_fraction", 1.0)
+                ),
+            )
+        except (ProductAccountingError, TypeError, ValueError) as exc:
+            raise ExecutorError(f"futures accounting evidence is invalid: {exc}") from exc
+        return {
+            "schema": "platform.futures_accounting/v1",
+            "objective_unit": report.objective_unit,
+            "initial_value": report.initial_equity,
+            "final_value": report.final_equity,
+            "benchmark_value": report.initial_equity,
+            "excess_value": report.net_pnl,
+            "return_fraction": report.return_fraction,
+            "realised_pnl": report.realised_pnl,
+            "unrealised_pnl": report.unrealised_pnl,
+            "fees": report.fees,
+            "funding_pnl": report.funding_pnl,
+            "spread_cost": report.spread_cost,
+            "slippage_cost": report.slippage_cost,
+            "fills": report.fills,
+            "partial_fills": report.partial_fills,
+            "capacity_violations": report.capacity_violations,
+            "max_leverage": report.max_leverage,
+            "max_margin_fraction": report.max_margin_fraction,
+            "liquidation": report.liquidation,
+            "effective_observations": report.effective_observations,
+            "event_receipts": [dict(item) for item in report.event_receipts],
+        }
+    return None
 
 
 def _numeric_series(value: Any) -> list[float]:

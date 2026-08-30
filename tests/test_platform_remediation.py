@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import select
 
 from src.data.database import PlatformDatabase, job
+from src.domain.forecasts import AlphaForecast, ForecastDirection
+from src.portfolio.optimiser import PortfolioConstraints, optimise_targets
+from src.research.accounting import BtcAccumulationAccounting, FuturesIncomeAccounting
 from src.research.artefacts import StrategyArtefact
 from src.research.catalogue import registered_strategy_candidates
 from src.research.evaluation import EvidencePolicy, EvidenceStatus
@@ -162,3 +166,99 @@ def test_registered_strategy_behaviour_is_shared_by_research_and_dispatch() -> N
     assert dispatched["behaviour_hash"] == artefact.behaviour_hash
     assert dispatched["execution_receipt"]["deployment_hash"] == artefact.artefact_hash
     assert dispatched["execution_receipt"]["behaviour_hash"] == artefact.behaviour_hash
+
+
+def test_btc_accounting_measures_sell_rebuy_in_btc_and_counts_costs() -> None:
+    report = BtcAccumulationAccounting().evaluate(
+        initial_btc=1.0,
+        initial_price=100.0,
+        trade_events=(
+            {"timestamp": NOW, "side": "sell", "quantity": 0.5, "price": 100.0},
+            {
+                "timestamp": "2026-08-30T10:01:00+00:00",
+                "side": "buy",
+                "quantity": 0.5,
+                "price": 80.0,
+                "fee": 0.001,
+                "fee_asset": "BTC",
+            },
+        ),
+        marks=(
+            {"timestamp": NOW, "price": 100.0, "regime": "trend"},
+            {"timestamp": "2026-08-30T10:01:00+00:00", "price": 80.0, "regime": "risk_off"},
+        ),
+    )
+
+    assert report.objective_unit == "BTC"
+    assert report.final_btc_nav == pytest.approx(1.124)
+    assert report.excess_btc == pytest.approx(0.124)
+    assert report.fees_btc == pytest.approx(0.001)
+    assert report.cycles == 1
+
+
+def test_futures_accounting_keeps_short_pnl_and_funding_signed() -> None:
+    report = FuturesIncomeAccounting().evaluate(
+        initial_cash=1_000.0,
+        leverage=2.0,
+        events=(
+            {
+                "type": "fill",
+                "timestamp": NOW,
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "quantity": 1.0,
+                "price": 100.0,
+            },
+            {
+                "type": "mark",
+                "timestamp": "2026-08-30T10:01:00+00:00",
+                "symbol": "BTCUSDT",
+                "mark_price": 90.0,
+            },
+            {
+                "type": "funding",
+                "timestamp": "2026-08-30T10:02:00+00:00",
+                "symbol": "BTCUSDT",
+                "mark_price": 90.0,
+                "funding_rate": 0.01,
+            },
+        ),
+    )
+
+    assert report.unrealised_pnl == pytest.approx(10.0)
+    assert report.funding_pnl == pytest.approx(0.9)
+    assert report.net_pnl == pytest.approx(10.9)
+    assert report.liquidation is False
+
+
+def test_short_forecast_is_ranked_and_allocated_after_funding() -> None:
+    forecast = AlphaForecast(
+        strategy_version_id="short-strategy",
+        product_id="active_income",
+        instrument_id="BTCUSDT",
+        direction=ForecastDirection.SHORT,
+        score=1.0,
+        expected_return=-0.1,
+        confidence=1.0,
+        horizon_seconds=3_600,
+        valid_from=NOW,
+        valid_until="2026-08-30T11:00:00+00:00",
+        target_volatility=0.1,
+        maximum_position=0.2,
+    )
+    targets = optimise_targets(
+        (forecast,),
+        prices={"BTCUSDT": 100.0},
+        valid_until="2026-08-30T11:00:00+00:00",
+        constraints=PortfolioConstraints(
+            portfolio_id="active_income",
+            equity=1_000.0,
+            max_net_fraction=1.0,
+            max_symbol_fraction=0.5,
+        ),
+        funding_rates={"BTCUSDT": 0.01},
+    )
+
+    assert len(targets) == 1
+    assert targets[0].target_fraction < 0
+    assert targets[0].metadata["net_expected_return"] == pytest.approx(0.11)

@@ -77,4 +77,18 @@ class AlphaForecast:
 
     @property
     def utility(self) -> float:
-        return max(0.0, self.expected_return) * self.score * self.confidence
+        """Rank alpha by magnitude while preserving its directional sign elsewhere.
+
+        ``expected_return`` is signed.  A short forecast therefore has a
+        negative expected return in price space, but it is still actionable
+        alpha and must not be discarded by the allocator's ranking step.
+        """
+        return abs(self.expected_return) * self.score * self.confidence
+
+    @property
+    def directional_expected_return(self) -> float:
+        """Return expected return in the forecast's profitable direction."""
+        if self.direction is ForecastDirection.FLAT:
+            return 0.0
+        sign = 1.0 if self.direction is ForecastDirection.LONG else -1.0
+        return sign * self.expected_return

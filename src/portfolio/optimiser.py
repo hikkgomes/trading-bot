@@ -137,7 +137,8 @@ def optimise_targets(
             continue
         funding_rate = float(funding_rates.get(forecast.instrument_id, 0.0))
         direction_sign = 1.0 if forecast.direction is ForecastDirection.LONG else -1.0
-        net_expected_return = forecast.expected_return - direction_sign * funding_rate
+        gross_expected_return = direction_sign * forecast.expected_return
+        net_expected_return = gross_expected_return - direction_sign * funding_rate
         if net_expected_return <= 0:
             continue
         signal_scale = forecast.score * forecast.confidence
@@ -149,7 +150,7 @@ def optimise_targets(
         )
         funding_scale = min(
             1.0,
-            net_expected_return / forecast.expected_return if forecast.expected_return > 0 else 0.0,
+            net_expected_return / gross_expected_return if gross_expected_return > 0 else 0.0,
         )
         fraction = (
             min(constraints.max_symbol_fraction, forecast.maximum_position)
@@ -217,6 +218,8 @@ def optimise_targets(
                 valid_until=valid_until,
                 metadata={
                     "expected_return": forecast.expected_return,
+                    "directional_expected_return": gross_expected_return,
+                    "net_expected_return": net_expected_return,
                     "confidence": forecast.confidence,
                     "score": forecast.score,
                     "observed_volatility": observed_volatility.get(forecast.instrument_id),

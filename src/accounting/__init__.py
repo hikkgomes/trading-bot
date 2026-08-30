@@ -5,10 +5,25 @@ from src.accounting.btc_performance import BtcPerformanceReport, build_btc_perfo
 from src.accounting.ledger import JsonlLedgerStore, Ledger, LedgerEntry, SqlLedgerStore
 from src.accounting.nav import NavSnapshot, btc_nav, usdt_nav
 from src.accounting.reconciliation import AccountingReconciliation, reconcile_accounting
+from src.research.accounting import (
+    BtcAccounting,
+    BtcAccountingReport,
+    BtcAccumulationAccounting,
+    FuturesAccounting,
+    FuturesAccountingReport,
+    FuturesIncomeAccounting,
+    ProductAccountingError,
+)
 
 __all__ = [
     "AccountingReconciliation",
     "BtcPerformanceReport",
+    "BtcAccounting",
+    "BtcAccountingReport",
+    "BtcAccumulationAccounting",
+    "FuturesAccounting",
+    "FuturesAccountingReport",
+    "FuturesIncomeAccounting",
     "JsonlLedgerStore",
     "Ledger",
     "LedgerEntry",
@@ -18,5 +33,6 @@ __all__ = [
     "btc_nav",
     "build_btc_performance_report",
     "reconcile_accounting",
+    "ProductAccountingError",
     "usdt_nav",
 ]
