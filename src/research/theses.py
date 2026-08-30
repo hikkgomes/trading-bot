@@ -37,6 +37,11 @@ class ThesisRegistry:
         existing = self._theses.get(thesis.thesis_id)
         if existing is not None and existing != thesis:
             raise ThesisError("thesis identity collision")
+        if thesis.thesis_id in thesis.parent_thesis_ids:
+            raise ThesisError("thesis cannot be its own parent")
+        missing = set(thesis.parent_thesis_ids) - set(self._theses)
+        if missing:
+            raise ThesisError(f"thesis parents are not registered: {sorted(missing)}")
         self._theses[thesis.thesis_id] = thesis
         return thesis.thesis_id
 
@@ -49,14 +54,42 @@ class ThesisRegistry:
     def claim_trial(self, *, thesis_id: str, candidate_id: str, lineage_id: str) -> ThesisTrial:
         thesis = self.get(thesis_id)
         trials = self._trials.setdefault(thesis_id, {})
-        existing = trials.get(candidate_id)
+        existing = next(
+            (
+                trial
+                for thesis_trials in self._trials.values()
+                for trial in thesis_trials.values()
+                if trial.candidate_id == candidate_id
+            ),
+            None,
+        )
         if existing is not None:
+            if existing.thesis_id != thesis_id or existing.lineage_id != lineage_id:
+                raise ThesisError("candidate trial identity collision")
             return existing
-        if len(trials) >= thesis.cumulative_trial_budget:
+        lineage_ids = self._lineage_ids(thesis_id)
+        used = sum(len(self._trials.get(item, {})) for item in lineage_ids)
+        if used >= thesis.cumulative_trial_budget:
             raise ThesisError("thesis cumulative trial budget is exhausted")
-        trial = ThesisTrial(thesis_id, candidate_id, lineage_id, len(trials) + 1)
+        trial = ThesisTrial(thesis_id, candidate_id, lineage_id, used + 1)
         trials[candidate_id] = trial
         return trial
+
+    def _lineage_ids(self, thesis_id: str) -> set[str]:
+        lineage = {thesis_id}
+        changed = True
+        while changed:
+            changed = False
+            for candidate_id, thesis in self._theses.items():
+                if candidate_id in lineage:
+                    parents = set(thesis.parent_thesis_ids) - lineage
+                    if parents:
+                        lineage.update(parents)
+                        changed = True
+                elif lineage.intersection(thesis.parent_thesis_ids):
+                    lineage.add(candidate_id)
+                    changed = True
+        return lineage
 
     def trials(self, thesis_id: str) -> tuple[ThesisTrial, ...]:
         self.get(thesis_id)
@@ -86,6 +119,16 @@ class SqlThesisRegistry:
                 "cumulative_trial_budget": thesis.cumulative_trial_budget,
                 "payload": payload,
             }
+            if thesis.thesis_id in thesis.parent_thesis_ids:
+                raise ThesisError("thesis cannot be its own parent")
+            if thesis.parent_thesis_ids:
+                parent_count = connection.execute(
+                    select(func.count())
+                    .select_from(research_thesis)
+                    .where(research_thesis.c.id.in_(thesis.parent_thesis_ids))
+                ).scalar_one()
+                if parent_count != len(set(thesis.parent_thesis_ids)):
+                    raise ThesisError("thesis parents are not registered")
             if existing is None:
                 connection.execute(insert(research_thesis).values(**values))
             elif any(existing[key] != value for key, value in values.items()):
@@ -122,10 +165,15 @@ class SqlThesisRegistry:
                 if existing["thesis_id"] != thesis_id or existing["lineage_id"] != lineage_id:
                     raise ThesisError("candidate trial identity collision")
                 return ThesisTrial(thesis_id, candidate_id, lineage_id, existing["ordinal"])
+            lineage_ids = _sql_lineage_ids(
+                connection,
+                thesis_id,
+                lock=self.engine.dialect.name == "postgresql",
+            )
             count = connection.execute(
                 select(func.count())
                 .select_from(thesis_trial)
-                .where(thesis_trial.c.thesis_id == thesis_id)
+                .where(thesis_trial.c.thesis_id.in_(lineage_ids))
             ).scalar_one()
             if count >= thesis_row["cumulative_trial_budget"]:
                 raise ThesisError("thesis cumulative trial budget is exhausted")
@@ -178,6 +226,34 @@ def _thesis_from_payload(payload: dict[str, object]) -> ResearchThesis:
         created_at=str(payload["created_at"]),
         creator_identity=str(payload["creator_identity"]),
     )
+
+
+def _sql_lineage_ids(connection, thesis_id: str, *, lock: bool = False) -> tuple[str, ...]:
+    statement = select(research_thesis.c.id, research_thesis.c.payload)
+    if lock:
+        statement = statement.with_for_update()
+    rows = connection.execute(statement).mappings()
+    payloads = {str(row["id"]): row["payload"] for row in rows}
+    lineage = {thesis_id}
+    changed = True
+    while changed:
+        changed = False
+        for candidate_id, payload in payloads.items():
+            if not isinstance(payload, Mapping):
+                continue
+            parents = payload.get("parent_thesis_ids", ())
+            parent_ids = (
+                {str(item) for item in parents} if isinstance(parents, list | tuple) else set()
+            )
+            if candidate_id in lineage:
+                missing_parents = parent_ids - lineage
+                if missing_parents:
+                    lineage.update(missing_parents)
+                    changed = True
+            elif lineage.intersection(parent_ids):
+                lineage.add(candidate_id)
+                changed = True
+    return tuple(sorted(lineage))
 
 
 REQUIRED_NEGATIVE_CONTROLS = (

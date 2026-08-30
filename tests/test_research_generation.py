@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import replace
 
 from src.data.database import PlatformDatabase
 from src.domain._codec import canonical_hash
@@ -16,7 +17,7 @@ from src.research.generation import (
     semantic_distance,
 )
 from src.research.store import SqlResearchStore
-from src.research.theses import SqlThesisRegistry
+from src.research.theses import SqlThesisRegistry, ThesisError, ThesisRegistry
 
 NOW = dt.datetime(2026, 8, 23, tzinfo=dt.UTC).isoformat()
 
@@ -113,3 +114,73 @@ def test_generated_thesis_and_candidate_are_product_and_universe_bound() -> None
     assert hypothesis.candidate.definition.universe["type"] == "point_in_time"
     assert hypothesis.candidate.definition.signal_model["rule"]["direction"] == "signed"
     assert hypothesis.semantic_signature == hypothesis_signature(hypothesis.candidate.definition)
+
+
+def test_in_memory_thesis_budget_is_shared_by_descendants() -> None:
+    root = build_hypothesis(
+        CAMPAIGNS[0],
+        variant=0,
+        instrument_universe=("BTCUSDT",),
+        dataset_snapshot_hashes=(canonical_hash({"snapshot": "root"}),),
+        submitted_at=NOW,
+    ).thesis
+    root = replace(root, cumulative_trial_budget=2)
+    child = replace(root, parent_thesis_ids=(root.thesis_id,))
+    registry = ThesisRegistry()
+    registry.register(root)
+    registry.register(child)
+    registry.claim_trial(thesis_id=root.thesis_id, candidate_id="root-trial", lineage_id="root")
+    registry.claim_trial(
+        thesis_id=child.thesis_id,
+        candidate_id="child-trial",
+        lineage_id="child",
+    )
+    try:
+        registry.claim_trial(
+            thesis_id=child.thesis_id,
+            candidate_id="third-trial",
+            lineage_id="child-2",
+        )
+    except ThesisError as exc:
+        assert "budget" in str(exc)
+    else:
+        raise AssertionError("descendant thesis must share its parent budget")
+
+
+def test_sql_thesis_budget_is_shared_by_descendants(tmp_path) -> None:
+    database = _database(tmp_path)
+    root = build_hypothesis(
+        CAMPAIGNS[0],
+        variant=0,
+        instrument_universe=("BTCUSDT",),
+        dataset_snapshot_hashes=(canonical_hash({"snapshot": "root"}),),
+        submitted_at=NOW,
+    ).thesis
+    root = replace(root, cumulative_trial_budget=2)
+    child = replace(root, parent_thesis_ids=(root.thesis_id,))
+    registry = SqlThesisRegistry(database.engine)
+    registry.register(root)
+    registry.register(child)
+    registry.claim_trial(
+        thesis_id=root.thesis_id,
+        candidate_id=canonical_hash({"candidate": "root"}),
+        lineage_id=canonical_hash({"lineage": "root"}),
+        claimed_at=NOW,
+    )
+    registry.claim_trial(
+        thesis_id=child.thesis_id,
+        candidate_id=canonical_hash({"candidate": "child"}),
+        lineage_id=canonical_hash({"lineage": "child"}),
+        claimed_at=NOW,
+    )
+    try:
+        registry.claim_trial(
+            thesis_id=child.thesis_id,
+            candidate_id=canonical_hash({"candidate": "third"}),
+            lineage_id=canonical_hash({"lineage": "third"}),
+            claimed_at=NOW,
+        )
+    except ThesisError as exc:
+        assert "budget" in str(exc)
+    else:
+        raise AssertionError("descendant thesis must share its parent budget")
