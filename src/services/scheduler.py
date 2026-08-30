@@ -16,10 +16,12 @@ from src.data.database import (
     dataset_bundle,
     dataset_snapshot,
     experiment,
+    forward_paper_observation,
     job,
     job_attempt,
     platform_schedule,
     strategy_artefact,
+    universe_member,
     universe_snapshot,
     worker,
     worker_lease,
@@ -71,6 +73,7 @@ AUTONOMOUS_SCHEDULES = (
     ScheduleSpec("event_replay", 1800),
     ScheduleSpec("ml_research", 3600),
     ScheduleSpec("forward_paper_observation", 300),
+    ScheduleSpec("forward_paper_summary", 900),
     ScheduleSpec("promotion_evaluation", 900),
     ScheduleSpec("reporting", 900),
     ScheduleSpec("maintenance", 3600),
@@ -194,6 +197,7 @@ class PlatformScheduler:
             "event_replay": "event_replay",
             "ml_research": "train_ml_experiment",
             "forward_paper_observation": "forward_paper_observation",
+            "forward_paper_summary": "forward_paper_summary",
             "promotion_evaluation": "promotion_evaluation",
             "reporting": "reporting",
             "maintenance": "maintenance",
@@ -237,6 +241,8 @@ class PlatformScheduler:
             return ()
         if schedule_name == "forward_paper_observation":
             return self._forward_jobs(product_id, now, due_at)
+        if schedule_name == "forward_paper_summary":
+            return self._summary_jobs(product_id, now, due_at)
         if schedule_name == "promotion_evaluation":
             return self._promotion_jobs(product_id, now, due_at)
         if schedule_name != "candidate_evaluation":
@@ -255,12 +261,15 @@ class PlatformScheduler:
                 state = connection.execute(
                     select(experiment.c.state).where(experiment.c.id == candidate.candidate_id)
                 ).scalar_one()
+            state_value = str(state)
             requested_stage = {
                 "queued": "screening",
                 "screening": "development",
                 "development": "robustness",
                 "robustness": "protected",
-            }.get(str(state))
+            }.get(state_value)
+            if requested_stage is None and state_value.startswith("waiting_for_dataset:"):
+                requested_stage = state_value.removeprefix("waiting_for_dataset:")
             if requested_stage is None:
                 continue
             expected_role = {
@@ -269,12 +278,31 @@ class PlatformScheduler:
                 "robustness": "robustness",
                 "protected": "protected_holdout",
             }[requested_stage]
+            plan_snapshot_ids = (
+                candidate.dataset_plan.snapshot_ids_for_stage(requested_stage)
+                if candidate.dataset_plan is not None
+                else candidate.dataset_snapshot_hashes
+            )
             snapshot_id, snapshot_payload = self._candidate_snapshot(
-                candidate.dataset_snapshot_hashes,
+                plan_snapshot_ids,
                 role=expected_role,
             )
             if snapshot_id is None or snapshot_payload is None:
+                self._mark_dataset_waiting(candidate.candidate_id, requested_stage, now)
                 continue
+            if self._candidate_stage_job_pending(candidate.candidate_id, requested_stage):
+                continue
+            if state_value.startswith("waiting_for_dataset:"):
+                self._clear_dataset_waiting(
+                    candidate.candidate_id,
+                    requested_stage,
+                    {
+                        "screening": "queued",
+                        "development": "screening",
+                        "robustness": "development",
+                        "protected": "robustness",
+                    }[requested_stage],
+                )
             jobs.append(
                 (
                     f"scheduled:candidate_evaluation:{candidate.candidate_id}:{requested_stage}:{due_at}",
@@ -289,6 +317,72 @@ class PlatformScheduler:
                 )
             )
         return tuple(jobs)
+
+    def _mark_dataset_waiting(self, candidate_id: str, stage: str, now: str) -> None:
+        with self.engine.begin() as connection:
+            row = (
+                connection.execute(
+                    select(experiment.c.state, experiment.c.metadata).where(
+                        experiment.c.id == candidate_id
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if row is None:
+                return
+            metadata = dict(row["metadata"] or {})
+            waiting = {
+                "stage": stage,
+                "reason_code": "missing_canonical_stage_dataset",
+                "observed_at": now,
+            }
+            if (
+                row["state"] == f"waiting_for_dataset:{stage}"
+                and metadata.get("dataset_waiting") == waiting
+            ):
+                return
+            metadata["dataset_waiting"] = waiting
+            connection.execute(
+                update(experiment)
+                .where(experiment.c.id == candidate_id)
+                .values(
+                    state=f"waiting_for_dataset:{stage}",
+                    metadata=json_value(metadata, field="metadata"),
+                )
+            )
+
+    def _clear_dataset_waiting(self, candidate_id: str, stage: str, state: str) -> None:
+        with self.engine.begin() as connection:
+            row = (
+                connection.execute(
+                    select(experiment.c.metadata).where(experiment.c.id == candidate_id)
+                )
+                .mappings()
+                .first()
+            )
+            if row is None:
+                return
+            metadata = dict(row["metadata"] or {})
+            metadata.pop("dataset_waiting", None)
+            connection.execute(
+                update(experiment)
+                .where(experiment.c.id == candidate_id)
+                .values(state=state, metadata=json_value(metadata, field="metadata"))
+            )
+
+    def _candidate_stage_job_pending(self, candidate_id: str, stage: str) -> bool:
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(job.c.state, job.c.payload).where(job.c.name == "evaluate_candidate")
+            ).mappings()
+            return any(
+                str(row["state"]) in {"pending", "running"}
+                and isinstance(row["payload"], Mapping)
+                and row["payload"].get("candidate_id") == candidate_id
+                and row["payload"].get("requested_stage") == stage
+                for row in rows
+            )
 
     def _pending_universe_refresh(self, product_id: str) -> bool:
         with self.engine.connect() as connection:
@@ -489,25 +583,115 @@ class PlatformScheduler:
             payload = assignment.get("payload")
             if isinstance(payload, Mapping) and payload.get("promotable") is False:
                 continue
-            instrument_id = str(assignment.get("instrument_id") or "")
-            if not instrument_id:
-                continue
             assignment_id = str(assignment["id"])
-            jobs.append(
-                (
-                    f"scheduled:forward_paper_observation:{assignment_id}:{due_at}",
-                    "forward_paper_observation",
+            instrument_ids = self._forward_instrument_ids(assignment, product_id, now)
+            if not instrument_ids:
+                instrument_ids = ("",)
+            for instrument_id in instrument_ids:
+                suffix = instrument_id or "waiting"
+                jobs.append(
+                    (
+                        f"scheduled:forward_paper_observation:{assignment_id}:{suffix}:{due_at}",
+                        "forward_paper_observation",
+                        {
+                            "assignment_id": assignment_id,
+                            "strategy_version_id": str(assignment["strategy_version_id"]),
+                            "product_id": product_id,
+                            "instrument_id": instrument_id,
+                            "artefact_hash": str(assignment["artefact_hash"]),
+                            "evaluation_time": now,
+                            **(
+                                {"waiting_reason": "universe_members_unavailable"}
+                                if not instrument_id
+                                else {}
+                            ),
+                        },
+                    )
+                )
+        return tuple(jobs)
+
+    def _summary_jobs(
+        self, product_id: str, now: str, due_at: str
+    ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(
+                    forward_paper_observation.c.strategy_version_id,
+                    forward_paper_observation.c.product_id,
+                    forward_paper_observation.c.artefact_hash,
+                )
+                .where(
+                    forward_paper_observation.c.product_id == product_id,
+                    forward_paper_observation.c.observed_at <= now,
+                )
+                .distinct()
+            ).mappings()
+            groups = tuple(
+                sorted(
                     {
-                        "assignment_id": assignment_id,
-                        "strategy_version_id": str(assignment["strategy_version_id"]),
-                        "product_id": product_id,
-                        "instrument_id": instrument_id,
-                        "artefact_hash": str(assignment["artefact_hash"]),
-                        "evaluation_time": now,
-                    },
+                        (
+                            str(row["strategy_version_id"]),
+                            str(row["product_id"]),
+                            str(row["artefact_hash"]),
+                        )
+                        for row in rows
+                    }
                 )
             )
-        return tuple(jobs)
+        return tuple(
+            (
+                f"scheduled:forward_paper_summary:{strategy_version_id}:{artefact_hash}:{due_at}",
+                "forward_paper_summary",
+                {
+                    "strategy_version_id": strategy_version_id,
+                    "product_id": group_product_id,
+                    "artefact_hash": artefact_hash,
+                    "evaluation_time": now,
+                },
+            )
+            for strategy_version_id, group_product_id, artefact_hash in groups
+        )
+
+    def _forward_instrument_ids(
+        self, assignment: Mapping[str, Any], product_id: str, now: str
+    ) -> tuple[str, ...]:
+        direct = str(assignment.get("instrument_id") or "")
+        if direct:
+            return (direct,)
+        payload = assignment.get("payload")
+        if isinstance(payload, Mapping):
+            configured = payload.get("instrument_ids")
+            if isinstance(configured, list | tuple):
+                values = tuple(sorted({str(item) for item in configured if str(item)}))
+                if values:
+                    return values
+        universe_id = str(assignment.get("universe_id") or "")
+        configured_product = self.products.get(product_id, {})
+        if universe_id.startswith("product:") or not universe_id:
+            universe_id = str(configured_product.get("universe_id") or universe_id)
+        if not universe_id:
+            return ()
+        with self.engine.connect() as connection:
+            snapshot_id = connection.execute(
+                select(universe_snapshot.c.id)
+                .where(
+                    universe_snapshot.c.universe_id == universe_id,
+                    universe_snapshot.c.observed_at <= now,
+                )
+                .order_by(universe_snapshot.c.observed_at.desc(), universe_snapshot.c.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if snapshot_id is None:
+                return ()
+            rows = connection.execute(
+                select(universe_member.c.instrument_id)
+                .where(
+                    universe_member.c.snapshot_id == snapshot_id,
+                    universe_member.c.eligible.is_(True),
+                )
+                .order_by(universe_member.c.instrument_id)
+            ).scalars()
+        return tuple(str(item) for item in rows)
 
     def _run_maintenance(self, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
@@ -549,12 +733,20 @@ class PlatformScheduler:
             }
         if schedule_name == "register_strategy_catalogue":
             with self.engine.connect() as connection:
-                row = connection.execute(
-                    select(dataset_bundle.c.id, dataset_bundle.c.created_at, dataset_bundle.c.payload)
-                    .where(dataset_bundle.c.product_id == product_id)
-                    .order_by(dataset_bundle.c.created_at.desc(), dataset_bundle.c.id.desc())
-                    .limit(1)
-                ).mappings().first()
+                row = (
+                    connection.execute(
+                        select(
+                            dataset_bundle.c.id,
+                            dataset_bundle.c.created_at,
+                            dataset_bundle.c.payload,
+                        )
+                        .where(dataset_bundle.c.product_id == product_id)
+                        .order_by(dataset_bundle.c.created_at.desc(), dataset_bundle.c.id.desc())
+                        .limit(1)
+                    )
+                    .mappings()
+                    .first()
+                )
             bundle_payload = row["payload"] if row is not None else None
             stage_ids = (
                 bundle_payload.get("stage_snapshot_ids")
@@ -972,11 +1164,15 @@ class DatabaseJobQueue:
     def recover_expired(self, *, now: str) -> int:
         now = timestamp(now, field="now")
         with self.engine.begin() as connection:
-            expired = connection.execute(
-                select(job.c.id, job.c.attempts, job.c.max_attempts).where(
-                    job.c.state == "running", job.c.lease_expires_at < now
+            expired = (
+                connection.execute(
+                    select(job.c.id, job.c.attempts, job.c.max_attempts).where(
+                        job.c.state == "running", job.c.lease_expires_at < now
+                    )
                 )
-            ).mappings().all()
+                .mappings()
+                .all()
+            )
             if not expired:
                 return 0
             for row in expired:

@@ -290,6 +290,50 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
 
     assert recorded["reason_code"] == "forward_observation_recorded"
     assert recorded["observed_at"] == "2026-08-25T00:00:00+00:00"
+    second_observation_id = repository.append(
+        strategy_version_id=definition.strategy_version_id,
+        product_id="active_income",
+        instrument_id="BTCUSDT",
+        observed_at="2026-08-26T00:00:00+00:00",
+        artefact_hash=artefact.artefact_hash,
+        observation={
+            "decision_id": "decision-2",
+            "net_pnl": 1.0,
+            "benchmark_pnl": 0.25,
+        },
+    )
+    summary_id, summary = repository.build_summary(
+        strategy_version_id=definition.strategy_version_id,
+        product_id="active_income",
+        artefact_hash=artefact.artefact_hash,
+        observed_at="2026-08-26T00:00:00+00:00",
+    )
+    assert summary.independent_decisions == 3
+    assert summary.net_pnl == pytest.approx(1.0)
+    assert summary.benchmark_pnl == pytest.approx(0.25)
+    assert summary.excess_benchmark_pnl == pytest.approx(0.75)
+    assert second_observation_id in summary.observation_ids
+    decision_id, accepted, reason_code = repository.decide_summary(
+        summary_id,
+        decided_at="2026-08-26T00:00:01+00:00",
+        minimum_days=1,
+        minimum_decisions=2,
+    )
+    assert decision_id.startswith("sha256:")
+    assert accepted is True
+    assert reason_code is None
+    with pytest.raises(CanonicalEvidenceError, match="unknown observation identity"):
+        repository.append_summary(
+            strategy_version_id=definition.strategy_version_id,
+            product_id="active_income",
+            observed_at="2026-08-26T00:00:02+00:00",
+            artefact_hash=artefact.artefact_hash,
+            evidence={
+                "observation_ids": ["sha256:" + "f" * 64],
+                "observed_from": "2026-08-24T00:00:00+00:00",
+                "observed_until": "2026-08-26T00:00:00+00:00",
+            },
+        )
     with pytest.raises(CanonicalEvidenceError, match="artefact-bound"):
         repository.append_summary(
             strategy_version_id=definition.strategy_version_id,

@@ -42,7 +42,10 @@ from src.services.config import load_platform_config, load_split_configuration
 from src.services.control_api import DatabaseControlPlane, build_control_server
 from src.services.data_writer import DatabaseMarketDataWriter
 from src.services.feature_worker import DatabaseFeatureWorker
-from src.services.forward_observation import DatabaseForwardObservationWorker
+from src.services.forward_observation import (
+    DatabaseForwardObservationWorker,
+    DatabaseForwardSummaryWorker,
+)
 from src.services.health import DatabaseHeartbeatStore
 from src.services.heavy_compute import HeavyComputeLeaseStore
 from src.services.live_execution import ApprovedLiveExecution
@@ -646,7 +649,11 @@ def _promotion_cycle(
         worker_id=worker_id,
         node_id=node_id,
         role="promotion-engine",
-        capabilities=("forward_paper_observation", "promotion_evaluation"),
+        capabilities=(
+            "forward_paper_observation",
+            "forward_paper_summary",
+            "promotion_evaluation",
+        ),
         observed_at=utc_now(),
     )
     policy_store = SqlPromotionPolicyStore(database.engine)
@@ -666,6 +673,25 @@ def _promotion_cycle(
         queue=queue,
         worker_id=worker_id,
     )
+    policies_by_id = {
+        str(policy["policy_id"]): dict(policy)
+        for policy in configuration["promotion"]["policies"]
+    }
+    policies_by_product = {
+        str(product["product_id"]): policies_by_id[str(product["promotion_policy_id"])]
+        for product in configuration["products"]["products"]
+    }
+    minimum_forward_days = {
+        product_id: int(policy["required_forward_evidence_days"])
+        for product_id, policy in policies_by_product.items()
+    }
+    summary_worker = DatabaseForwardSummaryWorker(
+        engine=database.engine,
+        queue=queue,
+        worker_id=worker_id,
+        minimum_days_by_product=minimum_forward_days,
+        policies_by_product=policies_by_product,
+    )
     worker = DatabasePromotionWorker(
         queue=queue,
         worker_id=worker_id,
@@ -678,6 +704,9 @@ def _promotion_cycle(
         forward = forward_worker.run_once(now=now)
         if forward.get("reason_code") != "forward_observation_queue_empty":
             return forward
+        summary = summary_worker.run_once(now=now)
+        if summary.get("reason_code") != "forward_summary_queue_empty":
+            return summary
         return worker.run_once(now=now)
 
     return run_once

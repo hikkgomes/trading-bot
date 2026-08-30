@@ -255,6 +255,37 @@ forward_paper_observation = Table(
     Column("observation_hash", String(80), nullable=False, unique=True),
     Column("payload", JSON, nullable=False),
 )
+forward_paper_summary = Table(
+    "forward_paper_summary",
+    metadata,
+    Column("id", String(200), primary_key=True),
+    Column("strategy_version_id", ForeignKey("strategy_version.id"), nullable=False, index=True),
+    Column("product_id", String(80), nullable=False, index=True),
+    Column("artefact_hash", String(80), nullable=False, index=True),
+    Column("observed_from", UtcTimestamp(), nullable=False),
+    Column("observed_until", UtcTimestamp(), nullable=False),
+    Column("created_at", UtcTimestamp(), nullable=False, index=True),
+    Column("content_hash", String(80), nullable=False, unique=True),
+    Column("payload", JSON, nullable=False),
+)
+forward_paper_decision = Table(
+    "forward_paper_decision",
+    metadata,
+    Column("id", String(200), primary_key=True),
+    Column("summary_id", ForeignKey("forward_paper_summary.id"), nullable=False, index=True),
+    Column("strategy_version_id", ForeignKey("strategy_version.id"), nullable=False, index=True),
+    Column("product_id", String(80), nullable=False, index=True),
+    Column("artefact_hash", String(80), nullable=False, index=True),
+    Column("decided_at", UtcTimestamp(), nullable=False, index=True),
+    Column("accepted", Boolean, nullable=False),
+    Column("reason_code", String(160)),
+    Column("content_hash", String(80), nullable=False, unique=True),
+    Column("payload", JSON, nullable=False),
+    CheckConstraint(
+        "accepted IS TRUE OR reason_code IS NOT NULL",
+        name="ck_forward_paper_decision_rejection_reason",
+    ),
+)
 
 strategy_approval = Table(
     "strategy_approval",
@@ -627,6 +658,7 @@ class PlatformDatabase:
                 "005_platform_bootstrap_authority.py",
                 "006_research_dataset_bundles.py",
                 "007_bounded_job_retries.py",
+                "008_forward_paper_summaries.py",
             )
             applied: list[str] = []
             with self.engine.begin() as connection:
@@ -676,7 +708,7 @@ class PlatformDatabase:
         if self.is_postgresql:
             with self.engine.connect() as connection:
                 revision = connection.execute(text("SELECT version_num FROM alembic_version"))
-                if revision.scalar_one_or_none() != "platform_v2_0007":
+                if revision.scalar_one_or_none() != "platform_v2_0008":
                     raise RuntimeError("database is not at the current Alembic revision")
 
     def dispose(self) -> None:

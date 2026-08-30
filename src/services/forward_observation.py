@@ -56,10 +56,29 @@ class DatabaseForwardObservationWorker:
                 "artefact_hash",
                 "evaluation_time",
             }
-            if set(payload) != required:
+            if not set(payload).issubset(required | {"waiting_reason"}) or not required.issubset(
+                payload
+            ):
                 raise ValueError("forward observation command has an invalid field set")
             evaluation_time = timestamp(str(payload["evaluation_time"]), field="evaluation_time")
             assignment = self.assignments.by_id(str(payload["assignment_id"]))
+            if payload.get("waiting_reason") is not None:
+                if (
+                    assignment is None
+                    or assignment.get("active") is not True
+                    or assignment.get("execution_mode") != "paper"
+                    or assignment.get("strategy_version_id") != payload["strategy_version_id"]
+                    or assignment.get("product_id") != payload["product_id"]
+                    or assignment.get("artefact_hash") != payload["artefact_hash"]
+                    or assignment.get("instrument_id") is not None
+                ):
+                    raise ValueError("forward waiting assignment binding is invalid")
+                self.queue.complete(claimed, completed_at=now)
+                return {
+                    "reason_code": "forward_waiting_for_universe_data",
+                    "job_id": claimed.job_id,
+                    "waiting_reason": str(payload["waiting_reason"]),
+                }
             if (
                 assignment is None
                 or assignment.get("active") is not True
@@ -110,7 +129,6 @@ class DatabaseForwardObservationWorker:
                     "forecast_content": forecast_payload,
                     "target_position_id": target[0] if target is not None else None,
                     "position": current_position,
-                    "accepted": False,
                     "reason_code": "collecting_forward_evidence",
                 },
             )
@@ -192,3 +210,101 @@ def _retry_at(value: str, seconds: int) -> str:
         .replace(microsecond=0)
         .isoformat()
     )
+
+
+class DatabaseForwardSummaryWorker:
+    """Aggregate immutable forward facts into one promotion input."""
+
+    def __init__(
+        self,
+        *,
+        engine,
+        queue: DatabaseJobQueue,
+        worker_id: str,
+        minimum_days_by_product: Mapping[str, int] | None = None,
+        minimum_decisions: int = 1,
+        policies_by_product: Mapping[str, Mapping[str, Any]] | None = None,
+        lease_seconds: int = 60,
+    ) -> None:
+        self.engine = engine
+        self.queue = queue
+        self.worker_id = worker_id
+        self.minimum_days_by_product = {
+            str(key): int(value) for key, value in (minimum_days_by_product or {}).items()
+        }
+        self.minimum_decisions = minimum_decisions
+        self.policies_by_product = {
+            str(key): dict(value) for key, value in (policies_by_product or {}).items()
+        }
+        self.lease_seconds = lease_seconds
+        self.evidence = SqlForwardEvidenceRepository(engine)
+
+    def run_once(self, *, now: str) -> dict[str, Any]:
+        now = timestamp(now, field="now")
+        claimed = self.queue.claim(
+            worker_id=self.worker_id,
+            now=now,
+            lease_seconds=self.lease_seconds,
+            names=("forward_paper_summary",),
+        )
+        if claimed is None:
+            return {"reason_code": "forward_summary_queue_empty"}
+        try:
+            required = {
+                "strategy_version_id",
+                "product_id",
+                "artefact_hash",
+                "evaluation_time",
+            }
+            if set(claimed.payload) != required:
+                raise ValueError("forward summary command has an invalid field set")
+            product_id = str(claimed.payload["product_id"])
+            evaluated_at = timestamp(
+                str(claimed.payload["evaluation_time"]), field="evaluation_time"
+            )
+            summary_id, summary = self.evidence.build_summary(
+                strategy_version_id=str(claimed.payload["strategy_version_id"]),
+                product_id=product_id,
+                artefact_hash=str(claimed.payload["artefact_hash"]),
+                observed_at=evaluated_at,
+            )
+            policy = self.policies_by_product.get(product_id, {})
+            decision_id, accepted, reason_code = self.evidence.decide_summary(
+                summary_id,
+                decided_at=evaluated_at,
+                minimum_days=int(
+                    policy.get(
+                        "required_forward_evidence_days",
+                        self.minimum_days_by_product.get(product_id, 0),
+                    )
+                ),
+                minimum_decisions=int(
+                    policy.get("minimum_forward_independent_decisions", self.minimum_decisions)
+                ),
+                minimum_net_pnl=float(policy.get("minimum_forward_net_pnl", 0.0)),
+                maximum_drawdown=float(policy.get("maximum_drawdown", 1.0)),
+                maximum_data_gaps=int(policy.get("maximum_forward_data_gaps", 0)),
+            )
+        except Exception as exc:
+            self.queue.fail(
+                claimed,
+                completed_at=now,
+                error=f"{type(exc).__name__}: {exc}",
+                retry_at=_retry_at(now, self.lease_seconds),
+            )
+            return {
+                "reason_code": "forward_summary_failed",
+                "job_id": claimed.job_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        self.queue.complete(claimed, completed_at=now)
+        return {
+            "reason_code": "forward_summary_decided",
+            "job_id": claimed.job_id,
+            "summary_id": summary_id,
+            "decision_id": decision_id,
+            "accepted": accepted,
+            "reason_code_detail": reason_code,
+            "independent_decisions": summary.independent_decisions,
+        }

@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass
 from enum import StrEnum
 from typing import Any
 
@@ -14,7 +14,8 @@ from sqlalchemy.engine import Engine
 
 from src.data.database import (
     experiment,
-    forward_paper_observation,
+    forward_paper_decision,
+    forward_paper_summary,
     holdout_claim,
     holdout_outcome,
     production_preflight,
@@ -75,7 +76,14 @@ class PromotionRequest:
         transition = non_empty(
             str(payload.get("requested_transition") or ""), field="requested_transition"
         )
-        if transition not in {"forward_paper", "live_canary", "live", "suspend", "retire"}:
+        if transition not in {
+            "forward_paper",
+            "live_canary",
+            "live",
+            "suspend",
+            "retire",
+            "resume",
+        }:
             raise ValueError("requested_transition is not a supported lifecycle transition")
         raw_capital = payload.get("requested_capital")
         if isinstance(raw_capital, bool) or not isinstance(raw_capital, int | float | str):
@@ -103,6 +111,9 @@ class PromotionPolicy:
     maximum_drawdown: float
     maximum_execution_drift: float
     maximum_model_drift: float
+    minimum_forward_independent_decisions: int = 1
+    minimum_forward_net_pnl: float = 0.0
+    maximum_forward_data_gaps: int = 0
 
 
 @dataclass(frozen=True)
@@ -130,6 +141,14 @@ class PromotionEvidence:
     market_making_live_capability: bool = False
     event_replay_passed: bool = False
     event_replay_fills: int = 0
+    forward_summary_id: str | None = None
+    forward_decision_id: str | None = None
+    forward_independent_decisions: int = 0
+    forward_net_pnl: float = 0.0
+    forward_benchmark_pnl: float = 0.0
+    forward_excess_benchmark_pnl: float = 0.0
+    forward_data_gaps: int = 0
+    canary_evidence_accepted: bool = False
 
 
 @dataclass(frozen=True)
@@ -161,6 +180,9 @@ class SqlPromotionPolicyStore:
                 "maximum_drawdown": policy.maximum_drawdown,
                 "maximum_execution_drift": policy.maximum_execution_drift,
                 "maximum_model_drift": policy.maximum_model_drift,
+                "minimum_forward_independent_decisions": policy.minimum_forward_independent_decisions,
+                "minimum_forward_net_pnl": policy.minimum_forward_net_pnl,
+                "maximum_forward_data_gaps": policy.maximum_forward_data_gaps,
             },
             field="promotion policy",
         )
@@ -190,7 +212,12 @@ class SqlPromotionPolicyStore:
         if payload is None:
             raise KeyError(f"promotion policy does not exist: {policy_id}")
         fields = PromotionPolicy.__dataclass_fields__
-        values = {key: payload[key] for key in fields}
+        values = {
+            key: payload[key]
+            if field.default is MISSING and field.default_factory is MISSING
+            else payload.get(key, field.default)
+            for key, field in fields.items()
+        }
         return PromotionPolicy(**values)
 
     def first(self) -> PromotionPolicy:
@@ -201,7 +228,14 @@ class SqlPromotionPolicyStore:
         if payload is None:
             raise KeyError("no authoritative promotion policy exists")
         fields = PromotionPolicy.__dataclass_fields__
-        return PromotionPolicy(**{key: payload[key] for key in fields})
+        return PromotionPolicy(
+            **{
+                key: payload[key]
+                if field.default is MISSING and field.default_factory is MISSING
+                else payload.get(key, field.default)
+                for key, field in fields.items()
+            }
+        )
 
 
 class SqlCanonicalPromotionEvidence:
@@ -329,13 +363,39 @@ class SqlCanonicalPromotionEvidence:
             ]
             if not holdout_rows:
                 raise ValueError("canonical holdout outcome is missing")
-            forward_rows = [
+            forward_summaries = [
                 row
-                for row in connection.execute(select(forward_paper_observation)).mappings()
+                for row in connection.execute(select(forward_paper_summary)).mappings()
                 if row["strategy_version_id"] == request.strategy_version_id
                 and row["product_id"] == product_id
                 and row["artefact_hash"] == artefact_hash
             ]
+            forward_summary = max(
+                forward_summaries,
+                key=lambda row: str(row["created_at"]),
+                default=None,
+            )
+            forward_decisions = [
+                row
+                for row in connection.execute(select(forward_paper_decision)).mappings()
+                if row["strategy_version_id"] == request.strategy_version_id
+                and row["product_id"] == product_id
+                and row["artefact_hash"] == artefact_hash
+            ]
+            forward_decision = (
+                max(
+                    (
+                        row
+                        for row in forward_decisions
+                        if forward_summary is not None
+                        and row["summary_id"] == forward_summary["id"]
+                    ),
+                    key=lambda row: str(row["decided_at"]),
+                    default=None,
+                )
+                if forward_summary is not None
+                else None
+            )
             approvals = [
                 row
                 for row in connection.execute(select(strategy_approval)).mappings()
@@ -375,21 +435,16 @@ class SqlCanonicalPromotionEvidence:
             if latest_event is not None
             else LifecycleState.REGISTERED
         )
-        observations = []
-        for row in forward_rows:
-            if not isinstance(row["payload"], dict):
-                continue
-            payload = dict(row["payload"])
-            summary = payload.get("evidence") or payload.get("observation")
-            observations.append(
-                {**dict(summary), **payload} if isinstance(summary, Mapping) else payload
-            )
+        summary_payload = (
+            forward_summary["payload"]
+            if forward_summary is not None and isinstance(forward_summary["payload"], Mapping)
+            else {}
+        )
+        forward_days = float(summary_payload.get("elapsed_days", 0.0))
         observation_values = {
-            field: [
-                float(item[field])
-                for item in observations
-                if isinstance(item.get(field), int | float)
-            ]
+            field: [float(summary_payload[field])]
+            if isinstance(summary_payload.get(field), int | float)
+            else []
             for field in (
                 "drawdown",
                 "execution_drift",
@@ -398,15 +453,6 @@ class SqlCanonicalPromotionEvidence:
                 "risk_budget_available",
             )
         }
-        forward_days = max([float(item.get("evidence_days", 0)) for item in observations] + [0.0])
-        if len(forward_rows) >= 2:
-            first = min(str(row["observed_at"]) for row in forward_rows)
-            last = max(str(row["observed_at"]) for row in forward_rows)
-            try:
-                delta = dt.datetime.fromisoformat(last) - dt.datetime.fromisoformat(first)
-                forward_days = max(forward_days, delta.total_seconds() / 86_400)
-            except ValueError:
-                pass
         source_commit_hash = str(
             artefact.get("source_commit_hash") or artefact.get("source_commit") or ""
         )
@@ -417,10 +463,8 @@ class SqlCanonicalPromotionEvidence:
             row["accepted"] for row in validation_rows
         )
         protected_accepted = bool(holdout_rows) and all(row["accepted"] for row in holdout_rows)
-        forward_accepted = (
-            bool(forward_rows)
-            and bool(observations)
-            and all(item.get("accepted") is True for item in observations)
+        forward_accepted = bool(
+            forward_decision is not None and forward_decision["accepted"] is True
         )
         fresh_preflight = bool(
             latest_preflight
@@ -467,6 +511,16 @@ class SqlCanonicalPromotionEvidence:
             ),
             event_replay_passed=isinstance(replay, Mapping) and replay.get("passed") is True,
             event_replay_fills=(int(replay.get("fills", 0)) if isinstance(replay, Mapping) else 0),
+            forward_summary_id=(str(forward_summary["id"]) if forward_summary else None),
+            forward_decision_id=(str(forward_decision["id"]) if forward_decision else None),
+            forward_independent_decisions=int(summary_payload.get("independent_decisions", 0)),
+            forward_net_pnl=float(summary_payload.get("net_pnl", 0.0)),
+            forward_benchmark_pnl=float(summary_payload.get("benchmark_pnl", 0.0)),
+            forward_excess_benchmark_pnl=float(
+                summary_payload.get("excess_benchmark_pnl", 0.0)
+            ),
+            forward_data_gaps=int(summary_payload.get("data_gaps", 0)),
+            canary_evidence_accepted=bool(summary_payload.get("canary_evidence_accepted") is True),
         )
         policy_id = str(artefact.get("promotion_policy_id") or "")
         policy = self.policy_store.get(policy_id) if policy_id else self.policy_store.first()
@@ -480,9 +534,105 @@ def decide_promotion(
     evidence: PromotionEvidence,
     policy: PromotionPolicy,
     evaluated_at: str,
+    requested_transition: str | None = None,
 ) -> PromotionDecision:
     strategy_version_id = non_empty(strategy_version_id, field="strategy_version_id")
     evaluated_at = timestamp(evaluated_at, field="evaluated_at")
+    if requested_transition is not None:
+        requested_transition = non_empty(
+            requested_transition, field="requested_transition"
+        )
+    if requested_transition == "suspend":
+        return _decision(
+            strategy_version_id,
+            current_state,
+            LifecycleState.SUSPENDED,
+            current_state is not LifecycleState.RETIRED,
+            "suspended_by_request",
+            evaluated_at,
+            0.0,
+            evidence,
+        )
+    if requested_transition == "retire":
+        return _decision(
+            strategy_version_id,
+            current_state,
+            LifecycleState.RETIRED,
+            current_state is not LifecycleState.RETIRED,
+            "retired_by_request",
+            evaluated_at,
+            0.0,
+            evidence,
+        )
+    if requested_transition == "resume":
+        if current_state is not LifecycleState.SUSPENDED:
+            return _decision(
+                strategy_version_id,
+                current_state,
+                current_state,
+                False,
+                "resume_requires_suspended_state",
+                evaluated_at,
+                0.0,
+                evidence,
+            )
+        if not evidence.forward_evidence_accepted:
+            return _decision(
+                strategy_version_id,
+                current_state,
+                current_state,
+                False,
+                "resume_forward_evidence_missing",
+                evaluated_at,
+                0.0,
+                evidence,
+            )
+        return _decision(
+            strategy_version_id,
+            current_state,
+            LifecycleState.FORWARD_PAPER,
+            True,
+            "resumed_to_forward_paper",
+            evaluated_at,
+            0.0,
+            evidence,
+        )
+    if requested_transition == "forward_paper" and current_state is LifecycleState.FORWARD_PAPER:
+        return _decision(
+            strategy_version_id,
+            current_state,
+            current_state,
+            True,
+            "forward_paper_maintained",
+            evaluated_at,
+            0.0,
+            evidence,
+        )
+    if requested_transition in {"live", "live_canary"} and current_state in {
+        LifecycleState.REGISTERED,
+        LifecycleState.DEVELOPMENT,
+    }:
+        return _decision(
+            strategy_version_id,
+            current_state,
+            current_state,
+            False,
+            "forward_paper_required",
+            evaluated_at,
+            0.0,
+            evidence,
+        )
+    if requested_transition == "live" and current_state is LifecycleState.FORWARD_PAPER:
+        return _decision(
+            strategy_version_id,
+            current_state,
+            current_state,
+            False,
+            "canary_required_before_live",
+            evaluated_at,
+            0.0,
+            evidence,
+        )
     if evidence.drawdown > policy.maximum_drawdown:
         next_state = (
             LifecycleState.SUSPENDED
@@ -576,8 +726,28 @@ def decide_promotion(
                 evidence.forward_evidence_days < policy.required_forward_evidence_days,
                 "forward_evidence_duration_insufficient",
             ),
+            (
+                evidence.forward_summary_id is not None
+                and evidence.forward_independent_decisions
+                < policy.minimum_forward_independent_decisions,
+                "forward_decisions_insufficient",
+            ),
+            (
+                evidence.forward_summary_id is not None
+                and evidence.forward_net_pnl <= policy.minimum_forward_net_pnl,
+                "forward_net_pnl_threshold",
+            ),
+            (
+                evidence.forward_summary_id is not None
+                and evidence.forward_data_gaps > policy.maximum_forward_data_gaps,
+                "forward_data_gaps",
+            ),
             (not evidence.forward_evidence_accepted, "forward_evidence_not_accepted"),
-            (not policy.automatic_live_canary_promotion, "automatic_live_canary_disabled"),
+            (
+                not policy.automatic_live_canary_promotion
+                and requested_transition != "live_canary",
+                "automatic_live_canary_disabled",
+            ),
             (not evidence.live_approval, "live_approval_missing"),
             (not evidence.fresh_preflight, "fresh_preflight_missing"),
             (evidence.portfolio_capacity <= 0, "portfolio_capacity_unavailable"),
@@ -616,6 +786,41 @@ def decide_promotion(
             LifecycleState.LIVE_CANARY,
             True,
             "live_canary_promoted",
+            evaluated_at,
+            capital,
+            evidence,
+        )
+    if current_state is LifecycleState.LIVE_CANARY and requested_transition == "live":
+        checks = (
+            (not evidence.canary_evidence_accepted, "canary_evidence_not_accepted"),
+            (not evidence.live_approval, "live_approval_missing"),
+            (not evidence.fresh_preflight, "fresh_preflight_missing"),
+            (evidence.portfolio_capacity <= 0, "portfolio_capacity_unavailable"),
+            (evidence.risk_budget_available <= 0, "risk_budget_unavailable"),
+        )
+        reason = next((reason for failed, reason in checks if failed), None)
+        if reason:
+            return _decision(
+                strategy_version_id,
+                current_state,
+                current_state,
+                False,
+                reason,
+                evaluated_at,
+                0.0,
+                evidence,
+            )
+        capital = min(
+            evidence.requested_capital,
+            evidence.portfolio_capacity,
+            evidence.risk_budget_available,
+        )
+        return _decision(
+            strategy_version_id,
+            current_state,
+            LifecycleState.LIVE,
+            True,
+            "live_promoted",
             evaluated_at,
             capital,
             evidence,
@@ -780,6 +985,11 @@ class DatabasePromotionWorker:
                 else PromotionEvidence(**evidence),
                 policy=policy if isinstance(policy, PromotionPolicy) else PromotionPolicy(**policy),
                 evaluated_at=evaluated_at,
+                requested_transition=(
+                    str(claimed.payload["requested_transition"])
+                    if claimed.payload.get("requested_transition") is not None
+                    else None
+                ),
             )
             identity = self.store.append(decision)
             if self.strict_identity_contract:

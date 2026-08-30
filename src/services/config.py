@@ -326,6 +326,35 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
                 raise ValueError(
                     f"promotion policy {policy_id}.{field} must be finite and non-negative"
                 )
+        minimum_decisions = policy.get("minimum_forward_independent_decisions", 1)
+        if (
+            not isinstance(minimum_decisions, int)
+            or isinstance(minimum_decisions, bool)
+            or minimum_decisions < 1
+        ):
+            raise ValueError(
+                f"promotion policy {policy_id}.minimum_forward_independent_decisions "
+                "must be a positive integer"
+            )
+        minimum_net_pnl = policy.get("minimum_forward_net_pnl", 0.0)
+        if (
+            not isinstance(minimum_net_pnl, int | float)
+            or isinstance(minimum_net_pnl, bool)
+            or not math.isfinite(float(minimum_net_pnl))
+        ):
+            raise ValueError(
+                f"promotion policy {policy_id}.minimum_forward_net_pnl must be finite"
+            )
+        maximum_data_gaps = policy.get("maximum_forward_data_gaps", 0)
+        if (
+            not isinstance(maximum_data_gaps, int)
+            or isinstance(maximum_data_gaps, bool)
+            or maximum_data_gaps < 0
+        ):
+            raise ValueError(
+                f"promotion policy {policy_id}.maximum_forward_data_gaps "
+                "must be a non-negative integer"
+            )
     risk_products = _mapping(configuration["risk"].get("products"), field="risk.products")
     if set(products) != {"btc_accumulation", "active_income"}:
         raise ValueError("products must define btc_accumulation and active_income")
