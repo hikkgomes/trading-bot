@@ -14,6 +14,7 @@ from src.research.canonical import (
     SqlForwardEvidenceRepository,
     SqlStrategyArtefactRepository,
 )
+from src.services.forward_metrics import ForwardEvidenceCollector
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -35,6 +36,7 @@ class DatabaseForwardObservationWorker:
         self.assignments = SqlActiveStrategyAssignmentRepository(engine)
         self.artefacts = SqlStrategyArtefactRepository(engine)
         self.evidence = SqlForwardEvidenceRepository(engine)
+        self.metrics = ForwardEvidenceCollector(engine)
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         now = timestamp(now, field="now")
@@ -115,6 +117,26 @@ class DatabaseForwardObservationWorker:
                 instrument_id=str(payload["instrument_id"]),
                 at=evaluation_time,
             )
+            previous_observed_at = self.metrics.latest_observed_at(
+                strategy_version_id=str(payload["strategy_version_id"]),
+                product_id=str(payload["product_id"]),
+                instrument_id=str(payload["instrument_id"]),
+                artefact_hash=str(payload["artefact_hash"]),
+            )
+            forecast_fact = {**forecast_payload, "forecast_id": forecast_id}
+            target_fact = (
+                {**target[2], "target_position_id": target[0]} if target is not None else None
+            )
+            metrics = self.metrics.collect(
+                assignment=assignment,
+                product_id=str(payload["product_id"]),
+                instrument_id=str(payload["instrument_id"]),
+                artefact_created_at=artefact_created_at,
+                evaluation_time=evaluation_time,
+                forecast=forecast_fact,
+                target=target_fact,
+                previous_observed_at=previous_observed_at,
+            )
             observation_id = self.evidence.append(
                 strategy_version_id=str(payload["strategy_version_id"]),
                 product_id=str(payload["product_id"]),
@@ -129,7 +151,8 @@ class DatabaseForwardObservationWorker:
                     "forecast_content": forecast_payload,
                     "target_position_id": target[0] if target is not None else None,
                     "position": current_position,
-                    "reason_code": "collecting_forward_evidence",
+                    "facts": metrics.to_payload(forecast=forecast_fact, target=target_fact),
+                    "reason_code": "forward_evidence_observed",
                 },
             )
         except Exception as exc:

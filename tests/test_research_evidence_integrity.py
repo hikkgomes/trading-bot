@@ -203,6 +203,49 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
         artefact.artefact_hash, artefact.to_dict(), created_at=created_at
     )
     repository = SqlForwardEvidenceRepository(database.engine)
+
+    forecast_payload = {
+        "strategy_version_id": definition.strategy_version_id,
+        "product_id": "active_income",
+        "instrument_id": "BTCUSDT",
+        "direction": "long",
+    }
+    forecast_id = canonical_hash(forecast_payload)
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(alpha_forecast).values(
+                id=forecast_id,
+                created_at="2026-08-25T00:00:00+00:00",
+                payload=forecast_payload,
+            )
+        )
+
+    def facts(*, net_pnl: float, benchmark_pnl: float = 0.0) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "schema": "platform.forward_evidence_facts/v1",
+            "window_start": "2026-08-23T00:00:00+00:00",
+            "source_event_ids": [artefact.artefact_hash],
+            "metrics": {
+                "net_pnl": net_pnl,
+                "benchmark_pnl": benchmark_pnl,
+                "drawdown": 0.0,
+                "execution_drift": 0.0,
+                "model_drift": 0.0,
+                "portfolio_capacity": 100.0,
+                "risk_budget_available": 10.0,
+                "data_gaps": 0,
+                "effective_trades": 1,
+                "fill_rate": 1.0,
+                "slippage": 0.0,
+                "data_uptime": 1.0,
+                "rejected_orders": 0,
+            },
+            "forecast_hash": canonical_hash(forecast_payload),
+            "target_hash": None,
+        }
+        payload["facts_hash"] = canonical_hash(payload)
+        return payload
+
     with pytest.raises(CanonicalEvidenceError, match="after artefact creation"):
         repository.append(
             strategy_version_id=definition.strategy_version_id,
@@ -231,7 +274,7 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
         instrument_id="BTCUSDT",
         observed_at="2026-08-24T00:00:00+00:00",
         artefact_hash=artefact.artefact_hash,
-        observation={"direction": "flat"},
+        observation={"decision_id": "decision-1", "facts": facts(net_pnl=0.0)},
     )
     assert observation_id.startswith("sha256:")
 
@@ -247,20 +290,6 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
         assigned_by="test",
         instrument_id="BTCUSDT",
     )
-    forecast_payload = {
-        "strategy_version_id": definition.strategy_version_id,
-        "product_id": "active_income",
-        "instrument_id": "BTCUSDT",
-        "direction": "long",
-    }
-    with database.engine.begin() as connection:
-        connection.execute(
-            insert(alpha_forecast).values(
-                id=canonical_hash(forecast_payload),
-                created_at="2026-08-25T00:00:00+00:00",
-                payload=forecast_payload,
-            )
-        )
     queue = DatabaseJobQueue(database.engine)
     queue.register_worker(
         worker_id="test:forward-observer",
@@ -298,8 +327,7 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
         artefact_hash=artefact.artefact_hash,
         observation={
             "decision_id": "decision-2",
-            "net_pnl": 1.0,
-            "benchmark_pnl": 0.25,
+            "facts": facts(net_pnl=1.0, benchmark_pnl=0.25),
         },
     )
     summary_id, summary = repository.build_summary(

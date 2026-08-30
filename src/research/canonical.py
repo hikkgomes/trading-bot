@@ -12,20 +12,26 @@ from sqlalchemy import insert, select, text
 from sqlalchemy.engine import Engine
 
 from src.data.database import (
+    accounting_entry,
     active_strategy_assignment,
+    alpha_forecast,
     dataset_snapshot,
     experiment,
     experiment_run,
+    fill,
     forward_paper_decision,
     forward_paper_observation,
     forward_paper_summary,
     holdout_claim,
     holdout_outcome,
+    order_intent,
     production_preflight,
+    risk_snapshot,
     strategy_approval,
     strategy_artefact,
     strategy_definition,
     strategy_version,
+    target_position,
     validation_stage,
 )
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
@@ -441,6 +447,11 @@ class ForwardPaperSummary:
     data_gaps: int
     strategy_decay: float
     observation_ids: tuple[str, ...]
+    effective_trades: int = 0
+    fill_rate: float = 1.0
+    slippage: float = 0.0
+    data_uptime: float = 0.0
+    rejected_orders: int = 0
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -463,6 +474,11 @@ class ForwardPaperSummary:
             "data_gaps": self.data_gaps,
             "strategy_decay": self.strategy_decay,
             "observation_ids": list(self.observation_ids),
+            "effective_trades": self.effective_trades,
+            "fill_rate": self.fill_rate,
+            "slippage": self.slippage,
+            "data_uptime": self.data_uptime,
+            "rejected_orders": self.rejected_orders,
         }
 
 
@@ -611,21 +627,32 @@ class SqlForwardEvidenceRepository:
             "portfolio_capacity",
             "risk_budget_available",
             "strategy_decay",
+            "slippage",
         ):
             payload[field_name] = _finite_nonnegative(
                 payload.get(field_name, 0.0), field=f"summary {field_name}"
+            )
+        for field_name in ("fill_rate", "data_uptime"):
+            value = _finite_nonnegative(payload.get(field_name, 0.0), field=f"summary {field_name}")
+            if value > 1:
+                raise CanonicalEvidenceError(f"summary {field_name} must be at most one")
+            payload[field_name] = value
+        for field_name in ("effective_trades", "rejected_orders"):
+            payload[field_name] = int(
+                _finite_nonnegative(payload.get(field_name, 0), field=f"summary {field_name}")
             )
         payload["data_gaps"] = int(
             _finite_nonnegative(payload.get("data_gaps", 0), field="summary data gaps")
         )
         observation_ids = payload.get("observation_ids", ())
-        if not isinstance(observation_ids, list | tuple) or not observation_ids or any(
-            not str(value).strip() for value in observation_ids
+        if (
+            not isinstance(observation_ids, list | tuple)
+            or not observation_ids
+            or any(not str(value).strip() for value in observation_ids)
         ):
             raise CanonicalEvidenceError("forward summary needs observation identities")
         normalised_observation_ids = tuple(
-            _identity(str(value), field="summary observation identity")
-            for value in observation_ids
+            _identity(str(value), field="summary observation identity") for value in observation_ids
         )
         if len(set(normalised_observation_ids)) != len(normalised_observation_ids):
             raise CanonicalEvidenceError("forward summary observation identities must be unique")
@@ -661,9 +688,7 @@ class SqlForwardEvidenceRepository:
                         forward_paper_observation.c.product_id,
                         forward_paper_observation.c.artefact_hash,
                         forward_paper_observation.c.observed_at,
-                    ).where(
-                        forward_paper_observation.c.id.in_(normalised_observation_ids)
-                    )
+                    ).where(forward_paper_observation.c.id.in_(normalised_observation_ids))
                 )
                 .mappings()
                 .all()
@@ -686,6 +711,7 @@ class SqlForwardEvidenceRepository:
                     raise CanonicalEvidenceError(
                         "forward summary observation binding or interval is invalid"
                     )
+            self._assert_observation_facts(connection, normalised_observation_ids)
             return _immutable_insert(
                 connection,
                 forward_paper_summary,
@@ -730,15 +756,20 @@ class SqlForwardEvidenceRepository:
             materialised = tuple(row for row in rows if isinstance(row["payload"], Mapping))
         if not materialised:
             raise CanonicalEvidenceError("no forward observations exist for summary")
+        with self.engine.connect() as connection:
+            self._assert_observation_facts(
+                connection, tuple(str(row["id"]) for row in materialised)
+            )
 
         def value(payload: Mapping[str, Any], *names: str, default: float = 0.0) -> float:
-            source = payload.get("observation")
-            source = source if isinstance(source, Mapping) else payload
+            source = payload["observation"]
+            facts = source["facts"]
+            metrics = facts["metrics"]
             for name in names:
-                if source.get(name) is not None:
+                if metrics.get(name) is not None:
                     if name in {"net_pnl", "cost_adjusted_return", "pnl"}:
-                        return _finite_number(source[name], field=f"forward observation {name}")
-                    return _finite_nonnegative(source[name], field=f"forward observation {name}")
+                        return _finite_number(metrics[name], field=f"forward observation {name}")
+                    return _finite_nonnegative(metrics[name], field=f"forward observation {name}")
             return default
 
         observed_from = min(str(row["observed_at"]) for row in materialised)
@@ -753,9 +784,9 @@ class SqlForwardEvidenceRepository:
         payloads = [dict(row["payload"]) for row in materialised]
         decisions = {
             str(
-                (payload.get("observation") or payload).get(
+                payload["observation"].get(
                     "decision_id",
-                    (payload.get("observation") or payload).get("forecast_id", row_id),
+                    payload["observation"].get("forecast_id", row_id),
                 )
             )
             for payload, row_id in zip(
@@ -794,6 +825,19 @@ class SqlForwardEvidenceRepository:
             ),
             strategy_decay=max(0.0, first_return - last_return),
             observation_ids=tuple(str(row["id"]) for row in materialised),
+            effective_trades=int(sum(value(payload, "effective_trades") for payload in payloads)),
+            fill_rate=(
+                sum(value(payload, "fill_rate") for payload in payloads) / len(payloads)
+                if payloads
+                else 0.0
+            ),
+            slippage=sum(value(payload, "slippage") for payload in payloads),
+            data_uptime=(
+                sum(value(payload, "data_uptime") for payload in payloads) / len(payloads)
+                if payloads
+                else 0.0
+            ),
+            rejected_orders=int(sum(value(payload, "rejected_orders") for payload in payloads)),
         )
         summary_id = self.append_summary(
             strategy_version_id=strategy_version_id,
@@ -803,6 +847,74 @@ class SqlForwardEvidenceRepository:
             evidence=summary.to_payload(),
         )
         return summary_id, summary
+
+    @staticmethod
+    def _assert_observation_facts(connection, observation_ids: tuple[str, ...]) -> None:
+        known_tables = (
+            strategy_version,
+            alpha_forecast,
+            target_position,
+            order_intent,
+            fill,
+            risk_snapshot,
+            accounting_entry,
+            strategy_artefact,
+        )
+        for observation_id in observation_ids:
+            row = connection.execute(
+                select(forward_paper_observation.c.payload).where(
+                    forward_paper_observation.c.id == observation_id
+                )
+            ).scalar_one_or_none()
+            if not isinstance(row, Mapping):
+                raise CanonicalEvidenceError("forward observation facts are missing")
+            observation = row.get("observation")
+            facts = observation.get("facts") if isinstance(observation, Mapping) else None
+            if (
+                not isinstance(facts, Mapping)
+                or facts.get("schema") != "platform.forward_evidence_facts/v1"
+            ):
+                raise CanonicalEvidenceError("forward observations need immutable evidence facts")
+            saved_hash = facts.get("facts_hash")
+            content = dict(facts)
+            content.pop("facts_hash", None)
+            if saved_hash != canonical_hash(content):
+                raise CanonicalEvidenceError("forward evidence facts hash is invalid")
+            source_ids = facts.get("source_event_ids")
+            metrics = facts.get("metrics")
+            if not isinstance(source_ids, list | tuple) or not source_ids:
+                raise CanonicalEvidenceError("forward evidence facts need source identities")
+            if not isinstance(metrics, Mapping):
+                raise CanonicalEvidenceError("forward evidence facts need metrics")
+            required_metrics = {
+                "net_pnl",
+                "benchmark_pnl",
+                "drawdown",
+                "execution_drift",
+                "model_drift",
+                "portfolio_capacity",
+                "risk_budget_available",
+                "data_gaps",
+                "effective_trades",
+                "fill_rate",
+                "slippage",
+                "data_uptime",
+                "rejected_orders",
+            }
+            if not required_metrics.issubset(metrics):
+                raise CanonicalEvidenceError("forward evidence facts metrics are incomplete")
+            known = False
+            for source_id in source_ids:
+                for table in known_tables:
+                    if connection.execute(
+                        select(table.c.id).where(table.c.id == str(source_id))
+                    ).first():
+                        known = True
+                        break
+                if known:
+                    break
+            if not known:
+                raise CanonicalEvidenceError("forward evidence facts reference no canonical source")
 
     def append_decision(
         self,
@@ -872,9 +984,7 @@ class SqlForwardEvidenceRepository:
         if isinstance(minimum_decisions, bool) or minimum_decisions < 0:
             raise CanonicalEvidenceError("minimum forward decisions must be non-negative")
         minimum_net_pnl = _finite_number(minimum_net_pnl, field="minimum forward net_pnl")
-        maximum_drawdown = _finite_nonnegative(
-            maximum_drawdown, field="maximum forward drawdown"
-        )
+        maximum_drawdown = _finite_nonnegative(maximum_drawdown, field="maximum forward drawdown")
         if isinstance(maximum_data_gaps, bool) or maximum_data_gaps < 0:
             raise CanonicalEvidenceError("maximum forward data gaps must be non-negative")
         with self.engine.connect() as connection:
