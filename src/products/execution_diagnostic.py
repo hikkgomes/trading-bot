@@ -73,6 +73,7 @@ class ExecutionDiagnostic:
         while moment.isoformat() in used_times:
             moment += dt.timedelta(seconds=1)
         now = moment.isoformat()
+        valid_until = (moment + dt.timedelta(minutes=5)).isoformat()
         traces = JsonlDecisionTraceStore(trace_path)
         entries_before = len(ledger.entries)
         traces_before = len(traces.read())
@@ -104,7 +105,7 @@ class ExecutionDiagnostic:
             target_fraction=0.001,
             strategy_contributions={"execution_diagnostic:v1": self.quantity},
             risk_budget=0.001,
-            valid_until=now,
+            valid_until=valid_until,
         )
         entry_orders, entry_fills, _entry_traces = execution.execute_targets(
             portfolio_id=self.product_id,
@@ -121,7 +122,7 @@ class ExecutionDiagnostic:
             target_fraction=0.0,
             strategy_contributions={"execution_diagnostic:v1": 0.0},
             risk_budget=0.001,
-            valid_until=now,
+            valid_until=valid_until,
         )
         market["price"] = self.price * 1.01
         exit_orders, exit_fills, _exit_traces = execution.execute_targets(
