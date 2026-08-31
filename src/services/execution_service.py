@@ -66,101 +66,128 @@ class ExecutionService:
         if risk_decision.scope not in {"account", "global", "portfolio"}:
             raise ValueError("execution requires a portfolio, account, or global risk decision")
         materialised = tuple(targets)
-        if decided_at is None:
-            now_value = dt.datetime.now(dt.UTC).replace(microsecond=0)
-            # Paper replay commonly consumes historical targets.  Use their
-            # own decision window when the host clock is later, while live
-            # callers always provide the actual submission timestamp.
-            if materialised:
-                latest_window = min(
-                    dt.datetime.fromisoformat(target.valid_until) for target in materialised
-                )
-                if latest_window <= now_value:
-                    now_value = latest_window - dt.timedelta(seconds=1)
-            decided_at = now_value.isoformat()
-        now = timestamp(decided_at, field="decided_at")
+        now = self._decision_time(materialised, decided_at)
         traces: list[DecisionTrace] = []
         if not risk_decision.accepted:
-            for target in materialised:
-                traces.append(
-                    DecisionTrace.start(
-                        event_id=f"target:{target.instrument_id}:{now}",
-                        instrument_id=target.instrument_id,
-                    )
-                    .pass_stage(DecisionTraceStage.DATA_AVAILABLE)
-                    .pass_stage(DecisionTraceStage.FEATURE_AVAILABLE)
-                    .pass_stage(DecisionTraceStage.STRATEGY_EVALUATED)
-                    .pass_stage(DecisionTraceStage.REGIME_PASSED)
-                    .pass_stage(DecisionTraceStage.SETUP_PASSED)
-                    .pass_stage(DecisionTraceStage.TRIGGER_PASSED)
-                    .pass_stage(DecisionTraceStage.SIGNAL_PRODUCED)
-                    .pass_stage(DecisionTraceStage.PORTFOLIO_ACCEPTED)
-                    .block(
-                        DecisionTraceStage.RISK_ACCEPTED,
-                        reason_code=risk_decision.reason_code or "risk_rejected",
-                    )
-                )
+            traces.extend(self._risk_rejection_traces(materialised, now, risk_decision))
             return self._result((), (), traces)
-        instrument_ids = [target.instrument_id for target in materialised]
-        if len(instrument_ids) != len(set(instrument_ids)):
-            raise ValueError("targets must contain at most one position per instrument")
+        self._assert_unique_instruments(materialised)
         fills: list[Fill] = []
         all_orders: list[OrderIntent] = []
         for target in materialised:
-            orders = plan_orders(
-                (target,),
-                current_quantities=self.positions.current_quantities(portfolio_id),
-                decided_at=now,
-            )
+            orders = self._target_orders(target, portfolio_id=portfolio_id, decided_at=now)
             if not orders:
-                traces.append(
-                    self._accepted_trace(
-                        target.instrument_id, now, risk_decision, event_id=event_id
-                    ).block(
-                        DecisionTraceStage.ORDER_PLANNED,
-                        reason_code="target_already_satisfied",
-                    )
-                )
+                traces.append(self._already_satisfied_trace(target, now, risk_decision, event_id))
                 continue
             for order in orders:
+                fill, trace = self._execute_order(order, now, risk_decision, event_id)
                 all_orders.append(order)
-                previous_position = self.positions.get(portfolio_id, order.instrument_id)
-                fill = self.paper_exchange.submit(order)
                 fills.append(fill)
-                self.record_execution_costs(order, fill, previous_position=previous_position)
-                updated_order = self.paper_exchange.order_manager.get(order.order_id)
-                position = self.positions.get(portfolio_id, order.instrument_id)
-                trace = (
-                    self._accepted_trace(
-                        order.instrument_id,
-                        now,
-                        risk_decision,
-                        event_id=f"{event_id}:{order.order_id}" if event_id else None,
-                    )
-                    .pass_stage(DecisionTraceStage.ORDER_PLANNED)
-                    .pass_stage(DecisionTraceStage.ORDER_SUBMITTED)
-                )
-                if updated_order.remaining_quantity > 1e-12:
-                    traces.append(
-                        trace.block(
-                            DecisionTraceStage.ORDER_FILLED,
-                            reason_code="partial_fill_pending",
-                            fill_id=fill.fill_id,
-                            filled_quantity=updated_order.filled_quantity,
-                            remaining_quantity=updated_order.remaining_quantity,
-                        )
-                    )
-                    continue
-                trace = trace.pass_stage(DecisionTraceStage.ORDER_FILLED, fill_id=fill.fill_id)
-                stage = (
-                    DecisionTraceStage.POSITION_CLOSED
-                    if position.quantity == 0
-                    else DecisionTraceStage.POSITION_OPENED
-                )
-                if stage is DecisionTraceStage.POSITION_CLOSED:
-                    trace = trace.pass_stage(DecisionTraceStage.POSITION_OPENED)
-                traces.append(trace.pass_stage(stage, quantity=position.quantity))
+                traces.append(trace)
         return self._result(all_orders, fills, traces)
+
+    @staticmethod
+    def _decision_time(targets: tuple[TargetPosition, ...], decided_at: str | None) -> str:
+        if decided_at is not None:
+            return timestamp(decided_at, field="decided_at")
+        now_value = dt.datetime.now(dt.UTC).replace(microsecond=0)
+        if targets:
+            latest_window = min(dt.datetime.fromisoformat(target.valid_until) for target in targets)
+            if latest_window <= now_value:
+                now_value = latest_window - dt.timedelta(seconds=1)
+        return timestamp(now_value.isoformat(), field="decided_at")
+
+    @staticmethod
+    def _assert_unique_instruments(targets: tuple[TargetPosition, ...]) -> None:
+        instrument_ids = [target.instrument_id for target in targets]
+        if len(instrument_ids) != len(set(instrument_ids)):
+            raise ValueError("targets must contain at most one position per instrument")
+
+    def _risk_rejection_traces(
+        self,
+        targets: tuple[TargetPosition, ...],
+        now: str,
+        risk_decision: RiskDecision,
+    ) -> tuple[DecisionTrace, ...]:
+        return tuple(
+            self._accepted_trace(target.instrument_id, now, risk_decision).block(
+                DecisionTraceStage.RISK_ACCEPTED,
+                reason_code=risk_decision.reason_code or "risk_rejected",
+            )
+            for target in targets
+        )
+
+    def _target_orders(
+        self, target: TargetPosition, *, portfolio_id: str, decided_at: str
+    ) -> tuple[OrderIntent, ...]:
+        return plan_orders(
+            (target,),
+            current_quantities=self.positions.current_quantities(portfolio_id),
+            decided_at=decided_at,
+        )
+
+    def _already_satisfied_trace(
+        self,
+        target: TargetPosition,
+        now: str,
+        risk_decision: RiskDecision,
+        event_id: str | None,
+    ) -> DecisionTrace:
+        return self._accepted_trace(
+            target.instrument_id, now, risk_decision, event_id=event_id
+        ).block(
+            DecisionTraceStage.ORDER_PLANNED,
+            reason_code="target_already_satisfied",
+        )
+
+    def _execute_order(
+        self,
+        order: OrderIntent,
+        now: str,
+        risk_decision: RiskDecision,
+        event_id: str | None,
+    ) -> tuple[Fill, DecisionTrace]:
+        previous_position = self.positions.get(order.portfolio_id, order.instrument_id)
+        fill = self.paper_exchange.submit(order)
+        self.record_execution_costs(order, fill, previous_position=previous_position)
+        updated_order = self.paper_exchange.order_manager.get(order.order_id)
+        position = self.positions.get(order.portfolio_id, order.instrument_id)
+        trace = self._order_trace(order, now, risk_decision, event_id)
+        if updated_order.remaining_quantity > 1e-12:
+            return fill, trace.block(
+                DecisionTraceStage.ORDER_FILLED,
+                reason_code="partial_fill_pending",
+                fill_id=fill.fill_id,
+                filled_quantity=updated_order.filled_quantity,
+                remaining_quantity=updated_order.remaining_quantity,
+            )
+        trace = trace.pass_stage(DecisionTraceStage.ORDER_FILLED, fill_id=fill.fill_id)
+        if position.quantity == 0:
+            trace = trace.pass_stage(DecisionTraceStage.POSITION_OPENED)
+            return fill, trace.pass_stage(
+                DecisionTraceStage.POSITION_CLOSED, quantity=position.quantity
+            )
+        return fill, trace.pass_stage(
+            DecisionTraceStage.POSITION_OPENED, quantity=position.quantity
+        )
+
+    def _order_trace(
+        self,
+        order: OrderIntent,
+        now: str,
+        risk_decision: RiskDecision,
+        event_id: str | None,
+    ) -> DecisionTrace:
+        return (
+            self._accepted_trace(
+                order.instrument_id,
+                now,
+                risk_decision,
+                event_id=f"{event_id}:{order.order_id}" if event_id else None,
+            )
+            .pass_stage(DecisionTraceStage.ORDER_PLANNED)
+            .pass_stage(DecisionTraceStage.ORDER_SUBMITTED)
+        )
 
     def _result(
         self,
