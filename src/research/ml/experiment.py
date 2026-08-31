@@ -275,17 +275,11 @@ def _bounded_parameters(values: Mapping[str, Any]) -> dict[str, float | int]:
     return result
 
 
-def _build_model(model_name: str, raw_parameters: Mapping[str, Any]):
+def _build_classification_model(model_name: str, values: Mapping[str, float | int]):
     from sklearn.calibration import CalibratedClassifierCV
-    from sklearn.ensemble import (
-        GradientBoostingClassifier,
-        GradientBoostingRegressor,
-        RandomForestClassifier,
-        RandomForestRegressor,
-    )
-    from sklearn.linear_model import ElasticNet, LinearRegression, LogisticRegression
+    from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+    from sklearn.linear_model import LogisticRegression
 
-    values = _bounded_parameters(raw_parameters)
     if model_name == "logistic_regression":
         return LogisticRegression(C=float(values.get("C", 1.0)), random_state=0, max_iter=1_000)
     if model_name == "elastic_net_classifier":
@@ -312,9 +306,14 @@ def _build_model(model_name: str, raw_parameters: Mapping[str, Any]):
             random_state=0,
             n_jobs=1,
         )
-    if model_name == "calibrated_classifier":
-        estimator = LogisticRegression(C=float(values.get("C", 1.0)), random_state=0)
-        return CalibratedClassifierCV(estimator, method="sigmoid", cv=3, n_jobs=1)
+    estimator = LogisticRegression(C=float(values.get("C", 1.0)), random_state=0)
+    return CalibratedClassifierCV(estimator, method="sigmoid", cv=3, n_jobs=1)
+
+
+def _build_regression_model(model_name: str, values: Mapping[str, float | int]):
+    from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+    from sklearn.linear_model import ElasticNet, LinearRegression
+
     if model_name == "linear_regression":
         return LinearRegression(n_jobs=1)
     if model_name == "elastic_net_regressor":
@@ -331,17 +330,20 @@ def _build_model(model_name: str, raw_parameters: Mapping[str, Any]):
             n_estimators=int(values.get("n_estimators", 100)),
             random_state=0,
         )
-    if model_name == "random_forest_regressor":
-        return RandomForestRegressor(
-            max_depth=int(values.get("max_depth", 6)),
-            n_estimators=int(values.get("n_estimators", 200)),
-            random_state=0,
-            n_jobs=1,
-        )
+    return RandomForestRegressor(
+        max_depth=int(values.get("max_depth", 6)),
+        n_estimators=int(values.get("n_estimators", 200)),
+        random_state=0,
+        n_jobs=1,
+    )
+
+
+def _build_lightgbm_model(model_name: str, values: Mapping[str, float | int]):
     try:
         from lightgbm import LGBMClassifier, LGBMRegressor
     except ImportError as exc:
         raise ImportError("LightGBM is required for this model") from exc
+
     common = {
         "learning_rate": float(values.get("learning_rate", 0.05)),
         "max_depth": int(values.get("max_depth", 6)),
@@ -353,6 +355,15 @@ def _build_model(model_name: str, raw_parameters: Mapping[str, Any]):
     return (
         LGBMClassifier(**common) if model_name.endswith("classifier") else LGBMRegressor(**common)
     )
+
+
+def _build_model(model_name: str, raw_parameters: Mapping[str, Any]):
+    values = _bounded_parameters(raw_parameters)
+    if model_name in CLASSIFICATION_MODELS:
+        return _build_classification_model(model_name, values)
+    if model_name in REGRESSION_MODELS:
+        return _build_regression_model(model_name, values)
+    return _build_lightgbm_model(model_name, values)
 
 
 def _metrics(
