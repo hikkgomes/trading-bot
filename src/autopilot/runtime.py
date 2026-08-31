@@ -3452,18 +3452,10 @@ def _accounted_futures_flatten_balance_valid(last: dict[str, Any]) -> bool:
     return abs((quote_after - quote_before) - delta) <= tolerance
 
 
-def _assert_futures_flatten_account_binding(
+def _durable_futures_account_identities(
     product: ProductConfig,
-    broker: Any,
-) -> str:
-    """Bind panic-flatten reads and writes to the durable production account."""
-
-    state, state_error = _read_local_state_for_flatten(product)
-    if state_error or state is None:
-        raise RuntimeError(
-            f"{product.name}: cannot verify account identity before futures flatten: "
-            f"{state_error or 'state reader returned no payload'}"
-        )
+    state: dict[str, Any],
+) -> list[tuple[str, Any]]:
     identities: list[tuple[str, Any]] = []
     positions = state.get("open_positions", {})
     if not isinstance(positions, dict):
@@ -3494,16 +3486,14 @@ def _assert_futures_flatten_account_binding(
                 f"{product.name}: {state_key} must be an object before futures flatten."
             )
         identities.append((state_key, marker.get("broker_account_fingerprint")))
-    if not identities:
-        accounted = _validated_accounted_futures_flatten(product, state)
-        if accounted is not None:
-            identities.append(("last_flatten", accounted["broker_account_fingerprint"]))
-        else:
-            raise RuntimeError(
-                f"{product.name}: no durable broker account identity exists; refusing to read or "
-                "flatten an arbitrary live account."
-            )
-    current = _live_broker_account_fingerprint(product, broker)
+    return identities
+
+
+def _assert_futures_flatten_account_identity(
+    product: ProductConfig,
+    identities: list[tuple[str, Any]],
+    current: str,
+) -> None:
     for label, expected in identities:
         if not _valid_account_fingerprint(expected):
             raise RuntimeError(
@@ -3514,6 +3504,32 @@ def _assert_futures_flatten_account_binding(
                 f"{product.name}: {label} belongs to a different broker account; refusing "
                 "position reads, flatten orders, and local-state mutation."
             )
+
+
+def _assert_futures_flatten_account_binding(
+    product: ProductConfig,
+    broker: Any,
+) -> str:
+    """Bind panic-flatten reads and writes to the durable production account."""
+
+    state, state_error = _read_local_state_for_flatten(product)
+    if state_error or state is None:
+        raise RuntimeError(
+            f"{product.name}: cannot verify account identity before futures flatten: "
+            f"{state_error or 'state reader returned no payload'}"
+        )
+    identities = _durable_futures_account_identities(product, state)
+    if not identities:
+        accounted = _validated_accounted_futures_flatten(product, state)
+        if accounted is not None:
+            identities.append(("last_flatten", accounted["broker_account_fingerprint"]))
+        else:
+            raise RuntimeError(
+                f"{product.name}: no durable broker account identity exists; refusing to read or "
+                "flatten an arbitrary live account."
+            )
+    current = _live_broker_account_fingerprint(product, broker)
+    _assert_futures_flatten_account_identity(product, identities, current)
     return current
 
 
