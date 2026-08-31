@@ -760,3 +760,57 @@ def test_ready_dataset_bundle_rejects_overlapping_intervals(tmp_path) -> None:
             },
             **kwargs,
         )
+
+
+def test_dataset_builder_selects_only_available_bars_for_every_stage(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'bar-datasets.sqlite3'}")
+    database.create_schema()
+    roles = ("screening", "development", "robustness", "protected_holdout")
+    intervals = {
+        role: {
+            "start": f"2026-08-{26 + index:02d}T00:00:00+00:00",
+            "end": f"2026-08-{27 + index:02d}T00:00:00+00:00",
+        }
+        for index, role in enumerate(roles)
+    }
+    identity = "sha256:" + "c" * 64
+    bars = [
+        {
+            "instrument_id": "binance:futures:BTCUSDT:USDT",
+            "close_timestamp": f"2026-08-{26 + index:02d}T12:00:00+00:00",
+            "availability_time": NOW,
+            "close": 100.0 + index,
+        }
+        for index in range(len(roles))
+    ]
+
+    bundle = CanonicalResearchDatasetBuilder(database.engine).build_from_bars(
+        "active_income",
+        bars=bars,
+        intervals=intervals,
+        universe_snapshot_id=identity,
+        feature_manifest_id=identity,
+        cost_model_id=identity,
+        parameter_set_id=identity,
+        instrument_scope=("binance:futures:BTCUSDT:USDT",),
+        created_at=NOW,
+    )
+
+    assert bundle.lifecycle_state is DatasetLifecycleState.READY
+    assert set(bundle.stage_snapshot_ids) == set(roles)
+    for role, snapshot_id in bundle.stage_snapshot_ids.items():
+        payload = SqlDatasetBundleRepository(database.engine).get(bundle.bundle_id)
+        assert payload.stage_snapshot_ids[role] == snapshot_id
+
+    with pytest.raises(DatasetResolutionError, match="data_pending"):
+        CanonicalResearchDatasetBuilder(database.engine).build_from_bars(
+            "active_income",
+            bars=bars[:2],
+            intervals=intervals,
+            universe_snapshot_id=identity,
+            feature_manifest_id=identity,
+            cost_model_id=identity,
+            parameter_set_id=identity,
+            instrument_scope=("binance:futures:BTCUSDT:USDT",),
+            created_at=NOW,
+        )

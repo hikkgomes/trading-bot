@@ -483,6 +483,82 @@ class CanonicalResearchDatasetBuilder:
     def build_bundle(self, product_id: str, **kwargs: Any) -> DatasetBundle:
         return self.build(product_id, **kwargs)
 
+    def build_from_bars(
+        self,
+        product_id: str,
+        *,
+        bars: Any,
+        intervals: Mapping[str, Mapping[str, str]],
+        universe_snapshot_id: str,
+        feature_manifest_id: str,
+        cost_model_id: str,
+        parameter_set_id: str,
+        instrument_scope: tuple[str, ...] | list[str],
+        created_at: str,
+        engine_version: str | None = None,
+        source_partition_hashes: tuple[str, ...] = (),
+    ) -> DatasetBundle:
+        """Build stage snapshots from immutable, availability-stamped bar rows.
+
+        Rows unavailable by ``created_at`` are excluded. A missing role raises
+        an explicit data-pending error so callers cannot advance a candidate
+        with a partial bundle.
+        """
+
+        if isinstance(bars, Mapping) or isinstance(bars, str):
+            raise DatasetResolutionError("bars must be an iterable of row objects")
+        materialised = tuple(dict(row) for row in bars if isinstance(row, Mapping))
+        if not materialised:
+            raise DatasetResolutionError("dataset data_pending: no immutable bars are available")
+        created = timestamp(created_at, field="created_at")
+        scope = {str(item) for item in instrument_scope}
+        payload_by_role: dict[str, Any] = {}
+        availability: dict[str, str] = {}
+        for role, raw_interval in intervals.items():
+            interval = self._interval(raw_interval, field=f"intervals.{role}")
+            selected = []
+            for row in materialised:
+                instrument_id = str(row.get("instrument_id") or row.get("symbol") or "")
+                if instrument_id not in scope:
+                    continue
+                observed = row.get("close_timestamp", row.get("timestamp"))
+                available = row.get("availability_time", row.get("available_at", observed))
+                if observed is None or available is None:
+                    continue
+                observed_at = timestamp(str(observed), field=f"{role}.bar_timestamp")
+                available_at = timestamp(str(available), field=f"{role}.availability_time")
+                if interval["start"] <= observed_at < interval["end"] and available_at <= created:
+                    selected.append(row)
+            if not selected:
+                raise DatasetResolutionError(
+                    f"dataset data_pending: no available bars for role {role}"
+                )
+            selected.sort(
+                key=lambda row: (
+                    str(row.get("close_timestamp", row.get("timestamp"))),
+                    str(row.get("instrument_id", row.get("symbol", ""))),
+                )
+            )
+            payload_by_role[role] = {
+                "bars": selected,
+                "independent_units": len(selected),
+            }
+            availability[role] = created
+        return self.build(
+            product_id,
+            intervals=intervals,
+            payload_by_role=payload_by_role,
+            universe_snapshot_id=universe_snapshot_id,
+            feature_manifest_id=feature_manifest_id,
+            cost_model_id=cost_model_id,
+            parameter_set_id=parameter_set_id,
+            instrument_scope=instrument_scope,
+            availability_timestamp=availability,
+            created_at=created,
+            engine_version=engine_version,
+            source_partition_hashes=source_partition_hashes,
+        )
+
     @staticmethod
     def _interval(value: Mapping[str, str], *, field: str) -> dict[str, str]:
         if not isinstance(value, Mapping) or set(value) != {"start", "end"}:
