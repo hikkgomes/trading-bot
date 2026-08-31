@@ -579,8 +579,7 @@ def _measured_result(
         },
         "drawdown_stability": {
             "passed": bool(return_report.net_returns)
-            and return_report.maximum_drawdown
-            <= float(context.get("maximum_drawdown", 1.0)),
+            and return_report.maximum_drawdown <= float(context.get("maximum_drawdown", 1.0)),
             "maximum_drawdown": return_report.maximum_drawdown,
             "tail_loss": _tail_loss(bootstrap_values),
             "tail_quantile": 0.05,
@@ -1015,6 +1014,9 @@ def _trial_sharpes(
 
 
 def _tunable_parameter_names(candidate: Candidate, context: Mapping[str, Any]) -> tuple[str, ...]:
+    signal_model = candidate.definition.signal_model
+    if isinstance(signal_model, Mapping) and signal_model.get("parameter_free") is True:
+        return ()
     parameters = candidate.definition.signal_model.get("parameters", {})
     declared_tunable = context.get("tunable_parameters")
     if isinstance(declared_tunable, list | tuple):
@@ -1045,7 +1047,7 @@ def _generated_parameter_neighbours(
     frame = context.get("market_frame")
     strategy_name = candidate.definition.signal_model.get("registered_strategy")
     if frame is None or not isinstance(strategy_name, str):
-        return {}
+        return _generated_dsl_parameter_neighbours(candidate, context, parameters)
     neighbours: dict[str, list[float]] = {}
     try:
         for name, value in parameters.items():
@@ -1071,6 +1073,33 @@ def _generated_parameter_neighbours(
                 ]
     except (ExecutorError, KeyError, TypeError, ValueError, StrategyBehaviourError):
         return {}
+    return neighbours
+
+
+def _generated_dsl_parameter_neighbours(
+    candidate: Candidate,
+    context: Mapping[str, Any],
+    parameters: Mapping[str, Any],
+) -> dict[str, list[float]]:
+    rows = context.get("feature_rows")
+    rule = candidate.definition.signal_model.get("rule")
+    if not isinstance(rows, list | tuple) or not isinstance(rule, Mapping):
+        return {}
+    feature = str(rule.get("feature") or "")
+    operator = str(rule.get("operator") or "")
+    if not feature or operator not in {"gt", "ge", "lt", "le"}:
+        return {}
+    threshold = float(parameters.get("threshold", rule.get("threshold", 0.0)))
+    step = max(abs(threshold) * 0.1, 0.1)
+    neighbours: dict[str, list[float]] = {}
+    for direction in (-1, 1):
+        varied_rule = {**dict(rule), "threshold": threshold + direction * step}
+        signals = _dsl_signals(rows, varied_rule)
+        returns = _market_price_returns(context, len(signals))
+        aligned = min(len(returns), max(0, len(signals) - 1))
+        neighbours[f"threshold:{direction:+d}"] = [
+            signals[index] * returns[index] for index in range(aligned)
+        ]
     return neighbours
 
 
@@ -1688,6 +1717,11 @@ def execute_generated_dsl(candidate: Candidate, context: Mapping[str, Any]) -> E
     rule = candidate.definition.signal_model.get("rule")
     if not isinstance(rows, list | tuple) or not isinstance(rule, Mapping):
         raise ExecutorError("DSL execution requires canonical feature_rows and a typed rule")
+    signals = _dsl_signals(rows, rule)
+    return _measured_result(candidate, context, signals)
+
+
+def _dsl_signals(rows: list[Any] | tuple[Any, ...], rule: Mapping[str, Any]) -> tuple[int, ...]:
     feature = str(rule.get("feature", ""))
     operator = str(rule.get("operator", ""))
     raw_threshold = rule.get("threshold")
@@ -1706,8 +1740,10 @@ def execute_generated_dsl(candidate: Candidate, context: Mapping[str, Any]) -> E
     if direction not in {"long", "short", "signed", "market_neutral", "hedged"}:
         raise ExecutorError("DSL rule direction is unsupported")
     sign = -1 if direction == "short" else 1
-    signals = tuple(sign if operations[operator](float(row[feature])) else 0 for row in rows)
-    return _measured_result(candidate, context, signals)
+    try:
+        return tuple(sign if operations[operator](float(row[feature])) else 0 for row in rows)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ExecutorError("DSL rule feature values are invalid") from exc
 
 
 def execute_machine_learning(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:

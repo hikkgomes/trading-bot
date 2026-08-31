@@ -95,6 +95,8 @@ def compile_openclaw_candidate(
             "threshold": threshold,
             "direction": direction,
         },
+        "parameters": {"threshold": threshold},
+        "parameter_free": False,
         "compiler": "openclaw-trusted-compiler/v1",
         "proposal_id": proposal.proposal_id,
     }

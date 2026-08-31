@@ -789,6 +789,8 @@ def _derive_hypothesis(
         "kind": "typed_rule",
         "method": method,
         "rule": rule,
+        "parameters": {"threshold": float(rule["threshold"])},
+        "parameter_free": False,
         "parents": [candidate.candidate_id for candidate in parents],
         "generator_schema": "bounded_hypothesis/v1",
     }
@@ -866,6 +868,8 @@ def build_hypothesis(
         "kind": "typed_rule",
         "campaign": campaign.name,
         "rule": rule,
+        "parameters": {"threshold": float(threshold)},
+        "parameter_free": False,
         "generator_schema": "bounded_hypothesis/v1",
     }
     market_type = MarketType.SPOT if campaign.product == "btc_accumulation" else MarketType.FUTURES
