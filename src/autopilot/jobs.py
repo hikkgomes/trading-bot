@@ -802,12 +802,12 @@ def _record_job_result(
     *,
     state_path: Path,
     scheduler_now: float | None,
+    definition_fingerprint: str,
 ) -> dict[str, Any]:
     if scheduler_now is not None:
         result["started_ts"] = scheduler_now
     previous_entry = state["jobs"].get(job.name, {})
     previous_entry = previous_entry if isinstance(previous_entry, dict) else {}
-    definition_fingerprint = job_definition_fingerprint(job)
     definition_changed = bool(
         previous_entry.get("definition_fingerprint")
         and previous_entry.get("definition_fingerprint") != definition_fingerprint
@@ -856,12 +856,14 @@ def _run_due_job(
     state_path: Path,
     scheduler_now: float | None,
 ) -> dict[str, Any]:
+    definition_fingerprint = job_definition_fingerprint(job)
     return _record_job_result(
         job,
         state,
         run_job(job),
         state_path=state_path,
         scheduler_now=scheduler_now,
+        definition_fingerprint=definition_fingerprint,
     )
 
 

@@ -119,23 +119,18 @@ def _dynamic_symbol_statuses(
     config: AutopilotConfig, symbols: list[str]
 ) -> dict[str, Any]:
     required = required_indicator_features_by_market(["futures"], jobs=config.jobs)["futures"]
-    return {
-        symbol: {
-            "ok": bool(
-                (market_data := build_market_data_status(market="futures", symbol=symbol)).get(
-                    "ok"
-                )
-                and (
-                    indicators := build_indicator_feature_status(
-                        required, market="futures", symbol=symbol
-                    )
-                ).get("ok")
-            ),
+    statuses: dict[str, Any] = {}
+    for symbol in symbols:
+        market_data = build_market_data_status(market="futures", symbol=symbol)
+        indicators = build_indicator_feature_status(
+            required, market="futures", symbol=symbol
+        )
+        statuses[symbol] = {
+            "ok": bool(market_data.get("ok") and indicators.get("ok")),
             "market_data": market_data,
             "indicator_features": indicators,
         }
-        for symbol in symbols
-    }
+    return statuses
 
 
 def _dynamic_universe_readiness(
