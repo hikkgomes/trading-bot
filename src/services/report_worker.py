@@ -12,6 +12,7 @@ from sqlalchemy.engine import Engine
 
 from src.domain._codec import canonical_hash, timestamp
 from src.observability.reports import DatabasePlatformReport
+from src.services.alerting import AlertSeverity, SqlAlertService
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -26,6 +27,8 @@ class DatabaseReportWorker:
         lease_seconds: int = 60,
         account_stale_after_seconds: int = 60,
         market_data_stale_after_seconds: int = 5,
+        alerts: SqlAlertService | None = None,
+        candidate_progress_after_seconds: int = 3_600,
     ) -> None:
         self.report = DatabasePlatformReport(
             engine,
@@ -36,6 +39,10 @@ class DatabaseReportWorker:
         self.queue = queue
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
+        self.alerts = alerts
+        if candidate_progress_after_seconds <= 0:
+            raise ValueError("candidate progress threshold must be positive")
+        self.candidate_progress_after_seconds = candidate_progress_after_seconds
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         now = timestamp(now, field="now")
@@ -70,12 +77,172 @@ class DatabaseReportWorker:
                     pass
             finally:
                 temporary.unlink(missing_ok=True)
+        emitted_alerts = self._emit_sli_alerts(report, now=now)
         result = {
             "reason_code": "operator_report_written",
             "report_hash": report_hash,
             "path": str(destination),
+            "alert_ids": emitted_alerts,
         }
         if claimed is not None and self.queue is not None:
             self.queue.complete(claimed, completed_at=now)
             result["job_id"] = claimed.job_id
         return result
+
+    def _emit_sli_alerts(self, report: dict[str, Any], *, now: str) -> list[str]:
+        if self.alerts is None:
+            return []
+        funnel = report.get("research", {}).get("funnel", {})
+        operations = report.get("operations", {})
+        slis = operations.get("slis", {})
+        emitted: list[str] = []
+        age_by_state = funnel.get("candidate_age_by_state", {})
+        blocking_states = {
+            "queued",
+            "screening",
+            "waiting_for_dataset:screening",
+            "waiting_for_dataset:development",
+            "waiting_for_dataset:robustness",
+            "waiting_for_dataset:protected_holdout",
+        }
+        blocking_age = max(
+            (
+                float(values.get("oldest_seconds", 0.0))
+                for state, values in age_by_state.items()
+                if state in blocking_states and isinstance(values, dict)
+            ),
+            default=0.0,
+        )
+        progressed = sum(
+            int(values.get("count", 0))
+            for state, values in age_by_state.items()
+            if state not in blocking_states and isinstance(values, dict)
+        )
+        if (
+            int(funnel.get("candidates_generated", 0)) > 0
+            and progressed == 0
+            and blocking_age >= self.candidate_progress_after_seconds
+        ):
+            emitted.append(
+                self._emit(
+                    event_type="candidate_funnel_stalled",
+                    severity=AlertSeverity.WARNING,
+                    dedupe_key="research:candidate-funnel-stalled",
+                    target="research",
+                    message="no research candidate has reached development",
+                    now=now,
+                    payload={"oldest_blocking_candidate_seconds": blocking_age},
+                )
+            )
+        if int(funnel.get("missing_stage_dataset_count", 0)) > 0:
+            emitted.append(
+                self._emit(
+                    event_type="research_dataset_missing",
+                    severity=AlertSeverity.WARNING,
+                    dedupe_key="research:missing-stage-dataset",
+                    target="research",
+                    message="research candidates are waiting for missing stage datasets",
+                    now=now,
+                    payload={"missing_stage_datasets": funnel.get("missing_stage_datasets", {})},
+                )
+            )
+        if funnel.get("candidates_without_job_or_reason"):
+            emitted.append(
+                self._emit(
+                    event_type="research_candidate_without_job",
+                    severity=AlertSeverity.CRITICAL,
+                    dedupe_key="research:candidate-without-job",
+                    target="research",
+                    message="research candidates have no active job or waiting reason",
+                    now=now,
+                    payload={
+                        "candidate_ids": funnel["candidates_without_job_or_reason"],
+                    },
+                )
+            )
+        schedule_progress = funnel.get("scheduled_versus_started_jobs", {})
+        if int(schedule_progress.get("not_started", 0)) > 0:
+            emitted.append(
+                self._emit(
+                    event_type="research_schedule_not_started",
+                    severity=AlertSeverity.WARNING,
+                    dedupe_key="research:schedule-not-started",
+                    target="platform-scheduler",
+                    message="scheduled platform jobs have not started",
+                    now=now,
+                    payload={"scheduled_versus_started_jobs": schedule_progress},
+                )
+            )
+        if int(slis.get("unresolved_recovery_count", 0)) > 0:
+            emitted.append(
+                self._emit(
+                    event_type="live_recovery_required",
+                    severity=AlertSeverity.CRITICAL,
+                    dedupe_key="live:recovery-required",
+                    target="execution-engine",
+                    message="live recovery work requires reconciliation",
+                    now=now,
+                    payload={"recovery": slis.get("unresolved_recovery", {})},
+                )
+            )
+        stale_account = slis.get("stale_account_authority", {})
+        if int(stale_account.get("count", 0)) > 0:
+            emitted.append(
+                self._emit(
+                    event_type="account_authority_stale",
+                    severity=AlertSeverity.CRITICAL,
+                    dedupe_key="risk:stale-account-authority",
+                    target="account-reconciliation",
+                    message="authenticated account authority is stale or unknown",
+                    now=now,
+                    payload={"stale_account_authority": stale_account},
+                )
+            )
+        stale_market = slis.get("stale_market_data", {})
+        if int(stale_market.get("count", 0)) > 0:
+            emitted.append(
+                self._emit(
+                    event_type="market_data_stale",
+                    severity=AlertSeverity.CRITICAL,
+                    dedupe_key="risk:stale-market-data",
+                    target="market-gateway",
+                    message="market data authority is stale",
+                    now=now,
+                    payload={"stale_market_data": stale_market},
+                )
+            )
+        conflicts = slis.get("execution_authority_conflicts", {})
+        if conflicts.get("conflict") is True:
+            emitted.append(
+                self._emit(
+                    event_type="execution_authority_conflict",
+                    severity=AlertSeverity.CRITICAL,
+                    dedupe_key="execution:authority-conflict",
+                    target="platform",
+                    message="old and new execution authorities are active together",
+                    now=now,
+                    payload={"execution_authority_conflicts": conflicts},
+                )
+            )
+        return emitted
+
+    def _emit(
+        self,
+        *,
+        event_type: str,
+        severity: AlertSeverity,
+        dedupe_key: str,
+        target: str,
+        message: str,
+        now: str,
+        payload: dict[str, Any],
+    ) -> str:
+        return self.alerts.emit(
+            event_type=event_type,
+            severity=severity,
+            dedupe_key=dedupe_key,
+            target=target,
+            message=message,
+            emitted_at=now,
+            payload=payload,
+        ).alert_id

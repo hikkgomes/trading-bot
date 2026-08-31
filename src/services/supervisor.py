@@ -856,6 +856,7 @@ def _report_cycle(
     root: Path,
     node_id: str,
     risk_configuration: Mapping[str, Any] | None = None,
+    alerts: SqlAlertService | None = None,
 ) -> Callable[[], dict[str, Any]]:
     queue = DatabaseJobQueue(database.engine)
     worker_id = f"{node_id}:report-worker"
@@ -877,6 +878,7 @@ def _report_cycle(
         market_data_stale_after_seconds=int(
             (risk_configuration or {}).get("maximum_market_data_staleness_seconds", 5)
         ),
+        alerts=alerts,
     )
     return lambda: worker.run_once(now=utc_now())
 
@@ -1154,6 +1156,7 @@ def run(args: argparse.Namespace) -> int:
             root=Path(config.paths["reports"]),
             node_id=args.node,
             risk_configuration=split_configuration["risk"],
+            alerts=alerts,
         )
     elif args.service in {"research-worker", "ml-worker", "event-replay-worker"}:
         work = _research_cycle(

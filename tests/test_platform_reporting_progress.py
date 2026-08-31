@@ -13,6 +13,8 @@ from src.data.database import (
     risk_snapshot,
 )
 from src.observability.reports import DatabasePlatformReport
+from src.services.alerting import SqlAlertService
+from src.services.report_worker import DatabaseReportWorker
 from src.services.scheduler import DatabaseJobQueue
 
 NOW = "2026-08-31T10:00:00+00:00"
@@ -180,4 +182,58 @@ def test_report_exposes_funnel_and_operational_sli_state(tmp_path) -> None:
     assert slis["unresolved_recovery_count"] == 1
     assert slis["stale_account_authority"]["count"] == 1
     assert slis["stale_market_data"]["count"] == 1
+    database.dispose()
+
+
+def test_report_worker_alerts_on_funnel_and_live_safety_slis(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'sli-alerts.sqlite3'}")
+    database.create_schema()
+    alerts = SqlAlertService(database.engine, default_cooldown_seconds=0)
+    worker = DatabaseReportWorker(
+        engine=database.engine,
+        root=tmp_path / "reports",
+        alerts=alerts,
+        candidate_progress_after_seconds=60,
+    )
+    worker.report.build = lambda **_kwargs: {
+        "schema": "platform.operator_report/v1",
+        "research": {
+            "funnel": {
+                "candidates_generated": 1,
+                "candidate_age_by_state": {"queued": {"count": 1, "oldest_seconds": 120}},
+                "missing_stage_dataset_count": 1,
+                "missing_stage_datasets": {"development": 1},
+                "candidates_without_job_or_reason": ["candidate-1"],
+                "scheduled_versus_started_jobs": {"not_started": 1},
+            }
+        },
+        "operations": {
+            "slis": {
+                "unresolved_recovery_count": 1,
+                "unresolved_recovery": {"count": 1},
+                "stale_account_authority": {"count": 1},
+                "stale_market_data": {"count": 1},
+                "execution_authority_conflicts": {"conflict": True},
+            }
+        },
+        "trading": {},
+        "products": {},
+    }
+
+    result = worker.run_once(now=NOW)
+
+    assert result["reason_code"] == "operator_report_written"
+    assert {
+        record.event_type for record in alerts.events()
+    } == {
+        "candidate_funnel_stalled",
+        "research_dataset_missing",
+        "research_candidate_without_job",
+        "research_schedule_not_started",
+        "live_recovery_required",
+        "account_authority_stale",
+        "market_data_stale",
+        "execution_authority_conflict",
+    }
+    assert len(result["alert_ids"]) == 8
     database.dispose()
