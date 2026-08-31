@@ -174,6 +174,37 @@ def test_hypothesis_generator_records_and_skips_an_exact_duplicate(tmp_path) -> 
     assert feedback_store.load(campaign=CAMPAIGNS[0].name)[0].outcome == "duplicate_exact"
 
 
+def test_hypothesis_generator_derives_a_bounded_mutation_from_a_duplicate(tmp_path) -> None:
+    database = _database(tmp_path)
+    snapshots = (canonical_hash({"snapshot": "screening"}),)
+    first = build_hypothesis(
+        CAMPAIGNS[2],
+        variant=0,
+        instrument_universe=("BTCUSDT",),
+        dataset_snapshot_hashes=snapshots,
+        submitted_at=NOW,
+    )
+    SqlThesisRegistry(database.engine).register(first.thesis)
+    ResearchCoordinator(SqlResearchStore(database.engine)).submit(first.candidate)
+
+    generated = HypothesisGenerator(
+        product="active_income",
+        instrument_universe=("BTCUSDT",),
+        memory=SqlHypothesisMemory(database.engine),
+    ).generate(
+        dataset_snapshot_hashes=snapshots,
+        submitted_at=NOW,
+        total_budget=1,
+        campaigns=(CAMPAIGNS[2],),
+        parent_candidates=(first.candidate,),
+    )
+
+    assert len(generated) == 1
+    assert generated[0].candidate.provider == "bounded_hypothesis_mutation"
+    assert generated[0].candidate.definition.metadata["generated_method"] == "mutation"
+    assert generated[0].thesis.parent_thesis_ids == (first.thesis.thesis_id,)
+
+
 def test_generation_worker_persists_a_typed_dataset_plan(tmp_path) -> None:
     database = _database(tmp_path)
     identity = {

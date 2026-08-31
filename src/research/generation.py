@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from sqlalchemy import insert, select
@@ -589,6 +589,7 @@ class HypothesisGenerator:
         dataset_bundle_id: str | None = None,
         universe_snapshot_id: str | None = None,
         parent_thesis_ids: tuple[str, ...] = (),
+        parent_candidates: Sequence[Candidate] = (),
     ) -> tuple[GeneratedHypothesis, ...]:
         selected = tuple(
             campaign for campaign in (campaigns or CAMPAIGNS) if campaign.product == self.product
@@ -616,6 +617,22 @@ class HypothesisGenerator:
                 )
                 match = self.memory.find(hypothesis.candidate) if self.memory is not None else None
                 if match is not None:
+                    derived = _derive_duplicate_hypothesis(
+                        hypothesis,
+                        match=match,
+                        parent_candidates=parent_candidates,
+                        submitted_at=submitted_at,
+                    )
+                    if derived is not None:
+                        derived_match = (
+                            self.memory.find(derived.candidate, maximum_distance=0.0)
+                            if self.memory is not None
+                            else None
+                        )
+                        if derived_match is None:
+                            generated.append(derived)
+                            self._record_outcome(derived, "generated", submitted_at)
+                            continue
                     self._record_duplicate(hypothesis, match, submitted_at)
                     continue
                 generated.append(hypothesis)
@@ -702,6 +719,118 @@ def campaign_thesis(
         cumulative_trial_budget=campaign.cumulative_trial_budget,
         created_at=created_at,
         creator_identity="bounded-hypothesis-generator/v1",
+    )
+
+
+def _derive_duplicate_hypothesis(
+    base: GeneratedHypothesis,
+    *,
+    match: DuplicateMatch,
+    parent_candidates: Sequence[Candidate],
+    submitted_at: str,
+) -> GeneratedHypothesis | None:
+    parents = tuple(
+        candidate
+        for candidate in parent_candidates
+        if candidate.definition.product == base.campaign.product
+        and candidate.definition.family == base.campaign.family
+        and isinstance(candidate.definition.signal_model.get("rule"), Mapping)
+    )
+    if not parents:
+        return None
+    if len(parents) >= 2 and match.kind == "near":
+        return _derive_hypothesis(
+            base,
+            parents=parents[:2],
+            method="crossover",
+            submitted_at=submitted_at,
+        )
+    return _derive_hypothesis(
+        base,
+        parents=(parents[0],),
+        method="mutation",
+        submitted_at=submitted_at,
+    )
+
+
+def _derive_hypothesis(
+    base: GeneratedHypothesis,
+    *,
+    parents: tuple[Candidate, ...],
+    method: str,
+    submitted_at: str,
+) -> GeneratedHypothesis:
+    if method not in {"mutation", "crossover"} or not parents:
+        raise GenerationError("unsupported derived hypothesis method")
+    rules = [
+        dict(candidate.definition.signal_model["rule"])
+        for candidate in parents
+        if isinstance(candidate.definition.signal_model.get("rule"), Mapping)
+    ]
+    if len(rules) != len(parents):
+        raise GenerationError("derived hypotheses need executable parent rules")
+    if method == "mutation":
+        rule = dict(rules[0])
+        threshold = float(rule.get("threshold", base.campaign.thresholds[0]))
+        step = max(abs(threshold) * 0.1, 0.1)
+        rule["threshold"] = threshold + step
+    else:
+        rule = {
+            "feature": base.campaign.feature,
+            "operator": base.campaign.operator,
+            "threshold": sum(float(item.get("threshold", 0.0)) for item in rules) / len(rules),
+            "direction": (
+                rules[0].get("direction")
+                if all(item.get("direction") == rules[0].get("direction") for item in rules)
+                else "signed"
+            ),
+        }
+    source_payload = {
+        "kind": "typed_rule",
+        "method": method,
+        "rule": rule,
+        "parents": [candidate.candidate_id for candidate in parents],
+        "generator_schema": "bounded_hypothesis/v1",
+    }
+    identity = f"{method}:{base.campaign.name}:{canonical_hash(source_payload).removeprefix('sha256:')[:16]}"
+    definition = replace(
+        base.candidate.definition,
+        identity=identity,
+        version=f"{method}-v1",
+        signal_model=source_payload,
+        source_type=StrategySourceType.GENERATED_DSL,
+        source_hash=canonical_hash(source_payload),
+        metadata={
+            **dict(base.candidate.definition.metadata),
+            "generated_method": method,
+            "parent_candidate_ids": [candidate.candidate_id for candidate in parents],
+            "promotable": True,
+        },
+    )
+    thesis = campaign_thesis(
+        base.campaign,
+        instrument_universe=tuple(base.candidate.definition.universe.get("symbols", ())),
+        created_at=submitted_at,
+        parent_thesis_ids=tuple(dict.fromkeys(candidate.thesis_id for candidate in parents)),
+    )
+    candidate = replace(
+        base.candidate,
+        definition=definition,
+        thesis_id=thesis.thesis_id,
+        lineage_id=canonical_hash(
+            {
+                "method": method,
+                "parents": [candidate.lineage_id for candidate in parents],
+                "thesis_id": thesis.thesis_id,
+            }
+        ),
+        provider=f"bounded_hypothesis_{method}",
+    )
+    return GeneratedHypothesis(
+        campaign=base.campaign,
+        thesis=thesis,
+        candidate=candidate,
+        semantic_signature=hypothesis_signature(definition),
     )
 
 

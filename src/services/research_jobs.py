@@ -280,6 +280,7 @@ class DatabaseResearchJobHandlers:
             memory=SqlHypothesisMemory(self.store.engine),
             feedback_store=feedback_store,
         )
+        parent_candidates = SqlResearchStore(self.store.engine).load_candidates()
         hypotheses = generator.generate(
             dataset_snapshot_hashes=snapshot_ids,
             submitted_at=str(payload["submitted_at"]),
@@ -292,6 +293,7 @@ class DatabaseResearchJobHandlers:
                 if payload.get("universe_snapshot_id")
                 else None
             ),
+            parent_candidates=parent_candidates,
         )
         bundle_id = payload.get("dataset_bundle_id")
         plan = None
