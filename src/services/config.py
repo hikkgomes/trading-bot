@@ -477,7 +477,11 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
         if product_id == "btc_accumulation":
             if accounts[account_id].get("market") != "spot":
                 raise ValueError("BTC accumulation must use a spot account")
-            for field in ("btc_core_fraction", "btc_max_tactical_fraction"):
+            for field in (
+                "btc_core_fraction",
+                "btc_max_tactical_fraction",
+                "btc_minimum_fraction",
+            ):
                 value = product.get(field)
                 if (
                     not isinstance(value, int | float)
@@ -493,6 +497,8 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
                 raise ValueError(
                     "BTC accumulation tactical allocation needs a positive neutral BTC fraction"
                 )
+            if float(product["btc_minimum_fraction"]) > float(product["btc_core_fraction"]):
+                raise ValueError("BTC minimum fraction cannot exceed the neutral BTC fraction")
     research = configuration["research"]
     permissions = _mapping(research.get("agent_permissions"), field="agent_permissions")
     if permissions.get("submit_exchange_orders") is not False:

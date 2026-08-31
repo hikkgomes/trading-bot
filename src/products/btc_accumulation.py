@@ -26,7 +26,13 @@ class BtcAllocationPolicy:
         if not 0 <= self.max_tactical_fraction <= 1:
             raise ValueError("max_tactical_fraction must be in [0, 1]")
         if self.core_btc_fraction == 0 and self.max_tactical_fraction > 0:
-            raise ValueError("a tactical BTC sleeve needs a positive neutral allocation")
+                raise ValueError("a tactical BTC sleeve needs a positive neutral allocation")
+
+    @property
+    def minimum_btc_fraction(self) -> float:
+        """Lowest BTC fraction reachable by the bounded tactical sleeve."""
+
+        return max(0.0, self.core_btc_fraction - self.max_tactical_fraction)
 
 
 @dataclass(frozen=True)
@@ -52,7 +58,7 @@ def target_btc_allocation(
         contributions[forecast.strategy_version_id] = contribution
     signal = sum(contributions.values())
     tactical = max(-policy.max_tactical_fraction, min(policy.max_tactical_fraction, signal))
-    minimum_target = max(0.0, policy.core_btc_fraction - policy.max_tactical_fraction)
+    minimum_target = policy.minimum_btc_fraction
     target = max(minimum_target, min(1.0, policy.core_btc_fraction + tactical))
     return BtcAllocationTarget(
         target_btc_fraction=target,

@@ -141,7 +141,13 @@ class DatabaseEmergencyFlattenWorker:
             if venue is None:
                 raise ValueError(f"no emergency venue for {product_id}")
             if order.status in {OrderStatus.CREATED, OrderStatus.VALIDATED, OrderStatus.PERSISTED}:
-                self.order_manager.recovery_required(order.order_id)
+                terminal = (
+                    OrderStatus.REJECTED
+                    if order.status in {OrderStatus.CREATED, OrderStatus.VALIDATED}
+                    else OrderStatus.EXPIRED
+                )
+                self.order_manager.transition(order.order_id, terminal, event_at=now)
+                cancelled += 1
                 continue
             if not hasattr(venue, "cancel"):
                 self.order_manager.recovery_required(order.order_id)
@@ -227,8 +233,13 @@ class DatabaseEmergencyFlattenWorker:
     def _reduction_quantity(self, product_id: str, instrument_id: str, quantity: float) -> float:
         if product_id != "btc_accumulation":
             return abs(quantity)
-        core_fraction = _bounded_fraction(self.products[product_id].get("btc_core_fraction", 1.0))
-        return abs(quantity) * (1.0 - core_fraction)
+        product = self.products[product_id]
+        minimum_fraction = product.get("btc_minimum_fraction")
+        if minimum_fraction is None:
+            core_fraction = _bounded_fraction(product.get("btc_core_fraction", 1.0))
+            tactical_fraction = _bounded_fraction(product.get("btc_max_tactical_fraction", 0.0))
+            minimum_fraction = max(0.0, core_fraction - tactical_fraction)
+        return abs(quantity) * (1.0 - _bounded_fraction(minimum_fraction))
 
     def _emit_alert(
         self,

@@ -19,6 +19,7 @@
       "accounting_policy": "btc_nav",
       "btc_core_fraction": 1.0,
       "btc_max_tactical_fraction": 0.3,
+      "btc_minimum_fraction": 0.7,
       "execution_costs": {"fee_bps": 10.0, "slippage_bps": 2.0},
       "execution_mode": "paper"
     },
