@@ -129,11 +129,18 @@ def _risk(product: ProductConfig) -> dict[str, Any]:
     }
 
 
-def build_reviewable_artifact(
-    trial: Mapping[str, Any],
-    product: ProductConfig,
-) -> dict[str, Any]:
-    """Convert an eligible protected-holdout result to a reviewable artifact."""
+def _candidate_context(
+    trial: Mapping[str, Any], product: ProductConfig
+) -> tuple[
+    Mapping[str, Any],
+    Mapping[str, Any],
+    Mapping[str, Any],
+    dict[str, Any],
+    FrozenGradientBoostingModel,
+    Mapping[str, Any],
+    dict[str, Any],
+    str,
+]:
     if trial.get("holdout_eligible") is not True:
         raise MlCandidateArtifactError("trial did not pass the protected holdout")
     protected = trial.get("protected_holdout")
@@ -170,6 +177,18 @@ def build_reviewable_artifact(
     experiment_id = str(trial.get("experiment_id") or "")
     if not SAFE_ID_RE.fullmatch(experiment_id):
         raise MlCandidateArtifactError("experiment_id is unsafe")
+    return protected, forward, spec, frozen, model, metrics_raw, metrics, experiment_id
+
+
+def _build_strategies(
+    product: ProductConfig,
+    spec: Mapping[str, Any],
+    frozen: dict[str, Any],
+    model: FrozenGradientBoostingModel,
+    metrics_raw: Mapping[str, Any],
+    metrics: dict[str, Any],
+    experiment_id: str,
+) -> list[dict[str, Any]]:
     directions = ("short",) if product.objective == "btc_accumulation" else ("long", "short")
     strategies = []
     for rank, direction in enumerate(directions, start=1):
@@ -202,6 +221,20 @@ def build_reviewable_artifact(
         if win_rate is not None and 0 < _finite(win_rate, "holdout win_rate") < 1:
             strategy["baseline_win_rate"] = float(win_rate)
         strategies.append(strategy)
+    return strategies
+
+
+def build_reviewable_artifact(
+    trial: Mapping[str, Any],
+    product: ProductConfig,
+) -> dict[str, Any]:
+    """Convert an eligible protected-holdout result to a reviewable artifact."""
+    protected, forward, spec, frozen, model, metrics_raw, metrics, experiment_id = (
+        _candidate_context(trial, product)
+    )
+    strategies = _build_strategies(
+        product, spec, frozen, model, metrics_raw, metrics, experiment_id
+    )
     artifact = {
         "version": 3,
         "generated_at": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
