@@ -651,14 +651,80 @@ def _config_path_collision_errors(config: AutopilotConfig) -> list[str]:
     return errors
 
 
-def validate_config(
-    config: AutopilotConfig,
-    *,
-    require_core_products: bool = False,
-    require_core_jobs: bool = False,
-    verify_job_imports: bool = False,
-    validate_jobs: bool = True,
+def _product_path_errors(
+    product: ProductConfig,
+    product_paths: dict[str, dict[Path, str]],
 ) -> list[str]:
+    errors: list[str] = []
+    for field_name, seen_paths in product_paths.items():
+        path = getattr(product, field_name)
+        if path is None:
+            continue
+        if field_name == "testnet_rehearsal_report" and not product.require_testnet_rehearsal:
+            continue
+        normalized = path.resolve(strict=False)
+        if normalized in seen_paths:
+            errors.append(
+                f"{product.name}: {field_name} duplicates {seen_paths[normalized]}: {path}"
+            )
+        else:
+            seen_paths[normalized] = product.name
+    return errors
+
+
+def _product_identity_errors(product: ProductConfig) -> list[str]:
+    errors: list[str] = []
+    if product.objective not in {"btc_accumulation", "active_income"}:
+        errors.append(
+            f"{product.name}: objective must be 'btc_accumulation' or 'active_income'"
+        )
+    if product.market not in {"spot", "futures"}:
+        errors.append(f"{product.name}: market must be 'spot' or 'futures'")
+    if product.execution_mode not in {"paper", "live"}:
+        errors.append(f"{product.name}: execution_mode must be 'paper' or 'live'")
+    if product.objective == "btc_accumulation" and product.base_asset.upper() != "BTC":
+        errors.append(f"{product.name}: btc_accumulation must use base_asset BTC")
+    if product.objective == "active_income" and product.base_asset.upper() != "USDT":
+        errors.append(f"{product.name}: active_income must use base_asset USDT")
+    if product.objective == "btc_accumulation" and product.market != "spot":
+        errors.append(f"{product.name}: BTC accumulation must use spot market")
+    if product.objective == "active_income" and product.market != "futures":
+        errors.append(f"{product.name}: active income must use futures market")
+    errors.extend(validate_product_symbol_policy(product))
+    return errors
+
+
+def _product_gate_errors(product: ProductConfig) -> list[str]:
+    errors: list[str] = []
+    if product.preflight_max_age_seconds <= 0:
+        errors.append(f"{product.name}: preflight_max_age_seconds must be positive")
+    if product.testnet_rehearsal_max_age_seconds <= 0:
+        errors.append(f"{product.name}: testnet_rehearsal_max_age_seconds must be positive")
+    if product.execution_mode == "live" and not product.require_preflight:
+        errors.append(f"{product.name}: live execution requires require_preflight=true")
+    if product.execution_mode == "live" and product.preflight_report is None:
+        errors.append(f"{product.name}: live execution requires a preflight_report path")
+    if product.require_testnet_rehearsal and product.objective != "active_income":
+        errors.append(
+            f"{product.name}: testnet rehearsal gate is only supported for active_income futures"
+        )
+    if product.require_testnet_rehearsal and product.testnet_rehearsal_report is None:
+        errors.append(
+            f"{product.name}: testnet rehearsal gate requires a testnet_rehearsal_report path"
+        )
+    if (
+        product.execution_mode == "live"
+        and product.objective == "active_income"
+        and product.market == "futures"
+        and not product.require_testnet_rehearsal
+    ):
+        errors.append(
+            f"{product.name}: active-income live execution requires require_testnet_rehearsal=true"
+        )
+    return errors
+
+
+def _validate_products(config: AutopilotConfig) -> list[str]:
     errors: list[str] = []
     names: set[str] = set()
     product_paths: dict[str, dict[Path, str]] = {
@@ -672,61 +738,14 @@ def validate_config(
         if product.name in names:
             errors.append(f"duplicate product name: {product.name}")
         names.add(product.name)
-        for field_name, seen_paths in product_paths.items():
-            path = getattr(product, field_name)
-            if path is None:
-                continue
-            if field_name == "testnet_rehearsal_report" and not product.require_testnet_rehearsal:
-                continue
-            normalized = path.resolve(strict=False)
-            if normalized in seen_paths:
-                errors.append(
-                    f"{product.name}: {field_name} duplicates {seen_paths[normalized]}: {path}"
-                )
-            else:
-                seen_paths[normalized] = product.name
-        if product.objective not in {"btc_accumulation", "active_income"}:
-            errors.append(
-                f"{product.name}: objective must be 'btc_accumulation' or 'active_income'"
-            )
-        if product.market not in {"spot", "futures"}:
-            errors.append(f"{product.name}: market must be 'spot' or 'futures'")
-        if product.execution_mode not in {"paper", "live"}:
-            errors.append(f"{product.name}: execution_mode must be 'paper' or 'live'")
-        if product.objective == "btc_accumulation" and product.base_asset.upper() != "BTC":
-            errors.append(f"{product.name}: btc_accumulation must use base_asset BTC")
-        if product.objective == "active_income" and product.base_asset.upper() != "USDT":
-            errors.append(f"{product.name}: active_income must use base_asset USDT")
-        if product.objective == "btc_accumulation" and product.market != "spot":
-            errors.append(f"{product.name}: BTC accumulation must use spot market")
-        if product.objective == "active_income" and product.market != "futures":
-            errors.append(f"{product.name}: active income must use futures market")
-        errors.extend(validate_product_symbol_policy(product))
-        if product.preflight_max_age_seconds <= 0:
-            errors.append(f"{product.name}: preflight_max_age_seconds must be positive")
-        if product.testnet_rehearsal_max_age_seconds <= 0:
-            errors.append(f"{product.name}: testnet_rehearsal_max_age_seconds must be positive")
-        if product.execution_mode == "live" and not product.require_preflight:
-            errors.append(f"{product.name}: live execution requires require_preflight=true")
-        if product.execution_mode == "live" and product.preflight_report is None:
-            errors.append(f"{product.name}: live execution requires a preflight_report path")
-        if product.require_testnet_rehearsal and product.objective != "active_income":
-            errors.append(
-                f"{product.name}: testnet rehearsal gate is only supported for active_income futures"
-            )
-        if product.require_testnet_rehearsal and product.testnet_rehearsal_report is None:
-            errors.append(
-                f"{product.name}: testnet rehearsal gate requires a testnet_rehearsal_report path"
-            )
-        if (
-            product.execution_mode == "live"
-            and product.objective == "active_income"
-            and product.market == "futures"
-            and not product.require_testnet_rehearsal
-        ):
-            errors.append(
-                f"{product.name}: active-income live execution requires require_testnet_rehearsal=true"
-            )
+        errors.extend(_product_path_errors(product, product_paths))
+        errors.extend(_product_identity_errors(product))
+        errors.extend(_product_gate_errors(product))
+    return errors
+
+
+def _validate_runtime_limits(config: AutopilotConfig, *, validate_jobs: bool) -> list[str]:
+    errors: list[str] = []
     if config.loop_sleep_seconds <= 0:
         errors.append("loop_sleep_seconds must be positive")
     if validate_jobs and config.max_jobs_per_cycle <= 0:
@@ -740,50 +759,78 @@ def validate_config(
             "run_data_update=true is unsupported because inline downloads can block trading "
             "supervision; use the isolated market_data_update_* jobs"
         )
-    # These are runtime- and product-owned paths, so supervision-only mode must
-    # still reject collisions that could overwrite trading state.
-    errors.extend(_config_path_collision_errors(config))
-    if validate_jobs:
-        job_names: set[str] = set()
-        job_output_paths: dict[Path, str] = {}
-        protected_output_paths = _protected_job_output_paths(config)
-        for job in config.jobs:
-            if job.name in job_names:
-                errors.append(f"duplicate job name: {job.name}")
-            job_names.add(job.name)
-            if job.cadence_seconds <= 0:
-                errors.append(f"job {job.name}: cadence_seconds must be positive")
-            if job.timeout_seconds <= 0:
-                errors.append(f"job {job.name}: timeout_seconds must be positive")
-            errors.extend(_validate_job_command(job))
-            errors.extend(_job_output_path_errors(job))
-            for flag, path in _job_output_paths(job):
-                normalized = path.resolve(strict=False)
-                owner = f"{job.name} {flag}"
-                if protected_owner := protected_output_paths.get(normalized):
-                    errors.append(
-                        f"job {job.name}: output path {path} for {flag} "
-                        f"targets protected runtime file {protected_owner}"
-                    )
-                elif normalized in job_output_paths:
-                    errors.append(
-                        f"job {job.name}: output path {path} for {flag} "
-                        f"duplicates {job_output_paths[normalized]}"
-                    )
-                else:
-                    job_output_paths[normalized] = owner
-    if validate_jobs and verify_job_imports:
-        verified: set[tuple[Path | None, Path, str | None]] = set()
-        for job in config.jobs:
-            key = (
-                _resolve_job_executable(job),
-                job.working_dir.resolve(strict=False),
-                _job_python_module(job),
+    return errors
+
+
+def _job_output_collision_errors(
+    job: JobConfig,
+    protected_output_paths: dict[Path, str],
+    job_output_paths: dict[Path, str],
+) -> list[str]:
+    errors: list[str] = []
+    for flag, path in _job_output_paths(job):
+        normalized = path.resolve(strict=False)
+        owner = f"{job.name} {flag}"
+        if protected_owner := protected_output_paths.get(normalized):
+            errors.append(
+                f"job {job.name}: output path {path} for {flag} "
+                f"targets protected runtime file {protected_owner}"
             )
-            if key in verified:
-                continue
-            verified.add(key)
-            errors.extend(_validate_python_module_dependencies(job))
+        elif normalized in job_output_paths:
+            errors.append(
+                f"job {job.name}: output path {path} for {flag} "
+                f"duplicates {job_output_paths[normalized]}"
+            )
+        else:
+            job_output_paths[normalized] = owner
+    return errors
+
+
+def _job_validation_errors(job: JobConfig) -> list[str]:
+    errors: list[str] = []
+    if job.cadence_seconds <= 0:
+        errors.append(f"job {job.name}: cadence_seconds must be positive")
+    if job.timeout_seconds <= 0:
+        errors.append(f"job {job.name}: timeout_seconds must be positive")
+    errors.extend(_validate_job_command(job))
+    errors.extend(_job_output_path_errors(job))
+    return errors
+
+
+def _validate_jobs(config: AutopilotConfig) -> list[str]:
+    errors: list[str] = []
+    job_names: set[str] = set()
+    job_output_paths: dict[Path, str] = {}
+    protected_output_paths = _protected_job_output_paths(config)
+    for job in config.jobs:
+        if job.name in job_names:
+            errors.append(f"duplicate job name: {job.name}")
+        job_names.add(job.name)
+        errors.extend(_job_validation_errors(job))
+        errors.extend(
+            _job_output_collision_errors(job, protected_output_paths, job_output_paths)
+        )
+    return errors
+
+
+def _verify_job_imports(config: AutopilotConfig) -> list[str]:
+    errors: list[str] = []
+    verified: set[tuple[Path | None, Path, str | None]] = set()
+    for job in config.jobs:
+        key = (
+            _resolve_job_executable(job),
+            job.working_dir.resolve(strict=False),
+            _job_python_module(job),
+        )
+        if key in verified:
+            continue
+        verified.add(key)
+        errors.extend(_validate_python_module_dependencies(job))
+    return errors
+
+
+def _validate_account_limits(config: AutopilotConfig) -> list[str]:
+    errors: list[str] = []
     if config.alert_cooldown_seconds < 0:
         errors.append("alert_cooldown_seconds must be non-negative")
     if (
@@ -804,6 +851,27 @@ def validate_config(
         value = getattr(config, field)
         if not isinstance(value, int | float) or isinstance(value, bool) or not 0 <= value <= 1:
             errors.append(f"{field} must be in [0, 1]")
+    return errors
+
+
+def validate_config(
+    config: AutopilotConfig,
+    *,
+    require_core_products: bool = False,
+    require_core_jobs: bool = False,
+    verify_job_imports: bool = False,
+    validate_jobs: bool = True,
+) -> list[str]:
+    errors = _validate_products(config)
+    errors.extend(_validate_runtime_limits(config, validate_jobs=validate_jobs))
+    # These are runtime- and product-owned paths, so supervision-only mode must
+    # still reject collisions that could overwrite trading state.
+    errors.extend(_config_path_collision_errors(config))
+    if validate_jobs:
+        errors.extend(_validate_jobs(config))
+    if validate_jobs and verify_job_imports:
+        errors.extend(_verify_job_imports(config))
+    errors.extend(_validate_account_limits(config))
     if require_core_products:
         errors.extend(_core_product_errors(config.products))
     if validate_jobs and require_core_jobs:
@@ -826,41 +894,45 @@ def _core_product_errors(products: list[ProductConfig]) -> list[str]:
     return errors
 
 
-def _core_job_errors(jobs: list[JobConfig]) -> list[str]:
+def _core_job_error_messages(job_name: str, job: JobConfig | None) -> list[str]:
+    if job is None:
+        return [f"missing required job: {job_name}"]
     errors: list[str] = []
-    by_name = {job.name: job for job in jobs}
-    for job_name in REQUIRED_CORE_JOBS:
-        job = by_name.get(job_name)
-        if job is None:
-            errors.append(f"missing required job: {job_name}")
-            continue
-        if not job.enabled:
-            errors.append(f"{job_name}: required job must be enabled")
-        expected_module = REQUIRED_CORE_JOB_MODULES[job_name]
-        actual_module = _job_python_module(job)
-        if actual_module != expected_module:
+    if not job.enabled:
+        errors.append(f"{job_name}: required job must be enabled")
+    expected_module = REQUIRED_CORE_JOB_MODULES[job_name]
+    actual_module = _job_python_module(job)
+    if actual_module != expected_module:
+        errors.append(
+            f"{job_name}: required job must run python module {expected_module}"
+            f" (got {actual_module or 'none'})"
+        )
+    for flag in REQUIRED_CORE_JOB_PRESENCE_FLAGS.get(job_name, ()):
+        if not _job_has_flag(job.command, flag):
+            errors.append(f"{job_name}: required job must include {flag}")
+    for flag in REQUIRED_CORE_JOB_FORBIDDEN_FLAGS.get(job_name, ()):
+        if _job_flag_values(job.command, flag) is not None:
+            errors.append(f"{job_name}: required job must not include {flag}")
+    for flag, required_values in REQUIRED_CORE_JOB_FLAG_VALUES.get(job_name, {}).items():
+        actual_values = _job_flag_values(job.command, flag)
+        if actual_values is None:
             errors.append(
-                f"{job_name}: required job must run python module {expected_module}"
-                f" (got {actual_module or 'none'})"
+                f"{job_name}: required job must include {flag} {' '.join(required_values)}"
             )
-        for flag in REQUIRED_CORE_JOB_PRESENCE_FLAGS.get(job_name, ()):
-            if not _job_has_flag(job.command, flag):
-                errors.append(f"{job_name}: required job must include {flag}")
-        for flag in REQUIRED_CORE_JOB_FORBIDDEN_FLAGS.get(job_name, ()):
-            if _job_flag_values(job.command, flag) is not None:
-                errors.append(f"{job_name}: required job must not include {flag}")
-        for flag, required_values in REQUIRED_CORE_JOB_FLAG_VALUES.get(job_name, {}).items():
-            actual_values = _job_flag_values(job.command, flag)
-            if actual_values is None:
-                errors.append(
-                    f"{job_name}: required job must include {flag} {' '.join(required_values)}"
-                )
-                continue
-            if tuple(actual_values) != required_values:
-                errors.append(
-                    f"{job_name}: required job {flag} must equal {' '.join(required_values)}"
-                    f" (got {' '.join(actual_values) or 'none'})"
-                )
+            continue
+        if tuple(actual_values) != required_values:
+            errors.append(
+                f"{job_name}: required job {flag} must equal {' '.join(required_values)}"
+                f" (got {' '.join(actual_values) or 'none'})"
+            )
+    return errors
+
+
+def _core_job_errors(jobs: list[JobConfig]) -> list[str]:
+    by_name = {job.name: job for job in jobs}
+    errors: list[str] = []
+    for job_name in REQUIRED_CORE_JOBS:
+        errors.extend(_core_job_error_messages(job_name, by_name.get(job_name)))
     return errors
 
 
