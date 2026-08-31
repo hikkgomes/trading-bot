@@ -801,6 +801,32 @@ def _non_negative_float(value: Any) -> float | None:
     return result
 
 
+def _open_position_risk_reasons(position: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    values = {
+        "position_size": _positive_float(position.get("position_size")),
+        "entry_price": _positive_float(position.get("entry_price")),
+        "stop_price": _positive_float(position.get("sl_price")),
+        "target_price": _positive_float(position.get("tp_price")),
+    }
+    reasons.extend(f"invalid_{name}" for name, value in values.items() if value is None)
+    direction = str(position.get("direction") or "").lower()
+    if direction not in {"long", "short"}:
+        reasons.append("invalid_direction")
+    elif all(values[name] is not None for name in ("entry_price", "stop_price", "target_price")):
+        entry_price = values["entry_price"]
+        sl_price = values["stop_price"]
+        tp_price = values["target_price"]
+        valid_order = (
+            sl_price < entry_price < tp_price
+            if direction == "long"
+            else tp_price < entry_price < sl_price
+        )
+        if not valid_order:
+            reasons.append(f"invalid_{direction}_stop_target_order")
+    return reasons
+
+
 def _open_position_risk_issues(
     operator_report: dict[str, Any], *, mode: str
 ) -> list[dict[str, Any]]:
@@ -811,27 +837,7 @@ def _open_position_risk_issues(
         for position in product.get("open_position_details", []) or []:
             if not isinstance(position, dict):
                 continue
-            reasons: list[str] = []
-            position_size = _positive_float(position.get("position_size"))
-            entry_price = _positive_float(position.get("entry_price"))
-            sl_price = _positive_float(position.get("sl_price"))
-            tp_price = _positive_float(position.get("tp_price"))
-            if position_size is None:
-                reasons.append("invalid_position_size")
-            if entry_price is None:
-                reasons.append("invalid_entry_price")
-            if sl_price is None:
-                reasons.append("invalid_stop_price")
-            if tp_price is None:
-                reasons.append("invalid_target_price")
-            direction = str(position.get("direction") or "").lower()
-            if direction not in {"long", "short"}:
-                reasons.append("invalid_direction")
-            elif entry_price is not None and sl_price is not None and tp_price is not None:
-                if direction == "long" and not (sl_price < entry_price < tp_price):
-                    reasons.append("invalid_long_stop_target_order")
-                if direction == "short" and not (tp_price < entry_price < sl_price):
-                    reasons.append("invalid_short_stop_target_order")
+            reasons = _open_position_risk_reasons(position)
             if reasons:
                 risk_issues.append(
                     {
@@ -858,6 +864,98 @@ def _paper_open_position_risk_issues(operator_report: dict[str, Any]) -> list[di
     return _open_position_risk_issues(operator_report, mode="paper")
 
 
+def _live_broker_position_reasons(product: dict[str, Any], position: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    broker_symbol = position.get("broker_symbol")
+    if not isinstance(broker_symbol, str) or not broker_symbol:
+        reasons.append("invalid_broker_symbol")
+    broker_side = str(position.get("broker_side") or "").lower()
+    if broker_side not in {"buy", "sell"}:
+        reasons.append("invalid_broker_side")
+    direction = str(position.get("direction") or "").lower()
+    if (direction == "long" and broker_side != "buy") or (
+        direction == "short" and broker_side != "sell"
+    ):
+        reasons.append("broker_side_direction_mismatch")
+    for field, validator in (
+        ("broker_qty", _positive_float),
+        ("broker_entry_price", _positive_float),
+        ("broker_entry_fee", _non_negative_float),
+        ("broker_requested_qty", _positive_float),
+        ("broker_fill_ratio", _positive_float),
+    ):
+        if validator(position.get(field)) is None:
+            reasons.append(f"invalid_{field}")
+    fill_ratio = _positive_float(position.get("broker_fill_ratio"))
+    if fill_ratio is not None and abs(fill_ratio - 1.0) > 1e-6:
+        reasons.append("broker_fill_ratio_not_complete")
+    broker_qty = _positive_float(position.get("broker_qty"))
+    requested_qty = _positive_float(position.get("broker_requested_qty"))
+    if (
+        broker_qty is not None
+        and requested_qty is not None
+        and abs(broker_qty - requested_qty) > max(requested_qty * 1e-6, 1e-9)
+    ):
+        reasons.append("broker_qty_mismatch_requested")
+    if product.get("market") == "futures":
+        reasons.extend(_futures_broker_position_reasons(position))
+    if product.get("objective") == "btc_accumulation" and product.get("market") == "spot":
+        reasons.extend(_spot_broker_position_reasons(position, direction))
+    return reasons
+
+
+def _futures_broker_position_reasons(position: dict[str, Any]) -> list[str]:
+    reasons = []
+    if _positive_float(position.get("broker_entry_balance")) is None:
+        reasons.append("invalid_broker_entry_balance")
+    for field in ("broker_stop_order_id", "broker_stop_client_id"):
+        value = position.get(field)
+        if not isinstance(value, str) or not value.strip():
+            reasons.append(f"invalid_{field}")
+    stop_trigger = _positive_float(position.get("broker_stop_trigger_price"))
+    if stop_trigger is None:
+        reasons.append("invalid_broker_stop_trigger_price")
+    else:
+        strategy_stop = _positive_float(position.get("sl_price"))
+        if strategy_stop is not None and abs(stop_trigger - strategy_stop) > max(
+            strategy_stop * 1e-9, 1e-12
+        ):
+            reasons.append("broker_stop_trigger_mismatch_strategy_stop")
+    return reasons
+
+
+def _spot_broker_position_reasons(position: dict[str, Any], direction: str) -> list[str]:
+    reasons = []
+    if direction == "short" and position.get("broker_exit_sizing") != "quote_reinvest":
+        reasons.append("invalid_spot_step_aside_exit_sizing")
+    if direction == "short" and _positive_float(position.get("broker_entry_quote_value")) is None:
+        reasons.append("invalid_spot_step_aside_quote_value")
+    return reasons
+
+
+def _live_broker_issue_detail(
+    product: dict[str, Any], position: dict[str, Any], reasons: list[str]
+) -> dict[str, Any]:
+    return {
+        "product": product.get("name"),
+        "objective": product.get("objective"),
+        "market": product.get("market"),
+        "strategy_id": position.get("strategy_id"),
+        "direction": position.get("direction"),
+        "broker_symbol": position.get("broker_symbol"),
+        "broker_side": position.get("broker_side"),
+        "broker_qty": position.get("broker_qty"),
+        "broker_requested_qty": position.get("broker_requested_qty"),
+        "broker_fill_ratio": position.get("broker_fill_ratio"),
+        "broker_entry_fee": position.get("broker_entry_fee"),
+        "broker_entry_balance": position.get("broker_entry_balance"),
+        "broker_stop_order_id": position.get("broker_stop_order_id"),
+        "broker_stop_client_id": position.get("broker_stop_client_id"),
+        "broker_stop_trigger_price": position.get("broker_stop_trigger_price"),
+        "reasons": reasons,
+    }
+
+
 def _live_open_position_broker_issues(operator_report: dict[str, Any]) -> list[dict[str, Any]]:
     broker_issues = []
     for product in _dict_list(operator_report, "products"):
@@ -872,90 +970,9 @@ def _live_open_position_broker_issues(operator_report: dict[str, Any]) -> list[d
         for position in product.get("open_position_details", []) or []:
             if not isinstance(position, dict):
                 continue
-            reasons: list[str] = []
-            broker_symbol = position.get("broker_symbol")
-            if not isinstance(broker_symbol, str) or not broker_symbol:
-                reasons.append("invalid_broker_symbol")
-            broker_side = str(position.get("broker_side") or "").lower()
-            if broker_side not in {"buy", "sell"}:
-                reasons.append("invalid_broker_side")
-            direction = str(position.get("direction") or "").lower()
-            if direction == "long" and broker_side != "buy":
-                reasons.append("broker_side_direction_mismatch")
-            if direction == "short" and broker_side != "sell":
-                reasons.append("broker_side_direction_mismatch")
-            broker_qty = _positive_float(position.get("broker_qty"))
-            if broker_qty is None:
-                reasons.append("invalid_broker_qty")
-            broker_entry_price = _positive_float(position.get("broker_entry_price"))
-            if broker_entry_price is None:
-                reasons.append("invalid_broker_entry_price")
-            broker_entry_fee = _non_negative_float(position.get("broker_entry_fee"))
-            if broker_entry_fee is None:
-                reasons.append("invalid_broker_entry_fee")
-            requested_qty = _positive_float(position.get("broker_requested_qty"))
-            if requested_qty is None:
-                reasons.append("invalid_broker_requested_qty")
-            fill_ratio = _positive_float(position.get("broker_fill_ratio"))
-            if fill_ratio is None:
-                reasons.append("invalid_broker_fill_ratio")
-            elif abs(fill_ratio - 1.0) > 1e-6:
-                reasons.append("broker_fill_ratio_not_complete")
-            if (
-                broker_qty is not None
-                and requested_qty is not None
-                and abs(broker_qty - requested_qty) > max(requested_qty * 1e-6, 1e-9)
-            ):
-                reasons.append("broker_qty_mismatch_requested")
-            if product.get("market") == "futures":
-                if _positive_float(position.get("broker_entry_balance")) is None:
-                    reasons.append("invalid_broker_entry_balance")
-                stop_order_id = position.get("broker_stop_order_id")
-                if not isinstance(stop_order_id, str) or not stop_order_id.strip():
-                    reasons.append("invalid_broker_stop_order_id")
-                stop_client_id = position.get("broker_stop_client_id")
-                if not isinstance(stop_client_id, str) or not stop_client_id.strip():
-                    reasons.append("invalid_broker_stop_client_id")
-                stop_trigger = _positive_float(position.get("broker_stop_trigger_price"))
-                if stop_trigger is None:
-                    reasons.append("invalid_broker_stop_trigger_price")
-                else:
-                    strategy_stop = _positive_float(position.get("sl_price"))
-                    if strategy_stop is not None and abs(stop_trigger - strategy_stop) > max(
-                        strategy_stop * 1e-9,
-                        1e-12,
-                    ):
-                        reasons.append("broker_stop_trigger_mismatch_strategy_stop")
-            if product.get("objective") == "btc_accumulation" and product.get("market") == "spot":
-                exit_sizing = position.get("broker_exit_sizing")
-                if direction == "short" and exit_sizing != "quote_reinvest":
-                    reasons.append("invalid_spot_step_aside_exit_sizing")
-                if (
-                    direction == "short"
-                    and _positive_float(position.get("broker_entry_quote_value")) is None
-                ):
-                    reasons.append("invalid_spot_step_aside_quote_value")
+            reasons = _live_broker_position_reasons(product, position)
             if reasons:
-                broker_issues.append(
-                    {
-                        "product": product.get("name"),
-                        "objective": product.get("objective"),
-                        "market": product.get("market"),
-                        "strategy_id": position.get("strategy_id"),
-                        "direction": position.get("direction"),
-                        "broker_symbol": position.get("broker_symbol"),
-                        "broker_side": position.get("broker_side"),
-                        "broker_qty": position.get("broker_qty"),
-                        "broker_requested_qty": position.get("broker_requested_qty"),
-                        "broker_fill_ratio": position.get("broker_fill_ratio"),
-                        "broker_entry_fee": position.get("broker_entry_fee"),
-                        "broker_entry_balance": position.get("broker_entry_balance"),
-                        "broker_stop_order_id": position.get("broker_stop_order_id"),
-                        "broker_stop_client_id": position.get("broker_stop_client_id"),
-                        "broker_stop_trigger_price": position.get("broker_stop_trigger_price"),
-                        "reasons": reasons,
-                    }
-                )
+                broker_issues.append(_live_broker_issue_detail(product, position, reasons))
     return broker_issues
 
 
@@ -1067,21 +1084,11 @@ def _paper_open_position_visibility_issues(operator_report: dict[str, Any]) -> l
     return _open_position_visibility_issues(operator_report, mode="paper")
 
 
-def evaluate_health(
+def _health_runtime_checks(
     operator_report: dict[str, Any],
-    *,
-    readiness_report: dict[str, Any] | None = None,
-    fail_on_job_failures: bool = True,
-    fail_on_job_overdue: bool = True,
-    now_ts: float | None = None,
-    max_backup_age_seconds: float | None = None,
-    max_consecutive_job_deferrals: int = 16,
-) -> dict[str, Any]:
-    """Convert report payloads into a compact health status and issue list."""
-
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     issues: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
-    now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.UTC).timestamp()
     malformed_sections = [
         detail
         for key in ("products", "jobs", "scheduled_jobs")
@@ -1155,6 +1162,14 @@ def evaluate_health(
                 detail=reporting_failure,
             )
         )
+    return issues, warnings
+
+
+def _health_market_checks(
+    operator_report: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    issues: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
     artifact_hygiene = operator_report.get("artifact_hygiene")
     if (
         isinstance(artifact_hygiene, dict)
@@ -1198,97 +1213,117 @@ def evaluate_health(
                 detail=market_data_issue,
             )
         )
-    live_state_errors = _product_state_error_details(operator_report, mode="live")
-    if live_state_errors:
-        issues.append(
-            _issue(
-                "live_product_state_invalid",
-                "one or more live products reported invalid local state",
-                detail={"products": live_state_errors},
-            )
-        )
-    paper_state_errors = _product_state_error_details(operator_report, mode="paper")
-    if paper_state_errors:
-        warnings.append(
-            _issue(
-                "paper_product_state_invalid",
-                "one or more paper products reported invalid local state",
-                detail={"products": paper_state_errors},
-            )
-        )
-    live_recovery_states = _product_recovery_state_details(operator_report, mode="live")
-    if live_recovery_states:
-        issues.append(
-            _issue(
-                "live_product_recovery_pending",
-                "one or more live products have unresolved broker intents or safety-recovery incidents",
-                detail={"products": live_recovery_states},
-            )
-        )
-    paper_recovery_states = _product_recovery_state_details(operator_report, mode="paper")
-    if paper_recovery_states:
-        warnings.append(
-            _issue(
-                "paper_product_recovery_pending",
-                "one or more paper products have unresolved broker intents or safety-recovery incidents",
-                detail={"products": paper_recovery_states},
-            )
-        )
-    live_drawdown_halts = _product_drawdown_halt_details(operator_report, mode="live")
-    if live_drawdown_halts:
-        issues.append(
-            _issue(
-                "live_product_drawdown_halted",
-                "one or more live products hit the sticky peak-equity drawdown circuit breaker",
-                detail={"products": live_drawdown_halts},
-            )
-        )
-    paper_drawdown_halts = _product_drawdown_halt_details(operator_report, mode="paper")
-    if paper_drawdown_halts:
-        warnings.append(
-            _issue(
-                "paper_product_drawdown_halted",
-                "one or more paper products hit the sticky peak-equity drawdown circuit breaker",
-                detail={"products": paper_drawdown_halts},
-            )
-        )
-    live_exit_accounting = _product_exit_accounting_intent_details(operator_report, mode="live")
-    if live_exit_accounting:
-        issues.append(
-            _issue(
-                "live_exit_accounting_pending",
-                "one or more live products have an unresolved idempotent exit accounting intent",
-                detail={"products": live_exit_accounting},
-            )
-        )
-    paper_exit_accounting = _product_exit_accounting_intent_details(operator_report, mode="paper")
-    if paper_exit_accounting:
-        warnings.append(
-            _issue(
-                "paper_exit_accounting_pending",
-                "one or more paper products have an unresolved idempotent exit accounting intent",
-                detail={"products": paper_exit_accounting},
-            )
-        )
-    live_trade_log_issues = _product_trade_log_issue_details(operator_report, mode="live")
-    if live_trade_log_issues:
-        issues.append(
-            _issue(
-                "live_trade_log_invalid",
-                "one or more live products have invalid trade-log audit fields",
-                detail={"products": live_trade_log_issues},
-            )
-        )
-    paper_trade_log_issues = _product_trade_log_issue_details(operator_report, mode="paper")
-    if paper_trade_log_issues:
-        warnings.append(
-            _issue(
-                "paper_trade_log_invalid",
-                "one or more paper products have invalid trade-log audit fields",
-                detail={"products": paper_trade_log_issues},
-            )
-        )
-    if readiness_report is not None and readiness_report.get("ok") is not True:
+    return issues, warnings
+
+
+def _health_product_state_checks(
+    operator_report: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    issues: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    state_specs = (
+        (
+            "live",
+            "live_product_state_invalid",
+            "one or more live products reported invalid local state",
+            issues,
+        ),
+        (
+            "paper",
+            "paper_product_state_invalid",
+            "one or more paper products reported invalid local state",
+            warnings,
+        ),
+    )
+    for mode, code, message, target in state_specs:
+        details = _product_state_error_details(operator_report, mode=mode)
+        if details:
+            target.append(_issue(code, message, detail={"products": details}))
+    recovery_specs = (
+        (
+            "live",
+            "live_product_recovery_pending",
+            "one or more live products have unresolved broker intents or safety-recovery incidents",
+            issues,
+        ),
+        (
+            "paper",
+            "paper_product_recovery_pending",
+            "one or more paper products have unresolved broker intents or safety-recovery incidents",
+            warnings,
+        ),
+    )
+    for mode, code, message, target in recovery_specs:
+        details = _product_recovery_state_details(operator_report, mode=mode)
+        if details:
+            target.append(_issue(code, message, detail={"products": details}))
+    return issues, warnings
+
+
+def _health_accounting_checks(
+    operator_report: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    issues: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    specs = (
+        (
+            "live",
+            _product_drawdown_halt_details,
+            "live_product_drawdown_halted",
+            "one or more live products hit the sticky peak-equity drawdown circuit breaker",
+            issues,
+        ),
+        (
+            "paper",
+            _product_drawdown_halt_details,
+            "paper_product_drawdown_halted",
+            "one or more paper products hit the sticky peak-equity drawdown circuit breaker",
+            warnings,
+        ),
+        (
+            "live",
+            _product_exit_accounting_intent_details,
+            "live_exit_accounting_pending",
+            "one or more live products have an unresolved idempotent exit accounting intent",
+            issues,
+        ),
+        (
+            "paper",
+            _product_exit_accounting_intent_details,
+            "paper_exit_accounting_pending",
+            "one or more paper products have an unresolved idempotent exit accounting intent",
+            warnings,
+        ),
+        (
+            "live",
+            _product_trade_log_issue_details,
+            "live_trade_log_invalid",
+            "one or more live products have invalid trade-log audit fields",
+            issues,
+        ),
+        (
+            "paper",
+            _product_trade_log_issue_details,
+            "paper_trade_log_invalid",
+            "one or more paper products have invalid trade-log audit fields",
+            warnings,
+        ),
+    )
+    for mode, builder, code, message, target in specs:
+        details = builder(operator_report, mode=mode)
+        if details:
+            target.append(_issue(code, message, detail={"products": details}))
+    return issues, warnings
+
+
+def _health_readiness_checks(
+    readiness_report: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    issues: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    if readiness_report is None:
+        return issues, warnings
+    if readiness_report.get("ok") is not True:
         blocking_checks = [
             {"name": item.get("name"), "level": item.get("level"), "detail": item.get("detail")}
             for item in _dict_list(readiness_report, "checks")
@@ -1301,29 +1336,36 @@ def evaluate_health(
                 detail={"blocking_checks": blocking_checks},
             )
         )
-    if readiness_report is not None:
-        malformed_readiness_checks = _malformed_dict_list_detail(readiness_report, "checks")
-        if malformed_readiness_checks is not None:
-            issues.append(
-                _issue(
-                    "readiness_report_malformed",
-                    "readiness report has malformed check entries",
-                    detail=malformed_readiness_checks,
-                )
+    malformed = _malformed_dict_list_detail(readiness_report, "checks")
+    if malformed is not None:
+        issues.append(
+            _issue(
+                "readiness_report_malformed",
+                "readiness report has malformed check entries",
+                detail=malformed,
             )
-        warning_checks = [
-            {"name": item.get("name"), "level": item.get("level"), "detail": item.get("detail")}
-            for item in _dict_list(readiness_report, "checks")
-            if item.get("level") == "warning" and not item.get("ok")
-        ]
-        if warning_checks:
-            warnings.append(
-                _issue(
-                    "readiness_warning",
-                    "autopilot readiness has warning-level failures",
-                    detail={"warning_checks": warning_checks},
-                )
+        )
+    warning_checks = [
+        {"name": item.get("name"), "level": item.get("level"), "detail": item.get("detail")}
+        for item in _dict_list(readiness_report, "checks")
+        if item.get("level") == "warning" and not item.get("ok")
+    ]
+    if warning_checks:
+        warnings.append(
+            _issue(
+                "readiness_warning",
+                "autopilot readiness has warning-level failures",
+                detail={"warning_checks": warning_checks},
             )
+        )
+    return issues, warnings
+
+
+def _health_candidate_paper_checks(
+    operator_report: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
     raw_candidate_paper = operator_report.get("candidate_paper")
     candidate_paper = raw_candidate_paper if isinstance(raw_candidate_paper, dict) else {}
     if raw_candidate_paper is not None and not isinstance(raw_candidate_paper, dict):
@@ -1340,10 +1382,7 @@ def evaluate_health(
                 _issue(
                     "candidate_paper_status_missing",
                     "candidate paper cycle is enabled but has not produced a status file",
-                    detail={
-                        "job": candidate_paper.get("job"),
-                        "path": candidate_paper.get("path"),
-                    },
+                    detail={"job": candidate_paper.get("job"), "path": candidate_paper.get("path")},
                 )
             )
         elif candidate_paper.get("ok") is not True:
@@ -1352,21 +1391,21 @@ def evaluate_health(
                     "candidate_paper_unhealthy",
                     "latest staged-candidate paper status is stale, invalid, or failed",
                     detail={
-                        "job": candidate_paper.get("job"),
-                        "path": candidate_paper.get("path"),
-                        "status": candidate_paper.get("status"),
-                        "generated_at": candidate_paper.get("generated_at"),
-                        "age_seconds": candidate_paper.get("age_seconds"),
-                        "max_age_seconds": candidate_paper.get("max_age_seconds"),
-                        "fresh": candidate_paper.get("fresh"),
-                        "reason": candidate_paper.get("reason"),
-                        "error": candidate_paper.get("error"),
-                        "errors": candidate_paper.get("errors") or [],
-                        "open_positions": candidate_paper.get("open_positions"),
-                        "activation_ready_products": candidate_paper.get(
-                            "activation_ready_products"
+                        key: candidate_paper.get(key)
+                        for key in (
+                            "job",
+                            "path",
+                            "status",
+                            "generated_at",
+                            "age_seconds",
+                            "max_age_seconds",
+                            "fresh",
+                            "reason",
+                            "error",
+                            "errors",
+                            "open_positions",
+                            "activation_ready_products",
                         )
-                        or [],
                     },
                 )
             )
@@ -1379,6 +1418,29 @@ def evaluate_health(
                     detail={"products": halted_products},
                 )
             )
+    return issues, warnings, candidate_paper
+
+
+def _health_optional_failure(
+    payload: Any,
+    *,
+    code: str,
+    message: str,
+    detail_keys: tuple[str, ...],
+) -> dict[str, Any] | None:
+    if not isinstance(payload, dict) or not payload or payload.get("ok") is True:
+        return None
+    return _issue(
+        code,
+        message,
+        detail={key: payload.get(key) for key in detail_keys},
+    )
+
+
+def _health_optional_checks(
+    operator_report: dict[str, Any],
+) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
     event_capture = operator_report.get("event_capture")
     if isinstance(event_capture, dict) and event_capture.get("enabled") is True:
         if event_capture.get("ok") is not True:
@@ -1401,256 +1463,257 @@ def evaluate_health(
                     },
                 )
             )
-    microstructure = operator_report.get("microstructure_research")
-    if isinstance(microstructure, dict) and microstructure and microstructure.get("ok") is not True:
-        issues.append(
-            _issue(
-                "microstructure_research_failed",
-                "bounded short-horizon event replay reported a failure",
-                detail={
-                    "artifact": microstructure.get("artifact"),
-                    "generated_at": microstructure.get("generated_at"),
-                    "status": microstructure.get("status"),
-                    "summary": microstructure.get("summary"),
-                },
-            )
+    sections = (
+        (
+            "microstructure_research",
+            "microstructure_research_failed",
+            "bounded short-horizon event replay reported a failure",
+            ("artifact", "generated_at", "status", "summary"),
+        ),
+        (
+            "accounting",
+            "accounting_unreconciled",
+            "trade accounting journal or equity reconciliation is unhealthy",
+            ("artifact", "summary", "reconciliation_errors"),
+        ),
+        (
+            "ml_research",
+            "ml_research_failed",
+            "bounded chronological ML research reported one or more trial failures",
+            ("artifact", "generated_at", "summary"),
+        ),
+        (
+            "ml_forward_paper",
+            "ml_forward_paper_failed",
+            "isolated ML forward paper reported an integrity or evaluation failure",
+            ("artifact", "generated_at", "status", "summary"),
+        ),
+        (
+            "trade_starvation",
+            "trade_starvation_diagnostic_failed",
+            "rolling trade-starvation diagnostic is unhealthy",
+            ("generated_at", "error"),
+        ),
+        (
+            "relative_value",
+            "relative_value_research_failed",
+            "bounded relative-value research is waiting or unhealthy",
+            ("artifact", "generated_at", "status", "summary"),
+        ),
+        (
+            "relative_value_paper",
+            "relative_value_paper_failed",
+            "isolated relative-value forward paper is unhealthy",
+            ("artifact", "generated_at", "status", "summary"),
+        ),
+    )
+    for key, code, message, detail_keys in sections:
+        failure = _health_optional_failure(
+            operator_report.get(key),
+            code=code,
+            message=message,
+            detail_keys=detail_keys,
         )
-    active_income_portfolio = operator_report.get("active_income_portfolio")
-    if isinstance(active_income_portfolio, dict):
-        portfolio_risk = active_income_portfolio.get("risk_model")
-        if (
-            isinstance(portfolio_risk, dict)
-            and portfolio_risk.get("required") is True
-            and portfolio_risk.get("ok") is not True
-        ):
+        if failure is not None:
+            issues.append(failure)
+    portfolio = operator_report.get("active_income_portfolio")
+    if isinstance(portfolio, dict):
+        risk = portfolio.get("risk_model")
+        if isinstance(risk, dict) and risk.get("required") is True and risk.get("ok") is not True:
             issues.append(
                 _issue(
                     "portfolio_risk_unhealthy",
                     "required portfolio correlation and beta model is unavailable or stale",
                     detail={
-                        key: portfolio_risk.get(key)
-                        for key in (
-                            "path",
-                            "fresh",
-                            "age_seconds",
-                            "reason",
-                            "error",
-                        )
+                        key: risk.get(key)
+                        for key in ("path", "fresh", "age_seconds", "reason", "error")
                     },
                 )
             )
-    accounting = operator_report.get("accounting")
-    if isinstance(accounting, dict) and accounting and accounting.get("ok") is not True:
-        issues.append(
-            _issue(
-                "accounting_unreconciled",
-                "trade accounting journal or equity reconciliation is unhealthy",
-                detail={
-                    "artifact": accounting.get("artifact"),
-                    "summary": accounting.get("summary"),
-                    "reconciliation_errors": accounting.get("reconciliation_errors") or [],
-                },
-            )
-        )
-    ml_research = operator_report.get("ml_research")
-    if isinstance(ml_research, dict) and ml_research and ml_research.get("ok") is not True:
-        issues.append(
-            _issue(
-                "ml_research_failed",
-                "bounded chronological ML research reported one or more trial failures",
-                detail={
-                    "artifact": ml_research.get("artifact"),
-                    "generated_at": ml_research.get("generated_at"),
-                    "summary": ml_research.get("summary"),
-                },
-            )
-        )
-    ml_forward_paper = operator_report.get("ml_forward_paper")
-    if (
-        isinstance(ml_forward_paper, dict)
-        and ml_forward_paper
-        and ml_forward_paper.get("ok") is not True
-    ):
-        issues.append(
-            _issue(
-                "ml_forward_paper_failed",
-                "isolated ML forward paper reported an integrity or evaluation failure",
-                detail={
-                    "artifact": ml_forward_paper.get("artifact"),
-                    "generated_at": ml_forward_paper.get("generated_at"),
-                    "status": ml_forward_paper.get("status"),
-                    "summary": ml_forward_paper.get("summary"),
-                },
-            )
-        )
-    trade_starvation = operator_report.get("trade_starvation")
-    if (
-        isinstance(trade_starvation, dict)
-        and trade_starvation
-        and trade_starvation.get("ok") is not True
-    ):
-        issues.append(
-            _issue(
-                "trade_starvation_diagnostic_failed",
-                "rolling trade-starvation diagnostic is unhealthy",
-                detail={
-                    "generated_at": trade_starvation.get("generated_at"),
-                    "error": trade_starvation.get("error"),
-                },
-            )
-        )
-    relative_value = operator_report.get("relative_value")
-    if isinstance(relative_value, dict) and relative_value and relative_value.get("ok") is not True:
-        issues.append(
-            _issue(
-                "relative_value_research_failed",
-                "bounded relative-value research is waiting or unhealthy",
-                detail={
-                    "artifact": relative_value.get("artifact"),
-                    "generated_at": relative_value.get("generated_at"),
-                    "status": relative_value.get("status"),
-                    "summary": relative_value.get("summary"),
-                },
-            )
-        )
-    relative_value_paper = operator_report.get("relative_value_paper")
-    if (
-        isinstance(relative_value_paper, dict)
-        and relative_value_paper
-        and relative_value_paper.get("ok") is not True
-    ):
-        issues.append(
-            _issue(
-                "relative_value_paper_failed",
-                "isolated relative-value forward paper is unhealthy",
-                detail={
-                    "artifact": relative_value_paper.get("artifact"),
-                    "generated_at": relative_value_paper.get("generated_at"),
-                    "status": relative_value_paper.get("status"),
-                    "summary": relative_value_paper.get("summary"),
-                },
-            )
-        )
+    return issues
+
+
+def _health_backup_checks(
+    operator_report: dict[str, Any],
+    *,
+    now_ts: float,
+    max_backup_age_seconds: float | None,
+) -> list[dict[str, Any]]:
     backup_report = operator_report.get("backup_report") or {}
-    if backup_report:
-        verification = backup_report.get("verification") or {}
-        manifest = backup_report.get("manifest") or {}
-        critical_skipped = [
-            {
-                "path": item.get("path"),
-                "role": item.get("role"),
-                "reason": item.get("reason"),
-            }
-            for item in _dict_list(manifest, "files")
-            if item.get("required_if_present") is True
-            and item.get("exists") is True
-            and item.get("included") is not True
-        ]
-        reported_critical_skipped = _int_value(manifest.get("critical_skipped_files")) or 0
-        if critical_skipped or reported_critical_skipped > 0:
-            issues.append(
-                _issue(
-                    "backup_incomplete",
-                    "latest backup omitted one or more existing recovery files",
-                    detail={
-                        "output": backup_report.get("output"),
-                        "critical_skipped_files": max(
-                            reported_critical_skipped,
-                            len(critical_skipped),
-                        ),
-                        "files": critical_skipped[:10],
-                    },
-                )
-            )
-        if backup_report.get("ok") is not True or verification.get("ok") is not True:
-            issues.append(
-                _issue(
-                    "backup_unhealthy",
-                    "latest backup report failed or did not verify",
-                    detail={
-                        "ok": backup_report.get("ok"),
-                        "output": backup_report.get("output"),
-                        "verification_ok": verification.get("ok"),
-                        "verification_issues": verification.get("issues") or [],
-                    },
-                )
-            )
-        else:
-            generated_at = manifest.get("generated_at") or backup_report.get("generated_at")
-            generated_ts = _parse_timestamp(generated_at)
-            stale_limit = (
-                float(max_backup_age_seconds)
-                if max_backup_age_seconds is not None
-                else _backup_stale_limit_seconds(operator_report)
-            )
-            if generated_ts is None:
-                issues.append(
-                    _issue(
-                        "backup_timestamp_missing",
-                        "latest backup report has no valid generation timestamp",
-                        detail={
-                            "output": backup_report.get("output"),
-                            "generated_at": generated_at,
-                        },
-                    )
-                )
-            elif generated_ts > now_ts:
-                issues.append(
-                    _issue(
-                        "backup_timestamp_future",
-                        "latest verified backup is timestamped in the future",
-                        detail={
-                            "output": backup_report.get("output"),
-                            "generated_at": generated_at,
-                        },
-                    )
-                )
-            else:
-                age_seconds = now_ts - generated_ts
-                if age_seconds > stale_limit:
-                    issues.append(
-                        _issue(
-                            "backup_stale",
-                            "latest verified backup is stale",
-                            detail={
-                                "output": backup_report.get("output"),
-                                "generated_at": generated_at,
-                                "age_seconds": round(age_seconds, 3),
-                                "limit_seconds": round(stale_limit, 3),
-                            },
-                        )
-                    )
-    else:
+    if not backup_report:
         backup_jobs = _enabled_backup_jobs(operator_report)
-        if backup_jobs:
-            issues.append(
+        return (
+            [
                 _issue(
                     "backup_report_missing",
                     "backup job is enabled but no backup report is available",
                     detail={"scheduled_jobs": backup_jobs},
                 )
+            ]
+            if backup_jobs
+            else []
+        )
+    issues: list[dict[str, Any]] = []
+    verification = backup_report.get("verification") or {}
+    manifest = backup_report.get("manifest") or {}
+    critical_skipped = [
+        {
+            "path": item.get("path"),
+            "role": item.get("role"),
+            "reason": item.get("reason"),
+        }
+        for item in _dict_list(manifest, "files")
+        if item.get("required_if_present") is True
+        and item.get("exists") is True
+        and item.get("included") is not True
+    ]
+    reported_skipped = _int_value(manifest.get("critical_skipped_files")) or 0
+    if critical_skipped or reported_skipped > 0:
+        issues.append(
+            _issue(
+                "backup_incomplete",
+                "latest backup omitted one or more existing recovery files",
+                detail={
+                    "output": backup_report.get("output"),
+                    "critical_skipped_files": max(reported_skipped, len(critical_skipped)),
+                    "files": critical_skipped[:10],
+                },
             )
-    scheduled_job_state_issues = _scheduled_job_state_issues(operator_report)
-    if scheduled_job_state_issues:
+        )
+    if backup_report.get("ok") is not True or verification.get("ok") is not True:
+        issues.append(
+            _issue(
+                "backup_unhealthy",
+                "latest backup report failed or did not verify",
+                detail={
+                    "ok": backup_report.get("ok"),
+                    "output": backup_report.get("output"),
+                    "verification_ok": verification.get("ok"),
+                    "verification_issues": verification.get("issues") or [],
+                },
+            )
+        )
+        return issues
+    generated_at = manifest.get("generated_at") or backup_report.get("generated_at")
+    generated_ts = _parse_timestamp(generated_at)
+    stale_limit = (
+        float(max_backup_age_seconds)
+        if max_backup_age_seconds is not None
+        else _backup_stale_limit_seconds(operator_report)
+    )
+    if generated_ts is None:
+        issues.append(
+            _issue(
+                "backup_timestamp_missing",
+                "latest backup report has no valid generation timestamp",
+                detail={"output": backup_report.get("output"), "generated_at": generated_at},
+            )
+        )
+    elif generated_ts > now_ts:
+        issues.append(
+            _issue(
+                "backup_timestamp_future",
+                "latest verified backup is timestamped in the future",
+                detail={"output": backup_report.get("output"), "generated_at": generated_at},
+            )
+        )
+    elif now_ts - generated_ts > stale_limit:
+        age_seconds = now_ts - generated_ts
+        issues.append(
+            _issue(
+                "backup_stale",
+                "latest verified backup is stale",
+                detail={
+                    "output": backup_report.get("output"),
+                    "generated_at": generated_at,
+                    "age_seconds": round(age_seconds, 3),
+                    "limit_seconds": round(stale_limit, 3),
+                },
+            )
+        )
+    return issues
+
+
+def _scheduled_overdue_details(
+    operator_report: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    never_run: list[dict[str, Any]] = []
+    overdue: list[dict[str, Any]] = []
+    for job in _dict_list(operator_report, "scheduled_jobs"):
+        if (
+            not job.get("enabled")
+            or job.get("status") in {"disabled", "fail"}
+            or job.get("due") is not True
+        ):
+            continue
+        if job.get("status") == "never_run":
+            never_run.append(
+                {
+                    "name": job.get("name"),
+                    "status": job.get("status"),
+                    "due": job.get("due"),
+                    "cadence_seconds": job.get("cadence_seconds"),
+                    "effective_cadence_seconds": job.get("effective_cadence_seconds"),
+                    "timeout_seconds": job.get("timeout_seconds"),
+                }
+            )
+            continue
+        try:
+            age_seconds = float(job.get("age_seconds"))
+            cadence_seconds = float(
+                job.get("effective_cadence_seconds") or job.get("cadence_seconds")
+            )
+        except (TypeError, ValueError):
+            continue
+        if age_seconds < 0 or cadence_seconds <= 0:
+            continue
+        limit_seconds = max(
+            cadence_seconds * 2.0,
+            cadence_seconds + float(job.get("timeout_seconds") or 0),
+        )
+        if age_seconds > limit_seconds:
+            overdue.append(
+                {
+                    "name": job.get("name"),
+                    "status": job.get("status"),
+                    "due": job.get("due"),
+                    "age_seconds": round(age_seconds, 3),
+                    "limit_seconds": round(limit_seconds, 3),
+                    "effective_cadence_seconds": round(cadence_seconds, 3),
+                    "last_started_at": job.get("last_started_at"),
+                    "last_reason": job.get("last_reason"),
+                }
+            )
+    return never_run, overdue
+
+
+def _health_scheduler_checks(
+    operator_report: dict[str, Any],
+    *,
+    fail_on_job_failures: bool,
+    fail_on_job_overdue: bool,
+    max_consecutive_job_deferrals: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    issues: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    state_issues = _scheduled_job_state_issues(operator_report)
+    if state_issues:
         issues.append(
             _issue(
                 "scheduled_job_state_invalid",
                 "one or more enabled scheduled jobs reported invalid scheduler state",
-                detail={"jobs": scheduled_job_state_issues},
+                detail={"jobs": state_issues},
             )
         )
-    job_worker = (
-        operator_report.get("job_worker")
-        if isinstance(operator_report.get("job_worker"), dict)
-        else {}
-    )
-    if job_worker.get("configured") is True and job_worker.get("ok") is not True:
+    worker = operator_report.get("job_worker")
+    worker = worker if isinstance(worker, dict) else {}
+    if worker.get("configured") is True and worker.get("ok") is not True:
         issues.append(
             _issue(
                 "scheduled_job_worker_unhealthy",
                 "the independent scheduled-job worker is missing, stale, or failing",
                 detail={
-                    key: job_worker.get(key)
+                    key: worker.get(key)
                     for key in (
                         "reason",
                         "path",
@@ -1664,253 +1727,230 @@ def evaluate_health(
                 },
             )
         )
-    truncated_job_outputs = _scheduled_job_output_truncation_warnings(operator_report)
-    if truncated_job_outputs:
+    truncated = _scheduled_job_output_truncation_warnings(operator_report)
+    if truncated:
         warnings.append(
             _issue(
                 "scheduled_job_output_truncated",
                 "one or more enabled scheduled jobs produced truncated output",
-                detail={"jobs": truncated_job_outputs},
+                detail={"jobs": truncated},
             )
         )
-    deferred_jobs = _scheduled_job_deferral_warnings(operator_report)
-    if deferred_jobs:
+    deferred = _scheduled_job_deferral_warnings(operator_report)
+    if deferred:
         warnings.append(
             _issue(
                 "scheduled_job_deferred",
                 "one or more enabled scheduled jobs were deferred by the per-cycle job limit",
-                detail={"jobs": deferred_jobs},
+                detail={"jobs": deferred},
             )
         )
-    excessive_deferred_jobs = _scheduled_job_deferral_limit_issues(
+    excessive = _scheduled_job_deferral_limit_issues(
         operator_report,
         max_consecutive_job_deferrals=max_consecutive_job_deferrals,
     )
-    if excessive_deferred_jobs:
+    if excessive:
         issues.append(
             _issue(
                 "scheduled_job_deferral_limit",
                 "one or more enabled scheduled jobs exceeded the consecutive deferral limit",
-                detail={"jobs": excessive_deferred_jobs},
+                detail={"jobs": excessive},
             )
         )
+    failure_issues, failure_warnings = _health_scheduler_failure_checks(
+        operator_report,
+        fail_on_job_failures=fail_on_job_failures,
+        fail_on_job_overdue=fail_on_job_overdue,
+    )
+    issues.extend(failure_issues)
+    warnings.extend(failure_warnings)
+    return issues, warnings
+
+
+def _health_scheduler_failure_checks(
+    operator_report: dict[str, Any],
+    *,
+    fail_on_job_failures: bool,
+    fail_on_job_overdue: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    issues: list[dict[str, Any]] = []
     if fail_on_job_failures:
-        failed_jobs = [
+        failed = [
             _scheduled_job_failure_detail(job)
             for job in _dict_list(operator_report, "scheduled_jobs")
             if job.get("enabled") and job.get("status") == "fail"
         ]
-        if failed_jobs:
+        if failed:
             issues.append(
                 _issue(
                     "scheduled_job_failed",
                     "one or more enabled scheduled jobs are failing",
-                    detail={"jobs": failed_jobs},
+                    detail={"jobs": failed},
                 )
             )
     if fail_on_job_overdue:
-        never_run_jobs = []
-        overdue_jobs = []
-        for job in _dict_list(operator_report, "scheduled_jobs"):
-            if not job.get("enabled"):
-                continue
-            if job.get("status") in {"disabled", "fail"}:
-                continue
-            if job.get("due") is not True:
-                continue
-            if job.get("status") == "never_run":
-                never_run_jobs.append(
-                    {
-                        "name": job.get("name"),
-                        "status": job.get("status"),
-                        "due": job.get("due"),
-                        "cadence_seconds": job.get("cadence_seconds"),
-                        "effective_cadence_seconds": job.get("effective_cadence_seconds"),
-                        "timeout_seconds": job.get("timeout_seconds"),
-                    }
-                )
-                continue
-            try:
-                age_seconds = float(job.get("age_seconds"))
-                cadence_seconds = float(
-                    job.get("effective_cadence_seconds") or job.get("cadence_seconds")
-                )
-            except (TypeError, ValueError):
-                continue
-            if age_seconds < 0 or cadence_seconds <= 0:
-                continue
-            limit_seconds = max(
-                cadence_seconds * 2.0, cadence_seconds + float(job.get("timeout_seconds") or 0)
-            )
-            if age_seconds > limit_seconds:
-                overdue_jobs.append(
-                    {
-                        "name": job.get("name"),
-                        "status": job.get("status"),
-                        "due": job.get("due"),
-                        "age_seconds": round(age_seconds, 3),
-                        "limit_seconds": round(limit_seconds, 3),
-                        "effective_cadence_seconds": round(cadence_seconds, 3),
-                        "last_started_at": job.get("last_started_at"),
-                        "last_reason": job.get("last_reason"),
-                    }
-                )
-        if overdue_jobs:
+        never_run, overdue = _scheduled_overdue_details(operator_report)
+        if overdue:
             issues.append(
                 _issue(
                     "scheduled_job_overdue",
                     "one or more enabled scheduled jobs are overdue",
-                    detail={"jobs": overdue_jobs},
+                    detail={"jobs": overdue},
                 )
             )
-        if never_run_jobs:
+        if never_run:
             issues.append(
                 _issue(
                     "scheduled_job_never_ran",
                     "one or more enabled scheduled jobs are due but have never run",
-                    detail={"jobs": never_run_jobs},
+                    detail={"jobs": never_run},
                 )
             )
-    waiting_paper_products = _paper_products_waiting_for_artifacts(operator_report)
-    for product in waiting_paper_products:
-        warnings.append(
-            _issue(
-                "paper_product_waiting_for_strategy_artifact",
-                "paper product is waiting for an exported strategy artifact",
-                detail={
-                    key: product.get(key)
-                    for key in ("name", "objective", "market", "strategy_artifact", "detail")
-                    if product.get(key) is not None
-                },
-            )
+    return issues, []
+
+
+def _health_position_checks(
+    operator_report: dict[str, Any],
+    *,
+    now_ts: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    issues: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    waiting = _paper_products_waiting_for_artifacts(operator_report)
+    warnings.extend(
+        _issue(
+            "paper_product_waiting_for_strategy_artifact",
+            "paper product is waiting for an exported strategy artifact",
+            detail={
+                key: product.get(key)
+                for key in ("name", "objective", "market", "strategy_artifact", "detail")
+                if product.get(key) is not None
+            },
         )
-    entry_disabled_products = []
-    for product in operator_report.get("products") or []:
-        if not isinstance(product, dict) or product.get("enabled") is not True:
-            continue
-        if product.get("entries_allowed") is not False:
-            continue
-        gate = product.get("entry_gate") if isinstance(product.get("entry_gate"), dict) else {}
-        trace = (
-            product.get("decision_trace") if isinstance(product.get("decision_trace"), dict) else {}
-        )
-        entry_disabled_products.append(
-            {
-                "name": product.get("name"),
-                "objective": product.get("objective"),
-                "market": product.get("market"),
-                "mode": product.get("mode"),
-                "gate_status": gate.get("status"),
-                "gate_reason": gate.get("reason"),
-                "decision_outcomes": (
-                    (trace.get("summary") or {}).get("outcomes")
-                    if isinstance(trace.get("summary"), dict)
-                    else None
-                ),
-            }
-        )
-    if entry_disabled_products:
+        for product in waiting
+    )
+    disabled = [
+        {
+            "name": product.get("name"),
+            "objective": product.get("objective"),
+            "market": product.get("market"),
+            "mode": product.get("mode"),
+            "gate_status": (
+                product.get("entry_gate", {}).get("status")
+                if isinstance(product.get("entry_gate"), dict)
+                else None
+            ),
+            "gate_reason": (
+                product.get("entry_gate", {}).get("reason")
+                if isinstance(product.get("entry_gate"), dict)
+                else None
+            ),
+            "decision_outcomes": (
+                (product.get("decision_trace", {}).get("summary") or {}).get("outcomes")
+                if isinstance(product.get("decision_trace"), dict)
+                and isinstance(product.get("decision_trace", {}).get("summary"), dict)
+                else None
+            ),
+        }
+        for product in operator_report.get("products") or []
+        if isinstance(product, dict)
+        and product.get("enabled") is True
+        and product.get("entries_allowed") is False
+    ]
+    if disabled:
         warnings.append(
             _issue(
                 "product_entries_disabled",
                 "one or more enabled products cannot open new positions",
-                detail={"products": entry_disabled_products},
+                detail={"products": disabled},
             )
         )
-    stale_positions = _stale_open_positions(operator_report, now_ts)
-    live_stale_positions = [
-        position for position in stale_positions if position.get("mode") == "live"
-    ]
-    paper_stale_positions = [
-        position for position in stale_positions if position.get("mode") != "live"
-    ]
-    if live_stale_positions:
+    stale = _stale_open_positions(operator_report, now_ts)
+    live_stale = [item for item in stale if item.get("mode") == "live"]
+    paper_stale = [item for item in stale if item.get("mode") != "live"]
+    if live_stale:
         issues.append(
             _issue(
                 "live_open_position_stale",
                 "one or more live open positions are older than their expected strategy horizon",
-                detail={"positions": live_stale_positions},
+                detail={"positions": live_stale},
             )
         )
-    if paper_stale_positions:
+    if paper_stale:
         warnings.append(
             _issue(
                 "open_position_stale",
                 "one or more open positions are older than their expected strategy horizon",
-                detail={"positions": paper_stale_positions},
+                detail={"positions": paper_stale},
             )
         )
-    live_risk_issues = _live_open_position_risk_issues(operator_report)
-    if live_risk_issues:
-        issues.append(
-            _issue(
-                "live_open_position_risk_invalid",
-                "one or more live open positions have missing or invalid risk metadata",
-                detail={"positions": live_risk_issues},
-            )
-        )
-    live_broker_issues = _live_open_position_broker_issues(operator_report)
-    if live_broker_issues:
-        issues.append(
-            _issue(
-                "live_open_position_broker_invalid",
-                "one or more live open positions have missing or invalid broker metadata",
-                detail={"positions": live_broker_issues},
-            )
-        )
-    paper_risk_issues = _paper_open_position_risk_issues(operator_report)
-    if paper_risk_issues:
-        warnings.append(
-            _issue(
-                "paper_open_position_risk_invalid",
-                "one or more paper open positions have missing or invalid risk metadata",
-                detail={"positions": paper_risk_issues},
-            )
-        )
-    live_monitoring_issues = _live_open_position_monitoring_issues(operator_report, now_ts=now_ts)
-    if live_monitoring_issues:
-        issues.append(
-            _issue(
-                "live_open_position_monitoring_invalid",
-                "one or more live open positions have missing or invalid monitoring metadata",
-                detail={"positions": live_monitoring_issues},
-            )
-        )
-    paper_monitoring_issues = _paper_open_position_monitoring_issues(operator_report, now_ts=now_ts)
-    if paper_monitoring_issues:
-        warnings.append(
-            _issue(
-                "paper_open_position_monitoring_invalid",
-                "one or more paper open positions have missing or invalid monitoring metadata",
-                detail={"positions": paper_monitoring_issues},
-            )
-        )
-    live_visibility_issues = _live_open_position_visibility_issues(operator_report)
-    if live_visibility_issues:
-        issues.append(
-            _issue(
-                "live_open_position_visibility_invalid",
-                "one or more live products report open positions without matching position details",
-                detail={"products": live_visibility_issues},
-            )
-        )
-    paper_visibility_issues = _paper_open_position_visibility_issues(operator_report)
-    if paper_visibility_issues:
-        warnings.append(
-            _issue(
-                "paper_open_position_visibility_invalid",
-                "one or more paper products report open positions without matching position details",
-                detail={"products": paper_visibility_issues},
-            )
-        )
-    research_cycle = (
-        operator_report.get("research_cycle")
-        if isinstance(operator_report.get("research_cycle"), dict)
-        else {}
+    position_specs = (
+        (
+            "live",
+            _live_open_position_risk_issues,
+            "live_open_position_risk_invalid",
+            "one or more live open positions have missing or invalid risk metadata",
+            issues,
+        ),
+        (
+            "live",
+            _live_open_position_broker_issues,
+            "live_open_position_broker_invalid",
+            "one or more live open positions have missing or invalid broker metadata",
+            issues,
+        ),
+        (
+            "paper",
+            _paper_open_position_risk_issues,
+            "paper_open_position_risk_invalid",
+            "one or more paper open positions have missing or invalid risk metadata",
+            warnings,
+        ),
+        (
+            "live",
+            _live_open_position_monitoring_issues,
+            "live_open_position_monitoring_invalid",
+            "one or more live open positions have missing or invalid monitoring metadata",
+            issues,
+        ),
+        (
+            "paper",
+            _paper_open_position_monitoring_issues,
+            "paper_open_position_monitoring_invalid",
+            "one or more paper open positions have missing or invalid monitoring metadata",
+            warnings,
+        ),
+        (
+            "live",
+            _live_open_position_visibility_issues,
+            "live_open_position_visibility_invalid",
+            "one or more live products report open positions without matching position details",
+            issues,
+        ),
+        (
+            "paper",
+            _paper_open_position_visibility_issues,
+            "paper_open_position_visibility_invalid",
+            "one or more paper products report open positions without matching position details",
+            warnings,
+        ),
     )
-    research_summary = (
-        research_cycle.get("summary") if isinstance(research_cycle.get("summary"), dict) else {}
-    )
+    for _mode, builder, code, message, target in position_specs:
+        details = (
+            builder(operator_report, now_ts=now_ts)
+            if "monitoring" in code
+            else builder(operator_report)
+        )
+        if details:
+            detail_key = "products" if "visibility" in code else "positions"
+            target.append(_issue(code, message, detail={detail_key: details}))
+    return issues, warnings
+
+
+def _health_research_cycle_artifact_checks(
+    research_cycle: dict[str, Any],
+) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
     if research_cycle.get("state_recovered") is True:
         warnings.append(
             _issue(
@@ -1922,24 +1962,21 @@ def evaluate_health(
                 },
             )
         )
-    cycle_mutation_batch = research_cycle.get("mutation_batch")
-    if (
-        isinstance(cycle_mutation_batch, dict)
-        and cycle_mutation_batch.get("status") == "read_error"
-    ):
+    mutation_batch = research_cycle.get("mutation_batch")
+    if isinstance(mutation_batch, dict) and mutation_batch.get("status") == "read_error":
         warnings.append(
             _issue(
                 "research_cycle_mutation_batch_read_error",
                 "research cycle ignored a mutation batch it could not read",
                 detail={
                     "generated_at": research_cycle.get("generated_at"),
-                    "path": cycle_mutation_batch.get("path"),
-                    "error": cycle_mutation_batch.get("error"),
+                    "path": mutation_batch.get("path"),
+                    "error": mutation_batch.get("error"),
                 },
             )
         )
-    cycle_generated_batch = research_cycle.get("generated_batch")
-    if isinstance(cycle_generated_batch, dict) and cycle_generated_batch.get("status") in {
+    generated_batch = research_cycle.get("generated_batch")
+    if isinstance(generated_batch, dict) and generated_batch.get("status") in {
         "read_error",
         "invalid",
         "ignored",
@@ -1950,10 +1987,10 @@ def evaluate_health(
                 "research cycle could not safely consume the generated strategy batch",
                 detail={
                     "generated_at": research_cycle.get("generated_at"),
-                    "status": cycle_generated_batch.get("status"),
-                    "path": cycle_generated_batch.get("path"),
-                    "reason": cycle_generated_batch.get("reason"),
-                    "error": cycle_generated_batch.get("error"),
+                    "status": generated_batch.get("status"),
+                    "path": generated_batch.get("path"),
+                    "reason": generated_batch.get("reason"),
+                    "error": generated_batch.get("error"),
                 },
             )
         )
@@ -1965,140 +2002,136 @@ def evaluate_health(
                 detail={
                     "generated_at": research_cycle.get("generated_at"),
                     "status": (
-                        cycle_generated_batch.get("status")
-                        if isinstance(cycle_generated_batch, dict)
-                        else None
+                        generated_batch.get("status") if isinstance(generated_batch, dict) else None
                     ),
                     "path": (
-                        cycle_generated_batch.get("path")
-                        if isinstance(cycle_generated_batch, dict)
-                        else None
+                        generated_batch.get("path") if isinstance(generated_batch, dict) else None
                     ),
                 },
             )
         )
+    return warnings
 
-    generated_batch = (
-        operator_report.get("generated_batch")
-        if isinstance(operator_report.get("generated_batch"), dict)
-        else {}
-    )
-    if generated_batch and not generated_batch.get("_load_error"):
-        unsafe_flags = [
-            name
-            for name, expected in (
-                ("schema", "autopilot.generative_strategy_batch/v1"),
-                ("research_only", True),
-                ("executable", False),
-                ("paper_trade_allowed", False),
-                ("promotion_allowed", False),
-                ("live_allowed", False),
-                ("requires_full_validation_before_export", True),
-            )
-            if generated_batch.get(name) != expected
-        ]
-        if generated_batch.get("ok") is False or unsafe_flags:
-            warnings.append(
-                _issue(
-                    "generated_batch_unhealthy",
-                    "latest generated strategy batch failed or violates its research-only contract",
-                    detail={
-                        "generated_at": generated_batch.get("generated_at"),
-                        "artifact": generated_batch.get("artifact"),
-                        "error": generated_batch.get("error"),
-                        "unsafe_flags": unsafe_flags,
-                    },
-                )
-            )
-        generated_summary = (
-            generated_batch.get("summary")
-            if isinstance(generated_batch.get("summary"), dict)
-            else {}
-        )
-        generated_count = generated_batch.get("hypotheses_count")
-        if generated_count is None:
-            generated_count = generated_summary.get("hypotheses")
-        if generated_batch.get("ok") is True and int(generated_count or 0) == 0:
-            warnings.append(
-                _issue(
-                    "generative_search_empty",
-                    "strategy factory completed without emitting any research hypotheses",
-                    detail={
-                        "generated_at": generated_batch.get("generated_at"),
-                        "rejected_attempts": generated_summary.get("rejected_attempts"),
-                        "unique_behavioral_specs": generated_summary.get("unique_behavioral_specs"),
-                    },
-                )
-            )
 
-    experiment_memory = (
-        operator_report.get("experiment_memory")
-        if isinstance(operator_report.get("experiment_memory"), dict)
-        else {}
-    )
-    if experiment_memory:
-        integrity = (
-            experiment_memory.get("integrity")
-            if isinstance(experiment_memory.get("integrity"), dict)
-            else {}
+def _health_generated_batch_checks(
+    generated_batch: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not generated_batch or generated_batch.get("_load_error"):
+        return []
+    unsafe_flags = [
+        name
+        for name, expected in (
+            ("schema", "autopilot.generative_strategy_batch/v1"),
+            ("research_only", True),
+            ("executable", False),
+            ("paper_trade_allowed", False),
+            ("promotion_allowed", False),
+            ("live_allowed", False),
+            ("requires_full_validation_before_export", True),
         )
-        if (
-            experiment_memory.get("status") == "error"
-            or experiment_memory.get("ok") is False
-            or integrity.get("ok") is False
-        ):
-            issues.append(
-                _issue(
-                    "experiment_memory_unhealthy",
-                    "strategy experiment memory failed integrity validation",
-                    detail={
-                        "path": experiment_memory.get("path"),
-                        "status": experiment_memory.get("status"),
-                        "error": experiment_memory.get("error"),
-                        "integrity": integrity,
-                    },
-                )
+        if generated_batch.get(name) != expected
+    ]
+    warnings = []
+    if generated_batch.get("ok") is False or unsafe_flags:
+        warnings.append(
+            _issue(
+                "generated_batch_unhealthy",
+                "latest generated strategy batch failed or violates its research-only contract",
+                detail={
+                    "generated_at": generated_batch.get("generated_at"),
+                    "artifact": generated_batch.get("artifact"),
+                    "error": generated_batch.get("error"),
+                    "unsafe_flags": unsafe_flags,
+                },
             )
-        if experiment_memory.get("protected_holdout_results_excluded") is not True:
-            issues.append(
-                _issue(
-                    "experiment_memory_feedback_scope_invalid",
-                    "experiment-memory reporting does not confirm protected holdout exclusion",
-                    detail={
-                        "path": experiment_memory.get("path"),
-                        "adaptive_evidence_scope": experiment_memory.get("adaptive_evidence_scope"),
-                    },
-                )
+        )
+    summary = generated_batch.get("summary")
+    summary = summary if isinstance(summary, dict) else {}
+    count = generated_batch.get("hypotheses_count")
+    count = summary.get("hypotheses") if count is None else count
+    if generated_batch.get("ok") is True and int(count or 0) == 0:
+        warnings.append(
+            _issue(
+                "generative_search_empty",
+                "strategy factory completed without emitting any research hypotheses",
+                detail={
+                    "generated_at": generated_batch.get("generated_at"),
+                    "rejected_attempts": summary.get("rejected_attempts"),
+                    "unique_behavioral_specs": summary.get("unique_behavioral_specs"),
+                },
             )
-        enabled_factory_jobs = [
-            job
-            for job in _dict_list(operator_report, "scheduled_jobs")
-            if job.get("enabled") and job.get("name") == "research_factory"
-        ]
-        factory_has_run = any(job.get("last_started_at") for job in enabled_factory_jobs)
-        if experiment_memory.get("status") == "missing" and factory_has_run:
-            warnings.append(
-                _issue(
-                    "experiment_memory_missing",
-                    "strategy factory has run but durable experiment memory is missing",
-                    detail={
-                        "path": experiment_memory.get("path"),
-                        "factory_jobs": [job.get("name") for job in enabled_factory_jobs],
-                    },
-                )
+        )
+    return warnings
+
+
+def _health_experiment_memory_checks(
+    operator_report: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    issues: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    memory = operator_report.get("experiment_memory")
+    memory = memory if isinstance(memory, dict) else {}
+    if not memory:
+        return issues, warnings
+    integrity = memory.get("integrity")
+    integrity = integrity if isinstance(integrity, dict) else {}
+    if memory.get("status") == "error" or memory.get("ok") is False or integrity.get("ok") is False:
+        issues.append(
+            _issue(
+                "experiment_memory_unhealthy",
+                "strategy experiment memory failed integrity validation",
+                detail={
+                    "path": memory.get("path"),
+                    "status": memory.get("status"),
+                    "error": memory.get("error"),
+                    "integrity": integrity,
+                },
             )
-    history_coverage = (
-        research_cycle.get("history_coverage")
-        if isinstance(research_cycle.get("history_coverage"), dict)
-        else {}
-    )
-    coverage_failures = int(
-        research_summary.get("coverage_failures") or history_coverage.get("failure_count") or 0
-    )
-    coverage_failed_scenarios = (
-        research_summary.get("coverage_failed_scenarios")
-        or history_coverage.get("failed_scenarios")
-        or []
+        )
+    if memory.get("protected_holdout_results_excluded") is not True:
+        issues.append(
+            _issue(
+                "experiment_memory_feedback_scope_invalid",
+                "experiment-memory reporting does not confirm protected holdout exclusion",
+                detail={
+                    "path": memory.get("path"),
+                    "adaptive_evidence_scope": memory.get("adaptive_evidence_scope"),
+                },
+            )
+        )
+    factory_jobs = [
+        job
+        for job in _dict_list(operator_report, "scheduled_jobs")
+        if job.get("enabled") and job.get("name") == "research_factory"
+    ]
+    if memory.get("status") == "missing" and any(
+        job.get("last_started_at") for job in factory_jobs
+    ):
+        warnings.append(
+            _issue(
+                "experiment_memory_missing",
+                "strategy factory has run but durable experiment memory is missing",
+                detail={
+                    "path": memory.get("path"),
+                    "factory_jobs": [job.get("name") for job in factory_jobs],
+                },
+            )
+        )
+    return issues, warnings
+
+
+def _health_research_progress_checks(
+    operator_report: dict[str, Any],
+    research_cycle: dict[str, Any],
+) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    summary = research_cycle.get("summary")
+    summary = summary if isinstance(summary, dict) else {}
+    coverage = research_cycle.get("history_coverage")
+    coverage = coverage if isinstance(coverage, dict) else {}
+    coverage_failures = int(summary.get("coverage_failures") or coverage.get("failure_count") or 0)
+    failed_scenarios = (
+        summary.get("coverage_failed_scenarios") or coverage.get("failed_scenarios") or []
     )
     if coverage_failures > 0:
         warnings.append(
@@ -2108,77 +2141,84 @@ def evaluate_health(
                 detail={
                     "generated_at": research_cycle.get("generated_at"),
                     "coverage_failures": coverage_failures,
-                    "scenarios": coverage_failed_scenarios,
-                    "next_actions": research_summary.get("next_actions") or [],
+                    "scenarios": failed_scenarios,
+                    "next_actions": summary.get("next_actions") or [],
                 },
             )
         )
+    waiting = _paper_products_waiting_for_artifacts(operator_report)
     if (
-        waiting_paper_products
+        waiting
         and research_cycle.get("ok") is True
-        and int(research_summary.get("hypotheses") or 0) > 0
-        and int(research_summary.get("keepers") or 0) == 0
-        and int(research_summary.get("exported") or 0) == 0
+        and int(summary.get("hypotheses") or 0) > 0
+        and int(summary.get("keepers") or 0) == 0
+        and int(summary.get("exported") or 0) == 0
     ):
-        mutation_effectiveness = research_summary.get("mutation_effectiveness")
+        mutation_effectiveness = summary.get("mutation_effectiveness")
+        detail = {
+            "generated_at": research_cycle.get("generated_at"),
+            "hypotheses": summary.get("hypotheses"),
+            "top_reasons": summary.get("top_reasons") or {},
+            "next_actions": summary.get("next_actions") or [],
+            "waiting_products": [
+                {
+                    "name": product.get("name"),
+                    "objective": product.get("objective"),
+                    "market": product.get("market"),
+                }
+                for product in waiting
+            ],
+        }
+        if isinstance(mutation_effectiveness, dict):
+            detail["mutation_effectiveness"] = mutation_effectiveness
         warnings.append(
             _issue(
                 "research_cycle_no_exportable_strategies",
                 "research has run but found no exportable strategy candidates",
-                detail={
-                    "generated_at": research_cycle.get("generated_at"),
-                    "hypotheses": research_summary.get("hypotheses"),
-                    "top_reasons": research_summary.get("top_reasons") or {},
-                    "next_actions": research_summary.get("next_actions") or [],
-                    "waiting_products": [
-                        {
-                            "name": product.get("name"),
-                            "objective": product.get("objective"),
-                            "market": product.get("market"),
-                        }
-                        for product in waiting_paper_products
-                    ],
-                    **(
-                        {"mutation_effectiveness": mutation_effectiveness}
-                        if isinstance(mutation_effectiveness, dict)
-                        else {}
-                    ),
-                },
+                detail=detail,
             )
         )
-    research_handoff_detail = research_handoff_warning_detail(operator_report)
-    if research_handoff_detail["warnings"]:
+    return warnings
+
+
+def _health_handoff_checks(
+    operator_report: dict[str, Any],
+) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    handoff = research_handoff_warning_detail(operator_report)
+    if handoff["warnings"]:
         warnings.append(
             _issue(
                 "research_handoff_warning",
                 "research handoff artifacts are stale, unsafe, or failed",
-                detail=research_handoff_detail,
+                detail=handoff,
             )
         )
-    stale_promotion_reviews = _stale_promotion_reviews(operator_report)
-    if stale_promotion_reviews:
+    stale_reviews = _stale_promotion_reviews(operator_report)
+    if stale_reviews:
         warnings.append(
             _issue(
                 "promotion_review_stale",
                 "one or more promotion review packets are stale or missing a valid timestamp",
-                detail={"reviews": stale_promotion_reviews},
+                detail={"reviews": stale_reviews},
             )
         )
-    testnet_rehearsal = (
-        operator_report.get("testnet_rehearsal")
-        if isinstance(operator_report.get("testnet_rehearsal"), dict)
-        else {}
-    )
-    required_testnet_products = _products_requiring_testnet_rehearsal(operator_report)
-    live_testnet_products = [
-        product for product in required_testnet_products if product.get("mode") == "live"
-    ]
-    rehearsal_required = bool(testnet_rehearsal.get("required")) or bool(required_testnet_products)
-    if rehearsal_required and testnet_rehearsal.get("ok") is not True:
-        detail = _testnet_rehearsal_issue_detail(
-            testnet_rehearsal, live_products=live_testnet_products
-        )
-        if live_testnet_products:
+    return warnings
+
+
+def _health_testnet_checks(
+    operator_report: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    issues: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    rehearsal = operator_report.get("testnet_rehearsal")
+    rehearsal = rehearsal if isinstance(rehearsal, dict) else {}
+    required_products = _products_requiring_testnet_rehearsal(operator_report)
+    live_products = [item for item in required_products if item.get("mode") == "live"]
+    required = bool(rehearsal.get("required")) or bool(required_products)
+    if required and rehearsal.get("ok") is not True:
+        detail = _testnet_rehearsal_issue_detail(rehearsal, live_products=live_products)
+        if live_products:
             issues.append(
                 _issue(
                     "live_required_testnet_rehearsal_not_ready",
@@ -2194,6 +2234,11 @@ def evaluate_health(
                     detail=detail,
                 )
             )
+    return issues, warnings
+
+
+def _health_alert_warnings(operator_report: dict[str, Any]) -> list[dict[str, Any]]:
+    warnings = []
     for key, code, message in (
         ("readiness_alert", "readiness_warning_alert", "autopilot has active readiness warnings"),
         (
@@ -2224,36 +2269,114 @@ def evaluate_health(
             if item_key in alert
         }
         warnings.append(_issue(code, message, detail=detail))
-    memory_feedback = (
-        experiment_memory.get("feedback")
-        if isinstance(experiment_memory.get("feedback"), dict)
+    return warnings
+
+
+def _health_generative_research(
+    operator_report: dict[str, Any],
+) -> dict[str, Any]:
+    memory = operator_report.get("experiment_memory")
+    memory = memory if isinstance(memory, dict) else {}
+    feedback = memory.get("feedback")
+    feedback = feedback if isinstance(feedback, dict) else {}
+    totals = feedback.get("totals")
+    totals = totals if isinstance(totals, dict) else {}
+    generated = operator_report.get("generated_batch")
+    generated = generated if isinstance(generated, dict) else {}
+    generated_summary = generated.get("summary")
+    generated_summary = generated_summary if isinstance(generated_summary, dict) else {}
+    integrity = memory.get("integrity")
+    integrity = integrity if isinstance(integrity, dict) else {}
+    return {
+        "batch_ok": generated.get("ok"),
+        "batch_generated_at": generated.get("generated_at"),
+        "batch_hypotheses": generated.get("hypotheses_count", generated_summary.get("hypotheses")),
+        "unique_behavioral_specs": totals.get("strategies"),
+        "recorded_evaluations": totals.get("evaluations"),
+        "memory_status": memory.get("status"),
+        "memory_integrity_ok": integrity.get("ok"),
+        "adaptive_evidence_scope": memory.get("adaptive_evidence_scope"),
+        "protected_holdout_results_excluded": memory.get("protected_holdout_results_excluded"),
+    }
+
+
+def evaluate_health(
+    operator_report: dict[str, Any],
+    *,
+    readiness_report: dict[str, Any] | None = None,
+    fail_on_job_failures: bool = True,
+    fail_on_job_overdue: bool = True,
+    now_ts: float | None = None,
+    max_backup_age_seconds: float | None = None,
+    max_consecutive_job_deferrals: int = 16,
+) -> dict[str, Any]:
+    """Convert report payloads into a compact health status and issue list."""
+
+    issues: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    now_ts = now_ts if now_ts is not None else dt.datetime.now(dt.UTC).timestamp()
+    runtime_issues, runtime_warnings = _health_runtime_checks(operator_report)
+    issues.extend(runtime_issues)
+    warnings.extend(runtime_warnings)
+    market_issues, market_warnings = _health_market_checks(operator_report)
+    issues.extend(market_issues)
+    warnings.extend(market_warnings)
+    product_issues, product_warnings = _health_product_state_checks(operator_report)
+    issues.extend(product_issues)
+    warnings.extend(product_warnings)
+    accounting_issues, accounting_warnings = _health_accounting_checks(operator_report)
+    issues.extend(accounting_issues)
+    warnings.extend(accounting_warnings)
+    readiness_issues, readiness_warnings = _health_readiness_checks(readiness_report)
+    issues.extend(readiness_issues)
+    warnings.extend(readiness_warnings)
+    candidate_issues, candidate_warnings, candidate_paper = _health_candidate_paper_checks(
+        operator_report
+    )
+    issues.extend(candidate_issues)
+    warnings.extend(candidate_warnings)
+    issues.extend(_health_optional_checks(operator_report))
+    issues.extend(
+        _health_backup_checks(
+            operator_report,
+            now_ts=now_ts,
+            max_backup_age_seconds=max_backup_age_seconds,
+        )
+    )
+    scheduler_issues, scheduler_warnings = _health_scheduler_checks(
+        operator_report,
+        fail_on_job_failures=fail_on_job_failures,
+        fail_on_job_overdue=fail_on_job_overdue,
+        max_consecutive_job_deferrals=max_consecutive_job_deferrals,
+    )
+    issues.extend(scheduler_issues)
+    warnings.extend(scheduler_warnings)
+    position_issues, position_warnings = _health_position_checks(operator_report, now_ts=now_ts)
+    issues.extend(position_issues)
+    warnings.extend(position_warnings)
+    research_cycle = (
+        operator_report.get("research_cycle")
+        if isinstance(operator_report.get("research_cycle"), dict)
         else {}
     )
-    memory_totals = (
-        memory_feedback.get("totals") if isinstance(memory_feedback.get("totals"), dict) else {}
+    warnings.extend(_health_research_cycle_artifact_checks(research_cycle))
+    generated_batch = (
+        operator_report.get("generated_batch")
+        if isinstance(operator_report.get("generated_batch"), dict)
+        else {}
     )
-    generated_summary = (
-        generated_batch.get("summary") if isinstance(generated_batch.get("summary"), dict) else {}
-    )
-    generative_research = {
-        "batch_ok": generated_batch.get("ok"),
-        "batch_generated_at": generated_batch.get("generated_at"),
-        "batch_hypotheses": generated_batch.get(
-            "hypotheses_count", generated_summary.get("hypotheses")
-        ),
-        "unique_behavioral_specs": memory_totals.get("strategies"),
-        "recorded_evaluations": memory_totals.get("evaluations"),
-        "memory_status": experiment_memory.get("status"),
-        "memory_integrity_ok": (
-            (experiment_memory.get("integrity") or {}).get("ok")
-            if isinstance(experiment_memory.get("integrity"), dict)
-            else None
-        ),
-        "adaptive_evidence_scope": experiment_memory.get("adaptive_evidence_scope"),
-        "protected_holdout_results_excluded": experiment_memory.get(
-            "protected_holdout_results_excluded"
-        ),
-    }
+    warnings.extend(_health_generated_batch_checks(generated_batch))
+
+    memory_issues, memory_warnings = _health_experiment_memory_checks(operator_report)
+    issues.extend(memory_issues)
+    warnings.extend(memory_warnings)
+    warnings.extend(_health_research_progress_checks(operator_report, research_cycle))
+    warnings.extend(_health_handoff_checks(operator_report))
+    testnet_issues, testnet_warnings = _health_testnet_checks(operator_report)
+    issues.extend(testnet_issues)
+    warnings.extend(testnet_warnings)
+    warnings.extend(_health_alert_warnings(operator_report))
+    generative_research = _health_generative_research(operator_report)
     return {
         "ok": not issues,
         "issues": issues,
