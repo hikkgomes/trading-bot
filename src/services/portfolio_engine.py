@@ -97,6 +97,10 @@ class DatabasePortfolioTargetBuilder:
         if product_family == "btc_accumulation":
             btc_instrument = seed.instrument_id
             btc_price = prices[btc_instrument]
+            current_positions = {
+                **current_positions,
+                btc_instrument: float(balances.get("BTC", 0.0)),
+            }
             btc_equity = balances.get("BTC", 0.0) + balances.get("USDT", 0.0) / btc_price
             if btc_equity <= 0:
                 raise ValueError("BTC accumulation equity must be positive")

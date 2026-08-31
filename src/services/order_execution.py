@@ -153,7 +153,7 @@ class DatabaseExecutionWorker:
                                 * float(canonical_inputs["prices"][order.instrument_id]),
                                 target_fraction=0.0,
                                 strategy_contributions=order.strategy_contributions,
-                                risk_budget=float(order.metadata.get("risk_budget", 0.0)),
+                                risk_budget=float(order.metadata.get("risk_budget") or 0.0),
                                 valid_until=order.valid_until,
                             ),
                             reason_code="control_plane_blocks_new_risk",
@@ -256,12 +256,12 @@ class DatabaseExecutionWorker:
         reconciled_positions = snapshot.get("reconciled_positions", {})
         if not isinstance(reconciled_positions, Mapping):
             raise ValueError("target snapshot has invalid reconciled positions")
-            return {
-                "targets": snapshot["targets"],
-                "prices": snapshot["prices"],
-                "balances": snapshot.get("balances", {}),
-                "reconciled_positions": reconciled_positions,
-            }
+        return {
+            "targets": snapshot["targets"],
+            "prices": snapshot["prices"],
+            "balances": snapshot.get("balances", {}),
+            "reconciled_positions": reconciled_positions,
+        }
 
     def _plan_orders(
         self,
