@@ -28,18 +28,32 @@ class AccountingService:
         self,
         *,
         engine: Engine,
-        ledgers: dict[str, Ledger],
+        ledgers: dict[str, Ledger] | None = None,
         snapshot_store: SqlRiskSnapshotStore | None = None,
     ):
         self.engine = engine
-        self.ledgers = dict(ledgers)
+        self.ledgers = dict(ledgers or {})
         self.snapshot_store = snapshot_store
 
     def record_nav(self, snapshot: NavSnapshot) -> str:
+        snapshot = NavSnapshot(**dict(snapshot.__dict__))
         payload = json_value(snapshot.__dict__, field="NAV snapshot")
         identity = canonical_hash(payload)
         self._append(nav_snapshot, identity, snapshot.observed_at, payload)
         return identity
+
+    def latest_nav(self, *, product_id: str, at: str) -> NavSnapshot | None:
+        at = timestamp(at, field="NAV lookup time")
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(nav_snapshot.c.payload)
+                .where(nav_snapshot.c.created_at <= at)
+                .order_by(nav_snapshot.c.created_at.desc(), nav_snapshot.c.id.desc())
+            ).scalars()
+            for payload in rows:
+                if isinstance(payload, dict) and str(payload.get("product_id")) == product_id:
+                    return NavSnapshot(**payload)
+        return None
 
     def record_balances(
         self,

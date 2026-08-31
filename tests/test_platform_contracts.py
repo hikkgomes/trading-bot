@@ -81,7 +81,12 @@ from src.research.providers import provider_candidate
 from src.research.store import SqlResearchStore
 from src.research.theses import REQUIRED_NEGATIVE_CONTROLS, SqlThesisRegistry
 from src.risk.account import AccountRiskLimits, assess_account_risk
-from src.risk.engine import JsonlRiskDecisionStore, SqlRiskDecisionStore, combine_risk_decisions
+from src.risk.engine import (
+    JsonlRiskDecisionStore,
+    SqlRiskDecisionStore,
+    SqlRiskSnapshotStore,
+    combine_risk_decisions,
+)
 from src.risk.global_risk import GlobalRiskLimits, assess_global_risk
 from src.risk.instrument import InstrumentRiskLimits, assess_instrument_risk
 from src.risk.product import ProductRiskLimits, assess_product_risk
@@ -115,6 +120,7 @@ from src.services.portfolio_service import (
     DatabaseProductSupervisor,
     SqlPortfolioRepository,
 )
+from src.services.portfolio_state import DatabasePortfolioSourceService
 from src.services.product_supervisor import (
     ActiveIncomeProductSupervisor,
     BtcAccumulationProductSupervisor,
@@ -1699,7 +1705,7 @@ def test_live_queue_uses_a_mandatory_authoriser_and_the_canonical_broker_contrac
         target_fraction=0.1,
         strategy_contributions={"approved-strategy": 0.1},
         risk_budget=0.1,
-        valid_until=LATER,
+        valid_until="2026-08-13T14:00:00+00:00",
     )
     queue.enqueue(
         job_id="live-target-1",
@@ -3428,6 +3434,39 @@ def test_accounting_service_persists_nav_balances_funding_and_reconciles_costs(t
 
     assert recorded["reason_code"] == "accounting_event_recorded"
     assert recorded["kind"] == "nav"
+
+
+def test_portfolio_source_builds_continuous_btc_nav_and_passive_benchmark(tmp_path: Path):
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'portfolio-state.sqlite3'}")
+    database.create_schema()
+    source = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=SqlRiskSnapshotStore(database.engine),
+        products={"btc_accumulation": {"account_id": "spot", "portfolio_id": "btc"}},
+        accounts={"spot": {"market": "spot"}},
+    )
+    first = source._nav_snapshot(
+        product_id="btc_accumulation",
+        product={"portfolio_id": "btc"},
+        balances={"BTC": 0.5, "USDT": 50.0},
+        positions={},
+        market={"binance:spot:BTCUSDT": {"price": 100.0}},
+        observed_at=NOW,
+    )
+    assert first is not None
+    source.accounting.record_nav(first)
+    second = source._nav_snapshot(
+        product_id="btc_accumulation",
+        product={"portfolio_id": "btc"},
+        balances={"BTC": 0.5, "USDT": 50.0},
+        positions={},
+        market={"binance:spot:BTCUSDT": {"price": 120.0}},
+        observed_at=LATER,
+    )
+
+    assert second is not None
+    assert second.nav == pytest.approx(50 / 120 + 0.5)
+    assert second.passive_benchmark_nav == pytest.approx(1.2)
 
 
 def test_observability_reports_all_domains_metrics_and_exact_health_causes(tmp_path: Path):

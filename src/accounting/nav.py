@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from src.domain._codec import finite, json_value, non_empty, timestamp
+
 
 @dataclass(frozen=True)
 class NavSnapshot:
@@ -14,6 +16,29 @@ class NavSnapshot:
     observed_at: str
     components: Mapping[str, float]
     passive_benchmark_nav: float | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "product_id", non_empty(self.product_id, field="product_id"))
+        object.__setattr__(
+            self,
+            "accounting_asset",
+            non_empty(self.accounting_asset, field="accounting_asset").upper(),
+        )
+        object.__setattr__(self, "observed_at", timestamp(self.observed_at, field="observed_at"))
+        object.__setattr__(self, "nav", finite(self.nav, field="nav", minimum=0.0))
+        if not isinstance(self.components, Mapping):
+            raise ValueError("NAV components must be an object")
+        object.__setattr__(
+            self,
+            "components",
+            json_value(dict(self.components), field="NAV components"),
+        )
+        if self.passive_benchmark_nav is not None:
+            object.__setattr__(
+                self,
+                "passive_benchmark_nav",
+                finite(self.passive_benchmark_nav, field="passive_benchmark_nav", minimum=0.0),
+            )
 
 
 def btc_nav(
@@ -34,8 +59,12 @@ def usdt_nav(
 ) -> float:
     """Return cash plus unrealised PnL from quantity, entry price, and mark."""
     nav = float(cash_balance)
+    if nav < 0:
+        raise ValueError("cash balance must be non-negative")
     for quantity, entry_price, mark_price in positions.values():
         if entry_price <= 0 or mark_price <= 0:
             raise ValueError("position entry and mark prices must be positive")
         nav += float(quantity) * (float(mark_price) - float(entry_price))
+    if nav < 0:
+        raise ValueError("USDT NAV cannot be negative")
     return nav

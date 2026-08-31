@@ -10,6 +10,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from src.accounting.nav import NavSnapshot, btc_nav, usdt_nav
 from src.data.database import (
     account_snapshot,
     balance_snapshot,
@@ -22,6 +23,7 @@ from src.data.database import (
 )
 from src.domain._codec import canonical_hash, timestamp
 from src.risk.engine import SqlRiskSnapshotStore
+from src.services.accounting_service import AccountingService
 from src.services.portfolio_engine import _canonical_portfolio_state
 from src.services.risk_state import PortfolioRiskCalculator
 from src.services.scheduler import DatabaseJobQueue
@@ -43,6 +45,7 @@ class DatabasePortfolioSourceService:
         self.products = {str(key): dict(value) for key, value in products.items()}
         self.accounts = {str(key): dict(value) for key, value in accounts.items()}
         self.risk_calculator = PortfolioRiskCalculator(engine)
+        self.accounting = AccountingService(engine=engine)
 
     def publish(
         self,
@@ -120,6 +123,16 @@ class DatabasePortfolioSourceService:
         balances = balance_payload.get("balances", {})
         if not isinstance(balances, Mapping):
             return
+        nav = self._nav_snapshot(
+            product_id=product_id,
+            product=product,
+            balances=balances,
+            positions=positions,
+            market=market,
+            observed_at=observed_at,
+        )
+        if nav is not None:
+            self.accounting.record_nav(nav)
         measurements = self.risk_calculator.calculate(
             product_id=product_id,
             account_id=account_id,
@@ -216,6 +229,104 @@ class DatabasePortfolioSourceService:
             or observed_at,
             values=drift_values,
         )
+
+    def _nav_snapshot(
+        self,
+        *,
+        product_id: str,
+        product: Mapping[str, Any],
+        balances: Mapping[str, Any],
+        positions: Mapping[str, float],
+        market: Mapping[str, Mapping[str, Any]],
+        observed_at: str,
+    ) -> NavSnapshot | None:
+        if product_id == "btc_accumulation":
+            price = next(
+                (
+                    float(values["price"])
+                    for instrument_id, values in market.items()
+                    if "BTCUSDT" in instrument_id.upper() and float(values.get("price", 0)) > 0
+                ),
+                0.0,
+            )
+            if price <= 0:
+                return None
+            btc_balance = float(balances.get("BTC", 0.0))
+            stablecoin_balance = float(
+                balances.get("USDT", balances.get("USDC", balances.get("BUSD", 0.0)))
+            )
+            nav = btc_nav(
+                btc_balance=btc_balance,
+                stablecoin_balance=stablecoin_balance,
+                stablecoin_per_btc=price,
+            )
+            previous = self.accounting.latest_nav(product_id=product_id, at=observed_at)
+            passive = nav if previous is None else self._passive_benchmark(previous, price)
+            return NavSnapshot(
+                product_id=product_id,
+                accounting_asset="BTC",
+                nav=nav,
+                observed_at=observed_at,
+                components={
+                    "btc_balance": btc_balance,
+                    "stablecoin_balance": stablecoin_balance,
+                    "stablecoin_per_btc": price,
+                },
+                passive_benchmark_nav=passive,
+            )
+        if product_id != "active_income":
+            return None
+        position_terms = self._position_terms(str(product["portfolio_id"]), observed_at)
+        if any(instrument_id not in market for instrument_id in position_terms):
+            return None
+        nav = usdt_nav(
+            cash_balance=float(balances.get("USDT", 0.0)),
+            positions={
+                instrument_id: (
+                    quantity,
+                    entry_price,
+                    float(market[instrument_id]["price"]),
+                )
+                for instrument_id, (quantity, entry_price) in position_terms.items()
+            },
+        )
+        return NavSnapshot(
+            product_id=product_id,
+            accounting_asset="USDT",
+            nav=nav,
+            observed_at=observed_at,
+            components={
+                "cash_balance": float(balances.get("USDT", 0.0)),
+                "position_count": len(position_terms),
+            },
+        )
+
+    def _position_terms(self, portfolio_id: str, at: str) -> dict[str, tuple[float, float]]:
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(position.c.payload)
+                .where(position.c.created_at <= at)
+                .order_by(position.c.created_at.desc(), position.c.id.desc())
+            ).scalars()
+        result: dict[str, tuple[float, float]] = {}
+        for payload in rows:
+            if not isinstance(payload, Mapping) or str(payload.get("portfolio_id")) != portfolio_id:
+                continue
+            instrument_id = str(payload.get("instrument_id") or "")
+            if not instrument_id or instrument_id in result:
+                continue
+            quantity = float(payload.get("quantity", 0.0))
+            if abs(quantity) <= 1e-12:
+                continue
+            result[instrument_id] = (quantity, float(payload.get("average_entry_price", 0.0)))
+        return result
+
+    @staticmethod
+    def _passive_benchmark(previous: NavSnapshot, price: float) -> float:
+        old_price = float(previous.components.get("stablecoin_per_btc", 0.0))
+        if old_price <= 0 or previous.passive_benchmark_nav is None:
+            return float(previous.passive_benchmark_nav or previous.nav)
+        return float(previous.passive_benchmark_nav) * price / old_price
 
     def _previous_observed_at(self, *, kind: str, product_id: str, at: str) -> str | None:
         try:
