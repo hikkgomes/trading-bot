@@ -19,6 +19,15 @@ from src.data.database import experiment, holdout_claim
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlHoldoutRepository, SqlValidationRepository
 from src.research.datasets import CanonicalDatasetResolver
+from src.research.evidence import (
+    EvidenceProfile,
+    cross_symbol_stability_passes,
+    drawdown_passes,
+    monte_carlo_passes,
+    parameter_stability_passes,
+    sample_evidence_passes,
+    select_profile,
+)
 from src.research.executors import ExecutorError, ProviderExecutorRegistry
 from src.research.objectives import objective_is_available, objective_passes
 from src.research.store import SqlResearchStore
@@ -287,6 +296,7 @@ class EvidencePolicy:
     bootstrap_method: str = "moving_block_bootstrap_v1"
     multiple_testing_method: str = "bailey_lopez_de_prado_dsr_v1"
     pbo_method: str = "combinatorial_purged_pbo_v1"
+    profiles: tuple[EvidenceProfile, ...] = ()
 
     @classmethod
     def from_configuration(cls, configuration: Mapping[str, Any]) -> EvidencePolicy:
@@ -308,7 +318,17 @@ class EvidencePolicy:
             raise EvaluationContractError(
                 "research evidence policy is missing versioned fields: " + ", ".join(missing)
             )
-        return cls(**{str(key): configuration[key] for key in required})
+        raw_profiles = configuration.get("profiles", ())
+        if not isinstance(raw_profiles, list | tuple):
+            raise EvaluationContractError("research evidence policy profiles must be a list")
+        try:
+            profiles = tuple(EvidenceProfile.from_mapping(item) for item in raw_profiles)
+        except (TypeError, ValueError) as exc:
+            raise EvaluationContractError(f"invalid research evidence profile: {exc}") from exc
+        return cls(
+            **{str(key): configuration[key] for key in required},
+            profiles=profiles,
+        )
 
     @property
     def policy_hash(self) -> str:
@@ -325,8 +345,35 @@ class EvidencePolicy:
                 "bootstrap_method": self.bootstrap_method,
                 "multiple_testing_method": self.multiple_testing_method,
                 "pbo_method": self.pbo_method,
+                "profiles": [profile.to_payload() for profile in self.profiles],
             }
         )
+
+    def profile_for(
+        self,
+        stage: str,
+        *,
+        product_id: str | None = None,
+        family: str | None = None,
+        horizon: str | None = None,
+        evidence_type: str | None = None,
+    ) -> EvidenceProfile:
+        selected = select_profile(
+            self.profiles,
+            stage=stage,
+            product_id=product_id,
+            family=family,
+            horizon=horizon,
+        )
+        if selected is None and evidence_type is not None and evidence_type != family:
+            selected = select_profile(
+                self.profiles,
+                stage=stage,
+                product_id=product_id,
+                family=evidence_type,
+                horizon=horizon,
+            )
+        return selected or EvidenceProfile()
 
     def accepts(
         self,
@@ -335,20 +382,47 @@ class EvidencePolicy:
         controls: tuple[str, ...],
         *,
         product_id: str | None = None,
+        family: str | None = None,
+        horizon: str | None = None,
+        evidence_type: str | None = None,
     ) -> bool:
         if evidence.get("evidence_policy_hash") != self.policy_hash:
             return False
-        statuses = self.statuses(stage, evidence, controls, product_id=product_id)
-        if not statuses or any(
+        statuses = self.statuses(
+            stage,
+            evidence,
+            controls,
+            product_id=product_id,
+            family=family,
+            horizon=horizon,
+            evidence_type=evidence_type,
+        )
+        required_statuses = {
+            name: status
+            for name, status in statuses.items()
+            if name not in _OPTIONAL_EVIDENCE_VALIDATORS.get(stage, {})
+        }
+        if not required_statuses or any(
             status not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
-            for status in statuses.values()
+            for status in required_statuses.values()
         ):
             return False
         if product_id is not None and stage in {"development", "robustness", "forward"}:
+            profile = self.profile_for(
+                stage,
+                product_id=product_id,
+                family=family,
+                horizon=horizon,
+                evidence_type=evidence_type,
+            )
             if not objective_passes(
                 evidence,
                 product_id=product_id,
-                minimum_excess_fraction=self.minimum_cost_adjusted_return,
+                minimum_excess_fraction=(
+                    profile.minimum_cost_adjusted_return
+                    if profile.minimum_cost_adjusted_return is not None
+                    else self.minimum_cost_adjusted_return
+                ),
             ):
                 return False
         return True
@@ -360,10 +434,21 @@ class EvidencePolicy:
         controls: tuple[str, ...],
         *,
         product_id: str | None = None,
+        family: str | None = None,
+        horizon: str | None = None,
+        evidence_type: str | None = None,
     ) -> dict[str, EvidenceStatus]:
         validators = _STAGE_EVIDENCE_VALIDATORS.get(stage, {})
+        optional = _OPTIONAL_EVIDENCE_VALIDATORS.get(stage, {})
+        profile = self.profile_for(
+            stage,
+            product_id=product_id,
+            family=family,
+            horizon=horizon,
+            evidence_type=evidence_type,
+        )
         statuses: dict[str, EvidenceStatus] = {}
-        for name, validator in validators.items():
+        for name, validator in {**validators, **optional}.items():
             value = evidence.get(name)
             if name == "negative_control_results" and stage == "robustness":
                 statuses[name] = _negative_control_status(value, controls)
@@ -373,7 +458,7 @@ class EvidencePolicy:
                 statuses[name] = EvidenceStatus.UNAVAILABLE
             else:
                 statuses[name] = (
-                    EvidenceStatus.PASS if validator(value, self) else EvidenceStatus.FAIL
+                    EvidenceStatus.PASS if validator(value, self, profile) else EvidenceStatus.FAIL
                 )
         if product_id is not None and stage in {"development", "robustness", "forward"}:
             if not objective_is_available(evidence, product_id=product_id):
@@ -384,7 +469,11 @@ class EvidencePolicy:
                     if objective_passes(
                         evidence,
                         product_id=product_id,
-                        minimum_excess_fraction=self.minimum_cost_adjusted_return,
+                        minimum_excess_fraction=(
+                            profile.minimum_cost_adjusted_return
+                            if profile.minimum_cost_adjusted_return is not None
+                            else self.minimum_cost_adjusted_return
+                        ),
                     )
                     else EvidenceStatus.FAIL
                 )
@@ -429,7 +518,7 @@ def _negative_control_status(value: object, controls: tuple[str, ...]) -> Eviden
     return EvidenceStatus.PASS
 
 
-def _true(value: object, _policy: EvidencePolicy) -> bool:
+def _true(value: object, _policy: EvidencePolicy, _profile: EvidenceProfile | None = None) -> bool:
     return value is True
 
 
@@ -440,48 +529,87 @@ def _finite(value: object) -> float | None:
     return result if __import__("math").isfinite(result) else None
 
 
-def _nonnegative(value: object, _policy: EvidencePolicy) -> bool:
+def _nonnegative(
+    value: object, _policy: EvidencePolicy, _profile: EvidenceProfile | None = None
+) -> bool:
     measured = _finite(value)
     return measured is not None and measured >= 0
 
 
-def _positive(value: object, _policy: EvidencePolicy) -> bool:
+def _positive(
+    value: object, _policy: EvidencePolicy, _profile: EvidenceProfile | None = None
+) -> bool:
     measured = _finite(value)
     return measured is not None and measured > 0
 
 
-def _return_passes(value: object, policy: EvidencePolicy) -> bool:
+def _return_passes(
+    value: object, policy: EvidencePolicy, profile: EvidenceProfile | None = None
+) -> bool:
     measured = _finite(value)
-    return measured is not None and measured >= policy.minimum_cost_adjusted_return
+    minimum = (
+        profile.minimum_cost_adjusted_return
+        if profile is not None and profile.minimum_cost_adjusted_return is not None
+        else policy.minimum_cost_adjusted_return
+    )
+    return measured is not None and measured >= minimum
 
 
-def _deflated_sharpe_passes(value: object, policy: EvidencePolicy) -> bool:
+def _deflated_sharpe_passes(
+    value: object, policy: EvidencePolicy, profile: EvidenceProfile | None = None
+) -> bool:
     measured = _finite(value)
-    return measured is not None and measured >= policy.minimum_deflated_sharpe
+    minimum = (
+        profile.minimum_deflated_sharpe
+        if profile is not None and profile.minimum_deflated_sharpe is not None
+        else policy.minimum_deflated_sharpe
+    )
+    return measured is not None and measured >= minimum
 
 
-def _pbo_passes(value: object, policy: EvidencePolicy) -> bool:
+def _pbo_passes(
+    value: object, policy: EvidencePolicy, profile: EvidenceProfile | None = None
+) -> bool:
     if _is_not_applicable(value):
         return True
     measured = _finite(value)
-    return measured is not None and 0 <= measured <= policy.maximum_backtest_overfitting_probability
+    maximum = (
+        profile.maximum_backtest_overfitting_probability
+        if profile is not None and profile.maximum_backtest_overfitting_probability is not None
+        else policy.maximum_backtest_overfitting_probability
+    )
+    return measured is not None and 0 <= measured <= maximum
 
 
-def _walk_forward_passes(value: object, policy: EvidencePolicy) -> bool:
+def _walk_forward_passes(
+    value: object, policy: EvidencePolicy, profile: EvidenceProfile | None = None
+) -> bool:
     if not isinstance(value, Mapping) or value.get("passed") is not True:
         return False
     windows = value.get("window_count")
     fraction = _finite(value.get("pass_fraction"))
+    minimum_windows = (
+        profile.minimum_walk_forward_windows
+        if profile is not None and profile.minimum_walk_forward_windows is not None
+        else policy.minimum_walk_forward_windows
+    )
+    minimum_fraction = (
+        profile.minimum_walk_forward_pass_fraction
+        if profile is not None and profile.minimum_walk_forward_pass_fraction is not None
+        else policy.minimum_walk_forward_pass_fraction
+    )
     return (
         isinstance(windows, int)
         and not isinstance(windows, bool)
-        and windows >= policy.minimum_walk_forward_windows
+        and windows >= minimum_windows
         and fraction is not None
-        and fraction >= policy.minimum_walk_forward_pass_fraction
+        and fraction >= minimum_fraction
     )
 
 
-def _mapping_passes(value: object, _policy: EvidencePolicy) -> bool:
+def _mapping_passes(
+    value: object, _policy: EvidencePolicy, _profile: EvidenceProfile | None = None
+) -> bool:
     if not _passed_mapping(value):
         return False
     assert isinstance(value, Mapping)
@@ -493,51 +621,21 @@ def _mapping_passes(value: object, _policy: EvidencePolicy) -> bool:
     )
 
 
-def _parameter_stability_passes(value: object, _policy: EvidencePolicy) -> bool:
-    if _is_not_applicable(value):
-        return True
-    if not isinstance(value, Mapping) or value.get("passed") is not True:
-        return False
-    results = value.get("results")
-    tested = value.get("neighbours_tested")
-    if not isinstance(results, list | tuple) or not isinstance(tested, int) or tested < 2:
-        return False
-    if len(results) != tested:
-        return False
-    return all(
-        isinstance(item, Mapping)
-        and item.get("passed") is True
-        and isinstance(item.get("observations"), int)
-        and int(item["observations"]) > 0
-        and _finite(item.get("return")) is not None
-        and _valid_hash(item.get("run_id"))
-        and _valid_hash(item.get("input_hash"))
-        for item in results
-    )
+def _parameter_stability_passes(
+    value: object, _policy: EvidencePolicy, profile: EvidenceProfile | None = None
+) -> bool:
+    return parameter_stability_passes(value, profile or EvidenceProfile())
 
 
-def _cross_symbol_stability_passes(value: object, _policy: EvidencePolicy) -> bool:
-    if _is_not_applicable(value):
-        return True
-    if not isinstance(value, Mapping) or value.get("passed") is not True:
-        return False
-    per_symbol = value.get("per_symbol")
-    symbols = value.get("symbols")
-    if not isinstance(per_symbol, Mapping) or not isinstance(symbols, int) or symbols <= 0:
-        return False
-    return len(per_symbol) == symbols and all(
-        isinstance(item, Mapping)
-        and item.get("passed") is True
-        and isinstance(item.get("observations"), int)
-        and int(item["observations"]) >= 2
-        and _finite(item.get("return")) is not None
-        and _valid_hash(item.get("run_id"))
-        and _valid_hash(item.get("input_hash"))
-        for item in per_symbol.values()
-    )
+def _cross_symbol_stability_passes(
+    value: object, _policy: EvidencePolicy, profile: EvidenceProfile | None = None
+) -> bool:
+    return cross_symbol_stability_passes(value, profile or EvidenceProfile())
 
 
-def _portfolio_overlap_passes(value: object, policy: EvidencePolicy) -> bool:
+def _portfolio_overlap_passes(
+    value: object, policy: EvidencePolicy, _profile: EvidenceProfile | None = None
+) -> bool:
     if _is_not_applicable(value):
         return True
     if not isinstance(value, Mapping) or value.get("passed") is not True:
@@ -579,7 +677,9 @@ def _valid_hash(value: object) -> bool:
     return True
 
 
-def _statistical_procedures_pass(value: object, policy: EvidencePolicy) -> bool:
+def _statistical_procedures_pass(
+    value: object, policy: EvidencePolicy, _profile: EvidenceProfile | None = None
+) -> bool:
     return isinstance(value, Mapping) and value == {
         "bootstrap": policy.bootstrap_method,
         "multiple_testing": policy.multiple_testing_method,
@@ -587,7 +687,9 @@ def _statistical_procedures_pass(value: object, policy: EvidencePolicy) -> bool:
     }
 
 
-def _negative_control_results_pass(value: object, _policy: EvidencePolicy) -> bool:
+def _negative_control_results_pass(
+    value: object, _policy: EvidencePolicy, _profile: EvidenceProfile | None = None
+) -> bool:
     if not isinstance(value, Mapping):
         return False
     return all(
@@ -599,24 +701,51 @@ def _negative_control_results_pass(value: object, _policy: EvidencePolicy) -> bo
     )
 
 
-def _bootstrap_passes(value: object, policy: EvidencePolicy) -> bool:
+def _bootstrap_passes(
+    value: object, policy: EvidencePolicy, profile: EvidenceProfile | None = None
+) -> bool:
     if not isinstance(value, Mapping) or value.get("passed") is not True:
         return False
     observations = value.get("observations")
     lower = _finite(value.get("lower_bound"))
+    minimum = (
+        profile.minimum_bootstrap_observations
+        if profile is not None and profile.minimum_bootstrap_observations is not None
+        else policy.minimum_bootstrap_observations
+    )
     return (
         isinstance(observations, int)
-        and observations >= policy.minimum_bootstrap_observations
+        and observations >= minimum
         and lower is not None
         and lower >= 0.0
     )
 
 
-def _mapping(value: object, _policy: EvidencePolicy) -> bool:
+def _sample_evidence_passes(
+    value: object, _policy: EvidencePolicy, profile: EvidenceProfile | None = None
+) -> bool:
+    return sample_evidence_passes(value, profile or EvidenceProfile())
+
+
+def _monte_carlo_passes(
+    value: object, _policy: EvidencePolicy, profile: EvidenceProfile | None = None
+) -> bool:
+    return monte_carlo_passes(value, profile or EvidenceProfile())
+
+
+def _drawdown_passes(
+    value: object, _policy: EvidencePolicy, profile: EvidenceProfile | None = None
+) -> bool:
+    return drawdown_passes(value, profile or EvidenceProfile())
+
+
+def _mapping(
+    value: object, _policy: EvidencePolicy, _profile: EvidenceProfile | None = None
+) -> bool:
     return isinstance(value, Mapping) and bool(value)
 
 
-EvidenceValidator = Callable[[object, EvidencePolicy], bool]
+EvidenceValidator = Callable[[object, EvidencePolicy, EvidenceProfile], bool]
 
 
 _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
@@ -635,10 +764,9 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
         "funding": _nonnegative,
         "regime_breakdown": _mapping_passes,
         "parameter_stability": _parameter_stability_passes,
-        "sample_evidence": _mapping_passes,
+        "sample_evidence": _sample_evidence_passes,
         "cross_symbol_stability": _cross_symbol_stability_passes,
         "universe_evidence": _mapping_passes,
-        "portfolio_overlap": _portfolio_overlap_passes,
     },
     "robustness": {
         "walk_forward": _walk_forward_passes,
@@ -649,12 +777,12 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
         "adverse_fill_stress": _mapping_passes,
         "missing_data_stress": _mapping_passes,
         "funding_stress": _mapping_passes,
-        "monte_carlo_trade_order": _mapping_passes,
+        "monte_carlo_trade_order": _monte_carlo_passes,
         "bootstrap_confidence": _bootstrap_passes,
         "probability_backtest_overfitting": _pbo_passes,
         "deflated_sharpe": _deflated_sharpe_passes,
         "statistical_procedures": _statistical_procedures_pass,
-        "drawdown_stability": _mapping_passes,
+        "drawdown_stability": _drawdown_passes,
         "null_results": _mapping_passes,
         "negative_control_results": _negative_control_results_pass,
     },
@@ -668,6 +796,11 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
         "duration": _positive,
         "evidence_units": _positive,
     },
+}
+
+
+_OPTIONAL_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
+    "development": {"portfolio_overlap": _portfolio_overlap_passes},
 }
 
 
@@ -828,6 +961,7 @@ class CanonicalResearchEvaluator:
             if prior["accepted"] is not True:
                 raise EvaluationContractError(f"prior stage was rejected: {prior_stage}")
         definition = candidate.definition
+        family, horizon, evidence_type = _evidence_dimensions(candidate)
         stage_snapshot_ids = request.snapshot_ids_for_stage(request.requested_stage)
         protected_snapshot_id = (
             (
@@ -853,6 +987,9 @@ class CanonicalResearchEvaluator:
             "candidate_id": request.candidate_id,
             "strategy_version_id": definition.strategy_version_id,
             "product_id": definition.product,
+            "strategy_family": family,
+            "strategy_horizon": horizon,
+            "evidence_type": evidence_type,
             "evaluation_policy_id": request.evaluation_policy_id,
             "dataset_snapshot_ids": list(stage_snapshot_ids),
             "dataset_roles": adaptive_roles,
@@ -947,6 +1084,7 @@ class CanonicalResearchEvaluator:
         Mapping[str, float],
     ]:
         definition = candidate.definition
+        family, horizon, evidence_type = _evidence_dimensions(candidate)
         identity = canonical_hash(
             {
                 "definition_hash": definition.definition_hash,
@@ -1016,7 +1154,13 @@ class CanonicalResearchEvaluator:
                 fields_valid
                 and causality_valid
                 and self.evidence_policy.accepts(
-                    "screening", measured, self._negative_controls(candidate.thesis_id)
+                    "screening",
+                    measured,
+                    self._negative_controls(candidate.thesis_id),
+                    product_id=definition.product,
+                    family=family,
+                    horizon=horizon,
+                    evidence_type=evidence_type,
                 )
             )
             return (
@@ -1169,7 +1313,6 @@ class CanonicalResearchEvaluator:
                 "sample_evidence",
                 "cross_symbol_stability",
                 "universe_evidence",
-                "portfolio_overlap",
             ),
             "robustness": (
                 "walk_forward",
@@ -1209,11 +1352,15 @@ class CanonicalResearchEvaluator:
             evidence,
             controls,
             product_id=candidate.definition.product if requires_objective else None,
+            family=family,
+            horizon=horizon,
+            evidence_type=evidence_type,
         )
         missing = [
             field
             for field in required_fields
-            if field not in policy_fields and field != "objective_excess_fraction"
+            if field not in policy_fields
+            and field != "objective_excess_fraction"
             or evidence_status.get(field)
             not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
         ]
@@ -1222,6 +1369,9 @@ class CanonicalResearchEvaluator:
             evidence,
             controls,
             product_id=candidate.definition.product if requires_objective else None,
+            family=family,
+            horizon=horizon,
+            evidence_type=evidence_type,
         )
         evidence["missing_evidence"] = missing
         evidence["evidence_status"] = {
@@ -1253,3 +1403,16 @@ def _requires_product_objective(candidate: Any) -> bool:
     if metadata.get("diagnostic") is True or metadata.get("promotable") is False:
         return False
     return metadata.get("promotable") is True or metadata.get("executable_registry_entry") is True
+
+
+def _evidence_dimensions(candidate: Any) -> tuple[str, str, str]:
+    definition = candidate.definition
+    validation = definition.validation_policy
+    evidence_type = str(validation.get("evidence_type") or "")
+    horizon = str(
+        validation.get("horizon")
+        or definition.position_model.get("horizon")
+        or definition.position_model.get("horizon_bars")
+        or "*"
+    )
+    return str(definition.family), horizon, evidence_type

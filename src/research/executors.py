@@ -171,6 +171,7 @@ def _measured_result(
         raise ExecutorError(f"position return ledger input is invalid: {exc}") from exc
     aligned = return_report.effective_observations
     gross = list(return_report.gross_returns)
+    bootstrap_values = list(return_report.net_returns) or gross
     fees = return_report.fees
     slippage = return_report.slippage
     funding_pnl = return_report.funding_pnl
@@ -190,12 +191,12 @@ def _measured_result(
     )
     delayed_gross = [signals[index - 1] * returns[index] for index in range(1, aligned)]
     missing_data_gross = [value for index, value in enumerate(gross) if (index + 1) % 20]
-    parameter_stability = _parameter_stability(candidate, context, gross)
-    cross_symbol_stability = _cross_symbol_stability(context, gross)
+    parameter_stability = _parameter_stability(candidate, context, bootstrap_values)
+    cross_symbol_stability = _cross_symbol_stability(context, bootstrap_values)
     portfolio_overlap = _portfolio_overlap(context, gross)
     walk_forward = _purged_walk_forward(gross, context)
     bootstrap_low, bootstrap_high = bootstrap_sharpe_ci(
-        gross,
+        bootstrap_values,
         n_boot=int(context.get("bootstrap_iterations", 1_000)),
         random_state=int(candidate.candidate_id[7:15], 16),
     )
@@ -262,10 +263,12 @@ def _measured_result(
     observed_feature_manifest = str(context.get("runtime_feature_manifest_id") or "")
     randomiser = random.Random(int(candidate.candidate_id[7:23], 16))
     monte_carlo_drawdowns = []
+    monte_carlo_tail_losses = []
     for _ in range(250):
-        permuted = list(gross)
+        permuted = list(bootstrap_values)
         randomiser.shuffle(permuted)
         monte_carlo_drawdowns.append(_maximum_drawdown(permuted))
+        monte_carlo_tail_losses.append(_tail_loss(permuted))
     declared_universe = candidate.definition.universe.get("symbols")
     scope = tuple(str(item) for item in context.get("instrument_scope", ()))
     predeclared = isinstance(declared_universe, list | tuple) and bool(declared_universe)
@@ -293,6 +296,14 @@ def _measured_result(
             "net_returns": list(return_report.net_returns),
             "maximum_drawdown": return_report.maximum_drawdown,
         },
+        "product_accounting": accounting,
+        "objective_unit": accounting.get("objective_unit") if accounting else None,
+        "objective_value": accounting.get("objective_value") if accounting else None,
+        "benchmark_value": accounting.get("benchmark_value") if accounting else None,
+        "objective_excess": accounting.get("objective_excess") if accounting else None,
+        "objective_excess_fraction": (
+            accounting.get("objective_excess_fraction") if accounting else None
+        ),
         "chronological": not bool(context.get("lookahead_detected", False)),
         "cost_adjusted_return": net_return,
         "fees": fees,
@@ -304,6 +315,21 @@ def _measured_result(
         "sample_evidence": {
             "passed": aligned >= 3,
             "observations": aligned,
+            "closed_trades": int(
+                context.get(
+                    "closed_trades",
+                    sum(
+                        1
+                        for index in range(1, len(signals))
+                        if abs(signals[index - 1]) > 1e-12 and signals[index] != signals[index - 1]
+                    ),
+                )
+            ),
+            "effective_independent_episodes": int(
+                context.get("effective_independent_episodes", len(window_returns))
+            ),
+            "trading_days": int(context.get("trading_days", context.get("evidence_days", 0))),
+            "calendar_days": float(context.get("calendar_days", 0.0)),
             "run_id": canonical_hash(
                 {
                     "kind": "sample_evidence/v1",
@@ -356,13 +382,16 @@ def _measured_result(
             "passed": bool(monte_carlo_drawdowns) and net_return >= 0,
             "iterations": len(monte_carlo_drawdowns),
             "maximum_drawdown": max(monte_carlo_drawdowns, default=0.0),
+            "tail_loss": max(monte_carlo_tail_losses, default=0.0),
+            "tail_quantile": 0.05,
         },
         "bootstrap_confidence": {
-            "passed": len(gross) >= int(context.get("minimum_bootstrap_observations", 30))
+            "passed": len(bootstrap_values)
+            >= int(context.get("minimum_bootstrap_observations", 30))
             and bootstrap_low >= 0.0,
             "lower_bound": bootstrap_low,
             "upper_bound": bootstrap_high,
-            "observations": len(gross),
+            "observations": len(bootstrap_values),
             "iterations": int(context.get("bootstrap_iterations", 1_000)),
             "method": str(context.get("bootstrap_method") or "moving_block_bootstrap_v1"),
             "run_id": canonical_hash(
@@ -370,14 +399,14 @@ def _measured_result(
                     "kind": "bootstrap_confidence/v1",
                     "candidate_id": candidate.candidate_id,
                     "dataset_snapshot_ids": list(snapshots),
-                    "returns": gross,
+                    "returns": bootstrap_values,
                     "iterations": int(context.get("bootstrap_iterations", 1_000)),
                 }
             ),
             "input_hash": canonical_hash(
                 {
                     "dataset_snapshot_ids": list(snapshots),
-                    "returns": gross,
+                    "returns": bootstrap_values,
                 }
             ),
         },
@@ -412,6 +441,8 @@ def _measured_result(
         "drawdown_stability": {
             "passed": bool(return_report.net_returns),
             "maximum_drawdown": return_report.maximum_drawdown,
+            "tail_loss": _tail_loss(bootstrap_values),
+            "tail_quantile": 0.05,
         },
         "null_results": {
             "passed": all(item["passed"] for item in negative_controls.values()),
@@ -566,9 +597,7 @@ def _product_accounting(
             "benchmark_value": report.passive_btc_nav,
             "objective_excess": report.excess_btc,
             "objective_excess_fraction": (
-                report.excess_btc / report.initial_btc_nav
-                if report.initial_btc_nav > 0
-                else 0.0
+                report.excess_btc / report.initial_btc_nav if report.initial_btc_nav > 0 else 0.0
             ),
             "return_fraction": report.return_fraction,
             "fees": report.fees_btc,
@@ -584,9 +613,7 @@ def _product_accounting(
         if events is None:
             if fallback_return is None:
                 return None
-            initial_equity = float(
-                context.get("initial_cash", context.get("initial_equity", 1.0))
-            )
+            initial_equity = float(context.get("initial_cash", context.get("initial_equity", 1.0)))
             if not math.isfinite(initial_equity) or initial_equity <= 0.0:
                 raise ExecutorError(
                     "active-income return-ledger accounting requires positive initial equity"
@@ -830,11 +857,36 @@ def _parameter_stability(
             ),
         }
         results.append(result)
+    neighbour_returns = [float(item["return"]) for item in results]
+    median_return = statistics.median(neighbour_returns) if neighbour_returns else None
+    worst_return = min(neighbour_returns) if neighbour_returns else None
+    allowed_degradation = float(context.get("maximum_parameter_degradation", 0.5))
+    degradation = (
+        max(0.0, (base_total - worst_return) / max(abs(base_total), 1e-12))
+        if worst_return is not None
+        else None
+    )
+    cliff_detected = degradation is not None and degradation > allowed_degradation
+    passed_count = sum(1 for item in results if item["passed"])
+    passed = (
+        bool(base_returns)
+        and bool(results)
+        and not cliff_detected
+        and passed_count >= (len(results) + 1) // 2
+        and (median_return or 0.0) >= base_total * (1.0 - allowed_degradation)
+    )
     return {
-        "status": "pass" if results and all(item["passed"] for item in results) else "fail",
-        "passed": bool(base_returns) and bool(results) and all(item["passed"] for item in results),
+        "status": "pass" if passed else "fail",
+        "passed": passed,
         "neighbours_tested": len(results),
         "results": results,
+        "base_return": base_total,
+        "median_return": median_return,
+        "worst_return": worst_return,
+        "maximum_degradation": allowed_degradation,
+        "degradation_fraction": degradation,
+        "degradation_shape": "cliff" if cliff_detected else "smooth",
+        "cliff_detected": cliff_detected,
         "base_window_returns": _window_sums(base_returns, 3),
     }
 
@@ -895,16 +947,30 @@ def _cross_symbol_stability(
         if item
     )
     missing_symbols = sorted(set(scope) - set(per_symbol)) if len(scope) > 1 else []
+    returns = [float(item["return"]) for item in per_symbol.values()]
+    positive_fraction = sum(value >= 0.0 for value in returns) / len(returns)
+    minimum_positive_fraction = float(context.get("minimum_positive_symbol_fraction", 0.5))
+    median_return = statistics.median(returns)
+    pooled_return = sum(returns) / len(returns)
+    lower_quantile_return = _quantile(returns, 0.1)
+    passed = (
+        not missing_symbols
+        and positive_fraction >= minimum_positive_fraction
+        and median_return >= float(context.get("minimum_cross_symbol_median_return", 0.0))
+        and pooled_return >= float(context.get("minimum_cross_symbol_pooled_return", 0.0))
+    )
     return {
-        "status": (
-            "pass"
-            if all(item["passed"] for item in per_symbol.values()) and not missing_symbols
-            else "fail"
-        ),
-        "passed": all(item["passed"] for item in per_symbol.values()) and not missing_symbols,
+        "status": "pass" if passed else "fail",
+        "passed": passed,
         "symbols": len(per_symbol),
         "per_symbol": per_symbol,
         "missing_symbols": missing_symbols,
+        "positive_symbol_fraction": positive_fraction,
+        "minimum_positive_symbol_fraction": minimum_positive_fraction,
+        "median_return": median_return,
+        "pooled_return": pooled_return,
+        "lower_quantile_return": lower_quantile_return,
+        "lower_quantile": 0.1,
     }
 
 
@@ -1092,6 +1158,26 @@ def _maximum_drawdown(values: list[float]) -> float:
         peak = max(peak, equity)
         maximum = max(maximum, (peak - equity) / peak if peak else 0.0)
     return maximum
+
+
+def _tail_loss(values: list[float], probability: float = 0.05) -> float:
+    ordered = sorted(value for value in values if math.isfinite(value))
+    if not ordered:
+        return 0.0
+    count = max(1, math.ceil(len(ordered) * probability))
+    return max(0.0, -statistics.fmean(ordered[:count]))
+
+
+def _quantile(values: list[float], probability: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    position = (len(ordered) - 1) * probability
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
 def _negative_control_evidence(

@@ -20,7 +20,15 @@ from src.research.datasets import (
     DatasetResolutionError,
     SqlDatasetBundleRepository,
 )
-from src.research.evaluation import EvidencePolicy, EvidenceStatus
+from src.research.evaluation import EvidencePolicy, EvidenceProfile, EvidenceStatus
+from src.research.evidence import (
+    cross_symbol_stability_passes,
+    drawdown_passes,
+    holdout_degradation_passes,
+    monte_carlo_passes,
+    parameter_stability_passes,
+    sample_evidence_passes,
+)
 from src.research.executors import _cross_symbol_stability, _portfolio_overlap
 from src.research.objectives import objective_passes
 from src.research.returns import PositionReturnLedger
@@ -123,6 +131,102 @@ def test_single_symbol_and_empty_portfolio_overlap_are_not_applicable() -> None:
     assert cross_symbol["passed"] is True
     assert overlap["status"] == "not_applicable"
     assert overlap["passed"] is True
+
+
+def _evidence_hashes(index: int) -> dict[str, str]:
+    return {
+        "run_id": "sha256:" + str(index) * 64,
+        "input_hash": "sha256:" + str(index + 1) * 64,
+    }
+
+
+def test_cross_symbol_evidence_uses_panel_statistics_not_all_positive_symbols() -> None:
+    per_symbol = {
+        symbol: {
+            "return": value,
+            "observations": 20,
+            "passed": value >= 0,
+            **_evidence_hashes(index),
+        }
+        for index, (symbol, value) in enumerate(
+            (("BTCUSDT", 0.10), ("ETHUSDT", 0.08), ("SOLUSDT", 0.06), ("XRPUSDT", -0.04))
+        )
+    }
+    evidence = {
+        "passed": False,
+        "symbols": 4,
+        "per_symbol": per_symbol,
+        "median_return": 0.07,
+        "pooled_return": 0.05,
+        "positive_symbol_fraction": 0.75,
+    }
+
+    assert cross_symbol_stability_passes(evidence, EvidenceProfile()) is True
+
+
+def test_parameter_surface_rejects_a_cliff_but_accepts_smooth_degradation() -> None:
+    def surface(values: tuple[float, ...]) -> dict[str, object]:
+        return {
+            "passed": True,
+            "base_return": 0.10,
+            "neighbours_tested": len(values),
+            "results": [
+                {
+                    "return": value,
+                    "observations": 20,
+                    "passed": value >= 0.05,
+                    **_evidence_hashes(index),
+                }
+                for index, value in enumerate(values)
+            ],
+        }
+
+    assert parameter_stability_passes(surface((0.09, 0.08, 0.07)), EvidenceProfile()) is True
+    assert parameter_stability_passes(surface((0.09, 0.08, -0.50)), EvidenceProfile()) is False
+
+
+def test_profile_enforces_effective_sample_and_quantitative_tail_limits() -> None:
+    profile = EvidenceProfile(
+        minimum_closed_trades=20,
+        minimum_effective_episodes=8,
+        maximum_drawdown=0.20,
+        maximum_tail_loss=0.05,
+    )
+    sample = {
+        "passed": True,
+        "observations": 40,
+        "closed_trades": 20,
+        "effective_independent_episodes": 8,
+    }
+    assert sample_evidence_passes(sample, profile) is True
+    assert sample_evidence_passes({**sample, "closed_trades": 19}, profile) is False
+    assert (
+        drawdown_passes({"passed": True, "maximum_drawdown": 0.12, "tail_loss": 0.04}, profile)
+        is True
+    )
+    assert (
+        monte_carlo_passes(
+            {"passed": True, "iterations": 250, "maximum_drawdown": 0.21, "tail_loss": 0.01},
+            profile,
+        )
+        is False
+    )
+
+
+def test_protected_holdout_allows_configured_moderate_degradation() -> None:
+    profile = EvidenceProfile(allowed_holdout_degradation=0.50)
+    assert (
+        holdout_degradation_passes(
+            {"objective_excess_fraction": 0.10}, {"objective_excess_fraction": 0.07}, profile
+        )
+        is True
+    )
+    assert (
+        holdout_degradation_passes(
+            {"objective_excess_fraction": 0.10}, {"objective_excess_fraction": 0.01}, profile
+        )
+        is False
+    )
 
 
 def test_registered_strategy_behaviour_is_shared_by_research_and_dispatch() -> None:
