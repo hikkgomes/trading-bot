@@ -131,6 +131,14 @@ class ApprovedLiveExecution:
                 for identity, item in instruments.items()
                 if item.market_type.value == market
             }
+            configured_symbols = product.get("live_exchange_symbols")
+            if isinstance(configured_symbols, list):
+                allowed_symbols = {str(value).upper() for value in configured_symbols}
+                product_instruments = {
+                    identity: item
+                    for identity, item in product_instruments.items()
+                    if item.exchange_symbol.upper() in allowed_symbols
+                }
             if not product_instruments:
                 raise ValueError(f"live product {product_id} has no persisted instruments")
             exchange = _exchange_config(account, market=market)

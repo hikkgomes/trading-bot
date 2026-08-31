@@ -167,7 +167,13 @@ class AccountReconciliationService:
     ) -> tuple[str, ...]:
         """Resolve the exact exchange scope owned by the current assignment."""
 
-        configured = product.get("exchange_symbols")
+        configured = product.get(
+            "live_exchange_symbols"
+            if product.get("execution_mode") == "live"
+            else "exchange_symbols"
+        )
+        if configured is None:
+            configured = product.get("exchange_symbols")
         if isinstance(configured, list | tuple):
             symbols = tuple(
                 sorted({str(value).strip().upper() for value in configured if str(value).strip()})

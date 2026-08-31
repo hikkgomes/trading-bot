@@ -499,6 +499,17 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
                 )
             if float(product["btc_minimum_fraction"]) > float(product["btc_core_fraction"]):
                 raise ValueError("BTC minimum fraction cannot exceed the neutral BTC fraction")
+        if product_id == "active_income":
+            live_symbols = product.get("live_exchange_symbols")
+            if (
+                not isinstance(live_symbols, list)
+                or not live_symbols
+                or any(not isinstance(symbol, str) or not symbol.strip() for symbol in live_symbols)
+                or len({str(symbol).upper() for symbol in live_symbols}) != len(live_symbols)
+            ):
+                raise ValueError(
+                    f"product {product_id}.live_exchange_symbols must be a unique non-empty list"
+                )
     research = configuration["research"]
     permissions = _mapping(research.get("agent_permissions"), field="agent_permissions")
     if permissions.get("submit_exchange_orders") is not False:

@@ -441,6 +441,14 @@ class PlatformLiveAuthority:
         expected_market = "spot" if account.get("market") == "spot" else "futures"
         if instrument_payload.get("market_type") != expected_market:
             raise PlatformLiveAuthorityError("instrument market does not match the account")
+        configured_live_symbols = product.get("live_exchange_symbols")
+        if isinstance(configured_live_symbols, list) and (
+            str(instrument_payload.get("exchange_symbol") or "").upper()
+            not in {str(value).upper() for value in configured_live_symbols}
+        ):
+            raise PlatformLiveAuthorityError(
+                "selected instrument is not in the configured live product scope"
+            )
         return product, account, artefact, instrument_payload
 
     @staticmethod

@@ -46,6 +46,7 @@
       "maximum_funding_age_seconds": 28800,
       "risk_policy_id": "active-income",
       "accounting_policy": "usdt_nav",
+      "live_exchange_symbols": ["BTCUSDT"],
       "execution_costs": {"fee_bps": 5.0, "slippage_bps": 2.0},
       "protective_stop_fraction": 0.02,
       "execution_mode": "paper"
