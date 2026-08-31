@@ -3673,30 +3673,113 @@ def _finalize_futures_flatten_state(
     return status
 
 
-def _flatten_btc_spot_step_aside_product(
-    product: ProductConfig, status: dict[str, Any]
+def _spot_unresolved_flatten(
+    status: dict[str, Any],
+    error: str,
+    *,
+    intent: Any = None,
+    balance_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    def unresolved(
-        error: str,
-        *,
-        intent: Any = None,
-        balance_evidence: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        status.update(
-            ok=False,
-            reason="unresolved_flatten_intent",
-            error=error,
-            operator_action=(
-                "Keep the product paused; reconcile the deterministic client ID, spot order/fills, "
-                "and BTC/USDT balances at the exchange before editing flatten_intent."
-            ),
-        )
-        if intent is not None:
-            status["flatten_intent"] = intent
-        if balance_evidence is not None:
-            status["balance_evidence"] = balance_evidence
-        return status
+    status.update(
+        ok=False,
+        reason="unresolved_flatten_intent",
+        error=error,
+        operator_action=(
+            "Keep the product paused; reconcile the deterministic client ID, spot order/fills, "
+            "and BTC/USDT balances at the exchange before editing flatten_intent."
+        ),
+    )
+    if intent is not None:
+        status["flatten_intent"] = intent
+    if balance_evidence is not None:
+        status["balance_evidence"] = balance_evidence
+    return status
 
+
+def _spot_flatten_position_context(
+    product: ProductConfig,
+    status: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any] | None:
+    has_intent = "flatten_intent" in state
+    try:
+        selected = _spot_step_aside_flatten_position(product, state)
+    except RuntimeError as exc:
+        if has_intent:
+            _spot_unresolved_flatten(status, str(exc), intent=state.get("flatten_intent"))
+        else:
+            status.update(ok=False, reason="invalid_spot_step_aside_state", error=str(exc))
+        return None
+    if selected is None:
+        if has_intent:
+            _spot_unresolved_flatten(
+                status,
+                "flatten_intent exists without exactly one tracked spot step-aside position",
+                intent=state.get("flatten_intent"),
+            )
+        else:
+            status.update(
+                ok=True,
+                skipped=True,
+                reason="no_local_spot_step_aside_position",
+                local_open_positions=0,
+            )
+        return None
+    strategy_id, position = selected
+    try:
+        position_detail = _validate_spot_step_aside_flatten_position(
+            product,
+            strategy_id,
+            position,
+        )
+    except RuntimeError as exc:
+        if has_intent:
+            _spot_unresolved_flatten(status, str(exc), intent=state.get("flatten_intent"))
+        else:
+            status.update(
+                ok=False,
+                reason="invalid_spot_step_aside_state",
+                error=str(exc),
+                position={
+                    key: position.get(key)
+                    for key in (
+                        "direction",
+                        "broker_symbol",
+                        "broker_side",
+                        "broker_qty",
+                        "broker_entry_price",
+                        "broker_entry_quote_value",
+                        "broker_exit_sizing",
+                    )
+                    if key in position
+                },
+            )
+        return None
+    existing_intent: dict[str, Any] | None = None
+    if has_intent:
+        try:
+            existing_intent = _validated_spot_flatten_intent(
+                product,
+                state.get("flatten_intent"),
+                strategy_id=strategy_id,
+                position_detail=position_detail,
+            )
+        except RuntimeError as exc:
+            _spot_unresolved_flatten(status, str(exc), intent=state.get("flatten_intent"))
+            return None
+    return {
+        "state": state,
+        "strategy_id": strategy_id,
+        "position": position,
+        "position_detail": position_detail,
+        "existing_intent": existing_intent,
+    }
+
+
+def _spot_flatten_context(
+    product: ProductConfig,
+    status: dict[str, Any],
+) -> dict[str, Any] | None:
     state, state_error = _read_local_state_for_flatten(product)
     if state_error or state is None:
         status.update(
@@ -3707,7 +3790,7 @@ def _flatten_btc_spot_step_aside_product(
                 "error": state_error or "state reader returned no payload",
             },
         )
-        return status
+        return None
     exit_accounting_intent = state.get("exit_accounting_intent")
     if exit_accounting_intent is not None:
         status.update(
@@ -3719,70 +3802,17 @@ def _flatten_btc_spot_step_aside_product(
             ),
             exit_accounting_intent=exit_accounting_intent,
         )
-        return status
-    has_intent = "flatten_intent" in state
-    try:
-        selected = _spot_step_aside_flatten_position(product, state)
-    except RuntimeError as exc:
-        if has_intent:
-            return unresolved(str(exc), intent=state.get("flatten_intent"))
-        status.update(ok=False, reason="invalid_spot_step_aside_state", error=str(exc))
-        return status
-    if selected is None:
-        if has_intent:
-            return unresolved(
-                "flatten_intent exists without exactly one tracked spot step-aside position",
-                intent=state.get("flatten_intent"),
-            )
-        status.update(
-            ok=True,
-            skipped=True,
-            reason="no_local_spot_step_aside_position",
-            local_open_positions=0,
-        )
-        return status
-    strategy_id, position = selected
-    try:
-        position_detail = _validate_spot_step_aside_flatten_position(
-            product,
-            strategy_id,
-            position,
-        )
-    except RuntimeError as exc:
-        if has_intent:
-            return unresolved(str(exc), intent=state.get("flatten_intent"))
-        status.update(
-            ok=False,
-            reason="invalid_spot_step_aside_state",
-            error=str(exc),
-            position={
-                key: position.get(key)
-                for key in (
-                    "direction",
-                    "broker_symbol",
-                    "broker_side",
-                    "broker_qty",
-                    "broker_entry_price",
-                    "broker_entry_quote_value",
-                    "broker_exit_sizing",
-                )
-                if key in position
-            },
-        )
-        return status
+        return None
+    return _spot_flatten_position_context(product, status, state)
 
-    existing_intent: dict[str, Any] | None = None
-    if has_intent:
-        try:
-            existing_intent = _validated_spot_flatten_intent(
-                product,
-                state.get("flatten_intent"),
-                strategy_id=strategy_id,
-                position_detail=position_detail,
-            )
-        except RuntimeError as exc:
-            return unresolved(str(exc), intent=state.get("flatten_intent"))
 
+def _spot_flatten_broker_context(
+    product: ProductConfig,
+    status: dict[str, Any],
+    *,
+    position_detail: dict[str, Any],
+    existing_intent: dict[str, Any] | None,
+) -> tuple[Any, str] | None:
     status["live_environment"] = assert_live_environment(
         product,
         require_production=True,
@@ -3797,16 +3827,25 @@ def _flatten_btc_spot_step_aside_product(
             "refusing balance reads, buyback submission, or local-state mutation"
         )
         if existing_intent is not None:
-            return unresolved(error, intent=existing_intent)
-        status.update(ok=False, reason="broker_account_mismatch", error=error)
-        return status
+            _spot_unresolved_flatten(status, error, intent=existing_intent)
+        else:
+            status.update(ok=False, reason="broker_account_mismatch", error=error)
+        return None
+    return broker, current_account_fingerprint
 
+
+def _spot_flatten_accounting_state(
+    product: ProductConfig,
+    status: dict[str, Any],
+    broker: Any,
+    *,
+    strategy_id: str,
+) -> dict[str, Any] | None:
     try:
         accounting_bot = _flatten_accounting_bot(product, broker)
         accounting_strategy, _accounting_position = _flatten_strategy_and_position(accounting_bot)
         if accounting_strategy["id"] != strategy_id:
             raise RuntimeError("spot flatten strategy identity changed")
-        state = accounting_bot.state
     except Exception as exc:
         status.update(
             ok=False,
@@ -3817,41 +3856,59 @@ def _flatten_btc_spot_step_aside_product(
                 "accounting evidence before a BTC buyback is submitted."
             ),
         )
-        return status
+        return None
+    return {"state": accounting_bot.state}
 
-    if existing_intent is not None:
-        try:
-            current = broker.get_position(product.symbol)
-        except Exception as exc:
-            return unresolved(
-                f"could not read broker BTC balance for intent reconciliation: {type(exc).__name__}: {exc}",
-                intent=existing_intent,
-            )
-        balance_evidence = _spot_flatten_balance_evidence(
-            product,
-            existing_intent,
-            current,
-            expected_filled_qty=float(existing_intent["qty"]),
-        )
-        status.update(
-            flatten_intent=existing_intent,
-            position_current={
-                "symbol": current.symbol,
-                "qty": current.qty,
-                "avg_price": current.avg_price,
-            },
-            balance_evidence=balance_evidence,
-        )
-        return unresolved(
-            (
-                "existing flatten_intent may have changed the broker BTC balance, but its "
-                "fill price/fee response was not durably committed; refusing both a duplicate "
-                "buyback and silent local accounting"
-            ),
-            intent=existing_intent,
-            balance_evidence=balance_evidence,
-        )
 
+def _reconcile_spot_flatten_intent(
+    product: ProductConfig,
+    status: dict[str, Any],
+    broker: Any,
+    intent: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        current = broker.get_position(product.symbol)
+    except Exception as exc:
+        return _spot_unresolved_flatten(
+            status,
+            f"could not read broker BTC balance for intent reconciliation: "
+            f"{type(exc).__name__}: {exc}",
+            intent=intent,
+        )
+    balance_evidence = _spot_flatten_balance_evidence(
+        product,
+        intent,
+        current,
+        expected_filled_qty=float(intent["qty"]),
+    )
+    status.update(
+        flatten_intent=intent,
+        position_current={
+            "symbol": current.symbol,
+            "qty": current.qty,
+            "avg_price": current.avg_price,
+        },
+        balance_evidence=balance_evidence,
+    )
+    return _spot_unresolved_flatten(
+        status,
+        (
+            "existing flatten_intent may have changed the broker BTC balance, but its "
+            "fill price/fee response was not durably committed; refusing both a duplicate "
+            "buyback and silent local accounting"
+        ),
+        intent=intent,
+        balance_evidence=balance_evidence,
+    )
+
+
+def _spot_buyback_quantity(
+    product: ProductConfig,
+    status: dict[str, Any],
+    broker: Any,
+    *,
+    quote_value: float,
+) -> tuple[Position, float, float, float, float] | None:
     before = broker.get_position(product.symbol)
     before_qty = _evidence_float(before.qty)
     before_avg_price = _evidence_float(before.avg_price)
@@ -3867,7 +3924,7 @@ def _flatten_btc_spot_step_aside_product(
             reason="invalid_spot_flatten_position_evidence",
             error="broker returned invalid pre-buyback BTC balance evidence",
         )
-        return status
+        return None
     price = broker.get_price(product.symbol)
     if not math.isfinite(float(price)) or float(price) <= 0:
         status.update(
@@ -3875,15 +3932,15 @@ def _flatten_btc_spot_step_aside_product(
             reason="invalid_spot_flatten_price",
             error=f"broker price is invalid: {price!r}",
         )
-        return status
-    raw_requested_qty = float(position_detail["quote_value"]) / float(price)
+        return None
+    raw_requested_qty = float(quote_value) / float(price)
     if not math.isfinite(raw_requested_qty) or raw_requested_qty <= 0:
         status.update(
             ok=False,
             reason="invalid_spot_flatten_qty",
             error=f"spot buyback quantity is invalid: {raw_requested_qty!r}",
         )
-        return status
+        return None
     normalizer = getattr(broker, "normalize_order_qty", None)
     try:
         normalized_raw = (
@@ -3903,14 +3960,14 @@ def _flatten_btc_spot_step_aside_product(
             reason="invalid_spot_flatten_qty",
             error=f"spot buyback quantity normalization failed: {type(exc).__name__}: {exc}",
         )
-        return status
+        return None
     if not math.isfinite(requested_qty) or requested_qty <= 0:
         status.update(
             ok=False,
             reason="invalid_spot_flatten_qty",
             error=f"normalized spot buyback quantity is invalid: {requested_qty!r}",
         )
-        return status
+        return None
     tolerance = max(abs(raw_requested_qty) * 1e-12, 1e-12)
     if requested_qty - raw_requested_qty > tolerance:
         status.update(
@@ -3921,15 +3978,36 @@ def _flatten_btc_spot_step_aside_product(
                 f"{raw_requested_qty:g} to {requested_qty:g}"
             ),
         )
-        return status
+        return None
+    return before, before_qty, before_avg_price, requested_qty, float(price)
 
+
+def _prepare_spot_buyback(
+    product: ProductConfig,
+    status: dict[str, Any],
+    broker: Any,
+    *,
+    state: dict[str, Any],
+    strategy_id: str,
+    position_detail: dict[str, Any],
+    account_fingerprint: str,
+) -> tuple[Order, dict[str, Any], Position, float] | None:
+    quantity = _spot_buyback_quantity(
+        product,
+        status,
+        broker,
+        quote_value=float(position_detail["quote_value"]),
+    )
+    if quantity is None:
+        return None
+    before, before_qty, before_avg_price, requested_qty, price = quantity
     client_id = _spot_flatten_client_id(
         strategy_id=strategy_id,
         symbol=product.symbol,
         qty=requested_qty,
         quote_budget=float(position_detail["quote_value"]),
         position_before_qty=before_qty,
-        broker_account_fingerprint=current_account_fingerprint,
+        broker_account_fingerprint=account_fingerprint,
     )
     raw_intent = {
         "version": 1,
@@ -3938,7 +4016,7 @@ def _flatten_btc_spot_step_aside_product(
         "side": OrderSide.BUY.value,
         "order_type": OrderType.MARKET.value,
         "client_id": client_id,
-        "broker_account_fingerprint": current_account_fingerprint,
+        "broker_account_fingerprint": account_fingerprint,
         "qty": requested_qty,
         "quote_budget": float(position_detail["quote_value"]),
         "position_before": {
@@ -3955,15 +4033,17 @@ def _flatten_btc_spot_step_aside_product(
         position_detail=position_detail,
     )
     try:
-        state = _persist_spot_flatten_intent(product, state, intent)
+        _persist_spot_flatten_intent(product, state, intent)
     except Exception as exc:
         status.update(
             ok=False,
             reason="flatten_intent_persist_failed",
-            error=f"could not persist flatten_intent before broker submission: {type(exc).__name__}: {exc}",
+            error=(
+                "could not persist flatten_intent before broker submission: "
+                f"{type(exc).__name__}: {exc}"
+            ),
         )
-        return status
-
+        return None
     order = Order(
         symbol=product.symbol,
         side=OrderSide.BUY,
@@ -3980,19 +4060,36 @@ def _flatten_btc_spot_step_aside_product(
         },
         spot_step_aside={
             **position_detail,
-            "reference_price": float(price),
-            "raw_requested_qty": raw_requested_qty,
+            "reference_price": price,
+            "raw_requested_qty": float(position_detail["quote_value"]) / price,
             "requested_qty": requested_qty,
         },
     )
+    return order, intent, before, float(position_detail["quote_value"])
+
+
+def _submit_spot_buyback(
+    product: ProductConfig,
+    status: dict[str, Any],
+    broker: Any,
+    *,
+    strategy_id: str,
+    order: Order,
+    intent: dict[str, Any],
+) -> dict[str, Any]:
+    def unresolved(error: str, *, balance_evidence: dict[str, Any] | None = None) -> dict[str, Any]:
+        return _spot_unresolved_flatten(
+            status,
+            error,
+            intent=intent,
+            balance_evidence=balance_evidence,
+        )
+
     try:
         fill = broker.place_order(order)
         _assert_spot_flatten_fill_valid(strategy_id, order, fill)
     except Exception as exc:
-        return unresolved(
-            f"spot buyback submission/fill is ambiguous: {type(exc).__name__}: {exc}",
-            intent=intent,
-        )
+        return unresolved(f"spot buyback submission/fill is ambiguous: {type(exc).__name__}: {exc}")
     fill_detail = {
         "symbol": fill.symbol,
         "side": _fill_side_value(fill),
@@ -4006,8 +4103,8 @@ def _flatten_btc_spot_step_aside_product(
         after = broker.get_position(product.symbol)
     except Exception as exc:
         return unresolved(
-            f"spot buyback filled but post-fill BTC balance is unavailable: {type(exc).__name__}: {exc}",
-            intent=intent,
+            "spot buyback filled but post-fill BTC balance is unavailable: "
+            f"{type(exc).__name__}: {exc}"
         )
     balance_evidence = _spot_flatten_balance_evidence(
         product,
@@ -4026,7 +4123,6 @@ def _flatten_btc_spot_step_aside_product(
     if not balance_evidence["proven"]:
         return unresolved(
             "spot buyback fill does not match the observed BTC balance increase",
-            intent=intent,
             balance_evidence=balance_evidence,
         )
     try:
@@ -4040,11 +4136,62 @@ def _flatten_btc_spot_step_aside_product(
     except Exception as exc:
         return unresolved(
             f"spot buyback is proven but local-state commit failed: {type(exc).__name__}: {exc}",
-            intent=intent,
             balance_evidence=balance_evidence,
         )
     status.update(ok=True, local_state=local_state)
     return status
+
+
+def _flatten_btc_spot_step_aside_product(
+    product: ProductConfig, status: dict[str, Any]
+) -> dict[str, Any]:
+    context = _spot_flatten_context(product, status)
+    if context is None:
+        return status
+    strategy_id = context["strategy_id"]
+    position_detail = context["position_detail"]
+    existing_intent = context["existing_intent"]
+    broker_context = _spot_flatten_broker_context(
+        product,
+        status,
+        position_detail=position_detail,
+        existing_intent=existing_intent,
+    )
+    if broker_context is None:
+        return status
+    broker, current_account_fingerprint = broker_context
+    accounting_context = _spot_flatten_accounting_state(
+        product,
+        status,
+        broker,
+        strategy_id=strategy_id,
+    )
+    if accounting_context is None:
+        return status
+    state = accounting_context["state"]
+    if existing_intent is not None:
+        return _reconcile_spot_flatten_intent(product, status, broker, existing_intent)
+
+    prepared = _prepare_spot_buyback(
+        product,
+        status,
+        broker,
+        state=state,
+        strategy_id=strategy_id,
+        position_detail=position_detail,
+        account_fingerprint=current_account_fingerprint,
+    )
+    if prepared is None:
+        return status
+    order, intent, _before, _quote_budget = prepared
+    return _submit_spot_buyback(
+        product,
+        status,
+        broker,
+        strategy_id=strategy_id,
+        order=order,
+        intent=intent,
+    )
 
 
 def _fill_from_flatten_intent(intent: dict[str, Any]) -> Fill:
