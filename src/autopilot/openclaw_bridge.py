@@ -286,9 +286,7 @@ def _is_forbidden_key(key: Any) -> bool:
     )
 
 
-def _validate_bounded_json(value: Any, *, path: str = "suggested_spec", depth: int = 0) -> Any:
-    if depth > 8:
-        raise ProposalValidationError(f"{path} exceeds maximum nesting depth")
+def _validate_bounded_json_scalar(value: Any, *, path: str) -> Any:
     if value is None or isinstance(value, bool | int | str):
         if isinstance(value, str) and len(value) > 2000:
             raise ProposalValidationError(f"{path} contains a string longer than 2000 characters")
@@ -297,6 +295,29 @@ def _validate_bounded_json(value: Any, *, path: str = "suggested_spec", depth: i
         if not math.isfinite(value):
             raise ProposalValidationError(f"{path} contains a non-finite number")
         return value
+    raise ProposalValidationError(f"{path} contains unsupported type {type(value).__name__}")
+
+
+def _validate_bounded_json_mapping(
+    value: dict[str, Any], *, path: str, depth: int
+) -> dict[str, Any]:
+    if len(value) > 100:
+        raise ProposalValidationError(f"{path} contains more than 100 object fields")
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not key or len(key) > 120:
+            raise ProposalValidationError(f"{path} contains an invalid field name")
+        if _is_forbidden_key(key):
+            raise ProposalValidationError(
+                f"{path} contains forbidden security/control field: {key}"
+            )
+        result[key] = _validate_bounded_json(item, path=f"{path}.{key}", depth=depth + 1)
+    return result
+
+
+def _validate_bounded_json(value: Any, *, path: str = "suggested_spec", depth: int = 0) -> Any:
+    if depth > 8:
+        raise ProposalValidationError(f"{path} exceeds maximum nesting depth")
     if isinstance(value, list):
         if len(value) > 100:
             raise ProposalValidationError(f"{path} contains more than 100 list items")
@@ -305,19 +326,8 @@ def _validate_bounded_json(value: Any, *, path: str = "suggested_spec", depth: i
             for index, item in enumerate(value)
         ]
     if isinstance(value, dict):
-        if len(value) > 100:
-            raise ProposalValidationError(f"{path} contains more than 100 object fields")
-        result: dict[str, Any] = {}
-        for key, item in value.items():
-            if not isinstance(key, str) or not key or len(key) > 120:
-                raise ProposalValidationError(f"{path} contains an invalid field name")
-            if _is_forbidden_key(key):
-                raise ProposalValidationError(
-                    f"{path} contains forbidden security/control field: {key}"
-                )
-            result[key] = _validate_bounded_json(item, path=f"{path}.{key}", depth=depth + 1)
-        return result
-    raise ProposalValidationError(f"{path} contains unsupported type {type(value).__name__}")
+        return _validate_bounded_json_mapping(value, path=path, depth=depth)
+    return _validate_bounded_json_scalar(value, path=path)
 
 
 def _validate_provenance(payload: dict[str, Any]) -> dict[str, str]:
@@ -339,7 +349,7 @@ def _validate_provenance(payload: dict[str, Any]) -> dict[str, str]:
     return result
 
 
-def validate_proposal(payload: dict[str, Any]) -> dict[str, Any]:
+def _proposal_header(payload: dict[str, Any]) -> dict[str, Any]:
     unknown = sorted(set(payload) - INPUT_KEYS)
     if unknown:
         raise ProposalValidationError(f"proposal has unknown fields: {', '.join(unknown)}")
@@ -367,11 +377,24 @@ def validate_proposal(payload: dict[str, Any]) -> dict[str, Any]:
     if objective == "btc_accumulation" and symbol != "BTCUSDT":
         raise ProposalValidationError("btc_accumulation proposals must target BTCUSDT")
     source_proposal_id = payload.get("source_proposal_id")
-    if source_proposal_id is not None:
-        if not isinstance(source_proposal_id, str) or not re.fullmatch(
-            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", source_proposal_id
-        ):
-            raise ProposalValidationError("source_proposal_id contains unsupported characters")
+    if source_proposal_id is not None and (
+        not isinstance(source_proposal_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", source_proposal_id)
+    ):
+        raise ProposalValidationError("source_proposal_id contains unsupported characters")
+    return {
+        "schema": schema,
+        "objective": objective,
+        "opportunity_type": opportunity_type,
+        "base_timeframe": base_timeframe,
+        "created_at": created_at,
+        "thesis": thesis,
+        "symbol": symbol,
+        "source_proposal_id": source_proposal_id,
+    }
+
+
+def _proposal_action(payload: dict[str, Any]) -> tuple[str, str | None]:
     raw_action = payload.get("action", "new")
     if not isinstance(raw_action, str):
         raise ProposalValidationError("action must be a string")
@@ -379,43 +402,50 @@ def validate_proposal(payload: dict[str, Any]) -> dict[str, Any]:
     if action not in ACTION_TYPES:
         raise ProposalValidationError(f"action must be one of {sorted(ACTION_TYPES)}")
     parent_hypothesis_id = payload.get("parent_hypothesis_id")
-    if action == "new":
-        if parent_hypothesis_id is not None:
-            raise ProposalValidationError("new actions cannot specify parent_hypothesis_id")
-    else:
-        if not isinstance(parent_hypothesis_id, str) or not re.fullmatch(
-            r"sha256:[a-f0-9]{64}", parent_hypothesis_id
-        ):
-            raise ProposalValidationError(
-                f"{action} actions require parent_hypothesis_id as a sha256 behavior hash"
-            )
+    if action == "new" and parent_hypothesis_id is not None:
+        raise ProposalValidationError("new actions cannot specify parent_hypothesis_id")
+    if action != "new" and (
+        not isinstance(parent_hypothesis_id, str)
+        or not re.fullmatch(r"sha256:[a-f0-9]{64}", parent_hypothesis_id)
+    ):
+        raise ProposalValidationError(
+            f"{action} actions require parent_hypothesis_id as a sha256 behavior hash"
+        )
+    return action, parent_hypothesis_id
+
+
+def _proposal_text_fields(
+    payload: dict[str, Any], *, schema: str, action: str, thesis: str
+) -> dict[str, str]:
     raw_reasoning = payload.get("reasoning", thesis)
     if not isinstance(raw_reasoning, str):
         raise ProposalValidationError("reasoning must be a string")
     reasoning = raw_reasoning.strip()
     if not 20 <= len(reasoning) <= 4000:
         raise ProposalValidationError("reasoning length must be between 20 and 4000")
-    raw_expected_outcome = payload.get("expected_outcome", "")
-    raw_falsification_criteria = payload.get("falsification_criteria", "")
-    if not isinstance(raw_expected_outcome, str):
-        raise ProposalValidationError("expected_outcome must be a string")
-    if not isinstance(raw_falsification_criteria, str):
-        raise ProposalValidationError("falsification_criteria must be a string")
-    expected_outcome = raw_expected_outcome.strip()
-    falsification_criteria = raw_falsification_criteria.strip()
+    values = {
+        "expected_outcome": payload.get("expected_outcome", ""),
+        "falsification_criteria": payload.get("falsification_criteria", ""),
+    }
+    if any(not isinstance(value, str) for value in values.values()):
+        raise ProposalValidationError("expected_outcome and falsification_criteria must be strings")
+    values = {key: value.strip() for key, value in values.items()}
     if (
         schema == ACTION_SCHEMA
         and action in {"new", "revise"}
-        and (len(expected_outcome) < 10 or len(falsification_criteria) < 10)
+        and any(len(value) < 10 for value in values.values())
     ):
         raise ProposalValidationError(
             "new/revise actions require expected_outcome and falsification_criteria"
         )
-    if len(expected_outcome) > 2000 or len(falsification_criteria) > 2000:
+    if any(len(value) > 2000 for value in values.values()):
         raise ProposalValidationError(
             "expected_outcome and falsification_criteria must be at most 2000 characters"
         )
-    changes = _bounded_string_list(payload, "changes")
+    return {"reasoning": reasoning, **values}
+
+
+def _proposal_spec_fields(payload: dict[str, Any]) -> dict[str, Any]:
     suggested_spec = payload.get("suggested_spec", {})
     if suggested_spec is None:
         suggested_spec = {}
@@ -424,26 +454,39 @@ def validate_proposal(payload: dict[str, Any]) -> dict[str, Any]:
     suggested_spec = _validate_bounded_json(suggested_spec)
     if len(json.dumps(suggested_spec, sort_keys=True, separators=(",", ":"))) > MAX_SPEC_BYTES:
         raise ProposalValidationError(f"suggested_spec exceeds {MAX_SPEC_BYTES} serialized bytes")
-    normalized = {
-        "source": "openclaw",
-        "source_created_at": created_at,
-        "action": action,
-        "objective": objective,
-        "opportunity_type": opportunity_type,
-        "base_timeframe": base_timeframe,
-        "thesis": thesis,
-        "reasoning": reasoning,
-        "expected_outcome": expected_outcome,
-        "falsification_criteria": falsification_criteria,
-        "changes": changes,
-        "symbol": symbol,
+    return {
+        "changes": _bounded_string_list(payload, "changes"),
         "suggested_primitives": _bounded_string_list(payload, "suggested_primitives"),
         "constraints": _bounded_string_list(payload, "constraints"),
         "untrusted_suggested_spec": suggested_spec,
         "provenance": _validate_provenance(payload),
     }
-    if source_proposal_id is not None:
-        normalized["source_proposal_id"] = source_proposal_id
+
+
+def validate_proposal(payload: dict[str, Any]) -> dict[str, Any]:
+    header = _proposal_header(payload)
+    action, parent_hypothesis_id = _proposal_action(payload)
+    text_fields = _proposal_text_fields(
+        payload,
+        schema=header["schema"],
+        action=action,
+        thesis=header["thesis"],
+    )
+    spec_fields = _proposal_spec_fields(payload)
+    normalized = {
+        "source": "openclaw",
+        "source_created_at": header["created_at"],
+        "action": action,
+        "objective": header["objective"],
+        "opportunity_type": header["opportunity_type"],
+        "base_timeframe": header["base_timeframe"],
+        "thesis": header["thesis"],
+        "symbol": header["symbol"],
+        **text_fields,
+        **spec_fields,
+    }
+    if header["source_proposal_id"] is not None:
+        normalized["source_proposal_id"] = header["source_proposal_id"]
     if parent_hypothesis_id is not None:
         normalized["parent_hypothesis_id"] = parent_hypothesis_id
     return normalized
@@ -575,32 +618,40 @@ def _existing_accepted(
     *,
     index_path: Path | None = None,
 ) -> tuple[set[str], set[str]]:
+    ids, digests = _load_dedup_index(index_path)
+    scanned_ids, scanned_digests = _scan_accepted_records(accepted_dir)
+    ids.update(scanned_ids)
+    digests.update(scanned_digests)
+    return ids, digests
+
+
+def _load_dedup_index(index_path: Path | None) -> tuple[set[str], set[str]]:
+    if index_path is None or not index_path.exists():
+        return set(), set()
+    if index_path.is_symlink() or not index_path.is_file():
+        raise ProposalValidationError(f"inbox index must be a regular file: {index_path}")
+    if index_path.stat().st_size > MAX_DEDUP_INDEX_BYTES:
+        raise ProposalValidationError("inbox deduplication index exceeds its safe size limit")
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProposalValidationError(f"cannot read inbox deduplication index: {exc}") from exc
+    if not isinstance(index, dict) or index.get("schema") != "autopilot.openclaw_inbox_index/v1":
+        raise ProposalValidationError("inbox deduplication index has an invalid schema")
+    prior_ids = index.get("proposal_ids")
+    prior_digests = index.get("content_digests")
+    if not isinstance(prior_ids, list) or not isinstance(prior_digests, list):
+        raise ProposalValidationError("inbox deduplication index has invalid identity lists")
+    if len(prior_ids) > MAX_DEDUP_INDEX_ITEMS or len(prior_digests) > MAX_DEDUP_INDEX_ITEMS:
+        raise ProposalValidationError("inbox deduplication index exceeds its item limit")
+    if any(not isinstance(item, str) for item in (*prior_ids, *prior_digests)):
+        raise ProposalValidationError("inbox deduplication index contains invalid identities")
+    return set(prior_ids), set(prior_digests)
+
+
+def _scan_accepted_records(accepted_dir: Path) -> tuple[set[str], set[str]]:
     ids: set[str] = set()
     digests: set[str] = set()
-    if index_path is not None and index_path.exists():
-        if index_path.is_symlink() or not index_path.is_file():
-            raise ProposalValidationError(f"inbox index must be a regular file: {index_path}")
-        if index_path.stat().st_size > MAX_DEDUP_INDEX_BYTES:
-            raise ProposalValidationError("inbox deduplication index exceeds its safe size limit")
-        try:
-            index = json.loads(index_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ProposalValidationError(f"cannot read inbox deduplication index: {exc}") from exc
-        if (
-            not isinstance(index, dict)
-            or index.get("schema") != "autopilot.openclaw_inbox_index/v1"
-        ):
-            raise ProposalValidationError("inbox deduplication index has an invalid schema")
-        prior_ids = index.get("proposal_ids")
-        prior_digests = index.get("content_digests")
-        if not isinstance(prior_ids, list) or not isinstance(prior_digests, list):
-            raise ProposalValidationError("inbox deduplication index has invalid identity lists")
-        if len(prior_ids) > MAX_DEDUP_INDEX_ITEMS or len(prior_digests) > MAX_DEDUP_INDEX_ITEMS:
-            raise ProposalValidationError("inbox deduplication index exceeds its item limit")
-        if any(not isinstance(item, str) for item in (*prior_ids, *prior_digests)):
-            raise ProposalValidationError("inbox deduplication index contains invalid identities")
-        ids.update(prior_ids)
-        digests.update(prior_digests)
     for index, path in enumerate(sorted(accepted_dir.glob("*.json"))):
         if index >= MAX_ACCEPTED_SCAN or path.is_symlink() or not path.is_file():
             continue
@@ -771,49 +822,9 @@ def _private_retention(
 ) -> dict[str, Any]:
     """Prune oldest private records without following or ignoring unsafe paths."""
 
-    directory_stat = directory.lstat()
-    if (
-        stat.S_ISLNK(directory_stat.st_mode)
-        or not stat.S_ISDIR(directory_stat.st_mode)
-        or directory_stat.st_uid != os.geteuid()
-        or directory_stat.st_mode & 0o077
-    ):
-        raise ProposalValidationError(
-            f"retention directory must be owner-private and non-symlink: {directory}"
-        )
-    total_files = 0
-    total_bytes = 0
-
-    def records():
-        nonlocal total_files, total_bytes
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                path = Path(entry.path)
-                try:
-                    item = path.lstat()
-                except OSError as exc:
-                    raise ProposalValidationError(
-                        f"cannot inspect private retention path {path}: {exc}"
-                    ) from exc
-                if (
-                    stat.S_ISLNK(item.st_mode)
-                    or not stat.S_ISREG(item.st_mode)
-                    or item.st_uid != os.geteuid()
-                    or item.st_mode & 0o077
-                ):
-                    raise ProposalValidationError(f"private retention path is unsafe: {path}")
-                total_files += 1
-                total_bytes += item.st_size
-                yield (
-                    item.st_mtime_ns,
-                    entry.name,
-                    item.st_size,
-                    item.st_dev,
-                    item.st_ino,
-                    path,
-                )
-
-    oldest = heapq.nsmallest(MAX_PRIVATE_PRUNE_PER_CYCLE, records())
+    _validate_retention_directory(directory)
+    records, total_files, total_bytes = _private_retention_records(directory)
+    oldest = heapq.nsmallest(MAX_PRIVATE_PRUNE_PER_CYCLE, records)
     initial_files = total_files
     initial_bytes = total_bytes
     pruned_files = 0
@@ -821,19 +832,7 @@ def _private_retention(
     for modified_ns, _name, size, device, inode, path in oldest:
         if total_files <= file_limit and total_bytes <= byte_limit:
             break
-        try:
-            current = path.lstat()
-        except OSError as exc:
-            raise ProposalValidationError(
-                f"private retention path changed during pruning: {path}: {exc}"
-            ) from exc
-        if (
-            current.st_mtime_ns,
-            current.st_size,
-            current.st_dev,
-            current.st_ino,
-        ) != (modified_ns, size, device, inode):
-            raise ProposalValidationError(f"private retention path changed during pruning: {path}")
+        _assert_retention_record_unchanged(path, modified_ns, size, device, inode)
         try:
             path.unlink()
         except OSError as exc:
@@ -857,6 +856,67 @@ def _private_retention(
         "retained_bytes": total_bytes,
         "limits_satisfied": total_files <= file_limit and total_bytes <= byte_limit,
     }
+
+
+def _validate_retention_directory(directory: Path) -> None:
+    directory_stat = directory.lstat()
+    if (
+        stat.S_ISLNK(directory_stat.st_mode)
+        or not stat.S_ISDIR(directory_stat.st_mode)
+        or directory_stat.st_uid != os.geteuid()
+        or directory_stat.st_mode & 0o077
+    ):
+        raise ProposalValidationError(
+            f"retention directory must be owner-private and non-symlink: {directory}"
+        )
+
+
+def _private_retention_records(
+    directory: Path,
+) -> tuple[list[tuple[int, str, int, int, int, Path]], int, int]:
+    records: list[tuple[int, str, int, int, int, Path]] = []
+    total_files = 0
+    total_bytes = 0
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                item = path.lstat()
+            except OSError as exc:
+                raise ProposalValidationError(
+                    f"cannot inspect private retention path {path}: {exc}"
+                ) from exc
+            if (
+                stat.S_ISLNK(item.st_mode)
+                or not stat.S_ISREG(item.st_mode)
+                or item.st_uid != os.geteuid()
+                or item.st_mode & 0o077
+            ):
+                raise ProposalValidationError(f"private retention path is unsafe: {path}")
+            total_files += 1
+            total_bytes += item.st_size
+            records.append(
+                (item.st_mtime_ns, entry.name, item.st_size, item.st_dev, item.st_ino, path)
+            )
+    return records, total_files, total_bytes
+
+
+def _assert_retention_record_unchanged(
+    path: Path, modified_ns: int, size: int, device: int, inode: int
+) -> None:
+    try:
+        current = path.lstat()
+    except OSError as exc:
+        raise ProposalValidationError(
+            f"private retention path changed during pruning: {path}: {exc}"
+        ) from exc
+    if (current.st_mtime_ns, current.st_size, current.st_dev, current.st_ino) != (
+        modified_ns,
+        size,
+        device,
+        inode,
+    ):
+        raise ProposalValidationError(f"private retention path changed during pruning: {path}")
 
 
 def _incoming_entries(directory: Path) -> tuple[list[tuple[int, str, int, Path, bool]], bool]:
@@ -950,15 +1010,14 @@ def _incoming_hygiene(directory: Path) -> dict[str, Any]:
     }
 
 
-def ingest_inbox(
-    *,
-    incoming_dir: Path = DEFAULT_INCOMING,
-    accepted_dir: Path = DEFAULT_ACCEPTED,
-    rejected_dir: Path = DEFAULT_REJECTED,
-    archive_dir: Path = DEFAULT_ARCHIVE,
-    index_path: Path = DEFAULT_INDEX,
-    max_batch: int = MAX_BATCH,
-) -> dict[str, Any]:
+def _prepare_inbox_paths(
+    incoming_dir: Path,
+    accepted_dir: Path,
+    rejected_dir: Path,
+    archive_dir: Path,
+    index_path: Path,
+    max_batch: int,
+) -> tuple[Path, tuple[Path, ...]]:
     if max_batch <= 0 or max_batch > MAX_BATCH:
         raise ValueError(f"max_batch must be between 1 and {MAX_BATCH}")
     root = incoming_dir.parent
@@ -969,22 +1028,215 @@ def ingest_inbox(
         raise ValueError("index path must be inside the inbox root")
     if index_path.is_symlink():
         raise ProposalValidationError(f"inbox index must not be a symlink: {index_path}")
+    return root, paths
+
+
+def _reject_incoming_source(source_path: Path, rejected_dir: Path, state: dict[str, Any]) -> bool:
+    if not (source_path.is_symlink() or not source_path.is_file()):
+        return False
+    raw_digest = "sha256:" + hashlib.sha256(f"unsafe-path:{source_path.name}".encode()).hexdigest()
+    reason = "proposal path must be a non-symlink regular file"
+    _write_rejection(
+        rejected_dir,
+        source_name=source_path.name,
+        raw_digest=raw_digest,
+        reason=reason,
+    )
+    state["rejected"].append({"source_name": source_path.name, "reason": reason})
+    if source_path.is_symlink():
+        source_path.unlink()
+    return True
+
+
+def _store_incoming_proposal(
+    source_path: Path,
+    rejected_dir: Path,
+    accepted_dir: Path,
+    *,
+    raw_digest: str,
+    known_ids: set[str],
+    known_digests: set[str],
+    accepted_spool: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
+    raw = _load_untrusted_json(source_path)
+    proposal = build_accepted_proposal(raw)
+    proposal_id = proposal["proposal_id"]
+    content_digest = proposal["content_digest"]
+    proposal_size = len(json.dumps(proposal, indent=2, sort_keys=True).encode("utf-8"))
+    if proposal_id in known_ids or content_digest in known_digests:
+        _write_rejection(
+            rejected_dir,
+            source_name=source_path.name,
+            raw_digest=raw_digest,
+            reason="duplicate_proposal",
+            duplicate_of=proposal_id,
+        )
+        state["rejected"].append(
+            {
+                "source_name": source_path.name,
+                "reason": "duplicate_proposal",
+                "duplicate_of": proposal_id,
+            }
+        )
+        return
+    if (
+        accepted_spool["scan_truncated"]
+        or accepted_spool["files"] >= MAX_ACCEPTED_FILES
+        or accepted_spool["bytes"] + proposal_size > MAX_ACCEPTED_BYTES
+    ):
+        state["accepted_spool_capacity_rejections"] += 1
+        reason = "accepted_spool_capacity"
+    elif len(known_ids) >= MAX_DEDUP_INDEX_ITEMS or len(known_digests) >= MAX_DEDUP_INDEX_ITEMS:
+        state["dedup_capacity_rejections"] += 1
+        reason = "dedup_index_capacity"
+    else:
+        destination = accepted_dir / f"{proposal_id}.json"
+        write_json_atomic(destination, proposal)
+        destination.chmod(0o600)
+        known_ids.add(proposal_id)
+        known_digests.add(content_digest)
+        accepted_spool["files"] += 1
+        accepted_spool["bytes"] += proposal_size
+        state["accepted"].append(
+            {
+                "source_name": source_path.name,
+                "proposal_id": proposal_id,
+                "content_digest": content_digest,
+            }
+        )
+        return
+    _write_rejection(
+        rejected_dir,
+        source_name=source_path.name,
+        raw_digest=raw_digest,
+        reason=reason,
+    )
+    state["rejected"].append({"source_name": source_path.name, "reason": reason})
+
+
+def _ingest_source(
+    source_path: Path,
+    *,
+    accepted_dir: Path,
+    rejected_dir: Path,
+    archive_dir: Path,
+    known_ids: set[str],
+    known_digests: set[str],
+    accepted_spool: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
+    if _reject_incoming_source(source_path, rejected_dir, state):
+        return
+    raw_digest = _raw_digest(source_path)
+    archive_path = _unique_archive_path(archive_dir, raw_digest)
+    try:
+        _store_incoming_proposal(
+            source_path,
+            rejected_dir,
+            accepted_dir,
+            raw_digest=raw_digest,
+            known_ids=known_ids,
+            known_digests=known_digests,
+            accepted_spool=accepted_spool,
+            state=state,
+        )
+    except Exception as exc:
+        reason = f"{type(exc).__name__}: {str(exc)[:420]}"
+        _write_rejection(
+            rejected_dir,
+            source_name=source_path.name,
+            raw_digest=raw_digest,
+            reason=reason,
+        )
+        state["rejected"].append({"source_name": source_path.name, "reason": reason})
+    try:
+        if _archive_untrusted_source(source_path, archive_path, expected_digest=raw_digest):
+            state["archived"] += 1
+        else:
+            state["oversized_discarded"] += 1
+    except (OSError, ProposalValidationError) as exc:
+        state["rejected"].append(
+            {
+                "source_name": source_path.name,
+                "reason": f"archive_failed: {type(exc).__name__}",
+            }
+        )
+
+
+def _inbox_degraded_reasons(
+    state: dict[str, Any],
+    *,
+    known_ids: set[str],
+    known_digests: set[str],
+    retention: dict[str, Any],
+    candidate_scan_truncated: bool,
+) -> tuple[list[str], bool, list[dict[str, Any]]]:
+    dedup_at_capacity = (
+        len(known_ids) >= MAX_DEDUP_INDEX_ITEMS or len(known_digests) >= MAX_DEDUP_INDEX_ITEMS
+    )
+    operational_rejections = [
+        item
+        for item in state["rejected"]
+        if str(item.get("reason") or "").startswith(
+            (
+                "archive_failed:",
+                "ProposalValidationError: cannot safely open proposal file:",
+                "ProposalValidationError: cannot remove consumed proposal",
+            )
+        )
+    ]
+    degraded_reasons: list[str] = []
+    checks = (
+        (bool(operational_rejections), "inbox_io_error"),
+        (dedup_at_capacity or state["dedup_capacity_rejections"], "dedup_index_capacity"),
+        (
+            state["accepted_spool_capacity_rejections"]
+            or not retention["accepted"]["limits_satisfied"],
+            "accepted_spool_capacity",
+        ),
+        (not retention["archive"]["limits_satisfied"], "archive_retention_backlog"),
+        (not retention["rejected"]["limits_satisfied"], "rejected_retention_backlog"),
+        (
+            candidate_scan_truncated or retention["incoming"]["scan_truncated"],
+            "incoming_scan_truncated",
+        ),
+        (not retention["incoming"]["limits_satisfied"], "incoming_retention_backlog"),
+    )
+    degraded_reasons.extend(reason for active, reason in checks if active)
+    return list(dict.fromkeys(degraded_reasons)), dedup_at_capacity, operational_rejections
+
+
+def ingest_inbox(
+    *,
+    incoming_dir: Path = DEFAULT_INCOMING,
+    accepted_dir: Path = DEFAULT_ACCEPTED,
+    rejected_dir: Path = DEFAULT_REJECTED,
+    archive_dir: Path = DEFAULT_ARCHIVE,
+    index_path: Path = DEFAULT_INDEX,
+    max_batch: int = MAX_BATCH,
+) -> dict[str, Any]:
+    root, paths = _prepare_inbox_paths(
+        incoming_dir,
+        accepted_dir,
+        rejected_dir,
+        archive_dir,
+        index_path,
+        max_batch,
+    )
     with _inbox_lock(root):
         for path in paths:
             _safe_directory(path, shared_incoming=path == incoming_dir)
-        known_ids, known_digests = _existing_accepted(
-            accepted_dir,
-            index_path=index_path,
-        )
+        known_ids, known_digests = _existing_accepted(accepted_dir, index_path=index_path)
         accepted_spool = _accepted_spool_usage(accepted_dir)
-        accepted: list[dict[str, Any]] = []
-        rejected: list[dict[str, Any]] = []
-        archived = 0
-        oversized_discarded = 0
-        dedup_capacity_rejections = 0
-        accepted_spool_capacity_rejections = 0
-        # Producers write a temporary non-.json file and atomically rename it
-        # when complete. Only completed proposal names enter the ingest batch.
+        state: dict[str, Any] = {
+            "accepted": [],
+            "rejected": [],
+            "archived": 0,
+            "oversized_discarded": 0,
+            "dedup_capacity_rejections": 0,
+            "accepted_spool_capacity_rejections": 0,
+        }
         incoming_snapshot, candidate_scan_truncated = _incoming_entries(incoming_dir)
         candidates = [
             path
@@ -992,122 +1244,16 @@ def ingest_inbox(
             if name.endswith(".json") and not name.startswith(".")
         ][:max_batch]
         for source_path in candidates:
-            if source_path.name.startswith("."):
-                continue
-            if source_path.is_symlink() or not source_path.is_file():
-                raw_digest = (
-                    "sha256:"
-                    + hashlib.sha256(f"unsafe-path:{source_path.name}".encode()).hexdigest()
-                )
-                reason = "proposal path must be a non-symlink regular file"
-                _write_rejection(
-                    rejected_dir,
-                    source_name=source_path.name,
-                    raw_digest=raw_digest,
-                    reason=reason,
-                )
-                rejected.append({"source_name": source_path.name, "reason": reason})
-                if source_path.is_symlink():
-                    source_path.unlink()
-                continue
-            raw_digest = _raw_digest(source_path)
-            archive_path = _unique_archive_path(archive_dir, raw_digest)
-            try:
-                raw = _load_untrusted_json(source_path)
-                proposal = build_accepted_proposal(raw)
-                proposal_id = proposal["proposal_id"]
-                content_digest = proposal["content_digest"]
-                proposal_size = len(json.dumps(proposal, indent=2, sort_keys=True).encode("utf-8"))
-                if proposal_id in known_ids or content_digest in known_digests:
-                    _write_rejection(
-                        rejected_dir,
-                        source_name=source_path.name,
-                        raw_digest=raw_digest,
-                        reason="duplicate_proposal",
-                        duplicate_of=proposal_id,
-                    )
-                    rejected.append(
-                        {
-                            "source_name": source_path.name,
-                            "reason": "duplicate_proposal",
-                            "duplicate_of": proposal_id,
-                        }
-                    )
-                elif (
-                    accepted_spool["scan_truncated"]
-                    or accepted_spool["files"] >= MAX_ACCEPTED_FILES
-                    or accepted_spool["bytes"] + proposal_size > MAX_ACCEPTED_BYTES
-                ):
-                    accepted_spool_capacity_rejections += 1
-                    _write_rejection(
-                        rejected_dir,
-                        source_name=source_path.name,
-                        raw_digest=raw_digest,
-                        reason="accepted_spool_capacity",
-                    )
-                    rejected.append(
-                        {
-                            "source_name": source_path.name,
-                            "reason": "accepted_spool_capacity",
-                        }
-                    )
-                elif (
-                    len(known_ids) >= MAX_DEDUP_INDEX_ITEMS
-                    or len(known_digests) >= MAX_DEDUP_INDEX_ITEMS
-                ):
-                    dedup_capacity_rejections += 1
-                    _write_rejection(
-                        rejected_dir,
-                        source_name=source_path.name,
-                        raw_digest=raw_digest,
-                        reason="dedup_index_capacity",
-                    )
-                    rejected.append(
-                        {
-                            "source_name": source_path.name,
-                            "reason": "dedup_index_capacity",
-                        }
-                    )
-                else:
-                    destination = accepted_dir / f"{proposal_id}.json"
-                    write_json_atomic(destination, proposal)
-                    destination.chmod(0o600)
-                    known_ids.add(proposal_id)
-                    known_digests.add(content_digest)
-                    accepted_spool["files"] += 1
-                    accepted_spool["bytes"] += proposal_size
-                    accepted.append(
-                        {
-                            "source_name": source_path.name,
-                            "proposal_id": proposal_id,
-                            "content_digest": content_digest,
-                        }
-                    )
-            except Exception as exc:
-                reason = f"{type(exc).__name__}: {str(exc)[:420]}"
-                _write_rejection(
-                    rejected_dir,
-                    source_name=source_path.name,
-                    raw_digest=raw_digest,
-                    reason=reason,
-                )
-                rejected.append({"source_name": source_path.name, "reason": reason})
-            try:
-                if _archive_untrusted_source(
-                    source_path,
-                    archive_path,
-                    expected_digest=raw_digest,
-                ):
-                    archived += 1
-                else:
-                    oversized_discarded += 1
-            except (OSError, ProposalValidationError) as exc:
-                rejected.append(
-                    {
-                        "source_name": source_path.name,
-                        "reason": f"archive_failed: {type(exc).__name__}",
-                    }
-                )
+            _ingest_source(
+                source_path,
+                accepted_dir=accepted_dir,
+                rejected_dir=rejected_dir,
+                archive_dir=archive_dir,
+                known_ids=known_ids,
+                known_digests=known_digests,
+                accepted_spool=accepted_spool,
+                state=state,
+            )
         index = {
             "schema": "autopilot.openclaw_inbox_index/v1",
             "updated_at": utc_now(),
@@ -1117,12 +1263,10 @@ def ingest_inbox(
         }
         write_json_atomic(index_path, index)
         index_path.chmod(0o600)
-        # Retention happens only after the durable dedup index update. Removing
-        # rolling audit/spool records therefore cannot make an old proposal new.
         retention = {
             "accepted": {
                 **accepted_spool,
-                "capacity_rejections": accepted_spool_capacity_rejections,
+                "capacity_rejections": state["accepted_spool_capacity_rejections"],
                 "limits_satisfied": (
                     not accepted_spool["scan_truncated"]
                     and accepted_spool["files"] <= MAX_ACCEPTED_FILES
@@ -1141,52 +1285,30 @@ def ingest_inbox(
             ),
             "incoming": _incoming_hygiene(incoming_dir),
         }
-        dedup_at_capacity = (
-            len(known_ids) >= MAX_DEDUP_INDEX_ITEMS or len(known_digests) >= MAX_DEDUP_INDEX_ITEMS
+        degraded_reasons, dedup_at_capacity, operational_rejections = _inbox_degraded_reasons(
+            state,
+            known_ids=known_ids,
+            known_digests=known_digests,
+            retention=retention,
+            candidate_scan_truncated=candidate_scan_truncated,
         )
-        degraded_reasons: list[str] = []
-        operational_rejections = [
-            item
-            for item in rejected
-            if str(item.get("reason") or "").startswith(
-                (
-                    "archive_failed:",
-                    "ProposalValidationError: cannot safely open proposal file:",
-                    "ProposalValidationError: cannot remove consumed proposal",
-                )
-            )
-        ]
-        if operational_rejections:
-            degraded_reasons.append("inbox_io_error")
-        if dedup_at_capacity or dedup_capacity_rejections:
-            degraded_reasons.append("dedup_index_capacity")
-        if accepted_spool_capacity_rejections or not retention["accepted"]["limits_satisfied"]:
-            degraded_reasons.append("accepted_spool_capacity")
-        if not retention["archive"]["limits_satisfied"]:
-            degraded_reasons.append("archive_retention_backlog")
-        if not retention["rejected"]["limits_satisfied"]:
-            degraded_reasons.append("rejected_retention_backlog")
-        if candidate_scan_truncated or retention["incoming"]["scan_truncated"]:
-            degraded_reasons.append("incoming_scan_truncated")
-        if not retention["incoming"]["limits_satisfied"]:
-            degraded_reasons.append("incoming_retention_backlog")
     return {
         "ok": not operational_rejections,
         "degraded": bool(degraded_reasons),
         "degraded_reasons": list(dict.fromkeys(degraded_reasons)),
         "native_generation_unaffected": True,
         "generated_at": utc_now(),
-        "accepted": accepted,
-        "rejected": rejected,
-        "archived": archived,
-        "oversized_discarded": oversized_discarded,
+        "accepted": state["accepted"],
+        "rejected": state["rejected"],
+        "archived": state["archived"],
+        "oversized_discarded": state["oversized_discarded"],
         "remaining": retention["incoming"]["retained_observed_json_files"],
         "remaining_scan_truncated": retention["incoming"]["scan_truncated"],
         "dedup_index": {
             "items": max(len(known_ids), len(known_digests)),
             "item_limit": MAX_DEDUP_INDEX_ITEMS,
             "at_capacity": dedup_at_capacity,
-            "capacity_rejections": dedup_capacity_rejections,
+            "capacity_rejections": state["dedup_capacity_rejections"],
         },
         "retention": retention,
         "safety": dict(SAFETY),
@@ -1811,60 +1933,61 @@ def _event_semantics(context: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _material_event_reasons(before: Any, after: dict[str, Any]) -> list[str]:
-    if not isinstance(before, dict):
-        return []
+def _material_single_product_reasons(item: dict[str, Any], prior: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
-    if before.get("operational_ok") != after.get("operational_ok"):
-        reasons.append("operational_health_changed")
-    if before.get("runtime_ok") != after.get("runtime_ok"):
-        reasons.append("runtime_health_changed")
+    name = item["name"]
+    if prior.get("cycle_ok") != item.get("cycle_ok") or prior.get("error") != item.get("error"):
+        reasons.append(f"product_health_changed:{name}")
+    if prior.get("drawdown_halted") != item.get("drawdown_halted"):
+        reasons.append(f"drawdown_halt_changed:{name}")
+    if prior.get("open_positions") != item.get("open_positions"):
+        reasons.append(f"position_count_changed:{name}")
+    prior_trades = (
+        prior.get("trade_summary", {}).get("trades")
+        if isinstance(prior.get("trade_summary"), dict)
+        else None
+    )
+    current_trades = (
+        item.get("trade_summary", {}).get("trades")
+        if isinstance(item.get("trade_summary"), dict)
+        else None
+    )
+    if prior_trades != current_trades:
+        reasons.append(f"paper_trade_result_changed:{name}")
+    try:
+        drawdown_delta = abs(
+            float(item.get("drawdown_fraction") or 0) - float(prior.get("drawdown_fraction") or 0)
+        )
+    except (TypeError, ValueError):
+        drawdown_delta = 0
+    if drawdown_delta >= 0.01:
+        reasons.append(f"material_drawdown_change:{name}")
+    try:
+        prior_equity = float(prior.get("equity"))
+        current_equity = float(item.get("equity"))
+        equity_change = abs(current_equity - prior_equity) / max(abs(prior_equity), 1e-12)
+    except (TypeError, ValueError):
+        equity_change = 0
+    if equity_change >= 0.01:
+        reasons.append(f"material_equity_change:{name}")
+    return reasons
+
+
+def _material_product_reasons(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
     before_products = {
         item.get("name"): item
         for item in before.get("products") or []
         if isinstance(item, dict) and item.get("name")
     }
+    reasons = []
     for item in after.get("products") or []:
-        if not isinstance(item, dict) or not item.get("name"):
-            continue
-        prior = before_products.get(item["name"])
-        if prior is None:
-            continue
-        if prior.get("cycle_ok") != item.get("cycle_ok") or prior.get("error") != item.get("error"):
-            reasons.append(f"product_health_changed:{item['name']}")
-        if prior.get("drawdown_halted") != item.get("drawdown_halted"):
-            reasons.append(f"drawdown_halt_changed:{item['name']}")
-        if prior.get("open_positions") != item.get("open_positions"):
-            reasons.append(f"position_count_changed:{item['name']}")
-        prior_trades = (
-            prior.get("trade_summary", {}).get("trades")
-            if isinstance(prior.get("trade_summary"), dict)
-            else None
-        )
-        current_trades = (
-            item.get("trade_summary", {}).get("trades")
-            if isinstance(item.get("trade_summary"), dict)
-            else None
-        )
-        if prior_trades != current_trades:
-            reasons.append(f"paper_trade_result_changed:{item['name']}")
-        try:
-            drawdown_delta = abs(
-                float(item.get("drawdown_fraction") or 0)
-                - float(prior.get("drawdown_fraction") or 0)
-            )
-        except (TypeError, ValueError):
-            drawdown_delta = 0
-        if drawdown_delta >= 0.01:
-            reasons.append(f"material_drawdown_change:{item['name']}")
-        try:
-            prior_equity = float(prior.get("equity"))
-            current_equity = float(item.get("equity"))
-            equity_change = abs(current_equity - prior_equity) / max(abs(prior_equity), 1e-12)
-        except (TypeError, ValueError):
-            equity_change = 0
-        if equity_change >= 0.01:
-            reasons.append(f"material_equity_change:{item['name']}")
+        if isinstance(item, dict) and item.get("name") in before_products:
+            reasons.extend(_material_single_product_reasons(item, before_products[item["name"]]))
+    return reasons
+
+
+def _material_hypothesis_reasons(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
     before_hypotheses = {
         item.get("hypothesis_id"): item.get("latest_evaluation")
         for item in before.get("hypotheses") or []
@@ -1877,6 +2000,19 @@ def _material_event_reasons(before: Any, after: dict[str, Any]) -> list[str]:
         latest = item.get("latest_evaluation")
         if prior != latest and latest is not None:
             reasons.append(f"research_result_completed:{item['hypothesis_id']}")
+    return reasons
+
+
+def _material_event_reasons(before: Any, after: dict[str, Any]) -> list[str]:
+    if not isinstance(before, dict):
+        return []
+    reasons: list[str] = []
+    if before.get("operational_ok") != after.get("operational_ok"):
+        reasons.append("operational_health_changed")
+    if before.get("runtime_ok") != after.get("runtime_ok"):
+        reasons.append("runtime_health_changed")
+    reasons.extend(_material_product_reasons(before, after))
+    reasons.extend(_material_hypothesis_reasons(before, after))
     if before.get("actions") != after.get("actions"):
         reasons.append("research_action_disposition_changed")
     if before.get("job_worker") != after.get("job_worker"):
