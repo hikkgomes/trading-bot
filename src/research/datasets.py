@@ -54,6 +54,69 @@ def _identity(value: object, *, field: str) -> str:
     return value
 
 
+def _normalise_dataset_identities(dataset: ResolvedDataset) -> None:
+    for attribute in (
+        "snapshot_id",
+        "content_hash",
+        "universe_snapshot_id",
+        "feature_manifest_hash",
+        "cost_model_hash",
+        "parameter_set_hash",
+        "universe_snapshot_id",
+        "product_id",
+        "engine_version",
+    ):
+        value = non_empty(getattr(dataset, attribute), field=attribute)
+        object.__setattr__(dataset, attribute, value)
+    for attribute in (
+        "snapshot_id",
+        "content_hash",
+        "feature_manifest_hash",
+        "cost_model_hash",
+        "parameter_set_hash",
+    ):
+        _identity(getattr(dataset, attribute), field=attribute)
+
+
+def _normalise_event_segments(dataset: ResolvedDataset) -> None:
+    if dataset.model_artefact_id is not None:
+        _identity(dataset.model_artefact_id, field="model_artefact_id")
+    event_ids = tuple(dataset.event_data_segment_ids)
+    if len(event_ids) != len(set(event_ids)) or any(
+        not value.startswith("sha256:") or len(value) != 71 for value in event_ids
+    ):
+        raise DatasetResolutionError(
+            "event_data_segment_ids must contain unique SHA-256 identities"
+        )
+    object.__setattr__(dataset, "event_data_segment_ids", event_ids)
+
+
+def _normalise_dataset_interval(dataset: ResolvedDataset) -> None:
+    interval = json_value(dict(dataset.interval), field="dataset interval")
+    if set(interval) != {"start", "end"}:
+        raise DatasetResolutionError("dataset interval needs start and end")
+    start = timestamp(interval["start"], field="interval.start")
+    end = timestamp(interval["end"], field="interval.end")
+    if start >= end:
+        raise DatasetResolutionError("dataset interval must be chronological")
+    object.__setattr__(dataset, "interval", {"start": start, "end": end})
+    availability = timestamp(dataset.availability_timestamp, field="availability_timestamp")
+    if availability < end:
+        raise DatasetResolutionError("dataset became available before its information interval")
+    object.__setattr__(dataset, "availability_timestamp", availability)
+
+
+def _normalise_dataset_scope(dataset: ResolvedDataset) -> None:
+    role = non_empty(dataset.role, field="role")
+    if role not in DATASET_ROLES:
+        raise DatasetResolutionError(f"unsupported dataset role: {role}")
+    object.__setattr__(dataset, "role", role)
+    scope = tuple(non_empty(item, field="instrument_scope") for item in dataset.instrument_scope)
+    if not scope:
+        raise DatasetResolutionError("instrument_scope cannot be empty")
+    object.__setattr__(dataset, "instrument_scope", scope)
+
+
 @dataclass(frozen=True)
 class CandidateDatasetPlan:
     """Typed stage plan bound to one product and one point-in-time universe."""
@@ -549,61 +612,10 @@ class ResolvedDataset:
     role: str = "unspecified"
 
     def __post_init__(self) -> None:
-        for attribute in (
-            "snapshot_id",
-            "content_hash",
-            "universe_snapshot_id",
-            "feature_manifest_hash",
-            "cost_model_hash",
-            "parameter_set_hash",
-            "universe_snapshot_id",
-            "product_id",
-            "engine_version",
-        ):
-            value = non_empty(getattr(self, attribute), field=attribute)
-            object.__setattr__(self, attribute, value)
-        for attribute in (
-            "snapshot_id",
-            "content_hash",
-            "feature_manifest_hash",
-            "cost_model_hash",
-            "parameter_set_hash",
-        ):
-            value = getattr(self, attribute)
-            if not value.startswith("sha256:") or len(value) != 71:
-                raise DatasetResolutionError(f"{attribute} must be a SHA-256 identity")
-        if self.model_artefact_id is not None and (
-            not self.model_artefact_id.startswith("sha256:") or len(self.model_artefact_id) != 71
-        ):
-            raise DatasetResolutionError("model_artefact_id must be a SHA-256 identity")
-        event_ids = tuple(self.event_data_segment_ids)
-        if len(event_ids) != len(set(event_ids)) or any(
-            not value.startswith("sha256:") or len(value) != 71 for value in event_ids
-        ):
-            raise DatasetResolutionError(
-                "event_data_segment_ids must contain unique SHA-256 identities"
-            )
-        object.__setattr__(self, "event_data_segment_ids", event_ids)
-        role = non_empty(self.role, field="role")
-        if role not in DATASET_ROLES:
-            raise DatasetResolutionError(f"unsupported dataset role: {role}")
-        object.__setattr__(self, "role", role)
-        interval = json_value(dict(self.interval), field="dataset interval")
-        if set(interval) != {"start", "end"}:
-            raise DatasetResolutionError("dataset interval needs start and end")
-        start = timestamp(interval["start"], field="interval.start")
-        end = timestamp(interval["end"], field="interval.end")
-        if start >= end:
-            raise DatasetResolutionError("dataset interval must be chronological")
-        object.__setattr__(self, "interval", {"start": start, "end": end})
-        availability = timestamp(self.availability_timestamp, field="availability_timestamp")
-        if availability < end:
-            raise DatasetResolutionError("dataset became available before its information interval")
-        object.__setattr__(self, "availability_timestamp", availability)
-        scope = tuple(non_empty(item, field="instrument_scope") for item in self.instrument_scope)
-        if not scope:
-            raise DatasetResolutionError("instrument_scope cannot be empty")
-        object.__setattr__(self, "instrument_scope", scope)
+        _normalise_dataset_identities(self)
+        _normalise_event_segments(self)
+        _normalise_dataset_interval(self)
+        _normalise_dataset_scope(self)
 
     @property
     def receipt(self) -> Mapping[str, Any]:
@@ -646,33 +658,15 @@ class CanonicalDatasetResolver:
             raise DatasetResolutionError("dataset content hash verification failed")
         return dataset
 
-    def resolve_context(
-        self,
+    @staticmethod
+    def _validate_context_filters(
+        resolved: tuple[ResolvedDataset, ...],
         *,
-        snapshot_ids: tuple[str, ...],
-        feature_manifest_id: str,
-        cost_model_id: str,
-        parameter_set_id: str,
-        allowed_roles: frozenset[str] | None = None,
-        forbidden_roles: frozenset[str] = frozenset(),
-        minimum_availability_timestamp: str | None = None,
-        maximum_availability_timestamp: str | None = None,
-    ) -> Mapping[str, Any]:
-        allowed_roles = None if allowed_roles is None else frozenset(allowed_roles)
-        unknown_roles = (allowed_roles or frozenset()) | forbidden_roles
-        if not unknown_roles.issubset(DATASET_ROLES):
-            raise DatasetResolutionError("dataset role filter contains an unsupported role")
-        resolved = tuple(
-            self.resolve(
-                snapshot_id,
-                expected={
-                    "feature_manifest_hash": feature_manifest_id,
-                    "cost_model_hash": cost_model_id,
-                    "parameter_set_hash": parameter_set_id,
-                },
-            )
-            for snapshot_id in snapshot_ids
-        )
+        allowed_roles: frozenset[str] | None,
+        forbidden_roles: frozenset[str],
+        minimum_availability_timestamp: str | None,
+        maximum_availability_timestamp: str | None,
+    ) -> None:
         if allowed_roles is None and any(item.role == "protected_holdout" for item in resolved):
             raise DatasetResolutionError(
                 "protected_holdout datasets require an explicit protected boundary"
@@ -700,6 +694,16 @@ class CanonicalDatasetResolver:
         intervals = sorted((item.interval["start"], item.interval["end"]) for item in resolved)
         if any(intervals[index][0] < intervals[index - 1][1] for index in range(1, len(intervals))):
             raise DatasetResolutionError("immutable dataset information intervals overlap")
+
+    @staticmethod
+    def _build_context(
+        snapshot_ids: tuple[str, ...],
+        resolved: tuple[ResolvedDataset, ...],
+        *,
+        feature_manifest_id: str,
+        cost_model_id: str,
+        parameter_set_id: str,
+    ) -> dict[str, Any]:
         context: dict[str, Any] = {
             "dataset_snapshot_ids": list(snapshot_ids),
             "feature_manifest_id": feature_manifest_id,
@@ -724,13 +728,63 @@ class CanonicalDatasetResolver:
                 for key, value in item.payload.items():
                     if key not in context:
                         context[str(key)] = value
+        return context
+
+    @staticmethod
+    def _validate_event_segments(context: Mapping[str, Any]) -> None:
+        identities = context["event_data_segment_ids"]
         raw_segments = context.get("event_data_segments", {})
-        if context["event_data_segment_ids"]:
-            if not isinstance(raw_segments, Mapping) or any(
+        if identities and (
+            not isinstance(raw_segments, Mapping)
+            or any(
                 identity not in raw_segments or canonical_hash(raw_segments[identity]) != identity
-                for identity in context["event_data_segment_ids"]
-            ):
-                raise DatasetResolutionError("event-data segment content hash verification failed")
+                for identity in identities
+            )
+        ):
+            raise DatasetResolutionError("event-data segment content hash verification failed")
+
+    def resolve_context(
+        self,
+        *,
+        snapshot_ids: tuple[str, ...],
+        feature_manifest_id: str,
+        cost_model_id: str,
+        parameter_set_id: str,
+        allowed_roles: frozenset[str] | None = None,
+        forbidden_roles: frozenset[str] = frozenset(),
+        minimum_availability_timestamp: str | None = None,
+        maximum_availability_timestamp: str | None = None,
+    ) -> Mapping[str, Any]:
+        allowed_roles = None if allowed_roles is None else frozenset(allowed_roles)
+        unknown_roles = (allowed_roles or frozenset()) | forbidden_roles
+        if not unknown_roles.issubset(DATASET_ROLES):
+            raise DatasetResolutionError("dataset role filter contains an unsupported role")
+        resolved = tuple(
+            self.resolve(
+                snapshot_id,
+                expected={
+                    "feature_manifest_hash": feature_manifest_id,
+                    "cost_model_hash": cost_model_id,
+                    "parameter_set_hash": parameter_set_id,
+                },
+            )
+            for snapshot_id in snapshot_ids
+        )
+        self._validate_context_filters(
+            resolved,
+            allowed_roles=allowed_roles,
+            forbidden_roles=forbidden_roles,
+            minimum_availability_timestamp=minimum_availability_timestamp,
+            maximum_availability_timestamp=maximum_availability_timestamp,
+        )
+        context = self._build_context(
+            snapshot_ids,
+            resolved,
+            feature_manifest_id=feature_manifest_id,
+            cost_model_id=cost_model_id,
+            parameter_set_id=parameter_set_id,
+        )
+        self._validate_event_segments(context)
         return context
 
 
