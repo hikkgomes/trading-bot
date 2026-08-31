@@ -37,6 +37,178 @@ def iter_events(paths: Iterable[Path]) -> Iterator[dict[str, Any]]:
                 yield event
 
 
+def _strategy_exit_reason(
+    position: dict[str, Any] | None,
+    forecast: Any | None,
+    last_received_ns: int,
+) -> str | None:
+    if position is None:
+        return None
+    elapsed_ns = int(last_received_ns) - int(position["entry_received_ns"])
+    if elapsed_ns >= int(position["horizon_seconds"]) * 1_000_000_000:
+        return "horizon"
+    if forecast is not None and forecast.direction != position["direction"]:
+        return "opposite_signal"
+    return None
+
+
+def _close_strategy_position(
+    state: MicrostructureState,
+    position: dict[str, Any],
+    strategy_trades: list[dict[str, Any]],
+    exit_reason: str,
+    last_received_ns: int,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    exit_side = "sell" if position["direction"] == "long" else "buy"
+    fill = state.market_fill(
+        side=exit_side,
+        quantity=float(position["filled_quantity"]),
+    )
+    if fill["filled_quantity"] <= 0:
+        return position, strategy_trades
+    signed = 1.0 if position["direction"] == "long" else -1.0
+    pnl = (
+        signed
+        * (float(fill["average_price"]) - float(position["average_price"]))
+        * float(fill["filled_quantity"])
+    )
+    pnl -= float(position["fee"]) + float(fill["fee"])
+    strategy_trades = [
+        *strategy_trades,
+        {
+            "direction": position["direction"],
+            "entry_received_ns": position["entry_received_ns"],
+            "exit_received_ns": last_received_ns,
+            "entry_price": position["average_price"],
+            "exit_price": fill["average_price"],
+            "filled_quantity": fill["filled_quantity"],
+            "net_pnl_quote": pnl,
+            "reason": exit_reason,
+        },
+    ][-100:]
+    return None, strategy_trades
+
+
+def _open_strategy_position(
+    state: MicrostructureState,
+    position: dict[str, Any] | None,
+    forecast: Any | None,
+    signal_detail: dict[str, Any],
+    strategy_quantity: float,
+    last_received_ns: int,
+) -> dict[str, Any] | None:
+    if position is not None or forecast is None:
+        return position
+    entry_side = "buy" if forecast.direction == "long" else "sell"
+    fill = state.market_fill(side=entry_side, quantity=strategy_quantity)
+    if fill["filled_quantity"] <= 0:
+        return None
+    return {
+        "direction": forecast.direction,
+        "entry_received_ns": last_received_ns,
+        "average_price": fill["average_price"],
+        "filled_quantity": fill["filled_quantity"],
+        "fee": fill["fee"],
+        "horizon_seconds": forecast.horizon_seconds,
+        "signal": forecast.to_dict(),
+        "signal_detail": signal_detail,
+    }
+
+
+def _run_strategy_sample(
+    state: MicrostructureState,
+    snapshot: dict[str, Any],
+    event: dict[str, Any],
+    policy: MicrostructureAlphaPolicy,
+    strategy_quantity: float,
+    last_received_ns: int,
+    strategy_position: dict[str, Any] | None,
+    strategy_signals: int,
+    strategy_trades: list[dict[str, Any]],
+    latest_forecast: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, int, list[dict[str, Any]], dict[str, Any] | None]:
+    generated_at = event.get("received_at") or str(last_received_ns)
+    forecast, signal_detail = forecast_from_microstructure(
+        snapshot,
+        market=str(event.get("market") or "futures"),
+        policy=policy,
+        generated_at=str(generated_at),
+    )
+    if forecast is not None:
+        strategy_signals += 1
+        latest_forecast = forecast.to_dict()
+    exit_reason = _strategy_exit_reason(strategy_position, forecast, last_received_ns)
+    if strategy_position is not None and exit_reason is not None:
+        strategy_position, strategy_trades = _close_strategy_position(
+            state,
+            strategy_position,
+            strategy_trades,
+            exit_reason,
+            last_received_ns,
+        )
+    strategy_position = _open_strategy_position(
+        state,
+        strategy_position,
+        forecast,
+        signal_detail,
+        strategy_quantity,
+        last_received_ns,
+    )
+    return strategy_position, strategy_signals, strategy_trades, latest_forecast
+
+
+def _process_replay_event(
+    state: MicrostructureState,
+    event: dict[str, Any],
+    *,
+    events: int,
+    sample_every: int,
+    limit_order: dict[str, Any] | None,
+    passive_order: RestingLimitOrder | None,
+    snapshots: list[dict[str, Any]],
+    microstructure_policy: MicrostructureAlphaPolicy | None,
+    strategy_quantity: float,
+    strategy_position: dict[str, Any] | None,
+    strategy_signals: int,
+    strategy_trades: list[dict[str, Any]],
+    latest_forecast: dict[str, Any] | None,
+) -> tuple[
+    RestingLimitOrder | None,
+    dict[str, Any] | None,
+    int,
+    list[dict[str, Any]],
+    dict[str, Any] | None,
+]:
+    state.apply(event)
+    if limit_order is not None and passive_order is None:
+        passive_order = RestingLimitOrder(submitted_ns=event["received_ns"], **limit_order)
+    if passive_order is not None:
+        passive_order.observe(event, state)
+    if events % sample_every != 0:
+        return passive_order, strategy_position, strategy_signals, strategy_trades, latest_forecast
+    snapshot = state.snapshot()
+    if not snapshot.get("ok"):
+        return passive_order, strategy_position, strategy_signals, strategy_trades, latest_forecast
+    snapshot["received_ns"] = event["received_ns"]
+    snapshots.append(snapshot)
+    if len(snapshots) > 1_000:
+        snapshots.pop(0)
+    if microstructure_policy is None:
+        return passive_order, strategy_position, strategy_signals, strategy_trades, latest_forecast
+    return passive_order, *_run_strategy_sample(
+        state,
+        snapshot,
+        event,
+        microstructure_policy,
+        strategy_quantity,
+        int(event["received_ns"]),
+        strategy_position,
+        strategy_signals,
+        strategy_trades,
+        latest_forecast,
+    )
+
+
 def replay(
     paths: Iterable[Path],
     *,
@@ -70,90 +242,27 @@ def replay(
         events += 1
         first_received_ns = first_received_ns or event["received_ns"]
         last_received_ns = event["received_ns"]
-        state.apply(event)
-        if limit_order is not None and passive_order is None:
-            passive_order = RestingLimitOrder(
-                submitted_ns=event["received_ns"],
-                **limit_order,
-            )
-        if passive_order is not None:
-            passive_order.observe(event, state)
-        if events % sample_every == 0:
-            snapshot = state.snapshot()
-            if snapshot.get("ok"):
-                snapshot["received_ns"] = last_received_ns
-                snapshots.append(snapshot)
-                if len(snapshots) > 1_000:
-                    snapshots.pop(0)
-                if microstructure_policy is not None:
-                    generated_at = event.get("received_at") or str(last_received_ns)
-                    forecast, signal_detail = forecast_from_microstructure(
-                        snapshot,
-                        market=str(event.get("market") or "futures"),
-                        policy=microstructure_policy,
-                        generated_at=str(generated_at),
-                    )
-                    if forecast is not None:
-                        strategy_signals += 1
-                        latest_forecast = forecast.to_dict()
-                    should_exit = False
-                    exit_reason = None
-                    if strategy_position is not None:
-                        elapsed_ns = int(last_received_ns) - int(
-                            strategy_position["entry_received_ns"]
-                        )
-                        if elapsed_ns >= int(strategy_position["horizon_seconds"]) * 1_000_000_000:
-                            should_exit, exit_reason = True, "horizon"
-                        elif (
-                            forecast is not None
-                            and forecast.direction != strategy_position["direction"]
-                        ):
-                            should_exit, exit_reason = True, "opposite_signal"
-                    if strategy_position is not None and should_exit:
-                        exit_side = "sell" if strategy_position["direction"] == "long" else "buy"
-                        fill = state.market_fill(
-                            side=exit_side,
-                            quantity=float(strategy_position["filled_quantity"]),
-                        )
-                        if fill["filled_quantity"] > 0:
-                            signed = 1.0 if strategy_position["direction"] == "long" else -1.0
-                            pnl = (
-                                signed
-                                * (
-                                    float(fill["average_price"])
-                                    - float(strategy_position["average_price"])
-                                )
-                                * float(fill["filled_quantity"])
-                            )
-                            pnl -= float(strategy_position["fee"]) + float(fill["fee"])
-                            strategy_trades.append(
-                                {
-                                    "direction": strategy_position["direction"],
-                                    "entry_received_ns": strategy_position["entry_received_ns"],
-                                    "exit_received_ns": last_received_ns,
-                                    "entry_price": strategy_position["average_price"],
-                                    "exit_price": fill["average_price"],
-                                    "filled_quantity": fill["filled_quantity"],
-                                    "net_pnl_quote": pnl,
-                                    "reason": exit_reason,
-                                }
-                            )
-                            strategy_trades = strategy_trades[-100:]
-                            strategy_position = None
-                    if strategy_position is None and forecast is not None:
-                        entry_side = "buy" if forecast.direction == "long" else "sell"
-                        fill = state.market_fill(side=entry_side, quantity=strategy_quantity)
-                        if fill["filled_quantity"] > 0:
-                            strategy_position = {
-                                "direction": forecast.direction,
-                                "entry_received_ns": last_received_ns,
-                                "average_price": fill["average_price"],
-                                "filled_quantity": fill["filled_quantity"],
-                                "fee": fill["fee"],
-                                "horizon_seconds": forecast.horizon_seconds,
-                                "signal": forecast.to_dict(),
-                                "signal_detail": signal_detail,
-                            }
+        (
+            passive_order,
+            strategy_position,
+            strategy_signals,
+            strategy_trades,
+            latest_forecast,
+        ) = _process_replay_event(
+            state,
+            event,
+            events=events,
+            sample_every=sample_every,
+            limit_order=limit_order,
+            passive_order=passive_order,
+            snapshots=snapshots,
+            microstructure_policy=microstructure_policy,
+            strategy_quantity=strategy_quantity,
+            strategy_position=strategy_position,
+            strategy_signals=strategy_signals,
+            strategy_trades=strategy_trades,
+            latest_forecast=latest_forecast,
+        )
     final_features = state.snapshot()
     simulated_fill = None
     if market_order is not None:
