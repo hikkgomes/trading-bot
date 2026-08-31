@@ -302,11 +302,10 @@ _CRITICAL_SERVICES = frozenset(
     {
         "market-gateway",
         "account-reconciliation",
-        "live-execution",
-        "user-stream",
-        "live-recovery",
-        "emergency-control",
+        "execution-engine",
+        "paper-engine",
         "control-api",
+        "platform-scheduler",
     }
 )
 

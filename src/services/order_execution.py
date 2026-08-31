@@ -49,6 +49,7 @@ class DatabaseExecutionWorker:
         product_execution: Mapping[str, Mapping[str, Any]],
         order_groups: OrderGroupManager | None = None,
         snapshot_store: SqlRiskSnapshotStore | None = None,
+        control_plane: Any | None = None,
         lease_seconds: int = 60,
     ) -> None:
         self.queue = queue
@@ -59,6 +60,7 @@ class DatabaseExecutionWorker:
         self.trace_store = trace_store
         self.order_groups = order_groups
         self.snapshot_store = snapshot_store
+        self.control_plane = control_plane
         self.product_execution = {
             product_id: dict(configuration)
             for product_id, configuration in product_execution.items()
@@ -130,6 +132,25 @@ class DatabaseExecutionWorker:
                 raise ValueError(f"unsupported execution mode: {mode}")
             venue_jobs: list[str] = []
             for order in orders:
+                if self._blocks_new_risk(product_id, order):
+                    self.trace_store.append(
+                        _risk_rejected_trace(
+                            event_id=str(payload["event_id"]),
+                            target=TargetPosition(
+                                portfolio_id=order.portfolio_id,
+                                instrument_id=order.instrument_id,
+                                target_quantity=order.quantity,
+                                target_notional=order.quantity
+                                * float(canonical_inputs["prices"][order.instrument_id]),
+                                target_fraction=0.0,
+                                strategy_contributions=order.strategy_contributions,
+                                risk_budget=float(order.metadata.get("risk_budget", 0.0)),
+                                valid_until=order.valid_until,
+                            ),
+                            reason_code="control_plane_blocks_new_risk",
+                        )
+                    )
+                    continue
                 existing = {item.order_id: item for item in self.order_manager.all()}.get(
                     order.order_id
                 )
@@ -184,12 +205,24 @@ class DatabaseExecutionWorker:
             }
         self.queue.complete(claimed, completed_at=now)
         return {
-            "reason_code": f"{mode}_orders_enqueued" if orders else "target_already_satisfied",
+            "reason_code": f"{mode}_orders_enqueued" if venue_jobs else "target_already_satisfied",
             "job_id": claimed.job_id,
-            "orders": len(orders),
+            "orders": len(venue_jobs),
             "venue_job_ids": venue_jobs,
             **({"paper_job_ids": venue_jobs} if mode == "paper" else {}),
         }
+
+    def _blocks_new_risk(self, product_id: str, order: OrderIntent) -> bool:
+        if self.control_plane is None or order.reduce_only:
+            return False
+        strategy_ids = tuple(sorted(order.strategy_contributions))
+        strategy_id = strategy_ids[0] if len(strategy_ids) == 1 else None
+        return bool(
+            self.control_plane.blocks_new_risk(
+                product_id=product_id,
+                strategy_id=strategy_id,
+            )
+        )
 
     def _canonical_inputs(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         snapshot_id = payload.get("target_position_snapshot_id")

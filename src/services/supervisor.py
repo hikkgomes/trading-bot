@@ -282,6 +282,7 @@ def _execution_cycle(
         trace_store=traces,
         order_groups=order_groups,
         snapshot_store=SqlRiskSnapshotStore(database.engine),
+        control_plane=control_plane,
         product_execution={
             product_id: {
                 "execution_mode": product["execution_mode"],
