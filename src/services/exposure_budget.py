@@ -83,42 +83,8 @@ class ExposureBudgetGuard:
         price_by_instrument = _known_prices(
             order=order, account_payload=account_payload, orders=order_rows
         )
-        current_notional: dict[str, float] = {}
-        current_signed: dict[str, float] = {}
-        for position in position_rows:
-            if abs(position.quantity) <= 1e-12:
-                continue
-            mark = price_by_instrument.get(position.instrument_id)
-            if mark is None:
-                raise ExposureBudgetError(
-                    f"live exposure has no current price for {position.instrument_id}"
-                )
-            notional = abs(position.quantity) * mark
-            current_notional[position.instrument_id] = (
-                current_notional.get(position.instrument_id, 0.0) + notional
-            )
-            current_signed[position.instrument_id] = (
-                current_signed.get(position.instrument_id, 0.0) + position.quantity * mark
-            )
-
-        pending_gross = 0.0
-        pending_net = 0.0
-        for existing in order_rows:
-            if (
-                existing.order_id == order.order_id
-                or existing.portfolio_id != order.portfolio_id
-                or existing.is_terminal
-                or existing.reduce_only
-            ):
-                continue
-            mark = price_by_instrument.get(existing.instrument_id)
-            if mark is None:
-                raise ExposureBudgetError(
-                    f"pending live exposure has no current price for {existing.instrument_id}"
-                )
-            notional = existing.remaining_quantity * mark
-            pending_gross += notional
-            pending_net += _signed_notional(existing.side, notional)
+        current_notional, current_signed = _position_exposure(position_rows, price_by_instrument)
+        pending_gross, pending_net = _pending_exposure(order, order_rows, price_by_instrument)
 
         proposed = 0.0 if order.reduce_only else order.quantity * price
         proposed_net = 0.0 if order.reduce_only else _signed_notional(order.side, proposed)
@@ -148,16 +114,70 @@ class ExposureBudgetGuard:
         if order.reduce_only:
             _assert_reduce_only(order, current_signed.get(order.instrument_id, 0.0), price)
             return assessment
-        for name, limit in limits.items():
-            value = abs(net) if name == "net_notional" else gross
-            if value > limit + max(1e-9, abs(limit) * 1e-12):
-                raise ExposureBudgetError(f"live order exceeds {name}: {value:g} > {limit:g}")
+        _assert_limits(gross, net, limits)
         return assessment
 
     def enforce(self, **kwargs: Any) -> ExposureBudgetAssessment:
         """Return the auditable assessment or raise a permission error."""
 
         return self.assess(**kwargs)
+
+
+def _position_exposure(
+    positions: Iterable[Position], prices: Mapping[str, float]
+) -> tuple[dict[str, float], dict[str, float]]:
+    gross: dict[str, float] = {}
+    signed: dict[str, float] = {}
+    for position in positions:
+        if abs(position.quantity) <= 1e-12:
+            continue
+        mark = prices.get(position.instrument_id)
+        if mark is None:
+            raise ExposureBudgetError(
+                f"live exposure has no current price for {position.instrument_id}"
+            )
+        notional = abs(position.quantity) * mark
+        gross[position.instrument_id] = gross.get(position.instrument_id, 0.0) + notional
+        signed[position.instrument_id] = (
+            signed.get(position.instrument_id, 0.0) + position.quantity * mark
+        )
+    return gross, signed
+
+
+def _pending_exposure(
+    order: OrderIntent,
+    orders: Iterable[OrderIntent],
+    prices: Mapping[str, float],
+) -> tuple[float, float]:
+    gross = net = 0.0
+    for existing in orders:
+        if _skip_pending_order(order, existing):
+            continue
+        mark = prices.get(existing.instrument_id)
+        if mark is None:
+            raise ExposureBudgetError(
+                f"pending live exposure has no current price for {existing.instrument_id}"
+            )
+        notional = existing.remaining_quantity * mark
+        gross += notional
+        net += _signed_notional(existing.side, notional)
+    return gross, net
+
+
+def _skip_pending_order(order: OrderIntent, existing: OrderIntent) -> bool:
+    return (
+        existing.order_id == order.order_id
+        or existing.portfolio_id != order.portfolio_id
+        or existing.is_terminal
+        or existing.reduce_only
+    )
+
+
+def _assert_limits(gross: float, net: float, limits: Mapping[str, float]) -> None:
+    for name, limit in limits.items():
+        value = abs(net) if name == "net_notional" else gross
+        if value > limit + max(1e-9, abs(limit) * 1e-12):
+            raise ExposureBudgetError(f"live order exceeds {name}: {value:g} > {limit:g}")
 
 
 def _account_equity(
@@ -189,27 +209,48 @@ def _known_prices(
     orders: Iterable[OrderIntent],
 ) -> dict[str, float]:
     prices: dict[str, float] = {order.instrument_id: _order_reference_price(order)}
+    prices.update(_account_market_prices(account_payload))
+    prices.update(_account_position_prices(account_payload, prices))
+    prices.update(_order_prices(orders, prices))
+    return prices
+
+
+def _account_market_prices(account_payload: Mapping[str, Any]) -> dict[str, float]:
     raw_prices = account_payload.get("market_prices")
-    if isinstance(raw_prices, Mapping):
-        for instrument_id, raw_price in raw_prices.items():
-            prices[str(instrument_id)] = _finite(raw_price, field=f"market price {instrument_id}")
+    if not isinstance(raw_prices, Mapping):
+        return {}
+    return {
+        str(instrument_id): _finite(raw_price, field=f"market price {instrument_id}")
+        for instrument_id, raw_price in raw_prices.items()
+    }
+
+
+def _account_position_prices(
+    account_payload: Mapping[str, Any], existing: Mapping[str, float]
+) -> dict[str, float]:
     raw_positions = account_payload.get("positions")
-    if isinstance(raw_positions, Mapping):
-        for instrument_id, raw_position in raw_positions.items():
-            if not isinstance(raw_position, Mapping):
-                continue
-            for key in ("mark_price", "price", "reference_price"):
-                if raw_position.get(key) is not None:
-                    prices.setdefault(
-                        str(instrument_id),
-                        _finite(raw_position[key], field=f"position {instrument_id} price"),
-                    )
-                    break
-    for existing in orders:
-        if existing.instrument_id in prices:
+    if not isinstance(raw_positions, Mapping):
+        return {}
+    prices: dict[str, float] = {}
+    for instrument_id, raw_position in raw_positions.items():
+        if str(instrument_id) in existing or not isinstance(raw_position, Mapping):
+            continue
+        for key in ("mark_price", "price", "reference_price"):
+            if raw_position.get(key) is not None:
+                prices[str(instrument_id)] = _finite(
+                    raw_position[key], field=f"position {instrument_id} price"
+                )
+                break
+    return prices
+
+
+def _order_prices(orders: Iterable[OrderIntent], existing: Mapping[str, float]) -> dict[str, float]:
+    prices: dict[str, float] = {}
+    for existing_order in orders:
+        if existing_order.instrument_id in existing or existing_order.instrument_id in prices:
             continue
         try:
-            prices[existing.instrument_id] = _order_reference_price(existing)
+            prices[existing_order.instrument_id] = _order_reference_price(existing_order)
         except ExposureBudgetError:
             continue
     return prices
