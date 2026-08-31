@@ -1704,9 +1704,326 @@ class SqlPreflightRepository:
         return None if row is None else dict(row)
 
 
+_ASSIGNMENT_LIFECYCLE_STATES = frozenset(
+    {
+        "registered",
+        "development",
+        "forward_paper",
+        "live_ready",
+        "live_canary",
+        "live",
+        "suspended",
+        "retired",
+    }
+)
+
+
+def _assignment_record(
+    *,
+    product_id: str,
+    portfolio_id: str,
+    strategy_version_id: str,
+    artefact_hash: str,
+    lifecycle_state: str,
+    execution_mode: str,
+    capital_limit: float,
+    assigned_at: str,
+    assigned_by: str,
+    sleeve_id: str,
+    instrument_id: str | None,
+    universe_id: str | None,
+    risk_budget: float,
+    active_until: str | None,
+    assignment_reason: str,
+    payload: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if execution_mode not in {"paper", "live"}:
+        raise CanonicalEvidenceError("active assignment execution mode must be paper or live")
+    if lifecycle_state not in _ASSIGNMENT_LIFECYCLE_STATES:
+        raise CanonicalEvidenceError("active assignment lifecycle state is not supported")
+    capital_limit = _finite_nonnegative(capital_limit, field="assignment capital limit")
+    risk_budget = _finite_nonnegative(risk_budget, field="assignment risk budget")
+    product_id = str(product_id).strip()
+    portfolio_id = str(portfolio_id).strip()
+    strategy_version_id = str(strategy_version_id).strip()
+    sleeve_id = str(sleeve_id).strip()
+    if not product_id or not portfolio_id or not strategy_version_id or not sleeve_id:
+        raise CanonicalEvidenceError("active assignment binding fields cannot be empty")
+    source_payload = payload or {}
+    if instrument_id is None and universe_id is None:
+        instrument_id = str(source_payload.get("instrument_id") or "").strip() or None
+        universe_id = str(source_payload.get("universe_id") or "").strip() or None
+    if instrument_id is None and universe_id is None:
+        universe_id = f"product:{product_id}"
+    if (instrument_id is None) == (universe_id is None):
+        raise CanonicalEvidenceError("assignment needs exactly one instrument_id or universe_id")
+    if not isinstance(assigned_by, str) or not assigned_by.strip():
+        raise CanonicalEvidenceError("active assignment actor must be non-empty")
+    assigned_at = timestamp(assigned_at, field="assigned_at")
+    return {
+        "product_id": product_id,
+        "portfolio_id": portfolio_id,
+        "sleeve_id": sleeve_id,
+        "strategy_version_id": strategy_version_id,
+        "instrument_id": instrument_id,
+        "universe_id": universe_id,
+        "assignment_scope_id": (
+            f"instrument:{instrument_id}" if instrument_id else f"universe:{universe_id}"
+        ),
+        "artefact_hash": _identity(artefact_hash, field="artefact_hash"),
+        "lifecycle_state": lifecycle_state,
+        "execution_mode": execution_mode,
+        "capital_limit": capital_limit,
+        "risk_budget": risk_budget,
+        "assigned_at": assigned_at,
+        "active_until": (
+            timestamp(active_until, field="active_until") if active_until is not None else None
+        ),
+        "assigned_by": assigned_by,
+        "assignment_reason": non_empty(assignment_reason, field="assignment_reason"),
+        "active": True,
+        "payload": _object(source_payload, field="assignment payload"),
+    }
+
+
 class SqlActiveStrategyAssignmentRepository:
     def __init__(self, engine: Engine):
         self.engine = engine
+
+    @staticmethod
+    def _lock_key(record: Mapping[str, Any]) -> str:
+        product_id = str(record["product_id"])
+        if record["execution_mode"] == "live":
+            return f"active-assignment-live:{product_id}"
+        return (
+            f"active-assignment:{product_id}:{record['portfolio_id']}:{record['sleeve_id']}:"
+            f"{record['strategy_version_id']}:{record['instrument_id'] or record['universe_id']}:"
+            f"{record['execution_mode']}"
+        )
+
+    @staticmethod
+    def _assert_references(connection, record: Mapping[str, Any]) -> dict[str, Any]:
+        strategy_version_id = str(record["strategy_version_id"])
+        product_id = str(record["product_id"])
+        portfolio_id = str(record["portfolio_id"])
+        if (
+            connection.execute(
+                select(strategy_version.c.id).where(strategy_version.c.id == strategy_version_id)
+            ).first()
+            is None
+        ):
+            raise CanonicalEvidenceError(f"strategy version does not exist: {strategy_version_id}")
+        artefact = _assert_canonical_artifact(connection, str(record["artefact_hash"]))
+        _assert_artefact_binding(
+            artefact,
+            strategy_version_id=strategy_version_id,
+            product_id=product_id,
+            portfolio_id=portfolio_id,
+        )
+        assigned_at = str(record["assigned_at"])
+        if assigned_at < timestamp(str(artefact["created_at"]), field="artefact.created_at"):
+            raise CanonicalEvidenceError(
+                "active assignment cannot activate before artefact creation"
+            )
+        active_until = record["active_until"]
+        if isinstance(active_until, str) and active_until <= assigned_at:
+            raise CanonicalEvidenceError("active assignment expiry must be after activation")
+        return artefact
+
+    @staticmethod
+    def _authority_rows(connection, record: Mapping[str, Any], artefact: Mapping[str, Any]):
+        account_id = str(artefact.get("account_id") or "")
+        if (
+            not account_id
+            or not artefact.get("source_commit_hash")
+            or not artefact.get("engine_version")
+        ):
+            raise CanonicalEvidenceError(
+                "live assignment artefact has incomplete authority bindings"
+            )
+        strategy_version_id = str(record["strategy_version_id"])
+        product_id = str(record["product_id"])
+        assigned_at = str(record["assigned_at"])
+        approval = (
+            connection.execute(
+                select(strategy_approval)
+                .where(
+                    strategy_approval.c.strategy_version_id == strategy_version_id,
+                    strategy_approval.c.product_id == product_id,
+                    strategy_approval.c.account_id == account_id,
+                    strategy_approval.c.approved_at <= assigned_at,
+                )
+                .order_by(
+                    strategy_approval.c.approved_at.desc(),
+                    strategy_approval.c.id.desc(),
+                )
+                .limit(1)
+            )
+            .mappings()
+            .first()
+        )
+        preflight = (
+            connection.execute(
+                select(production_preflight)
+                .where(
+                    production_preflight.c.strategy_version_id == strategy_version_id,
+                    production_preflight.c.product_id == product_id,
+                    production_preflight.c.account_id == account_id,
+                    production_preflight.c.checked_at <= assigned_at,
+                )
+                .order_by(
+                    production_preflight.c.checked_at.desc(),
+                    production_preflight.c.id.desc(),
+                )
+                .limit(1)
+            )
+            .mappings()
+            .first()
+        )
+        forward = latest_accepted_forward_summary(
+            connection.engine,
+            strategy_version_id=strategy_version_id,
+            product_id=product_id,
+            artefact_hash=str(record["artefact_hash"]),
+            at=assigned_at,
+        )
+        return approval, preflight, forward
+
+    @staticmethod
+    def _assert_live_authority(
+        connection, record: Mapping[str, Any], artefact: Mapping[str, Any]
+    ) -> None:
+        approval, preflight, forward = SqlActiveStrategyAssignmentRepository._authority_rows(
+            connection, record, artefact
+        )
+        approval_payload = (
+            approval["payload"]
+            if approval is not None and isinstance(approval["payload"], Mapping)
+            else {}
+        )
+        preflight_payload = (
+            preflight["payload"]
+            if preflight is not None and isinstance(preflight["payload"], Mapping)
+            else {}
+        )
+        forward_summary = forward["summary"] if forward is not None else None
+        forward_decision = forward["decision"] if forward is not None else None
+        instrument_id = record["instrument_id"]
+        sleeve_id = str(record["sleeve_id"])
+        exact_authority = (
+            instrument_id is not None
+            and approval_payload.get("schema") == "platform.strategy-approval/v1"
+            and preflight_payload.get("schema") == "platform.production-preflight/v1"
+            and approval_payload.get("preflight_id")
+            == (preflight["id"] if preflight is not None else None)
+            and approval_payload.get("instrument_id") == instrument_id
+            and preflight_payload.get("instrument_id") == instrument_id
+            and approval_payload.get("sleeve_id") == sleeve_id
+            and preflight_payload.get("sleeve_id") == sleeve_id
+            and approval_payload.get("environment") == preflight_payload.get("environment")
+            and approval_payload.get("environment") in {"testnet", "production"}
+            and isinstance(approval_payload.get("account_fingerprint"), str)
+            and bool(approval_payload.get("account_fingerprint"))
+            and approval_payload.get("account_fingerprint")
+            == preflight_payload.get("account_fingerprint")
+            and approval_payload.get("execution_engine_identity")
+            == preflight_payload.get("execution_engine_identity")
+            and approval_payload.get("configuration_hash")
+            == preflight_payload.get("configuration_hash")
+            and approval_payload.get("forward_summary_id")
+            == (forward_summary["id"] if forward_summary is not None else None)
+            and approval_payload.get("forward_decision_id")
+            == (forward_decision["id"] if forward_decision is not None else None)
+        )
+        if exact_authority:
+            _identity(
+                approval_payload["execution_engine_identity"],
+                field="live execution engine identity",
+            )
+            _identity(approval_payload["configuration_hash"], field="live configuration hash")
+        source_commit_hash = str(artefact.get("source_commit_hash") or "")
+        engine_version = str(artefact.get("engine_version") or "")
+        assigned_at = str(record["assigned_at"])
+        valid = (
+            approval is not None
+            and approval["status"] == "approved"
+            and approval["artefact_hash"] == record["artefact_hash"]
+            and approval["source_commit_hash"] == source_commit_hash
+            and approval["engine_version"] == engine_version
+            and _human_actor(approval["approved_by"], field="approval actor")
+            == approval["approved_by"]
+            and preflight is not None
+            and preflight["accepted"]
+            and preflight["artefact_hash"] == record["artefact_hash"]
+            and preflight["source_commit_hash"] == source_commit_hash
+            and preflight["engine_version"] == engine_version
+            and exact_authority
+            and preflight_is_fresh(str(preflight["checked_at"]), reference_at=assigned_at)
+        )
+        if not valid:
+            raise CanonicalEvidenceError(
+                "live assignment requires matching approval and fresh accepted preflight"
+            )
+        if float(record["capital_limit"]) > min(
+            float(approval["capital_cap"]), float(preflight["capital_cap"])
+        ):
+            raise CanonicalEvidenceError(
+                "live assignment exceeds approved or preflight capital cap"
+            )
+
+    @staticmethod
+    def _assert_no_live_conflict(connection, record: Mapping[str, Any]) -> None:
+        product_id = str(record["product_id"])
+        assigned_at = str(record["assigned_at"])
+        rows = (
+            connection.execute(
+                select(active_strategy_assignment)
+                .where(
+                    active_strategy_assignment.c.product_id == product_id,
+                    active_strategy_assignment.c.execution_mode == "live",
+                )
+                .order_by(
+                    active_strategy_assignment.c.assigned_at,
+                    active_strategy_assignment.c.id,
+                )
+            )
+            .mappings()
+            .all()
+        )
+        if rows and assigned_at < max(str(row["assigned_at"]) for row in rows):
+            raise CanonicalEvidenceError("live assignment cannot predate existing live authority")
+        if any(
+            row["active"] and (row["active_until"] is None or row["active_until"] > assigned_at)
+            for row in SqlActiveStrategyAssignmentRepository._current_assignment_rows(rows)
+        ):
+            raise CanonicalEvidenceError(
+                f"product {product_id} already has an active live assignment"
+            )
+
+    def _persist(self, connection, record: Mapping[str, Any], identity: str) -> str:
+        if connection.dialect.name == "postgresql":
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:assignment_key))"),
+                {"assignment_key": self._lock_key(record)},
+            )
+        existing_identity = (
+            connection.execute(
+                select(active_strategy_assignment).where(
+                    active_strategy_assignment.c.id == identity
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if existing_identity is not None:
+            return _immutable_insert(
+                connection, active_strategy_assignment, {"id": identity, **record}
+            )
+        artefact = self._assert_references(connection, record)
+        if record["execution_mode"] == "live":
+            self._assert_live_authority(connection, record, artefact)
+            self._assert_no_live_conflict(connection, record)
+        return _immutable_insert(connection, active_strategy_assignment, {"id": identity, **record})
 
     def assign(
         self,
@@ -1728,274 +2045,27 @@ class SqlActiveStrategyAssignmentRepository:
         assignment_reason: str = "unspecified",
         payload: Mapping[str, Any] | None = None,
     ) -> str:
-        if execution_mode not in {"paper", "live"}:
-            raise CanonicalEvidenceError("active assignment execution mode must be paper or live")
-        if lifecycle_state not in {
-            "registered",
-            "development",
-            "forward_paper",
-            "live_ready",
-            "live_canary",
-            "live",
-            "suspended",
-            "retired",
-        }:
-            raise CanonicalEvidenceError("active assignment lifecycle state is not supported")
-        capital_limit = _finite_nonnegative(capital_limit, field="assignment capital limit")
-        risk_budget = _finite_nonnegative(risk_budget, field="assignment risk budget")
-        product_id = str(product_id).strip()
-        portfolio_id = str(portfolio_id).strip()
-        strategy_version_id = str(strategy_version_id).strip()
-        sleeve_id = str(sleeve_id).strip()
-        if not product_id or not portfolio_id or not strategy_version_id or not sleeve_id:
-            raise CanonicalEvidenceError("active assignment binding fields cannot be empty")
-        if instrument_id is None and universe_id is None:
-            instrument_id = str((payload or {}).get("instrument_id") or "").strip() or None
-            universe_id = str((payload or {}).get("universe_id") or "").strip() or None
-        if instrument_id is None and universe_id is None:
-            universe_id = f"product:{product_id}"
-        if (instrument_id is None) == (universe_id is None):
-            raise CanonicalEvidenceError(
-                "assignment needs exactly one instrument_id or universe_id"
-            )
-        artefact_hash = _identity(artefact_hash, field="artefact_hash")
-        if not isinstance(assigned_by, str) or not assigned_by.strip():
-            raise CanonicalEvidenceError("active assignment actor must be non-empty")
-        assigned_at = timestamp(assigned_at, field="assigned_at")
-        record = {
-            "product_id": product_id,
-            "portfolio_id": portfolio_id,
-            "sleeve_id": sleeve_id,
-            "strategy_version_id": strategy_version_id,
-            "instrument_id": instrument_id,
-            "universe_id": universe_id,
-            "assignment_scope_id": (
-                f"instrument:{instrument_id}" if instrument_id else f"universe:{universe_id}"
-            ),
-            "artefact_hash": artefact_hash,
-            "lifecycle_state": lifecycle_state,
-            "execution_mode": execution_mode,
-            "capital_limit": capital_limit,
-            "risk_budget": risk_budget,
-            "assigned_at": assigned_at,
-            "active_until": (
-                timestamp(active_until, field="active_until") if active_until is not None else None
-            ),
-            "assigned_by": assigned_by,
-            "assignment_reason": non_empty(assignment_reason, field="assignment_reason"),
-            "active": True,
-            "payload": _object(payload or {}, field="assignment payload"),
-        }
+        record = _assignment_record(
+            product_id=product_id,
+            portfolio_id=portfolio_id,
+            strategy_version_id=strategy_version_id,
+            artefact_hash=artefact_hash,
+            lifecycle_state=lifecycle_state,
+            execution_mode=execution_mode,
+            capital_limit=capital_limit,
+            assigned_at=assigned_at,
+            assigned_by=assigned_by,
+            sleeve_id=sleeve_id,
+            instrument_id=instrument_id,
+            universe_id=universe_id,
+            risk_budget=risk_budget,
+            active_until=active_until,
+            assignment_reason=assignment_reason,
+            payload=payload,
+        )
         identity = _hash(record, field="active assignment")
         with self.engine.begin() as connection:
-            if connection.dialect.name == "postgresql":
-                connection.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:assignment_key))"),
-                    {
-                        "assignment_key": (
-                            f"active-assignment-live:{product_id}"
-                            if execution_mode == "live"
-                            else f"active-assignment:{product_id}:{portfolio_id}:{sleeve_id}:"
-                            f"{strategy_version_id}:{instrument_id or universe_id}:{execution_mode}"
-                        )
-                    },
-                )
-            existing_identity = (
-                connection.execute(
-                    select(active_strategy_assignment).where(
-                        active_strategy_assignment.c.id == identity
-                    )
-                )
-                .mappings()
-                .first()
-            )
-            if existing_identity is not None:
-                return _immutable_insert(
-                    connection, active_strategy_assignment, {"id": identity, **record}
-                )
-            if (
-                connection.execute(
-                    select(strategy_version.c.id).where(
-                        strategy_version.c.id == strategy_version_id
-                    )
-                ).first()
-                is None
-            ):
-                raise CanonicalEvidenceError(
-                    f"strategy version does not exist: {strategy_version_id}"
-                )
-            artefact = _assert_canonical_artifact(connection, artefact_hash)
-            _assert_artefact_binding(
-                artefact,
-                strategy_version_id=strategy_version_id,
-                product_id=product_id,
-                portfolio_id=portfolio_id,
-            )
-            artefact_created_at = timestamp(
-                str(artefact["created_at"]), field="artefact.created_at"
-            )
-            if assigned_at < artefact_created_at:
-                raise CanonicalEvidenceError(
-                    "active assignment cannot activate before artefact creation"
-                )
-            assignment_active_until = record["active_until"]
-            if isinstance(assignment_active_until, str) and assignment_active_until <= assigned_at:
-                raise CanonicalEvidenceError("active assignment expiry must be after activation")
-            if execution_mode == "live":
-                account_id = str(artefact.get("account_id") or "")
-                source_commit_hash = str(artefact.get("source_commit_hash") or "")
-                engine_version = str(artefact.get("engine_version") or "")
-                if not account_id or not source_commit_hash or not engine_version:
-                    raise CanonicalEvidenceError(
-                        "live assignment artefact has incomplete authority bindings"
-                    )
-                approval = (
-                    connection.execute(
-                        select(strategy_approval)
-                        .where(
-                            strategy_approval.c.strategy_version_id == strategy_version_id,
-                            strategy_approval.c.product_id == product_id,
-                            strategy_approval.c.account_id == account_id,
-                            strategy_approval.c.approved_at <= assigned_at,
-                        )
-                        .order_by(
-                            strategy_approval.c.approved_at.desc(),
-                            strategy_approval.c.id.desc(),
-                        )
-                        .limit(1)
-                    )
-                    .mappings()
-                    .first()
-                )
-                preflight = (
-                    connection.execute(
-                        select(production_preflight)
-                        .where(
-                            production_preflight.c.strategy_version_id == strategy_version_id,
-                            production_preflight.c.product_id == product_id,
-                            production_preflight.c.account_id == account_id,
-                            production_preflight.c.checked_at <= assigned_at,
-                        )
-                        .order_by(
-                            production_preflight.c.checked_at.desc(),
-                            production_preflight.c.id.desc(),
-                        )
-                        .limit(1)
-                    )
-                    .mappings()
-                    .first()
-                )
-                approval_payload = (
-                    approval["payload"]
-                    if approval is not None and isinstance(approval["payload"], Mapping)
-                    else {}
-                )
-                preflight_payload = (
-                    preflight["payload"]
-                    if preflight is not None and isinstance(preflight["payload"], Mapping)
-                    else {}
-                )
-                forward = latest_accepted_forward_summary(
-                    connection.engine,
-                    strategy_version_id=strategy_version_id,
-                    product_id=product_id,
-                    artefact_hash=artefact_hash,
-                    at=assigned_at,
-                )
-                forward_summary = forward["summary"] if forward is not None else None
-                forward_decision = forward["decision"] if forward is not None else None
-                exact_live_authority = (
-                    instrument_id is not None
-                    and approval_payload.get("schema") == "platform.strategy-approval/v1"
-                    and preflight_payload.get("schema") == "platform.production-preflight/v1"
-                    and approval_payload.get("preflight_id")
-                    == (preflight["id"] if preflight is not None else None)
-                    and approval_payload.get("instrument_id") == instrument_id
-                    and preflight_payload.get("instrument_id") == instrument_id
-                    and approval_payload.get("sleeve_id") == sleeve_id
-                    and preflight_payload.get("sleeve_id") == sleeve_id
-                    and approval_payload.get("environment") == preflight_payload.get("environment")
-                    and approval_payload.get("environment") in {"testnet", "production"}
-                    and isinstance(approval_payload.get("account_fingerprint"), str)
-                    and bool(approval_payload.get("account_fingerprint"))
-                    and approval_payload.get("account_fingerprint")
-                    == preflight_payload.get("account_fingerprint")
-                    and approval_payload.get("execution_engine_identity")
-                    == preflight_payload.get("execution_engine_identity")
-                    and approval_payload.get("configuration_hash")
-                    == preflight_payload.get("configuration_hash")
-                    and approval_payload.get("forward_summary_id")
-                    == (forward_summary["id"] if forward_summary is not None else None)
-                    and approval_payload.get("forward_decision_id")
-                    == (forward_decision["id"] if forward_decision is not None else None)
-                )
-                if exact_live_authority:
-                    _identity(
-                        approval_payload["execution_engine_identity"],
-                        field="live execution engine identity",
-                    )
-                    _identity(
-                        approval_payload["configuration_hash"],
-                        field="live configuration hash",
-                    )
-                if (
-                    approval is None
-                    or approval["status"] != "approved"
-                    or approval["artefact_hash"] != artefact_hash
-                    or approval["source_commit_hash"] != source_commit_hash
-                    or approval["engine_version"] != engine_version
-                    or _human_actor(approval["approved_by"], field="approval actor")
-                    != approval["approved_by"]
-                    or preflight is None
-                    or not preflight["accepted"]
-                    or preflight["artefact_hash"] != artefact_hash
-                    or preflight["source_commit_hash"] != source_commit_hash
-                    or preflight["engine_version"] != engine_version
-                    or not exact_live_authority
-                    or not preflight_is_fresh(
-                        str(preflight["checked_at"]),
-                        reference_at=assigned_at,
-                    )
-                ):
-                    raise CanonicalEvidenceError(
-                        "live assignment requires matching approval and fresh accepted preflight"
-                    )
-                if capital_limit > min(
-                    float(approval["capital_cap"]), float(preflight["capital_cap"])
-                ):
-                    raise CanonicalEvidenceError(
-                        "live assignment exceeds approved or preflight capital cap"
-                    )
-                rows = (
-                    connection.execute(
-                        select(active_strategy_assignment)
-                        .where(
-                            active_strategy_assignment.c.product_id == product_id,
-                            active_strategy_assignment.c.execution_mode == "live",
-                        )
-                        .order_by(
-                            active_strategy_assignment.c.assigned_at,
-                            active_strategy_assignment.c.id,
-                        )
-                    )
-                    .mappings()
-                    .all()
-                )
-                if rows and assigned_at < max(str(row["assigned_at"]) for row in rows):
-                    raise CanonicalEvidenceError(
-                        "live assignment cannot predate existing live authority"
-                    )
-                if any(
-                    row["active"]
-                    and (row["active_until"] is None or row["active_until"] > assigned_at)
-                    for row in self._current_assignment_rows(rows)
-                ):
-                    raise CanonicalEvidenceError(
-                        f"product {product_id} already has an active live assignment"
-                    )
-            return _immutable_insert(
-                connection, active_strategy_assignment, {"id": identity, **record}
-            )
+            return self._persist(connection, record, identity)
 
     def active(
         self,
