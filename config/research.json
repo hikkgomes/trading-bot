@@ -39,7 +39,53 @@
     "minimum_bootstrap_observations": 30,
     "bootstrap_method": "moving_block_bootstrap_v1",
     "multiple_testing_method": "bailey_lopez_de_prado_dsr_v1",
-    "pbo_method": "combinatorial_purged_pbo_v1"
+    "pbo_method": "combinatorial_purged_pbo_v1",
+    "profiles": [
+      {
+        "stage": "forward",
+        "product_id": "btc_accumulation",
+        "family": "btc_allocation",
+        "minimum_calendar_days": 90.0,
+        "minimum_cycles": 8,
+        "maximum_drawdown": 0.1,
+        "maximum_tail_loss": 0.05,
+        "allowed_holdout_degradation": 0.5
+      },
+      {
+        "stage": "forward",
+        "product_id": "active_income",
+        "family": "scalping",
+        "minimum_calendar_days": 14.0,
+        "minimum_closed_trades": 200,
+        "minimum_effective_episodes": 200,
+        "minimum_trading_days": 10,
+        "maximum_drawdown": 0.08,
+        "maximum_tail_loss": 0.05,
+        "allowed_holdout_degradation": 0.5
+      },
+      {
+        "stage": "forward",
+        "product_id": "active_income",
+        "family": "intraday",
+        "minimum_calendar_days": 30.0,
+        "minimum_closed_trades": 60,
+        "minimum_effective_episodes": 60,
+        "maximum_drawdown": 0.08,
+        "maximum_tail_loss": 0.05,
+        "allowed_holdout_degradation": 0.5
+      },
+      {
+        "stage": "forward",
+        "product_id": "active_income",
+        "family": "swing",
+        "minimum_calendar_days": 60.0,
+        "minimum_closed_trades": 20,
+        "minimum_effective_episodes": 20,
+        "maximum_drawdown": 0.08,
+        "maximum_tail_loss": 0.05,
+        "allowed_holdout_degradation": 0.5
+      }
+    ]
   },
   "holdout": {
     "protected": true,

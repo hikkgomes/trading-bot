@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
+from src.research.evidence import EvidenceProfile
+
 LINUX_SERVICES = frozenset(
     {
         "market-gateway",
@@ -489,3 +491,11 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
     }
     if any(not isinstance(value, str) or not value.strip() for value in procedures.values()):
         raise ValueError("research.evidence_policy statistical procedures must be named")
+    profiles = evidence_policy.get("profiles", [])
+    if not isinstance(profiles, list):
+        raise ValueError("research.evidence_policy.profiles must be a list")
+    try:
+        for profile in profiles:
+            EvidenceProfile.from_mapping(profile)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"research.evidence_policy.profiles is invalid: {exc}") from exc

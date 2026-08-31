@@ -166,7 +166,7 @@ def initial_forward_profile(evidence_type: str | None) -> EvidenceProfile:
     }
     days, trades, episodes, cycles = values.get(str(evidence_type or ""), (0.0, 0, 0, 0))
     return EvidenceProfile(
-        stage="forward_ready",
+        stage="forward",
         family=str(evidence_type or "*"),
         minimum_calendar_days=days,
         minimum_closed_trades=trades,
