@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -130,6 +131,14 @@ class DatabaseExecutionWorker:
             )
             if mode not in {"paper", "live"}:
                 raise ValueError(f"unsupported execution mode: {mode}")
+            if product_id == "btc_accumulation" and "balances" in canonical_inputs:
+                _validate_btc_spot_orders(
+                    orders,
+                    current=current,
+                    balances=canonical_inputs["balances"],
+                    prices=canonical_inputs["prices"],
+                    execution_costs=configuration["execution_costs"],
+                )
             venue_jobs: list[str] = []
             for order in orders:
                 if self._blocks_new_risk(product_id, order):
@@ -247,11 +256,12 @@ class DatabaseExecutionWorker:
         reconciled_positions = snapshot.get("reconciled_positions", {})
         if not isinstance(reconciled_positions, Mapping):
             raise ValueError("target snapshot has invalid reconciled positions")
-        return {
-            "targets": snapshot["targets"],
-            "prices": snapshot["prices"],
-            "reconciled_positions": reconciled_positions,
-        }
+            return {
+                "targets": snapshot["targets"],
+                "prices": snapshot["prices"],
+                "balances": snapshot.get("balances", {}),
+                "reconciled_positions": reconciled_positions,
+            }
 
     def _plan_orders(
         self,
@@ -1162,6 +1172,63 @@ def _same_order_identity(existing, planned) -> bool:
         "metadata",
     )
     return all(getattr(existing, name) == getattr(planned, name) for name in immutable_fields)
+
+
+def _validate_btc_spot_orders(
+    orders: tuple[OrderIntent, ...],
+    *,
+    current: Mapping[str, float],
+    balances: Mapping[str, Any],
+    prices: Mapping[str, float],
+    execution_costs: Mapping[str, Any],
+) -> None:
+    """Keep BTC spot orders inside owned inventory and same-cycle quote proceeds."""
+
+    if not isinstance(balances, Mapping):
+        raise ValueError("BTC spot execution requires canonical account balances")
+    if any(
+        ":spot:" not in order.instrument_id or not order.instrument_id.upper().endswith("BTCUSDT")
+        for order in orders
+    ):
+        raise ValueError("BTC accumulation orders must use BTCUSDT spot")
+    if not orders:
+        return
+    instrument_id = orders[0].instrument_id
+    owned_btc = float(current.get(instrument_id, 0.0))
+    if not math.isfinite(owned_btc) or owned_btc < -1e-12:
+        raise ValueError("BTC spot position is invalid")
+    sell_quantity = sum(order.quantity for order in orders if order.side is OrderSide.SELL)
+    if sell_quantity > owned_btc + max(1e-12, owned_btc * 1e-9):
+        raise ValueError("BTC spot sell exceeds the reconciled owned BTC position")
+    price = float(prices[instrument_id])
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("BTC spot execution price is invalid")
+    try:
+        fee_bps = float(execution_costs["fee_bps"])
+        slippage_bps = float(execution_costs["slippage_bps"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("BTC spot execution costs are invalid") from exc
+    if not all(math.isfinite(value) and value >= 0.0 for value in (fee_bps, slippage_bps)):
+        raise ValueError("BTC spot execution costs are invalid")
+    quote_asset = next(
+        (str(key).upper() for key in balances if str(key).upper() in {"USDT", "USDC", "BUSD"}),
+        "USDT",
+    )
+    quote_balance = float(balances.get(quote_asset, 0.0))
+    if not math.isfinite(quote_balance) or quote_balance < -1e-12:
+        raise ValueError("BTC spot quote balance is invalid")
+    buy_cost = sum(
+        order.quantity * price * (1.0 + slippage_bps / 10_000.0)
+        for order in orders
+        if order.side is OrderSide.BUY
+    )
+    sell_proceeds = sum(
+        order.quantity * price * max(0.0, 1.0 - slippage_bps / 10_000.0)
+        for order in orders
+        if order.side is OrderSide.SELL
+    )
+    if buy_cost > quote_balance + sell_proceeds + max(1e-12, quote_balance * 1e-9):
+        raise ValueError("BTC spot buys exceed quote balance and same-cycle sell proceeds")
 
 
 def _filled_trace(

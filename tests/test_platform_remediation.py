@@ -5,6 +5,8 @@ from sqlalchemy import select
 
 from src.data.database import PlatformDatabase, job
 from src.domain.forecasts import AlphaForecast, ForecastDirection
+from src.domain.orders import OrderSide
+from src.domain.portfolios import TargetPosition
 from src.portfolio.optimiser import PortfolioConstraints, optimise_targets
 from src.products.btc_accumulation import BtcAllocationPolicy, target_btc_allocation
 from src.research.accounting import (
@@ -36,6 +38,8 @@ from src.research.objectives import objective_passes
 from src.research.returns import PositionReturnLedger
 from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.scheduler import DatabaseJobQueue
+from src.services.order_execution import _validate_btc_spot_orders
+from src.execution.order_planner import plan_orders
 from src.strategies.behaviour import RegisteredStrategyBehaviour
 
 NOW = "2026-08-30T10:00:00+00:00"
@@ -516,6 +520,57 @@ def test_executor_derives_signed_futures_events_with_mark_to_market() -> None:
     assert accounting["unrealised_pnl"] == pytest.approx(20.0)
     assert accounting["funding_pnl"] == pytest.approx(2.0)
     assert accounting["max_leverage"] == pytest.approx(0.2)
+
+
+def test_btc_spot_execution_is_limited_to_owned_inventory_and_quote_proceeds() -> None:
+    instrument = "binance:spot:BTCUSDT"
+    target = TargetPosition(
+        portfolio_id="btc",
+        instrument_id=instrument,
+        target_quantity=0.7,
+        target_notional=70.0,
+        target_fraction=0.7,
+        strategy_contributions={"btc-risk-off": -0.3},
+        risk_budget=0.3,
+        valid_until="2026-08-30T11:00:00+00:00",
+    )
+    orders = plan_orders(
+        (target,),
+        current_quantities={instrument: 1.0},
+        decided_at=NOW,
+        prices={instrument: 100.0},
+    )
+
+    _validate_btc_spot_orders(
+        orders,
+        current={instrument: 1.0},
+        balances={"USDT": 0.0},
+        prices={instrument: 100.0},
+        execution_costs={"fee_bps": 10.0, "slippage_bps": 2.0},
+    )
+    assert orders[0].side is OrderSide.SELL
+
+    buy_target = TargetPosition(
+        **{
+            **target.__dict__,
+            "target_quantity": 1.0,
+            "target_notional": 100.0,
+        }
+    )
+    buy_orders = plan_orders(
+        (buy_target,),
+        current_quantities={instrument: 0.7},
+        decided_at=NOW,
+        prices={instrument: 100.0},
+    )
+    with pytest.raises(ValueError, match="quote balance"):
+        _validate_btc_spot_orders(
+            buy_orders,
+            current={instrument: 0.7},
+            balances={"USDT": 0.0},
+            prices={instrument: 100.0},
+            execution_costs={"fee_bps": 10.0, "slippage_bps": 2.0},
+        )
 
 
 def test_product_objective_rejects_positive_usdt_result_that_loses_btc() -> None:

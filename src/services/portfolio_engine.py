@@ -262,6 +262,7 @@ class DatabasePortfolioTargetBuilder:
                 "target_position_ids": list(target_ids),
                 "targets": [to_primitive(item) for item in targets],
                 "prices": prices,
+                "balances": balances,
                 "reconciled_positions": current_positions,
                 "scopes": target_scopes,
             },
