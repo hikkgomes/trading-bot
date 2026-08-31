@@ -76,6 +76,21 @@ def candidate_path_for_product(
 
 
 def _strict_json_object(path: Path, *, label: str) -> dict[str, Any]:
+    _assert_strict_json_path(path, label=label)
+    try:
+        payload = _read_strict_json(path, label=label)
+    except CandidateActivationError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise CandidateActivationError(
+            f"{label} must be readable valid JSON: {path}: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise CandidateActivationError(f"{label} must contain a JSON object: {path}")
+    return payload
+
+
+def _assert_strict_json_path(path: Path, *, label: str) -> None:
     if path.is_symlink():
         raise CandidateActivationError(f"{label} must not be a symlink: {path}")
     if not path.exists():
@@ -83,6 +98,8 @@ def _strict_json_object(path: Path, *, label: str) -> dict[str, Any]:
     if not path.is_file():
         raise CandidateActivationError(f"{label} must be a regular file: {path}")
 
+
+def _read_strict_json(path: Path, *, label: str) -> Any:
     def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         for key, value in pairs:
@@ -98,21 +115,11 @@ def _strict_json_object(path: Path, *, label: str) -> dict[str, Any]:
             f"{label} must use strict JSON; invalid constant {value!r}: {path}"
         )
 
-    try:
-        payload = json.loads(
-            path.read_text(encoding="utf-8"),
-            object_pairs_hook=reject_duplicate_keys,
-            parse_constant=reject_constant,
-        )
-    except CandidateActivationError:
-        raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise CandidateActivationError(
-            f"{label} must be readable valid JSON: {path}: {type(exc).__name__}: {exc}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise CandidateActivationError(f"{label} must contain a JSON object: {path}")
-    return payload
+    return json.loads(
+        path.read_text(encoding="utf-8"),
+        object_pairs_hook=reject_duplicate_keys,
+        parse_constant=reject_constant,
+    )
 
 
 def _assert_path_shape(path: Path, *, label: str, suffix: str) -> None:
@@ -278,17 +285,12 @@ def activate_candidate(
         ) from exc
 
 
-def _activate_candidate_locked(
-    *,
+def _activation_paths(
     config: AutopilotConfig,
     product: ProductConfig,
     config_path: Path,
     candidate_dir: Path,
-    expected_candidate_digest: str,
-    operator: str | None,
-) -> dict[str, Any]:
-    """Run every mutable activation check while holding the runtime lock."""
-
+) -> tuple[Path, Path, Path]:
     candidate_path = candidate_path_for_product(product.name, candidate_dir=candidate_dir)
     active_path = product.strategies_path
     audit_path = config.control_audit_file
@@ -304,7 +306,10 @@ def _activate_candidate_locked(
     for label, (path, suffix) in path_specs.items():
         _assert_path_shape(path, label=label, suffix=suffix)
     _assert_distinct_paths({label: path for label, (path, _) in path_specs.items()})
+    return candidate_path, active_path, audit_path
 
+
+def _assert_activation_control(config: AutopilotConfig, product: ProductConfig) -> None:
     control = load_control(config.control_file)
     if control.get("control_error"):
         raise CandidateActivationError(
@@ -317,6 +322,12 @@ def _activate_candidate_locked(
             f"{product.name} still has a flatten request; reconcile it before activation"
         )
 
+
+def _load_activation_candidate(
+    product: ProductConfig,
+    candidate_path: Path,
+    expected_candidate_digest: str,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
     _load_flat_state(product.state_file, product_name=product.name)
     candidate = _strict_json_object(candidate_path, label=f"{product.name} candidate")
     candidate_digest = artifact_digest(candidate)
@@ -325,12 +336,11 @@ def _activate_candidate_locked(
             f"{product.name} candidate changed after review: expected "
             f"{expected_candidate_digest}, current {candidate_digest}"
         )
-    identity = candidate.get("product")
     expected_identity = product_identity(product)
-    if identity != expected_identity:
+    if candidate.get("product") != expected_identity:
         raise CandidateActivationError(
             f"{product.name} candidate product identity mismatch: "
-            f"expected {expected_identity!r}, got {identity!r}"
+            f"expected {expected_identity!r}, got {candidate.get('product')!r}"
         )
     try:
         assert_loaded_strategy_artifact_allowed(
@@ -341,9 +351,18 @@ def _activate_candidate_locked(
         )
     except StrategyPolicyError as exc:
         raise CandidateActivationError(str(exc)) from exc
+    return candidate, candidate_digest, expected_identity
 
+
+def _forward_paper_binding(
+    config: AutopilotConfig,
+    product: ProductConfig,
+    config_path: Path,
+    candidate_path: Path,
+    candidate_digest: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     candidate_trade_log = candidate_path.parent / f"{product.name}_paper_trades.csv"
-    forward_review = build_promotion_review(
+    review = build_promotion_review(
         artifact_path=candidate_path,
         trade_log=candidate_trade_log,
         ledger_path=config.approval_ledger,
@@ -358,38 +377,69 @@ def _activate_candidate_locked(
             "recommendation": item.get("recommendation"),
             "reasons": item.get("reasons") or [],
         }
-        for item in forward_review.get("strategies", [])
+        for item in review.get("strategies", [])
         if item.get("recommendation") not in {"needs_approval", "already_approved"}
     ]
-    if not forward_review.get("strategies") or not_ready:
+    if not review.get("strategies") or not_ready:
         raise CandidateActivationError(
             f"{product.name} candidate exact-bound forward-paper evidence is not ready; "
             f"review {candidate_path.parent / f'{product.name}_promotion_review.md'}: "
             f"{not_ready or 'no strategy evidence'}"
         )
-    forward_execution_binding = forward_review.get("candidate_paper_execution_binding")
-    if not isinstance(forward_execution_binding, dict) or (
-        forward_execution_binding.get("required") is not True
-        or forward_execution_binding.get("artifact_digest") != candidate_digest
-        or not forward_execution_binding.get("execution_schema")
-        or not forward_execution_binding.get("execution_engine_digest")
+    binding = review.get("candidate_paper_execution_binding")
+    if not isinstance(binding, dict) or (
+        binding.get("required") is not True
+        or binding.get("artifact_digest") != candidate_digest
+        or not binding.get("execution_schema")
+        or not binding.get("execution_engine_digest")
     ):
         raise CandidateActivationError(
             f"{product.name} candidate forward-paper execution binding is missing or invalid"
         )
+    return review, binding
 
-    old_digest: str | None = None
-    if active_path.exists():
-        active = _strict_json_object(active_path, label=f"{product.name} active artifact")
-        old_digest = artifact_digest(active)
-        prior_activation = active.get("candidate_activation")
-        if (
-            isinstance(prior_activation, dict)
-            and prior_activation.get("candidate_artifact_digest") == candidate_digest
-        ):
-            raise CandidateActivationError(
-                f"{product.name} candidate is already the source of the active artifact"
-            )
+
+def _existing_active_digest(
+    active_path: Path, product: ProductConfig, candidate_digest: str
+) -> str | None:
+    if not active_path.exists():
+        return None
+    active = _strict_json_object(active_path, label=f"{product.name} active artifact")
+    old_digest = artifact_digest(active)
+    prior_activation = active.get("candidate_activation")
+    if (
+        isinstance(prior_activation, dict)
+        and prior_activation.get("candidate_artifact_digest") == candidate_digest
+    ):
+        raise CandidateActivationError(
+            f"{product.name} candidate is already the source of the active artifact"
+        )
+    return old_digest
+
+
+def _activate_candidate_locked(
+    *,
+    config: AutopilotConfig,
+    product: ProductConfig,
+    config_path: Path,
+    candidate_dir: Path,
+    expected_candidate_digest: str,
+    operator: str | None,
+) -> dict[str, Any]:
+    """Run every mutable activation check while holding the runtime lock."""
+
+    candidate_path, active_path, audit_path = _activation_paths(
+        config, product, config_path, candidate_dir
+    )
+    _assert_activation_control(config, product)
+    candidate, candidate_digest, expected_identity = _load_activation_candidate(
+        product, candidate_path, expected_candidate_digest
+    )
+    forward_review, forward_execution_binding = _forward_paper_binding(
+        config, product, config_path, candidate_path, candidate_digest
+    )
+    candidate_trade_log = candidate_path.parent / f"{product.name}_paper_trades.csv"
+    old_digest = _existing_active_digest(active_path, product, candidate_digest)
 
     _validate_audit_log(audit_path)
     actor = _operator(operator)
