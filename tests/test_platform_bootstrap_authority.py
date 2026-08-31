@@ -275,12 +275,51 @@ def test_platform_smoke_runs_after_bootstrap(tmp_path: Path) -> None:
         accounts=accounts,
     ).reconcile_once(now=smoke_now)
 
+    first_products = [
+        {
+            **dict(product),
+            "product_id": f"{product['product_id']}:smoke:first",
+            "product_family": str(product["product_id"]),
+            "portfolio_id": f"{product['portfolio_id']}:smoke:first",
+        }
+        for product in configuration["products"]["products"]
+    ]
     results = [
-        _product_fixture(database, dict(product), accounts, tmp_path, index)
-        for index, product in enumerate(configuration["products"]["products"])
+        _product_fixture(
+            database,
+            dict(product),
+            accounts,
+            tmp_path,
+            index,
+            run_id="first-run",
+            observed=dt.datetime(2026, 8, 23, tzinfo=dt.UTC),
+        )
+        for index, product in enumerate(first_products)
+    ]
+    second_products = [
+        {
+            **dict(product),
+            "product_id": f"{product['product_id']}:smoke:second",
+            "product_family": str(product["product_id"]),
+            "portfolio_id": f"{product['portfolio_id']}:smoke:second",
+        }
+        for product in configuration["products"]["products"]
+    ]
+    repeated_results = [
+        _product_fixture(
+            database,
+            dict(product),
+            accounts,
+            tmp_path,
+            index,
+            run_id="second-run",
+            observed=dt.datetime(2026, 8, 24, tzinfo=dt.UTC),
+        )
+        for index, product in enumerate(second_products)
     ]
 
     assert all(result["ok"] for result in results), results
+    assert all(result["ok"] for result in repeated_results), repeated_results
 
 
 def test_bootstrap_diagnostic_paper_round_trip_is_automatic(tmp_path: Path) -> None:

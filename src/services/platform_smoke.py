@@ -6,6 +6,8 @@ import argparse
 import datetime as dt
 import json
 import tempfile
+import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -87,11 +89,28 @@ def run_smoke(
     split = load_split_configuration(config_path.parent)
     accounts = {str(item["account_id"]): dict(item) for item in split["accounts"]["accounts"]}
     results: list[dict[str, Any]] = []
+    run_id = uuid.uuid4().hex
     try:
         with tempfile.TemporaryDirectory(prefix="platform-smoke-") as directory:
+            observed = dt.datetime.now(dt.UTC).replace(microsecond=0)
             for index, product in enumerate(split["products"]["products"]):
+                configured_product_id = str(product["product_id"])
+                smoke_product = {
+                    **dict(product),
+                    "product_id": f"{configured_product_id}:smoke:{run_id}",
+                    "product_family": configured_product_id,
+                    "portfolio_id": f"{product['portfolio_id']}:smoke:{run_id}",
+                }
                 results.append(
-                    _product_fixture(database, dict(product), accounts, Path(directory), index)
+                    _product_fixture(
+                        database,
+                        smoke_product,
+                        accounts,
+                        Path(directory),
+                        index,
+                        run_id=run_id,
+                        observed=observed,
+                    )
                 )
     finally:
         database.dispose()
@@ -109,15 +128,19 @@ def _product_fixture(
     accounts: dict[str, dict[str, Any]],
     root: Path,
     index: int,
+    *,
+    run_id: str = "fixture",
+    observed: dt.datetime | None = None,
 ) -> dict[str, Any]:
     product_id = str(product["product_id"])
     product = {
         **product,
         "risk_policy_id": f"platform-smoke:{product_id}:risk-v1",
     }
-    observed = dt.datetime(2026, 8, 23, tzinfo=dt.UTC)
+    observed = observed or dt.datetime(2026, 8, 23, tzinfo=dt.UTC)
     now = observed.isoformat()
-    market = "spot" if product_id == "btc_accumulation" else "futures"
+    product_family = str(product.get("product_family") or product_id)
+    market = "spot" if product_family == "btc_accumulation" else "futures"
     instrument = Instrument(
         venue="binance",
         market_type=MarketType.SPOT if market == "spot" else MarketType.FUTURES,
@@ -130,7 +153,7 @@ def _product_fixture(
         minimum_quantity=0.000001,
         minimum_notional=5.0,
     )
-    prefix = f"smoke:{product_id}:{index}"
+    prefix = f"smoke:{run_id}:{product_id}:{index}"
     queue = DatabaseJobQueue(database.engine)
     workers_ids = {
         name: f"{prefix}:{name}"
@@ -211,49 +234,59 @@ def _product_fixture(
             },
         },
     )
+    event = _stamp_smoke_event(event, run_id)
     market_events = [
         event,
-        normalise_public_event(
-            market=market,
-            stream="btcusdt@bookTicker",
-            receive_timestamp=now,
-            payload={
-                "e": "bookTicker",
-                "E": close_ms + 1,
-                "s": "BTCUSDT",
-                "b": "101999",
-                "B": "10000",
-                "a": "102001",
-                "A": "10000",
-            },
+        _stamp_smoke_event(
+            normalise_public_event(
+                market=market,
+                stream="btcusdt@bookTicker",
+                receive_timestamp=now,
+                payload={
+                    "e": "bookTicker",
+                    "E": close_ms + 1,
+                    "s": "BTCUSDT",
+                    "b": "101999",
+                    "B": "10000",
+                    "a": "102001",
+                    "A": "10000",
+                },
+            ),
+            run_id,
         ),
-        normalise_public_event(
-            market=market,
-            stream="btcusdt@trade",
-            receive_timestamp=now,
-            payload={
-                "e": "trade",
-                "E": close_ms + 2,
-                "s": "BTCUSDT",
-                "p": "102000",
-                "q": "25",
-            },
+        _stamp_smoke_event(
+            normalise_public_event(
+                market=market,
+                stream="btcusdt@trade",
+                receive_timestamp=now,
+                payload={
+                    "e": "trade",
+                    "E": close_ms + 2,
+                    "s": "BTCUSDT",
+                    "p": "102000",
+                    "q": "25",
+                },
+            ),
+            run_id,
         ),
     ]
     if market == "futures":
         market_events.append(
-            normalise_public_event(
-                market=market,
-                stream="btcusdt@markPrice@1s",
-                receive_timestamp=now,
-                payload={
-                    "e": "markPriceUpdate",
-                    "E": close_ms + 3,
-                    "s": "BTCUSDT",
-                    "p": "102000",
-                    "r": "0.0001",
-                    "T": close_ms + 3,
-                },
+            _stamp_smoke_event(
+                normalise_public_event(
+                    market=market,
+                    stream="btcusdt@markPrice@1s",
+                    receive_timestamp=now,
+                    payload={
+                        "e": "markPriceUpdate",
+                        "E": close_ms + 3,
+                        "s": "BTCUSDT",
+                        "p": "102000",
+                        "r": "0.0001",
+                        "T": close_ms + 3,
+                    },
+                ),
+                run_id,
             )
         )
     for index, market_event in enumerate(market_events):
@@ -294,7 +327,7 @@ def _product_fixture(
             "observed_at": now,
             "balances": (
                 {"BTC": 0.01, "USDT": 1000.0}
-                if product_id == "btc_accumulation"
+                if product_family == "btc_accumulation"
                 else {"USDT": 10000.0}
             ),
         },
@@ -456,7 +489,10 @@ def _product_fixture(
         worker_id=workers_ids["accounting"],
         service=accounting_service,
     ).run_once(now=now)
-    assessment = risk_store.assessment(str(results["risk"].get("assessment_id", "")))
+    assessment_id = str(results["risk"].get("assessment_id", ""))
+    if not assessment_id:
+        raise RuntimeError(f"{product_id} smoke did not produce a risk assessment: {results}")
+    assessment = risk_store.assessment(assessment_id)
     fee_entry_id = str(accounting.get("record_id", ""))
     with database.engine.connect() as connection:
         accounting_entries = int(
@@ -667,6 +703,19 @@ def _seed_strategy(
         assignment_reason="real service-chain smoke",
         instrument_id=instrument.instrument_id,
         payload={"instrument_ids": [instrument.instrument_id]},
+    )
+
+
+def _stamp_smoke_event(event, run_id: str):
+    raw_payload = event.payload.get("data")
+    if not isinstance(raw_payload, dict):
+        raise ValueError("platform smoke event has no raw payload")
+    return replace(
+        event,
+        payload={
+            **event.payload,
+            "data": {**raw_payload, "_platform_smoke_run_id": run_id},
+        },
     )
 
 

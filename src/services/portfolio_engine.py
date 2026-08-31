@@ -73,6 +73,7 @@ class DatabasePortfolioTargetBuilder:
             kind="canonical_portfolio_risk_state", product_id=product_id, at=evaluated_at
         )
         clean = _canonical_portfolio_state(state, product_id=product_id)
+        product_family = str(product.get("product_family") or product_id)
         maximum_age = float(clean["maximum_state_age_seconds"])
         observed_at = dt.datetime.fromisoformat(str(clean["observed_at"]))
         evaluated = dt.datetime.fromisoformat(evaluated_at)
@@ -83,7 +84,7 @@ class DatabasePortfolioTargetBuilder:
         balances = {str(key): float(value) for key, value in clean["balances"].items()}
         current_positions = {str(key): float(value) for key, value in clean["positions"].items()}
         market = {str(key): dict(value) for key, value in clean["market"].items()}
-        if product_id == "active_income" and clean["risk_data_available"] is not True:
+        if product_family == "active_income" and clean["risk_data_available"] is not True:
             missing = ", ".join(str(value) for value in clean["risk_data_missing"])
             raise ValueError(f"risk measurements are unavailable: {missing or 'unknown'}")
         missing_market = sorted({item.instrument_id for item in forecasts} - set(market))
@@ -93,7 +94,7 @@ class DatabasePortfolioTargetBuilder:
         if any(value <= 0 for value in prices.values()):
             raise ValueError("canonical market prices must be positive")
         portfolio_id = str(product["portfolio_id"])
-        if product_id == "btc_accumulation":
+        if product_family == "btc_accumulation":
             btc_instrument = seed.instrument_id
             btc_price = prices[btc_instrument]
             btc_equity = balances.get("BTC", 0.0) + balances.get("USDT", 0.0) / btc_price
