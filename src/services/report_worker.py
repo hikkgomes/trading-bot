@@ -24,8 +24,14 @@ class DatabaseReportWorker:
         queue: DatabaseJobQueue | None = None,
         worker_id: str | None = None,
         lease_seconds: int = 60,
+        account_stale_after_seconds: int = 60,
+        market_data_stale_after_seconds: int = 5,
     ) -> None:
-        self.report = DatabasePlatformReport(engine)
+        self.report = DatabasePlatformReport(
+            engine,
+            account_stale_after_seconds=account_stale_after_seconds,
+            market_data_stale_after_seconds=market_data_stale_after_seconds,
+        )
         self.root = root.resolve()
         self.queue = queue
         self.worker_id = worker_id
@@ -45,7 +51,7 @@ class DatabaseReportWorker:
             )
             if claimed is None:
                 return {"reason_code": "report_queue_empty"}
-        report = {**self.report.build(), "generated_at": now}
+        report = {**self.report.build(now=now), "generated_at": now}
         report_hash = canonical_hash(report)
         date = now[:10]
         destination = self.root / date / f"{report_hash.removeprefix('sha256:')}.json"
