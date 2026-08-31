@@ -40,10 +40,7 @@ def _resolve_settings_path(value: str | Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-def load_alert_settings_file(path: Path) -> dict[str, str]:
-    """Load an owner-private file containing only alert-routing assignments."""
-
-    path = _resolve_settings_path(path)
+def _read_alert_settings_lines(path: Path) -> list[str]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -72,7 +69,10 @@ def load_alert_settings_file(path: Path) -> dict[str, str]:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+    return lines
 
+
+def _parse_alert_settings_lines(path: Path, lines: list[str]) -> dict[str, str]:
     values: dict[str, str] = {}
     for line_number, raw_line in enumerate(lines, start=1):
         line = raw_line.strip()
@@ -98,6 +98,14 @@ def load_alert_settings_file(path: Path) -> dict[str, str]:
             )
         values[key] = parse_env_value(raw_value)
     return values
+
+
+def load_alert_settings_file(path: Path) -> dict[str, str]:
+    """Load an owner-private file containing only alert-routing assignments."""
+
+    path = _resolve_settings_path(path)
+    lines = _read_alert_settings_lines(path)
+    return _parse_alert_settings_lines(path, lines)
 
 
 def alert_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
