@@ -202,6 +202,8 @@ class ApprovedLiveExecution:
         order_created_at = timestamp(order.created_at, field="order.created_at")
         if authority_at < order_created_at:
             raise PermissionError("live order cannot be authorised before it was created")
+        if authority_at >= order.valid_until:
+            raise PermissionError("live order intent has expired")
         with self.engine.connect() as connection:
             account_row = (
                 connection.execute(

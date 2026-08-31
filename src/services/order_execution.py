@@ -332,6 +332,19 @@ class DatabaseLiveExecutionWorker:
                 raise ValueError(
                     f"live order is not in the durable pre-submission state: {order.status.value}"
                 )
+            if now >= order.valid_until:
+                self.order_manager.transition(
+                    order.order_id,
+                    OrderStatus.EXPIRED,
+                    event_at=now,
+                )
+                self.queue.complete(claimed, completed_at=now)
+                return {
+                    "reason_code": "live_order_expired",
+                    "job_id": claimed.job_id,
+                    "order_id": order.order_id,
+                    "valid_until": order.valid_until,
+                }
             if order.depends_on_order_id is not None:
                 dependency = self.order_manager.get(order.depends_on_order_id)
                 if dependency.status is not OrderStatus.FILLED:

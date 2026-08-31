@@ -123,6 +123,7 @@ def bounded_client_order_id(intent: OrderIntent) -> str:
     """Create a deterministic venue-safe ID from the complete intent identity."""
 
     material = (
-        f"{intent.order_id}|{intent.instrument_id}|{intent.created_at}|{intent.quantity:.12f}"
+        f"{intent.order_id}|{intent.instrument_id}|{intent.created_at}|{intent.valid_until}|"
+        f"{intent.quantity:.12f}"
     )
     return "c" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:35]

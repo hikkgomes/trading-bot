@@ -20,7 +20,9 @@ from src.domain.orders import Fill, OrderIntent, OrderSide, OrderStatus, OrderTy
 _ALLOWED_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
     OrderStatus.CREATED: frozenset({OrderStatus.VALIDATED, OrderStatus.REJECTED}),
     OrderStatus.VALIDATED: frozenset({OrderStatus.PERSISTED, OrderStatus.REJECTED}),
-    OrderStatus.PERSISTED: frozenset({OrderStatus.SUBMITTED, OrderStatus.RECOVERY_REQUIRED}),
+    OrderStatus.PERSISTED: frozenset(
+        {OrderStatus.SUBMITTED, OrderStatus.RECOVERY_REQUIRED, OrderStatus.EXPIRED}
+    ),
     OrderStatus.SUBMITTED: frozenset(
         {
             OrderStatus.ACKNOWLEDGED,

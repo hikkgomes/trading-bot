@@ -58,6 +58,7 @@ def _intent(
         order_type=order_type,
         limit_price=limit_price,
         created_at=decided_at,
+        valid_until=target.valid_until,
         reduce_only=reduce_only,
         depends_on_order_id=depends_on_order_id,
         strategy_contributions=target.strategy_contributions,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -50,6 +51,18 @@ def _normalise_order_identity(intent: OrderIntent) -> None:
     if intent.quantity == 0:
         raise ValueError("quantity must be positive")
     object.__setattr__(intent, "created_at", timestamp(intent.created_at, field="created_at"))
+
+
+def _normalise_order_validity(intent: OrderIntent) -> None:
+    created = dt.datetime.fromisoformat(intent.created_at)
+    valid_until = intent.valid_until
+    if valid_until is None:
+        valid_until = (created + dt.timedelta(minutes=5)).replace(microsecond=0).isoformat()
+    else:
+        valid_until = timestamp(valid_until, field="valid_until")
+    if dt.datetime.fromisoformat(valid_until) <= created:
+        raise ValueError("valid_until must be after created_at")
+    object.__setattr__(intent, "valid_until", valid_until)
 
 
 def _normalise_order_prices(intent: OrderIntent) -> None:
@@ -117,6 +130,7 @@ class OrderIntent:
     quantity: float
     order_type: OrderType
     created_at: str
+    valid_until: str | None = None
     limit_price: float | None = None
     reduce_only: bool = False
     depends_on_order_id: str | None = None
@@ -130,6 +144,7 @@ class OrderIntent:
 
     def __post_init__(self) -> None:
         _normalise_order_identity(self)
+        _normalise_order_validity(self)
         _normalise_order_prices(self)
         _normalise_order_fills(self)
         _normalise_order_links(self)
