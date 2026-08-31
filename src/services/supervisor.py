@@ -304,64 +304,27 @@ def _execution_cycle(
         str(account["account_id"]): str(account["products"][0])
         for account in configuration["accounts"]["accounts"]
     }
-    live_worker = None
-    recovery_worker = None
-    emergency_worker = None
-    protective_service = None
-    live_product_ids: frozenset[str] = frozenset()
-    approved_live = None
-    if any(product["execution_mode"] == "live" for product in products.values()):
-        approved_live = ApprovedLiveExecution(
-            engine=database.engine,
-            configuration=configuration,
-            order_manager=order_manager,
-            positions=positions,
-        )
-        live_product_ids = frozenset(approved_live.venues)
-        protective_service = LiveProtectiveStopService(
-            stop_manager=StopManager(SqlStopStore(database.engine)),
-            venues=approved_live.venues,
-            products=products,
-            accounts=approved_live.accounts,
-            queue=queue,
-            order_manager=order_manager,
-            positions=positions,
-            alerts=alerts,
-        )
-        live_worker = DatabaseLiveExecutionWorker(
-            queue=queue,
-            worker_id=worker_id,
-            order_manager=order_manager,
-            positions=positions,
-            ledgers={
-                product_id: execution_ledgers[product_id]
-                for product_id, product in products.items()
-                if product["execution_mode"] == "live"
-            },
-            trace_store=traces,
-            venues=approved_live.venues,
-            authorise=approved_live.authorise,
-            order_groups=order_groups,
-            prepare_protective_stop=protective_service.prepare_entry,
-            control_plane=control_plane,
-        )
-        emergency_worker = DatabaseEmergencyFlattenWorker(
-            queue=queue,
-            worker_id=worker_id,
-            order_manager=order_manager,
-            positions=positions,
-            venues=approved_live.venues,
-            products=products,
-            alerts=alerts,
-        )
-        recovery_worker = DatabaseLiveRecoveryWorker(
-            queue=queue,
-            worker_id=worker_id,
-            store=SqlRecoveryStore(database.engine),
-            reconcile_product=approved_live.reconcile,
-            account_products=account_products,
-            execute_action=approved_live.recover_action,
-        )
+    live_components = _live_execution_components(
+        database=database,
+        configuration=configuration,
+        products=products,
+        order_manager=order_manager,
+        positions=positions,
+        order_groups=order_groups,
+        queue=queue,
+        worker_id=worker_id,
+        ledgers=execution_ledgers,
+        traces=traces,
+        account_products=account_products,
+        alerts=alerts,
+        control_plane=control_plane,
+    )
+    live_worker = live_components["live_worker"]
+    recovery_worker = live_components["recovery_worker"]
+    emergency_worker = live_components["emergency_worker"]
+    protective_service = live_components["protective_service"]
+    live_product_ids = live_components["live_product_ids"]
+    approved_live = live_components["approved_live"]
 
     def on_live_fill(product_id: str, order, quantity: float, at: str) -> object:
         if protective_service is None or product_id not in live_product_ids:
@@ -388,40 +351,145 @@ def _execution_cycle(
     )
 
     def run_once() -> dict[str, Any]:
-        now = utc_now()
-        if emergency_worker is not None:
-            result = emergency_worker.run_once(now=now)
-            if result["reason_code"] != "emergency_queue_empty":
-                return result
-        result = worker.run_once(now=now)
-        if result["reason_code"] != "execution_queue_empty":
-            return result
-        if live_worker is not None:
-            result = live_worker.run_once(now=now)
-            if result["reason_code"] != "live_order_queue_empty":
-                return result
-        result = user_stream_worker.run_once(now=now)
-        if result["reason_code"] != "user_stream_queue_empty":
-            return result
-        if recovery_worker is not None:
-            result = recovery_worker.run_once(now=now)
-            if result["reason_code"] != "live_recovery_queue_empty":
-                return result
-        if protective_service is not None and approved_live is not None:
-            reconciled = {
-                product_id: protective_service.reconcile(product_id, now)
-                for product_id in sorted(approved_live.venues)
-            }
-            if any(reconciled.values()):
-                return {
-                    "reason_code": "protective_stops_reconciled",
-                    "stops": {
-                        product_id: list(results) for product_id, results in reconciled.items()
-                    },
-                }
-        return result
+        return _execution_run_once(
+            worker=worker,
+            user_stream_worker=user_stream_worker,
+            emergency_worker=emergency_worker,
+            live_worker=live_worker,
+            recovery_worker=recovery_worker,
+            protective_service=protective_service,
+            approved_live=approved_live,
+        )
 
     return run_once
+
+
+def _live_execution_components(
+    *,
+    database: PlatformDatabase,
+    configuration: Mapping[str, Mapping[str, Any]],
+    products: Mapping[str, Mapping[str, Any]],
+    order_manager: OrderManager,
+    positions: PositionManager,
+    order_groups: OrderGroupManager,
+    queue: DatabaseJobQueue,
+    worker_id: str,
+    ledgers: Mapping[str, Ledger],
+    traces: SqlDecisionTraceStore,
+    account_products: Mapping[str, str],
+    alerts: SqlAlertService | None,
+    control_plane: DatabaseControlPlane,
+) -> dict[str, Any]:
+    empty = {
+        "live_worker": None,
+        "recovery_worker": None,
+        "emergency_worker": None,
+        "protective_service": None,
+        "live_product_ids": frozenset(),
+        "approved_live": None,
+    }
+    if not any(product["execution_mode"] == "live" for product in products.values()):
+        return empty
+    approved_live = ApprovedLiveExecution(
+        engine=database.engine,
+        configuration=configuration,
+        order_manager=order_manager,
+        positions=positions,
+    )
+    live_product_ids = frozenset(approved_live.venues)
+    protective_service = LiveProtectiveStopService(
+        stop_manager=StopManager(SqlStopStore(database.engine)),
+        venues=approved_live.venues,
+        products=products,
+        accounts=approved_live.accounts,
+        queue=queue,
+        order_manager=order_manager,
+        positions=positions,
+        alerts=alerts,
+    )
+    live_worker = DatabaseLiveExecutionWorker(
+        queue=queue,
+        worker_id=worker_id,
+        order_manager=order_manager,
+        positions=positions,
+        ledgers={
+            product_id: ledgers[product_id]
+            for product_id, product in products.items()
+            if product["execution_mode"] == "live"
+        },
+        trace_store=traces,
+        venues=approved_live.venues,
+        authorise=approved_live.authorise,
+        order_groups=order_groups,
+        prepare_protective_stop=protective_service.prepare_entry,
+        control_plane=control_plane,
+    )
+    emergency_worker = DatabaseEmergencyFlattenWorker(
+        queue=queue,
+        worker_id=worker_id,
+        order_manager=order_manager,
+        positions=positions,
+        venues=approved_live.venues,
+        products=products,
+        alerts=alerts,
+    )
+    recovery_worker = DatabaseLiveRecoveryWorker(
+        queue=queue,
+        worker_id=worker_id,
+        store=SqlRecoveryStore(database.engine),
+        reconcile_product=approved_live.reconcile,
+        account_products=account_products,
+        execute_action=approved_live.recover_action,
+    )
+    return {
+        "live_worker": live_worker,
+        "recovery_worker": recovery_worker,
+        "emergency_worker": emergency_worker,
+        "protective_service": protective_service,
+        "live_product_ids": live_product_ids,
+        "approved_live": approved_live,
+    }
+
+
+def _execution_run_once(
+    *,
+    worker: DatabaseExecutionWorker,
+    user_stream_worker: DatabaseUserStreamWorker,
+    emergency_worker: Any,
+    live_worker: Any,
+    recovery_worker: Any,
+    protective_service: Any,
+    approved_live: Any,
+) -> dict[str, Any]:
+    now = utc_now()
+    result = {"reason_code": "execution_queue_empty"}
+    for candidate, empty_reason in (
+        (emergency_worker, "emergency_queue_empty"),
+        (worker, "execution_queue_empty"),
+        (live_worker, "live_order_queue_empty"),
+        (user_stream_worker, "user_stream_queue_empty"),
+        (recovery_worker, "live_recovery_queue_empty"),
+    ):
+        result = _run_worker_or_empty(candidate, now=now, empty_reason=empty_reason)
+        if result["reason_code"] != empty_reason:
+            return result
+    if protective_service is not None and approved_live is not None:
+        reconciled = {
+            product_id: protective_service.reconcile(product_id, now)
+            for product_id in sorted(approved_live.venues)
+        }
+        if any(reconciled.values()):
+            return {
+                "reason_code": "protective_stops_reconciled",
+                "stops": {product_id: list(results) for product_id, results in reconciled.items()},
+            }
+    return result
+
+
+def _run_worker_or_empty(worker: Any, *, now: str, empty_reason: str) -> dict[str, Any]:
+    if worker is None:
+        return {"reason_code": empty_reason}
+    return worker.run_once(now=now)
 
 
 def _paper_cycle(
@@ -1065,12 +1133,12 @@ def _agent_cycle(
     return lambda: worker.run_once(now=utc_now())
 
 
-def run(args: argparse.Namespace) -> int:
-    config = load_platform_config(args.config)
-    split_configuration = load_split_configuration(args.config.parent)
-    config.assert_service_assignment(node_id=args.node, service=args.service)
-    if args.validate:
-        return 0
+def _initialise_service(
+    args: argparse.Namespace,
+    *,
+    config: Any,
+    split: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
     database = PlatformDatabase(config.database_url())
     if not database.is_postgresql:
         raise ValueError("platform services require PostgreSQL")
@@ -1078,7 +1146,7 @@ def run(args: argparse.Namespace) -> int:
         database.migrate()
         PlatformBootstrap(
             engine=database.engine,
-            configuration=split_configuration,
+            configuration=split,
             node_id=args.node,
         ).ensure(now=utc_now())
     else:
@@ -1088,7 +1156,7 @@ def run(args: argparse.Namespace) -> int:
     control_plane = DatabaseControlPlane(
         database.engine,
         heartbeat_store,
-        configuration=split_configuration,
+        configuration=split,
         alerts=alerts,
     )
     runtime = ServiceRuntime(
@@ -1097,172 +1165,209 @@ def run(args: argparse.Namespace) -> int:
         service_name=args.service,
         heartbeat_store=heartbeat_store,
     )
-    if args.service == "market-gateway":
-        work = _market_gateway_cycle(
+    return {
+        "config": config,
+        "split": split,
+        "database": database,
+        "heartbeat_store": heartbeat_store,
+        "alerts": alerts,
+        "control_plane": control_plane,
+        "runtime": runtime,
+    }
+
+
+def _service_work(args: argparse.Namespace, context: Mapping[str, Any]) -> Callable[[], Any] | Any:
+    database = context["database"]
+    config = context["config"]
+    split = context["split"]
+    runtime = context["runtime"]
+    alerts = context["alerts"]
+    control_plane = context["control_plane"]
+    builders: dict[str, Callable[[], Any]] = {
+        "market-gateway": lambda: _market_gateway_cycle(
             database=database,
-            configuration=split_configuration,
+            configuration=split,
             config_root=args.config.parent,
             maximum_seconds=float(args.interval_seconds),
-        )
-    elif args.service == "product-supervisor":
-        work = _product_coordination_cycle(database=database, node_id=args.node)
-    elif args.service == "portfolio-engine":
-        work = _portfolio_cycle(
-            database=database, configuration=split_configuration, node_id=args.node
-        )
-    elif args.service == "portfolio-state-service":
-        work = _portfolio_state_cycle(
+        ),
+        "product-supervisor": lambda: _product_coordination_cycle(
+            database=database, node_id=args.node
+        ),
+        "portfolio-engine": lambda: _portfolio_cycle(
+            database=database, configuration=split, node_id=args.node
+        ),
+        "portfolio-state-service": lambda: _portfolio_state_cycle(
+            database=database, configuration=split, node_id=args.node
+        ),
+        "execution-engine": lambda: _execution_cycle(
             database=database,
-            configuration=split_configuration,
-            node_id=args.node,
-        )
-    elif args.service == "execution-engine":
-        work = _execution_cycle(
-            database=database,
-            configuration=split_configuration,
+            configuration=split,
             node_id=args.node,
             alerts=alerts,
             control_plane=control_plane,
-        )
-    elif args.service == "paper-engine":
-        work = _paper_cycle(
-            database=database,
-            node_id=args.node,
-            configuration=split_configuration,
-        )
-    elif args.service == "risk-engine":
-        work = _risk_cycle(database=database, node_id=args.node, configuration=split_configuration)
-    elif args.service == "strategy-evaluator":
-        work = _strategy_evaluator_cycle(database=database, node_id=args.node)
-    elif args.service == "universe-service":
-        work = _universe_cycle(database=database, node_id=args.node)
-    elif args.service == "platform-scheduler":
-        work = _platform_scheduler_cycle(
-            database=database, node_id=args.node, configuration=split_configuration
-        )
-    elif args.service == "data-writer":
-        work = _data_writer_cycle(
+        ),
+        "paper-engine": lambda: _paper_cycle(
+            database=database, node_id=args.node, configuration=split
+        ),
+        "risk-engine": lambda: _risk_cycle(
+            database=database, node_id=args.node, configuration=split
+        ),
+        "strategy-evaluator": lambda: _strategy_evaluator_cycle(
+            database=database, node_id=args.node
+        ),
+        "universe-service": lambda: _universe_cycle(database=database, node_id=args.node),
+        "platform-scheduler": lambda: _platform_scheduler_cycle(
+            database=database, node_id=args.node, configuration=split
+        ),
+        "data-writer": lambda: _data_writer_cycle(
             database=database,
             node_id=args.node,
             root=Path(config.paths["parquet"]),
-            configuration=split_configuration,
-        )
-    elif args.service in {"feature-service", "feature-build-worker"}:
-        work = _feature_cycle(
-            database=database,
-            node_id=args.node,
-            service_name=args.service,
-            parquet_root=Path(config.paths["parquet"]),
-        )
-    elif args.service == "promotion-engine":
-        work = _promotion_cycle(
-            database=database,
-            node_id=args.node,
-            configuration=split_configuration,
-        )
-    elif args.service == "accounting-service":
-        work = _accounting_cycle(database=database, node_id=args.node)
-    elif args.service == "account-reconciliation":
-        work = _account_reconciliation_cycle(
-            database=database, configuration=split_configuration, alerts=alerts
-        )
-    elif args.service == "report-worker":
-        work = _report_cycle(
+            configuration=split,
+        ),
+        "promotion-engine": lambda: _promotion_cycle(
+            database=database, node_id=args.node, configuration=split
+        ),
+        "accounting-service": lambda: _accounting_cycle(database=database, node_id=args.node),
+        "account-reconciliation": lambda: _account_reconciliation_cycle(
+            database=database, configuration=split, alerts=alerts
+        ),
+        "report-worker": lambda: _report_cycle(
             database=database,
             root=Path(config.paths["reports"]),
             node_id=args.node,
-            risk_configuration=split_configuration["risk"],
+            risk_configuration=split["risk"],
             alerts=alerts,
             alerting_configuration=config.alerting,
             backup_root=Path(config.paths["backups"]),
             backup_max_age_seconds=int(config.backup.get("maximum_age_seconds", 172_800)),
             minimum_free_bytes=int(config.backup.get("minimum_free_bytes", 536_870_912)),
+        ),
+    }
+    if args.service in {"feature-service", "feature-build-worker"}:
+        return _feature_cycle(
+            database=database,
+            node_id=args.node,
+            service_name=args.service,
+            parquet_root=Path(config.paths["parquet"]),
         )
-    elif args.service in {"research-worker", "ml-worker", "event-replay-worker"}:
-        work = _research_cycle(
+    if args.service in {"research-worker", "ml-worker", "event-replay-worker"}:
+        return _research_cycle(
             database=database,
             node_id=args.node,
             service_name=args.service,
             runtime=runtime,
             maximum_runtime_seconds=int(
-                split_configuration["research"]["resource_limits"]["maximum_runtime_seconds"]
+                split["research"]["resource_limits"]["maximum_runtime_seconds"]
             ),
             parquet_root=Path(config.paths["parquet"]),
             artefact_root=Path(config.paths["artefacts"]),
-            research_configuration=split_configuration["research"],
-            configuration=split_configuration,
+            research_configuration=split["research"],
+            configuration=split,
         )
-    elif args.service == "agent-sandbox":
-        configured_worktree_root = os.environ.get("TRADING_PLATFORM_AGENT_WORKTREE_ROOT")
-        if not configured_worktree_root:
-            raise RuntimeError(
-                "TRADING_PLATFORM_AGENT_WORKTREE_ROOT must be configured for agent-sandbox"
-            )
-        work = _agent_cycle(
-            database=database,
-            node_id=args.node,
-            runtime=runtime,
-            repository=Path.cwd(),
-            worktree_root=Path(configured_worktree_root),
-            research_configuration=split_configuration["research"],
+    if args.service == "agent-sandbox":
+        return _agent_service_work(args, context)
+    builder = builders.get(args.service)
+    if builder is None:
+        return lambda: _idle_cycle(args.service)
+    return builder()
+
+
+def _agent_service_work(args: argparse.Namespace, context: Mapping[str, Any]) -> Callable[[], Any]:
+    worktree_root = os.environ.get("TRADING_PLATFORM_AGENT_WORKTREE_ROOT")
+    if not worktree_root:
+        raise RuntimeError(
+            "TRADING_PLATFORM_AGENT_WORKTREE_ROOT must be configured for agent-sandbox"
         )
-    else:
+    return _agent_cycle(
+        database=context["database"],
+        node_id=args.node,
+        runtime=context["runtime"],
+        repository=Path.cwd(),
+        worktree_root=Path(worktree_root),
+        research_configuration=context["split"]["research"],
+    )
 
-        def work() -> dict[str, Any]:
-            return _idle_cycle(args.service)
 
-    market_gateway = work if isinstance(work, DatabaseMarketGateway) else None
-    if args.service != "control-api":
-        unpaused_work = work
+def _paused_work(
+    work: Callable[[], Any], *, service: str, control_plane: DatabaseControlPlane
+) -> Callable[[], Any]:
+    def run_once() -> Any:
+        if control_plane.service_is_paused(service):
+            return {"reason_code": "service_paused", "service": service}
+        return work()
 
-        def work() -> dict[str, Any]:
-            if control_plane.service_is_paused(args.service):
-                return {"reason_code": "service_paused", "service": args.service}
-            return unpaused_work()
+    return run_once
 
+
+def _serve_service(
+    args: argparse.Namespace, context: Mapping[str, Any], work: Callable[[], Any] | Any
+) -> int:
+    database = context["database"]
+    runtime = context["runtime"]
     if args.service == "control-api" and not args.once:
-        token = os.environ.get(args.control_token_env, "")
-        server = build_control_server(
-            bind=_parse_bind(args.control_bind),
-            control_plane=DatabaseControlPlane(
-                database.engine,
-                heartbeat_store,
-                configuration=split_configuration,
-                alerts=alerts,
-            ),
-            bearer_token=token,
-        )
-        metrics_provider = DatabaseMetricsProvider(
-            lambda: DatabasePlatformReport(database.engine).build()
-        )
-        metrics_server = build_metrics_server(
-            bind=_parse_bind(str(config.metrics.get("bind", "127.0.0.1:9108"))),
-            provider=metrics_provider.render,
-        )
-        metrics_thread = threading.Thread(
-            target=metrics_server.serve_forever,
-            kwargs={"poll_interval": 0.5},
-            daemon=True,
-        )
-        metrics_thread.start()
-        runtime.heartbeat(payload={"reason_code": "control_api_started"})
-
-        def stop_server(_signum: int, _frame: object) -> None:
-            metrics_server.shutdown()
-            server.shutdown()
-
-        signal.signal(signal.SIGTERM, stop_server)
-        signal.signal(signal.SIGINT, stop_server)
-        server.serve_forever(poll_interval=0.5)
-        metrics_server.shutdown()
-        metrics_thread.join(timeout=2.0)
-        database.dispose()
-        return 0
+        return _serve_control_api(args, context)
+    work = _paused_work(work, service=args.service, control_plane=context["control_plane"])
     if args.once:
-        cycle = runtime.run_once(work)
-        database.dispose()
-        return 0 if cycle.healthy else 1
+        return _serve_once(runtime, work, database)
+    return _serve_loop(args, runtime, work, database)
 
+
+def _serve_control_api(args: argparse.Namespace, context: Mapping[str, Any]) -> int:
+    database = context["database"]
+    config = context["config"]
+    server = build_control_server(
+        bind=_parse_bind(args.control_bind),
+        control_plane=DatabaseControlPlane(
+            database.engine,
+            context["heartbeat_store"],
+            configuration=context["split"],
+            alerts=context["alerts"],
+        ),
+        bearer_token=os.environ.get(args.control_token_env, ""),
+    )
+    metrics_provider = DatabaseMetricsProvider(
+        lambda: DatabasePlatformReport(database.engine).build()
+    )
+    metrics_server = build_metrics_server(
+        bind=_parse_bind(str(config.metrics.get("bind", "127.0.0.1:9108"))),
+        provider=metrics_provider.render,
+    )
+    metrics_thread = threading.Thread(
+        target=metrics_server.serve_forever,
+        kwargs={"poll_interval": 0.5},
+        daemon=True,
+    )
+    metrics_thread.start()
+    context["runtime"].heartbeat(payload={"reason_code": "control_api_started"})
+
+    def stop_server(_signum: int, _frame: object) -> None:
+        metrics_server.shutdown()
+        server.shutdown()
+
+    signal.signal(signal.SIGTERM, stop_server)
+    signal.signal(signal.SIGINT, stop_server)
+    server.serve_forever(poll_interval=0.5)
+    metrics_server.shutdown()
+    metrics_thread.join(timeout=2.0)
+    database.dispose()
+    return 0
+
+
+def _serve_once(
+    runtime: ServiceRuntime, work: Callable[[], Any], database: PlatformDatabase
+) -> int:
+    cycle = runtime.run_once(work)
+    database.dispose()
+    return 0 if cycle.healthy else 1
+
+
+def _serve_loop(
+    args: argparse.Namespace,
+    runtime: ServiceRuntime,
+    work: Callable[[], Any],
+    database: PlatformDatabase,
+) -> int:
     stopping = False
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -1271,31 +1376,47 @@ def run(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
+    market_gateway = work if isinstance(work, DatabaseMarketGateway) else None
     while not stopping:
         cycle = runtime.run_once(work)
-        reason_code = str(cycle.detail.get("reason_code") or "")
-        if (
-            args.service == "report-worker"
-            or reason_code == "market_gateway_running"
-            or reason_code.endswith("queue_empty")
-            or reason_code.endswith("paused")
-            or reason_code
-            in {
-                "service_waiting_for_input",
-                "service_cycle_failed",
-                "portfolio_state_waiting_for_source_snapshots",
-                "portfolio_state_idle",
-                "canonical_portfolio_state_published",
-                "platform_scheduler_completed",
-                "account_reconciliation_completed",
-            }
-        ):
+        if _should_sleep(args.service, cycle):
             time.sleep(args.interval_seconds)
     if market_gateway is not None:
         market_gateway.stop()
     runtime.heartbeat(payload={"reason_code": "service_stopped"})
     database.dispose()
     return 0
+
+
+def _should_sleep(service: str, cycle: Any) -> bool:
+    reason_code = str(cycle.detail.get("reason_code") or "")
+    return (
+        service == "report-worker"
+        or reason_code == "market_gateway_running"
+        or reason_code.endswith("queue_empty")
+        or reason_code.endswith("paused")
+        or reason_code
+        in {
+            "service_waiting_for_input",
+            "service_cycle_failed",
+            "portfolio_state_waiting_for_source_snapshots",
+            "portfolio_state_idle",
+            "canonical_portfolio_state_published",
+            "platform_scheduler_completed",
+            "account_reconciliation_completed",
+        }
+    )
+
+
+def run(args: argparse.Namespace) -> int:
+    config = load_platform_config(args.config)
+    split_configuration = load_split_configuration(args.config.parent)
+    config.assert_service_assignment(node_id=args.node, service=args.service)
+    if args.validate:
+        return 0
+    context = _initialise_service(args, config=config, split=split_configuration)
+    work = _service_work(args, context)
+    return _serve_service(args, context, work)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
