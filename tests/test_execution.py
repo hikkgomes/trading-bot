@@ -2251,48 +2251,92 @@ def test_ccxt_open_order_inventory_rejects_malformed_or_unsafe_responses(
         broker.list_open_orders("BTCUSDT", conditional=False)
 
 
-def test_ccxt_futures_entry_refuses_outstanding_orders_immediately_before_submit():
-    class FakeClient:
-        def __init__(self):
-            self.created = []
-            self.open_order_calls = []
+class _OutstandingOrdersClient:
+    def __init__(self):
+        self.created = []
+        self.open_order_calls = []
 
-        def fetch_ticker(self, symbol):
-            return {"last": 100.0}
+    def fetch_ticker(self, symbol):
+        return {"last": 100.0}
 
-        def set_margin_mode(self, margin_mode, symbol):
-            return None
+    def set_margin_mode(self, margin_mode, symbol):
+        return None
 
-        def set_leverage(self, leverage, symbol):
-            return None
+    def set_leverage(self, leverage, symbol):
+        return None
 
-        def set_position_mode(self, hedged, symbol):
-            return None
+    def set_position_mode(self, hedged, symbol):
+        return None
 
-        def fetch_position_mode(self, symbol):
-            return {"hedged": False}
+    def fetch_position_mode(self, symbol):
+        return {"hedged": False}
 
-        def fetch_open_orders(self, symbol, params):
-            self.open_order_calls.append((symbol, params))
-            if params:
-                return []
-            return [
-                {
-                    "id": "123",
-                    "clientOrderId": "manual-order-1",
-                    "symbol": "ETH/USDT:USDT",
-                    "status": "open",
-                }
-            ]
+    def fetch_open_orders(self, symbol, params):
+        self.open_order_calls.append((symbol, params))
+        if params:
+            return []
+        return [
+            {
+                "id": "123",
+                "clientOrderId": "manual-order-1",
+                "symbol": "ETH/USDT:USDT",
+                "status": "open",
+            }
+        ]
 
-        def fetch_positions(self, symbols):
+    def fetch_positions(self, symbols):
+        return [_futures_settings_position()]
+
+    def create_order(self, **kwargs):
+        self.created.append(kwargs)
+        raise AssertionError("entry must not be submitted with outstanding orders")
+
+
+class _MultiSymbolClient:
+    def __init__(self):
+        self.created = []
+        self.open_order_calls = []
+
+    def fetch_ticker(self, symbol):
+        return {"last": 100.0}
+
+    def set_margin_mode(self, margin_mode, symbol):
+        return None
+
+    def set_leverage(self, leverage, symbol):
+        return None
+
+    def set_position_mode(self, hedged, symbol):
+        return None
+
+    def fetch_position_mode(self, symbol):
+        return {"hedged": False}
+
+    def fetch_open_orders(self, symbol, params):
+        self.open_order_calls.append((symbol, params))
+        return []
+
+    def fetch_positions(self, symbols):
+        if symbols == ["BTC/USDT:USDT"]:
             return [_futures_settings_position()]
+        raise AssertionError("multi-symbol order must not require account flatness")
 
-        def create_order(self, **kwargs):
-            self.created.append(kwargs)
-            raise AssertionError("entry must not be submitted with outstanding orders")
+    def create_order(self, **kwargs):
+        self.created.append(kwargs)
+        return {
+            "status": "closed",
+            "symbol": "BTC/USDT:USDT",
+            "side": "buy",
+            "type": "market",
+            "amount": 0.1,
+            "filled": 0.1,
+            "average": 100.0,
+            "fee": {"cost": 0.01},
+        }
 
-    client = FakeClient()
+
+def test_ccxt_futures_entry_refuses_outstanding_orders_immediately_before_submit():
+    client = _OutstandingOrdersClient()
     broker = _ccxt_protective_broker(client)
     broker.config.max_notional_usd = 1000
 
@@ -2307,51 +2351,9 @@ def test_ccxt_futures_entry_refuses_outstanding_orders_immediately_before_submit
 
 
 def test_ccxt_multi_symbol_mode_allows_an_unrelated_position_and_order():
-    class FakeClient:
-        def __init__(self):
-            self.created = []
-            self.open_order_calls = []
-
-        def fetch_ticker(self, symbol):
-            return {"last": 100.0}
-
-        def set_margin_mode(self, margin_mode, symbol):
-            return None
-
-        def set_leverage(self, leverage, symbol):
-            return None
-
-        def set_position_mode(self, hedged, symbol):
-            return None
-
-        def fetch_position_mode(self, symbol):
-            return {"hedged": False}
-
-        def fetch_open_orders(self, symbol, params):
-            self.open_order_calls.append((symbol, params))
-            return []
-
-        def fetch_positions(self, symbols):
-            if symbols == ["BTC/USDT:USDT"]:
-                return [_futures_settings_position()]
-            raise AssertionError("multi-symbol order must not require account flatness")
-
-        def create_order(self, **kwargs):
-            self.created.append(kwargs)
-            return {
-                "status": "closed",
-                "symbol": "BTC/USDT:USDT",
-                "side": "buy",
-                "type": "market",
-                "amount": 0.1,
-                "filled": 0.1,
-                "average": 100.0,
-                "fee": {"cost": 0.01},
-            }
-
     from src.execution.ccxt_broker import CcxtBroker
 
-    client = FakeClient()
+    client = _MultiSymbolClient()
     broker = CcxtBroker.__new__(CcxtBroker)
     broker.config = ExchangeConfig(
         exchange="binanceusdm",
