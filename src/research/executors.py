@@ -710,182 +710,205 @@ def _product_accounting(
 
     product_id = str(context.get("product_id") or "")
     if product_id == "btc_accumulation":
-        events = context.get("btc_trade_events", context.get("trade_events"))
-        marks = context.get("btc_marks", context.get("marks"))
-        derived = events is None and marks is None
-        if derived:
-            events, marks = _derived_btc_accounting_inputs(context)
-        if events is None and marks is None:
-            return None
-        from src.research.accounting import BtcResearchAccounting, ProductAccountingError
-
-        try:
-            reserve_fraction = context.get("reserve_fraction")
-            if reserve_fraction is None and context.get("btc_minimum_fraction") is not None:
-                reserve_fraction = context["btc_minimum_fraction"]
-            if reserve_fraction is None and derived:
-                reserve_fraction = 1.0 - float(
-                    context.get(
-                        "max_tactical_fraction", context.get("btc_max_tactical_fraction", 0.3)
-                    )
-                )
-            max_tactical_fraction = context.get("max_tactical_fraction")
-            if max_tactical_fraction is None:
-                max_tactical_fraction = context.get("btc_max_tactical_fraction")
-            if max_tactical_fraction is None and derived:
-                max_tactical_fraction = 0.3
-            report = BtcResearchAccounting().evaluate(
-                trade_events=events or (),
-                marks=marks or (),
-                initial_btc=float(
-                    context.get("initial_btc", context.get("btc_balance", 1.0 if derived else 0.0))
-                ),
-                initial_stablecoin=float(
-                    context.get("initial_stablecoin", context.get("stablecoin_balance", 0.0))
-                ),
-                initial_price=(
-                    float(context["initial_price"])
-                    if context.get("initial_price") is not None
-                    else None
-                ),
-                reserve_fraction=(
-                    float(reserve_fraction) if reserve_fraction is not None else None
-                ),
-                max_tactical_fraction=(
-                    float(max_tactical_fraction) if max_tactical_fraction is not None else None
-                ),
-                external_events=context.get("btc_external_events", ()),
-            )
-        except (ProductAccountingError, TypeError, ValueError) as exc:
-            raise ExecutorError(f"BTC accounting evidence is invalid: {exc}") from exc
-        return {
-            "schema": "platform.btc_accounting/v1",
-            "objective_unit": report.objective_unit,
-            "initial_value": report.initial_btc_nav,
-            "objective_value": report.final_btc_nav,
-            "benchmark_value": report.passive_btc_nav,
-            "objective_excess": report.excess_btc,
-            "objective_excess_fraction": (
-                report.excess_btc / report.initial_btc_nav if report.initial_btc_nav > 0 else 0.0
-            ),
-            "return_fraction": report.return_fraction,
-            "fees": report.fees_btc,
-            "time_outside_btc_fraction": report.time_outside_btc_fraction,
-            "stablecoin_exposure_fraction": report.stablecoin_exposure_fraction,
-            "missed_btc_appreciation": report.missed_btc_appreciation,
-            "cycles": report.cycles,
-            "regime_pnl": dict(report.regime_pnl),
-            "maximum_btc_drawdown": report.maximum_btc_drawdown,
-            "btc_saved_in_drawdown_periods": report.btc_saved_in_drawdown_periods,
-            "round_trip_btc_gain": report.round_trip_btc_gain,
-            "maximum_tactical_allocation": report.maximum_tactical_allocation,
-            "average_stablecoin_exposure_fraction": report.average_stablecoin_exposure_fraction,
-            "worst_reentry_slippage": report.worst_reentry_slippage,
-            "failed_reentries": report.failed_reentries,
-            "external_deposits_btc": report.external_deposits_btc,
-            "external_withdrawals_btc": report.external_withdrawals_btc,
-            "event_receipts": [dict(item) for item in report.event_receipts],
-        }
+        return _btc_product_accounting(context)
     if product_id == "active_income":
-        events = context.get("futures_events", context.get("trade_events"))
-        if events is None:
-            events = _derived_futures_accounting_inputs(context)
-        if events is None:
-            if fallback_return is None:
-                return None
-            initial_equity = float(context.get("initial_cash", context.get("initial_equity", 1.0)))
-            if not math.isfinite(initial_equity) or initial_equity <= 0.0:
-                raise ExecutorError(
-                    "active-income return-ledger accounting requires positive initial equity"
-                )
-            net_pnl = float(fallback_return.net_pnl) * initial_equity
-            return {
-                "schema": "platform.futures_accounting/return_ledger_v1",
-                "objective_unit": "USDT",
-                "initial_value": initial_equity,
-                "objective_value": initial_equity + net_pnl,
-                "benchmark_value": initial_equity,
-                "objective_excess": net_pnl,
-                "objective_excess_fraction": net_pnl / initial_equity,
-                "return_fraction": net_pnl / initial_equity,
-                "realised_pnl": net_pnl,
-                "unrealised_pnl": 0.0,
-                "fees": float(fallback_return.fees),
-                "funding_pnl": float(fallback_return.funding_pnl),
-                "spread_cost": 0.0,
-                "slippage_cost": float(fallback_return.slippage),
-                "fills": int(fallback_return.effective_observations),
-                "partial_fills": 0,
-                "capacity_violations": 0,
-                "capacity_passed": True,
-                "max_leverage": 1.0,
-                "max_margin_fraction": 0.0,
-                "liquidation": False,
-                "effective_observations": int(fallback_return.effective_observations),
-                "turnover_notional": 0.0,
-                "implementation_shortfall": float(fallback_return.fees + fallback_return.slippage),
-                "capital_efficiency": 0.0,
-                "funding_adjusted_expectancy": (
-                    net_pnl / fallback_return.effective_observations
-                    if fallback_return.effective_observations > 0
-                    else 0.0
-                ),
-                "margin_mode": "isolated",
-                "target_notional": None,
-                "liquidation_buffer_fraction": 0.0,
-                "event_receipts": (),
-                "source": "canonical_return_ledger",
-            }
-        from src.research.accounting import FuturesResearchAccounting, ProductAccountingError
-
-        try:
-            report = FuturesResearchAccounting().evaluate(
-                events=events,
-                initial_cash=float(context.get("initial_cash", context.get("initial_equity", 0.0))),
-                leverage=float(context.get("leverage", 1.0)),
-                maintenance_margin_fraction=float(context.get("maintenance_margin_fraction", 0.0)),
-                max_participation_fraction=float(context.get("max_participation_fraction", 1.0)),
-                funding_timestamps=context.get("funding_timestamps"),
-                max_margin_fraction=float(context.get("max_margin_fraction", 1.0)),
-                target_notional=context.get("target_notional"),
-                margin_mode=str(context.get("margin_mode", "isolated")),
-                liquidation_buffer_fraction=float(context.get("liquidation_buffer_fraction", 0.0)),
-            )
-        except (ProductAccountingError, TypeError, ValueError) as exc:
-            raise ExecutorError(f"futures accounting evidence is invalid: {exc}") from exc
-        return {
-            "schema": "platform.futures_accounting/v1",
-            "objective_unit": report.objective_unit,
-            "initial_value": report.initial_equity,
-            "objective_value": report.final_equity,
-            "benchmark_value": report.initial_equity,
-            "objective_excess": report.net_pnl,
-            "objective_excess_fraction": report.return_fraction,
-            "return_fraction": report.return_fraction,
-            "realised_pnl": report.realised_pnl,
-            "unrealised_pnl": report.unrealised_pnl,
-            "fees": report.fees,
-            "funding_pnl": report.funding_pnl,
-            "spread_cost": report.spread_cost,
-            "slippage_cost": report.slippage_cost,
-            "fills": report.fills,
-            "partial_fills": report.partial_fills,
-            "capacity_violations": report.capacity_violations,
-            "capacity_passed": report.capacity_violations == 0,
-            "max_leverage": report.max_leverage,
-            "max_margin_fraction": report.max_margin_fraction,
-            "liquidation": report.liquidation,
-            "effective_observations": report.effective_observations,
-            "turnover_notional": report.turnover_notional,
-            "implementation_shortfall": report.implementation_shortfall,
-            "capital_efficiency": report.capital_efficiency,
-            "funding_adjusted_expectancy": report.funding_adjusted_expectancy,
-            "margin_mode": report.margin_mode,
-            "target_notional": report.target_notional,
-            "liquidation_buffer_fraction": report.liquidation_buffer_fraction,
-            "event_receipts": [dict(item) for item in report.event_receipts],
-        }
+        return _futures_product_accounting(context, fallback_return=fallback_return)
     return None
+
+
+def _btc_product_accounting(context: Mapping[str, Any]) -> dict[str, Any] | None:
+    events = context.get("btc_trade_events", context.get("trade_events"))
+    marks = context.get("btc_marks", context.get("marks"))
+    derived = events is None and marks is None
+    if derived:
+        events, marks = _derived_btc_accounting_inputs(context)
+    if events is None and marks is None:
+        return None
+    from src.research.accounting import BtcResearchAccounting, ProductAccountingError
+
+    try:
+        reserve_fraction, tactical_fraction = _btc_fraction_inputs(context, derived=derived)
+        report = BtcResearchAccounting().evaluate(
+            trade_events=events or (),
+            marks=marks or (),
+            initial_btc=float(
+                context.get("initial_btc", context.get("btc_balance", 1.0 if derived else 0.0))
+            ),
+            initial_stablecoin=float(
+                context.get("initial_stablecoin", context.get("stablecoin_balance", 0.0))
+            ),
+            initial_price=(
+                float(context["initial_price"])
+                if context.get("initial_price") is not None
+                else None
+            ),
+            reserve_fraction=reserve_fraction,
+            max_tactical_fraction=tactical_fraction,
+            external_events=context.get("btc_external_events", ()),
+        )
+    except (ProductAccountingError, TypeError, ValueError) as exc:
+        raise ExecutorError(f"BTC accounting evidence is invalid: {exc}") from exc
+    return _btc_accounting_payload(report)
+
+
+def _btc_fraction_inputs(
+    context: Mapping[str, Any], *, derived: bool
+) -> tuple[float | None, float | None]:
+    reserve_fraction = context.get("reserve_fraction")
+    if reserve_fraction is None:
+        reserve_fraction = context.get("btc_minimum_fraction")
+    tactical_fraction = context.get("max_tactical_fraction")
+    if tactical_fraction is None:
+        tactical_fraction = context.get("btc_max_tactical_fraction")
+    if derived and tactical_fraction is None:
+        tactical_fraction = 0.3
+    if derived and reserve_fraction is None:
+        reserve_fraction = 1.0 - float(tactical_fraction)
+    return (
+        float(reserve_fraction) if reserve_fraction is not None else None,
+        float(tactical_fraction) if tactical_fraction is not None else None,
+    )
+
+
+def _btc_accounting_payload(report: Any) -> dict[str, Any]:
+    return {
+        "schema": "platform.btc_accounting/v1",
+        "objective_unit": report.objective_unit,
+        "initial_value": report.initial_btc_nav,
+        "objective_value": report.final_btc_nav,
+        "benchmark_value": report.passive_btc_nav,
+        "objective_excess": report.excess_btc,
+        "objective_excess_fraction": (
+            report.excess_btc / report.initial_btc_nav if report.initial_btc_nav > 0 else 0.0
+        ),
+        "return_fraction": report.return_fraction,
+        "fees": report.fees_btc,
+        "time_outside_btc_fraction": report.time_outside_btc_fraction,
+        "stablecoin_exposure_fraction": report.stablecoin_exposure_fraction,
+        "missed_btc_appreciation": report.missed_btc_appreciation,
+        "cycles": report.cycles,
+        "regime_pnl": dict(report.regime_pnl),
+        "maximum_btc_drawdown": report.maximum_btc_drawdown,
+        "btc_saved_in_drawdown_periods": report.btc_saved_in_drawdown_periods,
+        "round_trip_btc_gain": report.round_trip_btc_gain,
+        "maximum_tactical_allocation": report.maximum_tactical_allocation,
+        "average_stablecoin_exposure_fraction": report.average_stablecoin_exposure_fraction,
+        "worst_reentry_slippage": report.worst_reentry_slippage,
+        "failed_reentries": report.failed_reentries,
+        "external_deposits_btc": report.external_deposits_btc,
+        "external_withdrawals_btc": report.external_withdrawals_btc,
+        "event_receipts": [dict(item) for item in report.event_receipts],
+    }
+
+
+def _futures_product_accounting(
+    context: Mapping[str, Any], *, fallback_return: Any | None
+) -> dict[str, Any] | None:
+    events = context.get("futures_events", context.get("trade_events"))
+    if events is None:
+        events = _derived_futures_accounting_inputs(context)
+    if events is None:
+        return _futures_return_ledger(context, fallback_return)
+    from src.research.accounting import FuturesResearchAccounting, ProductAccountingError
+
+    try:
+        report = FuturesResearchAccounting().evaluate(
+            events=events,
+            initial_cash=float(context.get("initial_cash", context.get("initial_equity", 0.0))),
+            leverage=float(context.get("leverage", 1.0)),
+            maintenance_margin_fraction=float(context.get("maintenance_margin_fraction", 0.0)),
+            max_participation_fraction=float(context.get("max_participation_fraction", 1.0)),
+            funding_timestamps=context.get("funding_timestamps"),
+            max_margin_fraction=float(context.get("max_margin_fraction", 1.0)),
+            target_notional=context.get("target_notional"),
+            margin_mode=str(context.get("margin_mode", "isolated")),
+            liquidation_buffer_fraction=float(context.get("liquidation_buffer_fraction", 0.0)),
+        )
+    except (ProductAccountingError, TypeError, ValueError) as exc:
+        raise ExecutorError(f"futures accounting evidence is invalid: {exc}") from exc
+    return _futures_accounting_payload(report)
+
+
+def _futures_return_ledger(
+    context: Mapping[str, Any], fallback_return: Any | None
+) -> dict[str, Any] | None:
+    if fallback_return is None:
+        return None
+    initial_equity = float(context.get("initial_cash", context.get("initial_equity", 1.0)))
+    if not math.isfinite(initial_equity) or initial_equity <= 0.0:
+        raise ExecutorError(
+            "active-income return-ledger accounting requires positive initial equity"
+        )
+    net_pnl = float(fallback_return.net_pnl) * initial_equity
+    observations = int(fallback_return.effective_observations)
+    return {
+        "schema": "platform.futures_accounting/return_ledger_v1",
+        "objective_unit": "USDT",
+        "initial_value": initial_equity,
+        "objective_value": initial_equity + net_pnl,
+        "benchmark_value": initial_equity,
+        "objective_excess": net_pnl,
+        "objective_excess_fraction": net_pnl / initial_equity,
+        "return_fraction": net_pnl / initial_equity,
+        "realised_pnl": net_pnl,
+        "unrealised_pnl": 0.0,
+        "fees": float(fallback_return.fees),
+        "funding_pnl": float(fallback_return.funding_pnl),
+        "spread_cost": 0.0,
+        "slippage_cost": float(fallback_return.slippage),
+        "fills": observations,
+        "partial_fills": 0,
+        "capacity_violations": 0,
+        "capacity_passed": True,
+        "max_leverage": 1.0,
+        "max_margin_fraction": 0.0,
+        "liquidation": False,
+        "effective_observations": observations,
+        "turnover_notional": 0.0,
+        "implementation_shortfall": float(fallback_return.fees + fallback_return.slippage),
+        "capital_efficiency": 0.0,
+        "funding_adjusted_expectancy": net_pnl / observations if observations > 0 else 0.0,
+        "margin_mode": "isolated",
+        "target_notional": None,
+        "liquidation_buffer_fraction": 0.0,
+        "event_receipts": (),
+        "source": "canonical_return_ledger",
+    }
+
+
+def _futures_accounting_payload(report: Any) -> dict[str, Any]:
+    return {
+        "schema": "platform.futures_accounting/v1",
+        "objective_unit": report.objective_unit,
+        "initial_value": report.initial_equity,
+        "objective_value": report.final_equity,
+        "benchmark_value": report.initial_equity,
+        "objective_excess": report.net_pnl,
+        "objective_excess_fraction": report.return_fraction,
+        "return_fraction": report.return_fraction,
+        "realised_pnl": report.realised_pnl,
+        "unrealised_pnl": report.unrealised_pnl,
+        "fees": report.fees,
+        "funding_pnl": report.funding_pnl,
+        "spread_cost": report.spread_cost,
+        "slippage_cost": report.slippage_cost,
+        "fills": report.fills,
+        "partial_fills": report.partial_fills,
+        "capacity_violations": report.capacity_violations,
+        "capacity_passed": report.capacity_violations == 0,
+        "max_leverage": report.max_leverage,
+        "max_margin_fraction": report.max_margin_fraction,
+        "liquidation": report.liquidation,
+        "effective_observations": report.effective_observations,
+        "turnover_notional": report.turnover_notional,
+        "implementation_shortfall": report.implementation_shortfall,
+        "capital_efficiency": report.capital_efficiency,
+        "funding_adjusted_expectancy": report.funding_adjusted_expectancy,
+        "margin_mode": report.margin_mode,
+        "target_notional": report.target_notional,
+        "liquidation_buffer_fraction": report.liquidation_buffer_fraction,
+        "event_receipts": [dict(item) for item in report.event_receipts],
+    }
 
 
 def _frame_rows(context: Mapping[str, Any]) -> tuple[dict[str, Any], ...] | None:
@@ -1021,6 +1044,49 @@ def _derived_btc_accounting_inputs(
 def _derived_futures_accounting_inputs(
     context: Mapping[str, Any],
 ) -> tuple[dict[str, Any], ...] | None:
+    inputs = _futures_frame_inputs(context)
+    if inputs is None:
+        return None
+    rows, signals, times, prices = inputs
+    fee_rate = _nonnegative_rate(context.get("fee_bps", 5.0), field="fee_bps") / 10_000.0
+    slippage_rate = (
+        _nonnegative_rate(context.get("slippage_bps", 2.0), field="slippage_bps") / 10_000.0
+    )
+    target_notional = _derived_futures_target_notional(context)
+    events: list[dict[str, Any]] = []
+    previous_target = 0.0
+    for observed_at, raw_price, row, raw_signal in zip(times, prices, rows, signals, strict=True):
+        price = float(raw_price)
+        target = _futures_target_notional(raw_signal, target_notional, price)
+        delta = target - previous_target
+        fill = _futures_fill_event(
+            observed_at,
+            row,
+            price,
+            delta,
+            fee_rate=fee_rate,
+            slippage_rate=slippage_rate,
+        )
+        if fill is not None:
+            events.append(fill)
+            previous_target = target
+        events.append(_futures_mark_event(observed_at, row, price))
+        funding = _futures_funding_event(observed_at, row, price)
+        if funding is not None:
+            events.append(funding)
+    if not events:
+        return None
+    return tuple(events)
+
+
+def _futures_frame_inputs(
+    context: Mapping[str, Any],
+) -> tuple[
+    tuple[dict[str, Any], ...],
+    list[float],
+    tuple[str, ...],
+    tuple[float, ...],
+] | None:
     rows = _frame_rows(context)
     signals = _numeric_series(context.get("signals"))
     if rows is None or len(rows) != len(signals):
@@ -1031,16 +1097,15 @@ def _derived_futures_accounting_inputs(
     prices = tuple(_row_price(row) for row in rows)
     if any(price is None for price in prices):
         return None
-    fee_rate = _nonnegative_rate(context.get("fee_bps", 5.0), field="fee_bps") / 10_000.0
-    slippage_rate = (
-        _nonnegative_rate(context.get("slippage_bps", 2.0), field="slippage_bps") / 10_000.0
-    )
+    return rows, signals, times, tuple(float(price) for price in prices)
+
+
+def _derived_futures_target_notional(context: Mapping[str, Any]) -> float:
     initial_cash = float(context.get("initial_cash", context.get("initial_equity", 1_000.0)))
     maximum_position = float(context.get("maximum_position", 0.1))
     leverage = float(context.get("leverage", 1.0))
-    if not all(
-        math.isfinite(value) and value > 0.0 for value in (initial_cash, maximum_position, leverage)
-    ):
+    values = (initial_cash, maximum_position, leverage)
+    if not all(math.isfinite(value) and value > 0.0 for value in values):
         raise ExecutorError("futures accounting configuration is invalid")
     raw_target_notional = context.get("target_notional")
     if isinstance(raw_target_notional, Mapping):
@@ -1053,52 +1118,66 @@ def _derived_futures_accounting_inputs(
         )
     if not math.isfinite(target_notional) or target_notional <= 0.0:
         raise ExecutorError("futures target notional is invalid")
-    events: list[dict[str, Any]] = []
-    previous_target = 0.0
-    for observed_at, raw_price, row, raw_signal in zip(times, prices, rows, signals, strict=True):
-        price = float(raw_price)
-        target = _signed_signal(raw_signal) * target_notional / price
-        delta = target - previous_target
-        if abs(delta) > 1e-12:
-            side = "buy" if delta > 0 else "sell"
-            quantity = abs(delta)
-            execution_price = price * (
-                1.0 + slippage_rate if side == "buy" else 1.0 - slippage_rate
-            )
-            events.append(
-                {
-                    "type": "fill",
-                    "timestamp": observed_at,
-                    "symbol": str(row.get("instrument_id", row.get("symbol", "BTCUSDT"))),
-                    "side": side,
-                    "quantity": quantity,
-                    "price": execution_price,
-                    "reference_price": price,
-                    "fee": quantity * execution_price * fee_rate,
-                }
-            )
-            previous_target = target
-        events.append(
-            {
-                "type": "mark",
-                "timestamp": observed_at,
-                "symbol": str(row.get("instrument_id", row.get("symbol", "BTCUSDT"))),
-                "mark_price": price,
-            }
-        )
-        if row.get("funding_rate") is not None or row.get("funding") is not None:
-            events.append(
-                {
-                    "type": "funding",
-                    "timestamp": observed_at,
-                    "symbol": str(row.get("instrument_id", row.get("symbol", "BTCUSDT"))),
-                    "mark_price": price,
-                    "funding_rate": row.get("funding_rate", row.get("funding", 0.0)),
-                }
-            )
-    if not events:
+    return target_notional
+
+
+def _futures_symbol(row: Mapping[str, Any]) -> str:
+    return str(row.get("instrument_id", row.get("symbol", "BTCUSDT")))
+
+
+def _futures_target_notional(raw_signal: Any, target_notional: float, price: float) -> float:
+    return _signed_signal(raw_signal) * target_notional / price
+
+
+def _futures_fill_event(
+    observed_at: str,
+    row: Mapping[str, Any],
+    price: float,
+    delta: float,
+    *,
+    fee_rate: float,
+    slippage_rate: float,
+) -> dict[str, Any] | None:
+    if abs(delta) <= 1e-12:
         return None
-    return tuple(events)
+    side = "buy" if delta > 0 else "sell"
+    quantity = abs(delta)
+    execution_price = price * (1.0 + slippage_rate if side == "buy" else 1.0 - slippage_rate)
+    return {
+        "type": "fill",
+        "timestamp": observed_at,
+        "symbol": _futures_symbol(row),
+        "side": side,
+        "quantity": quantity,
+        "price": execution_price,
+        "reference_price": price,
+        "fee": quantity * execution_price * fee_rate,
+    }
+
+
+def _futures_mark_event(
+    observed_at: str, row: Mapping[str, Any], price: float
+) -> dict[str, Any]:
+    return {
+        "type": "mark",
+        "timestamp": observed_at,
+        "symbol": _futures_symbol(row),
+        "mark_price": price,
+    }
+
+
+def _futures_funding_event(
+    observed_at: str, row: Mapping[str, Any], price: float
+) -> dict[str, Any] | None:
+    if row.get("funding_rate") is None and row.get("funding") is None:
+        return None
+    return {
+        "type": "funding",
+        "timestamp": observed_at,
+        "symbol": _futures_symbol(row),
+        "mark_price": price,
+        "funding_rate": row.get("funding_rate", row.get("funding", 0.0)),
+    }
 
 
 def _finite_rate(value: Any, *, field: str) -> float:
