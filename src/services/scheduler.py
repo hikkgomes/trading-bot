@@ -214,32 +214,9 @@ class PlatformScheduler:
         due_at: str,
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
         if schedule_name in {"reporting", "agent_review", "maintenance"}:
-            if product_id != min(self.products):
-                return ()
-            return (
-                (
-                    f"scheduled:{schedule_name}:{product_id}:{due_at}",
-                    schedule_name,
-                    self._payload(schedule_name, product_id, product, now),
-                ),
-            )
+            return self._single_job(schedule_name, product_id, product, now, due_at)
         if schedule_name == "candidate_generation":
-            catalogue = self._payload("register_strategy_catalogue", product_id, product, now)
-            jobs = [
-                (
-                    f"scheduled:{schedule_name}:{product_id}:catalogue:{due_at}",
-                    "register_strategy_catalogue",
-                    catalogue,
-                ),
-            ]
-            jobs.append(
-                (
-                    f"scheduled:{schedule_name}:{product_id}:hypotheses:{due_at}",
-                    "generate_hypotheses",
-                    self._hypothesis_generation_payload(product_id, product, catalogue),
-                )
-            )
-            return tuple(jobs)
+            return self._candidate_generation_jobs(product_id, product, due_at, now)
         if schedule_name in {"bounded_backtest", "event_replay", "ml_research"}:
             return self._research_jobs(schedule_name, product_id, now, due_at)
         if schedule_name == "universe_refresh" and self._pending_universe_refresh(product_id):
@@ -251,13 +228,53 @@ class PlatformScheduler:
         if schedule_name == "promotion_evaluation":
             return self._promotion_jobs(product_id, now, due_at)
         if schedule_name != "candidate_evaluation":
-            return (
-                (
-                    f"scheduled:{schedule_name}:{product_id}:{due_at}",
-                    schedule_name,
-                    self._payload(schedule_name, product_id, product, now),
-                ),
-            )
+            return self._single_job(schedule_name, product_id, product, now, due_at)
+        return self._candidate_evaluation_jobs(product_id, now, due_at)
+
+    def _single_job(
+        self,
+        schedule_name: str,
+        product_id: str,
+        product: Mapping[str, Any],
+        now: str,
+        due_at: str,
+    ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
+        if schedule_name in {"reporting", "agent_review", "maintenance"} and product_id != min(
+            self.products
+        ):
+            return ()
+        return (
+            (
+                f"scheduled:{schedule_name}:{product_id}:{due_at}",
+                schedule_name,
+                self._payload(schedule_name, product_id, product, now),
+            ),
+        )
+
+    def _candidate_generation_jobs(
+        self,
+        product_id: str,
+        product: Mapping[str, Any],
+        due_at: str,
+        now: str,
+    ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
+        catalogue = self._payload("register_strategy_catalogue", product_id, product, now)
+        return (
+            (
+                f"scheduled:candidate_generation:{product_id}:catalogue:{due_at}",
+                "register_strategy_catalogue",
+                catalogue,
+            ),
+            (
+                f"scheduled:candidate_generation:{product_id}:hypotheses:{due_at}",
+                "generate_hypotheses",
+                self._hypothesis_generation_payload(product_id, product, catalogue),
+            ),
+        )
+
+    def _candidate_evaluation_jobs(
+        self, product_id: str, now: str, due_at: str
+    ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
         jobs: list[tuple[str, str, dict[str, Any]]] = []
         for candidate in SqlResearchStore(self.engine).load_candidates():
             if candidate.definition.product != product_id or not candidate.dataset_snapshot_hashes:
