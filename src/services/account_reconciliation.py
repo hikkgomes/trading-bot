@@ -167,19 +167,9 @@ class AccountReconciliationService:
     ) -> tuple[str, ...]:
         """Resolve the exact exchange scope owned by the current assignment."""
 
-        configured = product.get(
-            "live_exchange_symbols"
-            if product.get("execution_mode") == "live"
-            else "exchange_symbols"
-        )
-        if configured is None:
-            configured = product.get("exchange_symbols")
-        if isinstance(configured, list | tuple):
-            symbols = tuple(
-                sorted({str(value).strip().upper() for value in configured if str(value).strip()})
-            )
-            if symbols:
-                return symbols
+        configured = self._configured_symbols(product)
+        if configured:
+            return configured
         direct = str(product.get("exchange_symbol") or "").strip().upper()
         if direct:
             return (direct,)
@@ -193,39 +183,7 @@ class AccountReconciliationService:
             str(row["instrument_id"]) for row in assignments if row.get("instrument_id")
         }
         universe_ids = {str(row["universe_id"]) for row in assignments if row.get("universe_id")}
-        if universe_ids:
-            with self.engine.connect() as connection:
-                latest_snapshots = connection.execute(
-                    select(universe_snapshot.c.id, universe_snapshot.c.universe_id)
-                    .where(
-                        universe_snapshot.c.universe_id.in_(universe_ids),
-                        *([universe_snapshot.c.observed_at <= observed_at] if observed_at else []),
-                    )
-                    .order_by(
-                        universe_snapshot.c.universe_id,
-                        universe_snapshot.c.observed_at.desc(),
-                        universe_snapshot.c.id.desc(),
-                    )
-                ).mappings()
-                seen_universes: set[str] = set()
-                snapshot_ids_list: list[str] = []
-                for row in latest_snapshots:
-                    universe_id = str(row["universe_id"])
-                    if universe_id in seen_universes:
-                        continue
-                    seen_universes.add(universe_id)
-                    snapshot_ids_list.append(str(row["id"]))
-                snapshot_ids = tuple(snapshot_ids_list)
-                if snapshot_ids:
-                    instrument_ids.update(
-                        str(value)
-                        for value in connection.execute(
-                            select(universe_member.c.instrument_id).where(
-                                universe_member.c.snapshot_id.in_(snapshot_ids),
-                                universe_member.c.eligible.is_(True),
-                            )
-                        ).scalars()
-                    )
+        instrument_ids.update(self._universe_instruments(universe_ids, observed_at))
         if not instrument_ids:
             if account.get("market") != "spot":
                 raise AccountAuthorityError(
@@ -242,6 +200,61 @@ class AccountReconciliationService:
                 f"live product {product_id} has no persisted symbols for its active scope"
             )
         return result
+
+    @staticmethod
+    def _configured_symbols(product: Mapping[str, Any]) -> tuple[str, ...]:
+        key = (
+            "live_exchange_symbols"
+            if product.get("execution_mode") == "live"
+            else "exchange_symbols"
+        )
+        configured = product.get(key) or product.get("exchange_symbols")
+        if not isinstance(configured, list | tuple):
+            return ()
+        return tuple(
+            sorted({str(value).strip().upper() for value in configured if str(value).strip()})
+        )
+
+    def _universe_instruments(self, universe_ids: set[str], observed_at: str | None) -> set[str]:
+        if not universe_ids:
+            return set()
+        with self.engine.connect() as connection:
+            latest_snapshots = connection.execute(
+                select(universe_snapshot.c.id, universe_snapshot.c.universe_id)
+                .where(
+                    universe_snapshot.c.universe_id.in_(universe_ids),
+                    *([universe_snapshot.c.observed_at <= observed_at] if observed_at else []),
+                )
+                .order_by(
+                    universe_snapshot.c.universe_id,
+                    universe_snapshot.c.observed_at.desc(),
+                    universe_snapshot.c.id.desc(),
+                )
+            ).mappings()
+            snapshot_ids = self._latest_snapshot_ids(latest_snapshots)
+            if not snapshot_ids:
+                return set()
+            return {
+                str(value)
+                for value in connection.execute(
+                    select(universe_member.c.instrument_id).where(
+                        universe_member.c.snapshot_id.in_(snapshot_ids),
+                        universe_member.c.eligible.is_(True),
+                    )
+                ).scalars()
+            }
+
+    @staticmethod
+    def _latest_snapshot_ids(rows) -> tuple[str, ...]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for row in rows:
+            universe_id = str(row["universe_id"])
+            if universe_id in seen:
+                continue
+            seen.add(universe_id)
+            result.append(str(row["id"]))
+        return tuple(result)
 
     def _reconcile_platform_exposure(
         self,
