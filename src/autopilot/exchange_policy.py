@@ -55,42 +55,55 @@ def validate_product_symbol_policy(product: ProductConfig) -> list[str]:
     return errors
 
 
-def validate_exchange_policy(product: ProductConfig, cfg: ExchangeConfig) -> list[str]:
+def _validate_active_income_exchange(product: ProductConfig, cfg: ExchangeConfig) -> list[str]:
     errors: list[str] = []
-    errors.extend(validate_product_symbol_policy(product))
     exchange = str(cfg.exchange).lower()
     quote_asset = str(cfg.quote_asset).upper()
+    if cfg.market_type != "futures":
+        errors.append(f"{product.name}: active income live execution must use futures.")
+    if exchange not in ACTIVE_INCOME_FUTURES_EXCHANGES:
+        allowed = ", ".join(sorted(ACTIVE_INCOME_FUTURES_EXCHANGES))
+        errors.append(
+            f"{product.name}: active income live futures must use Binance USDT futures "
+            f"(FUTURES_EXCHANGE={allowed}); got {cfg.exchange!r}."
+        )
+    if quote_asset != "USDT":
+        errors.append(
+            f"{product.name}: active income quote asset must be USDT; got {cfg.quote_asset!r}."
+        )
+    if getattr(cfg, "max_futures_leverage", None) != ACTIVE_INCOME_MAX_FUTURES_LEVERAGE:
+        errors.append(
+            f"{product.name}: active income futures must use "
+            f"MAX_FUTURES_LEVERAGE={ACTIVE_INCOME_MAX_FUTURES_LEVERAGE}."
+        )
+    if str(getattr(cfg, "futures_margin_mode", "")).lower() != "isolated":
+        errors.append(f"{product.name}: active income futures must use isolated margin.")
+    return errors
+
+
+def _validate_btc_accumulation_exchange(product: ProductConfig, cfg: ExchangeConfig) -> list[str]:
+    errors: list[str] = []
+    exchange = str(cfg.exchange).lower()
+    quote_asset = str(cfg.quote_asset).upper()
+    if cfg.market_type != "spot":
+        errors.append(f"{product.name}: BTC accumulation live execution must use spot.")
+    if exchange not in BTC_ACCUMULATION_SPOT_EXCHANGES:
+        allowed = ", ".join(sorted(BTC_ACCUMULATION_SPOT_EXCHANGES))
+        errors.append(
+            f"{product.name}: BTC accumulation live spot must use Binance spot "
+            f"(SPOT_EXCHANGE={allowed}); got {cfg.exchange!r}."
+        )
+    if quote_asset != "USDT":
+        errors.append(
+            f"{product.name}: BTC accumulation trades BTC/USDT, so QUOTE_ASSET must be USDT."
+        )
+    return errors
+
+
+def validate_exchange_policy(product: ProductConfig, cfg: ExchangeConfig) -> list[str]:
+    errors = validate_product_symbol_policy(product)
     if product.objective == "active_income":
-        if cfg.market_type != "futures":
-            errors.append(f"{product.name}: active income live execution must use futures.")
-        if exchange not in ACTIVE_INCOME_FUTURES_EXCHANGES:
-            allowed = ", ".join(sorted(ACTIVE_INCOME_FUTURES_EXCHANGES))
-            errors.append(
-                f"{product.name}: active income live futures must use Binance USDT futures "
-                f"(FUTURES_EXCHANGE={allowed}); got {cfg.exchange!r}."
-            )
-        if quote_asset != "USDT":
-            errors.append(
-                f"{product.name}: active income quote asset must be USDT; got {cfg.quote_asset!r}."
-            )
-        if getattr(cfg, "max_futures_leverage", None) != ACTIVE_INCOME_MAX_FUTURES_LEVERAGE:
-            errors.append(
-                f"{product.name}: active income futures must use "
-                f"MAX_FUTURES_LEVERAGE={ACTIVE_INCOME_MAX_FUTURES_LEVERAGE}."
-            )
-        if str(getattr(cfg, "futures_margin_mode", "")).lower() != "isolated":
-            errors.append(f"{product.name}: active income futures must use isolated margin.")
+        errors.extend(_validate_active_income_exchange(product, cfg))
     if product.objective == "btc_accumulation":
-        if cfg.market_type != "spot":
-            errors.append(f"{product.name}: BTC accumulation live execution must use spot.")
-        if exchange not in BTC_ACCUMULATION_SPOT_EXCHANGES:
-            allowed = ", ".join(sorted(BTC_ACCUMULATION_SPOT_EXCHANGES))
-            errors.append(
-                f"{product.name}: BTC accumulation live spot must use Binance spot "
-                f"(SPOT_EXCHANGE={allowed}); got {cfg.exchange!r}."
-            )
-        if quote_asset != "USDT":
-            errors.append(
-                f"{product.name}: BTC accumulation trades BTC/USDT, so QUOTE_ASSET must be USDT."
-            )
+        errors.extend(_validate_btc_accumulation_exchange(product, cfg))
     return errors
