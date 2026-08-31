@@ -402,6 +402,27 @@ class PlatformLiveAuthority:
     def _selection(
         self, *, product_id: str, artefact_hash: str, instrument_id: str, sleeve_id: str
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+        product, account = self._selected_product(product_id=product_id, sleeve_id=sleeve_id)
+        artefact = self._selected_artefact(
+            artefact_hash=artefact_hash,
+            product_id=product_id,
+            product=product,
+            account=account,
+        )
+        self._assert_reviewable(artefact)
+        if product_id == "btc_accumulation":
+            self._assert_btc_spot_only(artefact)
+        self._assert_instrument_supported(artefact, instrument_id=instrument_id)
+        instrument_payload = self._selected_instrument(
+            instrument_id=instrument_id,
+            account=account,
+            product=product,
+        )
+        return product, account, artefact, instrument_payload
+
+    def _selected_product(
+        self, *, product_id: str, sleeve_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         product = self.products.get(product_id)
         if product is None:
             raise PlatformLiveAuthorityError(f"unknown product: {product_id}")
@@ -413,6 +434,16 @@ class PlatformLiveAuthority:
         account = self.accounts[str(product["account_id"])]
         if account.get("environment") not in {"testnet", "production"}:
             raise PlatformLiveAuthorityError("selected account environment is invalid")
+        return product, account
+
+    def _selected_artefact(
+        self,
+        *,
+        artefact_hash: str,
+        product_id: str,
+        product: Mapping[str, Any],
+        account: Mapping[str, Any],
+    ) -> dict[str, Any]:
         try:
             artefact = self.artefacts.get(artefact_hash)
         except (CanonicalEvidenceError, KeyError, ValueError) as exc:
@@ -424,12 +455,21 @@ class PlatformLiveAuthority:
             or artefact.get("promotion_policy_id") != product["promotion_policy_id"]
         ):
             raise PlatformLiveAuthorityError("artefact binding does not match the selected product")
-        self._assert_reviewable(artefact)
-        if product_id == "btc_accumulation":
-            self._assert_btc_spot_only(artefact)
+        return artefact
+
+    @staticmethod
+    def _assert_instrument_supported(artefact: Mapping[str, Any], *, instrument_id: str) -> None:
         supported = {str(value) for value in artefact.get("supported_instruments", [])}
         if instrument_id not in supported:
             raise PlatformLiveAuthorityError("instrument is not supported by the artefact")
+
+    def _selected_instrument(
+        self,
+        *,
+        instrument_id: str,
+        account: Mapping[str, Any],
+        product: Mapping[str, Any],
+    ) -> dict[str, Any]:
         with self.engine.connect() as connection:
             row = connection.execute(
                 select(instrument.c.payload).where(instrument.c.id == instrument_id)
@@ -449,7 +489,7 @@ class PlatformLiveAuthority:
             raise PlatformLiveAuthorityError(
                 "selected instrument is not in the configured live product scope"
             )
-        return product, account, artefact, instrument_payload
+        return instrument_payload
 
     @staticmethod
     def _assert_reviewable(artefact: Mapping[str, Any]) -> None:
