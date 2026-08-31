@@ -20,10 +20,49 @@ DEFAULT_SNAPSHOT_DIR = PROJECT_ROOT / "runtime" / "market_universe_snapshots"
 API_ROOT = "https://fapi.binance.com"
 
 
-def _load_config(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or payload.get("version") != 1:
-        raise ValueError("market universe config must be a version 1 object")
+def _validate_legacy_config(payload: dict[str, Any]) -> None:
+    research = payload.get("research_symbols")
+    watchlist = payload.get("watchlist_symbols")
+    if not isinstance(research, list) or not research or not isinstance(watchlist, list):
+        raise ValueError("research_symbols and watchlist_symbols must be non-empty lists")
+    if not set(research).issubset(set(watchlist)):
+        raise ValueError("every research symbol must be on the watchlist")
+    if any(not isinstance(item, str) or not item.endswith("USDT") for item in watchlist):
+        raise ValueError("watchlist entries must be USDT symbols")
+
+
+def _validate_discovery_config(discovery: Any) -> None:
+    if not isinstance(discovery, dict):
+        raise ValueError("discovery must be an object")
+    allowed_discovery = {
+        "mode",
+        "maximum_research_symbols",
+        "always_include",
+        "exclude",
+    }
+    unknown_discovery = sorted(set(discovery) - allowed_discovery)
+    if unknown_discovery:
+        raise ValueError(
+            "market universe discovery has unknown fields: " + ", ".join(unknown_discovery)
+        )
+    if discovery.get("mode") != "all_trading_usdt_perpetuals":
+        raise ValueError("discovery.mode must be all_trading_usdt_perpetuals")
+    maximum = discovery.get("maximum_research_symbols")
+    if maximum is not None and (
+        not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1
+    ):
+        raise ValueError("discovery.maximum_research_symbols must be a positive integer when set")
+    for field in ("always_include", "exclude"):
+        values = discovery.get(field, [])
+        if not isinstance(values, list) or any(
+            not isinstance(item, str) or not item or not item.endswith("USDT") for item in values
+        ):
+            raise ValueError(f"discovery.{field} must be a list of USDT symbols")
+    if set(discovery.get("always_include", [])) & set(discovery.get("exclude", [])):
+        raise ValueError("discovery always_include and exclude must not overlap")
+
+
+def _validate_market_config(payload: dict[str, Any]) -> None:
     allowed = {
         "version",
         "market",
@@ -38,48 +77,18 @@ def _load_config(path: Path) -> dict[str, Any]:
         raise ValueError(f"market universe config has unknown fields: {', '.join(unknown)}")
     discovery = payload.get("discovery")
     if discovery is None:
-        research = payload.get("research_symbols")
-        watchlist = payload.get("watchlist_symbols")
-        if not isinstance(research, list) or not research or not isinstance(watchlist, list):
-            raise ValueError("research_symbols and watchlist_symbols must be non-empty lists")
-        if not set(research).issubset(set(watchlist)):
-            raise ValueError("every research symbol must be on the watchlist")
-        if any(not isinstance(item, str) or not item.endswith("USDT") for item in watchlist):
-            raise ValueError("watchlist entries must be USDT symbols")
+        _validate_legacy_config(payload)
     else:
-        if not isinstance(discovery, dict):
-            raise ValueError("discovery must be an object")
-        allowed_discovery = {
-            "mode",
-            "maximum_research_symbols",
-            "always_include",
-            "exclude",
-        }
-        unknown_discovery = sorted(set(discovery) - allowed_discovery)
-        if unknown_discovery:
-            raise ValueError(
-                "market universe discovery has unknown fields: " + ", ".join(unknown_discovery)
-            )
-        if discovery.get("mode") != "all_trading_usdt_perpetuals":
-            raise ValueError("discovery.mode must be all_trading_usdt_perpetuals")
-        maximum = discovery.get("maximum_research_symbols")
-        if maximum is not None and (
-            not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1
-        ):
-            raise ValueError(
-                "discovery.maximum_research_symbols must be a positive integer when set"
-            )
-        for field in ("always_include", "exclude"):
-            values = discovery.get(field, [])
-            if not isinstance(values, list) or any(
-                not isinstance(item, str) or not item or not item.endswith("USDT")
-                for item in values
-            ):
-                raise ValueError(f"discovery.{field} must be a list of USDT symbols")
-        if set(discovery.get("always_include", [])) & set(discovery.get("exclude", [])):
-            raise ValueError("discovery always_include and exclude must not overlap")
+        _validate_discovery_config(discovery)
     if payload.get("market") != "futures" or payload.get("quote_asset") != "USDT":
         raise ValueError("this screen is restricted to USDT futures")
+
+
+def _load_config(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError("market universe config must be a version 1 object")
+    _validate_market_config(payload)
     return payload
 
 
