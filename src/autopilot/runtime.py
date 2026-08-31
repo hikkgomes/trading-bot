@@ -3354,18 +3354,29 @@ def _validated_accounted_futures_flatten(
     if state.get("flatten_intent") is not None or state.get("exit_accounting_intent") is not None:
         return None
     last = state.get("last_flatten")
+    if not _accounted_futures_flatten_header_valid(last):
+        return None
+    if not _accounted_futures_flatten_fill_valid(product, last):
+        return None
+    if not _accounted_futures_flatten_position_valid(product, last):
+        return None
+    if not _accounted_futures_flatten_balance_valid(last):
+        return None
+    return last
+
+
+def _accounted_futures_flatten_header_valid(last: Any) -> bool:
     if not isinstance(last, dict) or last.get("reason") != "autopilot_control":
-        return None
-    fingerprint = last.get("broker_account_fingerprint")
-    if not _valid_account_fingerprint(fingerprint):
-        return None
+        return False
+    if not _valid_account_fingerprint(last.get("broker_account_fingerprint")):
+        return False
     event_id = last.get("exit_event_id")
     if (
         not isinstance(event_id, str)
         or len(event_id) != 64
         or any(char not in "0123456789abcdef" for char in event_id)
     ):
-        return None
+        return False
     client_id = last.get("flatten_client_id")
     if (
         not isinstance(client_id, str)
@@ -3373,14 +3384,19 @@ def _validated_accounted_futures_flatten(
         or len(client_id) > 36
         or any(char not in CLIENT_ORDER_ID_SAFE_CHARS for char in client_id)
     ):
-        return None
-    if last.get("submission_kind") != "reduce_only_market":
-        return None
+        return False
+    return last.get("submission_kind") == "reduce_only_market"
+
+
+def _accounted_futures_flatten_fill_valid(
+    product: ProductConfig,
+    last: dict[str, Any],
+) -> bool:
     fill = last.get("fill")
     if not isinstance(fill, dict) or fill.get("symbol") != product.symbol:
-        return None
+        return False
     if str(fill.get("side")) not in {OrderSide.BUY.value, OrderSide.SELL.value}:
-        return None
+        return False
     if any(
         value is None
         for value in (
@@ -3390,9 +3406,14 @@ def _validated_accounted_futures_flatten(
             _positive_evidence_float(fill.get("timestamp")),
         )
     ):
-        return None
-    if float(fill["fee"]) < 0:
-        return None
+        return False
+    return float(fill["fee"]) >= 0
+
+
+def _accounted_futures_flatten_position_valid(
+    product: ProductConfig,
+    last: dict[str, Any],
+) -> bool:
     before = last.get("position_before")
     before_qty = _evidence_float(before.get("qty")) if isinstance(before, dict) else None
     if (
@@ -3401,18 +3422,21 @@ def _validated_accounted_futures_flatten(
         or before_qty in {None, 0}
         or _positive_evidence_float(before.get("avg_price")) is None
     ):
-        return None
+        return False
     expected_side = OrderSide.SELL.value if float(before_qty) > 0 else OrderSide.BUY.value
-    if fill.get("side") != expected_side:
-        return None
+    fill = last.get("fill")
+    if not isinstance(fill, dict) or fill.get("side") != expected_side:
+        return False
     after = last.get("position_after")
-    if (
-        not isinstance(after, dict)
-        or after.get("symbol") != product.symbol
-        or _evidence_float(after.get("qty")) != 0
-        or _evidence_float(after.get("avg_price")) != 0
-    ):
-        return None
+    return (
+        isinstance(after, dict)
+        and after.get("symbol") == product.symbol
+        and _evidence_float(after.get("qty")) == 0
+        and _evidence_float(after.get("avg_price")) == 0
+    )
+
+
+def _accounted_futures_flatten_balance_valid(last: dict[str, Any]) -> bool:
     quote_before = _evidence_float(last.get("quote_balance_before"))
     quote_after = _evidence_float(last.get("quote_balance_after"))
     delta = _evidence_float(last.get("realized_account_delta"))
@@ -3423,11 +3447,9 @@ def _validated_accounted_futures_flatten(
         or quote_after < 0
         or delta is None
     ):
-        return None
+        return False
     tolerance = max(abs(quote_before) * 1e-12, 1e-9)
-    if abs((quote_after - quote_before) - delta) > tolerance:
-        return None
-    return last
+    return abs((quote_after - quote_before) - delta) <= tolerance
 
 
 def _assert_futures_flatten_account_binding(
