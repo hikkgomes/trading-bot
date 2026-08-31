@@ -44,6 +44,7 @@ from src.execution.broker import (
     ProtectiveOrderStatus,
 )
 from src.execution.config import ExchangeConfig
+from src.execution.rate_limit import RateLimitedExchangeClient, shared_exchange_rate_limiter
 
 LOGGER = logging.getLogger(__name__)
 QUOTE_ASSETS = ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH")
@@ -343,6 +344,11 @@ class CcxtBroker(Broker):
                 },
             }
         )
+        limiter = shared_exchange_rate_limiter(
+            f"{self.config.exchange}:{self.config.market_type}:{self.config.testnet}",
+            minimum_interval_seconds=self.config.request_min_interval_seconds,
+        )
+        client = RateLimitedExchangeClient(client, limiter)
         if self.config.testnet:
             if str(self.config.exchange).lower() == "binanceusdm":
                 enable_demo = getattr(client, "enable_demo_trading", None)

@@ -44,6 +44,7 @@ class ExchangeConfig:
     futures_margin_mode: str = "isolated"
     quote_asset: str = "USDT"
     allow_multi_symbol_positions: bool = False
+    request_min_interval_seconds: float = 0.05
 
     @property
     def account_fingerprint(self) -> str:
@@ -97,6 +98,9 @@ class ExchangeConfig:
         quote_asset = os.environ.get("QUOTE_ASSET", "USDT").strip().upper()
         if not quote_asset:
             raise ValueError("QUOTE_ASSET must be non-empty.")
+        request_min_interval_seconds = _bounded_float(
+            "EXCHANGE_MIN_REQUEST_INTERVAL_SECONDS", "0.05", minimum=0.0, maximum=60.0
+        )
 
         return cls(
             exchange=exchange,
@@ -112,6 +116,7 @@ class ExchangeConfig:
             futures_margin_mode=futures_margin_mode,
             quote_asset=quote_asset,
             allow_multi_symbol_positions=_env_bool("ALLOW_MULTI_SYMBOL_POSITIONS", False),
+            request_min_interval_seconds=request_min_interval_seconds,
         )
 
 
@@ -123,6 +128,19 @@ def _positive_float(name: str, default: str) -> float:
         raise ValueError(f"{name} must be numeric, got {raw!r}.") from exc
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be finite and positive, got {value:g}.")
+    return value
+
+
+def _bounded_float(name: str, default: str, *, minimum: float, maximum: float) -> float:
+    raw = os.environ.get(name, default).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be numeric, got {raw!r}.") from exc
+    if not math.isfinite(value) or value < minimum or value > maximum:
+        raise ValueError(
+            f"{name} must be finite and between {minimum:g} and {maximum:g}, got {value:g}."
+        )
     return value
 
 

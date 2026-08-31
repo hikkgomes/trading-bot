@@ -11,6 +11,7 @@ import requests
 
 from src.data.binance_market import normalise_public_event
 from src.domain.market_events import MarketEvent, MarketEventType
+from src.execution.rate_limit import ExchangeRateLimiter, shared_exchange_rate_limiter
 
 _REST_ENDPOINTS = {
     "spot": "https://api.binance.com",
@@ -47,6 +48,7 @@ class BinanceMarketGapRepair:
         base_urls: Mapping[str, str] | None = None,
         timeout_seconds: float = 10.0,
         clock_ms: Callable[[], int] | None = None,
+        rate_limiter: ExchangeRateLimiter | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("gap repair timeout must be positive")
@@ -57,6 +59,9 @@ class BinanceMarketGapRepair:
         self.base_urls = {market: str(url).rstrip("/") for market, url in urls.items()}
         self.timeout_seconds = timeout_seconds
         self.clock_ms = clock_ms or (lambda: int(time.time_ns() / 1_000_000))
+        self.rate_limiter = rate_limiter or shared_exchange_rate_limiter(
+            "binance-public-market-repair"
+        )
 
     def __call__(self, request: Mapping[str, Any]) -> tuple[MarketEvent, ...]:
         market = str(request.get("market") or "")
@@ -79,6 +84,7 @@ class BinanceMarketGapRepair:
         return handler(request, market=market, symbol=symbol)
 
     def _get(self, *, market: str, path: str, params: Mapping[str, Any]) -> Any:
+        self.rate_limiter.acquire()
         response = self.session.get(
             f"{self.base_urls[market]}{path}",
             params=dict(params),

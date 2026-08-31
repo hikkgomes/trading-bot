@@ -472,6 +472,55 @@ def test_shipped_dotenv_example_builds_execution_config(monkeypatch):
     assert cfg.quote_asset == "USDT"
 
 
+def test_exchange_config_reads_bounded_request_interval(monkeypatch):
+    monkeypatch.setenv("EXCHANGE_MIN_REQUEST_INTERVAL_SECONDS", "0.25")
+
+    cfg = ExchangeConfig.from_env(load_file=False)
+
+    assert cfg.request_min_interval_seconds == 0.25
+
+
+def test_exchange_config_rejects_invalid_request_interval(monkeypatch):
+    monkeypatch.setenv("EXCHANGE_MIN_REQUEST_INTERVAL_SECONDS", "-0.1")
+
+    with pytest.raises(ValueError, match="EXCHANGE_MIN_REQUEST_INTERVAL_SECONDS"):
+        ExchangeConfig.from_env(load_file=False)
+
+
+def test_rate_limited_exchange_client_throttles_network_methods() -> None:
+    from src.execution.rate_limit import ExchangeRateLimiter, RateLimitedExchangeClient
+
+    current = [0.0]
+    sleeps: list[float] = []
+
+    def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        current[0] += delay
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def fetch_ticker(self, symbol: str) -> dict[str, str]:
+            self.calls.append(symbol)
+            return {"last": "100"}
+
+        def amount_to_precision(self, symbol: str, amount: float) -> str:
+            return f"{symbol}:{amount}"
+
+    raw = Client()
+    client = RateLimitedExchangeClient(
+        raw,
+        ExchangeRateLimiter(0.5, clock=lambda: current[0], sleeper=sleep),
+    )
+
+    assert client.fetch_ticker("BTC/USDT") == {"last": "100"}
+    assert client.fetch_ticker("ETH/USDT") == {"last": "100"}
+    assert client.amount_to_precision("BTC/USDT", 1.0) == "BTC/USDT:1.0"
+    assert raw.calls == ["BTC/USDT", "ETH/USDT"]
+    assert sleeps == [0.5]
+
+
 def test_load_dotenv_rejects_symlink_without_loading_target(tmp_path, monkeypatch):
     from src.execution.config import load_dotenv
 
