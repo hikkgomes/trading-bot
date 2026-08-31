@@ -256,38 +256,16 @@ class DatabaseResearchJobHandlers:
         """Compile safe campaigns into the same candidate queue as all providers."""
 
         payload = claimed.payload
-        required = {
-            "product_id",
-            "instrument_universe",
-            "dataset_snapshot_hashes",
-            "submitted_at",
-            "generation_budget",
-        }
-        if not required.issubset(payload):
-            raise JobSchemaError("hypothesis generation command is incomplete")
-        product_id = str(payload["product_id"])
-        universe = tuple(str(item) for item in payload["instrument_universe"])
-        snapshot_ids = tuple(str(item) for item in payload["dataset_snapshot_hashes"])
+        product_id, universe, snapshot_ids = self._generation_inputs(payload)
         feedback_store = SqlGenerationFeedbackStore(self.store.engine)
         if not universe or not snapshot_ids:
-            for campaign in CAMPAIGNS:
-                if campaign.product == product_id:
-                    feedback_store.append(
-                        GenerationFeedback(
-                            campaign=campaign.name,
-                            outcome="data_unavailable",
-                            observed_at=str(payload["submitted_at"]),
-                            reason_code=(
-                                "point_in_time_universe_unavailable"
-                                if not universe
-                                else "canonical_dataset_bundle_unavailable"
-                            ),
-                        )
-                    )
-            return {
-                "product_id": product_id,
-                "state": "waiting_for_universe" if not universe else "waiting_for_dataset",
-            }
+            self._record_generation_waiting(
+                product_id=product_id,
+                observed_at=str(payload["submitted_at"]),
+                universe_available=bool(universe),
+                feedback_store=feedback_store,
+            )
+            return self._generation_waiting_response(product_id, universe_available=bool(universe))
         generator = HypothesisGenerator(
             product=product_id,
             instrument_universe=universe,
@@ -309,29 +287,101 @@ class DatabaseResearchJobHandlers:
             ),
             parent_candidates=parent_candidates,
         )
+        bundle, plan = self._generation_plan(payload)
+        registered = self._register_hypotheses(
+            hypotheses,
+            renew=renew,
+            plan=plan,
+            bundle=bundle,
+            observed_at=str(payload["submitted_at"]),
+            feedback_store=feedback_store,
+        )
+        return {
+            "product_id": product_id,
+            "state": "generated",
+            "candidate_ids": registered,
+            "candidate_count": len(registered),
+        }
+
+    @staticmethod
+    def _generation_inputs(
+        payload: Mapping[str, Any],
+    ) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+        required = {
+            "product_id",
+            "instrument_universe",
+            "dataset_snapshot_hashes",
+            "submitted_at",
+            "generation_budget",
+        }
+        if not required.issubset(payload):
+            raise JobSchemaError("hypothesis generation command is incomplete")
+        return (
+            str(payload["product_id"]),
+            tuple(str(item) for item in payload["instrument_universe"]),
+            tuple(str(item) for item in payload["dataset_snapshot_hashes"]),
+        )
+
+    @staticmethod
+    def _generation_waiting_response(
+        product_id: str, *, universe_available: bool
+    ) -> dict[str, Any]:
+        return {
+            "product_id": product_id,
+            "state": "waiting_for_dataset" if universe_available else "waiting_for_universe",
+        }
+
+    @staticmethod
+    def _record_generation_waiting(
+        *,
+        product_id: str,
+        observed_at: str,
+        universe_available: bool,
+        feedback_store: SqlGenerationFeedbackStore,
+    ) -> None:
+        reason_code = (
+            "canonical_dataset_bundle_unavailable"
+            if universe_available
+            else "point_in_time_universe_unavailable"
+        )
+        for campaign in CAMPAIGNS:
+            if campaign.product == product_id:
+                feedback_store.append(
+                    GenerationFeedback(
+                        campaign=campaign.name,
+                        outcome="data_unavailable",
+                        observed_at=observed_at,
+                        reason_code=reason_code,
+                    )
+                )
+
+    def _generation_plan(
+        self, payload: Mapping[str, Any]
+    ) -> tuple[Any | None, CandidateDatasetPlan | None]:
         bundle_id = payload.get("dataset_bundle_id")
-        plan = None
-        if bundle_id:
-            bundle = SqlDatasetBundleRepository(self.store.engine).get(str(bundle_id))
-            if bundle.lifecycle_state is not DatasetLifecycleState.READY:
-                raise JobSchemaError("hypothesis generation requires a ready dataset bundle")
-            plan = CandidateDatasetPlan.from_bundle(bundle)
+        if not bundle_id:
+            return None, None
+        bundle = SqlDatasetBundleRepository(self.store.engine).get(str(bundle_id))
+        if bundle.lifecycle_state is not DatasetLifecycleState.READY:
+            raise JobSchemaError("hypothesis generation requires a ready dataset bundle")
+        return bundle, CandidateDatasetPlan.from_bundle(bundle)
+
+    def _register_hypotheses(
+        self,
+        hypotheses: Any,
+        *,
+        renew: Callable[[], ClaimedJob],
+        plan: CandidateDatasetPlan | None,
+        bundle: Any | None,
+        observed_at: str,
+        feedback_store: SqlGenerationFeedbackStore,
+    ) -> list[str]:
         thesis_registry = SqlThesisRegistry(self.store.engine)
         coordinator = ResearchCoordinator(self.store)
         registered: list[str] = []
         for hypothesis in hypotheses:
             renew()
-            candidate = hypothesis.candidate
-            if plan is not None:
-                if plan.product_id != candidate.definition.product:
-                    raise JobSchemaError("generated candidate and dataset bundle products differ")
-                candidate = replace(
-                    candidate,
-                    dataset_snapshot_hashes=plan.all_snapshot_ids,
-                    dataset_bundle_id=bundle.bundle_id,
-                    dataset_plan=plan,
-                )
-                hypothesis = replace(hypothesis, candidate=candidate)
+            hypothesis = self._bind_generation_plan(hypothesis, plan=plan, bundle=bundle)
             try:
                 thesis_registry.register(hypothesis.thesis)
                 candidate_id = coordinator.submit(hypothesis.candidate)
@@ -340,7 +390,7 @@ class DatabaseResearchJobHandlers:
                     GenerationFeedback(
                         campaign=hypothesis.campaign.name,
                         outcome="resource_budget_exhausted",
-                        observed_at=str(payload["submitted_at"]),
+                        observed_at=observed_at,
                         reason_code=str(exc),
                         semantic_signature=hypothesis.semantic_signature,
                     )
@@ -350,18 +400,35 @@ class DatabaseResearchJobHandlers:
                 GenerationFeedback(
                     campaign=hypothesis.campaign.name,
                     outcome="accepted",
-                    observed_at=str(payload["submitted_at"]),
+                    observed_at=observed_at,
                     candidate_id=candidate_id,
                     semantic_signature=hypothesis.semantic_signature,
                 )
             )
             registered.append(candidate_id)
-        return {
-            "product_id": product_id,
-            "state": "generated",
-            "candidate_ids": registered,
-            "candidate_count": len(registered),
-        }
+        return registered
+
+    @staticmethod
+    def _bind_generation_plan(
+        hypothesis: Any,
+        *,
+        plan: CandidateDatasetPlan | None,
+        bundle: Any | None,
+    ) -> Any:
+        if plan is None:
+            return hypothesis
+        candidate = hypothesis.candidate
+        if plan.product_id != candidate.definition.product:
+            raise JobSchemaError("generated candidate and dataset bundle products differ")
+        return replace(
+            hypothesis,
+            candidate=replace(
+                candidate,
+                dataset_snapshot_hashes=plan.all_snapshot_ids,
+                dataset_bundle_id=bundle.bundle_id,
+                dataset_plan=plan,
+            ),
+        )
 
     def register_ml_candidate(
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
@@ -395,69 +462,12 @@ class DatabaseResearchJobHandlers:
             raise JobSchemaError("candidate evaluation requires a canonical dataset resolver")
         resolver = self.dataset_resolver
         candidate = self.store.get_candidate(request.candidate_id)
-        adaptive_snapshot_ids = request.snapshot_ids_for_stage(request.requested_stage)
-        if request.requested_stage == "protected":
-            adaptive_snapshot_ids = tuple(
-                snapshot_id
-                for snapshot_id in request.dataset_snapshot_ids
-                if snapshot_id
-                != (
-                    request.protected_snapshot_id()
-                    if request.dataset_roles
-                    else request.dataset_snapshot_ids[0]
-                )
-            )
-        if adaptive_snapshot_ids:
-            resolved_context = resolver.resolve_context(
-                snapshot_ids=adaptive_snapshot_ids,
-                feature_manifest_id=str(request.feature_manifest_id),
-                cost_model_id=str(request.cost_model_id),
-                parameter_set_id=str(request.parameter_set_id),
-                allowed_roles=(
-                    frozenset(
-                        {
-                            request.dataset_roles[snapshot_id]
-                            for snapshot_id in adaptive_snapshot_ids
-                        }
-                    )
-                    if request.dataset_roles
-                    else None
-                ),
-                minimum_availability_timestamp=(
-                    str(claimed.payload["artefact_created_at"])
-                    if request.requested_stage == "forward"
-                    else None
-                ),
-                maximum_availability_timestamp=(
-                    request.evaluated_at if request.requested_stage == "forward" else None
-                ),
-            )
-            try:
-                context = self.context_builders.build(
-                    CandidateEvaluationView.from_candidate(candidate, adaptive_snapshot_ids),
-                    resolved_context,
-                )
-            except (ExecutorError, KeyError, TypeError, ValueError) as exc:
-                context = {
-                    **dict(resolved_context),
-                    "provider_context_error": f"{type(exc).__name__}: {exc}",
-                }
-        else:
-            context = {
-                "candidate_id": request.candidate_id,
-                "dataset_snapshot_ids": [],
-                "feature_manifest_id": str(request.feature_manifest_id),
-                "cost_model_id": str(request.cost_model_id),
-                "parameter_set_id": str(request.parameter_set_id),
-            }
-        context = {
-            **dict(context),
-            "artefact_hash": request.artefact_hash,
-            "artefact_created_at": request.artefact_created_at,
-            "global_trial_count": SqlThesisRegistry(self.store.engine).lineage_trial_count(
-                candidate.thesis_id
-            ),
-        }
+        context = self._resolve_evaluation_context(
+            candidate=candidate,
+            request=request,
+            payload=claimed.payload,
+            resolver=resolver,
+        )
 
         def evaluate_protected(claim: Mapping[str, Any]) -> tuple[bool, Mapping[str, Any]]:
             protected_context = claim.get("protected_context")
@@ -563,6 +573,80 @@ class DatabaseResearchJobHandlers:
             ),
             evidence_policy=self.evidence_policy,
         ).evaluate(request)
+        return self._finalise_evaluation(candidate, request, result)
+
+    def _resolve_evaluation_context(
+        self,
+        *,
+        candidate: Candidate,
+        request: EvaluationRequest,
+        payload: Mapping[str, Any],
+        resolver: CanonicalDatasetResolver,
+    ) -> dict[str, Any]:
+        adaptive_snapshot_ids = request.snapshot_ids_for_stage(request.requested_stage)
+        if request.requested_stage == "protected":
+            protected_id = (
+                request.protected_snapshot_id()
+                if request.dataset_roles
+                else request.dataset_snapshot_ids[0]
+            )
+            adaptive_snapshot_ids = tuple(
+                snapshot_id
+                for snapshot_id in request.dataset_snapshot_ids
+                if snapshot_id != protected_id
+            )
+        if adaptive_snapshot_ids:
+            resolved_context = resolver.resolve_context(
+                snapshot_ids=adaptive_snapshot_ids,
+                feature_manifest_id=str(request.feature_manifest_id),
+                cost_model_id=str(request.cost_model_id),
+                parameter_set_id=str(request.parameter_set_id),
+                allowed_roles=(
+                    frozenset(
+                        request.dataset_roles[snapshot_id] for snapshot_id in adaptive_snapshot_ids
+                    )
+                    if request.dataset_roles
+                    else None
+                ),
+                minimum_availability_timestamp=(
+                    str(payload["artefact_created_at"])
+                    if request.requested_stage == "forward"
+                    else None
+                ),
+                maximum_availability_timestamp=(
+                    request.evaluated_at if request.requested_stage == "forward" else None
+                ),
+            )
+            try:
+                context = self.context_builders.build(
+                    CandidateEvaluationView.from_candidate(candidate, adaptive_snapshot_ids),
+                    resolved_context,
+                )
+            except (ExecutorError, KeyError, TypeError, ValueError) as exc:
+                context = {
+                    **dict(resolved_context),
+                    "provider_context_error": f"{type(exc).__name__}: {exc}",
+                }
+        else:
+            context = {
+                "candidate_id": request.candidate_id,
+                "dataset_snapshot_ids": [],
+                "feature_manifest_id": str(request.feature_manifest_id),
+                "cost_model_id": str(request.cost_model_id),
+                "parameter_set_id": str(request.parameter_set_id),
+            }
+        return {
+            **dict(context),
+            "artefact_hash": request.artefact_hash,
+            "artefact_created_at": request.artefact_created_at,
+            "global_trial_count": SqlThesisRegistry(self.store.engine).lineage_trial_count(
+                candidate.thesis_id
+            ),
+        }
+
+    def _finalise_evaluation(
+        self, candidate: Candidate, request: EvaluationRequest, result: Any
+    ) -> dict[str, Any]:
         response = {
             "candidate_id": result.candidate_id,
             "stage": result.stage,
@@ -579,19 +663,30 @@ class DatabaseResearchJobHandlers:
             )
         campaign = candidate.definition.metadata.get("campaign")
         if isinstance(campaign, str) and campaign:
-            if not result.accepted or result.stage == "protected":
-                SqlGenerationFeedbackStore(self.store.engine).append(
-                    GenerationFeedback(
-                        campaign=campaign,
-                        outcome="accepted" if result.accepted else "rejected",
-                        observed_at=request.evaluated_at,
-                        candidate_id=candidate.candidate_id,
-                        reason_code=result.reason_code,
-                        semantic_signature=hypothesis_signature(candidate.definition),
-                        metadata={"stage": result.stage},
-                    )
-                )
+            self._record_evaluation_feedback(candidate, request, result, campaign=campaign)
         return response
+
+    def _record_evaluation_feedback(
+        self,
+        candidate: Candidate,
+        request: EvaluationRequest,
+        result: Any,
+        *,
+        campaign: str,
+    ) -> None:
+        if result.accepted and result.stage != "protected":
+            return
+        SqlGenerationFeedbackStore(self.store.engine).append(
+            GenerationFeedback(
+                campaign=campaign,
+                outcome="accepted" if result.accepted else "rejected",
+                observed_at=request.evaluated_at,
+                candidate_id=candidate.candidate_id,
+                reason_code=result.reason_code,
+                semantic_signature=hypothesis_signature(candidate.definition),
+                metadata={"stage": result.stage},
+            )
+        )
 
     def _publish_strategy_artefact(
         self,
