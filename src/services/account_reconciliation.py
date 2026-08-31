@@ -169,7 +169,9 @@ class AccountReconciliationService:
 
         configured = product.get("exchange_symbols")
         if isinstance(configured, list | tuple):
-            symbols = tuple(sorted({str(value).strip().upper() for value in configured if str(value).strip()}))
+            symbols = tuple(
+                sorted({str(value).strip().upper() for value in configured if str(value).strip()})
+            )
             if symbols:
                 return symbols
         direct = str(product.get("exchange_symbol") or "").strip().upper()
@@ -182,19 +184,13 @@ class AccountReconciliationService:
             at=observed_at,
         )
         instrument_ids = {
-            str(row["instrument_id"])
-            for row in assignments
-            if row.get("instrument_id")
+            str(row["instrument_id"]) for row in assignments if row.get("instrument_id")
         }
-        universe_ids = {
-            str(row["universe_id"])
-            for row in assignments
-            if row.get("universe_id")
-        }
+        universe_ids = {str(row["universe_id"]) for row in assignments if row.get("universe_id")}
         if universe_ids:
             with self.engine.connect() as connection:
                 latest_snapshots = connection.execute(
-                    select(universe_snapshot.c.id)
+                    select(universe_snapshot.c.id, universe_snapshot.c.universe_id)
                     .where(
                         universe_snapshot.c.universe_id.in_(universe_ids),
                         *([universe_snapshot.c.observed_at <= observed_at] if observed_at else []),
@@ -204,8 +200,16 @@ class AccountReconciliationService:
                         universe_snapshot.c.observed_at.desc(),
                         universe_snapshot.c.id.desc(),
                     )
-                ).scalars()
-                snapshot_ids = tuple(dict.fromkeys(str(value) for value in latest_snapshots))
+                ).mappings()
+                seen_universes: set[str] = set()
+                snapshot_ids_list: list[str] = []
+                for row in latest_snapshots:
+                    universe_id = str(row["universe_id"])
+                    if universe_id in seen_universes:
+                        continue
+                    seen_universes.add(universe_id)
+                    snapshot_ids_list.append(str(row["id"]))
+                snapshot_ids = tuple(snapshot_ids_list)
                 if snapshot_ids:
                     instrument_ids.update(
                         str(value)
