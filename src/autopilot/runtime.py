@@ -2892,21 +2892,13 @@ def _strict_spot_flatten_intent_number(
     return number
 
 
-def _validated_spot_flatten_intent(
+def _spot_flatten_intent_header(
     product: ProductConfig,
-    raw_intent: Any,
+    raw_intent: dict[str, Any],
     *,
     strategy_id: str,
     position_detail: dict[str, Any],
 ) -> dict[str, Any]:
-    if not isinstance(raw_intent, dict):
-        raise RuntimeError("flatten_intent must be an object")
-    missing = sorted(SPOT_FLATTEN_INTENT_KEYS - set(raw_intent))
-    unexpected = sorted(set(raw_intent) - SPOT_FLATTEN_INTENT_KEYS)
-    if missing:
-        raise RuntimeError(f"flatten_intent is missing required key(s): {', '.join(missing)}")
-    if unexpected:
-        raise RuntimeError(f"flatten_intent has unexpected key(s): {', '.join(unexpected)}")
     if isinstance(raw_intent.get("version"), bool) or raw_intent.get("version") != 1:
         raise RuntimeError("flatten_intent.version must be 1")
     if raw_intent.get("strategy_id") != strategy_id:
@@ -2924,7 +2916,6 @@ def _validated_spot_flatten_intent(
         raise RuntimeError(
             "flatten_intent.broker_account_fingerprint does not match the tracked position"
         )
-
     qty = _strict_spot_flatten_intent_number(
         raw_intent.get("qty"),
         field="qty",
@@ -2944,7 +2935,18 @@ def _validated_spot_flatten_intent(
     quote_tolerance = max(abs(expected_quote_budget) * 1e-9, 1e-9)
     if abs(quote_budget - expected_quote_budget) > quote_tolerance:
         raise RuntimeError("flatten_intent.quote_budget does not match the tracked position")
+    return {
+        "broker_account_fingerprint": broker_account_fingerprint,
+        "qty": qty,
+        "quote_budget": quote_budget,
+        "created_ts": created_ts,
+    }
 
+
+def _spot_flatten_position_evidence(
+    product: ProductConfig,
+    raw_intent: dict[str, Any],
+) -> tuple[dict[str, Any], float, float]:
     position_before = raw_intent.get("position_before")
     if not isinstance(position_before, dict):
         raise RuntimeError("flatten_intent.position_before must be an object")
@@ -2972,7 +2974,19 @@ def _validated_spot_flatten_intent(
         field="position_before.avg_price",
         positive=False,
     )
+    return position_before, before_qty, before_avg_price
 
+
+def _assert_spot_flatten_client_id(
+    raw_intent: dict[str, Any],
+    *,
+    strategy_id: str,
+    symbol: str,
+    qty: float,
+    quote_budget: float,
+    before_qty: float,
+    broker_account_fingerprint: str,
+) -> str:
     client_id = raw_intent.get("client_id")
     if (
         not isinstance(client_id, str)
@@ -2983,7 +2997,7 @@ def _validated_spot_flatten_intent(
         raise RuntimeError("flatten_intent.client_id is unsafe")
     expected_client_id = _spot_flatten_client_id(
         strategy_id=strategy_id,
-        symbol=product.symbol,
+        symbol=symbol,
         qty=qty,
         quote_budget=quote_budget,
         position_before_qty=before_qty,
@@ -2991,6 +3005,36 @@ def _validated_spot_flatten_intent(
     )
     if client_id != expected_client_id:
         raise RuntimeError("flatten_intent.client_id does not match its deterministic intent")
+    return client_id
+
+
+def _validated_spot_flatten_intent(
+    product: ProductConfig,
+    raw_intent: Any,
+    *,
+    strategy_id: str,
+    position_detail: dict[str, Any],
+) -> dict[str, Any]:
+    raw = _validate_flatten_intent_mapping(raw_intent, SPOT_FLATTEN_INTENT_KEYS)
+    header = _spot_flatten_intent_header(
+        product,
+        raw,
+        strategy_id=strategy_id,
+        position_detail=position_detail,
+    )
+    position_before, before_qty, before_avg_price = _spot_flatten_position_evidence(
+        product,
+        raw,
+    )
+    client_id = _assert_spot_flatten_client_id(
+        raw,
+        strategy_id=strategy_id,
+        symbol=product.symbol,
+        qty=header["qty"],
+        quote_budget=header["quote_budget"],
+        before_qty=before_qty,
+        broker_account_fingerprint=header["broker_account_fingerprint"],
+    )
 
     return {
         "version": 1,
@@ -2999,15 +3043,15 @@ def _validated_spot_flatten_intent(
         "side": OrderSide.BUY.value,
         "order_type": OrderType.MARKET.value,
         "client_id": client_id,
-        "broker_account_fingerprint": broker_account_fingerprint,
-        "qty": qty,
-        "quote_budget": quote_budget,
+        "broker_account_fingerprint": header["broker_account_fingerprint"],
+        "qty": header["qty"],
+        "quote_budget": header["quote_budget"],
         "position_before": {
             "symbol": product.symbol,
             "qty": before_qty,
             "avg_price": before_avg_price,
         },
-        "created_ts": created_ts,
+        "created_ts": header["created_ts"],
     }
 
 
