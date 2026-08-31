@@ -298,170 +298,27 @@ class SqlCanonicalPromotionEvidence:
         self, request: PromotionRequest
     ) -> tuple[LifecycleState, PromotionEvidence, PromotionPolicy]:
         with self.engine.connect() as connection:
-            artefact_rows = [
-                row
-                for row in connection.execute(select(strategy_artefact)).mappings()
-                if isinstance(row["payload"], dict)
-                and row["payload"].get("strategy_version_id") == request.strategy_version_id
-            ]
-            if len(artefact_rows) != 1:
-                raise ValueError(
-                    "canonical strategy artefact must have exactly one immutable version"
-                )
-            artefact_row = artefact_rows[0]
-            if artefact_row is None:
-                raise ValueError("canonical strategy artefact is missing")
-            artefact = dict(artefact_row["payload"])
-            artefact_hash = str(artefact.get("artefact_hash") or "")
-            if artefact_hash != str(artefact_row["id"]):
-                raise ValueError("canonical strategy artefact identity is invalid")
-            content = dict(artefact)
-            content.pop("artefact_hash", None)
-            if canonical_hash(content) != artefact_hash:
-                raise ValueError("canonical strategy artefact content hash is invalid")
-            product_id = str(
-                artefact.get("product_id") or (artefact.get("supported_products") or [""])[0] or ""
+            artefact_row = _promotion_artefact_row(connection, request)
+            artefact, artefact_hash, product_id, portfolio_id, account_id, authoritative = (
+                _validate_promotion_artefact(artefact_row, request)
             )
-            portfolio_id = str(artefact.get("portfolio_id") or "")
-            if not portfolio_id:
-                raise ValueError("canonical strategy artefact has no portfolio identity")
-            account_id = str(artefact.get("account_id") or "")
-            if not product_id:
-                raise ValueError("canonical strategy artefact has no product identity")
-            if not account_id:
-                raise ValueError("canonical strategy artefact has no account identity")
-            if not artefact.get("engine_version"):
-                raise ValueError("canonical strategy artefact has no engine version")
-            if not artefact.get("promotion_policy_id"):
-                raise ValueError("canonical strategy artefact has no promotion policy identity")
-            authoritative = artefact.get("authoritative_evidence")
-            if not isinstance(authoritative, Mapping):
-                raise ValueError("canonical strategy artefact has no authoritative evidence map")
-            validation_stage_ids = authoritative.get("validation_stage_ids")
-            holdout_claim_id = str(authoritative.get("holdout_claim_id") or "")
-            if (
-                not isinstance(validation_stage_ids, list)
-                or not validation_stage_ids
-                or not holdout_claim_id
-            ):
-                raise ValueError("canonical strategy artefact has incomplete evidence identities")
-            binding_fields = {
-                "strategy_version_id": request.strategy_version_id,
-                "product_id": product_id,
-                "portfolio_id": portfolio_id,
-                "account_id": account_id,
-                "promotion_policy_id": str(artefact.get("promotion_policy_id")),
-                "engine_version": str(artefact.get("engine_version")),
-            }
-            if any(
-                authoritative.get(field) not in {None, expected}
-                for field, expected in binding_fields.items()
-            ):
-                raise ValueError("canonical artefact authoritative binding is inconsistent")
-            validation_experiment_ids = {
-                str(row["id"])
-                for row in connection.execute(
-                    select(experiment).where(
-                        experiment.c.strategy_version_id == request.strategy_version_id
-                    )
-                ).mappings()
-            }
-            validation_by_id = {
-                str(row["id"]): row
-                for row in connection.execute(select(validation_stage)).mappings()
-            }
-            missing_validation = [
-                str(identity)
-                for identity in validation_stage_ids
-                if str(identity) not in validation_by_id
-            ]
-            if missing_validation:
-                raise ValueError(
-                    "canonical validation stage is missing: " + ", ".join(missing_validation)
-                )
-            validation_rows = [validation_by_id[str(identity)] for identity in validation_stage_ids]
-            if any(
-                str(row["experiment_id"]) not in validation_experiment_ids
-                and str(row["experiment_id"]) != request.strategy_version_id
-                for row in validation_rows
-            ):
-                raise ValueError("canonical validation stage is bound to another experiment")
-            claim_ids = {
-                str(row["id"])
-                for row in connection.execute(select(holdout_claim)).mappings()
-                if isinstance(row["payload"], dict)
-                and row["payload"].get("strategy_version_id") == request.strategy_version_id
-            }
-            holdout_rows = [
-                row
-                for row in connection.execute(select(holdout_outcome)).mappings()
-                if str(row["holdout_claim_id"]) in claim_ids
-            ]
-            claim_row = next(
-                (
-                    row
-                    for row in connection.execute(select(holdout_claim)).mappings()
-                    if str(row["id"]) == holdout_claim_id
-                ),
-                None,
+            validation_stage_ids = authoritative["validation_stage_ids"]
+            holdout_claim_id = str(authoritative["holdout_claim_id"])
+            validation_rows = _promotion_validation_rows(connection, request, validation_stage_ids)
+            holdout_rows = _promotion_holdout_rows(connection, request, holdout_claim_id)
+            (
+                forward_summary,
+                forward_decision,
+                approvals,
+                preflights,
+                events,
+            ) = _promotion_evidence_rows(
+                connection,
+                request,
+                product_id=product_id,
+                account_id=account_id,
+                artefact_hash=artefact_hash,
             )
-            if claim_row is None or str(claim_row["id"]) not in claim_ids:
-                raise ValueError("canonical holdout claim is missing or misbound")
-            holdout_rows = [
-                row for row in holdout_rows if str(row["holdout_claim_id"]) == holdout_claim_id
-            ]
-            if not holdout_rows:
-                raise ValueError("canonical holdout outcome is missing")
-            forward_summaries = [
-                row
-                for row in connection.execute(select(forward_paper_summary)).mappings()
-                if row["strategy_version_id"] == request.strategy_version_id
-                and row["product_id"] == product_id
-                and row["artefact_hash"] == artefact_hash
-            ]
-            forward_summary = max(
-                forward_summaries,
-                key=lambda row: str(row["created_at"]),
-                default=None,
-            )
-            forward_decisions = [
-                row
-                for row in connection.execute(select(forward_paper_decision)).mappings()
-                if row["strategy_version_id"] == request.strategy_version_id
-                and row["product_id"] == product_id
-                and row["artefact_hash"] == artefact_hash
-            ]
-            forward_decision = (
-                max(
-                    (
-                        row
-                        for row in forward_decisions
-                        if forward_summary is not None
-                        and row["summary_id"] == forward_summary["id"]
-                    ),
-                    key=lambda row: str(row["decided_at"]),
-                    default=None,
-                )
-                if forward_summary is not None
-                else None
-            )
-            approvals = [
-                row
-                for row in connection.execute(select(strategy_approval)).mappings()
-                if row["strategy_version_id"] == request.strategy_version_id
-                and row["product_id"] == product_id
-                and row["account_id"] == account_id
-                and row["artefact_hash"] == artefact_hash
-            ]
-            preflights = [
-                row
-                for row in connection.execute(select(production_preflight)).mappings()
-                if row["strategy_version_id"] == request.strategy_version_id
-                and row["product_id"] == product_id
-                and row["account_id"] == account_id
-                and row["artefact_hash"] == artefact_hash
-            ]
-            events = list(connection.execute(select(promotion_event)).mappings())
 
         latest_approval = (
             max(approvals, key=lambda row: str(row["approved_at"])) if approvals else None
@@ -617,6 +474,219 @@ class SqlCanonicalPromotionEvidence:
         return current_state, evidence, policy
 
 
+def _promotion_artefact_row(connection: Any, request: PromotionRequest) -> Mapping[str, Any]:
+    rows = [
+        row
+        for row in connection.execute(select(strategy_artefact)).mappings()
+        if isinstance(row["payload"], dict)
+        and row["payload"].get("strategy_version_id") == request.strategy_version_id
+    ]
+    if len(rows) != 1:
+        raise ValueError("canonical strategy artefact must have exactly one immutable version")
+    row = rows[0]
+    if row is None:
+        raise ValueError("canonical strategy artefact is missing")
+    return row
+
+
+def _validate_promotion_artefact(
+    row: Mapping[str, Any], request: PromotionRequest
+) -> tuple[dict[str, Any], str, str, str, str, Mapping[str, Any]]:
+    artefact = dict(row["payload"])
+    artefact_hash, product_id, portfolio_id, account_id = _promotion_artefact_identity(
+        row, artefact
+    )
+    authoritative = _promotion_authoritative_evidence(
+        artefact,
+        request=request,
+        product_id=product_id,
+        portfolio_id=portfolio_id,
+        account_id=account_id,
+    )
+    return artefact, artefact_hash, product_id, portfolio_id, account_id, authoritative
+
+
+def _promotion_artefact_identity(
+    row: Mapping[str, Any], artefact: Mapping[str, Any]
+) -> tuple[str, str, str, str]:
+    artefact_hash = str(artefact.get("artefact_hash") or "")
+    if artefact_hash != str(row["id"]):
+        raise ValueError("canonical strategy artefact identity is invalid")
+    content = dict(artefact)
+    content.pop("artefact_hash", None)
+    if canonical_hash(content) != artefact_hash:
+        raise ValueError("canonical strategy artefact content hash is invalid")
+    product_id = str(
+        artefact.get("product_id") or (artefact.get("supported_products") or [""])[0] or ""
+    )
+    portfolio_id = str(artefact.get("portfolio_id") or "")
+    account_id = str(artefact.get("account_id") or "")
+    if not portfolio_id:
+        raise ValueError("canonical strategy artefact has no portfolio identity")
+    if not product_id:
+        raise ValueError("canonical strategy artefact has no product identity")
+    if not account_id:
+        raise ValueError("canonical strategy artefact has no account identity")
+    if not artefact.get("engine_version"):
+        raise ValueError("canonical strategy artefact has no engine version")
+    if not artefact.get("promotion_policy_id"):
+        raise ValueError("canonical strategy artefact has no promotion policy identity")
+    return artefact_hash, product_id, portfolio_id, account_id
+
+
+def _promotion_authoritative_evidence(
+    artefact: Mapping[str, Any],
+    *,
+    request: PromotionRequest,
+    product_id: str,
+    portfolio_id: str,
+    account_id: str,
+) -> Mapping[str, Any]:
+    authoritative = artefact.get("authoritative_evidence")
+    if not isinstance(authoritative, Mapping):
+        raise ValueError("canonical strategy artefact has no authoritative evidence map")
+    validation_stage_ids = authoritative.get("validation_stage_ids")
+    holdout_claim_id = str(authoritative.get("holdout_claim_id") or "")
+    if (
+        not isinstance(validation_stage_ids, list)
+        or not validation_stage_ids
+        or not holdout_claim_id
+    ):
+        raise ValueError("canonical strategy artefact has incomplete evidence identities")
+    binding_fields = {
+        "strategy_version_id": request.strategy_version_id,
+        "product_id": product_id,
+        "portfolio_id": portfolio_id,
+        "account_id": account_id,
+        "promotion_policy_id": str(artefact.get("promotion_policy_id")),
+        "engine_version": str(artefact.get("engine_version")),
+    }
+    if any(
+        authoritative.get(field) not in {None, expected}
+        for field, expected in binding_fields.items()
+    ):
+        raise ValueError("canonical artefact authoritative binding is inconsistent")
+    return authoritative
+
+
+def _promotion_validation_rows(
+    connection: Any,
+    request: PromotionRequest,
+    validation_stage_ids: list[Any],
+) -> list[Mapping[str, Any]]:
+    validation_experiment_ids = {
+        str(row["id"])
+        for row in connection.execute(
+            select(experiment).where(
+                experiment.c.strategy_version_id == request.strategy_version_id
+            )
+        ).mappings()
+    }
+    validation_by_id = {
+        str(row["id"]): row for row in connection.execute(select(validation_stage)).mappings()
+    }
+    missing = [
+        str(identity) for identity in validation_stage_ids if str(identity) not in validation_by_id
+    ]
+    if missing:
+        raise ValueError("canonical validation stage is missing: " + ", ".join(missing))
+    rows = [validation_by_id[str(identity)] for identity in validation_stage_ids]
+    if any(
+        str(row["experiment_id"]) not in validation_experiment_ids
+        and str(row["experiment_id"]) != request.strategy_version_id
+        for row in rows
+    ):
+        raise ValueError("canonical validation stage is bound to another experiment")
+    return rows
+
+
+def _promotion_holdout_rows(
+    connection: Any,
+    request: PromotionRequest,
+    holdout_claim_id: str,
+) -> list[Mapping[str, Any]]:
+    claims = list(connection.execute(select(holdout_claim)).mappings())
+    claim_ids = {
+        str(row["id"])
+        for row in claims
+        if isinstance(row["payload"], dict)
+        and row["payload"].get("strategy_version_id") == request.strategy_version_id
+    }
+    claim_row = next((row for row in claims if str(row["id"]) == holdout_claim_id), None)
+    if claim_row is None or str(claim_row["id"]) not in claim_ids:
+        raise ValueError("canonical holdout claim is missing or misbound")
+    rows = [
+        row
+        for row in connection.execute(select(holdout_outcome)).mappings()
+        if str(row["holdout_claim_id"]) == holdout_claim_id
+    ]
+    if not rows:
+        raise ValueError("canonical holdout outcome is missing")
+    return rows
+
+
+def _promotion_evidence_rows(
+    connection: Any,
+    request: PromotionRequest,
+    *,
+    product_id: str,
+    account_id: str,
+    artefact_hash: str,
+) -> tuple[
+    Mapping[str, Any] | None,
+    Mapping[str, Any] | None,
+    list[Mapping[str, Any]],
+    list[Mapping[str, Any]],
+    list[Mapping[str, Any]],
+]:
+    forward_summaries = [
+        row
+        for row in connection.execute(select(forward_paper_summary)).mappings()
+        if row["strategy_version_id"] == request.strategy_version_id
+        and row["product_id"] == product_id
+        and row["artefact_hash"] == artefact_hash
+    ]
+    forward_summary = max(forward_summaries, key=lambda row: str(row["created_at"]), default=None)
+    forward_decisions = [
+        row
+        for row in connection.execute(select(forward_paper_decision)).mappings()
+        if row["strategy_version_id"] == request.strategy_version_id
+        and row["product_id"] == product_id
+        and row["artefact_hash"] == artefact_hash
+    ]
+    forward_decision = _latest_forward_decision(forward_decisions, forward_summary)
+    approvals = [
+        row
+        for row in connection.execute(select(strategy_approval)).mappings()
+        if row["strategy_version_id"] == request.strategy_version_id
+        and row["product_id"] == product_id
+        and row["account_id"] == account_id
+        and row["artefact_hash"] == artefact_hash
+    ]
+    preflights = [
+        row
+        for row in connection.execute(select(production_preflight)).mappings()
+        if row["strategy_version_id"] == request.strategy_version_id
+        and row["product_id"] == product_id
+        and row["account_id"] == account_id
+        and row["artefact_hash"] == artefact_hash
+    ]
+    events = list(connection.execute(select(promotion_event)).mappings())
+    return forward_summary, forward_decision, approvals, preflights, events
+
+
+def _latest_forward_decision(
+    rows: list[Mapping[str, Any]], summary: Mapping[str, Any] | None
+) -> Mapping[str, Any] | None:
+    if summary is None:
+        return None
+    return max(
+        (row for row in rows if row["summary_id"] == summary["id"]),
+        key=lambda row: str(row["decided_at"]),
+        default=None,
+    )
+
+
 def decide_promotion(
     *,
     strategy_version_id: str,
@@ -633,6 +703,44 @@ def decide_promotion(
         if requested_transition is not None
         else None
     )
+    requested = _requested_transition_decision(
+        strategy_version_id=strategy_version_id,
+        current_state=current_state,
+        evidence=evidence,
+        policy=policy,
+        evaluated_at=evaluated_at,
+        requested_transition=requested_transition,
+    )
+    if requested is not None:
+        return requested
+    drift = _drift_decision(
+        strategy_version_id=strategy_version_id,
+        current_state=current_state,
+        evidence=evidence,
+        policy=policy,
+        evaluated_at=evaluated_at,
+    )
+    if drift is not None:
+        return drift
+    return _state_transition_decision(
+        strategy_version_id=strategy_version_id,
+        current_state=current_state,
+        evidence=evidence,
+        policy=policy,
+        evaluated_at=evaluated_at,
+        requested_transition=requested_transition,
+    )
+
+
+def _requested_transition_decision(
+    *,
+    strategy_version_id: str,
+    current_state: LifecycleState,
+    evidence: PromotionEvidence,
+    policy: PromotionPolicy,
+    evaluated_at: str,
+    requested_transition: str | None,
+) -> PromotionDecision | None:
     if requested_transition == "suspend":
         next_state = (
             current_state if current_state is LifecycleState.RETIRED else LifecycleState.SUSPENDED
@@ -659,38 +767,7 @@ def decide_promotion(
             evidence,
         )
     if requested_transition == "resume":
-        if current_state is not LifecycleState.SUSPENDED:
-            return _decision(
-                strategy_version_id,
-                current_state,
-                current_state,
-                False,
-                "resume_requires_suspended_state",
-                evaluated_at,
-                0.0,
-                evidence,
-            )
-        if not evidence.forward_evidence_accepted:
-            return _decision(
-                strategy_version_id,
-                current_state,
-                current_state,
-                False,
-                "resume_forward_evidence_missing",
-                evaluated_at,
-                0.0,
-                evidence,
-            )
-        return _decision(
-            strategy_version_id,
-            current_state,
-            LifecycleState.LIVE_READY,
-            True,
-            "resumed_to_live_ready",
-            evaluated_at,
-            policy.paper_capital_limit,
-            evidence,
-        )
+        return _resume_decision(strategy_version_id, current_state, evidence, policy, evaluated_at)
     if requested_transition in {"live", "live_canary"} and current_state in {
         LifecycleState.REGISTERED,
         LifecycleState.DEVELOPMENT,
@@ -719,184 +796,113 @@ def decide_promotion(
             0.0,
             evidence,
         )
-    if evidence.drawdown > policy.maximum_drawdown:
-        drawdown_next_state = (
-            LifecycleState.SUSPENDED
-            if current_state
-            in {
-                LifecycleState.FORWARD_PAPER,
-                LifecycleState.LIVE_READY,
-                LifecycleState.LIVE_CANARY,
-                LifecycleState.LIVE,
-            }
-            else current_state
-        )
+    return None
+
+
+def _resume_decision(
+    strategy_version_id: str,
+    current_state: LifecycleState,
+    evidence: PromotionEvidence,
+    policy: PromotionPolicy,
+    evaluated_at: str,
+) -> PromotionDecision:
+    if current_state is not LifecycleState.SUSPENDED:
         return _decision(
             strategy_version_id,
             current_state,
-            drawdown_next_state,
+            current_state,
             False,
-            "drawdown_limit",
+            "resume_requires_suspended_state",
             evaluated_at,
             0.0,
             evidence,
         )
-    if evidence.execution_drift > policy.maximum_execution_drift:
+    if not evidence.forward_evidence_accepted:
         return _decision(
             strategy_version_id,
             current_state,
-            LifecycleState.SUSPENDED,
+            current_state,
             False,
-            "execution_drift_limit",
+            "resume_forward_evidence_missing",
             evaluated_at,
             0.0,
             evidence,
         )
-    if evidence.model_drift > policy.maximum_model_drift:
-        return _decision(
-            strategy_version_id,
-            current_state,
-            LifecycleState.SUSPENDED,
-            False,
-            "model_drift_limit",
-            evaluated_at,
-            0.0,
-            evidence,
-        )
-    if current_state in {LifecycleState.REGISTERED, LifecycleState.DEVELOPMENT}:
-        checks = (
-            (not evidence.validation_accepted, "validation_not_accepted"),
-            (not evidence.protected_holdout_accepted, "protected_holdout_not_accepted"),
-            (not policy.automatic_paper_promotion, "automatic_paper_promotion_disabled"),
-        )
-        reason = next((reason for failed, reason in checks if failed), None)
-        if reason:
-            return _decision(
-                strategy_version_id,
-                current_state,
-                current_state,
-                False,
-                reason,
-                evaluated_at,
-                0.0,
-                evidence,
-            )
-        return _decision(
-            strategy_version_id,
-            current_state,
+    return _decision(
+        strategy_version_id,
+        current_state,
+        LifecycleState.LIVE_READY,
+        True,
+        "resumed_to_live_ready",
+        evaluated_at,
+        policy.paper_capital_limit,
+        evidence,
+    )
+
+
+def _drift_decision(
+    *,
+    strategy_version_id: str,
+    current_state: LifecycleState,
+    evidence: PromotionEvidence,
+    policy: PromotionPolicy,
+    evaluated_at: str,
+) -> PromotionDecision | None:
+    checks = (
+        (evidence.drawdown > policy.maximum_drawdown, "drawdown_limit"),
+        (evidence.execution_drift > policy.maximum_execution_drift, "execution_drift_limit"),
+        (evidence.model_drift > policy.maximum_model_drift, "model_drift_limit"),
+    )
+    reason = next((value for failed, value in checks if failed), None)
+    if reason is None:
+        return None
+    next_state = (
+        LifecycleState.SUSPENDED
+        if current_state
+        in {
             LifecycleState.FORWARD_PAPER,
-            True,
-            "forward_paper_promoted",
-            evaluated_at,
-            policy.paper_capital_limit,
-            evidence,
+            LifecycleState.LIVE_READY,
+            LifecycleState.LIVE_CANARY,
+            LifecycleState.LIVE,
+        }
+        else current_state
+    )
+    return _decision(
+        strategy_version_id,
+        current_state,
+        next_state,
+        False,
+        reason,
+        evaluated_at,
+        0.0,
+        evidence,
+    )
+
+
+def _state_transition_decision(
+    *,
+    strategy_version_id: str,
+    current_state: LifecycleState,
+    evidence: PromotionEvidence,
+    policy: PromotionPolicy,
+    evaluated_at: str,
+    requested_transition: str | None,
+) -> PromotionDecision:
+    if current_state in {LifecycleState.REGISTERED, LifecycleState.DEVELOPMENT}:
+        return _registered_state_decision(
+            strategy_version_id, current_state, evidence, policy, evaluated_at
         )
     if current_state in {LifecycleState.FORWARD_PAPER, LifecycleState.LIVE_READY}:
-        failures = _forward_evidence_failures(evidence, policy)
-        if failures:
-            return _decision(
-                strategy_version_id,
-                current_state,
-                current_state,
-                False,
-                failures[0],
-                evaluated_at,
-                0.0,
-                evidence,
-            )
-        if requested_transition == "live_canary":
-            reason = _live_authority_failure(evidence)
-            if reason:
-                return _decision(
-                    strategy_version_id,
-                    current_state,
-                    current_state,
-                    False,
-                    reason,
-                    evaluated_at,
-                    0.0,
-                    evidence,
-                )
-            capital = min(
-                policy.canary_capital_limit,
-                evidence.requested_capital or policy.canary_capital_limit,
-                evidence.portfolio_capacity,
-                evidence.risk_budget_available,
-            )
-            return _decision(
-                strategy_version_id,
-                current_state,
-                LifecycleState.LIVE_CANARY,
-                True,
-                "live_canary_promoted",
-                evaluated_at,
-                capital,
-                evidence,
-            )
-        if current_state is LifecycleState.LIVE_READY:
-            return _decision(
-                strategy_version_id,
-                current_state,
-                current_state,
-                True,
-                "live_ready_maintained",
-                evaluated_at,
-                policy.paper_capital_limit,
-                evidence,
-            )
-        if policy.automatic_live_ready_promotion and requested_transition in {
-            None,
-            "forward_paper",
-            "live_ready",
-        }:
-            return _decision(
-                strategy_version_id,
-                current_state,
-                LifecycleState.LIVE_READY,
-                True,
-                "live_ready_promoted",
-                evaluated_at,
-                policy.paper_capital_limit,
-                evidence,
-            )
-        return _decision(
+        return _forward_state_decision(
             strategy_version_id,
             current_state,
-            current_state,
-            True,
-            "forward_paper_maintained",
-            evaluated_at,
-            policy.paper_capital_limit,
             evidence,
+            policy,
+            evaluated_at,
+            requested_transition,
         )
     if current_state is LifecycleState.LIVE_CANARY and requested_transition == "live":
-        reason = _live_authority_failure(evidence, require_canary=True)
-        if reason:
-            return _decision(
-                strategy_version_id,
-                current_state,
-                current_state,
-                False,
-                reason,
-                evaluated_at,
-                0.0,
-                evidence,
-            )
-        capital = min(
-            evidence.requested_capital,
-            evidence.portfolio_capacity,
-            evidence.risk_budget_available,
-        )
-        return _decision(
-            strategy_version_id,
-            current_state,
-            LifecycleState.LIVE,
-            True,
-            "live_promoted",
-            evaluated_at,
-            capital,
-            evidence,
-        )
+        return _canary_state_decision(strategy_version_id, current_state, evidence, evaluated_at)
     return _decision(
         strategy_version_id,
         current_state,
@@ -905,6 +911,176 @@ def decide_promotion(
         "lifecycle_state_maintained",
         evaluated_at,
         min(evidence.requested_capital, evidence.risk_budget_available),
+        evidence,
+    )
+
+
+def _registered_state_decision(
+    strategy_version_id: str,
+    current_state: LifecycleState,
+    evidence: PromotionEvidence,
+    policy: PromotionPolicy,
+    evaluated_at: str,
+) -> PromotionDecision:
+    checks = (
+        (not evidence.validation_accepted, "validation_not_accepted"),
+        (not evidence.protected_holdout_accepted, "protected_holdout_not_accepted"),
+        (not policy.automatic_paper_promotion, "automatic_paper_promotion_disabled"),
+    )
+    reason = next((value for failed, value in checks if failed), None)
+    if reason:
+        return _decision(
+            strategy_version_id,
+            current_state,
+            current_state,
+            False,
+            reason,
+            evaluated_at,
+            0.0,
+            evidence,
+        )
+    return _decision(
+        strategy_version_id,
+        current_state,
+        LifecycleState.FORWARD_PAPER,
+        True,
+        "forward_paper_promoted",
+        evaluated_at,
+        policy.paper_capital_limit,
+        evidence,
+    )
+
+
+def _forward_state_decision(
+    strategy_version_id: str,
+    current_state: LifecycleState,
+    evidence: PromotionEvidence,
+    policy: PromotionPolicy,
+    evaluated_at: str,
+    requested_transition: str | None,
+) -> PromotionDecision:
+    failures = _forward_evidence_failures(evidence, policy)
+    if failures:
+        return _decision(
+            strategy_version_id,
+            current_state,
+            current_state,
+            False,
+            failures[0],
+            evaluated_at,
+            0.0,
+            evidence,
+        )
+    if requested_transition == "live_canary":
+        return _live_canary_decision(
+            strategy_version_id, current_state, evidence, policy, evaluated_at
+        )
+    if current_state is LifecycleState.LIVE_READY:
+        return _decision(
+            strategy_version_id,
+            current_state,
+            current_state,
+            True,
+            "live_ready_maintained",
+            evaluated_at,
+            policy.paper_capital_limit,
+            evidence,
+        )
+    if policy.automatic_live_ready_promotion and requested_transition in {
+        None,
+        "forward_paper",
+        "live_ready",
+    }:
+        return _decision(
+            strategy_version_id,
+            current_state,
+            LifecycleState.LIVE_READY,
+            True,
+            "live_ready_promoted",
+            evaluated_at,
+            policy.paper_capital_limit,
+            evidence,
+        )
+    return _decision(
+        strategy_version_id,
+        current_state,
+        current_state,
+        True,
+        "forward_paper_maintained",
+        evaluated_at,
+        policy.paper_capital_limit,
+        evidence,
+    )
+
+
+def _live_canary_decision(
+    strategy_version_id: str,
+    current_state: LifecycleState,
+    evidence: PromotionEvidence,
+    policy: PromotionPolicy,
+    evaluated_at: str,
+) -> PromotionDecision:
+    reason = _live_authority_failure(evidence)
+    if reason:
+        return _decision(
+            strategy_version_id,
+            current_state,
+            current_state,
+            False,
+            reason,
+            evaluated_at,
+            0.0,
+            evidence,
+        )
+    capital = min(
+        policy.canary_capital_limit,
+        evidence.requested_capital or policy.canary_capital_limit,
+        evidence.portfolio_capacity,
+        evidence.risk_budget_available,
+    )
+    return _decision(
+        strategy_version_id,
+        current_state,
+        LifecycleState.LIVE_CANARY,
+        True,
+        "live_canary_promoted",
+        evaluated_at,
+        capital,
+        evidence,
+    )
+
+
+def _canary_state_decision(
+    strategy_version_id: str,
+    current_state: LifecycleState,
+    evidence: PromotionEvidence,
+    evaluated_at: str,
+) -> PromotionDecision:
+    reason = _live_authority_failure(evidence, require_canary=True)
+    if reason:
+        return _decision(
+            strategy_version_id,
+            current_state,
+            current_state,
+            False,
+            reason,
+            evaluated_at,
+            0.0,
+            evidence,
+        )
+    capital = min(
+        evidence.requested_capital,
+        evidence.portfolio_capacity,
+        evidence.risk_budget_available,
+    )
+    return _decision(
+        strategy_version_id,
+        current_state,
+        LifecycleState.LIVE,
+        True,
+        "live_promoted",
+        evaluated_at,
+        capital,
         evidence,
     )
 
@@ -1126,40 +1302,14 @@ class DatabasePromotionWorker:
         if claimed is None:
             return {"reason_code": "promotion_queue_empty"}
         try:
-            if self.strict_identity_contract:
-                request = PromotionRequest.from_payload(claimed.payload)
-                current_state, evidence, policy = SqlCanonicalPromotionEvidence(
-                    self.store.engine, self.policy_store
-                ).build(request)
-                strategy_version_id = request.strategy_version_id
-                evaluated_at = request.evaluated_at
-            else:
-                # SQLite is retained for isolated unit tests. Those fixtures
-                # may still call the pure lifecycle function with an explicit
-                # evidence object, but production PostgreSQL never enters this
-                # branch.
-                raw_evidence = claimed.payload.get("evidence")
-                raw_policy = claimed.payload.get("policy")
-                if isinstance(raw_evidence, dict) and isinstance(raw_policy, dict):
-                    evidence = PromotionEvidence(**raw_evidence)
-                    policy = PromotionPolicy(**raw_policy)
-                    current_state = LifecycleState(str(claimed.payload["current_state"]))
-                    strategy_version_id = str(claimed.payload["strategy_version_id"])
-                    evaluated_at = str(claimed.payload.get("evaluated_at") or now)
-                else:
-                    request = PromotionRequest.from_payload(claimed.payload)
-                    current_state, evidence, policy = SqlCanonicalPromotionEvidence(
-                        self.store.engine, self.policy_store
-                    ).build(request)
-                    strategy_version_id = request.strategy_version_id
-                    evaluated_at = request.evaluated_at
+            current_state, evidence, policy, strategy_version_id, evaluated_at = (
+                self._load_promotion_context(claimed.payload, now=now)
+            )
             decision = decide_promotion(
                 strategy_version_id=strategy_version_id,
                 current_state=current_state,
-                evidence=evidence
-                if isinstance(evidence, PromotionEvidence)
-                else PromotionEvidence(**evidence),
-                policy=policy if isinstance(policy, PromotionPolicy) else PromotionPolicy(**policy),
+                evidence=evidence,
+                policy=policy,
                 evaluated_at=evaluated_at,
                 requested_transition=(
                     str(claimed.payload["requested_transition"])
@@ -1168,64 +1318,12 @@ class DatabasePromotionWorker:
                 ),
             )
             identity = self.store.append(decision)
-            if self.strict_identity_contract:
-                assignments = SqlActiveStrategyAssignmentRepository(self.store.engine)
-                assignable_states = {
-                    LifecycleState.FORWARD_PAPER,
-                    LifecycleState.LIVE_READY,
-                    LifecycleState.LIVE_CANARY,
-                    LifecycleState.LIVE,
-                }
-                if decision.accepted and decision.next_state in assignable_states:
-                    if not evidence.product_id or not evidence.portfolio_id:
-                        raise ValueError(
-                            "accepted promotion evidence lacks product/portfolio identity"
-                        )
-                    execution_mode = (
-                        "live"
-                        if decision.next_state
-                        in {
-                            LifecycleState.LIVE_CANARY,
-                            LifecycleState.LIVE,
-                        }
-                        else "paper"
-                    )
-                    if execution_mode == "live" and not evidence.supported_instruments:
-                        raise ValueError(
-                            "live promotion evidence lacks exact supported instruments"
-                        )
-                    if execution_mode == "live" and current_state is LifecycleState.LIVE_CANARY:
-                        assignments.deactivate(
-                            evidence.product_id,
-                            at=decision.evaluated_at,
-                            assignment_reason="promotion transition to live",
-                        )
-                    instrument_ids = evidence.supported_instruments or (None,)
-                    for instrument_id in instrument_ids:
-                        assignments.assign(
-                            product_id=evidence.product_id,
-                            portfolio_id=evidence.portfolio_id,
-                            strategy_version_id=decision.strategy_version_id,
-                            artefact_hash=evidence.strategy_artefact_hash,
-                            lifecycle_state=decision.next_state.value,
-                            execution_mode=execution_mode,
-                            capital_limit=decision.capital_limit,
-                            assigned_at=decision.evaluated_at,
-                            assigned_by=self.worker_id,
-                            instrument_id=instrument_id,
-                            risk_budget=min(
-                                decision.capital_limit,
-                                evidence.risk_budget_available,
-                            ),
-                            assignment_reason=(f"canonical promotion: {decision.reason_code}"),
-                            payload={
-                                "promotion_event_id": identity,
-                                "source": "canonical_promotion_worker",
-                            },
-                        )
-                elif decision.next_state in {LifecycleState.SUSPENDED, LifecycleState.RETIRED}:
-                    if evidence.product_id:
-                        assignments.deactivate(evidence.product_id)
+            self._apply_assignment_transition(
+                decision=decision,
+                evidence=evidence,
+                current_state=current_state,
+                identity=identity,
+            )
         except Exception as exc:
             self.queue.fail(
                 claimed,
@@ -1248,6 +1346,104 @@ class DatabasePromotionWorker:
             "next_state": decision.next_state.value,
             "capital_limit": decision.capital_limit,
         }
+
+    def _load_promotion_context(
+        self, payload: Mapping[str, Any], *, now: str
+    ) -> tuple[LifecycleState, PromotionEvidence, PromotionPolicy, str, str]:
+        if self.strict_identity_contract:
+            request = PromotionRequest.from_payload(payload)
+            state, evidence, policy = SqlCanonicalPromotionEvidence(
+                self.store.engine, self.policy_store
+            ).build(request)
+            return state, evidence, policy, request.strategy_version_id, request.evaluated_at
+        raw_evidence = payload.get("evidence")
+        raw_policy = payload.get("policy")
+        if isinstance(raw_evidence, dict) and isinstance(raw_policy, dict):
+            return (
+                LifecycleState(str(payload["current_state"])),
+                PromotionEvidence(**raw_evidence),
+                PromotionPolicy(**raw_policy),
+                str(payload["strategy_version_id"]),
+                str(payload.get("evaluated_at") or now),
+            )
+        request = PromotionRequest.from_payload(payload)
+        state, evidence, policy = SqlCanonicalPromotionEvidence(
+            self.store.engine, self.policy_store
+        ).build(request)
+        return state, evidence, policy, request.strategy_version_id, request.evaluated_at
+
+    def _apply_assignment_transition(
+        self,
+        *,
+        decision: PromotionDecision,
+        evidence: PromotionEvidence,
+        current_state: LifecycleState,
+        identity: str,
+    ) -> None:
+        if not self.strict_identity_contract:
+            return
+        assignments = SqlActiveStrategyAssignmentRepository(self.store.engine)
+        assignable_states = {
+            LifecycleState.FORWARD_PAPER,
+            LifecycleState.LIVE_READY,
+            LifecycleState.LIVE_CANARY,
+            LifecycleState.LIVE,
+        }
+        if decision.accepted and decision.next_state in assignable_states:
+            self._assign_promoted_state(
+                assignments,
+                decision=decision,
+                evidence=evidence,
+                current_state=current_state,
+                identity=identity,
+            )
+        elif decision.next_state in {LifecycleState.SUSPENDED, LifecycleState.RETIRED}:
+            if evidence.product_id:
+                assignments.deactivate(evidence.product_id)
+
+    def _assign_promoted_state(
+        self,
+        assignments: SqlActiveStrategyAssignmentRepository,
+        *,
+        decision: PromotionDecision,
+        evidence: PromotionEvidence,
+        current_state: LifecycleState,
+        identity: str,
+    ) -> None:
+        if not evidence.product_id or not evidence.portfolio_id:
+            raise ValueError("accepted promotion evidence lacks product/portfolio identity")
+        execution_mode = (
+            "live"
+            if decision.next_state in {LifecycleState.LIVE_CANARY, LifecycleState.LIVE}
+            else "paper"
+        )
+        if execution_mode == "live" and not evidence.supported_instruments:
+            raise ValueError("live promotion evidence lacks exact supported instruments")
+        if execution_mode == "live" and current_state is LifecycleState.LIVE_CANARY:
+            assignments.deactivate(
+                evidence.product_id,
+                at=decision.evaluated_at,
+                assignment_reason="promotion transition to live",
+            )
+        for instrument_id in evidence.supported_instruments or (None,):
+            assignments.assign(
+                product_id=evidence.product_id,
+                portfolio_id=evidence.portfolio_id,
+                strategy_version_id=decision.strategy_version_id,
+                artefact_hash=evidence.strategy_artefact_hash,
+                lifecycle_state=decision.next_state.value,
+                execution_mode=execution_mode,
+                capital_limit=decision.capital_limit,
+                assigned_at=decision.evaluated_at,
+                assigned_by=self.worker_id,
+                instrument_id=instrument_id,
+                risk_budget=min(decision.capital_limit, evidence.risk_budget_available),
+                assignment_reason=f"canonical promotion: {decision.reason_code}",
+                payload={
+                    "promotion_event_id": identity,
+                    "source": "canonical_promotion_worker",
+                },
+            )
 
 
 def _retry_at(value: str, seconds: int) -> str:
