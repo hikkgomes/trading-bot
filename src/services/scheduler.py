@@ -76,6 +76,7 @@ AUTONOMOUS_SCHEDULES = (
     ScheduleSpec("forward_paper_summary", 900),
     ScheduleSpec("promotion_evaluation", 900),
     ScheduleSpec("reporting", 900),
+    ScheduleSpec("agent_review", 3600),
     ScheduleSpec("maintenance", 3600),
 )
 
@@ -200,6 +201,7 @@ class PlatformScheduler:
             "forward_paper_summary": "forward_paper_summary",
             "promotion_evaluation": "promotion_evaluation",
             "reporting": "reporting",
+            "agent_review": "agent_review",
             "maintenance": "maintenance",
         }.get(schedule_name)
 
@@ -211,7 +213,7 @@ class PlatformScheduler:
         now: str,
         due_at: str,
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
-        if schedule_name in {"reporting", "maintenance"}:
+        if schedule_name in {"reporting", "agent_review", "maintenance"}:
             if product_id != min(self.products):
                 return ()
             return (
@@ -720,6 +722,12 @@ class PlatformScheduler:
                     bundle.universe_snapshot_id if bundle is not None else None
                 ),
                 "catalogue_submitted_at": bundle.created_at if bundle is not None else now,
+            }
+        if schedule_name == "agent_review":
+            return {
+                **base,
+                "review_scope": "development_and_robustness",
+                "reason_code": "scheduled_research_review",
             }
         return base
 

@@ -1030,7 +1030,7 @@ def _agent_cycle(
     maximum_runtime_seconds = int(limits["maximum_runtime_seconds"])
     queue = DatabaseJobQueue(database.engine)
     worker_id = f"{node_id}:agent-sandbox"
-    job_names = ("agent_research", "agent_code_workflow")
+    job_names = ("agent_research", "agent_code_workflow", "agent_review")
     queue.register_worker(
         worker_id=worker_id,
         node_id=node_id,

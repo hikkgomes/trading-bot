@@ -283,6 +283,14 @@ class DatabaseControlPlane:
             "report": DatabasePlatformReport(self.engine).build(),
         }
 
+    def agent_reviews(self) -> dict[str, Any]:
+        from src.agents.store import SqlAgentStore
+
+        return {
+            "schema": "platform.agent_reviews/v1",
+            "reviews": SqlAgentStore(self.engine).records("review")[-100:],
+        }
+
     def ingest_agent_proposal(self, payload: dict[str, Any]) -> dict[str, Any]:
         from src.agents.openclaw_bridge import OpenClawAgentBridge
         from src.agents.store import SqlAgentStore
@@ -357,6 +365,7 @@ def build_control_server(
                 "/status": control_plane.status,
                 "/configuration": control_plane.configuration_view,
                 "/reports": control_plane.report,
+                "/agent/reviews": control_plane.agent_reviews,
             }
             handler = routes.get(self.path)
             if handler is None:

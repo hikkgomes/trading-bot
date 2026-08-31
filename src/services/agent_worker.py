@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from src.agents.code_worker import AgentCodeWorkflow
 from src.agents.compiler import AgentCompilationError, compile_openclaw_candidate_payload
+from src.agents.context import AgentContext
 from src.agents.store import SqlAgentStore
+from src.domain._codec import canonical_hash
+from src.observability.reports import DatabasePlatformReport
 from src.research.coordinator import ResearchCoordinator
 from src.research.datasets import SqlDatasetBundleRepository
 from src.research.store import SqlResearchStore
@@ -49,6 +52,31 @@ class DatabaseAgentJobHandlers:
         return {
             "agent_research": self.agent_research,
             "agent_code_workflow": self.agent_code_workflow,
+            "agent_review": self.agent_review,
+        }
+
+    def agent_review(self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]) -> dict[str, Any]:
+        renew()
+        now = str(claimed.payload.get("available_at") or utc_now())
+        report = DatabasePlatformReport(self.queue.engine).build(now=now)
+        context = build_agent_review_context(report, created_at=now)
+        review_id = (
+            f"scheduled-agent-review:{canonical_hash(context.values).removeprefix('sha256:')}"
+        )
+        self.store.save_review(
+            proposal_id=review_id,
+            created_at=context.created_at,
+            payload={
+                "schema": "platform.agent_review_request/v1",
+                "review_id": review_id,
+                "context": dict(context.values),
+                "context_hash": context.content_hash,
+            },
+        )
+        return {
+            "review_id": review_id,
+            "context_hash": context.content_hash,
+            "reason_code": "sanitised_agent_review_recorded",
         }
 
     def agent_research(
@@ -157,3 +185,36 @@ class DatabaseAgentJobHandlers:
             "reason_code": result.reason_code,
             "commit_hash": result.commit_hash,
         }
+
+
+def build_agent_review_context(report: Mapping[str, Any], *, created_at: str) -> AgentContext:
+    """Extract only adaptive, non-protected research feedback for OpenClaw."""
+
+    research = report.get("research")
+    research = research if isinstance(research, Mapping) else {}
+    funnel = research.get("funnel")
+    funnel = funnel if isinstance(funnel, Mapping) else {}
+    values = {
+        "failure_reasons": dict(funnel.get("top_rejection_reasons", {})),
+        "family_coverage": dict(funnel.get("feature_family_concentration", {})),
+        "duplicate_feedback": {
+            "exact_duplicate_rate": funnel.get("exact_duplicate_rate", 0.0),
+            "near_duplicate_rate": funnel.get("near_duplicate_rate", 0.0),
+        },
+        "data_availability": dict(funnel.get("missing_stage_datasets", {})),
+        "research_queue": {
+            "candidates_generated": funnel.get("candidates_generated", 0),
+            "candidates_evaluated": funnel.get("candidates_evaluated", 0),
+            "candidates_never_evaluated": funnel.get("candidates_never_evaluated", []),
+        },
+        "generation_feedback": {
+            "theses_generated": funnel.get("theses_generated", 0),
+            "cumulative_trial_count": funnel.get("cumulative_trial_count", 0),
+        },
+        "research_progress": {
+            "candidates_rejected_by_stage": dict(funnel.get("candidates_rejected_by_stage", {})),
+            "first_blocked_stage": dict(funnel.get("first_blocked_stage", {})),
+            "jobs_dead_letter": funnel.get("jobs_dead_letter", 0),
+        },
+    }
+    return AgentContext(created_at=created_at, values=values)

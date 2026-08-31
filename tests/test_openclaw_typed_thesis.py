@@ -12,7 +12,7 @@ from src.data.database import PlatformDatabase
 from src.domain._codec import canonical_hash
 from src.research.datasets import RESEARCH_BUNDLE_ROLES, CanonicalResearchDatasetBuilder
 from src.research.store import SqlResearchStore
-from src.services.agent_worker import DatabaseAgentJobHandlers
+from src.services.agent_worker import DatabaseAgentJobHandlers, build_agent_review_context
 from src.services.scheduler import DatabaseJobQueue
 
 NOW = dt.datetime(2026, 8, 30, tzinfo=dt.UTC).isoformat()
@@ -150,3 +150,32 @@ def test_openclaw_worker_compiles_a_candidate_into_the_normal_queue(tmp_path) ->
     dispositions = SqlAgentStore(database.engine).records("disposition")
     assert dispositions[-1]["live_eligible"] is False
     assert dispositions[-1]["candidate_id"] == candidate.candidate_id
+
+
+def test_scheduled_agent_review_exposes_adaptive_failures_without_holdout_data() -> None:
+    context = build_agent_review_context(
+        {
+            "research": {
+                "funnel": {
+                    "top_rejection_reasons": {"negative_return": 3},
+                    "feature_family_concentration": {"time_series": 4},
+                    "exact_duplicate_rate": 0.25,
+                    "near_duplicate_rate": 0.10,
+                    "missing_stage_datasets": {"robustness": 1},
+                    "candidates_generated": 8,
+                    "candidates_evaluated": 5,
+                    "candidates_never_evaluated": ["candidate-1"],
+                    "theses_generated": 7,
+                    "cumulative_trial_count": 11,
+                    "candidates_rejected_by_stage": {"development": 3},
+                    "first_blocked_stage": {"development": 3},
+                    "jobs_dead_letter": 1,
+                }
+            }
+        },
+        created_at=NOW,
+    )
+
+    assert context.values["failure_reasons"] == {"negative_return": 3}
+    assert "holdout_outcomes" not in context.values
+    assert "protected_holdout" not in str(context.values).lower()
