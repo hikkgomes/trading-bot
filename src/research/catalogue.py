@@ -10,6 +10,7 @@ import subprocess
 import sys
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 from src.domain._codec import canonical_hash
 from src.domain.strategies import (
@@ -50,68 +51,95 @@ def registered_strategy_theses(
     }
 
 
+def _digest_path(path: Path, repository: Path) -> tuple[str, str]:
+    return str(path.relative_to(repository)), hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _imported_strategy_modules(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+    return modules
+
+
+def _direct_strategy_dependency_files(path: Path, repository: Path) -> dict[str, str]:
+    module_files: dict[str, str] = {}
+    for imported in sorted(_imported_strategy_modules(path)):
+        if not (
+            imported.startswith("src.strategies.indicators")
+            or imported.startswith("src.features")
+            or imported.startswith("src.indicators")
+        ):
+            continue
+        dependency = repository.joinpath(*imported.split(".")).with_suffix(".py")
+        if dependency.is_file():
+            relative, digest = _digest_path(dependency, repository)
+            module_files[relative] = digest
+    return module_files
+
+
+def _strategy_executable_files(strategy: object, repository: Path) -> dict[str, str]:
+    module_files: dict[str, str] = {}
+    module = inspect.getmodule(strategy)
+    module_path = getattr(module, "__file__", None) if module is not None else None
+    if module_path:
+        path = Path(module_path).resolve()
+        if path.is_file() and repository in path.parents:
+            relative, digest = _digest_path(path, repository)
+            module_files[relative] = digest
+            module_files.update(_direct_strategy_dependency_files(path, repository))
+    for directory in (repository / "src" / "indicators", repository / "src" / "features"):
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.rglob("*.py")):
+            if path.is_file() and not path.is_symlink():
+                relative, digest = _digest_path(path, repository)
+                module_files[relative] = digest
+    return module_files
+
+
+def _runtime_lock(repository: Path) -> dict[str, str]:
+    lock_files: dict[str, str] = {}
+    for filename in ("requirements-bot.txt", "requirements-runtime.txt", "pyproject.toml"):
+        path = repository / filename
+        if path.is_file():
+            lock_files[filename] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return lock_files
+
+
+def _strategy_identity_policy(strategy: Any) -> dict[str, object]:
+    configuration = strategy.default_config()
+    return {
+        "default_params": strategy.default_params(),
+        "position_model": {"signal_timing": "next_bar", "default": configuration},
+        "risk_policy": {
+            "take_profit": configuration.take_profit,
+            "stop_loss": configuration.stop_loss,
+            "horizon_bars": configuration.horizon_bars,
+        },
+        "cost_model": {
+            "fee_bps": configuration.fee_bps,
+            "slippage_bps": configuration.slippage_bps,
+            "pnl_unit": configuration.pnl_unit,
+        },
+    }
+
+
 def _registered_strategy_identity_payload(name: str) -> dict[str, object]:
     """Build the executable identity without repository-history metadata."""
 
     strategy = __import__("src.strategies.registry", fromlist=["get"]).get(name)
     repository = Path(__file__).resolve().parents[2]
-    module_files: dict[str, str] = {}
-    module = inspect.getmodule(strategy)
-    if module is not None:
-        module_path = getattr(module, "__file__", None)
-        if module_path:
-            path = Path(module_path).resolve()
-            if path.is_file() and repository in path.parents:
-                module_files[str(path.relative_to(repository))] = hashlib.sha256(
-                    path.read_bytes()
-                ).hexdigest()
-                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-                direct_modules: set[str] = set()
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.Import):
-                        direct_modules.update(alias.name for alias in node.names)
-                    elif isinstance(node, ast.ImportFrom) and node.module:
-                        direct_modules.add(node.module)
-                for imported in sorted(direct_modules):
-                    if not (
-                        imported.startswith("src.strategies.indicators")
-                        or imported.startswith("src.features")
-                        or imported.startswith("src.indicators")
-                    ):
-                        continue
-                    dependency = repository.joinpath(*imported.split(".")).with_suffix(".py")
-                    if dependency.is_file():
-                        module_files[str(dependency.relative_to(repository))] = hashlib.sha256(
-                            dependency.read_bytes()
-                        ).hexdigest()
-    for directory in (repository / "src" / "indicators", repository / "src" / "features"):
-        if directory.is_dir():
-            for path in sorted(directory.rglob("*.py")):
-                if path.is_file() and not path.is_symlink():
-                    module_files[str(path.relative_to(repository))] = hashlib.sha256(
-                        path.read_bytes()
-                    ).hexdigest()
-    lock_files = {}
-    for filename in ("requirements-bot.txt", "requirements-runtime.txt", "pyproject.toml"):
-        path = repository / filename
-        if path.is_file():
-            lock_files[filename] = hashlib.sha256(path.read_bytes()).hexdigest()
+    identity_policy = _strategy_identity_policy(strategy)
     return {
         "strategy": name,
-        "module_files": module_files,
-        "default_params": strategy.default_params(),
-        "position_model": {"signal_timing": "next_bar", "default": strategy.default_config()},
-        "risk_policy": {
-            "take_profit": strategy.default_config().take_profit,
-            "stop_loss": strategy.default_config().stop_loss,
-            "horizon_bars": strategy.default_config().horizon_bars,
-        },
-        "cost_model": {
-            "fee_bps": strategy.default_config().fee_bps,
-            "slippage_bps": strategy.default_config().slippage_bps,
-            "pnl_unit": strategy.default_config().pnl_unit,
-        },
-        "runtime_lock": lock_files,
+        "module_files": _strategy_executable_files(strategy, repository),
+        **identity_policy,
+        "runtime_lock": _runtime_lock(repository),
         "python": sys.version,
     }
 
