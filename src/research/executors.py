@@ -8,6 +8,7 @@ putting metrics in a queue payload.
 
 from __future__ import annotations
 
+import datetime as dt
 import math
 import random
 import statistics
@@ -711,15 +712,34 @@ def _product_accounting(
     if product_id == "btc_accumulation":
         events = context.get("btc_trade_events", context.get("trade_events"))
         marks = context.get("btc_marks", context.get("marks"))
+        derived = events is None and marks is None
+        if derived:
+            events, marks = _derived_btc_accounting_inputs(context)
         if events is None and marks is None:
             return None
         from src.research.accounting import BtcResearchAccounting, ProductAccountingError
 
         try:
+            reserve_fraction = context.get("reserve_fraction")
+            if reserve_fraction is None and context.get("btc_minimum_fraction") is not None:
+                reserve_fraction = context["btc_minimum_fraction"]
+            if reserve_fraction is None and derived:
+                reserve_fraction = 1.0 - float(
+                    context.get(
+                        "max_tactical_fraction", context.get("btc_max_tactical_fraction", 0.3)
+                    )
+                )
+            max_tactical_fraction = context.get("max_tactical_fraction")
+            if max_tactical_fraction is None:
+                max_tactical_fraction = context.get("btc_max_tactical_fraction")
+            if max_tactical_fraction is None and derived:
+                max_tactical_fraction = 0.3
             report = BtcResearchAccounting().evaluate(
                 trade_events=events or (),
                 marks=marks or (),
-                initial_btc=float(context.get("initial_btc", context.get("btc_balance", 0.0))),
+                initial_btc=float(
+                    context.get("initial_btc", context.get("btc_balance", 1.0 if derived else 0.0))
+                ),
                 initial_stablecoin=float(
                     context.get("initial_stablecoin", context.get("stablecoin_balance", 0.0))
                 ),
@@ -729,14 +749,10 @@ def _product_accounting(
                     else None
                 ),
                 reserve_fraction=(
-                    float(context["reserve_fraction"])
-                    if context.get("reserve_fraction") is not None
-                    else None
+                    float(reserve_fraction) if reserve_fraction is not None else None
                 ),
                 max_tactical_fraction=(
-                    float(context["max_tactical_fraction"])
-                    if context.get("max_tactical_fraction") is not None
-                    else None
+                    float(max_tactical_fraction) if max_tactical_fraction is not None else None
                 ),
                 external_events=context.get("btc_external_events", ()),
             )
@@ -772,6 +788,8 @@ def _product_accounting(
         }
     if product_id == "active_income":
         events = context.get("futures_events", context.get("trade_events"))
+        if events is None:
+            events = _derived_futures_accounting_inputs(context)
         if events is None:
             if fallback_return is None:
                 return None
@@ -868,6 +886,219 @@ def _product_accounting(
             "event_receipts": [dict(item) for item in report.event_receipts],
         }
     return None
+
+
+def _frame_rows(context: Mapping[str, Any]) -> tuple[dict[str, Any], ...] | None:
+    frame = context.get("market_frame")
+    if frame is None:
+        return None
+    if hasattr(frame, "to_dict"):
+        rows = frame.to_dict(orient="records")
+    elif isinstance(frame, list | tuple):
+        rows = frame
+    else:
+        return None
+    if not rows or not all(isinstance(row, Mapping) for row in rows):
+        return None
+    return tuple(dict(row) for row in rows)
+
+
+def _frame_times(
+    context: Mapping[str, Any], rows: tuple[dict[str, Any], ...]
+) -> tuple[str, ...] | None:
+    supplied = context.get("timestamps")
+    if isinstance(supplied, list | tuple) and len(supplied) == len(rows):
+        return tuple(_accounting_time(value, index=index) for index, value in enumerate(supplied))
+    values: list[str] = []
+    for index, row in enumerate(rows):
+        value = next(
+            (
+                row.get(name)
+                for name in ("timestamp", "close_timestamp", "observed_at", "time")
+                if row.get(name) is not None
+            ),
+            None,
+        )
+        if value is None:
+            return None
+        values.append(_accounting_time(value, index=index))
+    return tuple(values)
+
+
+def _accounting_time(value: Any, *, index: int) -> str:
+    if isinstance(value, bool):
+        raise ExecutorError(f"accounting timestamp {index} is invalid")
+    if isinstance(value, int | float):
+        try:
+            return dt.datetime.fromtimestamp(float(value) / 1_000, dt.UTC).isoformat()
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ExecutorError(f"accounting timestamp {index} is invalid") from exc
+    try:
+        return dt.datetime.fromisoformat(str(value)).isoformat()
+    except ValueError as exc:
+        raise ExecutorError(f"accounting timestamp {index} is invalid") from exc
+
+
+def _row_price(row: Mapping[str, Any], *, field: str = "close") -> float | None:
+    raw = row.get(field, row.get("price"))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _signed_signal(value: Any) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(-1.0, min(1.0, result)) if math.isfinite(result) else 0.0
+
+
+def _derived_btc_accounting_inputs(
+    context: Mapping[str, Any],
+) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]] | tuple[None, None]:
+    rows = _frame_rows(context)
+    signals = _numeric_series(context.get("signals"))
+    if rows is None or len(rows) != len(signals):
+        return None, None
+    times = _frame_times(context, rows)
+    if times is None:
+        return None, None
+    prices = tuple(_row_price(row) for row in rows)
+    if any(price is None for price in prices):
+        return None, None
+    prices = tuple(float(price) for price in prices)
+    tactical = float(
+        context.get("max_tactical_fraction", context.get("btc_max_tactical_fraction", 0.3))
+    )
+    if not math.isfinite(tactical) or not 0.0 <= tactical <= 1.0:
+        raise ExecutorError("BTC tactical fraction is invalid")
+    fee_rate = _nonnegative_rate(context.get("fee_bps", 10.0), field="fee_bps") / 10_000.0
+    slippage_rate = (
+        _nonnegative_rate(context.get("slippage_bps", 2.0), field="slippage_bps") / 10_000.0
+    )
+    btc = float(context.get("initial_btc", 1.0))
+    stable = float(context.get("initial_stablecoin", 0.0))
+    if not all(math.isfinite(value) and value >= 0.0 for value in (btc, stable)):
+        raise ExecutorError("BTC initial balances are invalid")
+    trades: list[dict[str, Any]] = []
+    marks = [
+        {"timestamp": observed_at, "price": price, "regime": row.get("regime", "unclassified")}
+        for observed_at, price, row in zip(times, prices, rows, strict=True)
+    ]
+    for observed_at, price, signal in zip(times, prices, signals, strict=True):
+        desired_fraction = 1.0 - tactical if _signed_signal(signal) < 0.0 else 1.0
+        nav = btc + stable / price
+        desired_btc = nav * desired_fraction
+        quantity = desired_btc - btc
+        if abs(quantity) <= 1e-12:
+            continue
+        side = "buy" if quantity > 0 else "sell"
+        execution_price = price * (1.0 + slippage_rate if side == "buy" else 1.0 - slippage_rate)
+        base_quantity = abs(quantity)
+        trades.append(
+            {
+                "timestamp": observed_at,
+                "side": side,
+                "quantity_btc": base_quantity,
+                "price": execution_price,
+                "reference_price": price,
+                "fee": base_quantity * execution_price * fee_rate,
+                "fee_asset": "USDT",
+            }
+        )
+        if side == "buy":
+            btc += base_quantity
+            stable -= base_quantity * execution_price * (1.0 + fee_rate)
+        else:
+            btc -= base_quantity
+            stable += base_quantity * execution_price * (1.0 - fee_rate)
+    return tuple(trades), tuple(marks)
+
+
+def _derived_futures_accounting_inputs(
+    context: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...] | None:
+    rows = _frame_rows(context)
+    signals = _numeric_series(context.get("signals"))
+    if rows is None or len(rows) != len(signals):
+        return None
+    times = _frame_times(context, rows)
+    if times is None:
+        return None
+    prices = tuple(_row_price(row) for row in rows)
+    if any(price is None for price in prices):
+        return None
+    fee_rate = _nonnegative_rate(context.get("fee_bps", 5.0), field="fee_bps") / 10_000.0
+    slippage_rate = (
+        _nonnegative_rate(context.get("slippage_bps", 2.0), field="slippage_bps") / 10_000.0
+    )
+    initial_cash = float(context.get("initial_cash", context.get("initial_equity", 1_000.0)))
+    maximum_position = float(context.get("maximum_position", 0.1))
+    leverage = float(context.get("leverage", 1.0))
+    if not all(
+        math.isfinite(value) and value > 0.0 for value in (initial_cash, maximum_position, leverage)
+    ):
+        raise ExecutorError("futures accounting configuration is invalid")
+    raw_target_notional = context.get("target_notional")
+    if isinstance(raw_target_notional, Mapping):
+        target_notional = sum(float(value) for value in raw_target_notional.values())
+    else:
+        target_notional = float(
+            raw_target_notional
+            if raw_target_notional is not None
+            else initial_cash * maximum_position * leverage
+        )
+    if not math.isfinite(target_notional) or target_notional <= 0.0:
+        raise ExecutorError("futures target notional is invalid")
+    events: list[dict[str, Any]] = []
+    previous_target = 0.0
+    for observed_at, raw_price, row, raw_signal in zip(times, prices, rows, signals, strict=True):
+        price = float(raw_price)
+        target = _signed_signal(raw_signal) * target_notional / price
+        delta = target - previous_target
+        if abs(delta) > 1e-12:
+            side = "buy" if delta > 0 else "sell"
+            quantity = abs(delta)
+            execution_price = price * (
+                1.0 + slippage_rate if side == "buy" else 1.0 - slippage_rate
+            )
+            events.append(
+                {
+                    "type": "fill",
+                    "timestamp": observed_at,
+                    "symbol": str(row.get("instrument_id", row.get("symbol", "BTCUSDT"))),
+                    "side": side,
+                    "quantity": quantity,
+                    "price": execution_price,
+                    "reference_price": price,
+                    "fee": quantity * execution_price * fee_rate,
+                }
+            )
+            previous_target = target
+        events.append(
+            {
+                "type": "mark",
+                "timestamp": observed_at,
+                "symbol": str(row.get("instrument_id", row.get("symbol", "BTCUSDT"))),
+                "mark_price": price,
+            }
+        )
+        if row.get("funding_rate") is not None or row.get("funding") is not None:
+            events.append(
+                {
+                    "type": "funding",
+                    "timestamp": observed_at,
+                    "symbol": str(row.get("instrument_id", row.get("symbol", "BTCUSDT"))),
+                    "mark_price": price,
+                    "funding_rate": row.get("funding_rate", row.get("funding", 0.0)),
+                }
+            )
+    if not events:
+        return None
+    return tuple(events)
 
 
 def _finite_rate(value: Any, *, field: str) -> float:

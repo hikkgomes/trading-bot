@@ -31,7 +31,7 @@ from src.research.evidence import (
     parameter_stability_passes,
     sample_evidence_passes,
 )
-from src.research.executors import _cross_symbol_stability, _portfolio_overlap
+from src.research.executors import _cross_symbol_stability, _portfolio_overlap, _product_accounting
 from src.research.objectives import objective_passes
 from src.research.returns import PositionReturnLedger
 from src.services.artefact_dispatcher import ArtefactDispatcher
@@ -467,6 +467,55 @@ def test_btc_accounting_tracks_external_flows_and_tactical_limit() -> None:
             marks=({"timestamp": NOW, "price": 100.0},),
             max_tactical_fraction=0.2,
         )
+
+
+def test_executor_derives_btc_objective_from_canonical_bar_frame() -> None:
+    frame = [
+        {"timestamp": NOW, "close": 100.0},
+        {"timestamp": "2026-08-30T10:01:00+00:00", "close": 80.0},
+        {"timestamp": "2026-08-30T10:02:00+00:00", "close": 80.0},
+    ]
+
+    accounting = _product_accounting(
+        {
+            "product_id": "btc_accumulation",
+            "market_frame": frame,
+            "signals": [-1.0, -1.0, 0.0],
+            "fee_bps": 0.0,
+            "slippage_bps": 0.0,
+        }
+    )
+
+    assert accounting is not None
+    assert accounting["objective_unit"] == "BTC"
+    assert accounting["objective_excess"] == pytest.approx(0.075)
+    assert accounting["objective_value"] > accounting["benchmark_value"]
+
+
+def test_executor_derives_signed_futures_events_with_mark_to_market() -> None:
+    frame = [
+        {"timestamp": NOW, "close": 100.0, "funding_rate": 0.0},
+        {"timestamp": "2026-08-30T10:01:00+00:00", "close": 90.0, "funding_rate": 0.01},
+    ]
+
+    accounting = _product_accounting(
+        {
+            "product_id": "active_income",
+            "market_frame": frame,
+            "signals": [-1.0, -1.0],
+            "initial_cash": 1_000.0,
+            "maximum_position": 0.1,
+            "leverage": 2.0,
+            "fee_bps": 0.0,
+            "slippage_bps": 0.0,
+        }
+    )
+
+    assert accounting is not None
+    assert accounting["objective_unit"] == "USDT"
+    assert accounting["unrealised_pnl"] == pytest.approx(20.0)
+    assert accounting["funding_pnl"] == pytest.approx(2.0)
+    assert accounting["max_leverage"] == pytest.approx(0.2)
 
 
 def test_product_objective_rejects_positive_usdt_result_that_loses_btc() -> None:
