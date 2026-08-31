@@ -288,6 +288,8 @@ def _target_metadata(
         metadata["order_group_key"] = str(forecast.metadata["order_group_key"])
     if forecast.metadata.get("recovery_policy"):
         metadata["recovery_policy"] = str(forecast.metadata["recovery_policy"])
+    if forecast.metadata.get("assignment_id"):
+        metadata["assignment_id"] = str(forecast.metadata["assignment_id"])
     return metadata
 
 

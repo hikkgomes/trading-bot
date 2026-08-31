@@ -109,6 +109,8 @@ class ForwardEvidenceCollector:
         forecast: Mapping[str, Any],
         target: Mapping[str, Any] | None,
         previous_observed_at: str | None,
+        strategy_version_id: str | None = None,
+        assignment_id: str | None = None,
     ) -> ForwardEvidenceMetrics:
         created_at = timestamp(artefact_created_at, field="artefact_created_at")
         evaluated_at = timestamp(evaluation_time, field="evaluation_time")
@@ -120,6 +122,8 @@ class ForwardEvidenceCollector:
             instrument_id=instrument_id,
             start=window_start,
             at=evaluated_at,
+            strategy_version_id=strategy_version_id,
+            assignment_id=assignment_id,
         )
         order_ids = tuple(str(row["id"]) for row in orders)
         fills = self._fills(order_ids, start=window_start, at=evaluated_at)
@@ -253,7 +257,14 @@ class ForwardEvidenceCollector:
         )
 
     def _orders(
-        self, *, portfolio_id: str, instrument_id: str, start: str, at: str
+        self,
+        *,
+        portfolio_id: str,
+        instrument_id: str,
+        start: str,
+        at: str,
+        strategy_version_id: str | None = None,
+        assignment_id: str | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -271,6 +282,10 @@ class ForwardEvidenceCollector:
                     isinstance(payload, Mapping)
                     and str(payload.get("portfolio_id")) == portfolio_id
                     and str(payload.get("instrument_id")) == instrument_id
+                    and _order_belongs_to_strategy(
+                        payload,
+                        strategy_version_id=strategy_version_id)
+                    and _order_belongs_to_assignment(payload, assignment_id=assignment_id)
                 ):
                     result.append(row)
         return tuple(result)
@@ -469,6 +484,9 @@ class ForwardEvidenceCollector:
         at: str | None = None,
     ) -> float:
         account_id = str(assignment.get("account_id") or "")
+        assignment_payload = assignment.get("payload")
+        if not account_id and isinstance(assignment_payload, Mapping):
+            account_id = str(assignment_payload.get("account_id") or "")
         with self.engine.connect() as connection:
             statement = select(account_snapshot.c.payload).where(
                 account_snapshot.c.account_id == account_id
@@ -637,3 +655,32 @@ def _positive_or_zero(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return result if math.isfinite(result) and result > 0 else 0.0
+
+
+def _order_belongs_to_strategy(
+    payload: Mapping[str, Any], *, strategy_version_id: str | None
+) -> bool:
+    if strategy_version_id is None:
+        return True
+    declared = payload.get("strategy_version_id")
+    if declared is not None:
+        return str(declared) == strategy_version_id
+    contributions = payload.get("strategy_contributions")
+    return isinstance(contributions, Mapping) and strategy_version_id in {
+        str(key) for key in contributions
+    }
+
+
+def _order_belongs_to_assignment(
+    payload: Mapping[str, Any], *, assignment_id: str | None
+) -> bool:
+    if assignment_id is None:
+        return True
+    declared = payload.get("assignment_id")
+    metadata = payload.get("metadata")
+    if declared is None and isinstance(metadata, Mapping):
+        declared = metadata.get("assignment_id")
+        target_metadata = metadata.get("target_metadata")
+        if declared is None and isinstance(target_metadata, Mapping):
+            declared = target_metadata.get("assignment_id")
+    return declared is not None and str(declared) == assignment_id

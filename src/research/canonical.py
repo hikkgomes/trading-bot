@@ -1412,6 +1412,22 @@ def _forward_decision_checks(
             int(payload.get("rejected_orders", 0)) > limits.maximum_rejected_orders,
             "forward_rejected_orders_limit",
         ),
+        (
+            float(payload.get("portfolio_capacity", 0.0)) <= 0.0,
+            "portfolio_capacity_unavailable",
+        ),
+        (
+            float(payload.get("risk_budget_available", 0.0)) <= 0.0,
+            "risk_budget_unavailable",
+        ),
+        (
+            float(payload.get("portfolio_capacity", 0.0)) <= 0.0,
+            "portfolio_capacity_unavailable",
+        ),
+        (
+            float(payload.get("risk_budget_available", 0.0)) <= 0.0,
+            "risk_budget_unavailable",
+        ),
     )
 
 

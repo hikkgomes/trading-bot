@@ -66,10 +66,19 @@ class ExecutionService:
         if risk_decision.scope not in {"account", "global", "portfolio"}:
             raise ValueError("execution requires a portfolio, account, or global risk decision")
         materialised = tuple(targets)
-        now = timestamp(
-            decided_at or dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
-            field="decided_at",
-        )
+        if decided_at is None:
+            now_value = dt.datetime.now(dt.UTC).replace(microsecond=0)
+            # Paper replay commonly consumes historical targets.  Use their
+            # own decision window when the host clock is later, while live
+            # callers always provide the actual submission timestamp.
+            if materialised:
+                latest_window = min(
+                    dt.datetime.fromisoformat(target.valid_until) for target in materialised
+                )
+                if latest_window <= now_value:
+                    now_value = latest_window - dt.timedelta(seconds=1)
+            decided_at = now_value.isoformat()
+        now = timestamp(decided_at, field="decided_at")
         traces: list[DecisionTrace] = []
         if not risk_decision.accepted:
             for target in materialised:

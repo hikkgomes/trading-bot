@@ -111,6 +111,8 @@ class DatabaseForwardObservationWorker:
                 product_id=str(payload["product_id"]),
                 after=artefact_created_at,
                 at=evaluation_time,
+                strategy_version_id=str(payload["strategy_version_id"]),
+                instrument_id=str(payload["instrument_id"]),
             )
             current_position = self._latest_position(
                 portfolio_id=str(assignment["portfolio_id"]),
@@ -128,7 +130,7 @@ class DatabaseForwardObservationWorker:
                 {**target[2], "target_position_id": target[0]} if target is not None else None
             )
             metrics = self.metrics.collect(
-                assignment=assignment,
+                assignment=_metrics_assignment(assignment, artefact),
                 product_id=str(payload["product_id"]),
                 instrument_id=str(payload["instrument_id"]),
                 artefact_created_at=artefact_created_at,
@@ -136,6 +138,8 @@ class DatabaseForwardObservationWorker:
                 forecast=forecast_fact,
                 target=target_fact,
                 previous_observed_at=previous_observed_at,
+                strategy_version_id=str(payload["strategy_version_id"]),
+                assignment_id=str(payload["assignment_id"]),
             )
             observation_id = self.evidence.append(
                 strategy_version_id=str(payload["strategy_version_id"]),
@@ -194,14 +198,23 @@ class DatabaseForwardObservationWorker:
             ).mappings()
             for row in rows:
                 payload = row["payload"]
-                if not isinstance(payload, Mapping) or payload.get("product_id") != product_id:
+                candidate = (
+                    payload.get("target")
+                    if isinstance(payload, Mapping)
+                    and isinstance(payload.get("target"), Mapping)
+                    else payload
+                )
+                if not isinstance(candidate, Mapping) or candidate.get("product_id") != product_id:
                     continue
                 if (
                     strategy_version_id is not None
-                    and payload.get("strategy_version_id") != strategy_version_id
+                    and not _target_belongs_to_strategy(candidate, strategy_version_id)
                 ):
                     continue
-                if instrument_id is not None and payload.get("instrument_id") != instrument_id:
+                if instrument_id is not None and candidate.get("instrument_id") not in {
+                    None,
+                    instrument_id,
+                }:
                     continue
                 return str(row["id"]), str(row["created_at"]), dict(payload)
         return None
@@ -225,6 +238,16 @@ class DatabaseForwardObservationWorker:
         return None
 
 
+def _target_belongs_to_strategy(candidate: Mapping[str, Any], strategy_version_id: str) -> bool:
+    declared = candidate.get("strategy_version_id")
+    if declared is not None:
+        return str(declared) == strategy_version_id
+    contributions = candidate.get("strategy_contributions")
+    return isinstance(contributions, Mapping) and strategy_version_id in {
+        str(key) for key in contributions
+    }
+
+
 def _retry_at(value: str, seconds: int) -> str:
     import datetime as dt
 
@@ -233,6 +256,17 @@ def _retry_at(value: str, seconds: int) -> str:
         .replace(microsecond=0)
         .isoformat()
     )
+
+
+def _metrics_assignment(
+    assignment: Mapping[str, Any], artefact: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    payload = assignment.get("payload")
+    bound_payload = dict(payload) if isinstance(payload, Mapping) else {}
+    account_id = artefact.get("account_id")
+    if account_id is not None:
+        bound_payload.setdefault("account_id", str(account_id))
+    return {**dict(assignment), "payload": bound_payload}
 
 
 class DatabaseForwardSummaryWorker:
