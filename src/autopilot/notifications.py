@@ -149,6 +149,34 @@ def _post_webhook(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"status_code": response.status_code, "ok": 200 <= response.status_code < 300}
 
 
+def _normalise_alert_inputs(
+    cooldown_seconds: int,
+    dedupe_key: str | None,
+    now: float | None,
+    detail: dict[str, Any],
+) -> tuple[float, float, dict[str, Any]]:
+    raw_now = time.time() if now is None else now
+    try:
+        normalised_now = float(raw_now)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("alert now timestamp must be numeric") from exc
+    if not math.isfinite(normalised_now) or normalised_now < 0:
+        raise ValueError("alert now timestamp must be finite and non-negative")
+    try:
+        normalised_cooldown = float(cooldown_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("alert cooldown_seconds must be numeric") from exc
+    if not math.isfinite(normalised_cooldown) or normalised_cooldown < 0:
+        raise ValueError("alert cooldown_seconds must be finite and non-negative")
+    if dedupe_key is None:
+        return normalised_now, normalised_cooldown, detail
+    if not isinstance(dedupe_key, str) or not dedupe_key.strip():
+        raise ValueError("alert dedupe_key must be a non-empty string")
+    if len(dedupe_key) > 512:
+        raise ValueError("alert dedupe_key must be at most 512 characters")
+    return normalised_now, normalised_cooldown, {"dedupe_key": dedupe_key.strip()}
+
+
 def emit_alert(
     *,
     alert_file: Path,
@@ -161,27 +189,9 @@ def emit_alert(
     webhook_url_env: str = "AUTOPILOT_WEBHOOK_URL",
     now: float | None = None,
 ) -> dict[str, Any]:
-    raw_now = time.time() if now is None else now
-    try:
-        now = float(raw_now)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("alert now timestamp must be numeric") from exc
-    if not math.isfinite(now) or now < 0:
-        raise ValueError("alert now timestamp must be finite and non-negative")
-    try:
-        cooldown_seconds = float(cooldown_seconds)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("alert cooldown_seconds must be numeric") from exc
-    if not math.isfinite(cooldown_seconds) or cooldown_seconds < 0:
-        raise ValueError("alert cooldown_seconds must be finite and non-negative")
-    if dedupe_key is not None:
-        if not isinstance(dedupe_key, str) or not dedupe_key.strip():
-            raise ValueError("alert dedupe_key must be a non-empty string")
-        if len(dedupe_key) > 512:
-            raise ValueError("alert dedupe_key must be at most 512 characters")
-        fingerprint_detail = {"dedupe_key": dedupe_key.strip()}
-    else:
-        fingerprint_detail = detail
+    now, cooldown_seconds, fingerprint_detail = _normalise_alert_inputs(
+        cooldown_seconds, dedupe_key, now, detail
+    )
     fingerprint = alert_fingerprint(severity, title, fingerprint_detail)
     with acquire_file_update_lock(state_file, label="alert cooldown state"):
         result, payload = _emit_alert_locked(
@@ -464,83 +474,100 @@ def failure_detail(report: dict[str, Any]) -> dict[str, Any]:
     return detail
 
 
+def _market_data_readiness_warning(check: dict[str, Any]) -> dict[str, Any] | None:
+    detail = check.get("detail") if isinstance(check.get("detail"), dict) else {}
+    markets = {
+        market: {"reason": item.get("reason"), "path": item.get("path")}
+        for market, item in detail.items()
+        if isinstance(item, dict) and not item.get("ok")
+    }
+    return {"name": check.get("name"), "markets": markets} if markets else None
+
+
+def _indicator_readiness_warning(check: dict[str, Any]) -> dict[str, Any] | None:
+    detail = check.get("detail") if isinstance(check.get("detail"), dict) else {}
+    missing: dict[str, Any] = {}
+    for market, item in detail.items():
+        if not isinstance(item, dict) or item.get("ok"):
+            continue
+        market_missing = {
+            timeframe: {
+                "reason": tf_item.get("reason"),
+                "missing_features": tf_item.get("missing_features") or [],
+            }
+            for timeframe, tf_item in (item.get("timeframes") or {}).items()
+            if isinstance(tf_item, dict) and not tf_item.get("ok")
+        }
+        if market_missing:
+            missing[market] = market_missing
+    return {"name": check.get("name"), "missing": missing} if missing else None
+
+
+def _simple_readiness_warning(check: dict[str, Any]) -> dict[str, Any] | None:
+    detail = check.get("detail") or {}
+    if not isinstance(detail, dict):
+        return None
+    name = check.get("name")
+    if name == "runtime filesystem free space":
+        return {
+            "name": name,
+            "path": detail.get("path"),
+            "checked_path": detail.get("checked_path"),
+            "free_bytes": detail.get("free_bytes"),
+            "min_free_bytes": detail.get("min_free_bytes"),
+            "reason": detail.get("reason"),
+        }
+    if name == "strategy framework smoke":
+        return {
+            "name": name,
+            "reason": detail.get("reason"),
+            "path": detail.get("path"),
+            "scenario_count": detail.get("scenario_count"),
+            "failures": detail.get("failures") or [],
+        }
+    return None
+
+
+def _ledger_readiness_warning(check: dict[str, Any]) -> dict[str, Any] | None:
+    detail = check.get("detail") or {}
+    if not isinstance(detail, dict):
+        return None
+    warning = {"name": check.get("name"), "entries": detail.get("entries") or []}
+    for key in (
+        "invalid_actor_count",
+        "fingerprint_mismatch_count",
+        "invalid_revocation_count",
+    ):
+        if key in detail:
+            warning[key] = detail.get(key)
+    return warning
+
+
+def _readiness_check_warning(check: dict[str, Any]) -> dict[str, Any] | None:
+    if check.get("ok") or check.get("level") != "warning":
+        return None
+    name = check.get("name")
+    if name == "market data seed and freshness":
+        return _market_data_readiness_warning(check)
+    if name == "indicator feature readiness":
+        return _indicator_readiness_warning(check)
+    if name in {"runtime filesystem free space", "strategy framework smoke"}:
+        return _simple_readiness_warning(check)
+    if name in {
+        "approval ledger actor audit",
+        "approval ledger fingerprint audit",
+        "approval ledger revocation audit",
+    }:
+        return _ledger_readiness_warning(check)
+    return None
+
+
 def readiness_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = []
     for check in _dict_list(report.get("checks")):
-        if check.get("ok") or check.get("level") != "warning":
-            continue
-        name = check.get("name")
-        if name == "market data seed and freshness":
-            markets = {}
-            detail = check.get("detail") if isinstance(check.get("detail"), dict) else {}
-            for market, item in detail.items():
-                if not isinstance(item, dict) or item.get("ok"):
-                    continue
-                markets[market] = {
-                    "reason": item.get("reason"),
-                    "path": item.get("path"),
-                }
-            if markets:
-                warnings.append({"name": name, "markets": markets})
-        elif name == "indicator feature readiness":
-            missing = {}
-            detail = check.get("detail") if isinstance(check.get("detail"), dict) else {}
-            for market, item in detail.items():
-                if not isinstance(item, dict) or item.get("ok"):
-                    continue
-                market_missing = {}
-                for timeframe, tf_item in (item.get("timeframes") or {}).items():
-                    if not isinstance(tf_item, dict) or tf_item.get("ok"):
-                        continue
-                    market_missing[timeframe] = {
-                        "reason": tf_item.get("reason"),
-                        "missing_features": tf_item.get("missing_features") or [],
-                    }
-                if market_missing:
-                    missing[market] = market_missing
-            if missing:
-                warnings.append({"name": name, "missing": missing})
-        elif name == "runtime filesystem free space":
-            detail = check.get("detail") or {}
-            if isinstance(detail, dict):
-                warnings.append(
-                    {
-                        "name": name,
-                        "path": detail.get("path"),
-                        "checked_path": detail.get("checked_path"),
-                        "free_bytes": detail.get("free_bytes"),
-                        "min_free_bytes": detail.get("min_free_bytes"),
-                        "reason": detail.get("reason"),
-                    }
-                )
-        elif name == "strategy framework smoke":
-            detail = check.get("detail") or {}
-            if isinstance(detail, dict):
-                warnings.append(
-                    {
-                        "name": name,
-                        "reason": detail.get("reason"),
-                        "path": detail.get("path"),
-                        "scenario_count": detail.get("scenario_count"),
-                        "failures": detail.get("failures") or [],
-                    }
-                )
-        elif name in {
-            "approval ledger actor audit",
-            "approval ledger fingerprint audit",
-            "approval ledger revocation audit",
-        }:
-            detail = check.get("detail") or {}
-            if isinstance(detail, dict):
-                warning = {"name": name, "entries": detail.get("entries") or []}
-                for key in (
-                    "invalid_actor_count",
-                    "fingerprint_mismatch_count",
-                    "invalid_revocation_count",
-                ):
-                    if key in detail:
-                        warning[key] = detail.get(key)
-                warnings.append(warning)
+        warning = _readiness_check_warning(check)
+        if warning is not None:
+            warnings.append(warning)
     return {"warnings": warnings}
 
 
@@ -585,69 +612,51 @@ def promotion_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
     return {"warnings": warnings}
 
 
-def research_handoff_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
+def _unsafe_handoff_flags(payload: dict[str, Any]) -> list[str]:
+    flags = [
+        key
+        for key in ("executable", "paper_trade_allowed", "promotion_allowed", "live_allowed")
+        if payload.get(key) is True
+    ]
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    flags.extend(
+        f"summary.{key}"
+        for key in ("executable", "paper_trade_allowed", "promotion_allowed", "live_allowed")
+        if summary.get(key) is True
+    )
+    flags.extend(str(flag) for flag in summary.get("unsafe_flags") or [])
+    return sorted(set(flags))
+
+
+def _handoff_health_warning(
+    name: str,
+    payload: dict[str, Any],
+    *,
+    include_skipped: bool = False,
+) -> dict[str, Any] | None:
+    unsafe_flags = _unsafe_handoff_flags(payload)
+    if payload.get("ok") is not False and not unsafe_flags:
+        return None
+    warning: dict[str, Any] = {
+        "name": name,
+        "ok": payload.get("ok"),
+        "status": payload.get("status"),
+        "generated_at": payload.get("generated_at"),
+        "path": payload.get("path"),
+        "unsafe_flags": unsafe_flags,
+    }
+    if include_skipped:
+        summary = payload.get("summary")
+        warning["skipped"] = summary.get("skipped") if isinstance(summary, dict) else None
+    return {key: value for key, value in warning.items() if value is not None and value != []}
+
+
+def _handoff_source_warnings(
+    research_cycle: dict[str, Any],
+    mutation_plan: dict[str, Any],
+    mutation_batch: dict[str, Any],
+) -> list[dict[str, Any]]:
     warnings: list[dict[str, Any]] = []
-    research_cycle = (
-        report.get("research_cycle") if isinstance(report.get("research_cycle"), dict) else {}
-    )
-    mutation_plan = (
-        report.get("mutation_plan") if isinstance(report.get("mutation_plan"), dict) else {}
-    )
-    mutation_batch = (
-        report.get("mutation_batch") if isinstance(report.get("mutation_batch"), dict) else {}
-    )
-    generated_batch = (
-        report.get("generated_batch") if isinstance(report.get("generated_batch"), dict) else {}
-    )
-
-    def unsafe_flags(payload: dict[str, Any]) -> list[str]:
-        flags = [
-            key
-            for key in ("executable", "paper_trade_allowed", "promotion_allowed", "live_allowed")
-            if payload.get(key) is True
-        ]
-        summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
-        flags.extend(
-            f"summary.{key}"
-            for key in ("executable", "paper_trade_allowed", "promotion_allowed", "live_allowed")
-            if summary.get(key) is True
-        )
-        flags.extend(str(flag) for flag in summary.get("unsafe_flags") or [])
-        return sorted(set(flags))
-
-    if mutation_plan:
-        plan_unsafe_flags = unsafe_flags(mutation_plan)
-        if mutation_plan.get("ok") is False or plan_unsafe_flags:
-            warning = {
-                "name": "mutation_plan_unhealthy",
-                "ok": mutation_plan.get("ok"),
-                "status": mutation_plan.get("status"),
-                "generated_at": mutation_plan.get("generated_at"),
-                "path": mutation_plan.get("path"),
-                "unsafe_flags": plan_unsafe_flags,
-            }
-            warnings.append(
-                {key: value for key, value in warning.items() if value is not None and value != []}
-            )
-
-    if mutation_batch:
-        batch_unsafe_flags = unsafe_flags(mutation_batch)
-        if mutation_batch.get("ok") is False or batch_unsafe_flags:
-            warning = {
-                "name": "mutation_batch_unhealthy",
-                "ok": mutation_batch.get("ok"),
-                "status": mutation_batch.get("status"),
-                "generated_at": mutation_batch.get("generated_at"),
-                "path": mutation_batch.get("path"),
-                "unsafe_flags": batch_unsafe_flags,
-                "skipped": (mutation_batch.get("summary") or {}).get("skipped")
-                if isinstance(mutation_batch.get("summary"), dict)
-                else None,
-            }
-            warnings.append(
-                {key: value for key, value in warning.items() if value is not None and value != []}
-            )
-
     research_generated_at = research_cycle.get("generated_at")
     plan_source = (
         mutation_plan.get("source") if isinstance(mutation_plan.get("source"), dict) else {}
@@ -666,7 +675,6 @@ def research_handoff_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
                 "mutation_plan_generated_at": mutation_plan.get("generated_at"),
             }
         )
-
     plan_generated_at = mutation_plan.get("generated_at")
     batch_source = (
         mutation_batch.get("source") if isinstance(mutation_batch.get("source"), dict) else {}
@@ -685,25 +693,36 @@ def research_handoff_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
                 "mutation_batch_generated_at": mutation_batch.get("generated_at"),
             }
         )
-    research_generated_ts = _parse_timestamp(research_generated_at)
+    return warnings
+
+
+def _generated_batch_handoff_warning(
+    research_cycle: dict[str, Any], generated_batch: dict[str, Any]
+) -> dict[str, Any] | None:
+    research_generated_at = _parse_timestamp(research_cycle.get("generated_at"))
     generated_batch_at = generated_batch.get("generated_at")
     generated_batch_ts = _parse_timestamp(generated_batch_at)
     if (
-        research_generated_ts is not None
-        and generated_batch_ts is not None
-        and generated_batch_ts > research_generated_ts
+        research_generated_at is None
+        or generated_batch_ts is None
+        or generated_batch_ts <= research_generated_at
     ):
-        warnings.append(
-            {
-                "name": "generated_batch_unconsumed",
-                "generated_batch_generated_at": generated_batch_at,
-                "research_cycle_generated_at": research_generated_at,
-                "hypotheses": generated_batch.get(
-                    "hypotheses_count",
-                    (generated_batch.get("summary") or {}).get("hypotheses"),
-                ),
-            }
-        )
+        return None
+    return {
+        "name": "generated_batch_unconsumed",
+        "generated_batch_generated_at": generated_batch_at,
+        "research_cycle_generated_at": research_cycle.get("generated_at"),
+        "hypotheses": generated_batch.get(
+            "hypotheses_count",
+            (generated_batch.get("summary") or {}).get("hypotheses"),
+        ),
+    }
+
+
+def _freshness_handoff_warnings(
+    research_cycle: dict[str, Any], generated_batch: dict[str, Any]
+) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
     for name, payload in (
         ("research_cycle_stale", research_cycle),
         ("generated_batch_stale", generated_batch),
@@ -718,7 +737,94 @@ def research_handoff_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
                     "reason": payload.get("freshness_reason"),
                 }
             )
+    return warnings
+
+
+def research_handoff_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
+    warnings: list[dict[str, Any]] = []
+    research_cycle = (
+        report.get("research_cycle") if isinstance(report.get("research_cycle"), dict) else {}
+    )
+    mutation_plan = (
+        report.get("mutation_plan") if isinstance(report.get("mutation_plan"), dict) else {}
+    )
+    mutation_batch = (
+        report.get("mutation_batch") if isinstance(report.get("mutation_batch"), dict) else {}
+    )
+    generated_batch = (
+        report.get("generated_batch") if isinstance(report.get("generated_batch"), dict) else {}
+    )
+    for name, payload, include_skipped in (
+        ("mutation_plan_unhealthy", mutation_plan, False),
+        ("mutation_batch_unhealthy", mutation_batch, True),
+    ):
+        if payload:
+            warning = _handoff_health_warning(name, payload, include_skipped=include_skipped)
+            if warning is not None:
+                warnings.append(warning)
+    warnings.extend(_handoff_source_warnings(research_cycle, mutation_plan, mutation_batch))
+    generated_warning = _generated_batch_handoff_warning(research_cycle, generated_batch)
+    if generated_warning is not None:
+        warnings.append(generated_warning)
+    warnings.extend(_freshness_handoff_warnings(research_cycle, generated_batch))
     return {"warnings": warnings}
+
+
+def _open_research_products(report: dict[str, Any]) -> list[dict[str, Any]]:
+    products = []
+    for product in _dict_list(report.get("products")):
+        try:
+            open_count = int(product.get("open_positions") or 0)
+        except (TypeError, ValueError):
+            open_count = 0
+        if open_count <= 0:
+            continue
+        products.append(
+            {
+                "name": product.get("name"),
+                "objective": product.get("objective"),
+                "market": product.get("market"),
+                "open_positions": open_count,
+            }
+        )
+    return products
+
+
+def _open_position_research_warning(
+    report: dict[str, Any],
+    research_cycle: dict[str, Any],
+    summary: dict[str, Any],
+    export_reasons: dict[str, Any],
+) -> dict[str, Any] | None:
+    if int(export_reasons.get("open_positions_block_export") or 0) <= 0:
+        return None
+    return {
+        "warnings": [
+            {
+                "name": "research_export_blocked_open_positions",
+                "generated_at": research_cycle.get("generated_at"),
+                "keepers": summary.get("keepers"),
+                "exported": summary.get("exported"),
+                "export_reasons": export_reasons,
+                "next_actions": summary.get("next_actions") or [],
+                "open_products": _open_research_products(report),
+            }
+        ]
+    }
+
+
+def _waiting_research_products(report: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": product.get("name"),
+            "objective": product.get("objective"),
+            "market": product.get("market"),
+        }
+        for product in _dict_list(report.get("products"))
+        if product.get("enabled") is not False
+        and product.get("mode") == "paper"
+        and product.get("reason") == "waiting_for_strategy_artifact"
+    ]
 
 
 def research_progress_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
@@ -737,55 +843,15 @@ def research_progress_warning_detail(report: dict[str, Any]) -> dict[str, Any]:
     export_reasons = (
         summary.get("export_reasons") if isinstance(summary.get("export_reasons"), dict) else {}
     )
-    if int(export_reasons.get("open_positions_block_export") or 0) > 0:
-        open_products = []
-        for product in _dict_list(report.get("products")):
-            open_positions = product.get("open_positions")
-            try:
-                open_count = int(open_positions or 0)
-            except (TypeError, ValueError):
-                open_count = 0
-            if open_count <= 0:
-                continue
-            open_products.append(
-                {
-                    "name": product.get("name"),
-                    "objective": product.get("objective"),
-                    "market": product.get("market"),
-                    "open_positions": open_count,
-                }
-            )
-        return {
-            "warnings": [
-                {
-                    "name": "research_export_blocked_open_positions",
-                    "generated_at": research_cycle.get("generated_at"),
-                    "keepers": summary.get("keepers"),
-                    "exported": summary.get("exported"),
-                    "export_reasons": export_reasons,
-                    "next_actions": summary.get("next_actions") or [],
-                    "open_products": open_products,
-                }
-            ]
-        }
+    open_position_warning = _open_position_research_warning(
+        report, research_cycle, summary, export_reasons
+    )
+    if open_position_warning is not None:
+        return open_position_warning
     if int(summary.get("keepers") or 0) > 0 or int(summary.get("exported") or 0) > 0:
         return {"warnings": []}
 
-    waiting_products = []
-    for product in _dict_list(report.get("products")):
-        if product.get("enabled") is False:
-            continue
-        if product.get("mode") != "paper":
-            continue
-        if product.get("reason") != "waiting_for_strategy_artifact":
-            continue
-        waiting_products.append(
-            {
-                "name": product.get("name"),
-                "objective": product.get("objective"),
-                "market": product.get("market"),
-            }
-        )
+    waiting_products = _waiting_research_products(report)
     if not waiting_products:
         return {"warnings": []}
 
