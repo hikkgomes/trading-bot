@@ -4945,154 +4945,237 @@ def _assert_live_pre_entry_gate(
     }
 
 
-def run_product_once(
+def _portfolio_gate_for_product(
     product: ProductConfig,
+    config: AutopilotConfig | None,
+) -> Callable[[dict[str, Any]], dict[str, Any]] | None:
+    if config is None or product.objective != "active_income":
+        return None
+
+    def portfolio_gate(proposal: dict[str, Any]) -> dict[str, Any]:
+        return _active_income_portfolio_decision(config, proposal)
+
+    return portfolio_gate
+
+
+def _configure_live_management_artifact(
+    product: ProductConfig,
+    status: dict[str, Any],
     *,
     approval_ledger: Path,
-    allow_entries: bool = True,
-    config: AutopilotConfig | None = None,
+    local_open_positions: int | None,
+    local_state_management: bool,
 ) -> dict[str, Any]:
-    status: dict[str, Any] = {
-        "product": _product_to_status(product),
-        "started_at": utc_now(),
-        "ok": False,
-    }
-    if not product.enabled:
-        status.update(ok=True, skipped=True, reason="disabled")
-        return status
-    portfolio_gate = None
-    if config is not None and product.objective == "active_income":
-
-        def portfolio_gate(proposal: dict[str, Any]) -> dict[str, Any]:
-            return _active_income_portfolio_decision(config, proposal)
-
-    if product.execution_mode == "live":
-        local_open_positions = _local_open_position_count(product)
-        local_state_management = _local_state_requires_management(product)
-        management_only = not allow_entries or local_state_management
-        artifact_snapshot: dict[str, Any] | None = None
-        status["entries_allowed"] = not management_only
-        if management_only:
-            status["entry_gate"] = {
-                "status": "management_only",
-                "reason": "paused_or_durable_management_state",
-                "local_open_positions": local_open_positions,
-                "local_state_requires_management": local_state_management,
-            }
-            # Approval/policy changes must block risk-increasing entries, never
-            # reconciliation or an exit that reduces an existing exposure.
-            try:
-                artifact_snapshot = load_artifact(product.strategies_path)
-                status["strategy_policy"] = assert_loaded_strategy_artifact_allowed(
-                    product,
-                    artifact_snapshot,
-                    artifact_path=product.strategies_path,
-                )
-            except (ApprovalError, FileNotFoundError, StrategyPolicyError, ValueError) as exc:
-                status["strategy_policy"] = {"ok": False, "management_warning": str(exc)}
-                if artifact_snapshot is None:
-                    artifact_snapshot = _frozen_management_artifact(product)
-                    status["strategy_policy"]["artifact_source"] = artifact_snapshot.get("source")
-            if local_state_management and not local_open_positions:
-                artifact_snapshot = _frozen_management_artifact(product)
-                status.setdefault("strategy_policy", {})["artifact_source"] = artifact_snapshot.get(
-                    "source"
-                )
-            try:
-                if artifact_snapshot is None:
-                    raise ApprovalError("Strategy artifact snapshot is unavailable.")
-                assert_loaded_artifact_live_approved(
-                    artifact_snapshot,
-                    product.strategies_path,
-                    approval_ledger,
-                    product=product,
-                )
-            except (ApprovalError, FileNotFoundError, StrategyPolicyError, ValueError) as exc:
-                status["approval_gate"] = "management_only"
-                status["approval_warning"] = str(exc)
-            else:
-                status["approval_gate"] = "approved"
-            status["preflight_gate"] = {
-                "skipped": True,
-                "reason": "entry_only_gate_while_managing_exposure",
-            }
-            status["testnet_rehearsal_gate"] = {
-                "skipped": True,
-                "reason": "entry_only_gate_while_managing_exposure",
-            }
-        else:
-            artifact_snapshot = load_artifact(product.strategies_path)
-            status["strategy_policy"] = assert_loaded_strategy_artifact_allowed(
-                product,
-                artifact_snapshot,
-                artifact_path=product.strategies_path,
-            )
-            assert_loaded_artifact_live_approved(
-                artifact_snapshot,
-                product.strategies_path,
-                approval_ledger,
-                product=product,
-            )
-            status["approval_gate"] = "approved"
-            status["preflight_gate"] = assert_recent_preflight(product, artifact=artifact_snapshot)
-            status["testnet_rehearsal_gate"] = assert_recent_testnet_rehearsal(
-                product,
-                artifact=artifact_snapshot,
-            )
-        status["live_environment"] = assert_live_environment(
+    artifact_snapshot: dict[str, Any] | None = None
+    try:
+        artifact_snapshot = load_artifact(product.strategies_path)
+        status["strategy_policy"] = assert_loaded_strategy_artifact_allowed(
             product,
-            require_production=True,
+            artifact_snapshot,
+            artifact_path=product.strategies_path,
         )
-        if not management_only:
-            _assert_current_environment_matches_preflight(
+    except (ApprovalError, FileNotFoundError, StrategyPolicyError, ValueError) as exc:
+        status["strategy_policy"] = {"ok": False, "management_warning": str(exc)}
+        if artifact_snapshot is None:
+            artifact_snapshot = _frozen_management_artifact(product)
+            status["strategy_policy"]["artifact_source"] = artifact_snapshot.get("source")
+    if local_state_management and not local_open_positions:
+        artifact_snapshot = _frozen_management_artifact(product)
+        status.setdefault("strategy_policy", {})["artifact_source"] = artifact_snapshot.get(
+            "source"
+        )
+    try:
+        if artifact_snapshot is None:
+            raise ApprovalError("Strategy artifact snapshot is unavailable.")
+        assert_loaded_artifact_live_approved(
+            artifact_snapshot,
+            product.strategies_path,
+            approval_ledger,
+            product=product,
+        )
+    except (ApprovalError, FileNotFoundError, StrategyPolicyError, ValueError) as exc:
+        status["approval_gate"] = "management_only"
+        status["approval_warning"] = str(exc)
+    else:
+        status["approval_gate"] = "approved"
+    status["preflight_gate"] = {
+        "skipped": True,
+        "reason": "entry_only_gate_while_managing_exposure",
+    }
+    status["testnet_rehearsal_gate"] = {
+        "skipped": True,
+        "reason": "entry_only_gate_while_managing_exposure",
+    }
+    if artifact_snapshot is None:  # pragma: no cover - frozen recovery always returns a payload
+        raise ApprovalError("Strategy artifact snapshot is unavailable.")
+    return artifact_snapshot
+
+
+def _configure_live_entry_artifact(
+    product: ProductConfig,
+    status: dict[str, Any],
+    *,
+    approval_ledger: Path,
+) -> dict[str, Any]:
+    artifact_snapshot = load_artifact(product.strategies_path)
+    status["strategy_policy"] = assert_loaded_strategy_artifact_allowed(
+        product,
+        artifact_snapshot,
+        artifact_path=product.strategies_path,
+    )
+    assert_loaded_artifact_live_approved(
+        artifact_snapshot,
+        product.strategies_path,
+        approval_ledger,
+        product=product,
+    )
+    status["approval_gate"] = "approved"
+    status["preflight_gate"] = assert_recent_preflight(product, artifact=artifact_snapshot)
+    status["testnet_rehearsal_gate"] = assert_recent_testnet_rehearsal(
+        product,
+        artifact=artifact_snapshot,
+    )
+    return artifact_snapshot
+
+
+def _live_product_artifact_setup(
+    product: ProductConfig,
+    status: dict[str, Any],
+    *,
+    approval_ledger: Path,
+    allow_entries: bool,
+) -> tuple[dict[str, Any], bool]:
+    local_open_positions = _local_open_position_count(product)
+    local_state_management = _local_state_requires_management(product)
+    management_only = not allow_entries or local_state_management
+    status["entries_allowed"] = not management_only
+    if management_only:
+        status["entry_gate"] = {
+            "status": "management_only",
+            "reason": "paused_or_durable_management_state",
+            "local_open_positions": local_open_positions,
+            "local_state_requires_management": local_state_management,
+        }
+        artifact_snapshot = _configure_live_management_artifact(
+            product,
+            status,
+            approval_ledger=approval_ledger,
+            local_open_positions=local_open_positions,
+            local_state_management=local_state_management,
+        )
+    else:
+        artifact_snapshot = _configure_live_entry_artifact(
+            product,
+            status,
+            approval_ledger=approval_ledger,
+        )
+    return artifact_snapshot, management_only
+
+
+def _build_product_bot(
+    product: ProductConfig,
+    *,
+    artifact_snapshot: dict[str, Any],
+    portfolio_gate: Callable[[dict[str, Any]], dict[str, Any]] | None,
+    broker: Any = None,
+    live_gate_approved: bool = False,
+    allow_entries: bool = True,
+    pre_entry_gate: Callable[[], dict[str, Any]] | None = None,
+) -> PaperTradingBot:
+    return PaperTradingBot(
+        strategies_path=product.strategies_path,
+        state_file=product.state_file,
+        trade_log=product.trade_log,
+        starting_equity=product.starting_equity,
+        regime_guard=product.regime_guard,
+        regime_mayer_top=product.regime_mayer_top,
+        broker=broker,
+        symbol=product.symbol,
+        market=product.market,
+        objective=product.objective,
+        base_asset=product.base_asset,
+        live_gate_approved=live_gate_approved,
+        allow_entries=allow_entries,
+        artifact_payload=artifact_snapshot,
+        pre_entry_gate=pre_entry_gate,
+        portfolio_gate=portfolio_gate,
+    )
+
+
+def _run_product_bot(
+    status: dict[str, Any],
+    bot: PaperTradingBot,
+    *,
+    broker_name: str | None = None,
+) -> dict[str, Any]:
+    try:
+        bot.run_cycle()
+    except Exception as exc:
+        return _bot_cycle_failure_status(status, bot, exc, broker_name=broker_name)
+    cycle_errors = _bot_cycle_errors(bot)
+    snapshot = _bot_status_snapshot(bot)
+    status.update(
+        ok=not cycle_errors and not snapshot.get("state_errors"),
+        cycle_errors=cycle_errors,
+        **snapshot,
+    )
+    if broker_name is not None:
+        status["broker"] = broker_name
+    return status
+
+
+def _run_live_product_once(
+    product: ProductConfig,
+    status: dict[str, Any],
+    *,
+    approval_ledger: Path,
+    allow_entries: bool,
+    config: AutopilotConfig | None,
+    portfolio_gate: Callable[[dict[str, Any]], dict[str, Any]] | None,
+) -> dict[str, Any]:
+    artifact_snapshot, management_only = _live_product_artifact_setup(
+        product,
+        status,
+        approval_ledger=approval_ledger,
+        allow_entries=allow_entries,
+    )
+    status["live_environment"] = assert_live_environment(product, require_production=True)
+    if not management_only:
+        _assert_current_environment_matches_preflight(
+            product,
+            current=status["live_environment"],
+            recorded=status["preflight_gate"]["exchange_environment"],
+        )
+    broker = build_live_broker(product)
+    pre_entry_gate = None
+    if not management_only:
+
+        def pre_entry_gate() -> dict[str, Any]:
+            return _assert_live_pre_entry_gate(
                 product,
-                current=status["live_environment"],
-                recorded=status["preflight_gate"]["exchange_environment"],
+                artifact_snapshot,
+                approval_ledger=approval_ledger,
+                config=config,
             )
-        broker = build_live_broker(product)
-        pre_entry_gate = None
-        if not management_only:
 
-            def pre_entry_gate() -> dict[str, Any]:
-                return _assert_live_pre_entry_gate(
-                    product,
-                    artifact_snapshot,
-                    approval_ledger=approval_ledger,
-                    config=config,
-                )
+    bot = _build_product_bot(
+        product,
+        artifact_snapshot=artifact_snapshot,
+        portfolio_gate=portfolio_gate,
+        broker=broker,
+        live_gate_approved=True,
+        allow_entries=not management_only,
+        pre_entry_gate=pre_entry_gate,
+    )
+    return _run_product_bot(status, bot, broker_name=broker.name)
 
-        bot = PaperTradingBot(
-            strategies_path=product.strategies_path,
-            state_file=product.state_file,
-            trade_log=product.trade_log,
-            starting_equity=product.starting_equity,
-            regime_guard=product.regime_guard,
-            regime_mayer_top=product.regime_mayer_top,
-            broker=broker,
-            symbol=product.symbol,
-            market=product.market,
-            objective=product.objective,
-            base_asset=product.base_asset,
-            live_gate_approved=True,
-            allow_entries=not management_only,
-            artifact_payload=artifact_snapshot,
-            pre_entry_gate=pre_entry_gate,
-            portfolio_gate=portfolio_gate,
-        )
-        try:
-            bot.run_cycle()
-        except Exception as exc:
-            return _bot_cycle_failure_status(status, bot, exc, broker_name=broker.name)
-        cycle_errors = _bot_cycle_errors(bot)
-        snapshot = _bot_status_snapshot(bot)
-        status.update(
-            ok=not cycle_errors and not snapshot.get("state_errors"),
-            broker=broker.name,
-            cycle_errors=cycle_errors,
-            **snapshot,
-        )
-        return status
 
+def _paper_product_artifact_setup(
+    product: ProductConfig,
+    status: dict[str, Any],
+    *,
+    allow_entries: bool,
+) -> tuple[dict[str, Any], bool] | None:
     if not product.strategies_path.exists():
         status.update(
             ok=True,
@@ -5100,8 +5183,7 @@ def run_product_once(
             reason="waiting_for_strategy_artifact",
             detail=f"Strategy artifact not found: {product.strategies_path}",
         )
-        return status
-
+        return None
     try:
         artifact_snapshot = load_artifact(product.strategies_path)
     except ApprovalError as exc:
@@ -5111,7 +5193,7 @@ def run_product_once(
             reason="strategy_policy_blocked",
             detail=str(exc),
         )
-        return status
+        return None
     bootstrap_management_only = (
         artifact_snapshot.get("source") == "paper_bootstrap"
         or artifact_snapshot.get("schema") == "autopilot.paper_bootstrap/v1"
@@ -5138,7 +5220,7 @@ def run_product_once(
                 reason="strategy_policy_blocked",
                 detail=str(exc),
             )
-            return status
+            return None
     effective_allow_entries = allow_entries and not bootstrap_management_only
     status["entries_allowed"] = effective_allow_entries
     if bootstrap_management_only:
@@ -5148,33 +5230,61 @@ def run_product_once(
             "artifact_source": artifact_snapshot.get("source"),
             "artifact_schema": artifact_snapshot.get("schema"),
         }
-    bot = PaperTradingBot(
-        strategies_path=product.strategies_path,
-        state_file=product.state_file,
-        trade_log=product.trade_log,
-        starting_equity=product.starting_equity,
-        regime_guard=product.regime_guard,
-        regime_mayer_top=product.regime_mayer_top,
-        symbol=product.symbol,
-        market=product.market,
-        objective=product.objective,
-        base_asset=product.base_asset,
+    return artifact_snapshot, effective_allow_entries
+
+
+def _run_paper_product_once(
+    product: ProductConfig,
+    status: dict[str, Any],
+    *,
+    allow_entries: bool,
+    portfolio_gate: Callable[[dict[str, Any]], dict[str, Any]] | None,
+) -> dict[str, Any]:
+    setup = _paper_product_artifact_setup(product, status, allow_entries=allow_entries)
+    if setup is None:
+        return status
+    artifact_snapshot, effective_allow_entries = setup
+    bot = _build_product_bot(
+        product,
+        artifact_snapshot=artifact_snapshot,
+        portfolio_gate=portfolio_gate,
         allow_entries=effective_allow_entries,
-        artifact_payload=artifact_snapshot,
+    )
+    return _run_product_bot(status, bot)
+
+
+def run_product_once(
+    product: ProductConfig,
+    *,
+    approval_ledger: Path,
+    allow_entries: bool = True,
+    config: AutopilotConfig | None = None,
+) -> dict[str, Any]:
+    status: dict[str, Any] = {
+        "product": _product_to_status(product),
+        "started_at": utc_now(),
+        "ok": False,
+    }
+    if not product.enabled:
+        status.update(ok=True, skipped=True, reason="disabled")
+        return status
+    portfolio_gate = _portfolio_gate_for_product(product, config)
+    if product.execution_mode == "live":
+        return _run_live_product_once(
+            product,
+            status,
+            approval_ledger=approval_ledger,
+            allow_entries=allow_entries,
+            config=config,
+            portfolio_gate=portfolio_gate,
+        )
+
+    return _run_paper_product_once(
+        product,
+        status,
+        allow_entries=allow_entries,
         portfolio_gate=portfolio_gate,
     )
-    try:
-        bot.run_cycle()
-    except Exception as exc:
-        return _bot_cycle_failure_status(status, bot, exc)
-    cycle_errors = _bot_cycle_errors(bot)
-    snapshot = _bot_status_snapshot(bot)
-    status.update(
-        ok=not cycle_errors and not snapshot.get("state_errors"),
-        cycle_errors=cycle_errors,
-        **snapshot,
-    )
-    return status
 
 
 def _report_output_status(path: Path) -> dict[str, Any]:
