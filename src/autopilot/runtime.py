@@ -1931,66 +1931,65 @@ def _local_open_position_count(product: ProductConfig) -> int | None:
     return len(positions)
 
 
-def _active_income_portfolio_status(config: AutopilotConfig) -> dict[str, Any]:
-    products: dict[str, Any] = {}
+def _active_income_product_snapshot(
+    product: ProductConfig,
+) -> tuple[dict[str, Any], list[PortfolioPosition], int, float, float]:
+    item: dict[str, Any] = {
+        "state_file": str(product.state_file),
+        "open_positions": 0,
+        "ok": True,
+    }
     positions: list[PortfolioPosition] = []
     total = 0
-    ok = True
     current_equity = 0.0
     peak_equity = 0.0
-    for product in config.products:
-        if not product.enabled or product.objective != "active_income":
-            continue
-        item: dict[str, Any] = {
-            "state_file": str(product.state_file),
-            "open_positions": 0,
-            "ok": True,
-        }
-        if product.state_file.is_symlink():
-            item.update(ok=False, reason="state_file_symlink")
-        elif product.state_file.exists():
-            count = _local_open_position_count(product)
-            if count is None:
-                item.update(ok=False, reason="state_file_unreadable")
-            else:
-                item["open_positions"] = count
-                total += count
-                try:
-                    state = json.loads(product.state_file.read_text(encoding="utf-8"))
-                    equity = float(state.get("equity", product.starting_equity))
-                    peak = float(state.get("peak_equity", max(equity, product.starting_equity)))
-                    if (
-                        not math.isfinite(equity)
-                        or not math.isfinite(peak)
-                        or equity <= 0
-                        or peak <= 0
-                    ):
-                        raise ValueError("portfolio equity/peak is invalid")
-                    current_equity += equity
-                    peak_equity += peak
-                    for raw_position in state.get("open_positions", {}).values():
-                        if not isinstance(raw_position, dict):
-                            raise ValueError("open position must be an object")
-                        positions.append(
-                            PortfolioPosition(
-                                product=product.name,
-                                symbol=product.symbol,
-                                direction=str(raw_position.get("direction") or ""),
-                                fraction=float(raw_position.get("position_size")),
-                            )
-                        )
-                except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                    item.update(ok=False, reason="portfolio_position_invalid", error=str(exc))
-        products[product.name] = item
-        ok = ok and bool(item["ok"])
-    gross = sum(position.fraction for position in positions)
-    net = sum(position.signed_fraction for position in positions)
+    if product.state_file.is_symlink():
+        item.update(ok=False, reason="state_file_symlink")
+        return item, positions, total, current_equity, peak_equity
+    if not product.state_file.exists():
+        return item, positions, total, current_equity, peak_equity
+    count = _local_open_position_count(product)
+    if count is None:
+        item.update(ok=False, reason="state_file_unreadable")
+        return item, positions, total, current_equity, peak_equity
+    item["open_positions"] = count
+    total = count
+    try:
+        state = json.loads(product.state_file.read_text(encoding="utf-8"))
+        equity = float(state.get("equity", product.starting_equity))
+        peak = float(state.get("peak_equity", max(equity, product.starting_equity)))
+        if not math.isfinite(equity) or not math.isfinite(peak) or equity <= 0 or peak <= 0:
+            raise ValueError("portfolio equity/peak is invalid")
+        current_equity = equity
+        peak_equity = peak
+        for raw_position in state.get("open_positions", {}).values():
+            if not isinstance(raw_position, dict):
+                raise ValueError("open position must be an object")
+            positions.append(
+                PortfolioPosition(
+                    product=product.name,
+                    symbol=product.symbol,
+                    direction=str(raw_position.get("direction") or ""),
+                    fraction=float(raw_position.get("position_size")),
+                )
+            )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        item.update(ok=False, reason="portfolio_position_invalid", error=str(exc))
+    return item, positions, total, current_equity, peak_equity
+
+
+def _active_income_symbol_fractions(
+    positions: list[PortfolioPosition],
+) -> dict[str, float]:
     symbol_fractions: dict[str, float] = {}
     for position in positions:
         symbol_fractions[position.symbol] = (
             symbol_fractions.get(position.symbol, 0.0) + position.fraction
         )
-    portfolio_drawdown = current_equity / peak_equity - 1 if peak_equity else 0.0
+    return symbol_fractions
+
+
+def _active_income_risk_status(config: AutopilotConfig) -> dict[str, Any]:
     risk_status: dict[str, Any] = {
         "required": config.portfolio_risk_required,
         "path": str(config.portfolio_risk_file),
@@ -2001,45 +2000,49 @@ def _active_income_portfolio_status(config: AutopilotConfig) -> dict[str, Any]:
     }
     if config.portfolio_risk_file.is_symlink():
         risk_status["reason"] = "risk_model_symlink"
-    elif not config.portfolio_risk_file.exists():
+        return risk_status
+    if not config.portfolio_risk_file.exists():
         risk_status["reason"] = "risk_model_missing"
-    else:
-        try:
-            payload = json.loads(config.portfolio_risk_file.read_text(encoding="utf-8"))
-            model = PortfolioRiskModel.from_dict(payload)
-            active_symbols = {
-                product.symbol.upper()
-                for product in config.products
-                if product.enabled and product.objective == "active_income"
-            }
-            missing_beta = sorted(active_symbols - set(model.beta_by_symbol))
-            missing_pairs = sorted(
-                f"{first}:{second}"
-                for first in active_symbols
-                for second in active_symbols
-                if model.correlation(first, second) is None
+        return risk_status
+    try:
+        payload = json.loads(config.portfolio_risk_file.read_text(encoding="utf-8"))
+        model = PortfolioRiskModel.from_dict(payload)
+        active_symbols = {
+            product.symbol.upper()
+            for product in config.products
+            if product.enabled and product.objective == "active_income"
+        }
+        missing_beta = sorted(active_symbols - set(model.beta_by_symbol))
+        missing_pairs = sorted(
+            f"{first}:{second}"
+            for first in active_symbols
+            for second in active_symbols
+            if model.correlation(first, second) is None
+        )
+        if missing_beta or missing_pairs:
+            raise ValueError(
+                "risk model is incomplete for configured symbols: "
+                f"missing_beta={missing_beta}, missing_correlations={missing_pairs}"
             )
-            if missing_beta or missing_pairs:
-                raise ValueError(
-                    "risk model is incomplete for configured symbols: "
-                    f"missing_beta={missing_beta}, missing_correlations={missing_pairs}"
-                )
-            generated = dt.datetime.fromisoformat(model.generated_at.replace("Z", "+00:00"))
-            if generated.tzinfo is None:
-                generated = generated.replace(tzinfo=dt.UTC)
-            age = time.time() - generated.timestamp()
-            fresh = 0 <= age <= config.portfolio_risk_max_age_seconds
-            risk_status.update(
-                ok=fresh,
-                fresh=fresh,
-                age_seconds=round(age, 3),
-                reason=None if fresh else "risk_model_stale_or_future",
-                model=payload if fresh else None,
-            )
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            risk_status.update(reason="risk_model_invalid", error=str(exc))
-    ok = ok and (bool(risk_status["ok"]) or not config.portfolio_risk_required)
-    policy = PortfolioPolicy(
+        generated = dt.datetime.fromisoformat(model.generated_at.replace("Z", "+00:00"))
+        if generated.tzinfo is None:
+            generated = generated.replace(tzinfo=dt.UTC)
+        age = time.time() - generated.timestamp()
+        fresh = 0 <= age <= config.portfolio_risk_max_age_seconds
+        risk_status.update(
+            ok=fresh,
+            fresh=fresh,
+            age_seconds=round(age, 3),
+            reason=None if fresh else "risk_model_stale_or_future",
+            model=payload if fresh else None,
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        risk_status.update(reason="risk_model_invalid", error=str(exc))
+    return risk_status
+
+
+def _active_income_policy(config: AutopilotConfig) -> PortfolioPolicy:
+    return PortfolioPolicy(
         max_positions=config.active_income_max_open_positions,
         max_gross_fraction=config.active_income_max_gross_fraction,
         max_net_fraction=config.active_income_max_net_fraction,
@@ -2050,6 +2053,34 @@ def _active_income_portfolio_status(config: AutopilotConfig) -> dict[str, Any]:
         max_abs_beta_fraction=config.active_income_max_abs_beta_fraction,
         max_drawdown_fraction=config.active_income_max_portfolio_drawdown_fraction,
     )
+
+
+def _active_income_portfolio_status(config: AutopilotConfig) -> dict[str, Any]:
+    products: dict[str, Any] = {}
+    positions: list[PortfolioPosition] = []
+    total = 0
+    ok = True
+    current_equity = 0.0
+    peak_equity = 0.0
+    for product in config.products:
+        if not product.enabled or product.objective != "active_income":
+            continue
+        item, item_positions, item_total, item_equity, item_peak = (
+            _active_income_product_snapshot(product)
+        )
+        products[product.name] = item
+        positions.extend(item_positions)
+        total += item_total
+        current_equity += item_equity
+        peak_equity += item_peak
+        ok = ok and bool(item["ok"])
+    gross = sum(position.fraction for position in positions)
+    net = sum(position.signed_fraction for position in positions)
+    symbol_fractions = _active_income_symbol_fractions(positions)
+    portfolio_drawdown = current_equity / peak_equity - 1 if peak_equity else 0.0
+    risk_status = _active_income_risk_status(config)
+    ok = ok and (bool(risk_status["ok"]) or not config.portfolio_risk_required)
+    policy = _active_income_policy(config)
     return {
         "ok": ok,
         "open_positions": total,
