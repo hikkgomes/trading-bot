@@ -22,7 +22,7 @@ extend-exclude = [".venv", "data", "outputs"]
 
 [tool.ruff.lint]
 # E/F = pyflakes+pycodestyle, I = isort, UP = pyupgrade, B = bugbear, C4 = comprehensions
-select = ["E", "F", "I", "UP", "B", "C4"]
+select = ["E", "F", "I", "UP", "B", "C4", "C90"]
 ignore = [
     "E501",  # line length handled by formatter, not enforced hard
     "B008",  # function calls in argument defaults (common for argparse/np defaults)
@@ -37,6 +37,9 @@ ignore = [
 
 [tool.ruff.format]
 quote-style = "double"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
 
 [tool.mypy]
 ignore_missing_imports = true
