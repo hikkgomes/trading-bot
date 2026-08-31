@@ -1,10 +1,8 @@
 [Unit]
-Description=Trading platform service %i
+Description=Trading platform control and metrics API
 After=network-online.target postgresql.service trading-platform-migration.service
 Wants=network-online.target
 Requires=postgresql.service trading-platform-migration.service
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -12,10 +10,9 @@ User=trading-runtime
 Group=trading-runtime
 WorkingDirectory=/opt/trading-bot
 EnvironmentFile=/etc/trading-platform/runtime.env
-EnvironmentFile=-/etc/trading-platform/%i.env
 Environment=PYTHONUNBUFFERED=1
-ExecStartPre=/opt/trading-bot/.venv-runtime/bin/python -m src.services.supervisor --config /opt/trading-bot/config/platform.json --node linux-optiplex --service %i --validate
-ExecStart=/opt/trading-bot/.venv-runtime/bin/python -m src.services.supervisor --config /opt/trading-bot/config/platform.json --node linux-optiplex --service %i
+ExecStartPre=/opt/trading-bot/.venv-runtime/bin/python -m src.services.supervisor --config /opt/trading-bot/config/platform.json --node linux-optiplex --service control-api --validate
+ExecStart=/opt/trading-bot/.venv-runtime/bin/python -m src.services.supervisor --config /opt/trading-bot/config/platform.json --node linux-optiplex --service control-api
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
@@ -34,7 +31,7 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-ReadWritePaths=/opt/trading-bot/data/raw /opt/trading-bot/data/bars /opt/trading-bot/data/features /opt/trading-bot/runtime
+ReadWritePaths=/opt/trading-bot/runtime
 Slice=trading-platform-critical.slice
 
 [Install]

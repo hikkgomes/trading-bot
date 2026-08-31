@@ -120,14 +120,16 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   setfacl -m u:trading-runtime:rx "$REPO/runtime/research"
   setfacl -m d:u:trading-runtime:rx "$REPO/runtime/research"
   setfacl -m u:trading-agent:rwx "$REPO/runtime/agent-worktrees"
-  install_platform_unit "$REPO/deploy/systemd/trading-platform@.service" \
-    /etc/systemd/system/trading-platform@.service
-  install_platform_unit "$REPO/deploy/systemd/trading-platform-research@.service" \
-    /etc/systemd/system/trading-platform-research@.service
-  install_platform_unit "$REPO/deploy/systemd/trading-platform-agent@.service" \
-    /etc/systemd/system/trading-platform-agent@.service
   install_platform_unit "$REPO/deploy/systemd/trading-platform-migration.service" \
     /etc/systemd/system/trading-platform-migration.service
+  install_platform_unit "$REPO/deploy/systemd/trading-platform-runtime.service" \
+    /etc/systemd/system/trading-platform-runtime.service
+  install_platform_unit "$REPO/deploy/systemd/trading-platform-research.service" \
+    /etc/systemd/system/trading-platform-research.service
+  install_platform_unit "$REPO/deploy/systemd/trading-platform-agent.service" \
+    /etc/systemd/system/trading-platform-agent.service
+  install_platform_unit "$REPO/deploy/systemd/trading-platform-control.service" \
+    /etc/systemd/system/trading-platform-control.service
   for slice in critical background agent; do
     install -m 0644 "$REPO/deploy/systemd/trading-platform-${slice}.slice" \
       "/etc/systemd/system/trading-platform-${slice}.slice"
@@ -145,15 +147,23 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     exit 0
   fi
   systemctl daemon-reload
-  critical_services=(market-gateway data-writer feature-service strategy-evaluator portfolio-engine portfolio-state-service risk-engine execution-engine paper-engine product-supervisor accounting-service account-reconciliation promotion-engine control-api universe-service platform-scheduler)
-  research_services=(research-worker ml-worker event-replay-worker feature-build-worker report-worker)
-  for service in "${critical_services[@]}"; do
-    systemctl enable "trading-platform@${service}.service"
+  legacy_units=(
+    trading-bot-autopilot.service
+    trading-bot-autopilot-jobs.service
+    trading-bot-candidate-paper.service
+    trading-bot-event-capture.service
+    trading-bot-autopilot-backup.timer
+    trading-bot-autopilot-healthcheck.timer
+    trading-bot-openclaw-bridge.service
+    trading-bot-telegram.service
+  )
+  for unit in "${legacy_units[@]}"; do
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
   done
-  for service in "${research_services[@]}"; do
-    systemctl enable "trading-platform-research@${service}.service"
-  done
-  systemctl enable trading-platform-agent@agent-sandbox.service
+  systemctl enable trading-platform-runtime.service
+  systemctl enable trading-platform-research.service
+  systemctl enable trading-platform-agent.service
+  systemctl enable trading-platform-control.service
   systemctl enable trading-platform-migration.service
   systemctl enable trading-platform-backup-postgresql.timer
   systemctl enable trading-platform-backup-parquet.timer

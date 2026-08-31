@@ -42,6 +42,36 @@ LINUX_SERVICES = frozenset(
 MAC_SERVICES: frozenset[str] = frozenset()
 ORDER_SUBMISSION_SERVICES = frozenset({"execution-engine"})
 
+PLATFORM_PROCESS_SERVICES: dict[str, tuple[str, ...]] = {
+    "trading-runtime": (
+        "market-gateway",
+        "data-writer",
+        "feature-service",
+        "universe-service",
+        "platform-scheduler",
+        "strategy-evaluator",
+        "product-supervisor",
+        "portfolio-engine",
+        "portfolio-state-service",
+        "risk-engine",
+        "execution-engine",
+        "paper-engine",
+        "accounting-service",
+        "account-reconciliation",
+    ),
+    "research-runtime": (
+        "promotion-engine",
+        "research-worker",
+        "ml-worker",
+        "event-replay-worker",
+        "feature-build-worker",
+        "report-worker",
+    ),
+    "agent-runtime": ("agent-sandbox",),
+    "control-api": ("control-api",),
+    "migration-service": ("migration-service",),
+}
+
 
 def _mapping(value: object, *, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
@@ -108,6 +138,7 @@ class PlatformConfig:
     backup: dict[str, Any]
     resource_limits: dict[str, Any]
     security_domains: dict[str, tuple[str, ...]]
+    processes: dict[str, tuple[str, ...]]
 
     @classmethod
     def from_dict(cls, value: object) -> PlatformConfig:
@@ -178,6 +209,24 @@ class PlatformConfig:
         ]
         if set(domain_services) != expected or len(domain_services) != len(expected):
             raise ValueError("each service must belong to exactly one security domain")
+        raw_processes = _mapping(
+            data.get(
+                "processes", {key: list(value) for key, value in PLATFORM_PROCESS_SERVICES.items()}
+            ),
+            field="platform.processes",
+        )
+        processes = {
+            str(process): tuple(
+                _string(item, field=f"platform.processes.{process}[]") for item in services
+            )
+            for process, services in raw_processes.items()
+            if isinstance(services, list | tuple) and services
+        }
+        if set(processes) != set(PLATFORM_PROCESS_SERVICES):
+            raise ValueError("platform.processes must define every platform process")
+        process_services = [service for services in processes.values() for service in services]
+        if set(process_services) != expected or len(process_services) != len(expected):
+            raise ValueError("each platform service must belong to exactly one process")
         alerting = _mapping(data.get("alerting"), field="platform.alerting")
         minimum_screenings = alerting.get("minimum_valid_screenings_before_progress", 10)
         if (
@@ -205,6 +254,7 @@ class PlatformConfig:
                 data.get("resource_limits", {}), field="platform.resource_limits"
             ),
             security_domains=security_domains,
+            processes=processes,
         )
 
     def node(self, node_id: str) -> NodeConfig:

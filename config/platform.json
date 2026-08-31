@@ -77,6 +77,21 @@
     "trading-agent": ["agent-sandbox"],
     "trading-migration": ["migration-service"]
   },
+  "processes": {
+    "trading-runtime": [
+      "market-gateway", "data-writer", "feature-service", "universe-service",
+      "platform-scheduler", "strategy-evaluator", "product-supervisor",
+      "portfolio-engine", "portfolio-state-service", "risk-engine",
+      "execution-engine", "paper-engine", "accounting-service", "account-reconciliation"
+    ],
+    "research-runtime": [
+      "promotion-engine", "research-worker", "ml-worker", "event-replay-worker",
+      "feature-build-worker", "report-worker"
+    ],
+    "agent-runtime": ["agent-sandbox"],
+    "control-api": ["control-api"],
+    "migration-service": ["migration-service"]
+  },
   "logging": {
     "format": "json",
     "level": "INFO"

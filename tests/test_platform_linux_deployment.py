@@ -12,9 +12,10 @@ INSTALLED_ROOT = Path(os.environ.get("TRADING_PLATFORM_INSTALL_ROOT", "/opt/trad
 
 def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -> None:
     installer = (ROOT / "scripts/install_platform_services.sh").read_text()
-    runtime = (ROOT / "deploy/systemd/trading-platform@.service").read_text()
-    research = (ROOT / "deploy/systemd/trading-platform-research@.service").read_text()
-    agent = (ROOT / "deploy/systemd/trading-platform-agent@.service").read_text()
+    runtime = (ROOT / "deploy/systemd/trading-platform-runtime.service").read_text()
+    research = (ROOT / "deploy/systemd/trading-platform-research.service").read_text()
+    agent = (ROOT / "deploy/systemd/trading-platform-agent.service").read_text()
+    control = (ROOT / "deploy/systemd/trading-platform-control.service").read_text()
     migration = (ROOT / "deploy/systemd/trading-platform-migration.service").read_text()
 
     assert "trading-platform" in installer
@@ -27,6 +28,7 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
     assert "EnvironmentFile=/etc/trading-platform/runtime.env" in runtime
     assert "EnvironmentFile=/etc/trading-platform/research.env" in research
     assert "EnvironmentFile=/etc/trading-platform/agent.env" in agent
+    assert "EnvironmentFile=/etc/trading-platform/runtime.env" in control
     assert "EnvironmentFile=/etc/trading-platform/migration.env" in migration
     assert "common.env" not in runtime + research + agent + migration
     assert 'install -d -m 0750 -o root -g trading-platform "$REPO/data"' in installer
@@ -75,7 +77,16 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
     assert '"$REPO/.venv-agent"' in installer
     assert "s|/opt/trading-bot|$REPO|g" in installer
     assert "s|ProtectHome=true|ProtectHome=$PROTECT_HOME|g" in installer
-    assert 'install_platform_unit "$REPO/deploy/systemd/trading-platform@.service"' in installer
+    assert (
+        'install_platform_unit "$REPO/deploy/systemd/trading-platform-runtime.service"'
+        in installer
+    )
+    assert 'install_platform_unit "$REPO/deploy/systemd/trading-platform-research.service"' in installer
+    assert 'install_platform_unit "$REPO/deploy/systemd/trading-platform-agent.service"' in installer
+    assert 'install_platform_unit "$REPO/deploy/systemd/trading-platform-control.service"' in installer
+    assert "systemctl enable trading-platform-runtime.service" in installer
+    assert "systemctl enable trading-platform-research.service" in installer
+    assert "systemctl disable --now" in installer
 
 
 def test_deployment_runbook_targets_the_actual_optiplex_checkout() -> None:
