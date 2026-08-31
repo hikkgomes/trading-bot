@@ -721,6 +721,7 @@ class DatabaseResearchJobHandlers:
         result = BarPortfolioEngine(
             initial_equity=float(loaded["initial_equity"]),
             fee_bps=float(loaded["fee_bps"]),
+            slippage_bps=float(loaded.get("slippage_bps", 0.0)),
         ).simulate(steps)
         final_equity = result.equity_curve[-1][1] if result.equity_curve else 0.0
         evidence: dict[str, Any] = {
@@ -750,6 +751,7 @@ class DatabaseResearchJobHandlers:
                 "final_equity": final_equity,
                 "fees_paid": result.fees_paid,
                 "funding_paid": result.funding_paid,
+                "slippage_paid": result.slippage_paid,
             },
             receipt=_execution_receipt(request, executor_version="bar-engine/v2"),
         )

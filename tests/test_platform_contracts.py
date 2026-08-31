@@ -1383,7 +1383,7 @@ def test_btc_supervisor_rebuys_from_actual_stablecoin_balance_and_accounts_in_bt
 
 
 def test_bar_engine_rebalances_multi_symbol_targets_with_costs_and_funding():
-    result = BarPortfolioEngine(initial_equity=1_000, fee_bps=10).simulate(
+    result = BarPortfolioEngine(initial_equity=1_000, fee_bps=10, slippage_bps=5).simulate(
         (
             BarStep(
                 timestamp=NOW,
@@ -1401,6 +1401,7 @@ def test_bar_engine_rebalances_multi_symbol_targets_with_costs_and_funding():
 
     assert result.quantities == {BTC: 0.0, ETH: 0.0}
     assert result.fees_paid > 0
+    assert result.slippage_paid > 0
     assert result.funding_paid < 0
     assert len(result.equity_curve) == 2
 
