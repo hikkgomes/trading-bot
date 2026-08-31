@@ -9,7 +9,9 @@ from src.portfolio.optimiser import PortfolioConstraints, optimise_targets
 from src.products.btc_accumulation import BtcAllocationPolicy, target_btc_allocation
 from src.research.accounting import (
     BtcAccumulationAccounting,
+    BtcResearchAccounting,
     FuturesIncomeAccounting,
+    FuturesResearchAccounting,
     ProductAccountingError,
 )
 from src.research.artefacts import StrategyArtefact
@@ -378,6 +380,55 @@ def test_btc_accounting_converts_bnb_fee_and_enforces_core_reserve() -> None:
                 },
             ),
         )
+
+
+def test_btc_accounting_allows_initial_stablecoin_deployment_with_reserve() -> None:
+    report = BtcAccumulationAccounting().evaluate(
+        initial_stablecoin=100.0,
+        initial_price=100.0,
+        reserve_fraction=0.8,
+        trade_events=({"timestamp": NOW, "side": "buy", "quantity": 1.0, "price": 100.0},),
+    )
+
+    assert report.final_btc_nav == pytest.approx(1.0)
+
+
+def test_btc_round_trip_includes_sell_and_buy_fees() -> None:
+    report = BtcAccumulationAccounting().evaluate(
+        initial_btc=1.0,
+        initial_price=100.0,
+        trade_events=(
+            {
+                "timestamp": NOW,
+                "side": "sell",
+                "quantity": 0.5,
+                "price": 100.0,
+                "fee": 1.0,
+                "fee_asset": "USDT",
+            },
+            {
+                "timestamp": "2026-08-30T10:01:00+00:00",
+                "side": "buy",
+                "quantity": 0.5,
+                "price": 80.0,
+                "fee": 0.001,
+                "fee_asset": "BTC",
+            },
+        ),
+        marks=(
+            {"timestamp": NOW, "price": 100.0},
+            {"timestamp": "2026-08-30T10:01:00+00:00", "price": 80.0},
+        ),
+    )
+
+    assert report.round_trip_btc_gain == pytest.approx(0.1115)
+
+
+def test_research_accounting_types_are_distinct_product_ledgers() -> None:
+    assert issubclass(BtcResearchAccounting, BtcAccumulationAccounting)
+    assert issubclass(FuturesResearchAccounting, FuturesIncomeAccounting)
+    assert BtcResearchAccounting is not BtcAccumulationAccounting
+    assert FuturesResearchAccounting is not FuturesIncomeAccounting
 
 
 def test_btc_accounting_tracks_external_flows_and_tactical_limit() -> None:

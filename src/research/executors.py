@@ -631,10 +631,10 @@ def _product_accounting(
         marks = context.get("btc_marks", context.get("marks"))
         if events is None and marks is None:
             return None
-        from src.research.accounting import BtcAccumulationAccounting, ProductAccountingError
+        from src.research.accounting import BtcResearchAccounting, ProductAccountingError
 
         try:
-            report = BtcAccumulationAccounting().evaluate(
+            report = BtcResearchAccounting().evaluate(
                 trade_events=events or (),
                 marks=marks or (),
                 initial_btc=float(context.get("initial_btc", context.get("btc_balance", 0.0))),
@@ -736,10 +736,10 @@ def _product_accounting(
                 "event_receipts": (),
                 "source": "canonical_return_ledger",
             }
-        from src.research.accounting import FuturesIncomeAccounting, ProductAccountingError
+        from src.research.accounting import FuturesResearchAccounting, ProductAccountingError
 
         try:
-            report = FuturesIncomeAccounting().evaluate(
+            report = FuturesResearchAccounting().evaluate(
                 events=events,
                 initial_cash=float(context.get("initial_cash", context.get("initial_equity", 0.0))),
                 leverage=float(context.get("leverage", 1.0)),

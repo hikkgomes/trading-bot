@@ -9,9 +9,11 @@ from src.research.accounting import (
     BtcAccounting,
     BtcAccountingReport,
     BtcAccumulationAccounting,
+    BtcResearchAccounting,
     FuturesAccounting,
     FuturesAccountingReport,
     FuturesIncomeAccounting,
+    FuturesResearchAccounting,
     ProductAccountingError,
 )
 
@@ -24,6 +26,8 @@ __all__ = [
     "FuturesAccounting",
     "FuturesAccountingReport",
     "FuturesIncomeAccounting",
+    "FuturesResearchAccounting",
+    "BtcResearchAccounting",
     "JsonlLedgerStore",
     "Ledger",
     "LedgerEntry",

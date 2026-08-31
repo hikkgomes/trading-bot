@@ -236,7 +236,7 @@ class BtcAccumulationAccounting:
         maximum_tactical_allocation = 0.0
         exposure_time = 0.0
         reentry_slippages: list[float] = []
-        pending_sell: tuple[float, float] | None = None
+        pending_sells: list[tuple[float, float, float, float]] = []
         failed_reentries = 0
         external_deposits_btc = 0.0
         external_withdrawals_btc = 0.0
@@ -322,30 +322,35 @@ class BtcAccumulationAccounting:
                     else:
                         btc += quantity
                         stable -= quote + fee_quote
-                    if core_btc and btc < core_btc - 1e-12:
-                        raise ProductAccountingError(
-                            "BTC buy or sell path breached core BTC reserve"
-                        )
                     if btc < -1e-12 or stable < -1e-12:
                         raise ProductAccountingError("BTC buy exceeds available balance")
                     if saw_sell:
                         cycles += 1
                         saw_sell = False
-                    if pending_sell is not None:
-                        sold_quantity, sold_price = pending_sell
-                        paired_quantity = min(quantity, sold_quantity)
+                    remaining_buy = quantity
+                    buy_fee_per_btc = converted_fee_btc / quantity if quantity > 0 else 0.0
+                    while remaining_buy > 1e-12 and pending_sells:
+                        sold_quantity, sold_price, sell_fee_btc, sell_fee_quote = pending_sells[0]
+                        paired_quantity = min(remaining_buy, sold_quantity)
+                        sell_fraction = paired_quantity / sold_quantity
                         round_trip_gain += (
-                            paired_quantity * sold_price / price
+                            (paired_quantity * sold_price - sell_fee_quote * sell_fraction) / price
+                            - sell_fee_btc * sell_fraction
                             - paired_quantity
-                            - converted_fee_btc
+                            - buy_fee_per_btc * paired_quantity
                         )
                         reentry_slippages.append(price / sold_price - 1.0)
-                        pending_sell = (
-                            sold_quantity - paired_quantity,
-                            sold_price,
-                        )
-                        if pending_sell[0] <= 1e-12:
-                            pending_sell = None
+                        remaining_buy -= paired_quantity
+                        remaining_sell = sold_quantity - paired_quantity
+                        if remaining_sell <= 1e-12:
+                            pending_sells.pop(0)
+                        else:
+                            pending_sells[0] = (
+                                remaining_sell,
+                                sold_price,
+                                sell_fee_btc * (remaining_sell / sold_quantity),
+                                sell_fee_quote * (remaining_sell / sold_quantity),
+                            )
                 else:
                     if fee_asset == "BTC":
                         btc -= quantity + converted_fee_btc
@@ -358,7 +363,14 @@ class BtcAccumulationAccounting:
                     if btc < -1e-12 or stable < -1e-12:
                         raise ProductAccountingError("BTC sell exceeds available balance")
                     saw_sell = True
-                    pending_sell = (quantity, price)
+                    pending_sells.append(
+                        (
+                            quantity,
+                            price,
+                            converted_fee_btc if fee_asset == "BTC" else 0.0,
+                            fee_quote if fee_asset != "BTC" else 0.0,
+                        )
+                    )
                 if side == "buy" and str(event.get("reentry_status") or "").casefold() == "failed":
                     failed_reentries += 1
                 fee_btc_total += converted_fee_btc
@@ -802,7 +814,13 @@ class FuturesIncomeAccounting:
         return cash + unrealised, unrealised, notional
 
 
+class FuturesResearchAccounting(FuturesIncomeAccounting):
+    """Research-facing futures ledger with the product accounting contract."""
+
+
+class BtcResearchAccounting(BtcAccumulationAccounting):
+    """Research-facing BTC ledger with the accumulation objective contract."""
+
+
 FuturesAccounting = FuturesIncomeAccounting
 BtcAccounting = BtcAccumulationAccounting
-FuturesResearchAccounting = FuturesIncomeAccounting
-BtcResearchAccounting = BtcAccumulationAccounting
