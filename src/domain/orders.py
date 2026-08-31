@@ -41,6 +41,73 @@ TERMINAL_ORDER_STATUSES = frozenset(
 )
 
 
+def _normalise_order_identity(intent: OrderIntent) -> None:
+    for attribute in ("order_id", "portfolio_id", "instrument_id"):
+        object.__setattr__(
+            intent, attribute, non_empty(getattr(intent, attribute), field=attribute)
+        )
+    object.__setattr__(intent, "quantity", finite(intent.quantity, field="quantity", minimum=0.0))
+    if intent.quantity == 0:
+        raise ValueError("quantity must be positive")
+    object.__setattr__(intent, "created_at", timestamp(intent.created_at, field="created_at"))
+
+
+def _normalise_order_prices(intent: OrderIntent) -> None:
+    if intent.order_type is OrderType.LIMIT and intent.limit_price is None:
+        raise ValueError("limit orders require limit_price")
+    if intent.limit_price is None:
+        return
+    object.__setattr__(
+        intent, "limit_price", finite(intent.limit_price, field="limit_price", minimum=0.0)
+    )
+    if intent.limit_price == 0:
+        raise ValueError("limit_price must be positive")
+
+
+def _normalise_order_fills(intent: OrderIntent) -> None:
+    object.__setattr__(
+        intent,
+        "filled_quantity",
+        finite(intent.filled_quantity, field="filled_quantity", minimum=0.0),
+    )
+    if intent.filled_quantity > intent.quantity + 1e-12:
+        raise ValueError("filled_quantity cannot exceed quantity")
+    if intent.average_fill_price is not None:
+        object.__setattr__(
+            intent,
+            "average_fill_price",
+            finite(intent.average_fill_price, field="average_fill_price", minimum=0.0),
+        )
+    object.__setattr__(intent, "fee", finite(intent.fee, field="fee", minimum=0.0))
+
+
+def _normalise_order_links(intent: OrderIntent) -> None:
+    if intent.group_id is not None:
+        object.__setattr__(intent, "group_id", non_empty(intent.group_id, field="group_id"))
+    if intent.depends_on_order_id is None:
+        return
+    dependency = non_empty(intent.depends_on_order_id, field="depends_on_order_id")
+    if dependency == intent.order_id:
+        raise ValueError("an order cannot depend on itself")
+    object.__setattr__(intent, "depends_on_order_id", dependency)
+
+
+def _normalise_order_metadata(intent: OrderIntent) -> None:
+    if not isinstance(intent.strategy_contributions, Mapping):
+        raise ValueError("strategy_contributions must be an object")
+    object.__setattr__(
+        intent,
+        "strategy_contributions",
+        {
+            str(key): finite(value, field="strategy contribution")
+            for key, value in intent.strategy_contributions.items()
+        },
+    )
+    if not isinstance(intent.metadata, Mapping):
+        raise ValueError("metadata must be an object")
+    object.__setattr__(intent, "metadata", json_value(dict(intent.metadata), field="metadata"))
+
+
 @dataclass(frozen=True)
 class OrderIntent:
     order_id: str
@@ -62,57 +129,11 @@ class OrderIntent:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        for attribute in ("order_id", "portfolio_id", "instrument_id"):
-            object.__setattr__(
-                self, attribute, non_empty(getattr(self, attribute), field=attribute)
-            )
-        object.__setattr__(self, "quantity", finite(self.quantity, field="quantity", minimum=0.0))
-        if self.quantity == 0:
-            raise ValueError("quantity must be positive")
-        object.__setattr__(self, "created_at", timestamp(self.created_at, field="created_at"))
-        if self.order_type is OrderType.LIMIT:
-            if self.limit_price is None:
-                raise ValueError("limit orders require limit_price")
-        if self.limit_price is not None:
-            object.__setattr__(
-                self, "limit_price", finite(self.limit_price, field="limit_price", minimum=0.0)
-            )
-            if self.limit_price == 0:
-                raise ValueError("limit_price must be positive")
-        object.__setattr__(
-            self,
-            "filled_quantity",
-            finite(self.filled_quantity, field="filled_quantity", minimum=0.0),
-        )
-        if self.filled_quantity > self.quantity + 1e-12:
-            raise ValueError("filled_quantity cannot exceed quantity")
-        if self.average_fill_price is not None:
-            object.__setattr__(
-                self,
-                "average_fill_price",
-                finite(self.average_fill_price, field="average_fill_price", minimum=0.0),
-            )
-        object.__setattr__(self, "fee", finite(self.fee, field="fee", minimum=0.0))
-        if self.group_id is not None:
-            object.__setattr__(self, "group_id", non_empty(self.group_id, field="group_id"))
-        if self.depends_on_order_id is not None:
-            dependency = non_empty(self.depends_on_order_id, field="depends_on_order_id")
-            if dependency == self.order_id:
-                raise ValueError("an order cannot depend on itself")
-            object.__setattr__(self, "depends_on_order_id", dependency)
-        if not isinstance(self.strategy_contributions, Mapping):
-            raise ValueError("strategy_contributions must be an object")
-        object.__setattr__(
-            self,
-            "strategy_contributions",
-            {
-                str(key): finite(value, field="strategy contribution")
-                for key, value in self.strategy_contributions.items()
-            },
-        )
-        if not isinstance(self.metadata, Mapping):
-            raise ValueError("metadata must be an object")
-        object.__setattr__(self, "metadata", json_value(dict(self.metadata), field="metadata"))
+        _normalise_order_identity(self)
+        _normalise_order_prices(self)
+        _normalise_order_fills(self)
+        _normalise_order_links(self)
+        _normalise_order_metadata(self)
 
     @property
     def remaining_quantity(self) -> float:
