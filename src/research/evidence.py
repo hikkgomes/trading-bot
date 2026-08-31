@@ -22,6 +22,95 @@ def _integer(value: object) -> int | None:
     return value
 
 
+_PROFILE_DIMENSIONS = ("product_id", "family", "horizon", "stage")
+_PROFILE_FINITE_FIELDS = (
+    "minimum_cost_adjusted_return",
+    "minimum_deflated_sharpe",
+    "minimum_walk_forward_pass_fraction",
+    "maximum_backtest_overfitting_probability",
+    "minimum_calendar_days",
+    "maximum_drawdown",
+    "maximum_tail_loss",
+    "maximum_parameter_degradation",
+    "minimum_positive_symbol_fraction",
+    "minimum_cross_symbol_median_return",
+    "minimum_cross_symbol_pooled_return",
+    "minimum_cross_symbol_lower_quantile_return",
+    "allowed_holdout_degradation",
+)
+_PROFILE_INTEGER_FIELDS = (
+    "minimum_walk_forward_windows",
+    "minimum_bootstrap_observations",
+    "minimum_closed_trades",
+    "minimum_effective_episodes",
+    "minimum_trading_days",
+    "minimum_cycles",
+)
+_PROFILE_UNIT_FIELDS = (
+    "minimum_walk_forward_pass_fraction",
+    "maximum_backtest_overfitting_probability",
+    "minimum_positive_symbol_fraction",
+    "maximum_parameter_degradation",
+    "allowed_holdout_degradation",
+)
+
+
+def _normalise_profile_dimensions(profile: EvidenceProfile) -> None:
+    for name in _PROFILE_DIMENSIONS:
+        value = str(getattr(profile, name)).strip()
+        if not value:
+            raise ValueError(f"evidence profile {name} cannot be empty")
+        object.__setattr__(profile, name, value)
+
+
+def _validate_profile_finite_fields(profile: EvidenceProfile) -> None:
+    for name in _PROFILE_FINITE_FIELDS:
+        value = getattr(profile, name)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"evidence profile {name} must be finite")
+
+
+def _validate_profile_integer_fields(profile: EvidenceProfile) -> None:
+    for name in _PROFILE_INTEGER_FIELDS:
+        value = getattr(profile, name)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+        ):
+            raise ValueError(f"evidence profile {name} must be a non-negative integer")
+
+
+def _validate_profile_unit_fields(profile: EvidenceProfile) -> None:
+    for name in _PROFILE_UNIT_FIELDS:
+        value = getattr(profile, name)
+        if value is not None and not 0.0 <= float(value) <= 1.0:
+            raise ValueError(f"evidence profile {name} must be between zero and one")
+
+
+def _validate_profile_thresholds(profile: EvidenceProfile) -> None:
+    if profile.minimum_calendar_days < 0:
+        raise ValueError("evidence profile minimum_calendar_days must be non-negative")
+    if (
+        profile.minimum_cost_adjusted_return is not None
+        and profile.minimum_cost_adjusted_return < 0
+    ):
+        raise ValueError("evidence profile minimum_cost_adjusted_return must be non-negative")
+    if profile.minimum_deflated_sharpe is not None and profile.minimum_deflated_sharpe < 0:
+        raise ValueError("evidence profile minimum_deflated_sharpe must be non-negative")
+    if (
+        profile.minimum_bootstrap_observations is not None
+        and profile.minimum_bootstrap_observations < 1
+    ):
+        raise ValueError("evidence profile minimum_bootstrap_observations must be positive")
+    for name in ("maximum_drawdown", "maximum_tail_loss"):
+        value = getattr(profile, name)
+        if value is not None and value < 0:
+            raise ValueError(f"evidence profile {name} must be non-negative")
+
+
 @dataclass(frozen=True)
 class EvidenceProfile:
     """One product, family, and horizon evidence policy.
@@ -56,71 +145,11 @@ class EvidenceProfile:
     allowed_holdout_degradation: float = 0.5
 
     def __post_init__(self) -> None:
-        for name in ("product_id", "family", "horizon", "stage"):
-            value = str(getattr(self, name)).strip()
-            if not value:
-                raise ValueError(f"evidence profile {name} cannot be empty")
-            object.__setattr__(self, name, value)
-        for name in (
-            "minimum_cost_adjusted_return",
-            "minimum_deflated_sharpe",
-            "minimum_walk_forward_pass_fraction",
-            "maximum_backtest_overfitting_probability",
-            "minimum_calendar_days",
-            "maximum_drawdown",
-            "maximum_tail_loss",
-            "maximum_parameter_degradation",
-            "minimum_positive_symbol_fraction",
-            "minimum_cross_symbol_median_return",
-            "minimum_cross_symbol_pooled_return",
-            "minimum_cross_symbol_lower_quantile_return",
-            "allowed_holdout_degradation",
-        ):
-            value = getattr(self, name)
-            if value is not None and (
-                isinstance(value, bool)
-                or not isinstance(value, int | float)
-                or not math.isfinite(float(value))
-            ):
-                raise ValueError(f"evidence profile {name} must be finite")
-        for name in (
-            "minimum_walk_forward_windows",
-            "minimum_bootstrap_observations",
-            "minimum_closed_trades",
-            "minimum_effective_episodes",
-            "minimum_trading_days",
-            "minimum_cycles",
-        ):
-            value = getattr(self, name)
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value < 0
-            ):
-                raise ValueError(f"evidence profile {name} must be a non-negative integer")
-        for name in (
-            "minimum_walk_forward_pass_fraction",
-            "maximum_backtest_overfitting_probability",
-            "minimum_positive_symbol_fraction",
-            "maximum_parameter_degradation",
-            "allowed_holdout_degradation",
-        ):
-            value = getattr(self, name)
-            if value is not None and not 0.0 <= float(value) <= 1.0:
-                raise ValueError(f"evidence profile {name} must be between zero and one")
-        if self.minimum_calendar_days < 0:
-            raise ValueError("evidence profile minimum_calendar_days must be non-negative")
-        if self.minimum_cost_adjusted_return is not None and self.minimum_cost_adjusted_return < 0:
-            raise ValueError("evidence profile minimum_cost_adjusted_return must be non-negative")
-        if self.minimum_deflated_sharpe is not None and self.minimum_deflated_sharpe < 0:
-            raise ValueError("evidence profile minimum_deflated_sharpe must be non-negative")
-        if (
-            self.minimum_bootstrap_observations is not None
-            and self.minimum_bootstrap_observations < 1
-        ):
-            raise ValueError("evidence profile minimum_bootstrap_observations must be positive")
-        for name in ("maximum_drawdown", "maximum_tail_loss"):
-            value = getattr(self, name)
-            if value is not None and value < 0:
-                raise ValueError(f"evidence profile {name} must be non-negative")
+        _normalise_profile_dimensions(self)
+        _validate_profile_finite_fields(self)
+        _validate_profile_integer_fields(self)
+        _validate_profile_unit_fields(self)
+        _validate_profile_thresholds(self)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> EvidenceProfile:
@@ -226,27 +255,10 @@ def parameter_stability_passes(value: object, profile: EvidenceProfile) -> bool:
         return True
     if value.get("cliff_detected") is True or value.get("degradation_shape") == "cliff":
         return False
-    results = value.get("results")
-    tested = _integer(value.get("neighbours_tested"))
-    if (
-        not isinstance(results, list | tuple)
-        or tested is None
-        or tested < 2
-        or len(results) != tested
-    ):
+    parameter_data = _parameter_data(value)
+    if parameter_data is None:
         return False
-    returns = [_finite(item.get("return")) for item in results if isinstance(item, Mapping)]
-    if len(returns) != len(results) or any(item is None for item in returns):
-        return False
-    if not all(
-        isinstance(item, Mapping)
-        and isinstance(item.get("observations"), int)
-        and int(item["observations"]) > 0
-        and _valid_hash(item.get("run_id"))
-        and _valid_hash(item.get("input_hash"))
-        for item in results
-    ):
-        return False
+    results, returns = parameter_data
     base = _finite(value.get("base_return", value.get("base_cost_adjusted_return")))
     median = _finite(value.get("median_return"))
     worst = _finite(value.get("worst_return"))
@@ -271,34 +283,42 @@ def parameter_stability_passes(value: object, profile: EvidenceProfile) -> bool:
     )
 
 
+def _parameter_data(
+    value: Mapping[str, Any],
+) -> tuple[list[Mapping[str, Any]], list[float]] | None:
+    results = value.get("results")
+    tested = _integer(value.get("neighbours_tested"))
+    if (
+        not isinstance(results, list | tuple)
+        or tested is None
+        or tested < 2
+        or len(results) != tested
+    ):
+        return None
+    result_items = [item for item in results if isinstance(item, Mapping)]
+    returns = [_finite(item.get("return")) for item in result_items]
+    if len(returns) != len(results) or any(item is None for item in returns):
+        return None
+    if not all(
+        isinstance(item, Mapping)
+        and isinstance(item.get("observations"), int)
+        and int(item["observations"]) > 0
+        and _valid_hash(item.get("run_id"))
+        and _valid_hash(item.get("input_hash"))
+        for item in results
+    ):
+        return None
+    return result_items, [item for item in returns if item is not None]
+
+
 def cross_symbol_stability_passes(value: object, profile: EvidenceProfile) -> bool:
     if not isinstance(value, Mapping):
         return False
     if value.get("status") == "not_applicable":
         return True
-    per_symbol = value.get("per_symbol")
-    symbols = _integer(value.get("symbols"))
-    if (
-        not isinstance(per_symbol, Mapping)
-        or symbols is None
-        or symbols <= 0
-        or len(per_symbol) != symbols
-    ):
+    returns = _cross_symbol_returns(value)
+    if returns is None:
         return False
-    returns: list[float] = []
-    for item in per_symbol.values():
-        if not isinstance(item, Mapping):
-            return False
-        measured = _finite(item.get("return"))
-        if (
-            measured is None
-            or not isinstance(item.get("observations"), int)
-            or int(item["observations"]) < 2
-        ):
-            return False
-        if not _valid_hash(item.get("run_id")) or not _valid_hash(item.get("input_hash")):
-            return False
-        returns.append(measured)
     median = _finite(value.get("median_return"))
     pooled = _finite(value.get("pooled_return"))
     lower = _finite(value.get("lower_quantile_return"))
@@ -319,6 +339,33 @@ def cross_symbol_stability_passes(value: object, profile: EvidenceProfile) -> bo
         and pooled >= profile.minimum_cross_symbol_pooled_return
         and (minimum_lower is None or lower >= minimum_lower)
     )
+
+
+def _cross_symbol_returns(value: Mapping[str, Any]) -> list[float] | None:
+    per_symbol = value.get("per_symbol")
+    symbols = _integer(value.get("symbols"))
+    if (
+        not isinstance(per_symbol, Mapping)
+        or symbols is None
+        or symbols <= 0
+        or len(per_symbol) != symbols
+    ):
+        return None
+    returns: list[float] = []
+    for item in per_symbol.values():
+        if not isinstance(item, Mapping):
+            return None
+        measured = _finite(item.get("return"))
+        if (
+            measured is None
+            or not isinstance(item.get("observations"), int)
+            or int(item["observations"]) < 2
+        ):
+            return None
+        if not _valid_hash(item.get("run_id")) or not _valid_hash(item.get("input_hash")):
+            return None
+        returns.append(measured)
+    return returns
 
 
 def drawdown_passes(value: object, profile: EvidenceProfile) -> bool:
