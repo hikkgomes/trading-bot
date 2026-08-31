@@ -334,65 +334,7 @@ def build_all_conditions(
     conditions: list[Condition] = []
 
     for feature in features:
-        if "value" in enabled_kinds:
-            quantiles = _finite_quantiles(train[feature], [0.1, 0.2, 0.8, 0.9])
-            for quantile, threshold in quantiles.items():
-                if quantile < 0.5:
-                    conditions.append(
-                        Condition(
-                            feature=feature,
-                            kind="value_le",
-                            threshold=threshold,
-                            description=f"{feature} <= train q{int(quantile * 100)} ({threshold:.6g})",
-                            threshold_source="quantile",
-                            quantile=float(quantile),
-                        )
-                    )
-                else:
-                    conditions.append(
-                        Condition(
-                            feature=feature,
-                            kind="value_ge",
-                            threshold=threshold,
-                            description=f"{feature} >= train q{int(quantile * 100)} ({threshold:.6g})",
-                            threshold_source="quantile",
-                            quantile=float(quantile),
-                        )
-                    )
-
-        if "delta" in enabled_kinds:
-            delta = train[feature].diff()
-            delta_quantiles = _finite_quantiles(delta, [0.1, 0.9])
-            if 0.1 in delta_quantiles:
-                threshold = delta_quantiles[0.1]
-                conditions.append(
-                    Condition(
-                        feature=feature,
-                        kind="delta_le",
-                        threshold=threshold,
-                        description=f"{feature} falling fast: 1-bar change <= train q10 ({threshold:.6g})",
-                        threshold_source="delta_quantile",
-                        quantile=0.1,
-                    )
-                )
-            if 0.9 in delta_quantiles:
-                threshold = delta_quantiles[0.9]
-                conditions.append(
-                    Condition(
-                        feature=feature,
-                        kind="delta_ge",
-                        threshold=threshold,
-                        description=f"{feature} rising fast: 1-bar change >= train q90 ({threshold:.6g})",
-                        threshold_source="delta_quantile",
-                        quantile=0.9,
-                    )
-                )
-
-        if "slope" in enabled_kinds:
-            conditions.extend(build_slope_conditions(train, feature))
-
-        if "divergence" in enabled_kinds:
-            conditions.extend(build_divergence_conditions(train, [feature]))
+        conditions.extend(_feature_conditions(train, feature, enabled_kinds))
 
     if cross_feature_pairs is None:
         cross_feature_pairs = detect_cross_feature_pairs(features)
@@ -406,77 +348,135 @@ def build_all_conditions(
     return conditions
 
 
+def _feature_conditions(
+    train: pd.DataFrame, feature: str, enabled_kinds: set[str]
+) -> list[Condition]:
+    conditions: list[Condition] = []
+    if "value" in enabled_kinds:
+        conditions.extend(_value_conditions(train, feature))
+    if "delta" in enabled_kinds:
+        conditions.extend(_delta_conditions(train, feature))
+    if "slope" in enabled_kinds:
+        conditions.extend(build_slope_conditions(train, feature))
+    if "divergence" in enabled_kinds:
+        conditions.extend(build_divergence_conditions(train, [feature]))
+    return conditions
+
+
+def _value_conditions(train: pd.DataFrame, feature: str) -> list[Condition]:
+    conditions: list[Condition] = []
+    for quantile, threshold in _finite_quantiles(train[feature], [0.1, 0.2, 0.8, 0.9]).items():
+        lower = quantile < 0.5
+        conditions.append(
+            Condition(
+                feature=feature,
+                kind="value_le" if lower else "value_ge",
+                threshold=threshold,
+                description=(
+                    f"{feature} {'<=' if lower else '>='} train q{int(quantile * 100)} "
+                    f"({threshold:.6g})"
+                ),
+                threshold_source="quantile",
+                quantile=float(quantile),
+            )
+        )
+    return conditions
+
+
+def _delta_conditions(train: pd.DataFrame, feature: str) -> list[Condition]:
+    conditions: list[Condition] = []
+    for quantile, threshold in _finite_quantiles(train[feature].diff(), [0.1, 0.9]).items():
+        lower = quantile < 0.5
+        conditions.append(
+            Condition(
+                feature=feature,
+                kind="delta_le" if lower else "delta_ge",
+                threshold=threshold,
+                description=(
+                    f"{feature} {'falling' if lower else 'rising'} fast: 1-bar change "
+                    f"{'<=' if lower else '>='} train q{int(quantile * 100)} ({threshold:.6g})"
+                ),
+                threshold_source="delta_quantile",
+                quantile=float(quantile),
+            )
+        )
+    return conditions
+
+
 _SLOPE_RE = re.compile(r"^slope_(\d+)_(le|ge)$")
 _DIVERGENCE_RE = re.compile(r"^divergence_(bull|bear)_(\d+)$")
 
 
 def condition_mask(data: pd.DataFrame, condition: Condition) -> pd.Series:
     series = data[condition.feature]
-
-    if condition.kind == "value_le":
-        return series <= condition.threshold
-    if condition.kind == "value_ge":
-        return series >= condition.threshold
-    if condition.kind == "delta_le":
-        return series.diff() <= condition.threshold
-    if condition.kind == "delta_ge":
-        return series.diff() >= condition.threshold
-
+    simple = {
+        "value_le": lambda: series <= condition.threshold,
+        "value_ge": lambda: series >= condition.threshold,
+        "delta_le": lambda: series.diff() <= condition.threshold,
+        "delta_ge": lambda: series.diff() >= condition.threshold,
+    }
+    if condition.kind in simple:
+        return simple[condition.kind]()
     slope_match = _SLOPE_RE.match(condition.kind)
     if slope_match:
-        window = int(slope_match.group(1))
-        direction = slope_match.group(2)
-        slope = (series - series.shift(window)) / window
-        if direction == "le":
-            return slope <= condition.threshold
-        return slope >= condition.threshold
-
+        return _slope_mask(series, condition, slope_match)
     if condition.kind in ("cross_above", "cross_below"):
-        series_b = data[condition.feature_b]
-        if condition.kind == "cross_above":
-            return (series > series_b) & (series.shift(1) <= series_b.shift(1))
-        return (series < series_b) & (series.shift(1) >= series_b.shift(1))
-
+        return _cross_mask(data, series, condition)
     if condition.kind in ("ratio_le", "ratio_ge"):
-        series_b = data[condition.feature_b]
-        ratio = series / series_b.replace(0, np.nan)
-        if condition.kind == "ratio_le":
-            return ratio <= condition.threshold
-        return ratio >= condition.threshold
-
+        return _ratio_mask(data, series, condition)
     div_match = _DIVERGENCE_RE.match(condition.kind)
     if div_match:
-        direction = div_match.group(1)
-        window = int(div_match.group(2))
-
-        # Determine the timeframe for this feature to get the correct close price
-        tf = "15m"
-        if condition.feature.startswith("tf_"):
-            parts = condition.feature.split("_", 3)
-            if len(parts) >= 3:
-                tf = parts[1]
-
-        close_col = f"tf_{tf}_close"
-        if close_col in data.columns:
-            price = data[close_col]
-        else:
-            close_cols = [c for c in data.columns if c.endswith("_close")]
-            if close_cols:
-                price = data[close_cols[0]]
-            else:
-                raise KeyError(
-                    f"Could not find close column (tried {close_col} and others) in DataFrame."
-                )
-
-        if direction == "bull":
-            return (price == price.rolling(window, min_periods=window).min()) & (
-                series > series.rolling(window, min_periods=window).min()
-            )
-        return (price == price.rolling(window, min_periods=window).max()) & (
-            series < series.rolling(window, min_periods=window).max()
-        )
-
+        return _divergence_mask(data, series, condition, div_match)
     raise ValueError(f"Unknown condition kind: {condition.kind}")
+
+
+def _slope_mask(series: pd.Series, condition: Condition, match: re.Match) -> pd.Series:
+    window = int(match.group(1))
+    slope = (series - series.shift(window)) / window
+    return slope <= condition.threshold if match.group(2) == "le" else slope >= condition.threshold
+
+
+def _cross_mask(data: pd.DataFrame, series: pd.Series, condition: Condition) -> pd.Series:
+    series_b = data[condition.feature_b]
+    if condition.kind == "cross_above":
+        return (series > series_b) & (series.shift(1) <= series_b.shift(1))
+    return (series < series_b) & (series.shift(1) >= series_b.shift(1))
+
+
+def _ratio_mask(data: pd.DataFrame, series: pd.Series, condition: Condition) -> pd.Series:
+    ratio = series / data[condition.feature_b].replace(0, np.nan)
+    return (
+        ratio <= condition.threshold
+        if condition.kind == "ratio_le"
+        else ratio >= condition.threshold
+    )
+
+
+def _divergence_mask(
+    data: pd.DataFrame,
+    series: pd.Series,
+    condition: Condition,
+    match: re.Match,
+) -> pd.Series:
+    window = int(match.group(2))
+    tf = condition.feature.split("_", 3)[1] if condition.feature.startswith("tf_") else "15m"
+    close_col = f"tf_{tf}_close"
+    if close_col in data.columns:
+        price = data[close_col]
+    else:
+        close_cols = [column for column in data.columns if column.endswith("_close")]
+        if not close_cols:
+            raise KeyError(
+                f"Could not find close column (tried {close_col} and others) in DataFrame."
+            )
+        price = data[close_cols[0]]
+    if match.group(1) == "bull":
+        return (price == price.rolling(window, min_periods=window).min()) & (
+            series > series.rolling(window, min_periods=window).min()
+        )
+    return (price == price.rolling(window, min_periods=window).max()) & (
+        series < series.rolling(window, min_periods=window).max()
+    )
 
 
 def evaluate_mask(mask: pd.Series, returns: pd.Series, baseline_mean: float) -> dict[str, float]:
