@@ -100,7 +100,11 @@ class DatabasePortfolioTargetBuilder:
             btc_equity = balances.get("BTC", 0.0) + balances.get("USDT", 0.0) / btc_price
             if btc_equity <= 0:
                 raise ValueError("BTC accumulation equity must be positive")
-            allocation = target_btc_allocation(forecasts, policy=BtcAllocationPolicy())
+            btc_policy = BtcAllocationPolicy(
+                core_btc_fraction=float(product.get("btc_core_fraction", 1.0)),
+                max_tactical_fraction=float(product.get("btc_max_tactical_fraction", 0.0)),
+            )
+            allocation = target_btc_allocation(forecasts, policy=btc_policy)
             target_quantity = max(0.0, allocation.target_btc_fraction * btc_equity)
             target = TargetPosition(
                 portfolio_id=portfolio_id,
@@ -128,6 +132,7 @@ class DatabasePortfolioTargetBuilder:
             if equity <= 0:
                 raise ValueError("active-income USDT equity must be positive")
             combined = aggregate_forecasts(forecasts)
+            account = self.account_configuration.get(str(product["account_id"]), {})
             constraints = PortfolioConstraints(
                 portfolio_id=portfolio_id,
                 equity=equity,
@@ -170,6 +175,12 @@ class DatabasePortfolioTargetBuilder:
                 available_margin_fraction=max(0.0, 1.0 - float(clean["used_margin_fraction"])),
                 risk_budget=float(clean["portfolio_risk_budget"]),
                 protective_stop_fraction=float(product.get("protective_stop_fraction", 0.02)),
+                default_leverage=float(account.get("maximum_leverage", 1.0)),
+                leverage_by_instrument={
+                    key: float(value.get("leverage", account.get("maximum_leverage", 1.0)))
+                    for key, value in market.items()
+                    if isinstance(value, Mapping) and value.get("leverage") is not None
+                },
             )
         if not targets:
             raise ValueError("portfolio optimiser produced no targets")
@@ -755,7 +766,8 @@ class DatabasePortfolioWorker:
         stablecoin_balance = float(payload["stablecoin_balance"])
         if btc_balance < 0 or stablecoin_balance < 0 or price <= 0:
             raise ValueError("BTC balances must be non-negative and price positive")
-        allocation = target_btc_allocation(forecasts, policy=BtcAllocationPolicy())
+        btc_policy = BtcAllocationPolicy()
+        allocation = target_btc_allocation(forecasts, policy=btc_policy)
         btc_nav = btc_balance + stablecoin_balance / price
         target_quantity = btc_nav * allocation.target_btc_fraction
         target = TargetPosition(
@@ -766,7 +778,7 @@ class DatabasePortfolioWorker:
             target_fraction=allocation.target_btc_fraction,
             strategy_contributions=allocation.contributions
             or {"btc_allocation:core": allocation.core_btc_fraction},
-            risk_budget=BtcAllocationPolicy().max_tactical_fraction,
+            risk_budget=btc_policy.max_tactical_fraction,
             valid_until=str(payload["valid_until"]),
             metadata={
                 "sleeve": "btc_tactical",

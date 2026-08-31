@@ -92,3 +92,13 @@ class AlphaForecast:
             return 0.0
         sign = 1.0 if self.direction is ForecastDirection.LONG else -1.0
         return sign * self.expected_return
+
+    @property
+    def expected_asset_return(self) -> float:
+        """Expected return of the underlying asset, signed in price space."""
+        return self.expected_return
+
+    @property
+    def expected_strategy_return(self) -> float:
+        """Expected return after applying the forecast direction."""
+        return self.directional_expected_return

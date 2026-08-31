@@ -12,8 +12,9 @@ from src.domain.forecasts import AlphaForecast, ForecastDirection
 class BtcAllocationPolicy:
     """Spot BTC policy with a neutral 100% BTC default.
 
-    A stablecoin reserve or tactical step-aside is an explicit product policy,
-    never an implicit consequence of a missing forecast.
+    ``max_tactical_fraction`` is a bounded reduction from the neutral BTC
+    allocation. A stablecoin reserve is therefore explicit and never an
+    implicit consequence of a missing forecast.
     """
 
     core_btc_fraction: float = 1.0
@@ -24,8 +25,8 @@ class BtcAllocationPolicy:
             raise ValueError("core_btc_fraction must be in [0, 1]")
         if not 0 <= self.max_tactical_fraction <= 1:
             raise ValueError("max_tactical_fraction must be in [0, 1]")
-        if self.core_btc_fraction + self.max_tactical_fraction > 1:
-            raise ValueError("core and tactical BTC fractions cannot exceed 1")
+        if self.core_btc_fraction == 0 and self.max_tactical_fraction > 0:
+            raise ValueError("a tactical BTC sleeve needs a positive neutral allocation")
 
 
 @dataclass(frozen=True)
@@ -51,7 +52,8 @@ def target_btc_allocation(
         contributions[forecast.strategy_version_id] = contribution
     signal = sum(contributions.values())
     tactical = max(-policy.max_tactical_fraction, min(policy.max_tactical_fraction, signal))
-    target = max(0.0, min(1.0, policy.core_btc_fraction + tactical))
+    minimum_target = max(0.0, policy.core_btc_fraction - policy.max_tactical_fraction)
+    target = max(minimum_target, min(1.0, policy.core_btc_fraction + tactical))
     return BtcAllocationTarget(
         target_btc_fraction=target,
         core_btc_fraction=policy.core_btc_fraction,

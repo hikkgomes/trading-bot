@@ -48,10 +48,12 @@ class PortfolioConstraints:
             value = float(getattr(self, field))
             if not 0 < value <= 1:
                 raise ValueError(f"{field} must be in (0, 1]")
-        for field in ("max_gross_fraction", "max_abs_beta", "max_margin_fraction"):
+        for field in ("max_gross_fraction", "max_abs_beta"):
             value = float(getattr(self, field))
             if not 0 < value <= 3:
                 raise ValueError(f"{field} must be in (0, 3]")
+        if not 0 < float(self.max_margin_fraction) <= 1:
+            raise ValueError("max_margin_fraction must be in (0, 1]")
         for field in ("min_confidence", "min_score"):
             value = float(getattr(self, field))
             if not 0 <= value <= 1:
@@ -72,6 +74,7 @@ class _AllocationState:
     net: float = 0.0
     beta: float = 0.0
     turnover: float = 0.0
+    margin: float = 0.0
     sleeve_usage: dict[str, float] = dataclass_field(default_factory=dict)
     cluster_usage: dict[str, float] = dataclass_field(default_factory=dict)
 
@@ -118,10 +121,13 @@ def _sized_forecast(
     constraints: PortfolioConstraints,
     gross_limit: float,
     gross: float,
+    margin: float,
+    margin_limit: float,
+    leverage: float,
 ) -> tuple[float, float, str, str] | None:
     funding_rate = float(funding_rates.get(forecast.instrument_id, 0.0))
     direction_sign = 1.0 if forecast.direction is ForecastDirection.LONG else -1.0
-    gross_expected_return = direction_sign * forecast.expected_return
+    gross_expected_return = forecast.expected_strategy_return
     net_expected_return = gross_expected_return - direction_sign * funding_rate
     if net_expected_return <= 0:
         return None
@@ -146,6 +152,7 @@ def _sized_forecast(
         fraction,
         max(0.0, float(liquidity_fraction_caps.get(forecast.instrument_id, 1.0))),
         max(0.0, gross_limit - gross),
+        max(0.0, margin_limit - margin) * leverage,
     )
     current_fraction = (
         float(current_quantities.get(forecast.instrument_id, 0.0))
@@ -185,6 +192,8 @@ def _try_allocate_forecast(
     cluster_by_instrument: Mapping[str, str],
     cluster_fraction_caps: Mapping[str, float],
     gross_limit: float,
+    margin_limit: float,
+    leverage: float,
 ) -> bool:
     if any(
         _correlation(correlations, forecast.instrument_id, previous.instrument_id)
@@ -207,6 +216,9 @@ def _try_allocate_forecast(
         constraints=constraints,
         gross_limit=gross_limit,
         gross=state.gross,
+        margin=state.margin,
+        margin_limit=margin_limit,
+        leverage=leverage,
     )
     if sizing is None:
         return False
@@ -229,6 +241,7 @@ def _try_allocate_forecast(
     state.net += signed
     state.beta = candidate_beta
     state.turnover = candidate_turnover
+    state.margin += fraction / leverage
     state.sleeve_usage[sleeve] = state.sleeve_usage.get(sleeve, 0.0) + fraction
     state.cluster_usage[cluster] = state.cluster_usage.get(cluster, 0.0) + fraction
     return True
@@ -242,13 +255,16 @@ def _target_metadata(
     liquidity_fraction_caps: Mapping[str, float],
     cluster_by_instrument: Mapping[str, str],
     state: _AllocationState,
+    leverage: float,
 ) -> dict[str, object]:
     funding_rate = float(funding_rates.get(forecast.instrument_id, 0.0))
     direction_sign = 1.0 if forecast.direction is ForecastDirection.LONG else -1.0
-    gross_expected_return = direction_sign * forecast.expected_return
+    gross_expected_return = forecast.expected_strategy_return
     net_expected_return = gross_expected_return - direction_sign * funding_rate
     metadata: dict[str, object] = {
         "expected_return": forecast.expected_return,
+        "expected_asset_return": forecast.expected_asset_return,
+        "expected_strategy_return": forecast.expected_strategy_return,
         "directional_expected_return": gross_expected_return,
         "net_expected_return": net_expected_return,
         "confidence": forecast.confidence,
@@ -265,6 +281,8 @@ def _target_metadata(
         "portfolio_net_fraction": state.net,
         "portfolio_beta": state.beta,
         "portfolio_turnover_fraction": state.turnover,
+        "leverage": leverage,
+        "portfolio_margin_fraction": state.margin,
     }
     if forecast.metadata.get("order_group_key"):
         metadata["order_group_key"] = str(forecast.metadata["order_group_key"])
@@ -287,9 +305,12 @@ def _build_open_targets(
     liquidity_fraction_caps: Mapping[str, float],
     cluster_by_instrument: Mapping[str, str],
     protective_stop_fraction: float | None,
+    leverage_by_instrument: Mapping[str, float],
+    default_leverage: float,
 ) -> list[TargetPosition]:
     targets: list[TargetPosition] = []
     for forecast, fraction in state.selected:
+        leverage = float(leverage_by_instrument.get(forecast.instrument_id, default_leverage))
         price = float(prices[forecast.instrument_id])
         metadata = _target_metadata(
             forecast,
@@ -298,6 +319,7 @@ def _build_open_targets(
             liquidity_fraction_caps=liquidity_fraction_caps,
             cluster_by_instrument=cluster_by_instrument,
             state=state,
+            leverage=leverage,
         )
         metadata.update(
             {
@@ -375,6 +397,9 @@ def optimise_targets(
     available_margin_fraction: float = 1.0,
     risk_budget: float = 1.0,
     protective_stop_fraction: float | None = None,
+    leverage_by_instrument: Mapping[str, float] | None = None,
+    default_leverage: float = 1.0,
+    leverage: float | None = None,
 ) -> tuple[TargetPosition, ...]:
     """Allocate compatible forecasts to simultaneous target positions.
 
@@ -391,6 +416,11 @@ def optimise_targets(
     sleeve_budgets = sleeve_budgets or {}
     cluster_by_instrument = cluster_by_instrument or {}
     cluster_fraction_caps = cluster_fraction_caps or {}
+    leverage_by_instrument = leverage_by_instrument or {}
+    if leverage is not None:
+        default_leverage = leverage
+    if isinstance(default_leverage, bool) or float(default_leverage) <= 0:
+        raise ValueError("default_leverage must be positive")
     if not 0 <= available_margin_fraction <= 1:
         raise ValueError("available_margin_fraction must be in [0, 1]")
     if not 0 <= product_drawdown_fraction <= 1:
@@ -401,11 +431,8 @@ def optimise_targets(
         )
         if not 0 < protective_stop_fraction < 1:
             raise ValueError("protective_stop_fraction must be in (0, 1)")
-    gross_limit = min(
-        constraints.max_gross_fraction,
-        constraints.max_margin_fraction,
-        available_margin_fraction,
-    )
+    gross_limit = constraints.max_gross_fraction
+    margin_limit = min(constraints.max_margin_fraction, available_margin_fraction)
     candidates = _eligible_forecasts(
         forecasts,
         prices=prices,
@@ -417,6 +444,11 @@ def optimise_targets(
     for forecast in candidates:
         if len(state.selected) >= constraints.max_positions:
             break
+        current_leverage = float(
+            leverage_by_instrument.get(forecast.instrument_id, default_leverage)
+        )
+        if not 0 < current_leverage <= 100:
+            raise ValueError(f"leverage for {forecast.instrument_id} must be in (0, 100]")
         _try_allocate_forecast(
             state,
             forecast,
@@ -432,6 +464,8 @@ def optimise_targets(
             cluster_by_instrument=cluster_by_instrument,
             cluster_fraction_caps=cluster_fraction_caps,
             gross_limit=gross_limit,
+            margin_limit=margin_limit,
+            leverage=current_leverage,
         )
     targets = _build_open_targets(
         state,
@@ -446,6 +480,8 @@ def optimise_targets(
         liquidity_fraction_caps=liquidity_fraction_caps,
         cluster_by_instrument=cluster_by_instrument,
         protective_stop_fraction=protective_stop_fraction,
+        leverage_by_instrument=leverage_by_instrument,
+        default_leverage=default_leverage,
     )
     selected_instruments = {target.instrument_id for target in targets}
     exit_reason = (
