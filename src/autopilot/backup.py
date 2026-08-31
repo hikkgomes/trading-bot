@@ -76,6 +76,53 @@ def _uses_project_artifacts(config_path: Path) -> bool:
     return True
 
 
+def _record_backup_role(roles: dict[Path, str], path: Path | None, role: str) -> None:
+    if path is not None:
+        roles.setdefault(path.resolve(strict=False), role)
+
+
+def _add_project_backup_roles(roles: dict[Path, str], include_project_artifacts: bool) -> None:
+    if not include_project_artifacts:
+        return
+    for path in sorted((PROJECT_ROOT / "runtime" / "research" / "ml_candidates").glob("*.json")):
+        _record_backup_role(roles, path, "ml_reviewable_candidate")
+
+
+def _add_product_backup_roles(roles: dict[Path, str], config: AutopilotConfig) -> None:
+    for product in config.products:
+        candidate_path = candidate_path_for_product(product.name)
+        for path, field in (
+            (product.strategies_path, "strategy_artifact"),
+            (candidate_path, "staged_candidate"),
+            (candidate_path.parent / f"{product.name}_paper_trades.csv", "candidate_paper_log"),
+            (
+                candidate_path.parent / f"{product.name}_promotion_review.json",
+                "candidate_promotion_review_json",
+            ),
+            (
+                candidate_path.parent / f"{product.name}_promotion_review.md",
+                "candidate_promotion_review_markdown",
+            ),
+            (product.state_file, "product_state"),
+            (product.trade_log, "product_trade_log"),
+            (product.preflight_report, "preflight_report"),
+            (product.testnet_rehearsal_report, "testnet_rehearsal_report"),
+        ):
+            _record_backup_role(roles, path, f"product:{product.name}:{field}")
+        for state_path in sorted(candidate_path.parent.glob(f"{product.name}_paper_state_*.json")):
+            _record_backup_role(roles, state_path, f"product:{product.name}:candidate_paper_state")
+
+
+def _add_job_backup_roles(roles: dict[Path, str], config: AutopilotConfig) -> None:
+    for job in config.jobs:
+        for flag in JOB_PATH_FLAGS:
+            _record_backup_role(
+                roles,
+                _job_command_path(job, flag),
+                f"job:{job.name}:{flag.removeprefix('--')}",
+            )
+
+
 def configured_backup_paths(config: AutopilotConfig, *, config_path: Path) -> list[Path]:
     """Return the small files needed to recover/review autopilot state."""
 
@@ -185,10 +232,6 @@ def _configured_backup_roles(
 ) -> dict[Path, str]:
     roles: dict[Path, str] = {}
     include_project_artifacts = _uses_project_artifacts(config_path)
-
-    def add(path: Path | None, role: str) -> None:
-        if path is not None:
-            roles.setdefault(path.resolve(strict=False), role)
 
     for path, role in (
         (config_path, "autopilot_config"),
@@ -301,39 +344,12 @@ def _configured_backup_roles(
             "exploration_paper_status",
         ),
     ):
-        add(path, role)
-    if include_project_artifacts:
-        for path in sorted(
-            (PROJECT_ROOT / "runtime" / "research" / "ml_candidates").glob("*.json")
-        ):
-            add(path, "ml_reviewable_candidate")
+        _record_backup_role(roles, path, role)
+    _add_project_backup_roles(roles, include_project_artifacts)
     if config.candidate_paper_enabled:
-        add(config.candidate_paper_status_file, "candidate_paper_status")
-    for product in config.products:
-        candidate_path = candidate_path_for_product(product.name)
-        for path, field in (
-            (product.strategies_path, "strategy_artifact"),
-            (candidate_path, "staged_candidate"),
-            (candidate_path.parent / f"{product.name}_paper_trades.csv", "candidate_paper_log"),
-            (
-                candidate_path.parent / f"{product.name}_promotion_review.json",
-                "candidate_promotion_review_json",
-            ),
-            (
-                candidate_path.parent / f"{product.name}_promotion_review.md",
-                "candidate_promotion_review_markdown",
-            ),
-            (product.state_file, "product_state"),
-            (product.trade_log, "product_trade_log"),
-            (product.preflight_report, "preflight_report"),
-            (product.testnet_rehearsal_report, "testnet_rehearsal_report"),
-        ):
-            add(path, f"product:{product.name}:{field}")
-        for state_path in sorted(candidate_path.parent.glob(f"{product.name}_paper_state_*.json")):
-            add(state_path, f"product:{product.name}:candidate_paper_state")
-    for job in config.jobs:
-        for flag in JOB_PATH_FLAGS:
-            add(_job_command_path(job, flag), f"job:{job.name}:{flag.removeprefix('--')}")
+        _record_backup_role(roles, config.candidate_paper_status_file, "candidate_paper_status")
+    _add_product_backup_roles(roles, config)
+    _add_job_backup_roles(roles, config)
     return roles
 
 
@@ -566,6 +582,291 @@ def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _archive_names(archive: zipfile.ZipFile, issues: list[dict[str, Any]]) -> set[str]:
+    bad_member = archive.testzip()
+    if bad_member:
+        issues.append({"code": "zip_crc_failed", "member": bad_member})
+    archive_names = archive.namelist()
+    names = set(archive_names)
+    duplicate_archive_members = sorted(name for name in names if archive_names.count(name) > 1)
+    for name in duplicate_archive_members:
+        issues.append({"code": "duplicate_archive_member", "arcname": name})
+    return names
+
+
+def _read_backup_manifest(
+    archive: zipfile.ZipFile, names: set[str], issues: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    if "MANIFEST.json" not in names:
+        issues.append({"code": "missing_manifest", "message": "MANIFEST.json is missing"})
+        return None
+    try:
+        manifest = json.loads(archive.read("MANIFEST.json"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        issues.append({"code": "invalid_manifest", "message": str(exc)})
+        return None
+    if not isinstance(manifest, dict):
+        issues.append({"code": "invalid_manifest", "message": "manifest must be an object"})
+        return None
+    return manifest
+
+
+def _memory_snapshot_issues(
+    manifest: dict[str, Any],
+    files: list[Any],
+    issues: list[dict[str, Any]],
+    report: dict[str, Any],
+) -> None:
+    memory_snapshot = manifest.get("experiment_memory_snapshot")
+    if not isinstance(memory_snapshot, dict):
+        return
+    report["experiment_memory_snapshot"] = memory_snapshot
+    snapshot_entries = [
+        item
+        for item in files
+        if isinstance(item, dict) and item.get("role") == "experiment_memory_snapshot"
+    ]
+    if len(snapshot_entries) > 1:
+        issues.append({"code": "duplicate_memory_snapshot_entries", "count": len(snapshot_entries)})
+    if (
+        memory_snapshot.get("source_exists") is True
+        and memory_snapshot.get("refreshed") is not True
+    ):
+        issues.append({"code": "memory_snapshot_not_refreshed"})
+    if not (
+        memory_snapshot.get("source_exists") is True
+        or memory_snapshot.get("existing_snapshot") is True
+    ):
+        return
+    integrity = memory_snapshot.get("snapshot_integrity")
+    if not isinstance(integrity, dict) or integrity.get("ok") is not True:
+        issues.append({"code": "memory_snapshot_integrity_missing"})
+    included_snapshots = [item for item in snapshot_entries if item.get("included") is True]
+    if len(included_snapshots) != 1:
+        issues.append(
+            {"code": "required_memory_snapshot_missing", "included": len(included_snapshots)}
+        )
+    elif included_snapshots[0].get("sha256") != memory_snapshot.get("sha256"):
+        issues.append({"code": "memory_snapshot_manifest_hash_mismatch"})
+
+
+def _manifest_summary(manifest: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "version": manifest.get("version"),
+        "generated_at": manifest.get("generated_at"),
+        "included_files": manifest.get("included_files"),
+        "missing_files": manifest.get("missing_files"),
+        "skipped_files": manifest.get("skipped_files"),
+        "optional_missing_files": manifest.get("optional_missing_files"),
+        "critical_skipped_files": manifest.get("critical_skipped_files"),
+        "required_recovery_files": manifest.get("required_recovery_files"),
+        "required_recovery_roles": manifest.get("required_recovery_roles"),
+    }
+
+
+def _manifest_entries(
+    manifest: dict[str, Any], issues: list[dict[str, Any]], report: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        issues.append(
+            {"code": "invalid_manifest_files", "message": "manifest files must be a list"}
+        )
+        return None
+    if manifest.get("version") != SUPPORTED_MANIFEST_VERSION:
+        issues.append(
+            {
+                "code": "unsupported_manifest_version",
+                "version": manifest.get("version"),
+                "supported_version": SUPPORTED_MANIFEST_VERSION,
+            }
+        )
+    included_entries = [item for item in files if isinstance(item, dict) and item.get("included")]
+    required_entries = [
+        item for item in files if isinstance(item, dict) and item.get("required_if_present") is True
+    ]
+    for item in files:
+        if (
+            isinstance(item, dict)
+            and item.get("required_if_present") is True
+            and item.get("exists") is True
+            and item.get("included") is not True
+        ):
+            issues.append(
+                {
+                    "code": "required_recovery_file_skipped",
+                    "path": item.get("path"),
+                    "role": item.get("role"),
+                    "reason": item.get("reason"),
+                }
+            )
+    _memory_snapshot_issues(manifest, files, issues, report)
+    report["manifest"] = _manifest_summary(manifest)
+    return included_entries, required_entries
+
+
+def _actual_manifest_counts(
+    files: list[dict[str, Any]], required_entries: list[dict[str, Any]]
+) -> dict[str, int]:
+    return {
+        "missing_files": sum(1 for item in files if item.get("reason") == "missing"),
+        "skipped_files": sum(
+            1 for item in files if item.get("exists") is True and item.get("included") is not True
+        ),
+        "optional_missing_files": sum(1 for item in files if item.get("optional_missing") is True),
+        "critical_skipped_files": sum(
+            1
+            for item in required_entries
+            if item.get("exists") is True and item.get("included") is not True
+        ),
+    }
+
+
+def _required_role_issues(
+    manifest: dict[str, Any], required_entries: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    declared_required_roles = manifest.get("required_recovery_roles")
+    if declared_required_roles is None:
+        return []
+    if not isinstance(declared_required_roles, list) or any(
+        not isinstance(role, str) or not role for role in declared_required_roles
+    ):
+        return [{"code": "invalid_required_recovery_roles"}]
+    actual_required_roles = [str(item.get("role") or "") for item in required_entries]
+    duplicate_declared_roles = sorted(
+        role for role in set(declared_required_roles) if declared_required_roles.count(role) > 1
+    )
+    duplicate_actual_roles = sorted(
+        role for role in set(actual_required_roles) if actual_required_roles.count(role) > 1
+    )
+    issues: list[dict[str, Any]] = []
+    if duplicate_declared_roles or duplicate_actual_roles:
+        issues.append(
+            {
+                "code": "duplicate_required_recovery_roles",
+                "declared": duplicate_declared_roles,
+                "actual": duplicate_actual_roles,
+            }
+        )
+    missing_roles = sorted(set(declared_required_roles) - set(actual_required_roles))
+    unexpected_roles = sorted(set(actual_required_roles) - set(declared_required_roles))
+    if missing_roles or unexpected_roles:
+        issues.append(
+            {
+                "code": "required_recovery_roles_mismatch",
+                "missing_roles": missing_roles,
+                "unexpected_roles": unexpected_roles,
+            }
+        )
+    return issues
+
+
+def _verify_manifest_counts(
+    manifest: dict[str, Any],
+    files: list[dict[str, Any]],
+    included_entries: list[dict[str, Any]],
+    required_entries: list[dict[str, Any]],
+    issues: list[dict[str, Any]],
+) -> None:
+    if manifest.get("included_files") != len(included_entries):
+        issues.append(
+            {
+                "code": "included_count_mismatch",
+                "manifest_included_files": manifest.get("included_files"),
+                "actual_included_files": len(included_entries),
+            }
+        )
+    for field, actual_count in _actual_manifest_counts(files, required_entries).items():
+        if field in manifest and manifest.get(field) != actual_count:
+            issues.append(
+                {
+                    "code": f"{field.removesuffix('_files')}_count_mismatch",
+                    "manifest_count": manifest.get(field),
+                    "actual_count": actual_count,
+                }
+            )
+    declared_required_count = manifest.get("required_recovery_files")
+    if declared_required_count is not None and declared_required_count != len(required_entries):
+        issues.append(
+            {
+                "code": "required_recovery_count_mismatch",
+                "manifest_count": declared_required_count,
+                "actual_count": len(required_entries),
+            }
+        )
+    issues.extend(_required_role_issues(manifest, required_entries))
+
+
+def _verify_archive_member(
+    archive: zipfile.ZipFile,
+    names: set[str],
+    item: dict[str, Any],
+    seen_arcnames: set[str],
+    issues: list[dict[str, Any]],
+) -> bool:
+    arcname = item.get("arcname")
+    if not isinstance(arcname, str) or not arcname:
+        issues.append({"code": "missing_arcname", "path": item.get("path")})
+        return False
+    try:
+        _safe_member_path(Path("."), arcname)
+    except ValueError:
+        issues.append({"code": "unsafe_arcname", "arcname": arcname})
+        return False
+    if arcname in seen_arcnames:
+        issues.append({"code": "duplicate_manifest_arcname", "arcname": arcname})
+        return False
+    seen_arcnames.add(arcname)
+    if arcname not in names:
+        issues.append({"code": "missing_member", "arcname": arcname})
+        return False
+    payload = archive.read(arcname)
+    expected_sha = item.get("sha256")
+    actual_sha = _sha256_bytes(payload)
+    if expected_sha != actual_sha:
+        issues.append(
+            {
+                "code": "sha256_mismatch",
+                "arcname": arcname,
+                "expected": expected_sha,
+                "actual": actual_sha,
+            }
+        )
+    expected_size = item.get("size_bytes")
+    if expected_size is not None and expected_size != len(payload):
+        issues.append(
+            {
+                "code": "size_mismatch",
+                "arcname": arcname,
+                "expected": expected_size,
+                "actual": len(payload),
+            }
+        )
+    return True
+
+
+def _verify_archive_members(
+    archive: zipfile.ZipFile,
+    names: set[str],
+    included_entries: list[dict[str, Any]],
+    issues: list[dict[str, Any]],
+) -> int:
+    expected_archive_members = {
+        item.get("arcname")
+        for item in included_entries
+        if isinstance(item.get("arcname"), str) and item.get("arcname")
+    }
+    expected_archive_members.add("MANIFEST.json")
+    for name in sorted(names - expected_archive_members):
+        issues.append({"code": "unexpected_member", "arcname": name})
+    seen_arcnames: set[str] = set()
+    checked_files = 0
+    for item in included_entries:
+        if _verify_archive_member(archive, names, item, seen_arcnames, issues):
+            checked_files += 1
+    return checked_files
+
+
 def verify_backup_archive(path: Path) -> dict[str, Any]:
     issues: list[dict[str, Any]] = []
     report: dict[str, Any] = {
@@ -583,255 +884,28 @@ def verify_backup_archive(path: Path) -> dict[str, Any]:
         return report
     try:
         with zipfile.ZipFile(path) as archive:
-            bad_member = archive.testzip()
-            if bad_member:
-                issues.append({"code": "zip_crc_failed", "member": bad_member})
-            archive_names = archive.namelist()
-            names = set(archive_names)
-            duplicate_archive_members = sorted(
-                name for name in names if archive_names.count(name) > 1
+            names = _archive_names(archive, issues)
+            manifest = _read_backup_manifest(archive, names, issues)
+            if manifest is None:
+                return report
+            entries = _manifest_entries(manifest, issues, report)
+            if entries is None:
+                return report
+            included_entries, required_entries = entries
+            files = manifest["files"]
+            _verify_manifest_counts(
+                manifest,
+                files,
+                included_entries,
+                required_entries,
+                issues,
             )
-            for name in duplicate_archive_members:
-                issues.append({"code": "duplicate_archive_member", "arcname": name})
-            if "MANIFEST.json" not in names:
-                issues.append({"code": "missing_manifest", "message": "MANIFEST.json is missing"})
-                report["ok"] = False
-                return report
-            try:
-                manifest = json.loads(archive.read("MANIFEST.json"))
-            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                issues.append({"code": "invalid_manifest", "message": str(exc)})
-                return report
-            files = manifest.get("files")
-            if not isinstance(files, list):
-                issues.append(
-                    {"code": "invalid_manifest_files", "message": "manifest files must be a list"}
-                )
-                return report
-            version = manifest.get("version")
-            if version != SUPPORTED_MANIFEST_VERSION:
-                issues.append(
-                    {
-                        "code": "unsupported_manifest_version",
-                        "version": version,
-                        "supported_version": SUPPORTED_MANIFEST_VERSION,
-                    }
-                )
-            included_entries = [
-                item for item in files if isinstance(item, dict) and item.get("included")
-            ]
-            required_entries = [
-                item
-                for item in files
-                if isinstance(item, dict) and item.get("required_if_present") is True
-            ]
-            for item in files:
-                if not isinstance(item, dict):
-                    continue
-                if (
-                    item.get("required_if_present") is True
-                    and item.get("exists") is True
-                    and item.get("included") is not True
-                ):
-                    issues.append(
-                        {
-                            "code": "required_recovery_file_skipped",
-                            "path": item.get("path"),
-                            "role": item.get("role"),
-                            "reason": item.get("reason"),
-                        }
-                    )
-            memory_snapshot = manifest.get("experiment_memory_snapshot")
-            if isinstance(memory_snapshot, dict):
-                report["experiment_memory_snapshot"] = memory_snapshot
-                snapshot_entries = [
-                    item
-                    for item in files
-                    if isinstance(item, dict) and item.get("role") == "experiment_memory_snapshot"
-                ]
-                if len(snapshot_entries) > 1:
-                    issues.append(
-                        {
-                            "code": "duplicate_memory_snapshot_entries",
-                            "count": len(snapshot_entries),
-                        }
-                    )
-                if memory_snapshot.get("source_exists") is True:
-                    if memory_snapshot.get("refreshed") is not True:
-                        issues.append({"code": "memory_snapshot_not_refreshed"})
-                if (
-                    memory_snapshot.get("source_exists") is True
-                    or memory_snapshot.get("existing_snapshot") is True
-                ):
-                    integrity = memory_snapshot.get("snapshot_integrity")
-                    if not isinstance(integrity, dict) or integrity.get("ok") is not True:
-                        issues.append({"code": "memory_snapshot_integrity_missing"})
-                    included_snapshots = [
-                        item for item in snapshot_entries if item.get("included") is True
-                    ]
-                    if len(included_snapshots) != 1:
-                        issues.append(
-                            {
-                                "code": "required_memory_snapshot_missing",
-                                "included": len(included_snapshots),
-                            }
-                        )
-                    elif included_snapshots[0].get("sha256") != memory_snapshot.get("sha256"):
-                        issues.append({"code": "memory_snapshot_manifest_hash_mismatch"})
-            report["manifest"] = {
-                "version": manifest.get("version"),
-                "generated_at": manifest.get("generated_at"),
-                "included_files": manifest.get("included_files"),
-                "missing_files": manifest.get("missing_files"),
-                "skipped_files": manifest.get("skipped_files"),
-                "optional_missing_files": manifest.get("optional_missing_files"),
-                "critical_skipped_files": manifest.get("critical_skipped_files"),
-                "required_recovery_files": manifest.get("required_recovery_files"),
-                "required_recovery_roles": manifest.get("required_recovery_roles"),
-            }
-            if manifest.get("included_files") != len(included_entries):
-                issues.append(
-                    {
-                        "code": "included_count_mismatch",
-                        "manifest_included_files": manifest.get("included_files"),
-                        "actual_included_files": len(included_entries),
-                    }
-                )
-            actual_counts = {
-                "missing_files": sum(
-                    1
-                    for item in files
-                    if isinstance(item, dict) and item.get("reason") == "missing"
-                ),
-                "skipped_files": sum(
-                    1
-                    for item in files
-                    if isinstance(item, dict)
-                    and item.get("exists") is True
-                    and item.get("included") is not True
-                ),
-                "optional_missing_files": sum(
-                    1
-                    for item in files
-                    if isinstance(item, dict) and item.get("optional_missing") is True
-                ),
-                "critical_skipped_files": sum(
-                    1
-                    for item in required_entries
-                    if item.get("exists") is True and item.get("included") is not True
-                ),
-            }
-            for field, actual_count in actual_counts.items():
-                if field in manifest and manifest.get(field) != actual_count:
-                    issues.append(
-                        {
-                            "code": f"{field.removesuffix('_files')}_count_mismatch",
-                            "manifest_count": manifest.get(field),
-                            "actual_count": actual_count,
-                        }
-                    )
-            declared_required_count = manifest.get("required_recovery_files")
-            if declared_required_count is not None and declared_required_count != len(
-                required_entries
-            ):
-                issues.append(
-                    {
-                        "code": "required_recovery_count_mismatch",
-                        "manifest_count": declared_required_count,
-                        "actual_count": len(required_entries),
-                    }
-                )
-            declared_required_roles = manifest.get("required_recovery_roles")
-            if declared_required_roles is not None:
-                if not isinstance(declared_required_roles, list) or any(
-                    not isinstance(role, str) or not role for role in declared_required_roles
-                ):
-                    issues.append({"code": "invalid_required_recovery_roles"})
-                else:
-                    actual_required_roles = [
-                        str(item.get("role") or "") for item in required_entries
-                    ]
-                    duplicate_declared_roles = sorted(
-                        role
-                        for role in set(declared_required_roles)
-                        if declared_required_roles.count(role) > 1
-                    )
-                    duplicate_actual_roles = sorted(
-                        role
-                        for role in set(actual_required_roles)
-                        if actual_required_roles.count(role) > 1
-                    )
-                    if duplicate_declared_roles or duplicate_actual_roles:
-                        issues.append(
-                            {
-                                "code": "duplicate_required_recovery_roles",
-                                "declared": duplicate_declared_roles,
-                                "actual": duplicate_actual_roles,
-                            }
-                        )
-                    missing_roles = sorted(
-                        set(declared_required_roles) - set(actual_required_roles)
-                    )
-                    unexpected_roles = sorted(
-                        set(actual_required_roles) - set(declared_required_roles)
-                    )
-                    if missing_roles or unexpected_roles:
-                        issues.append(
-                            {
-                                "code": "required_recovery_roles_mismatch",
-                                "missing_roles": missing_roles,
-                                "unexpected_roles": unexpected_roles,
-                            }
-                        )
-            expected_archive_members = {
-                item.get("arcname")
-                for item in included_entries
-                if isinstance(item.get("arcname"), str) and item.get("arcname")
-            }
-            expected_archive_members.add("MANIFEST.json")
-            for name in sorted(names - expected_archive_members):
-                issues.append({"code": "unexpected_member", "arcname": name})
-            seen_arcnames: set[str] = set()
-            for item in included_entries:
-                arcname = item.get("arcname")
-                if not isinstance(arcname, str) or not arcname:
-                    issues.append({"code": "missing_arcname", "path": item.get("path")})
-                    continue
-                try:
-                    _safe_member_path(Path("."), arcname)
-                except ValueError:
-                    issues.append({"code": "unsafe_arcname", "arcname": arcname})
-                    continue
-                if arcname in seen_arcnames:
-                    issues.append({"code": "duplicate_manifest_arcname", "arcname": arcname})
-                    continue
-                seen_arcnames.add(arcname)
-                if arcname not in names:
-                    issues.append({"code": "missing_member", "arcname": arcname})
-                    continue
-                payload = archive.read(arcname)
-                report["checked_files"] += 1
-                expected_sha = item.get("sha256")
-                actual_sha = _sha256_bytes(payload)
-                if expected_sha != actual_sha:
-                    issues.append(
-                        {
-                            "code": "sha256_mismatch",
-                            "arcname": arcname,
-                            "expected": expected_sha,
-                            "actual": actual_sha,
-                        }
-                    )
-                expected_size = item.get("size_bytes")
-                if expected_size is not None and expected_size != len(payload):
-                    issues.append(
-                        {
-                            "code": "size_mismatch",
-                            "arcname": arcname,
-                            "expected": expected_size,
-                            "actual": len(payload),
-                        }
-                    )
+            report["checked_files"] = _verify_archive_members(
+                archive,
+                names,
+                included_entries,
+                issues,
+            )
     except zipfile.BadZipFile as exc:
         issues.append({"code": "bad_zip", "message": str(exc)})
     report["ok"] = not issues
