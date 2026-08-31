@@ -52,6 +52,44 @@ class MicrostructureState:
         side.clear()
         side.update(replacement)
 
+    def _apply_depth_event(self, payload: dict[str, Any]) -> None:
+        bids = payload.get("bids", payload.get("b"))
+        asks = payload.get("asks", payload.get("a"))
+        if isinstance(bids, list) and isinstance(asks, list):
+            self._replace_depth(self.bids, bids)
+            self._replace_depth(self.asks, asks)
+
+    def _apply_book_ticker(self, payload: dict[str, Any]) -> None:
+        bid, bid_qty = _number(payload["b"]), _number(payload["B"])
+        ask, ask_qty = _number(payload["a"]), _number(payload["A"])
+        self.bids = {bid: bid_qty}
+        self.asks = {ask: ask_qty}
+
+    def _apply_trade_event(self, event: dict[str, Any], payload: dict[str, Any]) -> None:
+        price = _number(payload["p"])
+        quantity = _number(payload["q"])
+        buyer_is_maker = bool(payload.get("m"))
+        signed_quote = price * quantity * (-1.0 if buyer_is_maker else 1.0)
+        event_time = int(event.get("event_time_ms") or 0)
+        self.signed_trades.append((event_time, signed_quote))
+
+    def _apply_liquidation_event(self, event: dict[str, Any], payload: dict[str, Any]) -> None:
+        order = payload.get("o")
+        if not isinstance(order, dict):
+            return
+        price = _number(order.get("ap") or order.get("p"))
+        quantity = _number(order.get("z") or order.get("q"))
+        side = str(order.get("S") or "").upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("liquidation side must be BUY or SELL")
+        event_time = int(event.get("event_time_ms") or 0)
+        self.liquidations.append((event_time, price * quantity * (1.0 if side == "BUY" else -1.0)))
+
+    def _apply_mark_event(self, payload: dict[str, Any]) -> None:
+        self.mark_price = _number(payload["p"])
+        self.index_price = _number(payload["i"])
+        self.funding_rate = _number(payload.get("r", 0.0))
+
     def apply(self, event: dict[str, Any]) -> None:
         if event.get("symbol") not in {None, self.symbol}:
             return
@@ -60,39 +98,15 @@ class MicrostructureState:
         if not isinstance(payload, dict):
             raise ValueError("event payload must be an object")
         if "depth" in stream:
-            bids = payload.get("bids", payload.get("b"))
-            asks = payload.get("asks", payload.get("a"))
-            if isinstance(bids, list) and isinstance(asks, list):
-                self._replace_depth(self.bids, bids)
-                self._replace_depth(self.asks, asks)
+            self._apply_depth_event(payload)
         elif "bookTicker" in stream:
-            bid, bid_qty = _number(payload["b"]), _number(payload["B"])
-            ask, ask_qty = _number(payload["a"]), _number(payload["A"])
-            self.bids = {bid: bid_qty}
-            self.asks = {ask: ask_qty}
+            self._apply_book_ticker(payload)
         elif "aggTrade" in stream or stream.endswith("@trade"):
-            price = _number(payload["p"])
-            quantity = _number(payload["q"])
-            buyer_is_maker = bool(payload.get("m"))
-            signed_quote = price * quantity * (-1.0 if buyer_is_maker else 1.0)
-            event_time = int(event.get("event_time_ms") or 0)
-            self.signed_trades.append((event_time, signed_quote))
+            self._apply_trade_event(event, payload)
         elif "forceOrder" in stream:
-            order = payload.get("o")
-            if isinstance(order, dict):
-                price = _number(order.get("ap") or order.get("p"))
-                quantity = _number(order.get("z") or order.get("q"))
-                side = str(order.get("S") or "").upper()
-                if side not in {"BUY", "SELL"}:
-                    raise ValueError("liquidation side must be BUY or SELL")
-                event_time = int(event.get("event_time_ms") or 0)
-                self.liquidations.append(
-                    (event_time, price * quantity * (1.0 if side == "BUY" else -1.0))
-                )
+            self._apply_liquidation_event(event, payload)
         elif "markPrice" in stream:
-            self.mark_price = _number(payload["p"])
-            self.index_price = _number(payload["i"])
-            self.funding_rate = _number(payload.get("r", 0.0))
+            self._apply_mark_event(payload)
 
     def _levels(self, side: str, depth: int) -> list[tuple[float, float]]:
         book = self.bids if side == "bid" else self.asks
