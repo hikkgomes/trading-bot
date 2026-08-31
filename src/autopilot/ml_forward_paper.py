@@ -91,11 +91,9 @@ def _initial_candidate_state(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _run_candidate(
-    config: MlResearchConfig,
-    candidate: dict[str, Any],
-    state: dict[str, Any],
-) -> dict[str, Any]:
+def _load_candidate_forward_context(
+    config: MlResearchConfig, candidate: dict[str, Any], state: dict[str, Any]
+) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
     if candidate.get("schema") != "autopilot.ml_forward_paper_candidate/v1":
         raise ValueError("ML forward-paper candidate schema is invalid")
     if (
@@ -106,8 +104,7 @@ def _run_candidate(
     spec = candidate.get("spec")
     if not isinstance(spec, dict):
         raise ValueError("ML forward-paper candidate spec is invalid")
-    dataset = _dataset(config, spec)
-    frame = _load_dataset(dataset, config.max_rows)
+    frame = _load_dataset(_dataset(config, spec), config.max_rows)
     training_start = pd.Timestamp(candidate["training_start"])
     training_end = pd.Timestamp(candidate["training_end"])
     training = frame.loc[(frame.index >= training_start) & (frame.index <= training_end)]
@@ -115,9 +112,12 @@ def _run_candidate(
         raise ValueError("immutable ML training slice digest mismatch")
     cursor = pd.Timestamp(state.get("cursor") or candidate["forward_start_after"])
     forward = frame.loc[frame.index > cursor]
-    if forward.empty:
-        return {"status": "idle", "unseen_rows": 0}
-    model = FrozenGradientBoostingModel.from_dict(candidate.get("frozen_model"))
+    return spec, training, forward
+
+
+def _forward_signals(
+    training: pd.DataFrame, forward: pd.DataFrame, spec: dict[str, Any], model
+) -> pd.Series:
     context = pd.concat([training.tail(480), forward])
     regime = _regime_mask(
         context,
@@ -131,41 +131,65 @@ def _run_candidate(
             signals.loc[timestamp] = 1
         elif model.triggered(values, "short"):
             signals.loc[timestamp] = -1
-    signals = signals.where(regime, 0).reindex(forward.index).fillna(0).astype(int)
-    close_column = _close_column(frame)
+    return signals.where(regime, 0).reindex(forward.index).fillna(0).astype(int)
+
+
+def _close_forward_position(
+    state: dict[str, Any], spec: dict[str, Any], timestamp, price: float
+) -> None:
+    position = state.get("position")
+    if not isinstance(position, dict):
+        return
+    position["bars_held"] = int(position.get("bars_held", 0)) + 1
+    signed = 1.0 if position["direction"] == "long" else -1.0
+    gross = signed * (price / float(position["entry_price"]) - 1)
+    if not (gross >= 0.05 or gross <= -0.03 or position["bars_held"] >= int(spec["horizon"])):
+        return
+    net = gross - ROUND_TRIP_COST
+    state["equity"] = float(state["equity"]) * (1 + net)
+    state["peak_equity"] = max(float(state["peak_equity"]), float(state["equity"]))
+    state.setdefault("trades", []).append(
+        {
+            "entry_time": position["entry_time"],
+            "exit_time": timestamp.isoformat(),
+            "direction": position["direction"],
+            "entry_price": position["entry_price"],
+            "exit_price": price,
+            "net_return": net,
+        }
+    )
+    state["trades"] = state["trades"][-100:]
+    state["position"] = None
+
+
+def _open_forward_signal(state: dict[str, Any], signal: int, timestamp, price: float) -> None:
+    if state.get("position") is not None or signal == 0:
+        return
+    state["position"] = {
+        "direction": "long" if signal > 0 else "short",
+        "entry_time": timestamp.isoformat(),
+        "entry_price": price,
+        "bars_held": 0,
+    }
+
+
+def _run_candidate(
+    config: MlResearchConfig,
+    candidate: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    spec, training, forward = _load_candidate_forward_context(config, candidate, state)
+    if forward.empty:
+        return {"status": "idle", "unseen_rows": 0}
+    model = FrozenGradientBoostingModel.from_dict(candidate.get("frozen_model"))
+    signals = _forward_signals(training, forward, spec, model)
+    close_column = _close_column(forward)
     for timestamp, row in forward.iterrows():
         price = float(row[close_column])
         if not math.isfinite(price) or price <= 0:
             raise ValueError("ML forward-paper close price is invalid")
-        position = state.get("position")
-        if isinstance(position, dict):
-            position["bars_held"] = int(position.get("bars_held", 0)) + 1
-            signed = 1.0 if position["direction"] == "long" else -1.0
-            gross = signed * (price / float(position["entry_price"]) - 1)
-            horizon = int(spec["horizon"])
-            if gross >= 0.05 or gross <= -0.03 or position["bars_held"] >= horizon:
-                net = gross - ROUND_TRIP_COST
-                state["equity"] = float(state["equity"]) * (1 + net)
-                state["peak_equity"] = max(float(state["peak_equity"]), float(state["equity"]))
-                state.setdefault("trades", []).append(
-                    {
-                        "entry_time": position["entry_time"],
-                        "exit_time": timestamp.isoformat(),
-                        "direction": position["direction"],
-                        "entry_price": position["entry_price"],
-                        "exit_price": price,
-                        "net_return": net,
-                    }
-                )
-                state["trades"] = state["trades"][-100:]
-                state["position"] = None
-        if state.get("position") is None and int(signals.loc[timestamp]) != 0:
-            state["position"] = {
-                "direction": "long" if int(signals.loc[timestamp]) > 0 else "short",
-                "entry_time": timestamp.isoformat(),
-                "entry_price": price,
-                "bars_held": 0,
-            }
+        _close_forward_position(state, spec, timestamp, price)
+        _open_forward_signal(state, int(signals.loc[timestamp]), timestamp, price)
         state["cursor"] = timestamp.isoformat()
     trades = state.get("trades") or []
     return {

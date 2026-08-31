@@ -177,17 +177,7 @@ class MlResearchConfig:
     minimum_dsr: float
 
 
-def load_config(path: Path = DEFAULT_CONFIG) -> MlResearchConfig:
-    path = Path(path)
-    payload = _strict_json(path)
-    _keys(
-        payload,
-        {"schema", "memory_path", "datasets", "budgets", "search", "gates"},
-        "config",
-    )
-    if payload.get("schema") != CONFIG_SCHEMA:
-        raise MlResearchConfigError(f"schema must be {CONFIG_SCHEMA}")
-    raw_datasets = payload.get("datasets")
+def _load_ml_datasets(raw_datasets: Any) -> tuple[DatasetSpec, ...]:
     if not isinstance(raw_datasets, list) or not raw_datasets:
         raise MlResearchConfigError("datasets must be a non-empty list")
     datasets: list[DatasetSpec] = []
@@ -199,9 +189,10 @@ def load_config(path: Path = DEFAULT_CONFIG) -> MlResearchConfig:
             {"product", "market", "symbol", "timeframe", "pnl_unit", "enabled"},
             f"datasets[{index}]",
         )
-        if raw.get("enabled", True) is False:
+        enabled = raw.get("enabled", True)
+        if enabled is False:
             continue
-        if raw.get("enabled", True) is not True:
+        if enabled is not True:
             raise MlResearchConfigError(f"datasets[{index}].enabled must be boolean")
         market, pnl_unit = raw.get("market"), raw.get("pnl_unit")
         if market not in {"spot", "futures"} or pnl_unit not in {"btc", "usdt"}:
@@ -220,10 +211,17 @@ def load_config(path: Path = DEFAULT_CONFIG) -> MlResearchConfig:
         )
     if not datasets:
         raise MlResearchConfigError("at least one dataset must be enabled")
+    return tuple(datasets)
 
-    budgets = payload.get("budgets")
-    search = payload.get("search")
-    gates = payload.get("gates")
+
+def _ml_config_sections(
+    payload: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+    budgets, search, gates = (
+        payload.get("budgets"),
+        payload.get("search"),
+        payload.get("gates"),
+    )
     if not all(isinstance(value, Mapping) for value in (budgets, search, gates)):
         raise MlResearchConfigError("budgets, search, and gates must be objects")
     _keys(
@@ -266,42 +264,129 @@ def load_config(path: Path = DEFAULT_CONFIG) -> MlResearchConfig:
         },
         "gates",
     )
+    return budgets, search, gates
+
+
+def _ml_search_values(search: Mapping[str, Any]) -> dict[str, Any]:
     horizons = tuple(
         _integer(value, "search.horizons", minimum=1, maximum=10_000)
         for value in search.get("horizons", [])
     )
     if not horizons:
         raise MlResearchConfigError("search.horizons must not be empty")
-    max_features = tuple(
-        _integer(value, "search.max_features", minimum=4, maximum=500)
-        for value in search.get("max_features", [])
-    )
-    estimators = tuple(
-        _integer(value, "search.estimators", minimum=20, maximum=2_000)
-        for value in search.get("estimators", [])
-    )
-    learning_rates = tuple(
-        _number(value, "search.learning_rates", minimum=0.001, maximum=0.5)
-        for value in search.get("learning_rates", [])
-    )
-    if not max_features or not estimators or not learning_rates:
+    values = {
+        "feature_sets": _strings(
+            search.get("feature_sets"),
+            "search.feature_sets",
+            {"price_volume", "technical_core", "technical_wide"},
+        ),
+        "families": _strings(
+            search.get("families"),
+            "search.families",
+            {
+                "classifier_direction",
+                "classifier_triple_barrier",
+                "regressor_return",
+                "regressor_triple_barrier",
+            },
+        ),
+        "models": _strings(search.get("models"), "search.models", {"lightgbm", "sklearn"}),
+        "horizons": horizons,
+        "regimes": _strings(
+            search.get("regimes"),
+            "search.regimes",
+            {"all", "trend", "high_volatility", "low_volatility"},
+        ),
+        "max_features": tuple(
+            _integer(value, "search.max_features", minimum=4, maximum=500)
+            for value in search.get("max_features", [])
+        ),
+        "estimators": tuple(
+            _integer(value, "search.estimators", minimum=20, maximum=2_000)
+            for value in search.get("estimators", [])
+        ),
+        "learning_rates": tuple(
+            _number(value, "search.learning_rates", minimum=0.001, maximum=0.5)
+            for value in search.get("learning_rates", [])
+        ),
+    }
+    if not values["max_features"] or not values["estimators"] or not values["learning_rates"]:
         raise MlResearchConfigError("numeric search grids must not be empty")
-    min_train_rows = _integer(
-        budgets.get("min_train_rows"), "budgets.min_train_rows", minimum=200, maximum=2_000_000
-    )
-    validation_rows = _integer(
-        budgets.get("validation_rows"), "budgets.validation_rows", minimum=100, maximum=500_000
-    )
-    min_windows = _integer(budgets.get("min_windows"), "budgets.min_windows", minimum=2, maximum=20)
-    max_rows = _integer(
-        budgets.get("max_rows"), "budgets.max_rows", minimum=1_000, maximum=5_000_000
-    )
-    if min_train_rows + validation_rows * min_windows > max_rows:
+    return values
+
+
+def _ml_budget_values(budgets: Mapping[str, Any]) -> dict[str, Any]:
+    values = {
+        "min_train_rows": _integer(
+            budgets.get("min_train_rows"),
+            "budgets.min_train_rows",
+            minimum=200,
+            maximum=2_000_000,
+        ),
+        "validation_rows": _integer(
+            budgets.get("validation_rows"),
+            "budgets.validation_rows",
+            minimum=100,
+            maximum=500_000,
+        ),
+        "min_windows": _integer(
+            budgets.get("min_windows"), "budgets.min_windows", minimum=2, maximum=20
+        ),
+        "max_rows": _integer(
+            budgets.get("max_rows"), "budgets.max_rows", minimum=1_000, maximum=5_000_000
+        ),
+        "step_rows": _integer(
+            budgets.get("step_rows"), "budgets.step_rows", minimum=50, maximum=500_000
+        ),
+        "final_holdout_fraction": _number(
+            budgets.get("final_holdout_fraction"),
+            "budgets.final_holdout_fraction",
+            minimum=0.1,
+            maximum=0.4,
+        ),
+        "embargo_bars": _integer(
+            budgets.get("embargo_bars"), "budgets.embargo_bars", minimum=0, maximum=10_000
+        ),
+    }
+    if (
+        values["min_train_rows"] + values["validation_rows"] * values["min_windows"]
+        > values["max_rows"]
+    ):
         raise MlResearchConfigError("max_rows cannot satisfy the requested chronological windows")
-    maximum_drawdown = _number(
-        gates.get("maximum_drawdown"), "gates.maximum_drawdown", minimum=-1, maximum=0
-    )
-    raw_memory_path = payload.get("memory_path")
+    return values
+
+
+def _ml_gate_values(gates: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "minimum_total_trades": _integer(
+            gates.get("minimum_total_trades"),
+            "gates.minimum_total_trades",
+            minimum=1,
+            maximum=100_000,
+        ),
+        "minimum_holdout_trades": _integer(
+            gates.get("minimum_holdout_trades"),
+            "gates.minimum_holdout_trades",
+            minimum=1,
+            maximum=100_000,
+        ),
+        "minimum_profitable_window_fraction": _number(
+            gates.get("minimum_profitable_window_fraction"),
+            "gates.minimum_profitable_window_fraction",
+            minimum=0.5,
+            maximum=1,
+        ),
+        "maximum_drawdown": _number(
+            gates.get("maximum_drawdown"),
+            "gates.maximum_drawdown",
+            minimum=-1,
+            maximum=0,
+        ),
+        "minimum_dsr": _number(gates.get("minimum_dsr"), "gates.minimum_dsr", minimum=0, maximum=1),
+    }
+
+
+def _ml_memory_path(raw_memory_path: Any) -> Path:
     if not isinstance(raw_memory_path, str) or not raw_memory_path:
         raise MlResearchConfigError("memory_path must be a non-empty project-relative path")
     if Path(raw_memory_path).is_absolute():
@@ -311,6 +396,25 @@ def load_config(path: Path = DEFAULT_CONFIG) -> MlResearchConfig:
         memory_path.relative_to(PROJECT_ROOT.resolve())
     except ValueError as exc:
         raise MlResearchConfigError("memory_path must stay inside the project") from exc
+    return memory_path
+
+
+def load_config(path: Path = DEFAULT_CONFIG) -> MlResearchConfig:
+    path = Path(path)
+    payload = _strict_json(path)
+    _keys(
+        payload,
+        {"schema", "memory_path", "datasets", "budgets", "search", "gates"},
+        "config",
+    )
+    if payload.get("schema") != CONFIG_SCHEMA:
+        raise MlResearchConfigError(f"schema must be {CONFIG_SCHEMA}")
+    datasets = _load_ml_datasets(payload.get("datasets"))
+    budgets, search, gates = _ml_config_sections(payload)
+    search_values = _ml_search_values(search)
+    budget_values = _ml_budget_values(budgets)
+    gate_values = _ml_gate_values(gates)
+    memory_path = _ml_memory_path(payload.get("memory_path"))
     return MlResearchConfig(
         path=path.resolve(),
         memory_path=memory_path,
@@ -327,67 +431,31 @@ def load_config(path: Path = DEFAULT_CONFIG) -> MlResearchConfig:
             minimum=10,
             maximum=3_600,
         ),
-        max_rows=max_rows,
-        min_train_rows=min_train_rows,
-        validation_rows=validation_rows,
-        step_rows=_integer(
-            budgets.get("step_rows"), "budgets.step_rows", minimum=50, maximum=500_000
-        ),
-        min_windows=min_windows,
-        final_holdout_fraction=_number(
-            budgets.get("final_holdout_fraction"),
-            "budgets.final_holdout_fraction",
-            minimum=0.1,
-            maximum=0.4,
-        ),
-        embargo_bars=_integer(
-            budgets.get("embargo_bars"), "budgets.embargo_bars", minimum=0, maximum=10_000
-        ),
-        feature_sets=_strings(
-            search.get("feature_sets"),
-            "search.feature_sets",
-            {"price_volume", "technical_core", "technical_wide"},
-        ),
-        families=_strings(
-            search.get("families"),
-            "search.families",
-            {
-                "classifier_direction",
-                "classifier_triple_barrier",
-                "regressor_return",
-                "regressor_triple_barrier",
-            },
-        ),
-        models=_strings(search.get("models"), "search.models", {"lightgbm", "sklearn"}),
-        horizons=horizons,
-        regimes=_strings(
-            search.get("regimes"),
-            "search.regimes",
-            {"all", "trend", "high_volatility", "low_volatility"},
-        ),
-        max_features=max_features,
-        estimators=estimators,
-        learning_rates=learning_rates,
+        max_rows=budget_values["max_rows"],
+        min_train_rows=budget_values["min_train_rows"],
+        validation_rows=budget_values["validation_rows"],
+        step_rows=budget_values["step_rows"],
+        min_windows=budget_values["min_windows"],
+        final_holdout_fraction=budget_values["final_holdout_fraction"],
+        embargo_bars=budget_values["embargo_bars"],
+        feature_sets=search_values["feature_sets"],
+        families=search_values["families"],
+        models=search_values["models"],
+        horizons=search_values["horizons"],
+        regimes=search_values["regimes"],
+        max_features=search_values["max_features"],
+        estimators=search_values["estimators"],
+        learning_rates=search_values["learning_rates"],
         minimum_total_trades=_integer(
             gates.get("minimum_total_trades"),
             "gates.minimum_total_trades",
             minimum=1,
             maximum=100_000,
         ),
-        minimum_holdout_trades=_integer(
-            gates.get("minimum_holdout_trades"),
-            "gates.minimum_holdout_trades",
-            minimum=1,
-            maximum=100_000,
-        ),
-        minimum_profitable_window_fraction=_number(
-            gates.get("minimum_profitable_window_fraction"),
-            "gates.minimum_profitable_window_fraction",
-            minimum=0.5,
-            maximum=1,
-        ),
-        maximum_drawdown=maximum_drawdown,
-        minimum_dsr=_number(gates.get("minimum_dsr"), "gates.minimum_dsr", minimum=0, maximum=1),
+        minimum_holdout_trades=gate_values["minimum_holdout_trades"],
+        minimum_profitable_window_fraction=gate_values["minimum_profitable_window_fraction"],
+        maximum_drawdown=gate_values["maximum_drawdown"],
+        minimum_dsr=gate_values["minimum_dsr"],
     )
 
 
@@ -483,6 +551,42 @@ def _minimum_epoch_rows(config: MlResearchConfig) -> int:
     return rows
 
 
+def _protected_ml_masks(
+    timestamps: pd.DatetimeIndex,
+    dataset: DatasetSpec,
+    protected_intervals: tuple[dict[str, str], ...],
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, str]]]:
+    protected = np.zeros(len(timestamps), dtype=bool)
+    dependency_embargo = np.zeros(len(timestamps), dtype=bool)
+    relevant: list[dict[str, str]] = []
+    dependency_seconds = ML_FEATURE_DEPENDENCY_BARS * TIMEFRAME_SECONDS[dataset.timeframe]
+    for interval in protected_intervals:
+        start = pd.Timestamp(interval["start"])
+        end = pd.Timestamp(interval["end"])
+        overlap = np.asarray((timestamps >= start) & (timestamps <= end), dtype=bool)
+        embargo_end = end + pd.Timedelta(seconds=dependency_seconds)
+        embargo = np.asarray((timestamps > end) & (timestamps <= embargo_end), dtype=bool)
+        if overlap.any() or embargo.any():
+            protected |= overlap
+            dependency_embargo |= embargo
+            relevant.append(interval)
+    return protected, dependency_embargo, relevant
+
+
+def _unprotected_ml_runs(blocked: np.ndarray) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    run_start: int | None = None
+    for position, is_blocked in enumerate(blocked):
+        if not is_blocked and run_start is None:
+            run_start = position
+        elif is_blocked and run_start is not None:
+            runs.append((run_start, position))
+            run_start = None
+    if run_start is not None:
+        runs.append((run_start, len(blocked)))
+    return runs
+
+
 def _select_unprotected_epoch(
     frame: pd.DataFrame,
     dataset: DatasetSpec,
@@ -497,34 +601,14 @@ def _select_unprotected_epoch(
     if timeframe_seconds is None:
         raise ValueError(f"unsupported ML dataset timeframe: {dataset.timeframe}")
     timestamps = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True, errors="raise"))
-    protected = np.zeros(len(frame), dtype=bool)
-    dependency_embargo = np.zeros(len(frame), dtype=bool)
-    relevant: list[dict[str, str]] = []
-    dependency_seconds = ML_FEATURE_DEPENDENCY_BARS * timeframe_seconds
-    for interval in protected_intervals:
-        start = pd.Timestamp(interval["start"])
-        end = pd.Timestamp(interval["end"])
-        overlap = np.asarray((timestamps >= start) & (timestamps <= end), dtype=bool)
-        embargo_end = end + pd.Timedelta(seconds=dependency_seconds)
-        embargo = np.asarray((timestamps > end) & (timestamps <= embargo_end), dtype=bool)
-        if overlap.any() or embargo.any():
-            protected |= overlap
-            dependency_embargo |= embargo
-            relevant.append(interval)
+    protected, dependency_embargo, relevant = _protected_ml_masks(
+        timestamps, dataset, protected_intervals
+    )
     if not relevant:
         return frame, None
     dependency_embargo &= ~protected
     blocked = protected | dependency_embargo
-    runs: list[tuple[int, int]] = []
-    run_start: int | None = None
-    for position, is_blocked in enumerate(blocked):
-        if not is_blocked and run_start is None:
-            run_start = position
-        elif is_blocked and run_start is not None:
-            runs.append((run_start, position))
-            run_start = None
-    if run_start is not None:
-        runs.append((run_start, len(frame)))
+    runs = _unprotected_ml_runs(blocked)
     minimum_rows = _minimum_epoch_rows(config)
     eligible = [run for run in runs if run[1] - run[0] >= minimum_rows]
     if not eligible:
@@ -911,6 +995,122 @@ def _score_protected_holdout(
     }
 
 
+def _protected_paper_candidate(
+    result: dict[str, Any],
+    context: dict[str, Any],
+    holdout: dict[str, Any],
+    frozen_model: dict[str, Any] | None,
+) -> dict[str, Any]:
+    candidate = {
+        "schema": "autopilot.ml_forward_paper_candidate/v1",
+        "experiment_id": result["experiment_id"],
+        "behavior_hash": context["behavior_hash"],
+        "snapshot_id": context["snapshot_id"],
+        "spec": {
+            key: value
+            for key, value in result.items()
+            if key
+            in {
+                "product",
+                "market",
+                "symbol",
+                "timeframe",
+                "pnl_unit",
+                "feature_set",
+                "family",
+                "model",
+                "horizon",
+                "regime",
+                "max_features",
+                "n_estimators",
+                "learning_rate",
+                "experiment_id",
+            }
+        },
+        "training_content_sha256": context["dataset"]["evidence"]["training_content_sha256"],
+        "training_start": holdout["train_start"],
+        "training_end": holdout["train_end"],
+        "forward_start_after": holdout["holdout_end"],
+        "frozen_model": frozen_model,
+        "promotion_eligible": False,
+        "live_allowed": False,
+    }
+    candidate["spec"]["regime_close_feature"] = holdout["regime_close_feature"]
+    return candidate
+
+
+def _apply_protected_holdout_result(
+    result: dict[str, Any], context: dict[str, Any], holdout: dict[str, Any]
+) -> None:
+    frozen_model = holdout.pop("frozen_model", None)
+    result["protected_holdout"] = holdout
+    result["holdout_eligible"] = holdout["eligible"]
+    result["holdout_status"] = (
+        "protected_holdout_pass" if holdout["eligible"] else "protected_holdout_reject"
+    )
+    result["status"] = result["holdout_status"]
+    result["safety"] = {
+        "research_only": True,
+        "forward_paper_allowed": holdout["eligible"] and isinstance(frozen_model, dict),
+        "promotion_allowed": False,
+        "live_allowed": False,
+        "blocked_reason": "exact_digest_staging_candidate_paper_and_approval_required",
+    }
+    if result["safety"]["forward_paper_allowed"]:
+        result["forward_paper_candidate"] = _protected_paper_candidate(
+            result, context, holdout, frozen_model
+        )
+
+
+def _evaluate_protected_candidate(
+    memory: ExperimentMemory,
+    result: dict[str, Any],
+    dataset: DatasetSpec,
+    frame: pd.DataFrame,
+    context: dict[str, Any],
+    cohort,
+    config: MlResearchConfig,
+) -> None:
+    if context["behavior_hash"] not in cohort.member_hashes:
+        result["holdout_status"] = "deferred_not_in_sealed_cohort"
+        return
+    if memory.holdout_claimed(context["behavior_hash"], snapshot_id=context["snapshot_id"]):
+        result["holdout_status"] = "deferred_already_consumed"
+        return
+    claim = memory.claim_holdout(
+        context["behavior_hash"],
+        snapshot_id=context["snapshot_id"],
+        dataset=context["dataset"],
+        window=context["holdout_window"],
+        protocol=context["protocol"],
+    )
+    if not claim.created:
+        result["holdout_status"] = "deferred_already_claimed"
+        return
+    try:
+        holdout = _score_protected_holdout(result, dataset, frame, config)
+    except Exception as exc:
+        result["holdout_status"] = "protected_holdout_error"
+        result["status"] = "error"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        memory.complete_evaluation(
+            claim.evaluation_key,
+            outcome="error",
+            rejection_reasons=("ml_protected_holdout_error",),
+            metrics={},
+            details={"error": result["error"], "protected_feedback": True},
+        )
+        return
+    _apply_protected_holdout_result(result, context, holdout)
+    memory.complete_evaluation(
+        claim.evaluation_key,
+        outcome="pass" if holdout["eligible"] else "reject",
+        rejection_reasons=() if holdout["eligible"] else ("ml_protected_holdout_gates_failed",),
+        metrics=holdout["metrics"],
+        details={"protected_feedback": True},
+    )
+
+
 def _evaluate_protected_cohort(
     config: MlResearchConfig,
     candidates: list[tuple[dict[str, Any], DatasetSpec, pd.DataFrame, dict[str, Any]]],
@@ -928,103 +1128,14 @@ def _evaluate_protected_cohort(
                 min_seconds_since_last_seal=86_400,
             )
             for result, dataset, frame, context in candidates:
-                if context["behavior_hash"] not in cohort.member_hashes:
-                    result["holdout_status"] = "deferred_not_in_sealed_cohort"
-                    continue
-                if memory.holdout_claimed(
-                    context["behavior_hash"], snapshot_id=context["snapshot_id"]
-                ):
-                    result["holdout_status"] = "deferred_already_consumed"
-                    continue
-                claim = memory.claim_holdout(
-                    context["behavior_hash"],
-                    snapshot_id=context["snapshot_id"],
-                    dataset=context["dataset"],
-                    window=context["holdout_window"],
-                    protocol=context["protocol"],
-                )
-                if not claim.created:
-                    result["holdout_status"] = "deferred_already_claimed"
-                    continue
-                try:
-                    holdout = _score_protected_holdout(result, dataset, frame, config)
-                except Exception as exc:
-                    result["holdout_status"] = "protected_holdout_error"
-                    result["status"] = "error"
-                    result["error"] = f"{type(exc).__name__}: {exc}"
-                    memory.complete_evaluation(
-                        claim.evaluation_key,
-                        outcome="error",
-                        rejection_reasons=("ml_protected_holdout_error",),
-                        metrics={},
-                        details={"error": result["error"], "protected_feedback": True},
-                    )
-                    continue
-                frozen_model = holdout.pop("frozen_model", None)
-                result["protected_holdout"] = holdout
-                result["holdout_eligible"] = holdout["eligible"]
-                forward_paper_allowed = holdout["eligible"] and isinstance(frozen_model, dict)
-                result["holdout_status"] = (
-                    "protected_holdout_pass" if holdout["eligible"] else "protected_holdout_reject"
-                )
-                result["status"] = result["holdout_status"]
-                result["safety"] = {
-                    "research_only": True,
-                    "forward_paper_allowed": forward_paper_allowed,
-                    "promotion_allowed": False,
-                    "live_allowed": False,
-                    "blocked_reason": (
-                        "exact_digest_staging_candidate_paper_and_approval_required"
-                    ),
-                }
-                if forward_paper_allowed:
-                    result["forward_paper_candidate"] = {
-                        "schema": "autopilot.ml_forward_paper_candidate/v1",
-                        "experiment_id": result["experiment_id"],
-                        "behavior_hash": context["behavior_hash"],
-                        "snapshot_id": context["snapshot_id"],
-                        "spec": {
-                            key: value
-                            for key, value in result.items()
-                            if key
-                            in {
-                                "product",
-                                "market",
-                                "symbol",
-                                "timeframe",
-                                "pnl_unit",
-                                "feature_set",
-                                "family",
-                                "model",
-                                "horizon",
-                                "regime",
-                                "max_features",
-                                "n_estimators",
-                                "learning_rate",
-                                "experiment_id",
-                            }
-                        },
-                        "training_content_sha256": context["dataset"]["evidence"][
-                            "training_content_sha256"
-                        ],
-                        "training_start": holdout["train_start"],
-                        "training_end": holdout["train_end"],
-                        "forward_start_after": holdout["holdout_end"],
-                        "frozen_model": frozen_model,
-                        "promotion_eligible": False,
-                        "live_allowed": False,
-                    }
-                    result["forward_paper_candidate"]["spec"]["regime_close_feature"] = holdout[
-                        "regime_close_feature"
-                    ]
-                memory.complete_evaluation(
-                    claim.evaluation_key,
-                    outcome="pass" if holdout["eligible"] else "reject",
-                    rejection_reasons=()
-                    if holdout["eligible"]
-                    else ("ml_protected_holdout_gates_failed",),
-                    metrics=holdout["metrics"],
-                    details={"protected_feedback": True},
+                _evaluate_protected_candidate(
+                    memory,
+                    result,
+                    dataset,
+                    frame,
+                    context,
+                    cohort,
+                    config,
                 )
     except HoldoutSealBudgetError:
         for result, _, _, _ in candidates:
@@ -1033,6 +1144,109 @@ def _evaluate_protected_cohort(
         for result, _, _, _ in candidates:
             result["holdout_status"] = "deferred_holdout_scope_conflict"
             result["holdout_detail"] = str(exc)
+
+
+def _run_ml_trial(
+    config: MlResearchConfig,
+    spec: dict[str, Any],
+    *,
+    datasets: dict[tuple[str, str, str, str, str], DatasetSpec],
+    cache: dict[tuple[str, str, str, str, str], tuple[pd.DataFrame, dict[str, Any] | None]],
+) -> tuple[dict[str, Any], tuple[dict[str, Any], DatasetSpec, pd.DataFrame, dict[str, Any]] | None]:
+    identity = tuple(spec[key] for key in ("product", "market", "symbol", "timeframe", "pnl_unit"))
+    dataset = datasets[identity]
+    try:
+        if identity not in cache:
+            loaded = _load_dataset(dataset, config.max_rows)
+            with ExperimentMemory(config.memory_path) as memory:
+                protected_intervals = memory.protected_intervals(
+                    market=dataset.market, symbol=dataset.symbol
+                )
+            cache[identity] = _select_unprotected_epoch(
+                loaded, dataset, config, protected_intervals
+            )
+        frame, epoch_selection = cache[identity]
+        result = evaluate_experiment(spec, dataset, frame, config)
+        if epoch_selection is not None:
+            result["protected_epoch_selection"] = epoch_selection
+        if result["status"] not in {"pre_holdout_pass", "pre_holdout_reject"}:
+            return result, None
+        context = _remember_evaluation(config, spec, dataset, frame, result)
+        result["experiment_memory"] = {
+            key: context[key]
+            for key in (
+                "behavior_hash",
+                "evaluation_key",
+                "strategy_created",
+                "evaluation_created",
+                "snapshot_id",
+            )
+        }
+        holdout = (
+            (result, dataset, frame, context)
+            if result.get("pre_holdout_eligible") is True
+            else None
+        )
+        return result, holdout
+    except FileNotFoundError:
+        return {
+            **spec,
+            "status": "waiting_for_dataset",
+            "path": str(dataset.path),
+            "pre_holdout_eligible": False,
+        }, None
+    except ImportError as exc:
+        return {
+            **spec,
+            "status": "waiting_for_dependency",
+            "dependency": str(spec["model"]),
+            "detail": str(exc),
+            "pre_holdout_eligible": False,
+        }, None
+    except UnprotectedMlEpochUnavailableError as exc:
+        return {
+            **spec,
+            "status": "waiting_for_unprotected_epoch",
+            "detail": str(exc),
+            "pre_holdout_eligible": False,
+        }, None
+    except Exception as exc:
+        return {
+            **spec,
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "pre_holdout_eligible": False,
+        }, None
+
+
+def _export_ml_candidates(
+    trials: list[dict[str, Any]],
+    *,
+    autopilot_config_path: Path,
+    candidate_artifact_dir: Path,
+) -> None:
+    exportable = [item for item in trials if isinstance(item.get("forward_paper_candidate"), dict)]
+    if not exportable:
+        return
+    products = {
+        product.name: product for product in load_autopilot_config(autopilot_config_path).products
+    }
+    for trial in exportable:
+        product = products.get(str(trial.get("product") or ""))
+        if product is None:
+            trial["candidate_artifact_status"] = "error"
+            trial["candidate_artifact_error"] = "ML product is not configured in autopilot"
+            trial["status"] = "error"
+            continue
+        try:
+            trial["reviewable_candidate_artifact"] = export_reviewable_artifact(
+                trial, product, output_dir=candidate_artifact_dir
+            )
+            trial["candidate_artifact_status"] = "reviewable_not_staged"
+        except Exception as exc:
+            trial["candidate_artifact_status"] = "error"
+            trial["candidate_artifact_error"] = f"{type(exc).__name__}: {exc}"
+            trial["status"] = "error"
 
 
 def run_cycle(
@@ -1059,108 +1273,17 @@ def run_cycle(
     for spec in selected:
         if time.monotonic() - started >= config.max_runtime_seconds:
             break
-        identity = tuple(
-            spec[key] for key in ("product", "market", "symbol", "timeframe", "pnl_unit")
-        )
-        dataset = by_identity[identity]
-        try:
-            if identity not in cache:
-                loaded = _load_dataset(dataset, config.max_rows)
-                with ExperimentMemory(config.memory_path) as memory:
-                    protected_intervals = memory.protected_intervals(
-                        market=dataset.market,
-                        symbol=dataset.symbol,
-                    )
-                cache[identity] = _select_unprotected_epoch(
-                    loaded,
-                    dataset,
-                    config,
-                    protected_intervals,
-                )
-            frame, epoch_selection = cache[identity]
-            result = evaluate_experiment(spec, dataset, frame, config)
-            if epoch_selection is not None:
-                result["protected_epoch_selection"] = epoch_selection
-            if result["status"] in {"pre_holdout_pass", "pre_holdout_reject"}:
-                context = _remember_evaluation(config, spec, dataset, frame, result)
-                result["experiment_memory"] = {
-                    key: context[key]
-                    for key in (
-                        "behavior_hash",
-                        "evaluation_key",
-                        "strategy_created",
-                        "evaluation_created",
-                        "snapshot_id",
-                    )
-                }
-                if result.get("pre_holdout_eligible") is True:
-                    holdout_candidates.setdefault(context["snapshot_id"], []).append(
-                        (result, dataset, frame, context)
-                    )
-            trials.append(result)
-        except FileNotFoundError:
-            trials.append(
-                {
-                    **spec,
-                    "status": "waiting_for_dataset",
-                    "path": str(dataset.path),
-                    "pre_holdout_eligible": False,
-                }
-            )
-        except ImportError as exc:
-            trials.append(
-                {
-                    **spec,
-                    "status": "waiting_for_dependency",
-                    "dependency": str(spec["model"]),
-                    "detail": str(exc),
-                    "pre_holdout_eligible": False,
-                }
-            )
-        except UnprotectedMlEpochUnavailableError as exc:
-            trials.append(
-                {
-                    **spec,
-                    "status": "waiting_for_unprotected_epoch",
-                    "detail": str(exc),
-                    "pre_holdout_eligible": False,
-                }
-            )
-        except Exception as exc:
-            trials.append(
-                {
-                    **spec,
-                    "status": "error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "pre_holdout_eligible": False,
-                }
-            )
+        result, holdout = _run_ml_trial(config, spec, datasets=by_identity, cache=cache)
+        trials.append(result)
+        if holdout is not None:
+            holdout_candidates.setdefault(holdout[3]["snapshot_id"], []).append(holdout)
     for cohort_candidates in holdout_candidates.values():
         _evaluate_protected_cohort(config, cohort_candidates)
-    exportable = [item for item in trials if isinstance(item.get("forward_paper_candidate"), dict)]
-    if exportable:
-        products = {
-            product.name: product
-            for product in load_autopilot_config(autopilot_config_path).products
-        }
-        for trial in exportable:
-            product = products.get(str(trial.get("product") or ""))
-            if product is None:
-                trial["candidate_artifact_status"] = "error"
-                trial["candidate_artifact_error"] = "ML product is not configured in autopilot"
-                trial["status"] = "error"
-                continue
-            try:
-                trial["reviewable_candidate_artifact"] = export_reviewable_artifact(
-                    trial,
-                    product,
-                    output_dir=candidate_artifact_dir,
-                )
-                trial["candidate_artifact_status"] = "reviewable_not_staged"
-            except Exception as exc:
-                trial["candidate_artifact_status"] = "error"
-                trial["candidate_artifact_error"] = f"{type(exc).__name__}: {exc}"
-                trial["status"] = "error"
+    _export_ml_candidates(
+        trials,
+        autopilot_config_path=autopilot_config_path,
+        candidate_artifact_dir=candidate_artifact_dir,
+    )
     next_cursor = (cursor + len(trials)) % len(grid)
     report = {
         "schema": REPORT_SCHEMA,
