@@ -35,6 +35,62 @@ from src.services.execution_service import ExecutionService
 from src.services.scheduler import DatabaseJobQueue
 
 
+def _split_order_groups(
+    targets: tuple[TargetPosition, ...],
+) -> tuple[dict[str, list[TargetPosition]], list[TargetPosition]]:
+    grouped: dict[str, list[TargetPosition]] = {}
+    standalone: list[TargetPosition] = []
+    for target in targets:
+        group_key = str(target.metadata.get("order_group_key") or "").strip()
+        if group_key:
+            grouped.setdefault(group_key, []).append(target)
+        else:
+            standalone.append(target)
+    return grouped, standalone
+
+
+def _validate_fill_values(quantity: float, price: float, fee: float) -> None:
+    if quantity <= 0 or price <= 0 or fee < 0:
+        raise ValueError("fill update has invalid quantity, price, or fee")
+
+
+def _acknowledge_order(manager: OrderManager, order: OrderIntent, event_at: str) -> OrderIntent:
+    if order.status is OrderStatus.PERSISTED:
+        manager.submitted(order.order_id)
+        return manager.acknowledged(order.order_id, event_at=event_at)
+    if order.status is OrderStatus.SUBMITTED:
+        return manager.acknowledged(order.order_id, event_at=event_at)
+    return order
+
+
+def _apply_exchange_status(
+    manager: OrderManager,
+    order: OrderIntent,
+    status: str,
+    *,
+    order_groups: OrderGroupManager | None,
+) -> OrderIntent:
+    if status in {"NEW", "PARTIALLY_FILLED"}:
+        return order
+    if status in {"CANCELED", "CANCELLED"}:
+        if order.status in {OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED}:
+            manager.request_cancel(order.order_id)
+        cancelled = manager.cancelled(order.order_id)
+        _mark_group_recovery(order_groups, cancelled)
+        return cancelled
+    if status == "REJECTED":
+        return manager.transition(order.order_id, OrderStatus.REJECTED)
+    if status == "EXPIRED":
+        return manager.transition(order.order_id, OrderStatus.EXPIRED)
+    if status == "FILLED":
+        return (
+            order
+            if order.status is OrderStatus.FILLED
+            else manager.recovery_required(order.order_id)
+        )
+    raise ValueError(f"unsupported exchange order status: {status}")
+
+
 class DatabaseExecutionWorker:
     """Persist target deltas before handing paper orders to the venue worker."""
 
@@ -79,131 +135,7 @@ class DatabaseExecutionWorker:
         if claimed is None:
             return {"reason_code": "execution_queue_empty"}
         try:
-            payload = claimed.payload
-            self.order_manager.reload()
-            self.positions.reload()
-            product_id = str(payload["product_id"])
-            configuration = self.product_execution[product_id]
-            mode = str(payload["execution_mode"])
-            if mode != configuration["execution_mode"]:
-                raise ValueError("execution job mode differs from product configuration")
-            assessment = self.risk_store.assessment(str(payload["risk_assessment_id"]))
-            if assessment.aggregate.input_snapshot.get("product_id") != product_id:
-                raise ValueError("execution risk assessment belongs to another product")
-            canonical_inputs = self._canonical_inputs(payload)
-            targets = tuple(TargetPosition(**dict(item)) for item in canonical_inputs["targets"])
-            if not assessment.accepted:
-                for target in targets:
-                    self.trace_store.append(
-                        _risk_rejected_trace(
-                            event_id=str(payload["event_id"]),
-                            target=target,
-                            reason_code=assessment.aggregate.reason_code or "risk_rejected",
-                        )
-                    )
-                self.queue.complete(claimed, completed_at=now)
-                return {
-                    "reason_code": assessment.aggregate.reason_code or "risk_rejected",
-                    "job_id": claimed.job_id,
-                    "orders": 0,
-                    "first_blocked_stage": DecisionTraceStage.RISK_ACCEPTED.value,
-                }
-            for instrument_id, quantity in canonical_inputs["reconciled_positions"].items():
-                self.positions.reconcile_position(
-                    portfolio_id=next(
-                        target.portfolio_id
-                        for target in targets
-                        if target.instrument_id == instrument_id
-                    ),
-                    instrument_id=str(instrument_id),
-                    quantity=float(quantity),
-                    average_entry_price=float(canonical_inputs["prices"][instrument_id]),
-                    updated_at=str(payload["evaluated_at"]),
-                )
-            current = self.positions.current_quantities(targets[0].portfolio_id)
-            orders = self._plan_orders(
-                targets=targets,
-                current=current,
-                decided_at=str(payload["evaluated_at"]),
-                prices={
-                    str(key): float(value) for key, value in canonical_inputs["prices"].items()
-                },
-            )
-            if mode not in {"paper", "live"}:
-                raise ValueError(f"unsupported execution mode: {mode}")
-            if product_id == "btc_accumulation" and "balances" in canonical_inputs:
-                _validate_btc_spot_orders(
-                    orders,
-                    current=current,
-                    balances=canonical_inputs["balances"],
-                    prices=canonical_inputs["prices"],
-                    execution_costs=configuration["execution_costs"],
-                )
-            venue_jobs: list[str] = []
-            for order in orders:
-                if self._blocks_new_risk(product_id, order):
-                    self.trace_store.append(
-                        _risk_rejected_trace(
-                            event_id=str(payload["event_id"]),
-                            target=TargetPosition(
-                                portfolio_id=order.portfolio_id,
-                                instrument_id=order.instrument_id,
-                                target_quantity=order.quantity,
-                                target_notional=order.quantity
-                                * float(canonical_inputs["prices"][order.instrument_id]),
-                                target_fraction=0.0,
-                                strategy_contributions=order.strategy_contributions,
-                                risk_budget=float(order.metadata.get("risk_budget") or 0.0),
-                                valid_until=order.valid_until,
-                            ),
-                            reason_code="control_plane_blocks_new_risk",
-                        )
-                    )
-                    continue
-                existing = {item.order_id: item for item in self.order_manager.all()}.get(
-                    order.order_id
-                )
-                if existing is None:
-                    self.order_manager.create(order)
-                    self.order_manager.persist_for_submission(order.order_id)
-                elif not _same_order_identity(existing, order):
-                    raise ValueError(f"order identity collision: {order.order_id}")
-                order_payload = {
-                    "order_id": order.order_id,
-                    "product_id": product_id,
-                    "event_id": str(payload["event_id"]),
-                    "price": float(canonical_inputs["prices"][order.instrument_id]),
-                    "execution_costs": configuration["execution_costs"],
-                    "accounting_asset": configuration["base_accounting_asset"],
-                    "fee_in_base": product_id == "btc_accumulation",
-                    "order_group_id": order.group_id,
-                    "strategy_version_ids": sorted(order.strategy_contributions),
-                    "strategy_version_id": (
-                        next(iter(order.strategy_contributions))
-                        if len(order.strategy_contributions) == 1
-                        else None
-                    ),
-                    "assignment_id": order.metadata.get("target_metadata", {}).get("assignment_id")
-                    if isinstance(order.metadata.get("target_metadata"), Mapping)
-                    else None,
-                    **(
-                        {"fill_fraction": float(configuration["fill_fraction"])}
-                        if "fill_fraction" in configuration
-                        else {}
-                    ),
-                }
-                identity = canonical_hash(order_payload)
-                job_prefix = "paper-order" if mode == "paper" else "live-order"
-                job_name = "paper_order_submit" if mode == "paper" else "live_order_submit"
-                job_id = f"{job_prefix}:{identity.removeprefix('sha256:')}"
-                self.queue.enqueue_if_absent(
-                    job_id=job_id,
-                    name=job_name,
-                    payload=order_payload,
-                    available_at=str(payload["evaluated_at"]),
-                    priority=self._order_priority(order),
-                )
-                venue_jobs.append(job_id)
+            result = self._process_execution_job(claimed.payload, now)
         except Exception as exc:
             self.queue.fail(
                 claimed,
@@ -218,13 +150,194 @@ class DatabaseExecutionWorker:
                 "error": str(exc),
             }
         self.queue.complete(claimed, completed_at=now)
+        return {**result, "job_id": claimed.job_id}
+
+    def _process_execution_job(self, payload: Mapping[str, Any], now: str) -> dict[str, Any]:
+        self.order_manager.reload()
+        self.positions.reload()
+        product_id, mode, configuration, assessment, inputs, targets = self._execution_inputs(
+            payload
+        )
+        if not assessment.accepted:
+            self._record_risk_rejections(
+                targets,
+                event_id=str(payload["event_id"]),
+                reason_code=assessment.aggregate.reason_code or "risk_rejected",
+            )
+            return {
+                "reason_code": assessment.aggregate.reason_code or "risk_rejected",
+                "orders": 0,
+                "first_blocked_stage": DecisionTraceStage.RISK_ACCEPTED.value,
+            }
+        self._reconcile_positions(inputs, targets, evaluated_at=str(payload["evaluated_at"]))
+        current = self.positions.current_quantities(targets[0].portfolio_id)
+        prices = {str(key): float(value) for key, value in inputs["prices"].items()}
+        orders = self._plan_orders(
+            targets=targets,
+            current=current,
+            decided_at=str(payload["evaluated_at"]),
+            prices=prices,
+        )
+        if product_id == "btc_accumulation" and "balances" in inputs:
+            _validate_btc_spot_orders(
+                orders,
+                current=current,
+                balances=inputs["balances"],
+                prices=prices,
+                execution_costs=configuration["execution_costs"],
+            )
+        venue_jobs = [
+            job_id
+            for order in orders
+            if (
+                job_id := self._enqueue_order(
+                    order, payload, product_id, mode, configuration, prices
+                )
+            )
+        ]
         return {
             "reason_code": f"{mode}_orders_enqueued" if venue_jobs else "target_already_satisfied",
-            "job_id": claimed.job_id,
             "orders": len(venue_jobs),
             "venue_job_ids": venue_jobs,
             **({"paper_job_ids": venue_jobs} if mode == "paper" else {}),
         }
+
+    def _execution_inputs(
+        self, payload: Mapping[str, Any]
+    ) -> tuple[str, str, Mapping[str, Any], Any, Mapping[str, Any], tuple[TargetPosition, ...]]:
+        product_id = str(payload["product_id"])
+        configuration = self.product_execution[product_id]
+        mode = str(payload["execution_mode"])
+        if mode != configuration["execution_mode"]:
+            raise ValueError("execution job mode differs from product configuration")
+        if mode not in {"paper", "live"}:
+            raise ValueError(f"unsupported execution mode: {mode}")
+        assessment = self.risk_store.assessment(str(payload["risk_assessment_id"]))
+        if assessment.aggregate.input_snapshot.get("product_id") != product_id:
+            raise ValueError("execution risk assessment belongs to another product")
+        inputs = self._canonical_inputs(payload)
+        targets = tuple(TargetPosition(**dict(item)) for item in inputs["targets"])
+        if not targets:
+            raise ValueError("execution job has no targets")
+        return product_id, mode, configuration, assessment, inputs, targets
+
+    def _record_risk_rejections(
+        self, targets: tuple[TargetPosition, ...], *, event_id: str, reason_code: str
+    ) -> None:
+        for target in targets:
+            self.trace_store.append(
+                _risk_rejected_trace(event_id=event_id, target=target, reason_code=reason_code)
+            )
+
+    def _reconcile_positions(
+        self,
+        inputs: Mapping[str, Any],
+        targets: tuple[TargetPosition, ...],
+        *,
+        evaluated_at: str,
+    ) -> None:
+        for instrument_id, quantity in inputs["reconciled_positions"].items():
+            target = next((item for item in targets if item.instrument_id == instrument_id), None)
+            if target is None:
+                raise ValueError(f"reconciled position is outside target scope: {instrument_id}")
+            self.positions.reconcile_position(
+                portfolio_id=target.portfolio_id,
+                instrument_id=str(instrument_id),
+                quantity=float(quantity),
+                average_entry_price=float(inputs["prices"][instrument_id]),
+                updated_at=evaluated_at,
+            )
+
+    def _enqueue_order(
+        self,
+        order: OrderIntent,
+        payload: Mapping[str, Any],
+        product_id: str,
+        mode: str,
+        configuration: Mapping[str, Any],
+        prices: Mapping[str, float],
+    ) -> str | None:
+        if self._blocks_new_risk(product_id, order):
+            self._record_control_rejection(order, payload, prices)
+            return None
+        existing = {item.order_id: item for item in self.order_manager.all()}.get(order.order_id)
+        if existing is None:
+            self.order_manager.create(order)
+            self.order_manager.persist_for_submission(order.order_id)
+        elif not _same_order_identity(existing, order):
+            raise ValueError(f"order identity collision: {order.order_id}")
+        order_payload = self._order_payload(order, payload, product_id, configuration, prices)
+        identity = canonical_hash(order_payload)
+        job_prefix = "paper-order" if mode == "paper" else "live-order"
+        job_name = "paper_order_submit" if mode == "paper" else "live_order_submit"
+        job_id = f"{job_prefix}:{identity.removeprefix('sha256:')}"
+        self.queue.enqueue_if_absent(
+            job_id=job_id,
+            name=job_name,
+            payload=order_payload,
+            available_at=str(payload["evaluated_at"]),
+            priority=self._order_priority(order),
+        )
+        return job_id
+
+    def _record_control_rejection(
+        self,
+        order: OrderIntent,
+        payload: Mapping[str, Any],
+        prices: Mapping[str, float],
+    ) -> None:
+        target_metadata = order.metadata.get("target_metadata")
+        target = TargetPosition(
+            portfolio_id=order.portfolio_id,
+            instrument_id=order.instrument_id,
+            target_quantity=order.quantity,
+            target_notional=order.quantity * float(prices[order.instrument_id]),
+            target_fraction=0.0,
+            strategy_contributions=order.strategy_contributions,
+            risk_budget=float(order.metadata.get("risk_budget") or 0.0),
+            valid_until=order.valid_until,
+            metadata=dict(target_metadata) if isinstance(target_metadata, Mapping) else {},
+        )
+        self.trace_store.append(
+            _risk_rejected_trace(
+                event_id=str(payload["event_id"]),
+                target=target,
+                reason_code="control_plane_blocks_new_risk",
+            )
+        )
+
+    @staticmethod
+    def _order_payload(
+        order: OrderIntent,
+        payload: Mapping[str, Any],
+        product_id: str,
+        configuration: Mapping[str, Any],
+        prices: Mapping[str, float],
+    ) -> dict[str, Any]:
+        target_metadata = order.metadata.get("target_metadata")
+        assignment_id = (
+            target_metadata.get("assignment_id") if isinstance(target_metadata, Mapping) else None
+        )
+        result = {
+            "order_id": order.order_id,
+            "product_id": product_id,
+            "event_id": str(payload["event_id"]),
+            "price": float(prices[order.instrument_id]),
+            "execution_costs": configuration["execution_costs"],
+            "accounting_asset": configuration["base_accounting_asset"],
+            "fee_in_base": product_id == "btc_accumulation",
+            "order_group_id": order.group_id,
+            "strategy_version_ids": sorted(order.strategy_contributions),
+            "strategy_version_id": (
+                next(iter(order.strategy_contributions))
+                if len(order.strategy_contributions) == 1
+                else None
+            ),
+            "assignment_id": assignment_id,
+        }
+        if "fill_fraction" in configuration:
+            result["fill_fraction"] = float(configuration["fill_fraction"])
+        return result
 
     def _blocks_new_risk(self, product_id: str, order: OrderIntent) -> bool:
         if self.control_plane is None or order.reduce_only:
@@ -271,14 +384,7 @@ class DatabaseExecutionWorker:
         decided_at: str,
         prices: Mapping[str, float],
     ) -> tuple[OrderIntent, ...]:
-        grouped: dict[str, list[TargetPosition]] = {}
-        standalone: list[TargetPosition] = []
-        for target in targets:
-            group_key = str(target.metadata.get("order_group_key") or "").strip()
-            if group_key:
-                grouped.setdefault(group_key, []).append(target)
-            else:
-                standalone.append(target)
+        grouped, standalone = _split_order_groups(targets)
         orders = list(
             plan_orders(
                 standalone,
@@ -292,30 +398,47 @@ class DatabaseExecutionWorker:
         if self.order_groups is not None:
             self.order_groups.reload()
         for group_key, group_targets in sorted(grouped.items()):
-            if len(group_targets) < 2:
-                raise ValueError(f"order group {group_key} has fewer than two target legs")
-            recovery_policies = {
-                str(target.metadata.get("recovery_policy") or "unwind") for target in group_targets
-            }
-            if len(recovery_policies) != 1:
-                raise ValueError(f"order group {group_key} has conflicting recovery policies")
-            plan = plan_order_group(
-                group_targets,
-                current_quantities=current,
-                decided_at=decided_at,
-                recovery_policy=recovery_policies.pop(),
-                prices=prices,
+            orders.extend(
+                self._plan_group(
+                    group_key,
+                    group_targets,
+                    current=current,
+                    decided_at=decided_at,
+                    prices=prices,
+                )
             )
-            assert self.order_groups is not None
-            try:
-                existing = self.order_groups.get(plan.group.group_id)
-            except KeyError:
-                self.order_groups.create(plan.group)
-            else:
-                if existing != plan.group:
-                    raise ValueError(f"order-group identity collision: {plan.group.group_id}")
-            orders.extend(plan.orders)
         return tuple(orders)
+
+    def _plan_group(
+        self,
+        group_key: str,
+        targets: list[TargetPosition],
+        *,
+        current: Mapping[str, float],
+        decided_at: str,
+        prices: Mapping[str, float],
+    ) -> tuple[OrderIntent, ...]:
+        if len(targets) < 2:
+            raise ValueError(f"order group {group_key} has fewer than two target legs")
+        policies = {str(target.metadata.get("recovery_policy") or "unwind") for target in targets}
+        if len(policies) != 1:
+            raise ValueError(f"order group {group_key} has conflicting recovery policies")
+        plan = plan_order_group(
+            targets,
+            current_quantities=current,
+            decided_at=decided_at,
+            recovery_policy=policies.pop(),
+            prices=prices,
+        )
+        assert self.order_groups is not None
+        try:
+            existing = self.order_groups.get(plan.group.group_id)
+        except KeyError:
+            self.order_groups.create(plan.group)
+        else:
+            if existing != plan.group:
+                raise ValueError(f"order-group identity collision: {plan.group.group_id}")
+        return plan.orders
 
     def _order_priority(self, order: OrderIntent) -> int:
         if order.group_id is None or self.order_groups is None:
@@ -370,59 +493,7 @@ class DatabaseLiveExecutionWorker:
             return {"reason_code": "live_order_queue_empty"}
         payload = claimed.payload
         try:
-            self.order_manager.reload()
-            self.positions.reload()
-            order = self.order_manager.get(str(payload["order_id"]))
-            if order.status is OrderStatus.FILLED:
-                self.queue.complete(claimed, completed_at=now)
-                return {
-                    "reason_code": "live_order_already_filled",
-                    "job_id": claimed.job_id,
-                    "order_id": order.order_id,
-                }
-            if order.status is not OrderStatus.PERSISTED:
-                raise ValueError(
-                    f"live order is not in the durable pre-submission state: {order.status.value}"
-                )
-            if now >= order.valid_until:
-                self.order_manager.transition(
-                    order.order_id,
-                    OrderStatus.EXPIRED,
-                    event_at=now,
-                )
-                self.queue.complete(claimed, completed_at=now)
-                return {
-                    "reason_code": "live_order_expired",
-                    "job_id": claimed.job_id,
-                    "order_id": order.order_id,
-                    "valid_until": order.valid_until,
-                }
-            if order.depends_on_order_id is not None:
-                dependency = self.order_manager.get(order.depends_on_order_id)
-                if dependency.status is not OrderStatus.FILLED:
-                    raise ValueError("dependent opening order is blocked until close fill")
-                reconciled = self.positions.get(order.portfolio_id, order.instrument_id)
-                if abs(reconciled.quantity) > 1e-12:
-                    raise ValueError("dependent opening order is blocked until position is flat")
-            product_id = str(payload["product_id"])
-            if (
-                self.control_plane is not None
-                and not order.reduce_only
-                and self.control_plane.blocks_new_risk(
-                    product_id=product_id,
-                    strategy_id=str(payload.get("strategy_version_id") or "") or None,
-                )
-            ):
-                raise PermissionError("control plane blocks new live risk")
-            self.authorise({**payload, "authorisation_at": now}, order)
-            venue = self.venues[product_id]
-            if venue.order_manager is not self.order_manager:
-                raise ValueError("live venue must share the durable order manager")
-            if not order.reduce_only and self.prepare_protective_stop is not None:
-                self.prepare_protective_stop(product_id, order, now)
-            _before_group_submission(self.order_groups, order)
-            acknowledgement = venue.submit(order)
-            updated = self.order_manager.get(order.order_id)
+            result = self._submit_order(payload, now)
         except Exception as exc:
             uncertain = False
             try:
@@ -478,14 +549,76 @@ class DatabaseLiveExecutionWorker:
                 "error": str(exc),
             }
         self.queue.complete(claimed, completed_at=now)
+        return {**result, "job_id": claimed.job_id}
+
+    def _submit_order(self, payload: Mapping[str, Any], now: str) -> dict[str, Any]:
+        self.order_manager.reload()
+        self.positions.reload()
+        order = self.order_manager.get(str(payload["order_id"]))
+        early = self._early_order_result(order, now)
+        if early is not None:
+            return early
+        self._assert_order_dependencies(order)
+        product_id = str(payload["product_id"])
+        self._assert_control_allows(product_id, order, payload)
+        self.authorise({**payload, "authorisation_at": now}, order)
+        acknowledgement = self._submit_to_venue(product_id, order, now)
+        updated = self.order_manager.get(order.order_id)
         return {
             "reason_code": "live_order_acknowledged",
-            "job_id": claimed.job_id,
             "order_id": order.order_id,
             "exchange_order_id": acknowledgement.exchange_order_id,
             "client_order_id": acknowledgement.client_order_id,
             "remaining_quantity": updated.remaining_quantity,
         }
+
+    def _early_order_result(self, order: OrderIntent, now: str) -> dict[str, Any] | None:
+        if order.status is OrderStatus.FILLED:
+            return {"reason_code": "live_order_already_filled", "order_id": order.order_id}
+        if order.status is not OrderStatus.PERSISTED:
+            raise ValueError(
+                f"live order is not in the durable pre-submission state: {order.status.value}"
+            )
+        if now < order.valid_until:
+            return None
+        self.order_manager.transition(order.order_id, OrderStatus.EXPIRED, event_at=now)
+        return {
+            "reason_code": "live_order_expired",
+            "order_id": order.order_id,
+            "valid_until": order.valid_until,
+        }
+
+    def _assert_order_dependencies(self, order: OrderIntent) -> None:
+        if order.depends_on_order_id is None:
+            return
+        dependency = self.order_manager.get(order.depends_on_order_id)
+        if dependency.status is not OrderStatus.FILLED:
+            raise ValueError("dependent opening order is blocked until close fill")
+        reconciled = self.positions.get(order.portfolio_id, order.instrument_id)
+        if abs(reconciled.quantity) > 1e-12:
+            raise ValueError("dependent opening order is blocked until position is flat")
+
+    def _assert_control_allows(
+        self, product_id: str, order: OrderIntent, payload: Mapping[str, Any]
+    ) -> None:
+        if (
+            self.control_plane is not None
+            and not order.reduce_only
+            and self.control_plane.blocks_new_risk(
+                product_id=product_id,
+                strategy_id=str(payload.get("strategy_version_id") or "") or None,
+            )
+        ):
+            raise PermissionError("control plane blocks new live risk")
+
+    def _submit_to_venue(self, product_id: str, order: OrderIntent, now: str) -> Any:
+        venue = self.venues[product_id]
+        if venue.order_manager is not self.order_manager:
+            raise ValueError("live venue must share the durable order manager")
+        if not order.reduce_only and self.prepare_protective_stop is not None:
+            self.prepare_protective_stop(product_id, order, now)
+        _before_group_submission(self.order_groups, order)
+        return venue.submit(order)
 
 
 class DatabasePaperExecutionWorker:
@@ -850,8 +983,7 @@ class DatabaseUserStreamWorker:
         fee = float(values.get("n", 0.0) or 0.0)
         fee_asset = str(values.get("N") or "").upper() or None
         trade_id = str(values.get("t") or values.get("T") or event.sequence)
-        if quantity <= 0 or price <= 0 or fee < 0:
-            raise ValueError("fill update has invalid quantity, price, or fee")
+        _validate_fill_values(quantity, price, fee)
         fill_id = canonical_hash(
             {
                 "venue": "binance",
@@ -861,46 +993,20 @@ class DatabaseUserStreamWorker:
             }
         )
         if any(fill.fill_id == fill_id for fill in order_manager.fills_for(order.order_id)):
-            position = positions.get(order.portfolio_id, order.instrument_id)
-            if self.on_live_fill is not None and product_id is not None:
-                self.on_live_fill(product_id, order, position.quantity, event.receive_timestamp)
-            return {
-                "reason_code": "exchange_fill_already_recorded",
-                "fill_id": fill_id,
-                "position_quantity": position.quantity,
-            }
+            return self._duplicate_fill_result(order, fill_id, product_id, event.receive_timestamp)
         product_id = self.account_products.get(account_id)
         ledger = self.ledgers.get(product_id) if product_id is not None else None
         if fee and ledger is not None and fee_asset != ledger.accounting_asset:
-            if order.status is not OrderStatus.RECOVERY_REQUIRED:
-                order = order_manager.recovery_required(order.order_id)
-            recovery_payload = {
-                "account_id": account_id,
-                "order_id": order.order_id,
-                "product_id": product_id,
-                "event_id": event.event_id,
-                "fill_id": fill_id,
-                "fee": fee,
-                "fee_asset": fee_asset,
-                "accounting_asset": ledger.accounting_asset,
-                "reason_code": "fee_conversion_required",
-            }
-            recovery_job_id = "live-recovery:" + canonical_hash(recovery_payload).removeprefix(
-                "sha256:"
+            return self._fee_conversion_recovery(
+                order=order,
+                account_id=account_id,
+                product_id=product_id,
+                event=event,
+                fill_id=fill_id,
+                fee=fee,
+                fee_asset=fee_asset,
+                accounting_asset=ledger.accounting_asset,
             )
-            self.queue.enqueue_if_absent(
-                job_id=recovery_job_id,
-                name="live_order_recovery",
-                payload=recovery_payload,
-                available_at=event.receive_timestamp,
-                priority=100,
-            )
-            return {
-                "reason_code": "fee_conversion_required",
-                "order_id": order.order_id,
-                "fill_id": fill_id,
-                "recovery_job_id": recovery_job_id,
-            }
         if order.status is OrderStatus.PERSISTED:
             order_manager.submitted(order.order_id)
             order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
@@ -958,6 +1064,64 @@ class DatabaseUserStreamWorker:
             "remaining_quantity": updated.remaining_quantity,
         }
 
+    def _duplicate_fill_result(
+        self,
+        order: OrderIntent,
+        fill_id: str,
+        product_id: str | None,
+        received_at: str,
+    ) -> dict[str, Any]:
+        position = self.positions.get(order.portfolio_id, order.instrument_id)
+        if self.on_live_fill is not None and product_id is not None:
+            self.on_live_fill(product_id, order, position.quantity, received_at)
+        return {
+            "reason_code": "exchange_fill_already_recorded",
+            "fill_id": fill_id,
+            "position_quantity": position.quantity,
+        }
+
+    def _fee_conversion_recovery(
+        self,
+        *,
+        order: OrderIntent,
+        account_id: str,
+        product_id: str | None,
+        event: MarketEvent,
+        fill_id: str,
+        fee: float,
+        fee_asset: str | None,
+        accounting_asset: str,
+    ) -> dict[str, Any]:
+        if order.status is not OrderStatus.RECOVERY_REQUIRED:
+            order = self.order_manager.recovery_required(order.order_id)
+        recovery_payload = {
+            "account_id": account_id,
+            "order_id": order.order_id,
+            "product_id": product_id,
+            "event_id": event.event_id,
+            "fill_id": fill_id,
+            "fee": fee,
+            "fee_asset": fee_asset,
+            "accounting_asset": accounting_asset,
+            "reason_code": "fee_conversion_required",
+        }
+        recovery_job_id = "live-recovery:" + canonical_hash(recovery_payload).removeprefix(
+            "sha256:"
+        )
+        self.queue.enqueue_if_absent(
+            job_id=recovery_job_id,
+            name="live_order_recovery",
+            payload=recovery_payload,
+            available_at=event.receive_timestamp,
+            priority=100,
+        )
+        return {
+            "reason_code": "fee_conversion_required",
+            "order_id": order.order_id,
+            "fill_id": fill_id,
+            "recovery_job_id": recovery_job_id,
+        }
+
     def _apply_status_event(
         self, *, order: OrderIntent, values: Mapping[str, Any], event: MarketEvent
     ) -> dict[str, Any]:
@@ -965,26 +1129,13 @@ class DatabaseUserStreamWorker:
             raise RuntimeError("user-stream worker requires a durable order store")
         order_manager = self.order_manager
         status = str(values.get("X") or values.get("x") or "").upper()
-        if order.status is OrderStatus.PERSISTED:
-            order_manager.submitted(order.order_id)
-            order = order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
-        elif order.status is OrderStatus.SUBMITTED:
-            order = order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
-        if status == "NEW":
-            pass
-        elif status in {"CANCELED", "CANCELLED"}:
-            if order.status in {OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED}:
-                order_manager.request_cancel(order.order_id)
-            order = order_manager.cancelled(order.order_id)
-            _mark_group_recovery(self.order_groups, order)
-        elif status == "REJECTED":
-            order = order_manager.transition(order.order_id, OrderStatus.REJECTED)
-        elif status == "EXPIRED":
-            order = order_manager.transition(order.order_id, OrderStatus.EXPIRED)
-        elif status == "FILLED" and order.status is not OrderStatus.FILLED:
-            order = order_manager.recovery_required(order.order_id)
-        elif status not in {"PARTIALLY_FILLED", "FILLED"}:
-            raise ValueError(f"unsupported exchange order status: {status}")
+        order = _acknowledge_order(order_manager, order, event.exchange_timestamp)
+        order = _apply_exchange_status(
+            order_manager,
+            order,
+            status,
+            order_groups=self.order_groups,
+        )
         return {
             "reason_code": f"exchange_order_{order.status.value}",
             "order_id": order.order_id,
@@ -1184,6 +1335,24 @@ def _validate_btc_spot_orders(
 ) -> None:
     """Keep BTC spot orders inside owned inventory and same-cycle quote proceeds."""
 
+    _validate_btc_spot_identity(orders, balances)
+    if not orders:
+        return
+    instrument_id = orders[0].instrument_id
+    owned_btc = float(current.get(instrument_id, 0.0))
+    _validate_owned_btc(owned_btc)
+    sell_quantity = sum(order.quantity for order in orders if order.side is OrderSide.SELL)
+    price = float(prices[instrument_id])
+    if sell_quantity > owned_btc + max(1e-12, owned_btc * 1e-9):
+        raise ValueError("BTC spot sell exceeds the reconciled owned BTC position")
+    slippage_bps = _btc_spot_costs(execution_costs)
+    quote_balance = _btc_quote_balance(balances)
+    _assert_btc_quote_capacity(orders, price, slippage_bps, quote_balance, sell_quantity)
+
+
+def _validate_btc_spot_identity(
+    orders: tuple[OrderIntent, ...], balances: Mapping[str, Any]
+) -> None:
     if not isinstance(balances, Mapping):
         raise ValueError("BTC spot execution requires canonical account balances")
     if any(
@@ -1191,18 +1360,14 @@ def _validate_btc_spot_orders(
         for order in orders
     ):
         raise ValueError("BTC accumulation orders must use BTCUSDT spot")
-    if not orders:
-        return
-    instrument_id = orders[0].instrument_id
-    owned_btc = float(current.get(instrument_id, 0.0))
-    if not math.isfinite(owned_btc) or owned_btc < -1e-12:
+
+
+def _validate_owned_btc(value: float) -> None:
+    if not math.isfinite(value) or value < -1e-12:
         raise ValueError("BTC spot position is invalid")
-    sell_quantity = sum(order.quantity for order in orders if order.side is OrderSide.SELL)
-    if sell_quantity > owned_btc + max(1e-12, owned_btc * 1e-9):
-        raise ValueError("BTC spot sell exceeds the reconciled owned BTC position")
-    price = float(prices[instrument_id])
-    if not math.isfinite(price) or price <= 0:
-        raise ValueError("BTC spot execution price is invalid")
+
+
+def _btc_spot_costs(execution_costs: Mapping[str, Any]) -> float:
     try:
         fee_bps = float(execution_costs["fee_bps"])
         slippage_bps = float(execution_costs["slippage_bps"])
@@ -1210,6 +1375,10 @@ def _validate_btc_spot_orders(
         raise ValueError("BTC spot execution costs are invalid") from exc
     if not all(math.isfinite(value) and value >= 0.0 for value in (fee_bps, slippage_bps)):
         raise ValueError("BTC spot execution costs are invalid")
+    return slippage_bps
+
+
+def _btc_quote_balance(balances: Mapping[str, Any]) -> float:
     quote_asset = next(
         (str(key).upper() for key in balances if str(key).upper() in {"USDT", "USDC", "BUSD"}),
         "USDT",
@@ -1217,16 +1386,24 @@ def _validate_btc_spot_orders(
     quote_balance = float(balances.get(quote_asset, 0.0))
     if not math.isfinite(quote_balance) or quote_balance < -1e-12:
         raise ValueError("BTC spot quote balance is invalid")
+    return quote_balance
+
+
+def _assert_btc_quote_capacity(
+    orders: tuple[OrderIntent, ...],
+    price: float,
+    slippage_bps: float,
+    quote_balance: float,
+    sell_quantity: float,
+) -> None:
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError("BTC spot execution price is invalid")
     buy_cost = sum(
         order.quantity * price * (1.0 + slippage_bps / 10_000.0)
         for order in orders
         if order.side is OrderSide.BUY
     )
-    sell_proceeds = sum(
-        order.quantity * price * max(0.0, 1.0 - slippage_bps / 10_000.0)
-        for order in orders
-        if order.side is OrderSide.SELL
-    )
+    sell_proceeds = sell_quantity * price * max(0.0, 1.0 - slippage_bps / 10_000.0)
     if buy_cost > quote_balance + sell_proceeds + max(1e-12, quote_balance * 1e-9):
         raise ValueError("BTC spot buys exceed quote balance and same-cycle sell proceeds")
 
