@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 
 from src.domain._codec import finite
 from src.domain.forecasts import AlphaForecast, ForecastDirection
@@ -64,6 +65,297 @@ def _correlation(correlations: Mapping[str, Mapping[str, float]], first: str, se
     return abs(float(value))
 
 
+@dataclass
+class _AllocationState:
+    selected: list[tuple[AlphaForecast, float]] = dataclass_field(default_factory=list)
+    gross: float = 0.0
+    net: float = 0.0
+    beta: float = 0.0
+    turnover: float = 0.0
+    sleeve_usage: dict[str, float] = dataclass_field(default_factory=dict)
+    cluster_usage: dict[str, float] = dataclass_field(default_factory=dict)
+
+
+def _eligible_forecasts(
+    forecasts: Iterable[AlphaForecast],
+    *,
+    prices: Mapping[str, float],
+    funding_rates: Mapping[str, float],
+    constraints: PortfolioConstraints,
+    product_drawdown_fraction: float,
+) -> list[AlphaForecast]:
+    candidates = [
+        forecast
+        for forecast in forecasts
+        if forecast.direction is not ForecastDirection.FLAT
+        and forecast.confidence >= constraints.min_confidence
+        and forecast.score >= constraints.min_score
+        and forecast.maximum_position > 0
+        and float(prices.get(forecast.instrument_id, 0.0)) > 0
+        and abs(float(funding_rates.get(forecast.instrument_id, 0.0)))
+        <= constraints.max_abs_funding_rate
+        and product_drawdown_fraction <= constraints.max_drawdown_fraction
+    ]
+    candidates.sort(
+        key=lambda item: (item.utility, item.confidence, item.strategy_version_id), reverse=True
+    )
+    return candidates
+
+
+def _sized_forecast(
+    forecast: AlphaForecast,
+    *,
+    prices: Mapping[str, float],
+    funding_rates: Mapping[str, float],
+    observed_volatility: Mapping[str, float],
+    liquidity_fraction_caps: Mapping[str, float],
+    current_quantities: Mapping[str, float],
+    sleeve_budgets: Mapping[str, float],
+    cluster_by_instrument: Mapping[str, str],
+    cluster_fraction_caps: Mapping[str, float],
+    sleeve_usage: Mapping[str, float],
+    cluster_usage: Mapping[str, float],
+    constraints: PortfolioConstraints,
+    gross_limit: float,
+    gross: float,
+) -> tuple[float, float, str, str] | None:
+    funding_rate = float(funding_rates.get(forecast.instrument_id, 0.0))
+    direction_sign = 1.0 if forecast.direction is ForecastDirection.LONG else -1.0
+    gross_expected_return = direction_sign * forecast.expected_return
+    net_expected_return = gross_expected_return - direction_sign * funding_rate
+    if net_expected_return <= 0:
+        return None
+    signal_scale = forecast.score * forecast.confidence
+    volatility = float(observed_volatility.get(forecast.instrument_id, 0.0))
+    volatility_scale = (
+        min(1.0, forecast.target_volatility / volatility)
+        if volatility > 0 and forecast.target_volatility > 0
+        else 1.0
+    )
+    funding_scale = min(
+        1.0,
+        net_expected_return / gross_expected_return if gross_expected_return > 0 else 0.0,
+    )
+    fraction = (
+        min(constraints.max_symbol_fraction, forecast.maximum_position)
+        * signal_scale
+        * volatility_scale
+        * funding_scale
+    )
+    fraction = min(
+        fraction,
+        max(0.0, float(liquidity_fraction_caps.get(forecast.instrument_id, 1.0))),
+        max(0.0, gross_limit - gross),
+    )
+    current_fraction = (
+        float(current_quantities.get(forecast.instrument_id, 0.0))
+        * float(prices[forecast.instrument_id])
+        / constraints.equity
+    )
+    sleeve = str(forecast.metadata.get("sleeve") or "directional")
+    sleeve_limit = max(0.0, float(sleeve_budgets.get(sleeve, 1.0)))
+    fraction = min(fraction, max(0.0, sleeve_limit - sleeve_usage.get(sleeve, 0.0)))
+    cluster = str(
+        cluster_by_instrument.get(
+            forecast.instrument_id,
+            forecast.metadata.get("cluster") or "unclassified",
+        )
+    )
+    cluster_limit = min(
+        constraints.max_cluster_fraction,
+        max(0.0, float(cluster_fraction_caps.get(cluster, 1.0))),
+    )
+    fraction = min(fraction, max(0.0, cluster_limit - cluster_usage.get(cluster, 0.0)))
+    return fraction, current_fraction, sleeve, cluster
+
+
+def _try_allocate_forecast(
+    state: _AllocationState,
+    forecast: AlphaForecast,
+    *,
+    prices: Mapping[str, float],
+    constraints: PortfolioConstraints,
+    correlations: Mapping[str, Mapping[str, float]],
+    beta_by_instrument: Mapping[str, float],
+    observed_volatility: Mapping[str, float],
+    liquidity_fraction_caps: Mapping[str, float],
+    funding_rates: Mapping[str, float],
+    current_quantities: Mapping[str, float],
+    sleeve_budgets: Mapping[str, float],
+    cluster_by_instrument: Mapping[str, str],
+    cluster_fraction_caps: Mapping[str, float],
+    gross_limit: float,
+) -> bool:
+    if any(
+        _correlation(correlations, forecast.instrument_id, previous.instrument_id)
+        > constraints.max_correlation
+        for previous, _ in state.selected
+    ):
+        return False
+    sizing = _sized_forecast(
+        forecast,
+        prices=prices,
+        funding_rates=funding_rates,
+        observed_volatility=observed_volatility,
+        liquidity_fraction_caps=liquidity_fraction_caps,
+        current_quantities=current_quantities,
+        sleeve_budgets=sleeve_budgets,
+        cluster_by_instrument=cluster_by_instrument,
+        cluster_fraction_caps=cluster_fraction_caps,
+        sleeve_usage=state.sleeve_usage,
+        cluster_usage=state.cluster_usage,
+        constraints=constraints,
+        gross_limit=gross_limit,
+        gross=state.gross,
+    )
+    if sizing is None:
+        return False
+    fraction, current_fraction, sleeve, cluster = sizing
+    if fraction <= 1e-12:
+        return False
+    signed = fraction if forecast.direction is ForecastDirection.LONG else -fraction
+    candidate_turnover = state.turnover + abs(signed - current_fraction)
+    candidate_beta = state.beta + signed * float(
+        beta_by_instrument.get(forecast.instrument_id, 0.0)
+    )
+    if (
+        abs(state.net + signed) > constraints.max_net_fraction + 1e-12
+        or abs(candidate_beta) > constraints.max_abs_beta + 1e-12
+        or candidate_turnover > constraints.max_turnover_fraction + 1e-12
+    ):
+        return False
+    state.selected.append((forecast, signed))
+    state.gross += fraction
+    state.net += signed
+    state.beta = candidate_beta
+    state.turnover = candidate_turnover
+    state.sleeve_usage[sleeve] = state.sleeve_usage.get(sleeve, 0.0) + fraction
+    state.cluster_usage[cluster] = state.cluster_usage.get(cluster, 0.0) + fraction
+    return True
+
+
+def _target_metadata(
+    forecast: AlphaForecast,
+    *,
+    funding_rates: Mapping[str, float],
+    observed_volatility: Mapping[str, float],
+    liquidity_fraction_caps: Mapping[str, float],
+    cluster_by_instrument: Mapping[str, str],
+    state: _AllocationState,
+) -> dict[str, object]:
+    funding_rate = float(funding_rates.get(forecast.instrument_id, 0.0))
+    direction_sign = 1.0 if forecast.direction is ForecastDirection.LONG else -1.0
+    gross_expected_return = direction_sign * forecast.expected_return
+    net_expected_return = gross_expected_return - direction_sign * funding_rate
+    metadata: dict[str, object] = {
+        "expected_return": forecast.expected_return,
+        "directional_expected_return": gross_expected_return,
+        "net_expected_return": net_expected_return,
+        "confidence": forecast.confidence,
+        "score": forecast.score,
+        "observed_volatility": observed_volatility.get(forecast.instrument_id),
+        "funding_rate": funding_rate,
+        "liquidity_fraction_cap": liquidity_fraction_caps.get(forecast.instrument_id, 1.0),
+        "sleeve": forecast.metadata.get("sleeve") or "directional",
+        "cluster": cluster_by_instrument.get(
+            forecast.instrument_id,
+            forecast.metadata.get("cluster") or "unclassified",
+        ),
+        "portfolio_gross_fraction": state.gross,
+        "portfolio_net_fraction": state.net,
+        "portfolio_beta": state.beta,
+        "portfolio_turnover_fraction": state.turnover,
+    }
+    if forecast.metadata.get("order_group_key"):
+        metadata["order_group_key"] = str(forecast.metadata["order_group_key"])
+    if forecast.metadata.get("recovery_policy"):
+        metadata["recovery_policy"] = str(forecast.metadata["recovery_policy"])
+    return metadata
+
+
+def _build_open_targets(
+    state: _AllocationState,
+    *,
+    constraints: PortfolioConstraints,
+    prices: Mapping[str, float],
+    valid_until: str,
+    risk_budget: float,
+    available_margin_fraction: float,
+    product_drawdown_fraction: float,
+    funding_rates: Mapping[str, float],
+    observed_volatility: Mapping[str, float],
+    liquidity_fraction_caps: Mapping[str, float],
+    cluster_by_instrument: Mapping[str, str],
+    protective_stop_fraction: float | None,
+) -> list[TargetPosition]:
+    targets: list[TargetPosition] = []
+    for forecast, fraction in state.selected:
+        price = float(prices[forecast.instrument_id])
+        metadata = _target_metadata(
+            forecast,
+            funding_rates=funding_rates,
+            observed_volatility=observed_volatility,
+            liquidity_fraction_caps=liquidity_fraction_caps,
+            cluster_by_instrument=cluster_by_instrument,
+            state=state,
+        )
+        metadata.update(
+            {
+                "available_margin_fraction": available_margin_fraction,
+                "product_drawdown_fraction": product_drawdown_fraction,
+            }
+        )
+        if protective_stop_fraction is not None:
+            metadata.update(_protective_stop_metadata(price, fraction, protective_stop_fraction))
+        targets.append(
+            TargetPosition(
+                portfolio_id=constraints.portfolio_id,
+                instrument_id=forecast.instrument_id,
+                target_quantity=constraints.equity * fraction / price,
+                target_notional=constraints.equity * fraction,
+                target_fraction=fraction,
+                strategy_contributions={forecast.strategy_version_id: fraction},
+                risk_budget=risk_budget,
+                valid_until=valid_until,
+                metadata=metadata,
+            )
+        )
+    return targets
+
+
+def _build_closing_targets(
+    current_quantities: Mapping[str, float],
+    *,
+    selected_instruments: set[str],
+    prices: Mapping[str, float],
+    constraints: PortfolioConstraints,
+    valid_until: str,
+    risk_budget: float,
+    exit_reason: str,
+) -> list[TargetPosition]:
+    targets: list[TargetPosition] = []
+    for instrument_id, quantity in sorted(current_quantities.items()):
+        if abs(float(quantity)) <= 1e-12 or instrument_id in selected_instruments:
+            continue
+        price = float(prices.get(instrument_id, 0.0))
+        if price <= 0:
+            raise ValueError(f"price is required to close existing position {instrument_id}")
+        targets.append(
+            TargetPosition(
+                portfolio_id=constraints.portfolio_id,
+                instrument_id=instrument_id,
+                target_quantity=0.0,
+                target_notional=0.0,
+                target_fraction=0.0,
+                strategy_contributions={f"portfolio:{exit_reason}": 0.0},
+                risk_budget=risk_budget,
+                valid_until=valid_until,
+                metadata={"reason_code": exit_reason, "current_quantity": quantity},
+            )
+        )
+    return targets
+
+
 def optimise_targets(
     forecasts: Iterable[AlphaForecast],
     *,
@@ -109,190 +401,69 @@ def optimise_targets(
         )
         if not 0 < protective_stop_fraction < 1:
             raise ValueError("protective_stop_fraction must be in (0, 1)")
-    candidates = [
-        forecast
-        for forecast in forecasts
-        if forecast.direction is not ForecastDirection.FLAT
-        and forecast.confidence >= constraints.min_confidence
-        and forecast.score >= constraints.min_score
-        and forecast.maximum_position > 0
-        and float(prices.get(forecast.instrument_id, 0.0)) > 0
-        and abs(float(funding_rates.get(forecast.instrument_id, 0.0)))
-        <= constraints.max_abs_funding_rate
-        and product_drawdown_fraction <= constraints.max_drawdown_fraction
-    ]
-    candidates.sort(
-        key=lambda item: (item.utility, item.confidence, item.strategy_version_id), reverse=True
-    )
-    selected: list[tuple[AlphaForecast, float]] = []
-    gross = net = beta = 0.0
-    turnover = 0.0
-    sleeve_usage: dict[str, float] = {}
-    cluster_usage: dict[str, float] = {}
     gross_limit = min(
         constraints.max_gross_fraction,
         constraints.max_margin_fraction,
         available_margin_fraction,
     )
+    candidates = _eligible_forecasts(
+        forecasts,
+        prices=prices,
+        funding_rates=funding_rates,
+        constraints=constraints,
+        product_drawdown_fraction=product_drawdown_fraction,
+    )
+    state = _AllocationState()
     for forecast in candidates:
-        if len(selected) >= constraints.max_positions:
+        if len(state.selected) >= constraints.max_positions:
             break
-        if any(
-            _correlation(correlations, forecast.instrument_id, previous.instrument_id)
-            > constraints.max_correlation
-            for previous, _ in selected
-        ):
-            continue
-        funding_rate = float(funding_rates.get(forecast.instrument_id, 0.0))
-        direction_sign = 1.0 if forecast.direction is ForecastDirection.LONG else -1.0
-        gross_expected_return = direction_sign * forecast.expected_return
-        net_expected_return = gross_expected_return - direction_sign * funding_rate
-        if net_expected_return <= 0:
-            continue
-        signal_scale = forecast.score * forecast.confidence
-        volatility = float(observed_volatility.get(forecast.instrument_id, 0.0))
-        volatility_scale = (
-            min(1.0, forecast.target_volatility / volatility)
-            if volatility > 0 and forecast.target_volatility > 0
-            else 1.0
+        _try_allocate_forecast(
+            state,
+            forecast,
+            prices=prices,
+            constraints=constraints,
+            correlations=correlations,
+            beta_by_instrument=beta_by_instrument,
+            observed_volatility=observed_volatility,
+            liquidity_fraction_caps=liquidity_fraction_caps,
+            funding_rates=funding_rates,
+            current_quantities=current_quantities,
+            sleeve_budgets=sleeve_budgets,
+            cluster_by_instrument=cluster_by_instrument,
+            cluster_fraction_caps=cluster_fraction_caps,
+            gross_limit=gross_limit,
         )
-        funding_scale = min(
-            1.0,
-            net_expected_return / gross_expected_return if gross_expected_return > 0 else 0.0,
-        )
-        fraction = (
-            min(constraints.max_symbol_fraction, forecast.maximum_position)
-            * signal_scale
-            * volatility_scale
-            * funding_scale
-        )
-        fraction = min(
-            fraction,
-            max(0.0, float(liquidity_fraction_caps.get(forecast.instrument_id, 1.0))),
-        )
-        fraction = min(fraction, max(0.0, gross_limit - gross))
-        if fraction <= 1e-12:
-            continue
-        current_fraction = (
-            float(current_quantities.get(forecast.instrument_id, 0.0))
-            * float(prices[forecast.instrument_id])
-            / constraints.equity
-        )
-        sleeve = str(forecast.metadata.get("sleeve") or "directional")
-        sleeve_limit = max(0.0, float(sleeve_budgets.get(sleeve, 1.0)))
-        fraction = min(fraction, max(0.0, sleeve_limit - sleeve_usage.get(sleeve, 0.0)))
-        cluster = str(
-            cluster_by_instrument.get(
-                forecast.instrument_id,
-                forecast.metadata.get("cluster") or "unclassified",
-            )
-        )
-        cluster_limit = min(
-            constraints.max_cluster_fraction,
-            max(0.0, float(cluster_fraction_caps.get(cluster, 1.0))),
-        )
-        fraction = min(fraction, max(0.0, cluster_limit - cluster_usage.get(cluster, 0.0)))
-        if fraction <= 1e-12:
-            continue
-        signed = fraction if forecast.direction is ForecastDirection.LONG else -fraction
-        candidate_turnover = turnover + abs(signed - current_fraction)
-        candidate_beta = beta + signed * float(beta_by_instrument.get(forecast.instrument_id, 0.0))
-        if abs(net + signed) > constraints.max_net_fraction + 1e-12:
-            continue
-        if abs(candidate_beta) > constraints.max_abs_beta + 1e-12:
-            continue
-        if candidate_turnover > constraints.max_turnover_fraction + 1e-12:
-            continue
-        selected.append((forecast, signed))
-        gross += fraction
-        net += signed
-        beta = candidate_beta
-        turnover = candidate_turnover
-        sleeve_usage[sleeve] = sleeve_usage.get(sleeve, 0.0) + fraction
-        cluster_usage[cluster] = cluster_usage.get(cluster, 0.0) + fraction
-    targets: list[TargetPosition] = []
-    for forecast, fraction in selected:
-        price = float(prices[forecast.instrument_id])
-        notional = constraints.equity * fraction
-        protective_stop = (
-            _protective_stop_metadata(price, fraction, protective_stop_fraction)
-            if protective_stop_fraction is not None
-            else {}
-        )
-        targets.append(
-            TargetPosition(
-                portfolio_id=constraints.portfolio_id,
-                instrument_id=forecast.instrument_id,
-                target_quantity=notional / price,
-                target_notional=notional,
-                target_fraction=fraction,
-                strategy_contributions={forecast.strategy_version_id: fraction},
-                risk_budget=risk_budget,
-                valid_until=valid_until,
-                metadata={
-                    "expected_return": forecast.expected_return,
-                    "directional_expected_return": gross_expected_return,
-                    "net_expected_return": net_expected_return,
-                    "confidence": forecast.confidence,
-                    "score": forecast.score,
-                    "observed_volatility": observed_volatility.get(forecast.instrument_id),
-                    "funding_rate": funding_rates.get(forecast.instrument_id, 0.0),
-                    "liquidity_fraction_cap": liquidity_fraction_caps.get(
-                        forecast.instrument_id, 1.0
-                    ),
-                    "sleeve": forecast.metadata.get("sleeve") or "directional",
-                    "cluster": cluster_by_instrument.get(
-                        forecast.instrument_id,
-                        forecast.metadata.get("cluster") or "unclassified",
-                    ),
-                    "portfolio_gross_fraction": gross,
-                    "portfolio_net_fraction": net,
-                    "portfolio_beta": beta,
-                    "portfolio_turnover_fraction": turnover,
-                    "available_margin_fraction": available_margin_fraction,
-                    "product_drawdown_fraction": product_drawdown_fraction,
-                    **(
-                        {"order_group_key": str(forecast.metadata["order_group_key"])}
-                        if forecast.metadata.get("order_group_key")
-                        else {}
-                    ),
-                    **(
-                        {"recovery_policy": str(forecast.metadata["recovery_policy"])}
-                        if forecast.metadata.get("recovery_policy")
-                        else {}
-                    ),
-                    **protective_stop,
-                },
-            )
-        )
+    targets = _build_open_targets(
+        state,
+        constraints=constraints,
+        prices=prices,
+        valid_until=valid_until,
+        risk_budget=risk_budget,
+        available_margin_fraction=available_margin_fraction,
+        product_drawdown_fraction=product_drawdown_fraction,
+        funding_rates=funding_rates,
+        observed_volatility=observed_volatility,
+        liquidity_fraction_caps=liquidity_fraction_caps,
+        cluster_by_instrument=cluster_by_instrument,
+        protective_stop_fraction=protective_stop_fraction,
+    )
     selected_instruments = {target.instrument_id for target in targets}
     exit_reason = (
         "product_drawdown_limit"
         if product_drawdown_fraction > constraints.max_drawdown_fraction
         else "no_valid_forecast"
     )
-    for instrument_id, quantity in sorted(current_quantities.items()):
-        if abs(float(quantity)) <= 1e-12 or instrument_id in selected_instruments:
-            continue
-        price = float(prices.get(instrument_id, 0.0))
-        if price <= 0:
-            raise ValueError(f"price is required to close existing position {instrument_id}")
-        targets.append(
-            TargetPosition(
-                portfolio_id=constraints.portfolio_id,
-                instrument_id=instrument_id,
-                target_quantity=0.0,
-                target_notional=0.0,
-                target_fraction=0.0,
-                strategy_contributions={f"portfolio:{exit_reason}": 0.0},
-                risk_budget=risk_budget,
-                valid_until=valid_until,
-                metadata={
-                    "reason_code": exit_reason,
-                    "current_quantity": quantity,
-                },
-            )
+    targets.extend(
+        _build_closing_targets(
+            current_quantities,
+            selected_instruments=selected_instruments,
+            prices=prices,
+            constraints=constraints,
+            valid_until=valid_until,
+            risk_budget=risk_budget,
+            exit_reason=exit_reason,
         )
+    )
     return tuple(targets)
 
 
