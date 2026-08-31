@@ -57,144 +57,197 @@ class SqlResearchStore:
         self.engine = engine
 
     def save_candidate(self, candidate: Candidate) -> None:
-        candidate_id = candidate.candidate_id
         definition_id = candidate.definition.definition_hash
         version_id = candidate.definition.strategy_version_id
         definition_payload = to_primitive(candidate.definition)
+        metadata_payload = self._candidate_metadata(candidate)
+        with self.engine.begin() as connection:
+            self._assert_claimed_trial(connection, candidate)
+            if self._existing_candidate_matches(connection, candidate):
+                return
+            self._ensure_strategy_version(
+                connection,
+                candidate,
+                definition_id=definition_id,
+                version_id=version_id,
+                definition_payload=definition_payload,
+            )
+            self._ensure_strategy_identity(
+                connection,
+                candidate,
+                definition_id=definition_id,
+                definition_payload=definition_payload,
+                metadata_payload=metadata_payload,
+            )
+            connection.execute(
+                insert(experiment).values(
+                    **self._experiment_values(
+                        candidate,
+                        version_id=version_id,
+                        metadata_payload=metadata_payload,
+                    )
+                )
+            )
+
+    @staticmethod
+    def _candidate_metadata(candidate: Candidate) -> dict[str, Any]:
         metadata_values = dict(candidate.metadata)
         if candidate.dataset_plan is not None:
             metadata_values["_dataset_plan"] = candidate.dataset_plan.to_payload()
-        metadata_payload = json_value(metadata_values, field="candidate metadata")
-        parent_hashes = metadata_payload.get("parent_hashes", [])
-        with self.engine.begin() as connection:
-            trial = (
-                connection.execute(
-                    select(thesis_trial).where(thesis_trial.c.candidate_id == candidate_id)
-                )
-                .mappings()
-                .first()
-            )
-            if trial is None:
-                raise ValueError("candidate trial must be claimed before candidate registration")
-            if (
-                trial["thesis_id"] != candidate.thesis_id
-                or trial["lineage_id"] != candidate.lineage_id
-            ):
-                raise ValueError("candidate thesis lineage does not match its claimed trial")
-            existing = (
-                connection.execute(select(experiment).where(experiment.c.id == candidate_id))
-                .mappings()
-                .first()
-            )
-            if existing is not None:
-                if self._candidate_from_row(connection, existing) != candidate:
-                    raise ValueError("persisted research candidate does not match candidate hash")
-                return
-            existing_definition = (
-                connection.execute(
-                    select(strategy_definition)
-                    .where(strategy_definition.c.id == definition_id)
-                    .limit(1)
-                )
-                .mappings()
-                .first()
-            )
-            if existing_definition is None:
-                connection.execute(
-                    insert(strategy_definition).values(
-                        id=definition_id,
-                        identity=candidate.definition.identity,
-                        product_id=candidate.definition.product,
-                        source_type=candidate.definition.source_type.value,
-                        source_hash=candidate.definition.source_hash,
-                        definition=definition_payload,
-                    )
-                )
-                connection.execute(
-                    insert(strategy_version).values(
-                        id=version_id,
-                        definition_id=definition_id,
-                        version=candidate.definition.version,
-                        created_at=candidate.submitted_at,
-                        payload={"definition_hash": definition_id},
-                    )
-                )
-            else:
-                expected_definition = {
-                    "id": definition_id,
-                    "identity": candidate.definition.identity,
-                    "product_id": candidate.definition.product,
-                    "source_type": candidate.definition.source_type.value,
-                    "source_hash": candidate.definition.source_hash,
-                    "definition": definition_payload,
-                }
-                if any(
-                    existing_definition[field] != value
-                    for field, value in expected_definition.items()
-                ):
-                    raise ValueError("persisted strategy definition does not match definition hash")
-                existing_version = (
-                    connection.execute(
-                        select(strategy_version).where(strategy_version.c.id == version_id).limit(1)
-                    )
-                    .mappings()
-                    .first()
-                )
-                if existing_version is None:
-                    connection.execute(
-                        insert(strategy_version).values(
-                            id=version_id,
-                            definition_id=definition_id,
-                            version=candidate.definition.version,
-                            created_at=candidate.submitted_at,
-                            payload={"definition_hash": definition_id},
-                        )
-                    )
-                elif (
-                    existing_version["definition_id"] != definition_id
-                    or existing_version["version"] != candidate.definition.version
-                    or existing_version["payload"] != {"definition_hash": definition_id}
-                ):
-                    raise ValueError("persisted strategy version does not match version hash")
-            identity_rows = connection.execute(
-                select(strategy_identity.c.id).where(
-                    strategy_identity.c.behavior_hash == definition_id,
-                    strategy_identity.c.id != candidate_id,
-                )
-            ).all()
-            existing_identity = (
-                connection.execute(
-                    select(strategy_identity).where(strategy_identity.c.id == candidate_id).limit(1)
-                )
-                .mappings()
-                .first()
-            )
-            identity_values = {
-                "id": candidate_id,
-                "behavior_hash": definition_id,
-                "submitted_spec": definition_payload,
-                "generation_method": candidate.definition.source_type.value,
-                "metadata": metadata_payload,
-                "parent_hashes": parent_hashes,
-                "is_duplicate": bool(identity_rows),
-                "created_at": candidate.submitted_at,
-            }
-            if existing_identity is None:
-                connection.execute(insert(strategy_identity).values(**identity_values))
-            elif any(existing_identity[field] != value for field, value in identity_values.items()):
-                raise ValueError("persisted strategy identity does not match candidate hash")
+        return json_value(metadata_values, field="candidate metadata")
+
+    @staticmethod
+    def _assert_claimed_trial(connection, candidate: Candidate) -> None:
+        trial = (
             connection.execute(
-                insert(experiment).values(
-                    id=candidate_id,
-                    strategy_version_id=version_id,
-                    provider=candidate.provider,
-                    state=CandidateState.QUEUED.value,
-                    submitted_at=candidate.submitted_at,
-                    dataset_snapshot_hashes=list(candidate.dataset_snapshot_hashes),
-                    dataset_bundle_id=candidate.dataset_bundle_id,
-                    metadata=metadata_payload,
+                select(thesis_trial).where(thesis_trial.c.candidate_id == candidate.candidate_id)
+            )
+            .mappings()
+            .first()
+        )
+        if trial is None:
+            raise ValueError("candidate trial must be claimed before candidate registration")
+        if trial["thesis_id"] != candidate.thesis_id or trial["lineage_id"] != candidate.lineage_id:
+            raise ValueError("candidate thesis lineage does not match its claimed trial")
+
+    def _existing_candidate_matches(self, connection, candidate: Candidate) -> bool:
+        existing = (
+            connection.execute(select(experiment).where(experiment.c.id == candidate.candidate_id))
+            .mappings()
+            .first()
+        )
+        if existing is None:
+            return False
+        if self._candidate_from_row(connection, existing) != candidate:
+            raise ValueError("persisted research candidate does not match candidate hash")
+        return True
+
+    @staticmethod
+    def _ensure_strategy_version(
+        connection,
+        candidate: Candidate,
+        *,
+        definition_id: str,
+        version_id: str,
+        definition_payload: dict[str, Any],
+    ) -> None:
+        existing_definition = (
+            connection.execute(
+                select(strategy_definition)
+                .where(strategy_definition.c.id == definition_id)
+                .limit(1)
+            )
+            .mappings()
+            .first()
+        )
+        if existing_definition is None:
+            connection.execute(
+                insert(strategy_definition).values(
+                    id=definition_id,
+                    identity=candidate.definition.identity,
+                    product_id=candidate.definition.product,
+                    source_type=candidate.definition.source_type.value,
+                    source_hash=candidate.definition.source_hash,
+                    definition=definition_payload,
                 )
             )
+            connection.execute(
+                insert(strategy_version).values(
+                    id=version_id,
+                    definition_id=definition_id,
+                    version=candidate.definition.version,
+                    created_at=candidate.submitted_at,
+                    payload={"definition_hash": definition_id},
+                )
+            )
+            return
+        expected_definition = {
+            "id": definition_id,
+            "identity": candidate.definition.identity,
+            "product_id": candidate.definition.product,
+            "source_type": candidate.definition.source_type.value,
+            "source_hash": candidate.definition.source_hash,
+            "definition": definition_payload,
+        }
+        if any(existing_definition[field] != value for field, value in expected_definition.items()):
+            raise ValueError("persisted strategy definition does not match definition hash")
+        existing_version = (
+            connection.execute(
+                select(strategy_version).where(strategy_version.c.id == version_id).limit(1)
+            )
+            .mappings()
+            .first()
+        )
+        if existing_version is None:
+            connection.execute(
+                insert(strategy_version).values(
+                    id=version_id,
+                    definition_id=definition_id,
+                    version=candidate.definition.version,
+                    created_at=candidate.submitted_at,
+                    payload={"definition_hash": definition_id},
+                )
+            )
+        elif (
+            existing_version["definition_id"] != definition_id
+            or existing_version["version"] != candidate.definition.version
+            or existing_version["payload"] != {"definition_hash": definition_id}
+        ):
+            raise ValueError("persisted strategy version does not match version hash")
+
+    @staticmethod
+    def _ensure_strategy_identity(
+        connection,
+        candidate: Candidate,
+        *,
+        definition_id: str,
+        definition_payload: dict[str, Any],
+        metadata_payload: dict[str, Any],
+    ) -> None:
+        identity_rows = connection.execute(
+            select(strategy_identity.c.id).where(
+                strategy_identity.c.behavior_hash == definition_id,
+                strategy_identity.c.id != candidate.candidate_id,
+            )
+        ).all()
+        identity_values = {
+            "id": candidate.candidate_id,
+            "behavior_hash": definition_id,
+            "submitted_spec": definition_payload,
+            "generation_method": candidate.definition.source_type.value,
+            "metadata": metadata_payload,
+            "parent_hashes": metadata_payload.get("parent_hashes", []),
+            "is_duplicate": bool(identity_rows),
+            "created_at": candidate.submitted_at,
+        }
+        existing_identity = (
+            connection.execute(
+                select(strategy_identity)
+                .where(strategy_identity.c.id == candidate.candidate_id)
+                .limit(1)
+            )
+            .mappings()
+            .first()
+        )
+        if existing_identity is None:
+            connection.execute(insert(strategy_identity).values(**identity_values))
+        elif any(existing_identity[field] != value for field, value in identity_values.items()):
+            raise ValueError("persisted strategy identity does not match candidate hash")
+
+    @staticmethod
+    def _experiment_values(
+        candidate: Candidate, *, version_id: str, metadata_payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "id": candidate.candidate_id,
+            "strategy_version_id": version_id,
+            "provider": candidate.provider,
+            "state": CandidateState.QUEUED.value,
+            "submitted_at": candidate.submitted_at,
+            "dataset_snapshot_hashes": list(candidate.dataset_snapshot_hashes),
+            "dataset_bundle_id": candidate.dataset_bundle_id,
+            "metadata": metadata_payload,
+        }
 
     def load_candidates(self) -> tuple[Candidate, ...]:
         with self.engine.connect() as connection:
