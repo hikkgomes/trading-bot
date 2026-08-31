@@ -4171,46 +4171,11 @@ def _finalize_proven_futures_flatten(
     return status
 
 
-def _flatten_futures_product(
+def _futures_flatten_accounting_state(
     product: ProductConfig,
-    status: dict[str, Any],
     broker: Any,
-    account_fingerprint: str,
-) -> dict[str, Any]:
-    try:
-        already_accounted = _already_accounted_futures_flatten(product, broker)
-    except Exception as exc:
-        status.update(
-            reason="already_accounted_flatten_verification_failed",
-            error=f"{type(exc).__name__}: {exc}",
-        )
-        return status
-    if already_accounted is not None:
-        status.update(
-            ok=True,
-            skipped=True,
-            flattened=False,
-            reason="already_accounted_flat",
-            accounting=already_accounted,
-        )
-        return status
-    try:
-        resumed = _resume_flatten_exit_accounting(product, broker)
-    except Exception as exc:
-        status.update(
-            reason="unresolved_exit_accounting_intent",
-            error=f"{type(exc).__name__}: {exc}",
-        )
-        return status
-    if resumed is not None:
-        status.update(
-            ok=True,
-            flattened=True,
-            reason="exit_accounting_resumed",
-            accounting=resumed,
-        )
-        return status
-
+    status: dict[str, Any],
+) -> tuple[Any, dict[str, Any], dict[str, Any]] | None:
     try:
         accounting_bot = _flatten_accounting_bot(product, broker)
         strategy, local_position = _flatten_strategy_and_position(accounting_bot)
@@ -4223,44 +4188,65 @@ def _flatten_futures_product(
                 "evidence before submitting a close."
             ),
         )
-        return status
-    state = accounting_bot.state
-    existing_raw = state.get("flatten_intent")
-    if existing_raw is not None:
-        try:
-            existing = _validated_futures_flatten_intent(
-                product,
-                existing_raw,
-                position=local_position,
-            )
-        except Exception as exc:
-            status.update(
-                reason="unresolved_flatten_intent",
-                error=f"{type(exc).__name__}: {exc}",
-                flatten_intent=existing_raw,
-            )
-            return status
-        if existing["phase"] == "broker_flat_proven":
-            return _finalize_proven_futures_flatten(product, broker, status, existing)
-        current = broker.get_position(product.symbol)
+        return None
+    return accounting_bot, strategy, local_position
+
+
+def _resolve_existing_futures_flatten_intent(
+    product: ProductConfig,
+    broker: Any,
+    status: dict[str, Any],
+    *,
+    local_position: dict[str, Any],
+    existing_raw: Any,
+) -> dict[str, Any] | None:
+    if existing_raw is None:
+        return None
+    try:
+        existing = _validated_futures_flatten_intent(
+            product,
+            existing_raw,
+            position=local_position,
+        )
+    except Exception as exc:
         status.update(
             reason="unresolved_flatten_intent",
-            error=(
-                "Prepared futures flatten intent has an ambiguous submission boundary; "
-                "reconcile its deterministic client ID before any retry."
-            ),
-            flatten_intent=existing,
-            position_current={
-                "symbol": current.symbol,
-                "qty": current.qty,
-                "avg_price": current.avg_price,
-            },
-            operator_action=(
-                "Keep the product paused. The runtime will not submit a second close order."
-            ),
+            error=f"{type(exc).__name__}: {exc}",
+            flatten_intent=existing_raw,
         )
         return status
+    if existing["phase"] == "broker_flat_proven":
+        return _finalize_proven_futures_flatten(product, broker, status, existing)
+    current = broker.get_position(product.symbol)
+    status.update(
+        reason="unresolved_flatten_intent",
+        error=(
+            "Prepared futures flatten intent has an ambiguous submission boundary; "
+            "reconcile its deterministic client ID before any retry."
+        ),
+        flatten_intent=existing,
+        position_current={
+            "symbol": current.symbol,
+            "qty": current.qty,
+            "avg_price": current.avg_price,
+        },
+        operator_action=(
+            "Keep the product paused. The runtime will not submit a second close order."
+        ),
+    )
+    return status
 
+
+def _prepare_futures_flatten_submission(
+    product: ProductConfig,
+    broker: Any,
+    status: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    strategy: dict[str, Any],
+    local_position: dict[str, Any],
+    account_fingerprint: str,
+) -> tuple[Order, Position, dict[str, Any], float] | None:
     before = broker.get_position(product.symbol)
     status["position_before"] = {
         "symbol": before.symbol,
@@ -4275,8 +4261,7 @@ def _flatten_futures_product(
                 "fill proves price and fees. Local position state was retained."
             ),
         )
-        return status
-
+        return None
     expected_qty = _positive_evidence_float(local_position.get("broker_qty"))
     direction = str(local_position.get("direction") or "").lower()
     expected_signed = (
@@ -4300,8 +4285,7 @@ def _flatten_futures_product(
             reason="broker_position_reconciliation_failed",
             error="Broker position does not exactly match the single durable position.",
         )
-        return status
-
+        return None
     side = OrderSide.SELL if before_qty > 0 else OrderSide.BUY
     normalizer = getattr(broker, "normalize_order_qty", None)
     try:
@@ -4317,7 +4301,7 @@ def _flatten_futures_product(
         )
     except Exception as exc:
         status.update(reason="invalid_futures_flatten_qty", error=str(exc))
-        return status
+        return None
     if (
         not math.isfinite(normalized_qty)
         or normalized_qty <= 0
@@ -4327,8 +4311,7 @@ def _flatten_futures_product(
             reason="invalid_futures_flatten_qty",
             error="Venue normalization did not preserve the complete open-position size.",
         )
-        return status
-
+        return None
     quote_before = _strict_flatten_number(
         broker.get_balance(),
         field="quote_balance_before",
@@ -4381,8 +4364,7 @@ def _flatten_futures_product(
         _persist_flatten_intent(product, state, intent)
     except Exception as exc:
         status.update(reason="flatten_intent_persist_failed", error=str(exc))
-        return status
-
+        return None
     order = Order(
         symbol=product.symbol,
         side=side,
@@ -4392,6 +4374,20 @@ def _flatten_futures_product(
         client_id=client_id,
     )
     status["flatten_intent"] = intent
+    return order, before, intent, quote_before
+
+
+def _submit_futures_flatten(
+    product: ProductConfig,
+    broker: Any,
+    status: dict[str, Any],
+    *,
+    order: Order,
+    before: Position,
+    intent: dict[str, Any],
+    quote_before: float,
+    local_position: dict[str, Any],
+) -> dict[str, Any]:
     try:
         fill = broker.place_order(order)
         _assert_futures_flatten_fill_valid(product, before, fill)
@@ -4415,7 +4411,6 @@ def _flatten_futures_product(
         except Exception as readback_exc:
             status["position_after_attempt_error"] = str(readback_exc)
         return status
-
     after = broker.get_position(product.symbol)
     quote_after = _strict_flatten_number(
         broker.get_balance(),
@@ -4468,6 +4463,85 @@ def _flatten_futures_product(
         )
         return status
     return _finalize_proven_futures_flatten(product, broker, status, proven)
+
+
+def _flatten_futures_product(
+    product: ProductConfig,
+    status: dict[str, Any],
+    broker: Any,
+    account_fingerprint: str,
+) -> dict[str, Any]:
+    try:
+        already_accounted = _already_accounted_futures_flatten(product, broker)
+    except Exception as exc:
+        status.update(
+            reason="already_accounted_flatten_verification_failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return status
+    if already_accounted is not None:
+        status.update(
+            ok=True,
+            skipped=True,
+            flattened=False,
+            reason="already_accounted_flat",
+            accounting=already_accounted,
+        )
+        return status
+    try:
+        resumed = _resume_flatten_exit_accounting(product, broker)
+    except Exception as exc:
+        status.update(
+            reason="unresolved_exit_accounting_intent",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return status
+    if resumed is not None:
+        status.update(
+            ok=True,
+            flattened=True,
+            reason="exit_accounting_resumed",
+            accounting=resumed,
+        )
+        return status
+
+    accounting_state = _futures_flatten_accounting_state(product, broker, status)
+    if accounting_state is None:
+        return status
+    accounting_bot, strategy, local_position = accounting_state
+    state = accounting_bot.state
+    handled = _resolve_existing_futures_flatten_intent(
+        product,
+        broker,
+        status,
+        local_position=local_position,
+        existing_raw=state.get("flatten_intent"),
+    )
+    if handled is not None:
+        return handled
+
+    prepared = _prepare_futures_flatten_submission(
+        product,
+        broker,
+        status,
+        state=state,
+        strategy=strategy,
+        local_position=local_position,
+        account_fingerprint=account_fingerprint,
+    )
+    if prepared is None:
+        return status
+    order, before, intent, quote_before = prepared
+    return _submit_futures_flatten(
+        product,
+        broker,
+        status,
+        order=order,
+        before=before,
+        intent=intent,
+        quote_before=quote_before,
+        local_position=local_position,
+    )
 
 
 def flatten_product_once(product: ProductConfig) -> dict[str, Any]:
