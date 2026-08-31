@@ -355,6 +355,14 @@ def _request_dataset_roles(
         raise EvaluationContractError(
             "adaptive evaluation cannot contain a protected_holdout snapshot"
         )
+    if stage == "forward" and any(value != "forward_observation" for value in roles.values()):
+        raise EvaluationContractError(
+            "forward evaluation requests may contain only forward_observation snapshots"
+        )
+    if stage != "forward" and "forward_observation" in roles.values():
+        raise EvaluationContractError(
+            "adaptive evaluation cannot contain a forward_observation snapshot"
+        )
     return roles
 
 
@@ -1150,6 +1158,18 @@ class CanonicalResearchEvaluator:
             ):
                 raise EvaluationContractError(
                     "adaptive evaluation cannot contain a protected_holdout snapshot"
+                )
+            if request.requested_stage == "forward" and any(
+                role != "forward_observation" for role in request.dataset_roles.values()
+            ):
+                raise EvaluationContractError(
+                    "forward evaluation requests may contain only forward_observation snapshots"
+                )
+            if request.requested_stage != "forward" and "forward_observation" in set(
+                request.dataset_roles.values()
+            ):
+                raise EvaluationContractError(
+                    "adaptive evaluation cannot contain a forward_observation snapshot"
                 )
         candidate = self.store.get_candidate(request.candidate_id)
         if not set(request.dataset_snapshot_ids).issubset(set(candidate.dataset_snapshot_hashes)):
