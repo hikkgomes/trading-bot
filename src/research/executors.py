@@ -586,6 +586,12 @@ def _product_accounting(
                     if context.get("reserve_fraction") is not None
                     else None
                 ),
+                max_tactical_fraction=(
+                    float(context["max_tactical_fraction"])
+                    if context.get("max_tactical_fraction") is not None
+                    else None
+                ),
+                external_events=context.get("btc_external_events", ()),
             )
         except (ProductAccountingError, TypeError, ValueError) as exc:
             raise ExecutorError(f"BTC accounting evidence is invalid: {exc}") from exc
@@ -606,6 +612,15 @@ def _product_accounting(
             "missed_btc_appreciation": report.missed_btc_appreciation,
             "cycles": report.cycles,
             "regime_pnl": dict(report.regime_pnl),
+            "maximum_btc_drawdown": report.maximum_btc_drawdown,
+            "btc_saved_in_drawdown_periods": report.btc_saved_in_drawdown_periods,
+            "round_trip_btc_gain": report.round_trip_btc_gain,
+            "maximum_tactical_allocation": report.maximum_tactical_allocation,
+            "average_stablecoin_exposure_fraction": report.average_stablecoin_exposure_fraction,
+            "worst_reentry_slippage": report.worst_reentry_slippage,
+            "failed_reentries": report.failed_reentries,
+            "external_deposits_btc": report.external_deposits_btc,
+            "external_withdrawals_btc": report.external_withdrawals_btc,
             "event_receipts": [dict(item) for item in report.event_receipts],
         }
     if product_id == "active_income":
@@ -642,6 +657,17 @@ def _product_accounting(
                 "max_margin_fraction": 0.0,
                 "liquidation": False,
                 "effective_observations": int(fallback_return.effective_observations),
+                "turnover_notional": 0.0,
+                "implementation_shortfall": float(fallback_return.fees + fallback_return.slippage),
+                "capital_efficiency": 0.0,
+                "funding_adjusted_expectancy": (
+                    net_pnl / fallback_return.effective_observations
+                    if fallback_return.effective_observations > 0
+                    else 0.0
+                ),
+                "margin_mode": "isolated",
+                "target_notional": None,
+                "liquidation_buffer_fraction": 0.0,
                 "event_receipts": (),
                 "source": "canonical_return_ledger",
             }
@@ -656,6 +682,9 @@ def _product_accounting(
                 max_participation_fraction=float(context.get("max_participation_fraction", 1.0)),
                 funding_timestamps=context.get("funding_timestamps"),
                 max_margin_fraction=float(context.get("max_margin_fraction", 1.0)),
+                target_notional=context.get("target_notional"),
+                margin_mode=str(context.get("margin_mode", "isolated")),
+                liquidation_buffer_fraction=float(context.get("liquidation_buffer_fraction", 0.0)),
             )
         except (ProductAccountingError, TypeError, ValueError) as exc:
             raise ExecutorError(f"futures accounting evidence is invalid: {exc}") from exc
@@ -682,6 +711,13 @@ def _product_accounting(
             "max_margin_fraction": report.max_margin_fraction,
             "liquidation": report.liquidation,
             "effective_observations": report.effective_observations,
+            "turnover_notional": report.turnover_notional,
+            "implementation_shortfall": report.implementation_shortfall,
+            "capital_efficiency": report.capital_efficiency,
+            "funding_adjusted_expectancy": report.funding_adjusted_expectancy,
+            "margin_mode": report.margin_mode,
+            "target_notional": report.target_notional,
+            "liquidation_buffer_fraction": report.liquidation_buffer_fraction,
             "event_receipts": [dict(item) for item in report.event_receipts],
         }
     return None

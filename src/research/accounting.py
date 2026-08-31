@@ -153,6 +153,8 @@ class BtcAccountingReport:
     average_stablecoin_exposure_fraction: float = 0.0
     worst_reentry_slippage: float = 0.0
     failed_reentries: int = 0
+    external_deposits_btc: float = 0.0
+    external_withdrawals_btc: float = 0.0
 
     @property
     def btc_vs_passive_hold(self) -> float:
@@ -179,12 +181,15 @@ class BtcAccumulationAccounting:
         initial_stablecoin: float = 0.0,
         initial_price: float | None = None,
         reserve_fraction: float | None = None,
+        max_tactical_fraction: float | None = None,
+        external_events: Iterable[Mapping[str, Any]] = (),
     ) -> BtcAccountingReport:
         btc = _number(initial_btc, field_name="initial_btc", minimum=0.0)
         stable = _number(initial_stablecoin, field_name="initial_stablecoin", minimum=0.0)
         trades = _events(trade_events)
+        flows = _events(external_events)
         mark_events = self._normalise_marks(marks)
-        if not mark_events and not trades:
+        if not mark_events and not trades and not flows:
             raise ProductAccountingError("BTC accounting requires trade events or marks")
         first_price = initial_price
         if first_price is None:
@@ -196,10 +201,21 @@ class BtcAccumulationAccounting:
             reserve_fraction = _number(reserve_fraction, field_name="reserve_fraction", minimum=0.0)
             if reserve_fraction > 1:
                 raise ProductAccountingError("reserve_fraction must be at most 1")
+        if max_tactical_fraction is not None:
+            max_tactical_fraction = _number(
+                max_tactical_fraction, field_name="max_tactical_fraction", minimum=0.0
+            )
+            if max_tactical_fraction > 1:
+                raise ProductAccountingError("max_tactical_fraction must be at most 1")
         initial_nav = btc + stable / first_price
         passive = initial_nav
-        all_times = sorted({time for time, _ in trades} | {time for time, _, _ in mark_events})
+        all_times = sorted(
+            {time for time, _ in trades}
+            | {time for time, _ in flows}
+            | {time for time, _, _ in mark_events}
+        )
         trade_index = 0
+        flow_index = 0
         mark_index = 0
         current_price = first_price
         snapshots: list[BtcAccountingSnapshot] = []
@@ -222,8 +238,63 @@ class BtcAccumulationAccounting:
         reentry_slippages: list[float] = []
         pending_sell: tuple[float, float] | None = None
         failed_reentries = 0
+        external_deposits_btc = 0.0
+        external_withdrawals_btc = 0.0
 
         for observed_at in all_times:
+            while mark_index < len(mark_events) and mark_events[mark_index][0] == observed_at:
+                _, mark_price, mark_event = mark_events[mark_index]
+                current_price = mark_price
+                current_regime = str(mark_event.get("regime", "unclassified"))
+                mark_index += 1
+            while flow_index < len(flows) and flows[flow_index][0] == observed_at:
+                _, event = flows[flow_index]
+                kind = _event_kind(event)
+                if kind not in {"deposit", "withdrawal", "transfer"}:
+                    raise ProductAccountingError(f"unsupported BTC external event type: {kind}")
+                amount = _number(
+                    event.get("amount", event.get("quantity", event.get("value", 0.0))),
+                    field_name="external amount",
+                    minimum=0.0,
+                )
+                asset = (
+                    str(event.get("asset", event.get("currency", event.get("fee_asset", "BTC"))))
+                    .strip()
+                    .upper()
+                )
+                if asset == "BTC":
+                    value_btc = amount
+                    balance_name = "btc"
+                elif asset in {"USDT", "USDC", "BUSD"}:
+                    value_btc = amount / current_price
+                    balance_name = "stable"
+                else:
+                    raise ProductAccountingError(f"unsupported BTC external asset: {asset}")
+                direction = 1.0 if kind == "deposit" else -1.0
+                if balance_name == "btc":
+                    btc += direction * amount
+                else:
+                    stable += direction * amount
+                if btc < -1e-12 or stable < -1e-12:
+                    raise ProductAccountingError(
+                        "external BTC balance flow exceeds available balance"
+                    )
+                passive += direction * value_btc
+                if direction > 0:
+                    external_deposits_btc += value_btc
+                else:
+                    external_withdrawals_btc += value_btc
+                receipts.append(
+                    {
+                        "event_hash": canonical_hash(dict(event)),
+                        "occurred_at": observed_at,
+                        "event_type": kind,
+                        "asset": asset,
+                        "amount": amount,
+                        "amount_btc": value_btc,
+                    }
+                )
+                flow_index += 1
             while trade_index < len(trades) and trades[trade_index][0] == observed_at:
                 _, event = trades[trade_index]
                 side = str(event.get("side", "")).casefold()
@@ -252,7 +323,9 @@ class BtcAccumulationAccounting:
                         btc += quantity
                         stable -= quote + fee_quote
                     if core_btc and btc < core_btc - 1e-12:
-                        raise ProductAccountingError("BTC buy or sell path breached core BTC reserve")
+                        raise ProductAccountingError(
+                            "BTC buy or sell path breached core BTC reserve"
+                        )
                     if btc < -1e-12 or stable < -1e-12:
                         raise ProductAccountingError("BTC buy exceeds available balance")
                     if saw_sell:
@@ -286,7 +359,7 @@ class BtcAccumulationAccounting:
                         raise ProductAccountingError("BTC sell exceeds available balance")
                     saw_sell = True
                     pending_sell = (quantity, price)
-                if str(event.get("reentry_status") or "").casefold() == "failed":
+                if side == "buy" and str(event.get("reentry_status") or "").casefold() == "failed":
                     failed_reentries += 1
                 fee_btc_total += converted_fee_btc
                 receipts.append(
@@ -303,11 +376,6 @@ class BtcAccumulationAccounting:
                     }
                 )
                 trade_index += 1
-            while mark_index < len(mark_events) and mark_events[mark_index][0] == observed_at:
-                _, mark_price, mark_event = mark_events[mark_index]
-                current_price = mark_price
-                current_regime = str(mark_event.get("regime", "unclassified"))
-                mark_index += 1
             nav = btc + stable / current_price
             snapshot = BtcAccountingSnapshot(
                 observed_at=observed_at,
@@ -346,12 +414,16 @@ class BtcAccumulationAccounting:
             if peak_nav > 0:
                 maximum_drawdown = max(maximum_drawdown, (peak_nav - nav) / peak_nav)
             tactical = stable / current_price / nav if nav > 0 else 0.0
+            if max_tactical_fraction is not None and tactical > max_tactical_fraction + 1e-12:
+                raise ProductAccountingError("BTC tactical allocation exceeded configured limit")
             maximum_tactical_allocation = max(maximum_tactical_allocation, tactical)
 
         if not snapshots:
             snapshots.append(
                 BtcAccountingSnapshot(
-                    observed_at=trades[0][0] if trades else mark_events[0][0],
+                    observed_at=(
+                        trades[0][0] if trades else flows[0][0] if flows else mark_events[0][0]
+                    ),
                     btc_balance=btc,
                     stablecoin_balance=stable,
                     stablecoin_per_btc=current_price,
@@ -394,6 +466,8 @@ class BtcAccumulationAccounting:
             ),
             worst_reentry_slippage=max(reentry_slippages, default=0.0),
             failed_reentries=failed_reentries,
+            external_deposits_btc=external_deposits_btc,
+            external_withdrawals_btc=external_withdrawals_btc,
         )
 
     @staticmethod
@@ -401,9 +475,7 @@ class BtcAccumulationAccounting:
         marks: Iterable[Mapping[str, Any]] | Mapping[str, Any],
     ) -> tuple[tuple[str, float, Mapping[str, Any]], ...]:
         if isinstance(marks, Mapping):
-            source = tuple(
-                {"timestamp": key, "price": value} for key, value in marks.items()
-            )
+            source = tuple({"timestamp": key, "price": value} for key, value in marks.items())
         else:
             source = tuple(marks)
         result: list[tuple[str, float, Mapping[str, Any]]] = []
@@ -438,6 +510,13 @@ class FuturesAccountingReport:
     liquidation: bool
     effective_observations: int
     event_receipts: tuple[Mapping[str, Any], ...] = ()
+    turnover_notional: float = 0.0
+    implementation_shortfall: float = 0.0
+    capital_efficiency: float = 0.0
+    funding_adjusted_expectancy: float = 0.0
+    margin_mode: str = "isolated"
+    target_notional: float | None = None
+    liquidation_buffer_fraction: float = 0.0
 
     @property
     def objective_unit(self) -> str:
@@ -461,6 +540,9 @@ class FuturesIncomeAccounting:
         max_participation_fraction: float = 1.0,
         funding_timestamps: Iterable[str] | None = None,
         max_margin_fraction: float = 1.0,
+        target_notional: float | Mapping[str, float] | None = None,
+        margin_mode: str = "isolated",
+        liquidation_buffer_fraction: float = 0.0,
     ) -> FuturesAccountingReport:
         starting_cash = _number(initial_cash, field_name="initial_cash", minimum=0.0)
         cash = starting_cash
@@ -481,8 +563,7 @@ class FuturesIncomeAccounting:
             None
             if funding_timestamps is None
             else frozenset(
-                timestamp(str(value), field="funding_timestamps[]")
-                for value in funding_timestamps
+                timestamp(str(value), field="funding_timestamps[]") for value in funding_timestamps
             )
         )
         margin_limit = _number(
@@ -492,6 +573,25 @@ class FuturesIncomeAccounting:
         )
         if margin_limit > 1.0:
             raise ProductAccountingError("max_margin_fraction must be at most 1")
+        margin_mode = str(margin_mode).strip().casefold()
+        if margin_mode not in {"isolated", "cross"}:
+            raise ProductAccountingError("margin_mode must be isolated or cross")
+        liquidation_buffer = _number(
+            liquidation_buffer_fraction,
+            field_name="liquidation_buffer_fraction",
+            minimum=0.0,
+        )
+        if liquidation_buffer > 1.0:
+            raise ProductAccountingError("liquidation_buffer_fraction must be at most 1")
+        target_value: float | None = None
+        target_by_symbol: dict[str, float] = {}
+        if isinstance(target_notional, Mapping):
+            for symbol, value in target_notional.items():
+                target_by_symbol[str(symbol)] = _number(
+                    value, field_name=f"target_notional[{symbol}]", minimum=0.0
+                )
+        elif target_notional is not None:
+            target_value = _number(target_notional, field_name="target_notional", minimum=0.0)
         ordered = _events(events)
         if not ordered:
             raise ProductAccountingError("futures accounting requires events")
@@ -509,6 +609,7 @@ class FuturesIncomeAccounting:
         observed_max_margin_fraction = 0.0
         liquidation = False
         observations = 0
+        turnover_notional = 0.0
         receipts: list[Mapping[str, Any]] = []
 
         for observed_at, event in ordered:
@@ -530,6 +631,7 @@ class FuturesIncomeAccounting:
                 realised += realised_delta
                 positions[symbol] = (new_quantity, new_entry)
                 marks[symbol] = price
+                turnover_notional += quantity * price
                 cash += realised_delta
                 fill_fee = _fee(event)
                 fees += fill_fee
@@ -544,7 +646,9 @@ class FuturesIncomeAccounting:
                 fills += 1
                 requested = event.get("requested_quantity", event.get("order_quantity"))
                 if requested is not None:
-                    requested_value = _number(requested, field_name="requested_quantity", minimum=0.0)
+                    requested_value = _number(
+                        requested, field_name="requested_quantity", minimum=0.0
+                    )
                     if quantity + 1e-12 < requested_value:
                         partials += 1
                 visible_depth = event.get("visible_depth", event.get("available_depth"))
@@ -559,7 +663,9 @@ class FuturesIncomeAccounting:
                 mark = _price(event, field_name="mark_price")
                 marks[symbol] = mark
                 quantity = positions.get(symbol, (0.0, 0.0))[0]
-                rate = _number(event.get("funding_rate", event.get("rate", 0.0)), field_name="funding_rate")
+                rate = _number(
+                    event.get("funding_rate", event.get("rate", 0.0)), field_name="funding_rate"
+                )
                 funding_applied = funding_schedule is None or observed_at in funding_schedule
                 if funding_applied:
                     amount = -quantity * mark * rate
@@ -580,6 +686,12 @@ class FuturesIncomeAccounting:
                 raise ProductAccountingError(f"unsupported futures accounting event type: {kind}")
             equity, unrealised, notional = self._equity(cash, positions, marks)
             margin = notional / leverage
+            symbol_target = target_by_symbol.get(symbol, target_value)
+            event_target = event.get("target_notional")
+            if event_target is not None:
+                symbol_target = _number(event_target, field_name="target_notional", minimum=0.0)
+            if symbol_target is not None and notional > symbol_target + 1e-12:
+                capacity_violations += 1
             if equity > 0:
                 max_leverage = max(max_leverage, notional / equity)
                 if notional > equity * leverage + 1e-12:
@@ -590,7 +702,7 @@ class FuturesIncomeAccounting:
             )
             if equity > 0 and margin / equity > margin_limit + 1e-12:
                 capacity_violations += 1
-            if equity <= maintenance * margin and notional > 0:
+            if equity <= (maintenance + liquidation_buffer) * margin and notional > 0:
                 liquidation = True
             receipt = {
                 "event_hash": canonical_hash(dict(event)),
@@ -598,14 +710,18 @@ class FuturesIncomeAccounting:
                 "event_type": kind,
                 "equity": equity,
                 "unrealised_pnl": unrealised,
+                "notional": notional,
+                "margin": margin,
+                "target_notional": symbol_target,
+                "liquidation_buffer_fraction": liquidation_buffer,
             }
             if funding_applied is not None:
-                receipt.update(
-                    {"funding_applied": funding_applied, "funding_pnl": funding_amount}
-                )
+                receipt.update({"funding_applied": funding_applied, "funding_pnl": funding_amount})
             receipts.append(receipt)
 
         final_equity, unrealised, _ = self._equity(cash, positions, marks)
+        target_report = target_value if target_value is not None else None
+        implementation_shortfall = fees + spread + slippage
         return FuturesAccountingReport(
             initial_equity=starting_cash,
             final_equity=final_equity,
@@ -625,6 +741,19 @@ class FuturesIncomeAccounting:
             liquidation=liquidation,
             effective_observations=observations + fills,
             event_receipts=tuple(receipts),
+            turnover_notional=turnover_notional,
+            implementation_shortfall=implementation_shortfall,
+            capital_efficiency=(
+                (final_equity - starting_cash) / turnover_notional
+                if turnover_notional > 0.0
+                else 0.0
+            ),
+            funding_adjusted_expectancy=(
+                (final_equity - starting_cash) / fills if fills > 0 else 0.0
+            ),
+            margin_mode=margin_mode,
+            target_notional=target_report,
+            liquidation_buffer_fraction=liquidation_buffer,
         )
 
     @staticmethod

@@ -213,6 +213,26 @@ def test_profile_enforces_effective_sample_and_quantitative_tail_limits() -> Non
     )
 
 
+def test_evidence_profiles_select_the_most_specific_product_horizon_policy() -> None:
+    policy = EvidencePolicy(
+        profiles=(
+            EvidenceProfile(stage="forward", product_id="*", family="swing"),
+            EvidenceProfile(
+                stage="forward",
+                product_id="active_income",
+                family="swing",
+                minimum_closed_trades=20,
+            ),
+        )
+    )
+
+    selected = policy.profile_for(
+        "forward", product_id="active_income", family="swing", horizon="1d"
+    )
+
+    assert selected.minimum_closed_trades == 20
+
+
 def test_protected_holdout_allows_configured_moderate_degradation() -> None:
     profile = EvidenceProfile(allowed_holdout_degradation=0.50)
     assert (
@@ -360,6 +380,44 @@ def test_btc_accounting_converts_bnb_fee_and_enforces_core_reserve() -> None:
         )
 
 
+def test_btc_accounting_tracks_external_flows_and_tactical_limit() -> None:
+    report = BtcAccumulationAccounting().evaluate(
+        initial_btc=1.0,
+        initial_price=100.0,
+        external_events=(
+            {
+                "type": "deposit",
+                "timestamp": NOW,
+                "asset": "USDT",
+                "amount": 100.0,
+            },
+            {
+                "type": "withdrawal",
+                "timestamp": "2026-08-30T10:01:00+00:00",
+                "asset": "USDT",
+                "amount": 100.0,
+            },
+        ),
+        marks=(
+            {"timestamp": NOW, "price": 100.0},
+            {"timestamp": "2026-08-30T10:01:00+00:00", "price": 100.0},
+        ),
+        max_tactical_fraction=0.5,
+    )
+
+    assert report.excess_btc == pytest.approx(0.0)
+    assert report.external_deposits_btc == pytest.approx(1.0)
+    assert report.external_withdrawals_btc == pytest.approx(1.0)
+    with pytest.raises(ProductAccountingError, match="tactical allocation"):
+        BtcAccumulationAccounting().evaluate(
+            initial_btc=1.0,
+            initial_price=100.0,
+            trade_events=({"timestamp": NOW, "side": "sell", "quantity": 0.3, "price": 100.0},),
+            marks=({"timestamp": NOW, "price": 100.0},),
+            max_tactical_fraction=0.2,
+        )
+
+
 def test_product_objective_rejects_positive_usdt_result_that_loses_btc() -> None:
     assert not objective_passes(
         {
@@ -477,6 +535,35 @@ def test_futures_accounting_reports_leverage_and_margin_policy_violations() -> N
 
     assert report.capacity_violations >= 1
     assert report.max_leverage == pytest.approx(2.0)
+
+
+def test_futures_accounting_reports_target_notional_and_shortfall_metrics() -> None:
+    report = FuturesIncomeAccounting().evaluate(
+        initial_cash=1_000.0,
+        leverage=2.0,
+        target_notional={"BTCUSDT": 100.0},
+        liquidation_buffer_fraction=0.05,
+        events=(
+            {
+                "type": "fill",
+                "timestamp": NOW,
+                "symbol": "BTCUSDT",
+                "side": "buy",
+                "quantity": 2.0,
+                "price": 100.0,
+                "requested_quantity": 3.0,
+                "fee": 1.0,
+                "reference_price": 99.0,
+            },
+        ),
+    )
+
+    assert report.capacity_violations >= 1
+    assert report.partial_fills == 1
+    assert report.margin_mode == "isolated"
+    assert report.liquidation_buffer_fraction == pytest.approx(0.05)
+    assert report.implementation_shortfall == pytest.approx(3.0)
+    assert report.turnover_notional == pytest.approx(200.0)
 
 
 def test_short_forecast_is_ranked_and_allocated_after_funding() -> None:
