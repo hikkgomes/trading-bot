@@ -47,6 +47,7 @@ _ALLOWED_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
             OrderStatus.PARTIALLY_FILLED,
             OrderStatus.FILLED,
             OrderStatus.CANCEL_PENDING,
+            OrderStatus.EXPIRED,
             OrderStatus.RECOVERY_REQUIRED,
         }
     ),
@@ -55,6 +56,7 @@ _ALLOWED_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
             OrderStatus.CANCELLED,
             OrderStatus.PARTIALLY_FILLED,
             OrderStatus.FILLED,
+            OrderStatus.EXPIRED,
             OrderStatus.RECOVERY_REQUIRED,
         }
     ),

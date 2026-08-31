@@ -147,6 +147,10 @@ class DatabaseExecutionWorker:
                     "accounting_asset": configuration["base_accounting_asset"],
                     "fee_in_base": product_id == "btc_accumulation",
                     "order_group_id": order.group_id,
+                    "strategy_version_ids": sorted(order.strategy_contributions),
+                    "assignment_id": order.metadata.get("target_metadata", {}).get("assignment_id")
+                    if isinstance(order.metadata.get("target_metadata"), Mapping)
+                    else None,
                     **(
                         {"fill_fraction": float(configuration["fill_fraction"])}
                         if "fill_fraction" in configuration
@@ -481,6 +485,19 @@ class DatabasePaperExecutionWorker:
                     "job_id": claimed.job_id,
                     "order_id": order.order_id,
                     "fill_id": fill_id,
+                }
+            if now >= order.valid_until and not order.is_terminal:
+                self.order_manager.transition(
+                    order.order_id,
+                    OrderStatus.EXPIRED,
+                    event_at=now,
+                )
+                self.queue.complete(claimed, completed_at=now)
+                return {
+                    "reason_code": "paper_order_expired",
+                    "job_id": claimed.job_id,
+                    "order_id": order.order_id,
+                    "valid_until": order.valid_until,
                 }
             previous_position = self.positions.get(order.portfolio_id, order.instrument_id)
             costs = dict(payload["execution_costs"])
@@ -1099,6 +1116,7 @@ def _same_order_identity(existing, planned) -> bool:
         "quantity",
         "order_type",
         "created_at",
+        "valid_until",
         "limit_price",
         "reduce_only",
         "group_id",

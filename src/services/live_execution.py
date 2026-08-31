@@ -442,6 +442,7 @@ class ApprovedLiveExecution:
             if not callable(supports_stops) or not supports_stops():
                 raise PermissionError("live futures entry requires native protective stops")
         requested_strategy_id = str(payload.get("strategy_version_id") or "")
+        requested_assignment_id = str(payload.get("assignment_id") or "")
         live_assignments = self.assignments.active_assignments(product_id, at=authority_at)
         current_assignment = next(
             (
@@ -449,6 +450,7 @@ class ApprovedLiveExecution:
                 for item in live_assignments
                 if item["execution_mode"] == "live"
                 and item.get("instrument_id") == order.instrument_id
+                and (not requested_assignment_id or item["id"] == requested_assignment_id)
                 and (
                     not requested_strategy_id
                     or item["strategy_version_id"] == requested_strategy_id
@@ -463,6 +465,8 @@ class ApprovedLiveExecution:
             and requested_strategy_id != current_assignment["strategy_version_id"]
         ):
             raise PermissionError("live order strategy identity does not match assignment")
+        if requested_assignment_id and requested_assignment_id != current_assignment["id"]:
+            raise PermissionError("live order assignment identity does not match assignment")
         requested_artefact_hash = str(payload.get("artefact_hash") or "")
         if (
             requested_artefact_hash
