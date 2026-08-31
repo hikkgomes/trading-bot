@@ -664,32 +664,39 @@ def _risk_control_invalid_reasons(
     return reasons
 
 
-def _embedded_preflight_invalid_reasons(
-    payload: dict[str, Any], expected_product: ProductConfig | None
-) -> list[str]:
-    if expected_product is None or "preflight" not in payload:
-        return []
+def _embedded_preflight_context(
+    payload: dict[str, Any],
+    expected_product: ProductConfig,
+) -> tuple[list[str], dict[str, Any] | None]:
     preflight = payload.get("preflight")
     if not isinstance(preflight, dict):
-        return ["embedded_preflight_invalid"]
+        return ["embedded_preflight_invalid"], None
     reasons: list[str] = []
     if preflight.get("ok") is not True:
         reasons.append("embedded_preflight_failed")
     products = preflight.get("products")
     if not isinstance(products, list):
-        return [*reasons, "embedded_preflight_products_invalid"]
+        return [*reasons, "embedded_preflight_products_invalid"], None
     matched = None
     for item in products:
         if not isinstance(item, dict):
-            return [*reasons, "embedded_preflight_products_invalid"]
+            return [*reasons, "embedded_preflight_products_invalid"], None
         item_product = item.get("product")
         if not isinstance(item_product, dict):
-            return [*reasons, "embedded_preflight_product_invalid"]
+            return [*reasons, "embedded_preflight_product_invalid"], None
         if item_product.get("name") == expected_product.name:
             matched = item
             break
     if matched is None:
-        return [*reasons, "embedded_preflight_missing_product"]
+        return [*reasons, "embedded_preflight_missing_product"], None
+    return reasons, matched
+
+
+def _embedded_preflight_product_artifact_reasons(
+    matched: dict[str, Any],
+    expected_product: ProductConfig,
+) -> list[str]:
+    reasons: list[str] = []
     if matched.get("ok") is not True:
         reasons.append("embedded_preflight_product_failed")
     reported_product = matched.get("product")
@@ -713,104 +720,146 @@ def _embedded_preflight_invalid_reasons(
         else:
             if current_digest != reported_digest:
                 reasons.append("embedded_preflight_artifact_digest_mismatch")
+    return reasons
+
+
+def _embedded_preflight_check(
+    checks: list[Any],
+    name: str,
+) -> dict[str, Any] | None:
+    return next(
+        (
+            check
+            for check in checks
+            if isinstance(check, dict) and check.get("name") == name
+        ),
+        None,
+    )
+
+
+def _embedded_preflight_stop_reasons(checks: list[Any]) -> list[str]:
+    capability_check = _embedded_preflight_check(checks, "broker_native_protective_stops")
+    if capability_check is None:
+        return ["embedded_preflight_missing_native_stop_capability"]
+    if capability_check.get("ok") is not True:
+        return ["embedded_preflight_native_stop_capability_failed"]
+    detail = capability_check.get("detail")
+    if not isinstance(detail, dict) or detail.get("supported") is not True:
+        return ["embedded_preflight_native_stop_capability_invalid"]
+    return []
+
+
+def _embedded_preflight_position_mode_reasons(
+    checks: list[Any],
+    expected_product: ProductConfig,
+) -> list[str]:
+    position_mode_check = _embedded_preflight_check(
+        checks,
+        "broker_position_mode_one_way",
+    )
+    if position_mode_check is None:
+        return ["embedded_preflight_missing_one_way_position_mode"]
+    if position_mode_check.get("ok") is not True:
+        return ["embedded_preflight_one_way_position_mode_failed"]
+    detail = position_mode_check.get("detail")
+    if (
+        not isinstance(detail, dict)
+        or detail.get("one_way") is not True
+        or str(detail.get("symbol") or "").upper() != expected_product.symbol.upper()
+    ):
+        return ["embedded_preflight_one_way_position_mode_invalid"]
+    return []
+
+
+def _embedded_preflight_open_order_reasons(
+    checks: list[Any],
+    expected_product: ProductConfig,
+) -> list[str]:
+    open_orders_check = _embedded_preflight_check(checks, "broker_open_orders_empty")
+    if open_orders_check is None:
+        return ["embedded_preflight_missing_open_order_inventory"]
+    if open_orders_check.get("ok") is not True:
+        return ["embedded_preflight_open_order_inventory_failed"]
+    inventory_detail = open_orders_check.get("detail")
+    if not isinstance(inventory_detail, dict):
+        return ["embedded_preflight_open_order_inventory_invalid"]
+    if (
+        inventory_detail.get("scope") != "whole_account"
+        or str(inventory_detail.get("configured_symbol") or "").upper()
+        != expected_product.symbol.upper()
+    ):
+        return ["embedded_preflight_open_order_inventory_invalid"]
+    for order_kind in ("regular", "conditional"):
+        inventory = inventory_detail.get(order_kind)
+        if not isinstance(inventory, dict):
+            return ["embedded_preflight_open_order_inventory_invalid"]
+        count = inventory.get("count")
+        orders = inventory.get("orders")
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count != 0
+            or not isinstance(orders, list)
+            or orders
+        ):
+            return ["embedded_preflight_open_order_inventory_invalid"]
+    return []
+
+
+def _embedded_preflight_position_inventory_reasons(
+    checks: list[Any],
+    expected_product: ProductConfig,
+) -> list[str]:
+    position_inventory_check = _embedded_preflight_check(checks, "broker_position_flat")
+    if position_inventory_check is None:
+        return ["embedded_preflight_missing_position_inventory"]
+    if position_inventory_check.get("ok") is not True:
+        return ["embedded_preflight_position_inventory_failed"]
+    position_inventory = position_inventory_check.get("detail")
+    if (
+        not isinstance(position_inventory, dict)
+        or position_inventory.get("scope") != "whole_account"
+        or str(position_inventory.get("configured_symbol") or "").upper()
+        != expected_product.symbol.upper()
+        or position_inventory.get("count") != 0
+        or position_inventory.get("positions") != []
+    ):
+        return ["embedded_preflight_position_inventory_invalid"]
+    return []
+
+
+def _embedded_preflight_futures_reasons(
+    matched: dict[str, Any],
+    expected_product: ProductConfig,
+) -> list[str]:
+    checks = matched.get("checks")
+    if not isinstance(checks, list):
+        return ["embedded_preflight_checks_invalid"]
+    for checker in (
+        lambda: _embedded_preflight_stop_reasons(checks),
+        lambda: _embedded_preflight_position_mode_reasons(checks, expected_product),
+        lambda: _embedded_preflight_open_order_reasons(checks, expected_product),
+        lambda: _embedded_preflight_position_inventory_reasons(checks, expected_product),
+    ):
+        reasons = checker()
+        if reasons:
+            return reasons
+    return []
+
+
+def _embedded_preflight_invalid_reasons(
+    payload: dict[str, Any], expected_product: ProductConfig | None
+) -> list[str]:
+    if expected_product is None or "preflight" not in payload:
+        return []
+    reasons, matched = _embedded_preflight_context(payload, expected_product)
+    if matched is None:
+        return reasons
+    reasons.extend(_embedded_preflight_product_artifact_reasons(matched, expected_product))
     if reasons:
         return reasons
     if expected_product.objective == "active_income" and expected_product.market == "futures":
-        checks = matched.get("checks")
-        if not isinstance(checks, list):
-            return ["embedded_preflight_checks_invalid"]
-        capability_check = next(
-            (
-                check
-                for check in checks
-                if isinstance(check, dict) and check.get("name") == "broker_native_protective_stops"
-            ),
-            None,
-        )
-        if capability_check is None:
-            return ["embedded_preflight_missing_native_stop_capability"]
-        if capability_check.get("ok") is not True:
-            return ["embedded_preflight_native_stop_capability_failed"]
-        detail = capability_check.get("detail")
-        if not isinstance(detail, dict) or detail.get("supported") is not True:
-            return ["embedded_preflight_native_stop_capability_invalid"]
-        position_mode_check = next(
-            (
-                check
-                for check in checks
-                if isinstance(check, dict) and check.get("name") == "broker_position_mode_one_way"
-            ),
-            None,
-        )
-        if position_mode_check is None:
-            return ["embedded_preflight_missing_one_way_position_mode"]
-        if position_mode_check.get("ok") is not True:
-            return ["embedded_preflight_one_way_position_mode_failed"]
-        position_mode_detail = position_mode_check.get("detail")
-        if (
-            not isinstance(position_mode_detail, dict)
-            or position_mode_detail.get("one_way") is not True
-            or str(position_mode_detail.get("symbol") or "").upper()
-            != expected_product.symbol.upper()
-        ):
-            return ["embedded_preflight_one_way_position_mode_invalid"]
-        open_orders_check = next(
-            (
-                check
-                for check in checks
-                if isinstance(check, dict) and check.get("name") == "broker_open_orders_empty"
-            ),
-            None,
-        )
-        if open_orders_check is None:
-            return ["embedded_preflight_missing_open_order_inventory"]
-        if open_orders_check.get("ok") is not True:
-            return ["embedded_preflight_open_order_inventory_failed"]
-        inventory_detail = open_orders_check.get("detail")
-        if not isinstance(inventory_detail, dict):
-            return ["embedded_preflight_open_order_inventory_invalid"]
-        if (
-            inventory_detail.get("scope") != "whole_account"
-            or str(inventory_detail.get("configured_symbol") or "").upper()
-            != expected_product.symbol.upper()
-        ):
-            return ["embedded_preflight_open_order_inventory_invalid"]
-        for order_kind in ("regular", "conditional"):
-            inventory = inventory_detail.get(order_kind)
-            if not isinstance(inventory, dict):
-                return ["embedded_preflight_open_order_inventory_invalid"]
-            count = inventory.get("count")
-            orders = inventory.get("orders")
-            if (
-                isinstance(count, bool)
-                or not isinstance(count, int)
-                or count != 0
-                or not isinstance(orders, list)
-                or orders
-            ):
-                return ["embedded_preflight_open_order_inventory_invalid"]
-        position_inventory_check = next(
-            (
-                check
-                for check in checks
-                if isinstance(check, dict) and check.get("name") == "broker_position_flat"
-            ),
-            None,
-        )
-        if position_inventory_check is None:
-            return ["embedded_preflight_missing_position_inventory"]
-        if position_inventory_check.get("ok") is not True:
-            return ["embedded_preflight_position_inventory_failed"]
-        position_inventory = position_inventory_check.get("detail")
-        if (
-            not isinstance(position_inventory, dict)
-            or position_inventory.get("scope") != "whole_account"
-            or str(position_inventory.get("configured_symbol") or "").upper()
-            != expected_product.symbol.upper()
-            or position_inventory.get("count") != 0
-            or position_inventory.get("positions") != []
-        ):
-            return ["embedded_preflight_position_inventory_invalid"]
+        return _embedded_preflight_futures_reasons(matched, expected_product)
     return reasons
 
 
