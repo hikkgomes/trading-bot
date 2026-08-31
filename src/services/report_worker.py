@@ -152,7 +152,13 @@ class DatabaseReportWorker:
         operations = report.get("operations", {})
         slis = operations.get("slis", {})
         emitted: list[str] = []
-        age_by_state = funnel.get("candidate_age_by_state", {})
+        emitted.extend(self._funnel_alerts(funnel, now=now))
+        emitted.extend(self._risk_alerts(slis, now=now))
+        emitted.extend(self._resource_alerts(operations, now=now))
+        return emitted
+
+    def _funnel_alerts(self, funnel: Mapping[str, Any], *, now: str) -> list[str]:
+        emitted: list[str] = []
         blocking_states = {
             "queued",
             "screening",
@@ -161,6 +167,7 @@ class DatabaseReportWorker:
             "waiting_for_dataset:robustness",
             "waiting_for_dataset:protected_holdout",
         }
+        age_by_state = funnel.get("candidate_age_by_state", {})
         progressed = sum(
             int(values.get("count", 0))
             for state, values in age_by_state.items()
@@ -207,9 +214,7 @@ class DatabaseReportWorker:
                     target="research",
                     message="research candidates have no active job or waiting reason",
                     now=now,
-                    payload={
-                        "candidate_ids": funnel["candidates_without_job_or_reason"],
-                    },
+                    payload={"candidate_ids": funnel["candidates_without_job_or_reason"]},
                 )
             )
         schedule_progress = funnel.get("scheduled_versus_started_jobs", {})
@@ -225,6 +230,10 @@ class DatabaseReportWorker:
                     payload={"scheduled_versus_started_jobs": schedule_progress},
                 )
             )
+        return emitted
+
+    def _risk_alerts(self, slis: Mapping[str, Any], *, now: str) -> list[str]:
+        emitted: list[str] = []
         if int(slis.get("unresolved_recovery_count", 0)) > 0:
             emitted.append(
                 self._emit(
@@ -237,45 +246,43 @@ class DatabaseReportWorker:
                     payload={"recovery": slis.get("unresolved_recovery", {})},
                 )
             )
-        stale_account = slis.get("stale_account_authority", {})
-        if int(stale_account.get("count", 0)) > 0:
-            emitted.append(
-                self._emit(
-                    event_type="account_authority_stale",
-                    severity=AlertSeverity.CRITICAL,
-                    dedupe_key="risk:stale-account-authority",
-                    target="account-reconciliation",
-                    message="authenticated account authority is stale or unknown",
-                    now=now,
-                    payload={"stale_account_authority": stale_account},
+        checks = (
+            (
+                "stale_account_authority",
+                "account_authority_stale",
+                "risk:stale-account-authority",
+                "account-reconciliation",
+                "authenticated account authority is stale or unknown",
+            ),
+            (
+                "stale_market_data",
+                "market_data_stale",
+                "risk:stale-market-data",
+                "market-gateway",
+                "market data authority is stale",
+            ),
+            (
+                "missing_risk_data",
+                "risk_state_data_missing",
+                "risk:state-data-missing",
+                "portfolio-state-service",
+                "portfolio risk state contains unavailable measurements",
+            ),
+        )
+        for value_key, event_type, dedupe_key, target, message in checks:
+            value = slis.get(value_key, {})
+            if int(value.get("count", 0)) > 0:
+                emitted.append(
+                    self._emit(
+                        event_type=event_type,
+                        severity=AlertSeverity.CRITICAL,
+                        dedupe_key=dedupe_key,
+                        target=target,
+                        message=message,
+                        now=now,
+                        payload={value_key: value},
+                    )
                 )
-            )
-        stale_market = slis.get("stale_market_data", {})
-        if int(stale_market.get("count", 0)) > 0:
-            emitted.append(
-                self._emit(
-                    event_type="market_data_stale",
-                    severity=AlertSeverity.CRITICAL,
-                    dedupe_key="risk:stale-market-data",
-                    target="market-gateway",
-                    message="market data authority is stale",
-                    now=now,
-                    payload={"stale_market_data": stale_market},
-                )
-            )
-        missing_risk = slis.get("missing_risk_data", {})
-        if int(missing_risk.get("count", 0)) > 0:
-            emitted.append(
-                self._emit(
-                    event_type="risk_state_data_missing",
-                    severity=AlertSeverity.CRITICAL,
-                    dedupe_key="risk:state-data-missing",
-                    target="portfolio-state-service",
-                    message="portfolio risk state contains unavailable measurements",
-                    now=now,
-                    payload={"missing_risk_data": missing_risk},
-                )
-            )
         conflicts = slis.get("execution_authority_conflicts", {})
         if conflicts.get("conflict") is True:
             emitted.append(
@@ -289,6 +296,10 @@ class DatabaseReportWorker:
                     payload={"execution_authority_conflicts": conflicts},
                 )
             )
+        return emitted
+
+    def _resource_alerts(self, operations: Mapping[str, Any], *, now: str) -> list[str]:
+        emitted: list[str] = []
         disk = operations.get("disk", {})
         if isinstance(disk, Mapping) and disk.get("healthy") is False:
             emitted.append(
