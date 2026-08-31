@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 import statistics
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from sqlalchemy import select
@@ -27,6 +27,28 @@ from src.services.accounting_service import AccountingService
 from src.services.portfolio_engine import _canonical_portfolio_state
 from src.services.risk_state import PortfolioRiskCalculator
 from src.services.scheduler import DatabaseJobQueue
+
+
+def _live_balance_ready(payload: Mapping[str, Any] | None) -> bool:
+    if payload is None:
+        return False
+    required = {
+        "account_state_known",
+        "account_state_authority",
+        "used_margin_fraction",
+        "liquidation_buffer_fraction",
+        "unknown_exposure",
+        "positions",
+        "regular_orders",
+        "conditional_orders",
+        "account_mode",
+    }
+    return (
+        required.issubset(payload)
+        and payload.get("account_state_known") is True
+        and payload.get("account_state_authority")
+        in {"authenticated_rest", "authenticated_reconciled"}
+    )
 
 
 class DatabasePortfolioSourceService:
@@ -73,26 +95,8 @@ class DatabasePortfolioSourceService:
         account_id = str(product["account_id"])
         now = timestamp(now, field="now")
         balance_payload, balance_at = self._latest_payload(balance_snapshot, account_id, now)
-        if product.get("execution_mode") == "live":
-            required_authority = {
-                "account_state_known",
-                "account_state_authority",
-                "used_margin_fraction",
-                "liquidation_buffer_fraction",
-                "unknown_exposure",
-                "positions",
-                "regular_orders",
-                "conditional_orders",
-                "account_mode",
-            }
-            if (
-                balance_payload is None
-                or not required_authority.issubset(balance_payload)
-                or balance_payload.get("account_state_known") is not True
-                or balance_payload.get("account_state_authority")
-                not in {"authenticated_rest", "authenticated_reconciled"}
-            ):
-                return
+        if product.get("execution_mode") == "live" and not _live_balance_ready(balance_payload):
+            return
         positions, positions_at = self._positions(str(product["portfolio_id"]), now)
         open_orders, orders_at = self._open_orders(str(product["portfolio_id"]), now)
         market, market_at = self._market(product_id, now)
@@ -437,18 +441,65 @@ class DatabasePortfolioSourceService:
         return tuple(latest[key] for key in sorted(latest)), latest_at
 
     def _market(self, product_id: str, at: str) -> tuple[dict[str, dict[str, Any]], str | None]:
+        product = self.products.get(product_id, {})
+        account = self.accounts.get(str(product.get("account_id")), {})
+        market_type = "spot" if account.get("market") == "spot" else "futures"
+        rows = self._market_rows(at)
+        latest_values: dict[str, dict[str, Any]] = {}
+        latest_times: dict[str, str] = {}
+        field_times: dict[str, dict[str, str]] = {}
+        close_history: dict[str, list[float]] = {}
+        for row in rows:
+            self._capture_market_row(
+                row,
+                product_id=product_id,
+                latest_values=latest_values,
+                latest_times=latest_times,
+                field_times=field_times,
+                close_history=close_history,
+            )
+        return self._complete_market(
+            latest_values=latest_values,
+            latest_times=latest_times,
+            field_times=field_times,
+            close_history=close_history,
+            market_type=market_type,
+            product=product,
+            at=at,
+        )
+
+    def _market_rows(self, at: str):
         with self.engine.connect() as connection:
-            rows = connection.execute(
+            return connection.execute(
                 select(risk_snapshot.c.payload, risk_snapshot.c.created_at)
                 .where(risk_snapshot.c.created_at <= at)
                 .order_by(risk_snapshot.c.created_at.desc(), risk_snapshot.c.id.desc())
             ).mappings()
-        market: dict[str, dict[str, Any]] = {}
-        product = self.products.get(product_id, {})
-        account = self.accounts.get(str(product.get("account_id")), {})
-        market_type = "spot" if account.get("market") == "spot" else "futures"
-        latest_at: str | None = None
-        fields = {
+
+    @staticmethod
+    def _capture_market_row(
+        row: Mapping[str, Any],
+        *,
+        product_id: str,
+        latest_values: dict[str, dict[str, Any]],
+        latest_times: dict[str, str],
+        field_times: dict[str, dict[str, str]],
+        close_history: dict[str, list[float]],
+    ) -> None:
+        payload = row["payload"]
+        if not isinstance(payload, dict) or payload.get("kind") != "market_data_input":
+            return
+        if str(payload.get("product_id")) != product_id:
+            return
+        instrument_id = str(payload.get("instrument_id") or "")
+        raw = payload.get("values")
+        if not instrument_id or not isinstance(raw, Mapping):
+            return
+        values = latest_values.setdefault(instrument_id, {})
+        close = _number(raw.get("close", raw.get("price")))
+        if close > 0:
+            close_history.setdefault(instrument_id, []).append(close)
+        for source_name, target_name in {
             "close": "price",
             "price": "price",
             "spread_bps": "spread_bps",
@@ -456,70 +507,40 @@ class DatabasePortfolioSourceService:
             "volatility": "volatility",
             "funding": "funding",
             "funding_rate": "funding",
-        }
-        latest_values: dict[str, dict[str, Any]] = {}
-        latest_times: dict[str, str] = {}
-        field_times: dict[str, dict[str, str]] = {}
-        close_history: dict[str, list[float]] = {}
-        for row in rows:
-            payload = row["payload"]
-            if not isinstance(payload, dict) or payload.get("kind") != "market_data_input":
+        }.items():
+            if target_name in values or source_name not in raw:
                 continue
-            if str(payload.get("product_id")) != product_id:
+            value = _number(raw[source_name])
+            if not math.isfinite(value):
                 continue
-            instrument_id = str(payload.get("instrument_id") or "")
-            if not instrument_id:
-                continue
-            raw = payload.get("values")
-            if not isinstance(raw, Mapping):
-                continue
-            values = latest_values.setdefault(instrument_id, {})
-            close = raw.get("close", raw.get("price"))
-            try:
-                close_value = float(close)
-            except (TypeError, ValueError):
-                close_value = 0.0
-            if close_value > 0 and close_value == close_value:
-                close_history.setdefault(instrument_id, []).append(close_value)
-            for source_name, target_name in fields.items():
-                if target_name in values or source_name not in raw:
-                    continue
-                try:
-                    value = float(raw[source_name])
-                except (TypeError, ValueError):
-                    continue
-                if value != value or value in (float("inf"), float("-inf")):
-                    continue
-                values[target_name] = value
-                field_times.setdefault(instrument_id, {})[target_name] = str(row["created_at"])
-                latest_times.setdefault(instrument_id, str(row["created_at"]))
+            values[target_name] = value
+            field_times.setdefault(instrument_id, {})[target_name] = str(row["created_at"])
+            latest_times.setdefault(instrument_id, str(row["created_at"]))
+
+    @staticmethod
+    def _complete_market(
+        *,
+        latest_values: dict[str, dict[str, Any]],
+        latest_times: Mapping[str, str],
+        field_times: Mapping[str, Mapping[str, str]],
+        close_history: Mapping[str, list[float]],
+        market_type: str,
+        product: Mapping[str, Any],
+        at: str,
+    ) -> tuple[dict[str, dict[str, Any]], str | None]:
         required = {"price", "spread_bps", "visible_depth", "volatility"}
-        if market_type == "futures":
-            required.add("funding")
+        market: dict[str, dict[str, Any]] = {}
+        latest_at: str | None = None
         for instrument_id, values in latest_values.items():
-            if "volatility" not in values:
-                closes = list(reversed(close_history.get(instrument_id, [])))
-                returns = [
-                    closes[index] / closes[index - 1] - 1.0
-                    for index in range(1, len(closes))
-                    if closes[index - 1] > 0
-                ]
-                if len(returns) >= 2:
-                    values["volatility"] = statistics.pstdev(returns)
-            if market_type == "spot":
-                # Funding is not a spot market requirement. Supplying a zero
-                # value keeps downstream risk payloads structurally uniform.
-                values.setdefault("funding", 0.0)
-            else:
-                funding_at = field_times.get(instrument_id, {}).get("funding")
-                if funding_at is None:
-                    continue
-                funding_age = (
-                    dt.datetime.fromisoformat(at) - dt.datetime.fromisoformat(funding_at)
-                ).total_seconds()
-                maximum_funding_age = float(product.get("maximum_funding_age_seconds", 28_800))
-                if funding_age < 0 or funding_age > maximum_funding_age:
-                    continue
+            _fill_market_volatility(values, close_history.get(instrument_id, ()))
+            if not _funding_is_current(
+                values,
+                field_times.get(instrument_id, {}),
+                market_type=market_type,
+                product=product,
+                at=at,
+            ):
+                continue
             if not required.issubset(values):
                 continue
             values["market_type"] = market_type
@@ -772,113 +793,118 @@ class DatabasePortfolioStateWorker:
         if claimed is None:
             return {"reason_code": "portfolio_state_queue_empty"}
         try:
-            source_ids = claimed.payload.get("source_snapshot_ids")
-            if not isinstance(source_ids, Mapping) or set(source_ids) != self.REQUIRED_SOURCES:
-                raise ValueError("portfolio state source snapshot identities are incomplete")
-            policy_hash = str(claimed.payload.get("risk_policy_hash") or "")
-            expected_job_id = (
-                self.job_id_prefix
-                + ":"
-                + canonical_hash(
-                    {
-                        "product_id": str(claimed.payload["product_id"]),
-                        "source_snapshot_ids": dict(source_ids),
-                        "risk_policy_hash": policy_hash,
-                    }
-                ).removeprefix("sha256:")
-            )
-            if claimed.job_id != expected_job_id:
-                raise ValueError("portfolio state job identity is not content-addressed")
-            assembled: dict[str, Any] = {
-                "kind": "canonical_portfolio_risk_state",
-                "product_id": str(claimed.payload["product_id"]),
-                "source_snapshot_ids": dict(source_ids),
-                "risk_policy_hash": policy_hash,
-            }
-            source_observed_at: list[str] = []
-            for source, identity in source_ids.items():
-                snapshot = self.store.get(str(identity))
-                if snapshot.get("kind") not in {source, f"{source}_snapshot"}:
-                    raise ValueError(f"portfolio state {source} snapshot has the wrong kind")
-                if str(snapshot.get("product_id") or "") != assembled["product_id"]:
-                    raise ValueError(
-                        f"portfolio state {source} snapshot belongs to another product"
-                    )
-                observed_at = snapshot.get("observed_at", snapshot.get("created_at"))
-                if observed_at is None:
-                    raise ValueError(f"portfolio state {source} snapshot has no timestamp")
-                source_observed_at.append(
-                    timestamp(str(observed_at), field=f"{source}.observed_at")
-                )
-                values = snapshot.get("values", snapshot)
-                if not isinstance(values, Mapping):
-                    raise ValueError(f"portfolio state {source} snapshot has no values")
-                for key, value in values.items():
-                    if key not in {"kind", "product_id", "observed_at", "created_at"}:
-                        assembled[str(key)] = value
-            latest_source_at = max(source_observed_at)
-            claimed_observed_at = timestamp(
-                str(claimed.payload.get("observed_at")), field="observed_at"
-            )
-            if claimed_observed_at != latest_source_at:
-                raise ValueError("portfolio state observed_at is not the latest source timestamp")
-            assembled["observed_at"] = latest_source_at
-            policy = claimed.payload.get("risk_policy")
-            if not isinstance(policy, Mapping):
-                raise ValueError("portfolio state job requires immutable risk policy values")
-            if str(claimed.payload.get("risk_policy_hash") or "") != canonical_hash(dict(policy)):
-                raise ValueError("portfolio state risk policy hash is invalid")
-            measured_fields = {
-                key: assembled[key]
-                for key in {
-                    "product_drawdown_fraction",
-                    "daily_pnl_fraction",
-                    "global_drawdown_fraction",
-                    "trades_today",
-                    "correlations",
-                    "beta",
-                    "clusters",
-                    "cluster_fraction_caps",
-                    "open_exposure_fraction",
-                    "pending_exposure_fraction",
-                }
-                if key in assembled
-            }
-            assembled.update(policy)
-            assembled.update(measured_fields)
-            state_id = self.publisher.publish(assembled)
+            state_id = self._assemble_state(claimed.payload, claimed.job_id)
         except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            if str(exc) == "exchange and database health are required for new exposure":
-                self.queue.complete(claimed, completed_at=now)
-                return {
-                    "reason_code": "portfolio_state_publish_rejected",
-                    "job_id": claimed.job_id,
-                    "error_type": type(exc).__name__,
-                    "error": error,
-                }
-            retry_at = (
-                (dt.datetime.fromisoformat(now) + dt.timedelta(seconds=self.lease_seconds))
-                .replace(microsecond=0)
-                .isoformat()
-            )
-            self.queue.fail(
-                claimed,
-                completed_at=now,
-                error=error,
-                retry_at=retry_at,
-            )
-            return {
-                "reason_code": "portfolio_state_publish_failed",
-                "job_id": claimed.job_id,
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            }
+            return self._handle_failure(claimed, now, exc)
         self.queue.complete(claimed, completed_at=now)
         return {
             "reason_code": "canonical_portfolio_state_published",
             "job_id": claimed.job_id,
             "state_id": state_id,
+        }
+
+    def _assemble_state(self, payload: Mapping[str, Any], job_id: str) -> str:
+        source_ids, policy_hash = self._validated_job_identity(payload, job_id)
+        product_id = str(payload["product_id"])
+        assembled: dict[str, Any] = {
+            "kind": "canonical_portfolio_risk_state",
+            "product_id": product_id,
+            "source_snapshot_ids": dict(source_ids),
+            "risk_policy_hash": policy_hash,
+        }
+        observed_at = []
+        for source, identity in source_ids.items():
+            observed_at.append(self._merge_source(assembled, source, str(identity)))
+        latest_source_at = max(observed_at)
+        claimed_observed_at = timestamp(str(payload.get("observed_at")), field="observed_at")
+        if claimed_observed_at != latest_source_at:
+            raise ValueError("portfolio state observed_at is not the latest source timestamp")
+        assembled["observed_at"] = latest_source_at
+        policy = payload.get("risk_policy")
+        if not isinstance(policy, Mapping):
+            raise ValueError("portfolio state job requires immutable risk policy values")
+        if policy_hash != canonical_hash(dict(policy)):
+            raise ValueError("portfolio state risk policy hash is invalid")
+        measured_fields = {
+            key: assembled[key]
+            for key in {
+                "product_drawdown_fraction",
+                "daily_pnl_fraction",
+                "global_drawdown_fraction",
+                "trades_today",
+                "correlations",
+                "beta",
+                "clusters",
+                "cluster_fraction_caps",
+                "open_exposure_fraction",
+                "pending_exposure_fraction",
+            }
+            if key in assembled
+        }
+        assembled.update(policy)
+        assembled.update(measured_fields)
+        return self.publisher.publish(assembled)
+
+    def _validated_job_identity(
+        self, payload: Mapping[str, Any], job_id: str
+    ) -> tuple[Mapping[str, Any], str]:
+        source_ids = payload.get("source_snapshot_ids")
+        if not isinstance(source_ids, Mapping) or set(source_ids) != self.REQUIRED_SOURCES:
+            raise ValueError("portfolio state source snapshot identities are incomplete")
+        policy_hash = str(payload.get("risk_policy_hash") or "")
+        expected_job_id = (
+            self.job_id_prefix
+            + ":"
+            + canonical_hash(
+                {
+                    "product_id": str(payload["product_id"]),
+                    "source_snapshot_ids": dict(source_ids),
+                    "risk_policy_hash": policy_hash,
+                }
+            ).removeprefix("sha256:")
+        )
+        if job_id != expected_job_id:
+            raise ValueError("portfolio state job identity is not content-addressed")
+        return source_ids, policy_hash
+
+    def _merge_source(self, assembled: dict[str, Any], source: str, identity: str) -> str:
+        snapshot = self.store.get(identity)
+        if snapshot.get("kind") not in {source, f"{source}_snapshot"}:
+            raise ValueError(f"portfolio state {source} snapshot has the wrong kind")
+        if str(snapshot.get("product_id") or "") != assembled["product_id"]:
+            raise ValueError(f"portfolio state {source} snapshot belongs to another product")
+        observed_at = snapshot.get("observed_at", snapshot.get("created_at"))
+        if observed_at is None:
+            raise ValueError(f"portfolio state {source} snapshot has no timestamp")
+        values = snapshot.get("values", snapshot)
+        if not isinstance(values, Mapping):
+            raise ValueError(f"portfolio state {source} snapshot has no values")
+        for key, value in values.items():
+            if key not in {"kind", "product_id", "observed_at", "created_at"}:
+                assembled[str(key)] = value
+        return timestamp(str(observed_at), field=f"{source}.observed_at")
+
+    def _handle_failure(self, claimed, now: str, exc: Exception) -> dict[str, Any]:
+        error = f"{type(exc).__name__}: {exc}"
+        if str(exc) == "exchange and database health are required for new exposure":
+            self.queue.complete(claimed, completed_at=now)
+            return {
+                "reason_code": "portfolio_state_publish_rejected",
+                "job_id": claimed.job_id,
+                "error_type": type(exc).__name__,
+                "error": error,
+            }
+        retry_at = (
+            (dt.datetime.fromisoformat(now) + dt.timedelta(seconds=self.lease_seconds))
+            .replace(microsecond=0)
+            .isoformat()
+        )
+        self.queue.fail(claimed, completed_at=now, error=error, retry_at=retry_at)
+        return {
+            "reason_code": "portfolio_state_publish_failed",
+            "job_id": claimed.job_id,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
         }
 
 
@@ -926,3 +952,35 @@ def _number(value: object) -> float:
     except (TypeError, ValueError):
         return 0.0
     return result if math.isfinite(result) else 0.0
+
+
+def _fill_market_volatility(values: dict[str, Any], history: Iterable[float]) -> None:
+    if "volatility" in values:
+        return
+    closes = list(reversed(history))
+    returns = [
+        closes[index] / closes[index - 1] - 1.0
+        for index in range(1, len(closes))
+        if closes[index - 1] > 0
+    ]
+    if len(returns) >= 2:
+        values["volatility"] = statistics.pstdev(returns)
+
+
+def _funding_is_current(
+    values: dict[str, Any],
+    field_times: Mapping[str, str],
+    *,
+    market_type: str,
+    product: Mapping[str, Any],
+    at: str,
+) -> bool:
+    if market_type == "spot":
+        values.setdefault("funding", 0.0)
+        return True
+    funding_at = field_times.get("funding")
+    if funding_at is None:
+        return False
+    age = (dt.datetime.fromisoformat(at) - dt.datetime.fromisoformat(funding_at)).total_seconds()
+    maximum_age = float(product.get("maximum_funding_age_seconds", 28_800))
+    return 0 <= age <= maximum_age
