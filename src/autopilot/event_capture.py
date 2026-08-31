@@ -83,7 +83,7 @@ def _positive_int(value: Any, *, field: str, maximum: int) -> int:
     return value
 
 
-def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig:
+def _load_capture_payload(path: Path) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"event capture config must be a regular non-symlink file: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -104,6 +104,84 @@ def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig
     }
     if unknown := sorted(set(payload) - allowed):
         raise ValueError(f"event capture config has unknown fields: {', '.join(unknown)}")
+    return payload
+
+
+def _source_core_values(index: int, item: Any) -> tuple[str, str, tuple[str, ...], tuple[str, ...]]:
+    if not isinstance(item, dict):
+        raise ValueError(f"sources[{index}] must be an object")
+    if unknown := sorted(
+        set(item)
+        - {
+            "market",
+            "url",
+            "symbols",
+            "dynamic_universe",
+            "streams",
+            "include_liquidations",
+            "max_dynamic_symbols",
+        }
+    ):
+        raise ValueError(f"sources[{index}] has unknown fields: {', '.join(unknown)}")
+    market = item.get("market")
+    if market not in {"spot", "futures"}:
+        raise ValueError(f"sources[{index}].market must be spot or futures")
+    url = item.get("url")
+    parsed = urlparse(str(url))
+    if parsed.scheme != "wss" or parsed.hostname not in ALLOWED_HOSTS:
+        raise ValueError(f"sources[{index}].url must be an approved Binance WSS endpoint")
+    symbols = item.get("symbols")
+    if not isinstance(symbols, list) or not symbols:
+        raise ValueError(f"sources[{index}].symbols must be a non-empty list")
+    normalized_symbols = tuple(str(symbol).upper() for symbol in symbols)
+    if any(not symbol.isalnum() or len(symbol) > 30 for symbol in normalized_symbols):
+        raise ValueError(f"sources[{index}] contains an invalid symbol")
+    streams = item.get("streams")
+    if not isinstance(streams, list) or not streams:
+        raise ValueError(f"sources[{index}].streams must be a non-empty list")
+    if invalid := sorted(set(map(str, streams)) - ALLOWED_STREAMS):
+        raise ValueError(f"sources[{index}] has unsupported streams: {', '.join(invalid)}")
+    return str(market), str(url).rstrip("/"), normalized_symbols, tuple(map(str, streams))
+
+
+def _source_flags(index: int, item: dict[str, Any], market: str) -> tuple[bool, bool]:
+    dynamic = item.get("dynamic_universe", False)
+    liquidations = item.get("include_liquidations", False)
+    if not isinstance(dynamic, bool) or not isinstance(liquidations, bool):
+        raise ValueError(f"sources[{index}] boolean fields must be JSON booleans")
+    if liquidations and market != "futures":
+        raise ValueError("liquidation stream is futures-only")
+    return dynamic, liquidations
+
+
+def _parse_event_source(index: int, item: Any, payload: dict[str, Any]) -> EventSource:
+    market, url, symbols, streams = _source_core_values(index, item)
+    dynamic, liquidations = _source_flags(index, item, market)
+    return EventSource(
+        market=market,
+        url=url,
+        symbols=symbols,
+        dynamic_universe=dynamic,
+        streams=streams,
+        include_liquidations=liquidations,
+        max_dynamic_symbols=_positive_int(
+            item.get("max_dynamic_symbols", payload.get("max_dynamic_symbols")),
+            field=f"sources[{index}].max_dynamic_symbols",
+            maximum=1_000,
+        ),
+    )
+
+
+def _parse_event_sources(payload: dict[str, Any]) -> tuple[EventSource, ...]:
+    sources_payload = payload.get("sources")
+    if not isinstance(sources_payload, list) or not sources_payload:
+        raise ValueError("event capture sources must be a non-empty list")
+    return tuple(
+        _parse_event_source(index, item, payload) for index, item in enumerate(sources_payload)
+    )
+
+
+def _capture_limits(payload: dict[str, Any]) -> tuple[int, int, float, int, int, int]:
     flush_seconds = payload.get("flush_seconds")
     if (
         isinstance(flush_seconds, bool)
@@ -112,65 +190,6 @@ def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig
         or not 0.1 <= float(flush_seconds) <= 30
     ):
         raise ValueError("flush_seconds must be in [0.1, 30]")
-    sources_payload = payload.get("sources")
-    if not isinstance(sources_payload, list) or not sources_payload:
-        raise ValueError("event capture sources must be a non-empty list")
-    sources: list[EventSource] = []
-    for index, item in enumerate(sources_payload):
-        if not isinstance(item, dict):
-            raise ValueError(f"sources[{index}] must be an object")
-        if unknown := sorted(
-            set(item)
-            - {
-                "market",
-                "url",
-                "symbols",
-                "dynamic_universe",
-                "streams",
-                "include_liquidations",
-                "max_dynamic_symbols",
-            }
-        ):
-            raise ValueError(f"sources[{index}] has unknown fields: {', '.join(unknown)}")
-        market = item.get("market")
-        if market not in {"spot", "futures"}:
-            raise ValueError(f"sources[{index}].market must be spot or futures")
-        url = item.get("url")
-        parsed = urlparse(str(url))
-        if parsed.scheme != "wss" or parsed.hostname not in ALLOWED_HOSTS:
-            raise ValueError(f"sources[{index}].url must be an approved Binance WSS endpoint")
-        symbols = item.get("symbols")
-        if not isinstance(symbols, list) or not symbols:
-            raise ValueError(f"sources[{index}].symbols must be a non-empty list")
-        normalized_symbols = tuple(str(symbol).upper() for symbol in symbols)
-        if any(not symbol.isalnum() or len(symbol) > 30 for symbol in normalized_symbols):
-            raise ValueError(f"sources[{index}] contains an invalid symbol")
-        streams = item.get("streams")
-        if not isinstance(streams, list) or not streams:
-            raise ValueError(f"sources[{index}].streams must be a non-empty list")
-        if invalid := sorted(set(map(str, streams)) - ALLOWED_STREAMS):
-            raise ValueError(f"sources[{index}] has unsupported streams: {', '.join(invalid)}")
-        dynamic = item.get("dynamic_universe", False)
-        liquidations = item.get("include_liquidations", False)
-        if not isinstance(dynamic, bool) or not isinstance(liquidations, bool):
-            raise ValueError(f"sources[{index}] boolean fields must be JSON booleans")
-        if liquidations and market != "futures":
-            raise ValueError("liquidation stream is futures-only")
-        sources.append(
-            EventSource(
-                market=market,
-                url=str(url).rstrip("/"),
-                symbols=normalized_symbols,
-                dynamic_universe=dynamic,
-                streams=tuple(map(str, streams)),
-                include_liquidations=liquidations,
-                max_dynamic_symbols=_positive_int(
-                    item.get("max_dynamic_symbols", payload.get("max_dynamic_symbols")),
-                    field=f"sources[{index}].max_dynamic_symbols",
-                    maximum=1_000,
-                ),
-            )
-        )
     max_file_bytes = _positive_int(
         payload.get("max_file_bytes"), field="max_file_bytes", maximum=2 * 1024**3
     )
@@ -179,21 +198,50 @@ def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig
     )
     if max_total_bytes < max_file_bytes:
         raise ValueError("max_total_bytes must be at least max_file_bytes")
+    max_dynamic_symbols = _positive_int(
+        payload.get("max_dynamic_symbols"), field="max_dynamic_symbols", maximum=100
+    )
+    retention_seconds = _positive_int(
+        payload.get("retention_seconds"), field="retention_seconds", maximum=365 * 86400
+    )
+    queue_max_events = _positive_int(
+        payload.get("queue_max_events"), field="queue_max_events", maximum=1_000_000
+    )
+    return (
+        max_file_bytes,
+        max_total_bytes,
+        float(flush_seconds),
+        max_dynamic_symbols,
+        retention_seconds,
+        queue_max_events,
+    )
+
+
+def _data_tier_budgets(payload: dict[str, Any]) -> tuple[tuple[str, int], ...]:
     raw_tiers = payload.get("data_tiers", {})
     if not isinstance(raw_tiers, dict):
         raise ValueError("data_tiers must be an object")
-    data_tier_budgets: list[tuple[str, int]] = []
+    budgets: list[tuple[str, int]] = []
     for name, value in sorted(raw_tiers.items()):
         if not isinstance(name, str) or not name.strip():
             raise ValueError("data_tiers names must be non-empty strings")
         if isinstance(value, dict):
             value = value.get("maximum_symbols")
-        data_tier_budgets.append(
-            (
-                name,
-                _positive_int(value, field=f"data_tiers.{name}", maximum=1_000_000),
-            )
-        )
+        budgets.append((name, _positive_int(value, field=f"data_tiers.{name}", maximum=1_000_000)))
+    return tuple(budgets)
+
+
+def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig:
+    payload = _load_capture_payload(path)
+    sources = _parse_event_sources(payload)
+    (
+        max_file_bytes,
+        max_total_bytes,
+        flush_seconds,
+        max_dynamic_symbols,
+        retention_seconds,
+        queue_max_events,
+    ) = _capture_limits(payload)
     return EventCaptureConfig(
         path=path.resolve(),
         root=_project_path(payload.get("root"), field="root"),
@@ -202,20 +250,14 @@ def load_event_capture_config(path: Path = DEFAULT_CONFIG) -> EventCaptureConfig
             if payload.get("market_universe_report") is not None
             else None
         ),
-        max_dynamic_symbols=_positive_int(
-            payload.get("max_dynamic_symbols"), field="max_dynamic_symbols", maximum=100
-        ),
+        max_dynamic_symbols=max_dynamic_symbols,
         max_file_bytes=max_file_bytes,
         max_total_bytes=max_total_bytes,
-        retention_seconds=_positive_int(
-            payload.get("retention_seconds"), field="retention_seconds", maximum=365 * 86400
-        ),
-        flush_seconds=float(flush_seconds),
-        queue_max_events=_positive_int(
-            payload.get("queue_max_events"), field="queue_max_events", maximum=1_000_000
-        ),
+        retention_seconds=retention_seconds,
+        flush_seconds=flush_seconds,
+        queue_max_events=queue_max_events,
         sources=tuple(sources),
-        data_tier_budgets=tuple(data_tier_budgets),
+        data_tier_budgets=_data_tier_budgets(payload),
     )
 
 
@@ -456,6 +498,83 @@ async def _collect_source(
             delay = min(30.0, delay * 2)
 
 
+def _install_capture_signal_handlers(loop: asyncio.AbstractEventLoop, stop: asyncio.Event) -> None:
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+
+def _restart_finished_sources(
+    tasks: list[asyncio.Task],
+    config: EventCaptureConfig,
+    source_streams: list[list[str]],
+    session: aiohttp.ClientSession,
+    queue: asyncio.Queue,
+    stop: asyncio.Event,
+) -> None:
+    for index, task in enumerate(tasks):
+        if not task.done():
+            continue
+        if not task.cancelled():
+            task.exception()
+        tasks[index] = asyncio.create_task(
+            _collect_source(
+                session,
+                config.sources[index],
+                source_streams[index],
+                queue,
+                stop,
+            )
+        )
+
+
+def _write_capture_status(
+    status_path: Path | None,
+    elapsed: float,
+    last_status_write: float,
+    writer: EventSink,
+    queue: asyncio.Queue,
+    last_event_ns: int | None,
+    source_status: list[dict[str, Any]],
+    dynamic: tuple[str, ...],
+) -> tuple[float, dict[str, Any]]:
+    if status_path is None or elapsed - last_status_write < 15:
+        return last_status_write, {"removed_files": 0, "removed_bytes": 0, "total_bytes": 0}
+    retention = writer.enforce_retention()
+    write_json_atomic(
+        status_path,
+        {
+            "schema": STATUS_SCHEMA,
+            "generated_at": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
+            "ok": writer.events > 0 or elapsed < 90,
+            "running": True,
+            "events": writer.events,
+            "bytes_written": writer.bytes,
+            "queue_size": queue.qsize(),
+            "last_event_received_ns": last_event_ns,
+            "last_event_at": (
+                dt.datetime.fromtimestamp(last_event_ns / 1_000_000_000, dt.UTC)
+                .replace(microsecond=0)
+                .isoformat()
+                if last_event_ns is not None
+                else None
+            ),
+            "sources": source_status,
+            "dynamic_symbols": list(dynamic),
+            "retention": retention,
+        },
+    )
+    return elapsed, retention
+
+
+def _capture_remaining_seconds(max_seconds: float | None, started: float) -> float | None:
+    if max_seconds is None:
+        return None
+    return max(0.0, max_seconds - (time.monotonic() - started))
+
+
 async def capture(
     config: EventCaptureConfig,
     *,
@@ -467,11 +586,7 @@ async def capture(
 ) -> dict[str, Any]:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(signum, stop.set)
-        except (NotImplementedError, RuntimeError):
-            pass
+    _install_capture_signal_handlers(loop, stop)
     dynamic = tuple(dict.fromkeys(str(symbol).upper() for symbol in dynamic_symbols))
     queue: asyncio.Queue = asyncio.Queue(maxsize=config.queue_max_events)
     writer = sink or EventWriter(config)
@@ -508,54 +623,21 @@ async def capture(
         ]
         try:
             while not stop.is_set():
-                for index, task in enumerate(tasks):
-                    if not task.done():
-                        continue
-                    if not task.cancelled():
-                        task.exception()
-                    tasks[index] = asyncio.create_task(
-                        _collect_source(
-                            session,
-                            config.sources[index],
-                            source_streams[index],
-                            queue,
-                            stop,
-                        )
-                    )
+                _restart_finished_sources(tasks, config, source_streams, session, queue, stop)
                 elapsed = time.monotonic() - started
-                if status_path is not None and elapsed - last_status_write >= 15:
-                    retention = writer.enforce_retention()
-                    write_json_atomic(
-                        status_path,
-                        {
-                            "schema": STATUS_SCHEMA,
-                            "generated_at": dt.datetime.now(dt.UTC)
-                            .replace(microsecond=0)
-                            .isoformat(),
-                            "ok": writer.events > 0 or elapsed < 90,
-                            "running": True,
-                            "events": writer.events,
-                            "bytes_written": writer.bytes,
-                            "queue_size": queue.qsize(),
-                            "last_event_received_ns": last_event_ns,
-                            "last_event_at": (
-                                dt.datetime.fromtimestamp(last_event_ns / 1_000_000_000, dt.UTC)
-                                .replace(microsecond=0)
-                                .isoformat()
-                                if last_event_ns is not None
-                                else None
-                            ),
-                            "sources": source_status,
-                            "dynamic_symbols": list(dynamic),
-                            "retention": retention,
-                        },
-                    )
-                    last_status_write = elapsed
-                remaining = None
-                if max_seconds is not None:
-                    remaining = max(0.0, max_seconds - (time.monotonic() - started))
-                    if remaining <= 0:
-                        break
+                last_status_write, retention = _write_capture_status(
+                    status_path,
+                    elapsed,
+                    last_status_write,
+                    writer,
+                    queue,
+                    last_event_ns,
+                    source_status,
+                    dynamic,
+                )
+                remaining = _capture_remaining_seconds(max_seconds, started)
+                if remaining is not None and remaining <= 0:
+                    break
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=min(1.0, remaining or 1.0))
                 except TimeoutError:
