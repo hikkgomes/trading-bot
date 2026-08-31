@@ -114,46 +114,56 @@ class SearchSpace:
         )
 
     def __post_init__(self) -> None:
-        if not self.name or not self.product or not self.opportunity_type:
-            raise ValueError("search-space identity fields cannot be empty")
-        if not self.symbol or not self.symbol.isalnum() or not self.symbol.endswith("USDT"):
-            raise ValueError("search-space symbol must be an uppercase USDT pair")
-        if self.market not in {"spot", "futures"}:
-            raise ValueError("search-space market must be spot or futures")
-        if self.pnl_unit not in {"btc", "usdt"}:
-            raise ValueError("search-space pnl_unit must be btc or usdt")
-        if not self.directions or any(value not in {"long", "short"} for value in self.directions):
-            raise ValueError("search-space directions must contain long and/or short")
-        for label, timeframe in (
-            ("base_timeframe", self.base_timeframe),
-            ("regime_timeframe", self.regime_timeframe),
-            ("setup_timeframe", self.setup_timeframe),
-            ("trigger_timeframe", self.trigger_timeframe),
-        ):
-            if timeframe not in TF_RANK:
-                raise ValueError(f"{label} has unknown timeframe {timeframe!r}")
-        if not (
-            TF_RANK[self.regime_timeframe]
-            >= TF_RANK[self.setup_timeframe]
-            >= TF_RANK[self.trigger_timeframe]
-            >= TF_RANK[self.base_timeframe]
-        ):
-            raise ValueError(
-                "search-space timeframes must satisfy regime >= setup >= trigger >= base"
-            )
-        for label, bounds in (
-            ("take_profit_range", self.take_profit_range),
-            ("stop_loss_range", self.stop_loss_range),
-            ("risk_per_trade_range", self.risk_per_trade_range),
-        ):
-            if bounds[0] <= 0 or bounds[1] < bounds[0]:
-                raise ValueError(f"{label} must be positive ascending bounds")
-        if self.horizon_range[0] <= 0 or self.horizon_range[1] < self.horizon_range[0]:
-            raise ValueError("horizon_range must be positive ascending bounds")
-        if not 0 < self.max_position_fraction <= 1:
-            raise ValueError("max_position_fraction must be in (0, 1]")
-        if self.max_trades_per_day is not None and self.max_trades_per_day <= 0:
-            raise ValueError("max_trades_per_day must be positive when configured")
+        _validate_search_space_identity(self)
+        _validate_search_space_timeframes(self)
+        _validate_search_space_bounds(self)
+
+
+def _validate_search_space_identity(space: SearchSpace) -> None:
+    if not space.name or not space.product or not space.opportunity_type:
+        raise ValueError("search-space identity fields cannot be empty")
+    if not space.symbol or not space.symbol.isalnum() or not space.symbol.endswith("USDT"):
+        raise ValueError("search-space symbol must be an uppercase USDT pair")
+    if space.market not in {"spot", "futures"}:
+        raise ValueError("search-space market must be spot or futures")
+    if space.pnl_unit not in {"btc", "usdt"}:
+        raise ValueError("search-space pnl_unit must be btc or usdt")
+    if not space.directions or any(value not in {"long", "short"} for value in space.directions):
+        raise ValueError("search-space directions must contain long and/or short")
+
+
+def _validate_search_space_timeframes(space: SearchSpace) -> None:
+    for label, timeframe in (
+        ("base_timeframe", space.base_timeframe),
+        ("regime_timeframe", space.regime_timeframe),
+        ("setup_timeframe", space.setup_timeframe),
+        ("trigger_timeframe", space.trigger_timeframe),
+    ):
+        if timeframe not in TF_RANK:
+            raise ValueError(f"{label} has unknown timeframe {timeframe!r}")
+    if not (
+        TF_RANK[space.regime_timeframe]
+        >= TF_RANK[space.setup_timeframe]
+        >= TF_RANK[space.trigger_timeframe]
+        >= TF_RANK[space.base_timeframe]
+    ):
+        raise ValueError("search-space timeframes must satisfy regime >= setup >= trigger >= base")
+
+
+def _validate_search_space_bounds(space: SearchSpace) -> None:
+    for label, bounds in (
+        ("take_profit_range", space.take_profit_range),
+        ("stop_loss_range", space.stop_loss_range),
+        ("risk_per_trade_range", space.risk_per_trade_range),
+    ):
+        if bounds[0] <= 0 or bounds[1] < bounds[0]:
+            raise ValueError(f"{label} must be positive ascending bounds")
+    if space.horizon_range[0] <= 0 or space.horizon_range[1] < space.horizon_range[0]:
+        raise ValueError("horizon_range must be positive ascending bounds")
+    if not 0 < space.max_position_fraction <= 1:
+        raise ValueError("max_position_fraction must be in (0, 1]")
+    if space.max_trades_per_day is not None and space.max_trades_per_day <= 0:
+        raise ValueError("max_trades_per_day must be positive when configured")
 
 
 @dataclass(frozen=True)
@@ -291,6 +301,278 @@ def _candidate(
     )
 
 
+def _regime_core_candidates(
+    timeframe: str, direction: str, features: set[str], rng: random.Random
+) -> list[PredicateCandidate]:
+    long = direction == "long"
+    out: list[PredicateCandidate] = []
+    for root in ("ema", "sma"):
+        fast, slow = f"{root}_50", f"{root}_200"
+        if _has(features, fast, slow):
+            out.append(
+                _candidate(
+                    f"regime:{root}_trend",
+                    timeframe,
+                    fast,
+                    "gt_feature" if long else "lt_feature",
+                    ("trend_following", "orderflow_confirmation", "hybrid"),
+                    feature_b=slow,
+                )
+            )
+    for average in ("ema_20", "ema_50", "ema_200", "sma_50", "sma_200"):
+        if _has(features, "close", average):
+            out.append(
+                _candidate(
+                    f"regime:price_vs_{average}",
+                    timeframe,
+                    "close",
+                    "gt_feature" if long else "lt_feature",
+                    ("trend_following", "countertrend_reversion", "hybrid"),
+                    feature_b=average,
+                )
+            )
+    if "adx_14" in features:
+        out.extend(
+            [
+                _candidate(
+                    f"regime:adx_trending:{threshold}",
+                    timeframe,
+                    "adx_14",
+                    "ge",
+                    ("trend_following", "range_expansion", "orderflow_confirmation"),
+                    reference=float(threshold),
+                )
+                for threshold in rng.sample([18, 20, 22, 25, 28], k=3)
+            ]
+        )
+        out.append(
+            _candidate(
+                "regime:adx_quiet",
+                timeframe,
+                "adx_14",
+                "le",
+                ("countertrend_reversion", "volatility_transition"),
+                reference=float(rng.choice([18, 20, 22])),
+            )
+        )
+    if "natr_14" in features:
+        out.extend(
+            [
+                _candidate(
+                    f"regime:natr_{side}",
+                    timeframe,
+                    "natr_14",
+                    "q_ge" if side == "high" else "q_le",
+                    ("volatility_transition", "range_expansion", "hybrid"),
+                    window=rng.choice([90, 120, 180, 240]),
+                    quantile=rng.choice([0.25, 0.35, 0.65, 0.75]),
+                )
+                for side in ("low", "high")
+            ]
+        )
+    if "linearreg_slope_20" in features:
+        out.append(
+            _candidate(
+                "regime:linearreg_direction",
+                timeframe,
+                "linearreg_slope_20",
+                "slope_up" if long else "slope_down",
+                ("trend_following", "hybrid"),
+                lookback=rng.choice([2, 3, 5, 8]),
+                reference=0.0,
+            )
+        )
+    return out
+
+
+def _setup_core_candidates(
+    timeframe: str, direction: str, features: set[str], rng: random.Random
+) -> list[PredicateCandidate]:
+    long = direction == "long"
+    out: list[PredicateCandidate] = []
+    if "rsi_14" in features:
+        out.extend(
+            [
+                _candidate(
+                    f"setup:rsi_pullback:{threshold}",
+                    timeframe,
+                    "rsi_14",
+                    "le" if long else "ge",
+                    ("trend_following", "countertrend_reversion", "hybrid"),
+                    reference=float(threshold if long else 100 - threshold),
+                )
+                for threshold in rng.sample([25, 30, 35, 40, 45, 48], k=3)
+            ]
+        )
+        low, high = (40.0, 68.0) if long else (32.0, 60.0)
+        out.append(
+            _candidate(
+                "setup:rsi_continuation_band",
+                timeframe,
+                "rsi_14",
+                "between",
+                ("trend_following", "orderflow_confirmation"),
+                low=low,
+                high=high,
+            )
+        )
+    if _has(features, "close", "bbands_20_lowerband", "bbands_20_upperband"):
+        out.append(
+            _candidate(
+                "setup:band_extreme",
+                timeframe,
+                "close",
+                "lt_feature" if long else "gt_feature",
+                ("countertrend_reversion", "hybrid"),
+                feature_b="bbands_20_lowerband" if long else "bbands_20_upperband",
+            )
+        )
+    for average in ("ema_20", "ema_50", "sma_20", "sma_50"):
+        if _has(features, "close", average):
+            out.append(
+                _candidate(
+                    f"setup:price_posture:{average}",
+                    timeframe,
+                    "close",
+                    "gt_feature" if long else "lt_feature",
+                    ("trend_following", "orderflow_confirmation", "hybrid"),
+                    feature_b=average,
+                )
+            )
+    for feature in ("natr_14", "stddev_20"):
+        if feature in features:
+            out.extend(
+                [
+                    _candidate(
+                        f"setup:{feature}:{side}",
+                        timeframe,
+                        feature,
+                        "q_le" if side == "compressed" else "q_ge",
+                        (
+                            ("volatility_transition", "range_expansion")
+                            if side == "compressed"
+                            else ("countertrend_reversion", "hybrid")
+                        ),
+                        window=rng.choice([60, 90, 120, 180]),
+                        quantile=rng.choice([0.25, 0.35, 0.65, 0.75]),
+                    )
+                    for side in ("compressed", "expanded")
+                ]
+            )
+    if "mom_10" in features:
+        out.append(
+            _candidate(
+                "setup:momentum_pause",
+                timeframe,
+                "mom_10",
+                "falling" if long else "rising",
+                ("trend_following", "countertrend_reversion", "hybrid"),
+                lookback=rng.choice([2, 3, 5, 8]),
+            )
+        )
+    return out
+
+
+def _trigger_core_candidates(
+    timeframe: str, direction: str, features: set[str], rng: random.Random
+) -> list[PredicateCandidate]:
+    long = direction == "long"
+    out: list[PredicateCandidate] = []
+    if _has(features, "close", "open"):
+        out.append(
+            _candidate(
+                "trigger:candle_direction",
+                timeframe,
+                "close",
+                "gt_feature" if long else "lt_feature",
+                ("countertrend_reversion", "orderflow_confirmation", "hybrid"),
+                feature_b="open",
+            )
+        )
+    if _has(features, "macd_macd", "macd_macdsignal"):
+        out.append(
+            _candidate(
+                "trigger:macd_cross",
+                timeframe,
+                "macd_macd",
+                "cross_above" if long else "cross_below",
+                ("trend_following", "countertrend_reversion", "hybrid"),
+                feature_b="macd_macdsignal",
+            )
+        )
+    for average in ("ema_20", "ema_50", "sma_20", "sma_50"):
+        if _has(features, "close", average):
+            out.append(
+                _candidate(
+                    f"trigger:price_cross:{average}",
+                    timeframe,
+                    "close",
+                    "cross_above" if long else "cross_below",
+                    ("trend_following", "countertrend_reversion", "hybrid"),
+                    feature_b=average,
+                )
+            )
+    if "rsi_14" in features:
+        out.append(
+            _candidate(
+                "trigger:rsi_turn",
+                timeframe,
+                "rsi_14",
+                "rising" if long else "falling",
+                ("countertrend_reversion", "trend_following", "hybrid"),
+                lookback=rng.choice([2, 3, 5]),
+            )
+        )
+    if "mom_10" in features:
+        out.append(
+            _candidate(
+                "trigger:momentum_acceleration",
+                timeframe,
+                "mom_10",
+                "slope_up" if long else "slope_down",
+                ("trend_following", "range_expansion", "orderflow_confirmation"),
+                lookback=rng.choice([2, 3, 5]),
+                reference=0.0,
+            )
+        )
+    breakout_feature = "max_20" if long else "min_20"
+    if _has(features, "close", breakout_feature):
+        out.append(
+            _candidate(
+                "trigger:prior_range_break",
+                timeframe,
+                "close",
+                "gt_feature" if long else "lt_feature",
+                ("range_expansion", "volatility_transition", "hybrid"),
+                feature_b=breakout_feature,
+                shift_b=1,
+            )
+        )
+    if "volume_z_20" in features:
+        out.append(
+            _candidate(
+                "trigger:volume_confirmation",
+                timeframe,
+                "volume_z_20",
+                "ge",
+                ("range_expansion", "orderflow_confirmation", "hybrid"),
+                reference=rng.choice([0.25, 0.5, 0.75, 1.0, 1.25]),
+            )
+        )
+    if "taker_buy_ratio" in features:
+        out.append(
+            _candidate(
+                "trigger:taker_imbalance",
+                timeframe,
+                "taker_buy_ratio",
+                "ge" if long else "le",
+                ("orderflow_confirmation", "range_expansion", "hybrid"),
+                reference=rng.choice([0.48, 0.5, 0.52, 0.55]),
+            )
+        )
+    return out
+
+
 def _core_candidates(
     stage: str,
     timeframe: str,
@@ -298,263 +580,13 @@ def _core_candidates(
     features: set[str],
     rng: random.Random,
 ) -> list[PredicateCandidate]:
-    long = direction == "long"
-    out: list[PredicateCandidate] = []
-
     if stage == "regime":
-        for root in ("ema", "sma"):
-            fast, slow = f"{root}_50", f"{root}_200"
-            if _has(features, fast, slow):
-                out.append(
-                    _candidate(
-                        f"{stage}:{root}_trend",
-                        timeframe,
-                        fast,
-                        "gt_feature" if long else "lt_feature",
-                        ("trend_following", "orderflow_confirmation", "hybrid"),
-                        feature_b=slow,
-                    )
-                )
-        for average in ("ema_20", "ema_50", "ema_200", "sma_50", "sma_200"):
-            if _has(features, "close", average):
-                out.append(
-                    _candidate(
-                        f"{stage}:price_vs_{average}",
-                        timeframe,
-                        "close",
-                        "gt_feature" if long else "lt_feature",
-                        ("trend_following", "countertrend_reversion", "hybrid"),
-                        feature_b=average,
-                    )
-                )
-        if "adx_14" in features:
-            out.extend(
-                [
-                    _candidate(
-                        f"{stage}:adx_trending:{threshold}",
-                        timeframe,
-                        "adx_14",
-                        "ge",
-                        ("trend_following", "range_expansion", "orderflow_confirmation"),
-                        reference=float(threshold),
-                    )
-                    for threshold in rng.sample([18, 20, 22, 25, 28], k=3)
-                ]
-            )
-            out.append(
-                _candidate(
-                    f"{stage}:adx_quiet",
-                    timeframe,
-                    "adx_14",
-                    "le",
-                    ("countertrend_reversion", "volatility_transition"),
-                    reference=float(rng.choice([18, 20, 22])),
-                )
-            )
-        if "natr_14" in features:
-            out.extend(
-                [
-                    _candidate(
-                        f"{stage}:natr_{side}",
-                        timeframe,
-                        "natr_14",
-                        "q_ge" if side == "high" else "q_le",
-                        ("volatility_transition", "range_expansion", "hybrid"),
-                        window=rng.choice([90, 120, 180, 240]),
-                        quantile=rng.choice([0.25, 0.35, 0.65, 0.75]),
-                    )
-                    for side in ("low", "high")
-                ]
-            )
-        if "linearreg_slope_20" in features:
-            out.append(
-                _candidate(
-                    f"{stage}:linearreg_direction",
-                    timeframe,
-                    "linearreg_slope_20",
-                    "slope_up" if long else "slope_down",
-                    ("trend_following", "hybrid"),
-                    lookback=rng.choice([2, 3, 5, 8]),
-                    reference=0.0,
-                )
-            )
-
+        return _regime_core_candidates(timeframe, direction, features, rng)
     if stage == "setup":
-        if "rsi_14" in features:
-            out.extend(
-                [
-                    _candidate(
-                        f"{stage}:rsi_pullback:{threshold}",
-                        timeframe,
-                        "rsi_14",
-                        "le" if long else "ge",
-                        ("trend_following", "countertrend_reversion", "hybrid"),
-                        reference=float(threshold if long else 100 - threshold),
-                    )
-                    for threshold in rng.sample([25, 30, 35, 40, 45, 48], k=3)
-                ]
-            )
-            low, high = (40.0, 68.0) if long else (32.0, 60.0)
-            out.append(
-                _candidate(
-                    f"{stage}:rsi_continuation_band",
-                    timeframe,
-                    "rsi_14",
-                    "between",
-                    ("trend_following", "orderflow_confirmation"),
-                    low=low,
-                    high=high,
-                )
-            )
-        if _has(features, "close", "bbands_20_lowerband", "bbands_20_upperband"):
-            out.append(
-                _candidate(
-                    f"{stage}:band_extreme",
-                    timeframe,
-                    "close",
-                    "lt_feature" if long else "gt_feature",
-                    ("countertrend_reversion", "hybrid"),
-                    feature_b="bbands_20_lowerband" if long else "bbands_20_upperband",
-                )
-            )
-        for average in ("ema_20", "ema_50", "sma_20", "sma_50"):
-            if _has(features, "close", average):
-                out.append(
-                    _candidate(
-                        f"{stage}:price_posture:{average}",
-                        timeframe,
-                        "close",
-                        "gt_feature" if long else "lt_feature",
-                        ("trend_following", "orderflow_confirmation", "hybrid"),
-                        feature_b=average,
-                    )
-                )
-        for feature in ("natr_14", "stddev_20"):
-            if feature in features:
-                out.extend(
-                    [
-                        _candidate(
-                            f"{stage}:{feature}:{side}",
-                            timeframe,
-                            feature,
-                            "q_le" if side == "compressed" else "q_ge",
-                            (
-                                ("volatility_transition", "range_expansion")
-                                if side == "compressed"
-                                else ("countertrend_reversion", "hybrid")
-                            ),
-                            window=rng.choice([60, 90, 120, 180]),
-                            quantile=rng.choice([0.25, 0.35, 0.65, 0.75]),
-                        )
-                        for side in ("compressed", "expanded")
-                    ]
-                )
-        if "mom_10" in features:
-            out.append(
-                _candidate(
-                    f"{stage}:momentum_pause",
-                    timeframe,
-                    "mom_10",
-                    "falling" if long else "rising",
-                    ("trend_following", "countertrend_reversion", "hybrid"),
-                    lookback=rng.choice([2, 3, 5, 8]),
-                )
-            )
-
+        return _setup_core_candidates(timeframe, direction, features, rng)
     if stage == "trigger":
-        if _has(features, "close", "open"):
-            out.append(
-                _candidate(
-                    f"{stage}:candle_direction",
-                    timeframe,
-                    "close",
-                    "gt_feature" if long else "lt_feature",
-                    ("countertrend_reversion", "orderflow_confirmation", "hybrid"),
-                    feature_b="open",
-                )
-            )
-        if _has(features, "macd_macd", "macd_macdsignal"):
-            out.append(
-                _candidate(
-                    f"{stage}:macd_cross",
-                    timeframe,
-                    "macd_macd",
-                    "cross_above" if long else "cross_below",
-                    ("trend_following", "countertrend_reversion", "hybrid"),
-                    feature_b="macd_macdsignal",
-                )
-            )
-        for average in ("ema_20", "ema_50", "sma_20", "sma_50"):
-            if _has(features, "close", average):
-                out.append(
-                    _candidate(
-                        f"{stage}:price_cross:{average}",
-                        timeframe,
-                        "close",
-                        "cross_above" if long else "cross_below",
-                        ("trend_following", "countertrend_reversion", "hybrid"),
-                        feature_b=average,
-                    )
-                )
-        if "rsi_14" in features:
-            out.append(
-                _candidate(
-                    f"{stage}:rsi_turn",
-                    timeframe,
-                    "rsi_14",
-                    "rising" if long else "falling",
-                    ("countertrend_reversion", "trend_following", "hybrid"),
-                    lookback=rng.choice([2, 3, 5]),
-                )
-            )
-        if "mom_10" in features:
-            out.append(
-                _candidate(
-                    f"{stage}:momentum_acceleration",
-                    timeframe,
-                    "mom_10",
-                    "slope_up" if long else "slope_down",
-                    ("trend_following", "range_expansion", "orderflow_confirmation"),
-                    lookback=rng.choice([2, 3, 5]),
-                    reference=0.0,
-                )
-            )
-        breakout_feature = "max_20" if long else "min_20"
-        if _has(features, "close", breakout_feature):
-            out.append(
-                _candidate(
-                    f"{stage}:prior_range_break",
-                    timeframe,
-                    "close",
-                    "gt_feature" if long else "lt_feature",
-                    ("range_expansion", "volatility_transition", "hybrid"),
-                    feature_b=breakout_feature,
-                    shift_b=1,
-                )
-            )
-        if "volume_z_20" in features:
-            out.append(
-                _candidate(
-                    f"{stage}:volume_confirmation",
-                    timeframe,
-                    "volume_z_20",
-                    "ge",
-                    ("range_expansion", "orderflow_confirmation", "hybrid"),
-                    reference=rng.choice([0.25, 0.5, 0.75, 1.0, 1.25]),
-                )
-            )
-        if "taker_buy_ratio" in features:
-            out.append(
-                _candidate(
-                    f"{stage}:taker_imbalance",
-                    timeframe,
-                    "taker_buy_ratio",
-                    "ge" if long else "le",
-                    ("orderflow_confirmation", "range_expansion", "hybrid"),
-                    reference=rng.choice([0.48, 0.5, 0.52, 0.55]),
-                )
-            )
-    return out
+        return _trigger_core_candidates(timeframe, direction, features, rng)
+    return []
 
 
 def _dynamic_candidates(
@@ -936,6 +968,197 @@ def _bounded(value: float, bounds: tuple[float, float]) -> float:
     return min(bounds[1], max(bounds[0], value))
 
 
+def _mutation_action_weights(
+    failure_reasons: Sequence[str],
+) -> tuple[tuple[str, ...], dict[str, float], tuple[str, ...], str]:
+    normalized_reasons = tuple(
+        dict.fromkeys(
+            str(reason).strip()[:128] for reason in failure_reasons if str(reason).strip()
+        )
+    )
+    reason_text = " ".join(normalized_reasons).lower()
+    action_weights = {
+        "replace": 3.0,
+        "add": 1.5,
+        "remove": 1.0,
+        "jitter": 2.5,
+        "exit": 1.5,
+        "risk": 1.0,
+    }
+    if any(token in reason_text for token in ("insufficient", "too_few", "sparse")):
+        action_weights.update(remove=4.0, jitter=3.0, exit=2.0, add=0.5)
+    if any(token in reason_text for token in ("no_train_edge", "no_validation_edge", "weak_edge")):
+        action_weights.update(replace=5.0, jitter=3.5, exit=2.5)
+    if any(token in reason_text for token in ("unstable", "fragile", "sensitivity", "drawdown")):
+        action_weights.update(remove=3.0, replace=4.0, exit=3.0, risk=3.0)
+    return tuple(action_weights), action_weights, normalized_reasons, reason_text
+
+
+def _apply_predicate_mutation(
+    action: str,
+    stage: str,
+    stages: dict[str, list[Predicate]],
+    space: SearchSpace,
+    direction: str,
+    available_features: Mapping[str, Iterable[str]] | None,
+    feedback_weights: Mapping[str, float] | None,
+    limits: GrammarLimits,
+    rng: random.Random,
+    keys: list[str],
+) -> None:
+    lo, hi = _stage_bounds(stage, limits)
+    if action in {"replace", "add"}:
+        candidates = predicate_candidates(
+            stage,
+            _stage_timeframe(space, stage),
+            direction,
+            available_features=available_features,
+            rng=rng,
+            limits=limits,
+        )
+        selected = _weighted_sample_without_replacement(
+            candidates,
+            1,
+            motif="hybrid",
+            feedback_weights=feedback_weights,
+            rng=rng,
+        )
+        if selected:
+            item = selected[0]
+            keys.append(item.key)
+            if action == "replace" and stages[stage]:
+                stages[stage][rng.randrange(len(stages[stage]))] = item.predicate
+            elif action == "add" and len(stages[stage]) < hi:
+                stages[stage].append(item.predicate)
+    elif action == "remove" and len(stages[stage]) > lo:
+        stages[stage].pop(rng.randrange(len(stages[stage])))
+    elif action == "jitter" and stages[stage]:
+        index = rng.randrange(len(stages[stage]))
+        stages[stage][index] = _jitter_predicate(stages[stage][index], rng)
+
+
+def _mutated_exit(exit_rule: ExitRule, space: SearchSpace, rng: random.Random) -> ExitRule:
+    return dataclasses.replace(
+        exit_rule,
+        take_profit=round(
+            _bounded(exit_rule.take_profit * rng.uniform(0.75, 1.3), space.take_profit_range),
+            6,
+        ),
+        stop_loss=round(
+            _bounded(exit_rule.stop_loss * rng.uniform(0.75, 1.3), space.stop_loss_range),
+            6,
+        ),
+        horizon_bars=int(
+            _bounded(
+                round(exit_rule.horizon_bars * rng.uniform(0.7, 1.4)),
+                (float(space.horizon_range[0]), float(space.horizon_range[1])),
+            )
+        ),
+    )
+
+
+def _mutated_risk(risk_rule: RiskRule, space: SearchSpace, rng: random.Random) -> RiskRule:
+    return dataclasses.replace(
+        risk_rule,
+        risk_per_trade=round(
+            _bounded(
+                risk_rule.risk_per_trade * rng.uniform(0.75, 1.2),
+                space.risk_per_trade_range,
+            ),
+            6,
+        ),
+        max_position_fraction=min(
+            space.max_position_fraction,
+            max(0.01, risk_rule.max_position_fraction * rng.uniform(0.8, 1.05)),
+        ),
+    )
+
+
+def _apply_mutation_action(
+    action: str,
+    stage: str,
+    stages: dict[str, list[Predicate]],
+    *,
+    space: SearchSpace,
+    direction: str,
+    available_features: Mapping[str, Iterable[str]] | None,
+    feedback_weights: Mapping[str, float] | None,
+    limits: GrammarLimits,
+    rng: random.Random,
+    keys: list[str],
+    exit_rule: ExitRule,
+    risk_rule: RiskRule,
+) -> tuple[ExitRule, RiskRule]:
+    if action in {"replace", "add", "remove", "jitter"}:
+        _apply_predicate_mutation(
+            action,
+            stage,
+            stages,
+            space,
+            direction,
+            available_features,
+            feedback_weights,
+            limits,
+            rng,
+            keys,
+        )
+    elif action == "exit":
+        exit_rule = _mutated_exit(exit_rule, space, rng)
+    elif action == "risk":
+        risk_rule = _mutated_risk(risk_rule, space, rng)
+    return exit_rule, risk_rule
+
+
+def _trim_mutation_stages(
+    stages: dict[str, list[Predicate]], limits: GrammarLimits, rng: random.Random
+) -> None:
+    while sum(len(values) for values in stages.values()) > limits.max_total_predicates:
+        removable = [
+            stage
+            for stage in ("regime", "setup", "trigger")
+            if len(stages[stage]) > _stage_bounds(stage, limits)[0]
+        ]
+        if not removable:
+            break
+        chosen = rng.choice(removable)
+        stages[chosen].pop(rng.randrange(len(stages[chosen])))
+
+
+def _mutation_child(
+    parent: Hypothesis,
+    space: SearchSpace,
+    stages: dict[str, list[Predicate]],
+    exit_rule: ExitRule,
+    risk_rule: RiskRule,
+    reason_text: str,
+    rng: random.Random,
+) -> Hypothesis:
+    return dataclasses.replace(
+        parent,
+        id="GENERATED_PENDING_ID",
+        family="generated_evolution",
+        idea=f"Autonomous recursive mutation of a prior {space.opportunity_type} experiment.",
+        market_logic=(
+            "A bounded descendant generated from pre-holdout experiment feedback; it makes no "
+            "claim of profitability until the full validation protocol completes."
+        ),
+        regime=stages["regime"],
+        setup=stages["setup"],
+        trigger=stages["trigger"],
+        exit=exit_rule,
+        risk=risk_rule,
+        entry_score=(
+            _new_entry_score(stages, rng)
+            if parent.entry_score is not None
+            or "sparse" in reason_text
+            or "insufficient" in reason_text
+            or rng.random() < 0.25
+            else None
+        ),
+        tags=[*dict.fromkeys([*parent.tags, "autonomous_generation", "recursive_mutation"])],
+    )
+
+
 def mutate_hypothesis(
     parent: Hypothesis,
     space: SearchSpace,
@@ -969,32 +1192,9 @@ def mutate_hypothesis(
     exit_rule = parent.exit
     risk_rule = parent.risk
 
-    normalized_reasons = tuple(
-        dict.fromkeys(
-            str(reason).strip()[:128] for reason in failure_reasons if str(reason).strip()
-        )
+    action_names, action_weights, normalized_reasons, reason_text = _mutation_action_weights(
+        failure_reasons
     )
-    reason_text = " ".join(normalized_reasons).lower()
-    action_weights = {
-        "replace": 3.0,
-        "add": 1.5,
-        "remove": 1.0,
-        "jitter": 2.5,
-        "exit": 1.5,
-        "risk": 1.0,
-    }
-    # Failure evidence changes which safe grammar operators are attempted; it
-    # never changes the language or its risk bounds.  Sparse signals are
-    # simplified, weak edges are recomposed, and fragility/risk failures favor
-    # robustness-oriented edits.  Unknown reasons retain the neutral prior.
-    if any(token in reason_text for token in ("insufficient", "too_few", "sparse")):
-        action_weights.update(remove=4.0, jitter=3.0, exit=2.0, add=0.5)
-    if any(token in reason_text for token in ("no_train_edge", "no_validation_edge", "weak_edge")):
-        action_weights.update(replace=5.0, jitter=3.5, exit=2.5)
-    if any(token in reason_text for token in ("unstable", "fragile", "sensitivity", "drawdown")):
-        action_weights.update(remove=3.0, replace=4.0, exit=3.0, risk=3.0)
-
-    action_names = list(action_weights)
     for _ in range(operations):
         action = rng.choices(
             action_names,
@@ -1002,107 +1202,23 @@ def mutate_hypothesis(
             k=1,
         )[0]
         stage = rng.choice(["regime", "setup", "trigger"])
-        lo, hi = _stage_bounds(stage, limits)
-        if action in {"replace", "add"}:
-            candidates = predicate_candidates(
-                stage,
-                _stage_timeframe(space, stage),
-                direction,
-                available_features=available_features,
-                rng=rng,
-                limits=limits,
-            )
-            selected = _weighted_sample_without_replacement(
-                candidates,
-                1,
-                motif="hybrid",
-                feedback_weights=feedback_weights,
-                rng=rng,
-            )
-            if selected:
-                item = selected[0]
-                keys.append(item.key)
-                if action == "replace" and stages[stage]:
-                    stages[stage][rng.randrange(len(stages[stage]))] = item.predicate
-                elif action == "add" and len(stages[stage]) < hi:
-                    stages[stage].append(item.predicate)
-        elif action == "remove" and len(stages[stage]) > lo:
-            stages[stage].pop(rng.randrange(len(stages[stage])))
-        elif action == "jitter" and stages[stage]:
-            index = rng.randrange(len(stages[stage]))
-            stages[stage][index] = _jitter_predicate(stages[stage][index], rng)
-        elif action == "exit":
-            exit_rule = dataclasses.replace(
-                exit_rule,
-                take_profit=round(
-                    _bounded(
-                        exit_rule.take_profit * rng.uniform(0.75, 1.3), space.take_profit_range
-                    ),
-                    6,
-                ),
-                stop_loss=round(
-                    _bounded(exit_rule.stop_loss * rng.uniform(0.75, 1.3), space.stop_loss_range),
-                    6,
-                ),
-                horizon_bars=int(
-                    _bounded(
-                        round(exit_rule.horizon_bars * rng.uniform(0.7, 1.4)),
-                        (float(space.horizon_range[0]), float(space.horizon_range[1])),
-                    )
-                ),
-            )
-        elif action == "risk":
-            risk_rule = dataclasses.replace(
-                risk_rule,
-                risk_per_trade=round(
-                    _bounded(
-                        risk_rule.risk_per_trade * rng.uniform(0.75, 1.2),
-                        space.risk_per_trade_range,
-                    ),
-                    6,
-                ),
-                max_position_fraction=min(
-                    space.max_position_fraction,
-                    max(0.01, risk_rule.max_position_fraction * rng.uniform(0.8, 1.05)),
-                ),
-            )
+        exit_rule, risk_rule = _apply_mutation_action(
+            action,
+            stage,
+            stages,
+            space=space,
+            direction=direction,
+            available_features=available_features,
+            feedback_weights=feedback_weights,
+            limits=limits,
+            rng=rng,
+            keys=keys,
+            exit_rule=exit_rule,
+            risk_rule=risk_rule,
+        )
 
-    # Enforce the total-complexity cap after additions.
-    while sum(len(values) for values in stages.values()) > limits.max_total_predicates:
-        removable = [
-            stage
-            for stage in ("regime", "setup", "trigger")
-            if len(stages[stage]) > _stage_bounds(stage, limits)[0]
-        ]
-        if not removable:
-            break
-        chosen = rng.choice(removable)
-        stages[chosen].pop(rng.randrange(len(stages[chosen])))
-
-    child = dataclasses.replace(
-        parent,
-        id="GENERATED_PENDING_ID",
-        family="generated_evolution",
-        idea=f"Autonomous recursive mutation of a prior {space.opportunity_type} experiment.",
-        market_logic=(
-            "A bounded descendant generated from pre-holdout experiment feedback; it makes no "
-            "claim of profitability until the full validation protocol completes."
-        ),
-        regime=stages["regime"],
-        setup=stages["setup"],
-        trigger=stages["trigger"],
-        exit=exit_rule,
-        risk=risk_rule,
-        entry_score=(
-            _new_entry_score(stages, rng)
-            if parent.entry_score is not None
-            or "sparse" in reason_text
-            or "insufficient" in reason_text
-            or rng.random() < 0.25
-            else None
-        ),
-        tags=[*dict.fromkeys([*parent.tags, "autonomous_generation", "recursive_mutation"])],
-    )
+    _trim_mutation_stages(stages, limits, rng)
+    child = _mutation_child(parent, space, stages, exit_rule, risk_rule, reason_text, rng)
     problems = validate_hypothesis_against_space(
         child,
         space,
@@ -1260,14 +1376,7 @@ def structural_similarity(
     return len(a & b) / len(a | b) if a or b else 1.0
 
 
-def validate_hypothesis_against_space(
-    hypothesis: Hypothesis,
-    space: SearchSpace,
-    *,
-    available_features: Mapping[str, Iterable[str]] | None = None,
-    limits: GrammarLimits | None = None,
-) -> list[str]:
-    limits = limits or GrammarLimits()
+def _space_identity_problems(hypothesis: Hypothesis, space: SearchSpace) -> list[str]:
     problems: list[str] = []
     expected = {
         "base_timeframe": space.base_timeframe,
@@ -1282,7 +1391,38 @@ def validate_hypothesis_against_space(
         problems.append("direction_not_allowed")
     if space.market == "spot" and space.pnl_unit == "btc" and hypothesis.direction != "short":
         problems.append("btc_accumulation_requires_short_dodge_signal")
+    return problems
 
+
+def _predicate_problems(
+    stage: str,
+    predicate: Predicate,
+    expected_tf: str,
+    available_features: Mapping[str, Iterable[str]] | None,
+    available: set[str],
+    seen: set[tuple],
+) -> list[str]:
+    problems: list[str] = []
+    if predicate.timeframe != expected_tf:
+        problems.append(f"{stage}_timeframe_mismatch")
+    token = predicate_token(predicate, include_values=True)
+    if token in seen:
+        problems.append(f"{stage}_duplicate_predicate")
+    seen.add(token)
+    if available_features is not None:
+        for feature in (predicate.feature, predicate.feature_b):
+            if feature is not None and feature not in available:
+                problems.append(f"missing_feature:{expected_tf}:{feature}")
+    return problems
+
+
+def _stage_problems(
+    hypothesis: Hypothesis,
+    space: SearchSpace,
+    available_features: Mapping[str, Iterable[str]] | None,
+    limits: GrammarLimits,
+) -> tuple[list[str], int]:
+    problems: list[str] = []
     total = 0
     for stage in ("regime", "setup", "trigger"):
         predicates = list(getattr(hypothesis, stage))
@@ -1291,32 +1431,27 @@ def validate_hypothesis_against_space(
         if not lo <= len(predicates) <= hi:
             problems.append(f"{stage}_predicate_count")
         expected_tf = _stage_timeframe(space, stage)
-        seen = set()
         available = _features_for(available_features, expected_tf)
+        seen: set[tuple] = set()
         for predicate in predicates:
-            if predicate.timeframe != expected_tf:
-                problems.append(f"{stage}_timeframe_mismatch")
-            token = predicate_token(predicate, include_values=True)
-            if token in seen:
-                problems.append(f"{stage}_duplicate_predicate")
-            seen.add(token)
-            if available_features is not None:
-                for feature in (predicate.feature, predicate.feature_b):
-                    if feature is not None and feature not in available:
-                        problems.append(f"missing_feature:{expected_tf}:{feature}")
-    if total > limits.max_total_predicates:
-        problems.append("total_predicate_limit")
-    if hypothesis.entry_score is not None and len(hypothesis.entry_score.weights) != total:
-        problems.append("entry_score_weight_count")
+            problems.extend(
+                _predicate_problems(
+                    stage, predicate, expected_tf, available_features, available, seen
+                )
+            )
+    return problems, total
 
+
+def _risk_and_exit_problems(hypothesis: Hypothesis, space: SearchSpace) -> list[str]:
+    problems: list[str] = []
     if not space.take_profit_range[0] <= hypothesis.exit.take_profit <= space.take_profit_range[1]:
         problems.append("take_profit_out_of_bounds")
     if not space.stop_loss_range[0] <= hypothesis.exit.stop_loss <= space.stop_loss_range[1]:
         problems.append("stop_loss_out_of_bounds")
     if not space.horizon_range[0] <= hypothesis.exit.horizon_bars <= space.horizon_range[1]:
         problems.append("horizon_out_of_bounds")
-    if (
-        not space.risk_per_trade_range[0]
+    if not (
+        space.risk_per_trade_range[0]
         <= hypothesis.risk.risk_per_trade
         <= space.risk_per_trade_range[1]
     ):
@@ -1331,4 +1466,23 @@ def validate_hypothesis_against_space(
         and hypothesis.risk.min_atr_pct >= hypothesis.risk.max_atr_pct
     ):
         problems.append("invalid_atr_band")
+    return problems
+
+
+def validate_hypothesis_against_space(
+    hypothesis: Hypothesis,
+    space: SearchSpace,
+    *,
+    available_features: Mapping[str, Iterable[str]] | None = None,
+    limits: GrammarLimits | None = None,
+) -> list[str]:
+    limits = limits or GrammarLimits()
+    problems = _space_identity_problems(hypothesis, space)
+    stage_errors, total = _stage_problems(hypothesis, space, available_features, limits)
+    problems.extend(stage_errors)
+    if total > limits.max_total_predicates:
+        problems.append("total_predicate_limit")
+    if hypothesis.entry_score is not None and len(hypothesis.entry_score.weights) != total:
+        problems.append("entry_score_weight_count")
+    problems.extend(_risk_and_exit_problems(hypothesis, space))
     return sorted(set(problems))
