@@ -83,6 +83,112 @@ def _counter_payload(value: Any) -> dict[str, int]:
     return result
 
 
+def _cycle_decision_stats(
+    decisions: Mapping[str, Any],
+) -> tuple[Counter[str], Counter[str], int, int, int, dt.datetime | None, dt.datetime | None]:
+    stages: Counter[str] = Counter()
+    predicates: Counter[str] = Counter()
+    regime_eligible = 0
+    setup_matches = 0
+    trigger_matches = 0
+    last_signal_at: dt.datetime | None = None
+    last_entry_at: dt.datetime | None = None
+    for decision in decisions.values():
+        if not isinstance(decision, Mapping):
+            continue
+        outcome = str(decision.get("outcome") or "")
+        failed_stage = decision.get("failed_stage")
+        if isinstance(failed_stage, str) and failed_stage:
+            stages[failed_stage] += 1
+        failed_predicate = decision.get("failed_predicate")
+        if isinstance(failed_predicate, str) and failed_predicate:
+            predicates[failed_predicate] += 1
+        latest_bar = _timestamp(decision.get("latest_bar"))
+        if outcome in SIGNAL_OUTCOMES and latest_bar is not None:
+            last_signal_at = max(last_signal_at, latest_bar) if last_signal_at else latest_bar
+        if outcome == "entry_opened" and latest_bar is not None:
+            last_entry_at = max(last_entry_at, latest_bar) if last_entry_at else latest_bar
+        if outcome not in SIGNAL_EVALUATED_OUTCOMES:
+            continue
+        regime_eligible += failed_stage != "regime"
+        setup_matches += failed_stage not in {"regime", "setup"}
+        trigger_matches += failed_stage not in {"regime", "setup", *TRIGGER_FAILURE_STAGES}
+    return (
+        stages,
+        predicates,
+        regime_eligible,
+        setup_matches,
+        trigger_matches,
+        last_signal_at,
+        last_entry_at,
+    )
+
+
+def _cycle_market_bars(summary: Mapping[str, Any]) -> list[dict[str, str]]:
+    market_bars: list[dict[str, str]] = []
+    raw_market_bars = summary.get("market_bars")
+    if not isinstance(raw_market_bars, list):
+        return market_bars
+    seen: set[tuple[str, str]] = set()
+    for item in raw_market_bars:
+        if not isinstance(item, Mapping):
+            continue
+        timeframe = str(item.get("timeframe") or "")
+        timestamp = _timestamp(item.get("timestamp"))
+        if not timeframe or timestamp is None:
+            continue
+        key = (timeframe, timestamp.isoformat())
+        if key in seen:
+            continue
+        seen.add(key)
+        market_bars.append({"timeframe": key[0], "timestamp": key[1]})
+    return market_bars
+
+
+def _cycle_product_record(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+    identity = raw.get("product")
+    if not isinstance(identity, Mapping):
+        return None
+    trace = raw.get("decision_trace")
+    trace = trace if isinstance(trace, Mapping) else {}
+    summary = trace.get("summary")
+    summary = summary if isinstance(summary, Mapping) else {}
+    decisions = trace.get("strategies")
+    decisions = decisions if isinstance(decisions, Mapping) else {}
+    stages, predicates, regime, setup, trigger, last_signal, last_entry = _cycle_decision_stats(
+        decisions
+    )
+    outcomes = _counter_payload(summary.get("outcomes"))
+    cycle_errors = raw.get("cycle_errors")
+    return {
+        "name": str(identity.get("name") or ""),
+        "objective": str(identity.get("objective") or ""),
+        "market": str(identity.get("market") or ""),
+        "symbol": str(identity.get("symbol") or "").upper(),
+        "entries_allowed": raw.get("entries_allowed") is True,
+        "entry_gate_reason": (
+            str(raw.get("entry_gate", {}).get("reason") or "")
+            if isinstance(raw.get("entry_gate"), Mapping)
+            else ""
+        ),
+        "strategies_loaded": _non_negative_int(summary.get("strategies")),
+        "data_ready": _non_negative_int(summary.get("data_ready")),
+        "market_bars": _cycle_market_bars(summary),
+        "regime_eligible": regime,
+        "setup_matches": setup,
+        "trigger_matches": trigger,
+        "signals": _non_negative_int(summary.get("signals")),
+        "entries_opened": _non_negative_int(summary.get("entries_opened")),
+        "positions_managed": _non_negative_int(summary.get("positions_managed")),
+        "outcomes": outcomes,
+        "failed_stages": dict(stages),
+        "killer_predicates": dict(predicates),
+        "cycle_errors": len(cycle_errors) if isinstance(cycle_errors, list) else 0,
+        "last_signal_at": last_signal.isoformat() if last_signal else None,
+        "last_entry_at": last_entry.isoformat() if last_entry else None,
+    }
+
+
 def cycle_record(report: Mapping[str, Any], *, generated_at: dt.datetime | None = None) -> dict:
     """Reduce a supervisor report to bounded starvation evidence."""
     timestamp = generated_at or _utc_now()
@@ -93,100 +199,9 @@ def cycle_record(report: Mapping[str, Any], *, generated_at: dt.datetime | None 
     for raw in raw_products:
         if not isinstance(raw, Mapping):
             continue
-        identity = raw.get("product")
-        if not isinstance(identity, Mapping):
-            continue
-        trace = raw.get("decision_trace")
-        trace = trace if isinstance(trace, Mapping) else {}
-        summary = trace.get("summary")
-        summary = summary if isinstance(summary, Mapping) else {}
-        decisions = trace.get("strategies")
-        decisions = decisions if isinstance(decisions, Mapping) else {}
-        stages: Counter[str] = Counter()
-        predicates: Counter[str] = Counter()
-        regime_eligible = 0
-        setup_matches = 0
-        trigger_matches = 0
-        last_signal_at: dt.datetime | None = None
-        last_entry_at: dt.datetime | None = None
-        for decision in decisions.values():
-            if not isinstance(decision, Mapping):
-                continue
-            outcome = str(decision.get("outcome") or "")
-            failed_stage = decision.get("failed_stage")
-            if isinstance(failed_stage, str) and failed_stage:
-                stages[failed_stage] += 1
-            failed_predicate = decision.get("failed_predicate")
-            if isinstance(failed_predicate, str) and failed_predicate:
-                predicates[failed_predicate] += 1
-            latest_bar = _timestamp(decision.get("latest_bar"))
-            if outcome in SIGNAL_OUTCOMES and latest_bar is not None:
-                last_signal_at = (
-                    latest_bar
-                    if last_signal_at is None or latest_bar > last_signal_at
-                    else last_signal_at
-                )
-            if outcome == "entry_opened" and latest_bar is not None:
-                last_entry_at = (
-                    latest_bar
-                    if last_entry_at is None or latest_bar > last_entry_at
-                    else last_entry_at
-                )
-            if outcome not in SIGNAL_EVALUATED_OUTCOMES:
-                continue
-            if failed_stage != "regime":
-                regime_eligible += 1
-            if failed_stage not in {"regime", "setup"}:
-                setup_matches += 1
-            if failed_stage not in {"regime", "setup", *TRIGGER_FAILURE_STAGES}:
-                trigger_matches += 1
-        outcomes = _counter_payload(summary.get("outcomes"))
-        market_bars: list[dict[str, str]] = []
-        raw_market_bars = summary.get("market_bars")
-        if isinstance(raw_market_bars, list):
-            seen_market_bars: set[tuple[str, str]] = set()
-            for item in raw_market_bars:
-                if not isinstance(item, Mapping):
-                    continue
-                timeframe = str(item.get("timeframe") or "")
-                bar_timestamp = _timestamp(item.get("timestamp"))
-                if not timeframe or bar_timestamp is None:
-                    continue
-                key = (timeframe, bar_timestamp.isoformat())
-                if key in seen_market_bars:
-                    continue
-                seen_market_bars.add(key)
-                market_bars.append({"timeframe": key[0], "timestamp": key[1]})
-        cycle_errors = raw.get("cycle_errors")
-        products.append(
-            {
-                "name": str(identity.get("name") or ""),
-                "objective": str(identity.get("objective") or ""),
-                "market": str(identity.get("market") or ""),
-                "symbol": str(identity.get("symbol") or "").upper(),
-                "entries_allowed": raw.get("entries_allowed") is True,
-                "entry_gate_reason": (
-                    str(raw.get("entry_gate", {}).get("reason") or "")
-                    if isinstance(raw.get("entry_gate"), Mapping)
-                    else ""
-                ),
-                "strategies_loaded": _non_negative_int(summary.get("strategies")),
-                "data_ready": _non_negative_int(summary.get("data_ready")),
-                "market_bars": market_bars,
-                "regime_eligible": regime_eligible,
-                "setup_matches": setup_matches,
-                "trigger_matches": trigger_matches,
-                "signals": _non_negative_int(summary.get("signals")),
-                "entries_opened": _non_negative_int(summary.get("entries_opened")),
-                "positions_managed": _non_negative_int(summary.get("positions_managed")),
-                "outcomes": outcomes,
-                "failed_stages": dict(stages),
-                "killer_predicates": dict(predicates),
-                "cycle_errors": len(cycle_errors) if isinstance(cycle_errors, list) else 0,
-                "last_signal_at": last_signal_at.isoformat() if last_signal_at else None,
-                "last_entry_at": last_entry_at.isoformat() if last_entry_at else None,
-            }
-        )
+        product = _cycle_product_record(raw)
+        if product is not None:
+            products.append(product)
     return {
         "schema": CYCLE_SCHEMA,
         "generated_at": timestamp.isoformat(),
@@ -274,6 +289,82 @@ def _starvation_point(summary: Mapping[str, Any]) -> str:
     return "not_starved"
 
 
+def _add_market_bar_keys(raw_market_bars: Any, market_bars: set[tuple[str, str]]) -> None:
+    if not isinstance(raw_market_bars, list):
+        return
+    for item in raw_market_bars:
+        if not isinstance(item, Mapping):
+            continue
+        timeframe = str(item.get("timeframe") or "")
+        timestamp = _timestamp(item.get("timestamp"))
+        if timeframe and timestamp is not None:
+            market_bars.add((timeframe, timestamp.isoformat()))
+
+
+def _aggregate_product_history(
+    records: list[Mapping[str, Any]],
+    product: ProductConfig,
+    *,
+    cutoff: dt.datetime,
+) -> dict[str, Any]:
+    outcomes: Counter[str] = Counter()
+    stages: Counter[str] = Counter()
+    predicates: Counter[str] = Counter()
+    totals: Counter[str] = Counter()
+    market_bars: set[tuple[str, str]] = set()
+    last_signal: str | None = None
+    last_entry: str | None = None
+    for cycle in records:
+        raw_products = cycle.get("products")
+        if not isinstance(raw_products, list):
+            continue
+        for row in raw_products:
+            if not isinstance(row, Mapping) or row.get("name") != product.name:
+                continue
+            generated = str(cycle.get("generated_at") or "")
+            outcomes.update(_counter_payload(row.get("outcomes")))
+            stages.update(_counter_payload(row.get("failed_stages")))
+            predicates.update(_counter_payload(row.get("killer_predicates")))
+            totals["cycles"] += 1
+            totals["entry_enabled_cycles"] += int(row.get("entries_allowed") is True)
+            _add_market_bar_keys(row.get("market_bars"), market_bars)
+            for key in (
+                "strategies_loaded",
+                "data_ready",
+                "regime_eligible",
+                "setup_matches",
+                "trigger_matches",
+                "signals",
+                "entries_opened",
+                "positions_managed",
+                "cycle_errors",
+            ):
+                totals[key] += _non_negative_int(row.get(key))
+            if _non_negative_int(row.get("signals")):
+                last_signal = str(row.get("last_signal_at") or generated)
+            if _non_negative_int(row.get("entries_opened")):
+                last_entry = str(row.get("last_entry_at") or generated)
+    completed_trades, last_trade = _completed_trades(product, cutoff)
+    summary: dict[str, Any] = {
+        **dict(totals),
+        "market_bars_processed": len(market_bars),
+        "completed_trades": completed_trades,
+        "risk_rejected": sum(outcomes[name] for name in RISK_REJECTION_OUTCOMES),
+        "execution_rejected": totals["cycle_errors"],
+        "outcomes": dict(outcomes),
+        "failed_stages": dict(stages),
+        "killer_predicates": [
+            {"predicate": name, "count": count} for name, count in predicates.most_common(10)
+        ],
+        "dominant_failed_stage": _dominant(stages),
+        "last_signal": last_signal,
+        "last_entry": last_entry,
+        "last_trade": last_trade,
+    }
+    summary["starvation_point"] = _starvation_point(summary)
+    return summary
+
+
 def build_report(
     records: Iterable[Mapping[str, Any]],
     products: Iterable[ProductConfig],
@@ -284,69 +375,7 @@ def build_report(
     record_list = list(records)
     output = []
     for product in products:
-        outcomes: Counter[str] = Counter()
-        stages: Counter[str] = Counter()
-        predicates: Counter[str] = Counter()
-        totals: Counter[str] = Counter()
-        market_bars: set[tuple[str, str]] = set()
-        last_signal: str | None = None
-        last_entry: str | None = None
-        for cycle in record_list:
-            raw_products = cycle.get("products")
-            if not isinstance(raw_products, list):
-                continue
-            for row in raw_products:
-                if not isinstance(row, Mapping) or row.get("name") != product.name:
-                    continue
-                generated = str(cycle.get("generated_at") or "")
-                outcomes.update(_counter_payload(row.get("outcomes")))
-                stages.update(_counter_payload(row.get("failed_stages")))
-                predicates.update(_counter_payload(row.get("killer_predicates")))
-                totals["cycles"] += 1
-                totals["entry_enabled_cycles"] += int(row.get("entries_allowed") is True)
-                raw_market_bars = row.get("market_bars")
-                if isinstance(raw_market_bars, list):
-                    for item in raw_market_bars:
-                        if not isinstance(item, Mapping):
-                            continue
-                        timeframe = str(item.get("timeframe") or "")
-                        timestamp = _timestamp(item.get("timestamp"))
-                        if timeframe and timestamp is not None:
-                            market_bars.add((timeframe, timestamp.isoformat()))
-                for key in (
-                    "strategies_loaded",
-                    "data_ready",
-                    "regime_eligible",
-                    "setup_matches",
-                    "trigger_matches",
-                    "signals",
-                    "entries_opened",
-                    "positions_managed",
-                    "cycle_errors",
-                ):
-                    totals[key] += _non_negative_int(row.get(key))
-                if _non_negative_int(row.get("signals")):
-                    last_signal = str(row.get("last_signal_at") or generated)
-                if _non_negative_int(row.get("entries_opened")):
-                    last_entry = str(row.get("last_entry_at") or generated)
-        completed_trades, last_trade = _completed_trades(product, cutoff)
-        summary: dict[str, Any] = {
-            **dict(totals),
-            "market_bars_processed": len(market_bars),
-            "completed_trades": completed_trades,
-            "risk_rejected": sum(outcomes[name] for name in RISK_REJECTION_OUTCOMES),
-            "execution_rejected": totals["cycle_errors"],
-            "outcomes": dict(outcomes),
-            "failed_stages": dict(stages),
-            "killer_predicates": [
-                {"predicate": name, "count": count} for name, count in predicates.most_common(10)
-            ],
-            "dominant_failed_stage": _dominant(stages),
-            "last_signal": last_signal,
-            "last_entry": last_entry,
-            "last_trade": last_trade,
-        }
-        summary["starvation_point"] = _starvation_point(summary)
+        summary = _aggregate_product_history(record_list, product, cutoff=cutoff)
         output.append(
             {
                 "product": product.name,

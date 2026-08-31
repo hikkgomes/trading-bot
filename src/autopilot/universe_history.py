@@ -161,6 +161,146 @@ def _compatible_spaces(
     return tuple(compatible), excluded
 
 
+def _universe_history_symbol_report(
+    *,
+    config_path: Path,
+    symbol: str,
+    timeframes: list[str] | None,
+    exclude_timeframes: list[str] | None,
+    spaces: tuple[Any, ...],
+    deadline: float,
+) -> dict[str, Any]:
+    try:
+        return run_history_bootstrap(
+            config_path=config_path,
+            markets=["futures"],
+            timeframes=timeframes,
+            exclude_timeframes=exclude_timeframes,
+            symbol=symbol,
+            search_spaces=spaces,
+            deadline_monotonic=deadline,
+        )
+    except Exception as exc:
+        return {"ok": False, "symbol": symbol, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _universe_history_progress_payload(
+    *,
+    symbols: list[str],
+    work_symbols: list[str],
+    partition: list[str],
+    completed_symbols: set[str],
+    reports: list[dict[str, Any]],
+    failures: list[dict[str, Any]],
+    next_index: int,
+    excluded_spaces: list[dict[str, Any]],
+    universe: dict[str, Any],
+    dynamic: bool,
+) -> dict[str, Any]:
+    return {
+        "ok": not failures,
+        "schema": "autopilot.universe_history/v2",
+        "generated_at": datetime.now(UTC).isoformat(),
+        "symbols": symbols,
+        "work_symbols": work_symbols,
+        "partition": partition,
+        "complete": False,
+        "deferred": not failures,
+        "reason": "bootstrap_failed" if failures else "bootstrap_in_progress",
+        "completed": len(completed_symbols),
+        "completed_symbols": sorted(completed_symbols),
+        "next_index": next_index,
+        "next_symbol": work_symbols[next_index] if next_index < len(work_symbols) else None,
+        "failed_symbols": sorted(
+            str(item.get("symbol")) for item in failures if item.get("symbol")
+        ),
+        "excluded_search_spaces": excluded_spaces,
+        "market_universe": universe if dynamic else None,
+        "reports": reports,
+    }
+
+
+def _run_universe_history_work(
+    *,
+    config_path: Path,
+    output_path: Path | None,
+    timeframes: list[str] | None,
+    exclude_timeframes: list[str] | None,
+    symbols: list[str],
+    work_symbols: list[str],
+    partition: list[str],
+    spaces_by_symbol: dict[str, tuple[Any, ...]],
+    excluded_spaces: list[dict[str, Any]],
+    universe: dict[str, Any],
+    dynamic: bool,
+    progress: dict[str, Any],
+    deadline: float,
+) -> tuple[list[dict[str, Any]], set[str], list[dict[str, Any]], dict[str, Any] | None, int, bool]:
+    reports = [
+        item
+        for item in progress.get("reports") or []
+        if isinstance(item, dict) and item.get("ok") is True
+    ]
+    completed_symbols = {
+        str(item.get("symbol")) for item in reports if isinstance(item.get("symbol"), str)
+    }
+    try:
+        next_index = int(progress.get("next_index") or 0)
+    except (TypeError, ValueError):
+        next_index = 0
+    if not 0 <= next_index <= len(work_symbols):
+        next_index = 0
+    failures: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    deferred = False
+    for index in range(next_index, len(work_symbols)):
+        symbol = work_symbols[index]
+        if time.monotonic() >= deadline:
+            next_index = index
+            deferred = True
+            break
+        report = _universe_history_symbol_report(
+            config_path=config_path,
+            symbol=symbol,
+            timeframes=timeframes,
+            exclude_timeframes=exclude_timeframes,
+            spaces=spaces_by_symbol[symbol],
+            deadline=deadline,
+        )
+        if report.get("deferred"):
+            current = report
+            next_index = index
+            deferred = True
+            break
+        reports = [item for item in reports if item.get("symbol") != symbol]
+        reports.append(report)
+        if report.get("ok"):
+            completed_symbols.add(symbol)
+            next_index = index + 1
+        else:
+            failures.append(report)
+            next_index = index
+        if output_path is not None:
+            write_json_atomic(
+                output_path,
+                _universe_history_progress_payload(
+                    symbols=symbols,
+                    work_symbols=work_symbols,
+                    partition=partition,
+                    completed_symbols=completed_symbols,
+                    reports=reports,
+                    failures=failures,
+                    next_index=next_index,
+                    excluded_spaces=excluded_spaces,
+                    universe=universe,
+                    dynamic=dynamic,
+                ),
+            )
+        if failures:
+            break
+    return reports, completed_symbols, failures, current, next_index, deferred
+
+
 def run_universe_history(
     *,
     config_path: Path = DEFAULT_CONFIG,
@@ -208,88 +348,24 @@ def run_universe_history(
         partition=partition,
         snapshot_id=universe.get("snapshot_id"),
     )
-    reports = [
-        item
-        for item in progress.get("reports") or []
-        if isinstance(item, dict) and item.get("ok") is True
-    ]
-    completed_symbols = {
-        str(item.get("symbol")) for item in reports if isinstance(item.get("symbol"), str)
-    }
-    try:
-        next_index = int(progress.get("next_index") or 0)
-    except (TypeError, ValueError):
-        next_index = 0
-    if not 0 <= next_index <= len(work_symbols):
-        next_index = 0
     deadline = time.monotonic() + float(max_runtime_seconds)
-    failures: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    deferred = False
-    for index in range(next_index, len(work_symbols)):
-        symbol = work_symbols[index]
-        if time.monotonic() >= deadline:
-            next_index = index
-            deferred = True
-            break
-        try:
-            report = run_history_bootstrap(
-                config_path=config_path,
-                markets=["futures"],
-                timeframes=timeframes,
-                exclude_timeframes=exclude_timeframes,
-                symbol=symbol,
-                search_spaces=spaces_by_symbol[symbol],
-                deadline_monotonic=deadline,
-            )
-        except Exception as exc:
-            report = {
-                "ok": False,
-                "symbol": symbol,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        if report.get("deferred"):
-            current = report
-            next_index = index
-            deferred = True
-            break
-        reports = [item for item in reports if item.get("symbol") != symbol]
-        reports.append(report)
-        if report.get("ok"):
-            completed_symbols.add(symbol)
-            next_index = index + 1
-        else:
-            failures.append(report)
-            next_index = index
-        if output_path is not None:
-            write_json_atomic(
-                output_path,
-                {
-                    "ok": not failures,
-                    "schema": "autopilot.universe_history/v2",
-                    "generated_at": datetime.now(UTC).isoformat(),
-                    "symbols": symbols,
-                    "work_symbols": work_symbols,
-                    "partition": partition,
-                    "complete": False,
-                    "deferred": not failures,
-                    "reason": ("bootstrap_failed" if failures else "bootstrap_in_progress"),
-                    "completed": len(completed_symbols),
-                    "completed_symbols": sorted(completed_symbols),
-                    "next_index": next_index,
-                    "next_symbol": (
-                        work_symbols[next_index] if next_index < len(work_symbols) else None
-                    ),
-                    "failed_symbols": sorted(
-                        str(item.get("symbol")) for item in failures if item.get("symbol")
-                    ),
-                    "excluded_search_spaces": excluded_spaces,
-                    "market_universe": universe if config.dynamic_active_income_universe else None,
-                    "reports": reports,
-                },
-            )
-        if failures:
-            break
+    reports, completed_symbols, failures, current, next_index, deferred = (
+        _run_universe_history_work(
+            config_path=config_path,
+            output_path=output_path,
+            timeframes=timeframes,
+            exclude_timeframes=exclude_timeframes,
+            symbols=symbols,
+            work_symbols=work_symbols,
+            partition=partition,
+            spaces_by_symbol=spaces_by_symbol,
+            excluded_spaces=excluded_spaces,
+            universe=universe,
+            dynamic=config.dynamic_active_income_universe,
+            progress=progress,
+            deadline=deadline,
+        )
+    )
     complete = next_index >= len(work_symbols) and not deferred
     failed_symbols = sorted(
         str(item.get("symbol")) for item in reports if item.get("ok") is not True
