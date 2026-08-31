@@ -568,6 +568,7 @@ def test_live_recovery_worker_reconciles_missing_exchange_order(tmp_path: Path):
         payload={"product_id": "active_income", "order_id": "missing-order"},
         available_at=NOW,
     )
+    actions = []
     worker = DatabaseLiveRecoveryWorker(
         queue=queue,
         worker_id="linux-optiplex:execution-engine",
@@ -579,15 +580,20 @@ def test_live_recovery_worker_reconciles_missing_exchange_order(tmp_path: Path):
             exchange_open_order_ids=set(),
         ),
         account_products={"binance-futures-main": "active_income"},
+        execute_action=lambda product_id, action: actions.append(
+            (product_id, action.action_type.value, action.target)
+        )
+        or {"status": "applied", "target": action.target},
     )
 
     result = worker.run_once(now=NOW)
     plans = SqlRecoveryStore(database.engine).read()
 
-    assert result["reason_code"] == "live_recovery_plan_created"
+    assert result["reason_code"] == "live_recovery_actions_executed"
     assert result["operator_review_required"] is True
     assert plans[0].actions[0].action_type is RecoveryActionType.RECONCILE_ORDER
     assert plans[0].actions[0].target == "missing-order"
+    assert actions == [("active_income", "reconcile_order", "missing-order")]
 
 
 def test_live_recovery_worker_verifies_a_user_stream_reconnect_without_difference(

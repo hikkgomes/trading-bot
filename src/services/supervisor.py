@@ -359,6 +359,7 @@ def _execution_cycle(
             store=SqlRecoveryStore(database.engine),
             reconcile_product=approved_live.reconcile,
             account_products=account_products,
+            execute_action=approved_live.recover_action,
         )
 
     def on_live_fill(product_id: str, order, quantity: float, at: str) -> object:

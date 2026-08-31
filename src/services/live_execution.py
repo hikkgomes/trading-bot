@@ -16,13 +16,14 @@ from src.data.database import account_snapshot
 from src.data.database import instrument as instrument_table
 from src.domain._codec import canonical_hash, timestamp, to_primitive
 from src.domain.instruments import Instrument, MarketType
-from src.domain.orders import OrderIntent
+from src.domain.orders import OrderIntent, OrderSide, OrderStatus, OrderType
 from src.execution.ccxt_broker import CcxtBroker
 from src.execution.config import ExchangeConfig
 from src.execution.live_exchange import BrokerExecutionVenue
 from src.execution.order_manager import OrderManager
 from src.execution.position_manager import PositionManager
 from src.execution.reconciler import ReconciliationResult, reconcile_account
+from src.execution.recovery import RecoveryAction, RecoveryActionType
 from src.research.canonical import (
     SqlActiveStrategyAssignmentRepository,
     SqlApprovalRepository,
@@ -31,6 +32,7 @@ from src.research.canonical import (
     preflight_is_fresh,
 )
 from src.services.exposure_budget import ExposureBudgetGuard
+from src.services.runtime import utc_now
 
 _EXECUTION_IDENTITY_FILES = (
     Path("requirements-runtime.txt"),
@@ -190,6 +192,178 @@ class ApprovedLiveExecution:
             local_open_order_ids=local_orders,
             exchange_open_order_ids=exchange_orders,
         )
+
+    def recover_action(self, product_id: str, action: RecoveryAction) -> Mapping[str, Any]:
+        """Execute one bounded, idempotent recovery action on the approved venue."""
+
+        venue = self.venues[product_id]
+        broker = venue.broker
+        if action.action_type is RecoveryActionType.CANCEL_UNKNOWN_ORDER:
+            return self._cancel_unknown_order(broker, action.target)
+        if action.action_type is RecoveryActionType.RECONCILE_ORDER:
+            return self._reconcile_missing_order(action.target)
+        if action.action_type is RecoveryActionType.RECONCILE_POSITION:
+            return self._reconcile_position(product_id, action.target, action.quantity)
+        if action.action_type is RecoveryActionType.EMERGENCY_FLATTEN:
+            return self._emergency_flatten(product_id, action.target, action.quantity)
+        raise ValueError(f"unsupported recovery action: {action.action_type}")
+
+    def _cancel_unknown_order(self, broker: Any, target: str) -> Mapping[str, Any]:
+        matches = []
+        for conditional in (False, True):
+            matches.extend(broker.list_account_open_orders(conditional=conditional))
+        matching = tuple(
+            item
+            for item in matches
+            if target in {item.order_id, item.client_id, f"exchange:{item.order_id}"}
+        )
+        if not matching:
+            return {"action": "cancel_unknown_order", "target": target, "status": "absent"}
+        if len(matching) != 1:
+            raise RuntimeError(f"recovery order identity is ambiguous: {target}")
+        item = matching[0]
+        result = broker.cancel_order(
+            symbol=item.symbol,
+            exchange_order_id=item.order_id,
+            client_order_id=item.client_id,
+        )
+        status = str(result.status).casefold()
+        if status in {"open", "new", "accepted", "partially_filled"}:
+            raise RuntimeError(f"unknown exchange order remains open: {target}")
+        return {"action": "cancel_unknown_order", "target": target, "status": status}
+
+    def _reconcile_missing_order(self, target: str) -> Mapping[str, Any]:
+        self.order_manager.reload()
+        matches = tuple(
+            order
+            for order in self.order_manager.all()
+            if order.order_id == target
+            or str(order.metadata.get("client_order_id") or "") == target
+            or str(order.metadata.get("exchange_order_id") or "") == target
+        )
+        if not matches:
+            return {"action": "reconcile_order", "target": target, "status": "local_absent"}
+        if len(matches) != 1:
+            raise RuntimeError(f"local recovery order identity is ambiguous: {target}")
+        order = matches[0]
+        if order.status is not OrderStatus.RECONCILED:
+            if order.status is not OrderStatus.RECOVERY_REQUIRED:
+                self.order_manager.recovery_required(order.order_id)
+            self.order_manager.reconcile(order.order_id)
+        return {
+            "action": "reconcile_order",
+            "target": target,
+            "order_id": order.order_id,
+            "status": "reconciled",
+        }
+
+    def _reconcile_position(
+        self, product_id: str, instrument_id: str, quantity: float | None
+    ) -> Mapping[str, Any]:
+        venue = self.venues[product_id]
+        broker = venue.broker
+        instrument = venue.instruments.get(instrument_id)
+        if instrument is None:
+            raise RuntimeError(f"recovery instrument is not approved: {instrument_id}")
+        observed_quantity = quantity
+        average_price = 0.0
+        if broker.config.market_type == "futures":
+            matches = tuple(
+                item
+                for item in broker.list_account_futures_positions()
+                if broker._symbols_match(item.symbol, instrument.exchange_symbol)
+            )
+            if len(matches) > 1:
+                raise RuntimeError(f"recovery position identity is ambiguous: {instrument_id}")
+            if matches:
+                observed_quantity = matches[0].qty
+                average_price = matches[0].avg_price
+        else:
+            position = broker.get_position(instrument.exchange_symbol)
+            observed_quantity = position.qty
+            average_price = position.avg_price
+        if observed_quantity is None:
+            raise RuntimeError(f"recovery position quantity is missing: {instrument_id}")
+        self.positions.reconcile_position(
+            portfolio_id=self.product_portfolios[product_id],
+            instrument_id=instrument_id,
+            quantity=float(observed_quantity),
+            average_entry_price=float(average_price),
+            updated_at=utc_now(),
+        )
+        return {
+            "action": "reconcile_position",
+            "instrument_id": instrument_id,
+            "quantity": float(observed_quantity),
+            "status": "reconciled",
+        }
+
+    def _emergency_flatten(
+        self, product_id: str, instrument_id: str, quantity: float | None
+    ) -> Mapping[str, Any]:
+        venue = self.venues[product_id]
+        instrument = venue.instruments.get(instrument_id)
+        if instrument is None:
+            raise RuntimeError(f"recovery instrument is not approved: {instrument_id}")
+        broker = venue.broker
+        signed_quantity = float(quantity or 0.0)
+        if abs(signed_quantity) <= 1e-12:
+            if broker.config.market_type == "futures":
+                positions = tuple(
+                    item
+                    for item in broker.list_account_futures_positions()
+                    if broker._symbols_match(item.symbol, instrument.exchange_symbol)
+                )
+                if len(positions) > 1:
+                    raise RuntimeError(f"recovery position identity is ambiguous: {instrument_id}")
+                signed_quantity = positions[0].qty if positions else 0.0
+            else:
+                signed_quantity = broker.get_position(instrument.exchange_symbol).qty
+        if abs(signed_quantity) <= 1e-12:
+            return {"action": "emergency_flatten", "instrument_id": instrument_id, "status": "flat"}
+        reference_price = float(broker.get_price(instrument.exchange_symbol))
+        unsigned = {
+            "product_id": product_id,
+            "instrument_id": instrument_id,
+            "quantity": abs(signed_quantity),
+            "side": "sell" if signed_quantity > 0 else "buy",
+            "kind": "emergency_flatten",
+        }
+        order_id = "recovery:" + canonical_hash(unsigned).removeprefix("sha256:")[:40]
+        self.order_manager.reload()
+        existing = next(
+            (order for order in self.order_manager.all() if order.order_id == order_id), None
+        )
+        if existing is not None:
+            return {
+                "action": "emergency_flatten",
+                "instrument_id": instrument_id,
+                "order_id": order_id,
+                "status": existing.status.value,
+            }
+        intent = OrderIntent(
+            order_id=order_id,
+            portfolio_id=self.product_portfolios[product_id],
+            instrument_id=instrument_id,
+            side=OrderSide.SELL if signed_quantity > 0 else OrderSide.BUY,
+            quantity=abs(signed_quantity),
+            order_type=OrderType.MARKET,
+            created_at=utc_now(),
+            reduce_only=True,
+            strategy_contributions={"recovery": 1.0},
+            metadata={
+                "recovery": True,
+                "reason_code": "emergency_flatten",
+                "reference_price": reference_price,
+            },
+        )
+        venue.submit(intent)
+        return {
+            "action": "emergency_flatten",
+            "instrument_id": instrument_id,
+            "order_id": order_id,
+            "status": "submitted",
+        }
 
     def authorise(self, payload: Mapping[str, Any], order: OrderIntent) -> None:
         product_id = str(payload["product_id"])

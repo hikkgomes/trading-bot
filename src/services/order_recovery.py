@@ -8,7 +8,7 @@ from typing import Any
 
 from src.domain._codec import timestamp
 from src.execution.reconciler import ReconciliationResult
-from src.execution.recovery import SqlRecoveryStore, plan_recovery
+from src.execution.recovery import RecoveryAction, SqlRecoveryStore, plan_recovery
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -23,6 +23,7 @@ class DatabaseLiveRecoveryWorker:
         store: SqlRecoveryStore,
         reconcile_product: Callable[[str], ReconciliationResult],
         account_products: Mapping[str, str],
+        execute_action: Callable[[str, RecoveryAction], Mapping[str, Any]] | None = None,
         lease_seconds: int = 60,
     ) -> None:
         self.queue = queue
@@ -30,6 +31,7 @@ class DatabaseLiveRecoveryWorker:
         self.store = store
         self.reconcile_product = reconcile_product
         self.account_products = dict(account_products)
+        self.execute_action = execute_action
         self.lease_seconds = lease_seconds
 
     def run_once(self, *, now: str) -> dict[str, Any]:
@@ -57,6 +59,11 @@ class DatabaseLiveRecoveryWorker:
                         "recovery_kind": "user_stream_reconnect",
                     }
                 raise ValueError("recovery job found no exchange-state difference")
+            action_results = ()
+            if self.execute_action is not None:
+                action_results = tuple(
+                    dict(self.execute_action(product_id, action)) for action in plan.actions
+                )
         except Exception as exc:
             self.queue.fail(
                 claimed,
@@ -72,12 +79,17 @@ class DatabaseLiveRecoveryWorker:
             }
         self.queue.complete(claimed, completed_at=now)
         return {
-            "reason_code": "live_recovery_plan_created",
+            "reason_code": (
+                "live_recovery_actions_executed"
+                if self.execute_action is not None
+                else "live_recovery_plan_created"
+            ),
             "job_id": claimed.job_id,
             "product_id": product_id,
             "recovery_plan_id": plan.plan_id,
             "actions": len(plan.actions),
             "operator_review_required": plan.requires_operator_review,
+            "action_results": list(action_results),
         }
 
 
