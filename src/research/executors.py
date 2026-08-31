@@ -643,6 +643,7 @@ def _measured_result(
         "output_hash": output_hash,
         "observations": observations,
         "behaviour_hash": context.get("behaviour_hash"),
+        "parity_receipt": context.get("parity_receipt"),
     }
     product_id = str(context.get("product_id") or "")
     if product_id in {"btc_accumulation", "active_income"}:
@@ -1667,11 +1668,17 @@ def execute_registered_python(candidate: Candidate, context: Mapping[str, Any]) 
     try:
         behaviour = RegisteredStrategyBehaviour.from_definition(candidate.definition)
         signals = behaviour.generate_signals(frame)
+        parity = behaviour.parity_receipt(frame)
     except StrategyBehaviourError as exc:
         raise ExecutorError(str(exc)) from exc
     return _measured_result(
         candidate,
-        {**context, "behaviour_hash": behaviour.behaviour_hash},
+        {
+            **context,
+            "behaviour_hash": behaviour.behaviour_hash,
+            "behaviour_input_hash": parity["input_hash"],
+            "parity_receipt": parity,
+        },
         signals,
     )
 

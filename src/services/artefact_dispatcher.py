@@ -180,7 +180,8 @@ def _registered_strategy_behaviour(
         behaviour = RegisteredStrategyBehaviour.from_definition(_definition(artefact))
         frame = features.get("market_frame")
         if frame is not None:
-            signal = behaviour.latest_signal(frame)
+            parity = behaviour.parity_receipt(frame)
+            signal = int(parity["signals"][-1]) if parity["signals"] else 0
             input_hash = behaviour.frame_input_hash(frame)
             input_status = "market_frame"
         else:
@@ -199,6 +200,8 @@ def _registered_strategy_behaviour(
     forecast["behaviour_hash"] = behaviour.behaviour_hash
     forecast["behaviour_input_hash"] = input_hash
     forecast["behaviour_input_status"] = input_status
+    if frame is not None:
+        forecast["parity_receipt"] = parity
     return forecast
 
 

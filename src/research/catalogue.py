@@ -133,7 +133,7 @@ def _strategy_identity_policy(strategy: Any) -> dict[str, object]:
 
 
 def _registered_strategy_identity_payload(name: str) -> dict[str, object]:
-    """Build the executable identity without repository-history metadata."""
+    """Build the economic behaviour identity without deployment metadata."""
 
     strategy = __import__("src.strategies.registry", fromlist=["get"]).get(name)
     repository = Path(__file__).resolve().parents[2]
@@ -142,6 +142,16 @@ def _registered_strategy_identity_payload(name: str) -> dict[str, object]:
         "strategy": name,
         "module_files": _strategy_executable_files(strategy, repository),
         **identity_policy,
+    }
+
+
+def _registered_strategy_deployment_payload(name: str) -> dict[str, object]:
+    """Build non-authoritative deployment provenance for one strategy."""
+
+    repository = Path(__file__).resolve().parents[2]
+    return {
+        "strategy": name,
+        "behaviour_source_hash": canonical_hash(_registered_strategy_identity_payload(name)),
         "runtime_lock": _runtime_lock(repository),
         "python": sys.version,
     }
@@ -165,11 +175,12 @@ def registered_strategy_provenance(name: str) -> dict[str, object]:
 
     repository = Path(__file__).resolve().parents[2]
     identity_payload = _registered_strategy_identity_payload(name)
-    source_hash = "sha256:" + hashlib.sha256(repr(identity_payload).encode("utf-8")).hexdigest()
+    deployment_payload = _registered_strategy_deployment_payload(name)
     return {
-        "source_hash": source_hash,
+        "source_hash": canonical_hash(identity_payload),
+        "deployment_hash": canonical_hash(deployment_payload),
         "git_commit": _repository_commit(repository),
-        "identity_schema": "registered_strategy_executable/v2",
+        "identity_schema": "registered_strategy_executable/v3",
     }
 
 

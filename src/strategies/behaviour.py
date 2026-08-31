@@ -132,6 +132,18 @@ class RegisteredStrategyBehaviour:
             }
         )
 
+    def parity_receipt(self, frame: Any) -> Mapping[str, Any]:
+        """Return a deterministic bar-by-bar receipt for runtime parity."""
+
+        signals = self.generate_signals(frame)
+        payload = {
+            "schema": "registered_strategy_parity/v1",
+            "behaviour_hash": self.behaviour_hash,
+            "input_hash": self.frame_input_hash(frame),
+            "signals": list(signals),
+        }
+        return {**payload, "receipt_hash": canonical_hash(payload)}
+
     @staticmethod
     def _signal(value: Any) -> int:
         if isinstance(value, bool):
