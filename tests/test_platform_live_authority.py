@@ -202,6 +202,20 @@ def _fixture(tmp_path: Path, monkeypatch) -> tuple[PlatformDatabase, PlatformLiv
         decided_at="2026-08-29T10:00:01+00:00",
         accepted=True,
     )
+    SqlActiveStrategyAssignmentRepository(database.engine).assign(
+        product_id="active_income",
+        portfolio_id="active-income-portfolio",
+        strategy_version_id=str(paper_assignment["strategy_version_id"]),
+        artefact_hash=str(paper_assignment["artefact_hash"]),
+        lifecycle_state="live_ready",
+        execution_mode="paper",
+        capital_limit=100.0,
+        risk_budget=100.0,
+        assigned_at=observation_at,
+        assigned_by="promotion-test",
+        instrument_id=instrument.instrument_id,
+        payload={"account_id": "binance-futures-main"},
+    )
     authority = PlatformLiveAuthority(
         engine=database.engine,
         configuration=configuration,

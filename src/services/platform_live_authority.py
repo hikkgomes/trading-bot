@@ -324,10 +324,21 @@ class PlatformLiveAuthority:
             expected_preflight_id=expected_preflight_id,
             at=assigned_at,
         )
+        self._assert_forward_ready(
+            product_id=product_id,
+            strategy_version_id=str(artefact["strategy_version_id"]),
+            artefact_hash=artefact_hash,
+            at=assigned_at,
+        )
         if capital_limit > min(float(preflight["capital_cap"]), float(approval["capital_cap"])):
             raise PlatformLiveAuthorityError("assignment capital exceeds approved authority")
         if not isinstance(assigned_by, str) or not assigned_by.strip():
             raise PlatformLiveAuthorityError("assignment operator is required")
+        self.assignments.deactivate(
+            product_id,
+            at=assigned_at,
+            assignment_reason="paper authority replaced by live canary",
+        )
         assignment_id = self.assignments.assign(
             product_id=product_id,
             portfolio_id=str(product["portfolio_id"]),
@@ -364,6 +375,27 @@ class PlatformLiveAuthority:
             "assigned_by": assigned_by.strip(),
             "assigned_at": assigned_at,
         }
+
+    def _assert_forward_ready(
+        self,
+        *,
+        product_id: str,
+        strategy_version_id: str,
+        artefact_hash: str,
+        at: str,
+    ) -> None:
+        assignments = self.assignments.active_assignments(product_id, at=at)
+        if any(
+            row["execution_mode"] == "paper"
+            and row["lifecycle_state"] == "live_ready"
+            and row["strategy_version_id"] == strategy_version_id
+            and row["artefact_hash"] == artefact_hash
+            for row in assignments
+        ):
+            return
+        raise PlatformLiveAuthorityError(
+            "live assignment requires a current live_ready lifecycle assignment"
+        )
 
     def _selection(
         self, *, product_id: str, artefact_hash: str, instrument_id: str, sleeve_id: str
