@@ -108,7 +108,7 @@ def _source_connection(path: Path) -> sqlite3.Connection:
         raise SqliteImportError(f"cannot open SQLite source read-only: {exc}") from exc
 
 
-def _validate_source(connection: sqlite3.Connection, path: Path) -> dict[str, list[sqlite3.Row]]:
+def _validate_source_structure(connection: sqlite3.Connection, path: Path) -> None:
     quick = [row[0] for row in connection.execute("PRAGMA quick_check")]
     if quick != ["ok"]:
         raise SqliteImportError(f"SQLite quick_check failed for {path}: {quick[:3]}")
@@ -130,10 +130,16 @@ def _validate_source(connection: sqlite3.Connection, path: Path) -> dict[str, li
     }
     if meta.get("schema_version") != str(SCHEMA_VERSION) or meta.get("format") != MEMORY_FORMAT:
         raise SqliteImportError("SQLite source has an unsupported experiment-memory marker")
-    rows = {
+
+
+def _source_rows(connection: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
+    return {
         table: list(connection.execute(f"SELECT * FROM {table}"))
         for table in ("strategies", "strategy_identities", "lineage_edges", "evaluations")
     }
+
+
+def _validate_strategy_rows(rows: Mapping[str, list[sqlite3.Row]]) -> set[str]:
     strategy_hashes = {str(row["behavior_hash"]) for row in rows["strategies"]}
     for row in rows["strategies"]:
         spec = _decode(row["canonical_spec_json"], label="strategy canonical JSON")
@@ -141,6 +147,12 @@ def _validate_source(connection: sqlite3.Connection, path: Path) -> dict[str, li
             raise SqliteImportError(
                 f"strategy hash mismatch in SQLite source: {row['behavior_hash']}"
             )
+    return strategy_hashes
+
+
+def _validate_relationship_rows(
+    rows: Mapping[str, list[sqlite3.Row]], strategy_hashes: set[str]
+) -> None:
     if any(str(row["behavior_hash"]) not in strategy_hashes for row in rows["strategy_identities"]):
         raise SqliteImportError("SQLite strategy identity references an unknown strategy")
     if any(row["is_duplicate"] not in (0, 1, False, True) for row in rows["strategy_identities"]):
@@ -151,6 +163,11 @@ def _validate_source(connection: sqlite3.Connection, path: Path) -> dict[str, li
         for row in rows["lineage_edges"]
     ):
         raise SqliteImportError("SQLite lineage references an unknown strategy")
+
+
+def _validate_evaluation_rows(
+    rows: Mapping[str, list[sqlite3.Row]], strategy_hashes: set[str]
+) -> None:
     for row in rows["evaluations"]:
         behavior_hash = str(row["behavior_hash"])
         if behavior_hash not in strategy_hashes:
@@ -169,6 +186,15 @@ def _validate_source(connection: sqlite3.Connection, path: Path) -> dict[str, li
         )
         if expected_key != row["evaluation_key"]:
             raise SqliteImportError(f"evaluation hash mismatch: {row['evaluation_key']}")
+
+
+def _validate_source(connection: sqlite3.Connection, path: Path) -> dict[str, list[sqlite3.Row]]:
+    _validate_source_structure(connection, path)
+    rows = _source_rows(connection)
+    rows = {key: list(value) for key, value in rows.items()}
+    strategy_hashes = _validate_strategy_rows(rows)
+    _validate_relationship_rows(rows, strategy_hashes)
+    _validate_evaluation_rows(rows, strategy_hashes)
     return rows
 
 
@@ -272,14 +298,9 @@ def _strategy_version_id(strategy_row: sqlite3.Row) -> str:
     return f"{strategy_row['primary_strategy_id']}:sqlite-import-v1"
 
 
-def import_sqlite_memory(
-    source: Path,
-    database: PlatformDatabase | Engine,
-    *,
-    archive_to: Path | None = None,
-) -> ImportReport:
-    """Validate and import the complete legacy SQLite research memory."""
-
+def _prepare_import_source(
+    source: Path, database: PlatformDatabase | Engine
+) -> tuple[Path, str, dict[str, list[sqlite3.Row]], Engine]:
     source = Path(source)
     if source.is_symlink():
         raise SqliteImportError(f"SQLite source must not be a symlink: {source}")
@@ -290,285 +311,368 @@ def import_sqlite_memory(
         rows = _validate_source(connection, source)
     finally:
         connection.close()
-
     engine = database.engine if isinstance(database, PlatformDatabase) else database
-    if isinstance(database, PlatformDatabase):
-        if database.is_postgresql:
-            database.migrate()
-        else:
-            inspector = inspect(engine)
-            if "experiment" not in inspector.get_table_names():
-                database.create_schema()
+    return source, source_hash, rows, engine
 
-    strategy_rows = rows["strategies"]
-    identity_rows = rows["strategy_identities"]
-    lineage_rows = rows["lineage_edges"]
-    evaluation_rows = rows["evaluations"]
-    destination_payload = _destination_payload(
-        strategy_rows, identity_rows, lineage_rows, evaluation_rows
+
+def _prepare_import_database(database: PlatformDatabase | Engine, engine: Engine) -> None:
+    if not isinstance(database, PlatformDatabase):
+        return
+    if database.is_postgresql:
+        database.migrate()
+        return
+    inspector = inspect(engine)
+    if "experiment" not in inspector.get_table_names():
+        database.create_schema()
+
+
+def _strategy_snapshot_ids(evaluation_rows: Iterable[sqlite3.Row], behavior_hash: str) -> list[str]:
+    snapshots: set[str] = set()
+    for item in evaluation_rows:
+        if str(item["behavior_hash"]) != behavior_hash:
+            continue
+        dataset = _decode(item["dataset_json"], label="evaluation dataset JSON")
+        if not isinstance(dataset, Mapping):
+            raise SqliteImportError(
+                f"evaluation dataset is not an object: {item['evaluation_key']}"
+            )
+        snapshots.add(str(dataset.get("snapshot_id")))
+    return sorted(snapshots)
+
+
+def _import_strategy_row(target, row: sqlite3.Row, evaluation_rows: Iterable[sqlite3.Row]) -> None:
+    behavior_hash = str(row["behavior_hash"])
+    definition = _definition_payload(row)
+    _insert_immutable(
+        target,
+        strategy_definition,
+        {
+            "id": behavior_hash,
+            "identity": str(row["primary_strategy_id"]),
+            "product_id": str(definition["product"]),
+            "source_type": str(definition["source_type"]),
+            "source_hash": behavior_hash,
+            "definition": definition,
+        },
     )
-    destination_hash = canonical_hash(destination_payload)
-    now = datetime.now(UTC).replace(microsecond=0).isoformat()
-    archived_path = None
-    if archive_to is not None:
-        archived_path = str(archive_sqlite_source(source, archive_to))
-    imported_stages: set[tuple[str, str]] = set()
-    with engine.begin() as target:
-        for row in strategy_rows:
-            behavior_hash = str(row["behavior_hash"])
-            definition = _definition_payload(row)
-            _insert_immutable(
-                target,
-                strategy_definition,
-                {
-                    "id": behavior_hash,
-                    "identity": str(row["primary_strategy_id"]),
-                    "product_id": str(definition["product"]),
-                    "source_type": str(definition["source_type"]),
-                    "source_hash": behavior_hash,
-                    "definition": definition,
-                },
-            )
-            _insert_immutable(
-                target,
-                strategy_version,
-                {
-                    "id": _strategy_version_id(row),
-                    "definition_id": behavior_hash,
-                    "version": "sqlite-import-v1",
-                    "created_at": _timestamp(row["created_at"]),
-                    "payload": {"legacy_behavior_hash": behavior_hash},
-                },
-            )
-            experiment_id = _experiment_id(behavior_hash)
-            evals_for_strategy = [
-                item for item in evaluation_rows if str(item["behavior_hash"]) == behavior_hash
-            ]
-            snapshots: set[str] = set()
-            for item in evals_for_strategy:
-                dataset = _decode(item["dataset_json"], label="evaluation dataset JSON")
-                if not isinstance(dataset, Mapping):
-                    raise SqliteImportError(
-                        f"evaluation dataset is not an object: {item['evaluation_key']}"
-                    )
-                snapshots.add(str(dataset.get("snapshot_id")))
-            snapshot_ids = sorted(snapshots)
-            _insert_immutable(
-                target,
-                experiment,
-                {
-                    "id": experiment_id,
-                    "strategy_version_id": _strategy_version_id(row),
-                    "provider": "legacy_sqlite_import",
-                    "state": "queued",
-                    "submitted_at": _timestamp(row["created_at"]),
-                    "dataset_snapshot_hashes": snapshot_ids or [behavior_hash],
-                    "metadata": {"legacy_behavior_hash": behavior_hash},
-                },
-            )
+    _insert_immutable(
+        target,
+        strategy_version,
+        {
+            "id": _strategy_version_id(row),
+            "definition_id": behavior_hash,
+            "version": "sqlite-import-v1",
+            "created_at": _timestamp(row["created_at"]),
+            "payload": {"legacy_behavior_hash": behavior_hash},
+        },
+    )
+    _insert_immutable(
+        target,
+        experiment,
+        {
+            "id": _experiment_id(behavior_hash),
+            "strategy_version_id": _strategy_version_id(row),
+            "provider": "legacy_sqlite_import",
+            "state": "queued",
+            "submitted_at": _timestamp(row["created_at"]),
+            "dataset_snapshot_hashes": _strategy_snapshot_ids(evaluation_rows, behavior_hash)
+            or [behavior_hash],
+            "metadata": {"legacy_behavior_hash": behavior_hash},
+        },
+    )
 
-        for row in identity_rows:
-            _insert_immutable(
-                target,
-                strategy_identity,
-                {
-                    "id": str(row["strategy_id"]),
-                    "behavior_hash": str(row["behavior_hash"]),
-                    "submitted_spec": _decode(
-                        row["submitted_spec_json"], label="strategy submitted JSON"
-                    ),
-                    "generation_method": str(row["generation_method"]),
-                    "metadata": _decode(
-                        row["metadata_json"], label="strategy identity metadata JSON"
-                    ),
-                    "parent_hashes": _decode(
-                        row["parent_hashes_json"], label="strategy parent hashes JSON"
-                    ),
-                    "is_duplicate": bool(row["is_duplicate"]),
-                    "created_at": _timestamp(row["created_at"]),
-                },
-            )
 
-        for row in lineage_rows:
-            child = str(row["child_hash"])
-            parent = str(row["parent_hash"])
-            _insert_immutable(
-                target,
-                strategy_lineage,
-                {
-                    "id": f"sqlite-import:{child}:{parent}",
-                    "created_at": _timestamp(row["created_at"]),
-                    "payload": {
-                        "child_hash": child,
-                        "parent_hash": parent,
-                        "parent_ordinal": int(row["parent_ordinal"]),
-                        "generation_method": str(row["generation_method"]),
-                        "legacy_import": True,
-                    },
-                },
-            )
+def _import_strategy_rows(
+    target, strategy_rows: Iterable[sqlite3.Row], evaluation_rows: Iterable[sqlite3.Row]
+) -> None:
+    for row in strategy_rows:
+        _import_strategy_row(target, row, evaluation_rows)
 
-        for row in evaluation_rows:
-            evaluation_key = str(row["evaluation_key"])
-            behavior_hash = str(row["behavior_hash"])
-            strategy_row = next(
-                item for item in strategy_rows if str(item["behavior_hash"]) == behavior_hash
-            )
-            strategy_version_id = _strategy_version_id(strategy_row)
-            phase = str(row["phase"])
-            run_payload = {
-                "legacy_import": True,
-                "evaluation_key": evaluation_key,
-                "behavior_hash": behavior_hash,
-                "phase": phase,
-                "dataset": _decode(row["dataset_json"], label="evaluation dataset JSON"),
-                "window": _decode(row["window_json"], label="evaluation window JSON"),
-                "protocol": _decode(row["protocol_json"], label="evaluation protocol JSON"),
-                "status": str(row["status"]),
-                "outcome": row["outcome"],
-                "rejection_reasons": _decode(
-                    row["rejection_reasons_json"], label="evaluation rejection JSON"
-                ),
-                "metrics": _decode(row["metrics_json"], label="evaluation metrics JSON"),
-                "details": _decode(row["details_json"], label="evaluation details JSON"),
-            }
-            _insert_immutable(
-                target,
-                experiment_run,
-                {
-                    "id": evaluation_key,
-                    "created_at": _timestamp(row["claimed_at"]),
-                    "payload": run_payload,
-                },
-            )
-            accepted = str(row["outcome"] or "").lower() in {"accept", "accepted", "pass", "passed"}
-            reasons = run_payload["rejection_reasons"]
-            reason_code = str(reasons[0]) if isinstance(reasons, list) and reasons else None
-            _insert_immutable(
-                target,
-                validation_result,
-                {
-                    "id": evaluation_key,
-                    "experiment_id": _experiment_id(behavior_hash),
-                    "state": "forward_paper" if accepted else f"{phase}_rejected",
-                    "accepted": accepted,
-                    "reason_code": reason_code,
-                    "evidence": run_payload,
-                },
-            )
-            stage_name = {
-                "holdout": "protected",
-                "final_holdout": "protected",
-                "final": "protected",
-            }.get(phase, phase)
-            stage_identity = (_experiment_id(behavior_hash), stage_name)
-            if stage_identity not in imported_stages:
-                imported_stages.add(stage_identity)
-                stage_accepted = accepted
-                stage_reason = reason_code or (
-                    None if stage_accepted else "legacy_outcome_not_accepted"
-                )
-                stage_payload = {
-                    "legacy_import": True,
-                    "evaluation_key": evaluation_key,
-                    "phase": phase,
-                    "source_hash": behavior_hash,
-                }
-                _insert_immutable(
-                    target,
-                    validation_stage,
-                    {
-                        "id": canonical_hash(
-                            {
-                                "experiment_id": stage_identity[0],
-                                "stage": stage_name,
-                                "source_run_id": evaluation_key,
-                                "payload": stage_payload,
-                            }
-                        ),
-                        "experiment_id": stage_identity[0],
-                        "stage": stage_name,
-                        "source_run_id": evaluation_key,
-                        "evaluated_at": _timestamp(row["completed_at"] or row["claimed_at"]),
-                        "state": "accepted" if stage_accepted else "rejected",
-                        "accepted": stage_accepted,
-                        "reason_code": stage_reason,
-                        "evidence_hash": canonical_hash(run_payload),
-                        "payload": stage_payload,
-                    },
-                )
-            if phase in {"holdout", "final_holdout", "final"}:
-                claim_id = f"sqlite-import:holdout:{evaluation_key}"
-                claim_payload = {
-                    "legacy_import": True,
-                    "strategy_version_id": strategy_version_id,
-                    "evaluation_key": evaluation_key,
-                    "behavior_hash": behavior_hash,
-                    "data_snapshot_id": run_payload["dataset"].get("snapshot_id"),
-                    "protocol_hash": str(row["protocol_hash"]),
-                    "claimed_at": _timestamp(row["claimed_at"]),
-                }
-                _insert_immutable(
-                    target,
-                    holdout_claim,
-                    {
-                        "id": claim_id,
-                        "created_at": _timestamp(row["claimed_at"]),
-                        "payload": claim_payload,
-                    },
-                )
-                outcome_payload = {
-                    "legacy_import": True,
-                    "evaluation_key": evaluation_key,
-                    "outcome": row["outcome"],
-                    "metrics": run_payload["metrics"],
-                    "details": run_payload["details"],
-                }
-                outcome_hash = canonical_hash(outcome_payload)
-                _insert_immutable(
-                    target,
-                    holdout_outcome,
-                    {
-                        "id": f"sqlite-import:holdout-outcome:{evaluation_key}",
-                        "holdout_claim_id": claim_id,
-                        "evaluated_at": _timestamp(row["completed_at"] or row["claimed_at"]),
-                        "accepted": accepted,
-                        "outcome_hash": outcome_hash,
-                        "payload": outcome_payload,
-                    },
-                )
 
-        provenance_id = f"sqlite-import:{source_hash}"
-        provenance_payload = {
-            "schema": "platform.sqlite_import/v1",
-            "source_counts": {
-                "strategies": len(strategy_rows),
-                "strategy_identities": len(identity_rows),
-                "lineage_edges": len(lineage_rows),
-                "evaluations": len(evaluation_rows),
-            },
-            "source_tables": sorted(REQUIRED_TABLES),
-        }
+def _import_identity_rows(target, rows: Iterable[sqlite3.Row]) -> None:
+    for row in rows:
         _insert_immutable(
             target,
-            import_provenance,
+            strategy_identity,
             {
-                "id": provenance_id,
-                "source_path": str(source),
-                "source_hash": source_hash,
-                "destination_hash": destination_hash,
-                "imported_at": now,
-                "archived_path": archived_path,
-                "payload": provenance_payload,
+                "id": str(row["strategy_id"]),
+                "behavior_hash": str(row["behavior_hash"]),
+                "submitted_spec": _decode(
+                    row["submitted_spec_json"], label="strategy submitted JSON"
+                ),
+                "generation_method": str(row["generation_method"]),
+                "metadata": _decode(row["metadata_json"], label="strategy identity metadata JSON"),
+                "parent_hashes": _decode(
+                    row["parent_hashes_json"], label="strategy parent hashes JSON"
+                ),
+                "is_duplicate": bool(row["is_duplicate"]),
+                "created_at": _timestamp(row["created_at"]),
             },
         )
 
-    imported_strategy_ids = [str(row["behavior_hash"]) for row in strategy_rows]
-    imported_identity_ids = [str(row["strategy_id"]) for row in identity_rows]
-    imported_lineage_ids = [
-        f"sqlite-import:{row['child_hash']}:{row['parent_hash']}" for row in lineage_rows
+
+def _import_lineage_rows(target, rows: Iterable[sqlite3.Row]) -> None:
+    for row in rows:
+        child = str(row["child_hash"])
+        parent = str(row["parent_hash"])
+        _insert_immutable(
+            target,
+            strategy_lineage,
+            {
+                "id": f"sqlite-import:{child}:{parent}",
+                "created_at": _timestamp(row["created_at"]),
+                "payload": {
+                    "child_hash": child,
+                    "parent_hash": parent,
+                    "parent_ordinal": int(row["parent_ordinal"]),
+                    "generation_method": str(row["generation_method"]),
+                    "legacy_import": True,
+                },
+            },
+        )
+
+
+def _evaluation_run_payload(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "legacy_import": True,
+        "evaluation_key": str(row["evaluation_key"]),
+        "behavior_hash": str(row["behavior_hash"]),
+        "phase": str(row["phase"]),
+        "dataset": _decode(row["dataset_json"], label="evaluation dataset JSON"),
+        "window": _decode(row["window_json"], label="evaluation window JSON"),
+        "protocol": _decode(row["protocol_json"], label="evaluation protocol JSON"),
+        "status": str(row["status"]),
+        "outcome": row["outcome"],
+        "rejection_reasons": _decode(
+            row["rejection_reasons_json"], label="evaluation rejection JSON"
+        ),
+        "metrics": _decode(row["metrics_json"], label="evaluation metrics JSON"),
+        "details": _decode(row["details_json"], label="evaluation details JSON"),
+    }
+
+
+def _evaluation_reason_code(run_payload: Mapping[str, object]) -> str | None:
+    reasons = run_payload["rejection_reasons"]
+    return str(reasons[0]) if isinstance(reasons, list) and reasons else None
+
+
+def _insert_evaluation_stage(
+    target,
+    row: sqlite3.Row,
+    run_payload: Mapping[str, object],
+    accepted: bool,
+    reason_code: str | None,
+    imported_stages: set[tuple[str, str]],
+) -> None:
+    phase = str(row["phase"])
+    stage_name = {"holdout": "protected", "final_holdout": "protected", "final": "protected"}.get(
+        phase, phase
+    )
+    behavior_hash = str(row["behavior_hash"])
+    stage_identity = (_experiment_id(behavior_hash), stage_name)
+    if stage_identity in imported_stages:
+        return
+    imported_stages.add(stage_identity)
+    stage_accepted = accepted
+    stage_reason = reason_code or (None if stage_accepted else "legacy_outcome_not_accepted")
+    stage_payload = {
+        "legacy_import": True,
+        "evaluation_key": str(row["evaluation_key"]),
+        "phase": phase,
+        "source_hash": behavior_hash,
+    }
+    _insert_immutable(
+        target,
+        validation_stage,
+        {
+            "id": canonical_hash(
+                {
+                    "experiment_id": stage_identity[0],
+                    "stage": stage_name,
+                    "source_run_id": str(row["evaluation_key"]),
+                    "payload": stage_payload,
+                }
+            ),
+            "experiment_id": stage_identity[0],
+            "stage": stage_name,
+            "source_run_id": str(row["evaluation_key"]),
+            "evaluated_at": _timestamp(row["completed_at"] or row["claimed_at"]),
+            "state": "accepted" if stage_accepted else "rejected",
+            "accepted": stage_accepted,
+            "reason_code": stage_reason,
+            "evidence_hash": canonical_hash(run_payload),
+            "payload": stage_payload,
+        },
+    )
+
+
+def _insert_holdout_records(
+    target,
+    row: sqlite3.Row,
+    run_payload: Mapping[str, object],
+    strategy_version_id: str,
+    accepted: bool,
+) -> None:
+    evaluation_key = str(row["evaluation_key"])
+    claim_id = f"sqlite-import:holdout:{evaluation_key}"
+    dataset = run_payload["dataset"]
+    claim_payload = {
+        "legacy_import": True,
+        "strategy_version_id": strategy_version_id,
+        "evaluation_key": evaluation_key,
+        "behavior_hash": str(row["behavior_hash"]),
+        "data_snapshot_id": dataset.get("snapshot_id") if isinstance(dataset, Mapping) else None,
+        "protocol_hash": str(row["protocol_hash"]),
+        "claimed_at": _timestamp(row["claimed_at"]),
+    }
+    _insert_immutable(
+        target,
+        holdout_claim,
+        {
+            "id": claim_id,
+            "created_at": _timestamp(row["claimed_at"]),
+            "payload": claim_payload,
+        },
+    )
+    outcome_payload = {
+        "legacy_import": True,
+        "evaluation_key": evaluation_key,
+        "outcome": row["outcome"],
+        "metrics": run_payload["metrics"],
+        "details": run_payload["details"],
+    }
+    _insert_immutable(
+        target,
+        holdout_outcome,
+        {
+            "id": f"sqlite-import:holdout-outcome:{evaluation_key}",
+            "holdout_claim_id": claim_id,
+            "evaluated_at": _timestamp(row["completed_at"] or row["claimed_at"]),
+            "accepted": accepted,
+            "outcome_hash": canonical_hash(outcome_payload),
+            "payload": outcome_payload,
+        },
+    )
+
+
+def _import_evaluation_row(
+    target,
+    row: sqlite3.Row,
+    strategy_rows: Iterable[sqlite3.Row],
+    imported_stages: set[tuple[str, str]],
+) -> None:
+    behavior_hash = str(row["behavior_hash"])
+    strategy_row = next(
+        item for item in strategy_rows if str(item["behavior_hash"]) == behavior_hash
+    )
+    strategy_version_id = _strategy_version_id(strategy_row)
+    run_payload = _evaluation_run_payload(row)
+    evaluation_key = str(row["evaluation_key"])
+    _insert_immutable(
+        target,
+        experiment_run,
+        {
+            "id": evaluation_key,
+            "created_at": _timestamp(row["claimed_at"]),
+            "payload": run_payload,
+        },
+    )
+    accepted = str(row["outcome"] or "").lower() in {"accept", "accepted", "pass", "passed"}
+    reason_code = _evaluation_reason_code(run_payload)
+    _insert_immutable(
+        target,
+        validation_result,
+        {
+            "id": evaluation_key,
+            "experiment_id": _experiment_id(behavior_hash),
+            "state": "forward_paper" if accepted else f"{row['phase']}_rejected",
+            "accepted": accepted,
+            "reason_code": reason_code,
+            "evidence": run_payload,
+        },
+    )
+    _insert_evaluation_stage(target, row, run_payload, accepted, reason_code, imported_stages)
+    if str(row["phase"]) in {"holdout", "final_holdout", "final"}:
+        _insert_holdout_records(target, row, run_payload, strategy_version_id, accepted)
+
+
+def _import_evaluation_rows(
+    target,
+    evaluation_rows: Iterable[sqlite3.Row],
+    strategy_rows: Iterable[sqlite3.Row],
+) -> None:
+    imported_stages: set[tuple[str, str]] = set()
+    for row in evaluation_rows:
+        _import_evaluation_row(target, row, strategy_rows, imported_stages)
+
+
+def _import_canonical_rows(target, rows: Mapping[str, list[sqlite3.Row]]) -> None:
+    strategy_rows = rows["strategies"]
+    _import_strategy_rows(target, strategy_rows, rows["evaluations"])
+    _import_identity_rows(target, rows["strategy_identities"])
+    _import_lineage_rows(target, rows["lineage_edges"])
+    _import_evaluation_rows(target, rows["evaluations"], strategy_rows)
+
+
+def _archive_if_requested(source: Path, archive_to: Path | None) -> str | None:
+    if archive_to is None:
+        return None
+    return str(archive_sqlite_source(source, archive_to))
+
+
+def _import_provenance(
+    target,
+    source: Path,
+    source_hash: str,
+    destination_hash: str,
+    imported_at: str,
+    archived_path: str | None,
+    rows: Mapping[str, list[sqlite3.Row]],
+) -> None:
+    provenance_id = f"sqlite-import:{source_hash}"
+    provenance_payload = {
+        "schema": "platform.sqlite_import/v1",
+        "source_counts": {
+            "strategies": len(rows["strategies"]),
+            "strategy_identities": len(rows["strategy_identities"]),
+            "lineage_edges": len(rows["lineage_edges"]),
+            "evaluations": len(rows["evaluations"]),
+        },
+        "source_tables": sorted(REQUIRED_TABLES),
+    }
+    _insert_immutable(
+        target,
+        import_provenance,
+        {
+            "id": provenance_id,
+            "source_path": str(source),
+            "source_hash": source_hash,
+            "destination_hash": destination_hash,
+            "imported_at": imported_at,
+            "archived_path": archived_path,
+            "payload": provenance_payload,
+        },
+    )
+
+
+def _imported_payloads(target, table, identifiers: list[str]) -> list[object]:
+    return [
+        row[0]
+        for row in target.execute(select(table.c.payload).where(table.c.id.in_(identifiers))).all()
     ]
-    imported_evaluation_ids = [str(row["evaluation_key"]) for row in evaluation_rows]
+
+
+def _verify_import(
+    engine: Engine,
+    rows: Mapping[str, list[sqlite3.Row]],
+    destination_hash: str,
+) -> dict[str, int]:
+    imported_strategy_ids = [str(row["behavior_hash"]) for row in rows["strategies"]]
+    imported_identity_ids = [str(row["strategy_id"]) for row in rows["strategy_identities"]]
+    imported_lineage_ids = [
+        f"sqlite-import:{row['child_hash']}:{row['parent_hash']}" for row in rows["lineage_edges"]
+    ]
+    imported_evaluation_ids = [str(row["evaluation_key"]) for row in rows["evaluations"]]
     with engine.connect() as target:
         strategy_count = len(
             target.execute(
@@ -584,22 +688,8 @@ def import_sqlite_memory(
                 )
             ).all()
         )
-        lineage_payloads = [
-            row[0]
-            for row in target.execute(
-                select(strategy_lineage.c.payload).where(
-                    strategy_lineage.c.id.in_(imported_lineage_ids)
-                )
-            ).all()
-        ]
-        run_payloads = [
-            row[0]
-            for row in target.execute(
-                select(experiment_run.c.payload).where(
-                    experiment_run.c.id.in_(imported_evaluation_ids)
-                )
-            ).all()
-        ]
+        lineage_payloads = _imported_payloads(target, strategy_lineage, imported_lineage_ids)
+        run_payloads = _imported_payloads(target, experiment_run, imported_evaluation_ids)
     actual_payload = {
         "strategies": sorted(imported_strategy_ids),
         "identities": sorted(imported_identity_ids),
@@ -621,10 +711,10 @@ def import_sqlite_memory(
         "evaluations": len(run_payloads),
     }
     expected_counts = {
-        "strategies": len(strategy_rows),
-        "strategy_identities": len(identity_rows),
-        "lineage_edges": len(lineage_rows),
-        "evaluations": len(evaluation_rows),
+        "strategies": len(rows["strategies"]),
+        "strategy_identities": len(rows["strategy_identities"]),
+        "lineage_edges": len(rows["lineage_edges"]),
+        "evaluations": len(rows["evaluations"]),
     }
     if actual_counts != expected_counts or canonical_hash(actual_payload) != destination_hash:
         raise SqliteImportError(
@@ -632,12 +722,41 @@ def import_sqlite_memory(
             f"expected counts/hash {expected_counts}/{destination_hash}, "
             f"got {actual_counts}/{canonical_hash(actual_payload)}"
         )
-    counts = {
-        "strategies": len(strategy_rows),
-        "strategy_identities": len(identity_rows),
-        "lineage_edges": len(lineage_rows),
-        "evaluations": len(evaluation_rows),
-    }
+    return actual_counts
+
+
+def import_sqlite_memory(
+    source: Path,
+    database: PlatformDatabase | Engine,
+    *,
+    archive_to: Path | None = None,
+) -> ImportReport:
+    """Validate and import the complete legacy SQLite research memory."""
+
+    source, source_hash, rows, engine = _prepare_import_source(source, database)
+    _prepare_import_database(database, engine)
+    destination_hash = canonical_hash(
+        _destination_payload(
+            rows["strategies"],
+            rows["strategy_identities"],
+            rows["lineage_edges"],
+            rows["evaluations"],
+        )
+    )
+    imported_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+    archived_path = _archive_if_requested(source, archive_to)
+    with engine.begin() as target:
+        _import_canonical_rows(target, rows)
+        _import_provenance(
+            target,
+            source,
+            source_hash,
+            destination_hash,
+            imported_at,
+            archived_path,
+            rows,
+        )
+    counts = _verify_import(engine, rows, destination_hash)
     return ImportReport(
         source_path=str(source),
         source_hash=source_hash,
