@@ -302,33 +302,86 @@ def _control_snapshot(control: dict[str, Any]) -> dict[str, Any]:
     return {key: normalized[key] for key in DEFAULT_CONTROL}
 
 
-def _update_control_locked(
-    path: Path,
+def _assert_expected_control(
+    control: dict[str, Any],
+    recovered_error: str | None,
+    expected: dict[str, Any] | None,
     command: str,
-    *,
-    name: str | None = None,
-    reason: str | None = None,
-    audit_path: Path | None = None,
-    actor: str | None = None,
-    enforce_flatten_pause: bool = False,
-    expected_control: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    control, recovered_control_error = _load_editable_control(path)
-    if expected_control is not None:
-        if recovered_control_error is not None:
-            raise ControlConflictError(
-                "control changed or became invalid after the runtime snapshot; "
-                f"refusing stale {command!r} mutation: {recovered_control_error}"
-            )
-        if _control_snapshot(control) != _control_snapshot(expected_control):
-            raise ControlConflictError(
-                f"control changed after the runtime snapshot; refusing stale {command!r} mutation"
-            )
-    before = dict(control)
-    if recovered_control_error is not None:
-        before["recovered_control_error"] = recovered_control_error
+) -> None:
+    if expected is None:
+        return
+    if recovered_error is not None:
+        raise ControlConflictError(
+            "control changed or became invalid after the runtime snapshot; "
+            f"refusing stale {command!r} mutation: {recovered_error}"
+        )
+    if _control_snapshot(control) != _control_snapshot(expected):
+        raise ControlConflictError(
+            f"control changed after the runtime snapshot; refusing stale {command!r} mutation"
+        )
+
+
+def _require_control_name(name: str | None, command: str) -> str:
+    if not name:
+        if command in {"pause-product", "resume-product", "flatten"}:
+            raise ValueError(f"{command} requires a product name")
+        raise ValueError(f"{command} requires a job name")
+    return name
+
+
+def _apply_clear_flatten(
+    control: dict[str, Any], name: str | None, reason: str | None, enforce_flatten_pause: bool
+) -> None:
+    if enforce_flatten_pause:
+        if name:
+            _append_unique(control, "paused_products", name)
+        else:
+            control["paused"] = True
+    if name:
+        _remove_value(control, "flatten_products", name)
+    else:
+        control["flatten_products"] = []
+        control["flatten_all"] = False
+    _set_reason(control, reason)
+
+
+def _apply_named_control_command(
+    control: dict[str, Any],
+    command: str,
+    name: str | None,
+    reason: str | None,
+    enforce_flatten_pause: bool,
+) -> bool:
+    if command == "pause-product":
+        _append_unique(control, "paused_products", _require_control_name(name, command))
+        _set_reason(control, reason)
+    elif command == "resume-product":
+        _remove_value(control, "paused_products", _require_control_name(name, command))
+        _set_reason(control, reason)
+    elif command == "pause-job":
+        _append_unique(control, "paused_jobs", _require_control_name(name, command))
+        _set_reason(control, reason)
+    elif command == "resume-job":
+        _remove_value(control, "paused_jobs", _require_control_name(name, command))
+        _set_reason(control, reason)
+    elif command == "flatten":
+        product_name = _require_control_name(name, command)
+        _append_unique(control, "paused_products", product_name)
+        _append_unique(control, "flatten_products", product_name)
+        _set_reason(control, reason)
+    elif command == "clear-flatten":
+        _apply_clear_flatten(control, name, reason, enforce_flatten_pause)
+    else:
+        return False
+    return True
+
+
+def _apply_global_control_command(
+    control: dict[str, Any], command: str, reason: str | None
+) -> bool:
     if command == "clear":
-        control = dict(DEFAULT_CONTROL)
+        control.clear()
+        control.update(DEFAULT_CONTROL)
         _set_reason(control, reason)
     elif command == "panic":
         control["paused"] = True
@@ -341,62 +394,57 @@ def _update_control_locked(
     elif command == "resume":
         control["paused"] = False
         _set_reason(control, reason)
-    elif command == "pause-product":
-        if not name:
-            raise ValueError("pause-product requires a product name")
-        _append_unique(control, "paused_products", name)
-        _set_reason(control, reason)
-    elif command == "resume-product":
-        if not name:
-            raise ValueError("resume-product requires a product name")
-        _remove_value(control, "paused_products", name)
-        _set_reason(control, reason)
-    elif command == "pause-job":
-        if not name:
-            raise ValueError("pause-job requires a job name")
-        _append_unique(control, "paused_jobs", name)
-        _set_reason(control, reason)
-    elif command == "resume-job":
-        if not name:
-            raise ValueError("resume-job requires a job name")
-        _remove_value(control, "paused_jobs", name)
-        _set_reason(control, reason)
     elif command == "pause-jobs":
         control["pause_jobs"] = True
         _set_reason(control, reason)
     elif command == "resume-jobs":
         control["pause_jobs"] = False
         _set_reason(control, reason)
-    elif command == "flatten":
-        if not name:
-            raise ValueError("flatten requires a product name")
-        # Flattening is an emergency/risk-reduction action. Keep the product
-        # paused after the one-shot request is auto-cleared so it cannot open a
-        # fresh position before the operator reconciles fills and accounting.
-        _append_unique(control, "paused_products", name)
-        _append_unique(control, "flatten_products", name)
-        _set_reason(control, reason)
     elif command == "flatten-all":
         control["paused"] = True
         control["flatten_all"] = True
         _set_reason(control, reason)
-    elif command == "clear-flatten":
-        if enforce_flatten_pause:
-            if name:
-                _append_unique(control, "paused_products", name)
-            else:
-                control["paused"] = True
-        if name:
-            _remove_value(control, "flatten_products", name)
-        else:
-            control["flatten_products"] = []
-            control["flatten_all"] = False
-        _set_reason(control, reason)
     else:
-        raise ValueError(f"unknown control command: {command}")
+        return False
+    return True
+
+
+def _apply_control_command(
+    control: dict[str, Any],
+    command: str,
+    *,
+    name: str | None,
+    reason: str | None,
+    enforce_flatten_pause: bool,
+) -> dict[str, Any]:
+    if _apply_global_control_command(control, command, reason):
+        return control
+    if _apply_named_control_command(
+        control,
+        command,
+        name,
+        reason,
+        enforce_flatten_pause,
+    ):
+        return control
+    raise ValueError(f"unknown control command: {command}")
+
+
+def _write_control_and_audit(
+    path: Path,
+    control: dict[str, Any],
+    recovered_error: str | None,
+    *,
+    audit_path: Path | None,
+    command: str,
+    name: str | None,
+    reason: str | None,
+    actor: str | None,
+    before: dict[str, Any],
+) -> dict[str, Any]:
     payload = write_control(path, control)
-    if recovered_control_error is not None:
-        payload["recovered_control_error"] = recovered_control_error
+    if recovered_error is not None:
+        payload["recovered_control_error"] = recovered_error
     try:
         _audit_event(
             audit_path,
@@ -412,6 +460,42 @@ def _update_control_locked(
         LOGGER.exception("Failed to append control audit event")
         payload["audit_error"] = f"{type(exc).__name__}: {exc}"
     return payload
+
+
+def _update_control_locked(
+    path: Path,
+    command: str,
+    *,
+    name: str | None = None,
+    reason: str | None = None,
+    audit_path: Path | None = None,
+    actor: str | None = None,
+    enforce_flatten_pause: bool = False,
+    expected_control: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    control, recovered_control_error = _load_editable_control(path)
+    _assert_expected_control(control, recovered_control_error, expected_control, command)
+    before = dict(control)
+    if recovered_control_error is not None:
+        before["recovered_control_error"] = recovered_control_error
+    control = _apply_control_command(
+        control,
+        command,
+        name=name,
+        reason=reason,
+        enforce_flatten_pause=enforce_flatten_pause,
+    )
+    return _write_control_and_audit(
+        path,
+        control,
+        recovered_control_error,
+        audit_path=audit_path,
+        command=command,
+        name=name,
+        reason=reason,
+        actor=actor,
+        before=before,
+    )
 
 
 def update_control(
