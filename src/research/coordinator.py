@@ -22,6 +22,32 @@ class CandidateState(StrEnum):
     FORWARD_PAPER = "forward_paper"
 
 
+def _sha256_identity(value: str, *, field: str) -> str:
+    value = non_empty(value, field=field)
+    if not value.startswith("sha256:") or len(value) != 71:
+        raise ValueError(f"{field} must be a SHA-256 identity")
+    return value
+
+
+def _validate_snapshot_hashes(values: tuple[str, ...]) -> None:
+    if not values or any(
+        not isinstance(item, str) or len(item) != 71 or not item.startswith("sha256:")
+        for item in values
+    ):
+        raise ValueError("dataset_snapshot_hashes must contain SHA-256 hashes")
+    if len(set(values)) != len(values):
+        raise ValueError("dataset_snapshot_hashes must not contain duplicates")
+
+
+def _validate_dataset_plan(candidate: Candidate) -> None:
+    if candidate.dataset_plan is None:
+        return
+    if candidate.dataset_plan.product_id != candidate.definition.product:
+        raise ValueError("candidate dataset plan product does not match definition")
+    if set(candidate.dataset_snapshot_hashes) != set(candidate.dataset_plan.all_snapshot_ids):
+        raise ValueError("candidate dataset identities do not match its typed plan")
+
+
 @dataclass(frozen=True)
 class Candidate:
     definition: StrategyDefinition
@@ -36,32 +62,22 @@ class Candidate:
 
     def __post_init__(self) -> None:
         for field_name in ("thesis_id", "lineage_id"):
-            value = non_empty(getattr(self, field_name), field=field_name)
-            if not value.startswith("sha256:") or len(value) != 71:
-                raise ValueError(f"{field_name} must be a SHA-256 identity")
-            object.__setattr__(self, field_name, value)
+            object.__setattr__(
+                self, field_name, _sha256_identity(getattr(self, field_name), field=field_name)
+            )
         object.__setattr__(self, "provider", non_empty(self.provider, field="provider"))
-        if not self.dataset_snapshot_hashes or any(
-            not isinstance(item, str) or len(item) != 71 or not item.startswith("sha256:")
-            for item in self.dataset_snapshot_hashes
-        ):
-            raise ValueError("dataset_snapshot_hashes must contain SHA-256 hashes")
-        if len(set(self.dataset_snapshot_hashes)) != len(self.dataset_snapshot_hashes):
-            raise ValueError("dataset_snapshot_hashes must not contain duplicates")
+        _validate_snapshot_hashes(self.dataset_snapshot_hashes)
         object.__setattr__(self, "submitted_at", timestamp(self.submitted_at, field="submitted_at"))
         if not isinstance(self.metadata, Mapping):
             raise ValueError("metadata must be an object")
         object.__setattr__(self, "metadata", json_value(dict(self.metadata), field="metadata"))
         if self.dataset_bundle_id is not None:
-            value = non_empty(self.dataset_bundle_id, field="dataset_bundle_id")
-            if not value.startswith("sha256:") or len(value) != 71:
-                raise ValueError("dataset_bundle_id must be a SHA-256 identity")
-            object.__setattr__(self, "dataset_bundle_id", value)
-        if self.dataset_plan is not None:
-            if self.dataset_plan.product_id != self.definition.product:
-                raise ValueError("candidate dataset plan product does not match definition")
-            if set(self.dataset_snapshot_hashes) != set(self.dataset_plan.all_snapshot_ids):
-                raise ValueError("candidate dataset identities do not match its typed plan")
+            object.__setattr__(
+                self,
+                "dataset_bundle_id",
+                _sha256_identity(self.dataset_bundle_id, field="dataset_bundle_id"),
+            )
+        _validate_dataset_plan(self)
 
     @property
     def candidate_id(self) -> str:
