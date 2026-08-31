@@ -1144,6 +1144,111 @@ def _write_rehearsal_report(path: Path, report: dict[str, Any]) -> None:
         )
 
 
+def _finish_rehearsal_report(
+    output_path: Path | None,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    if output_path is not None:
+        _write_rehearsal_report(output_path, report)
+    return report
+
+
+def _validate_rehearsal_product_setup(
+    config: AutopilotConfig,
+    *,
+    product_name: str,
+    confirm: bool,
+) -> tuple[ProductConfig | None, dict[str, Any] | None]:
+    product = _selected_product(config, product_name)
+    if product is None:
+        return None, _fail(None, f"product not found: {product_name}")
+    product_error = _validate_product(product)
+    if product_error:
+        return None, _fail(product, product_error)
+    if not confirm:
+        return None, _fail(
+            product,
+            "explicit confirmation is required because this places testnet orders",
+            required_flag="--confirm",
+        )
+    return product, None
+
+
+def _prepare_rehearsal_context(
+    config: AutopilotConfig,
+    *,
+    product_name: str,
+    notional_usd: float,
+    confirm: bool,
+    broker_builder: Callable[[ProductConfig], Broker] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    product, failure = _validate_rehearsal_product_setup(
+        config,
+        product_name=product_name,
+        confirm=confirm,
+    )
+    if failure is not None:
+        return None, failure
+    if product is None:  # pragma: no cover - paired with failure above
+        raise RuntimeError("testnet rehearsal product setup returned no product")
+    try:
+        approved_artifact = load_artifact(product.strategies_path)
+        assert_loaded_artifact_live_approved(
+            approved_artifact,
+            product.strategies_path,
+            config.approval_ledger,
+            product=product,
+        )
+    except (ApprovalError, FileNotFoundError, json.JSONDecodeError) as exc:
+        return None, _fail(product, f"approval_failed: {exc}")
+    exchange_cfg, env_error = _validate_rehearsal_env(notional_usd)
+    if env_error:
+        return None, _fail(product, env_error)
+    live_product = replace(product, execution_mode="live")
+    if broker_builder is None:
+        from src.autopilot.runtime import build_live_broker
+
+        builder = build_live_broker
+    else:
+        builder = broker_builder
+    broker_cache: dict[str, Broker] = {}
+
+    def cached_builder(selected: ProductConfig) -> Broker:
+        if "broker" not in broker_cache:
+            broker_cache["broker"] = builder(selected)
+        return broker_cache["broker"]
+
+    from src.autopilot.preflight import run_preflight
+
+    preflight = run_preflight(
+        config,
+        product_name=product.name,
+        assume_live=True,
+        connect=True,
+        require_testnet=True,
+        broker_builder=cached_builder,
+    )
+    if not preflight.get("ok"):
+        return None, _fail(product, "preflight_failed", preflight=preflight)
+    broker = cached_builder(live_product)
+    initial_position = broker.get_position(live_product.symbol)
+    if not initial_position.is_flat:
+        return None, _fail(
+            product,
+            "initial_position_not_flat",
+            initial_position_qty=initial_position.qty,
+            initial_position_avg_price=initial_position.avg_price,
+            preflight=preflight,
+        )
+    return {
+        "product": product,
+        "live_product": live_product,
+        "exchange_cfg": exchange_cfg,
+        "preflight": preflight,
+        "broker": broker,
+    }, None
+
+
 def _selected_product(config: AutopilotConfig, product_name: str) -> ProductConfig | None:
     for product in config.products:
         if product.name == product_name:
@@ -1207,6 +1312,406 @@ def _order_qty(notional_usd: float, price: float) -> float:
     return qty
 
 
+def _new_rehearsal_order_state() -> dict[str, Any]:
+    return {
+        "entry_fill": None,
+        "close_fill": None,
+        "recovery_close_fill": None,
+        "placed_stop": None,
+        "fetched_open_stop": None,
+        "cancel_result": None,
+        "fetched_terminal_stop": None,
+        "stop_client_id": None,
+        "stop_trigger_price": None,
+        "final_position": None,
+        "native_stop_evidence": {
+            "capability_supported": False,
+            "native": True,
+            "reduce_only": True,
+            "trigger_distance_fraction": TESTNET_PROTECTIVE_STOP_DISTANCE_FRACTION,
+            "open_verified": False,
+            "canceled_verified": False,
+            "placed": None,
+            "fetched_open": None,
+            "cancel_result": None,
+            "fetched_terminal": None,
+        },
+    }
+
+
+def _rehearsal_order_parameters(
+    live_product: ProductConfig,
+    broker: Broker,
+    *,
+    notional_usd: float,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    evidence = state["native_stop_evidence"]
+    capability_supported = broker.supports_native_protective_stops()
+    evidence["capability_supported"] = capability_supported
+    if capability_supported is not True:
+        raise RuntimeError("connected broker does not support exchange-native protective stops")
+    price = broker.get_price(live_product.symbol)
+    balance = broker.get_balance()
+    raw_stop_trigger_price = float(price) * (1.0 - TESTNET_PROTECTIVE_STOP_DISTANCE_FRACTION)
+    stop_trigger_price = _finite_float(
+        broker.normalize_order_price(live_product.symbol, raw_stop_trigger_price)
+    )
+    if (
+        stop_trigger_price is None
+        or stop_trigger_price <= 0
+        or stop_trigger_price >= float(price)
+    ):
+        raise RuntimeError("broker returned an invalid normalized protective-stop trigger price")
+    raw_qty = _order_qty(notional_usd, price)
+    normalized_qty = _finite_float(
+        broker.normalize_order_qty(live_product.symbol, raw_qty, price=price)
+    )
+    if normalized_qty is None or normalized_qty <= 0:
+        raise RuntimeError("broker returned an invalid normalized order quantity")
+    evidence["trigger_reference_price"] = float(price)
+    evidence["raw_trigger_price"] = raw_stop_trigger_price
+    evidence["normalized_trigger_price"] = stop_trigger_price
+    return {
+        "price": price,
+        "balance": balance,
+        "raw_qty": raw_qty,
+        "qty": normalized_qty,
+        "stop_trigger_price": stop_trigger_price,
+        "nonce": int(time.time() * 1000),
+    }
+
+
+def _place_rehearsal_entry_stop(
+    live_product: ProductConfig,
+    broker: Broker,
+    state: dict[str, Any],
+    parameters: dict[str, Any],
+) -> None:
+    evidence = state["native_stop_evidence"]
+    nonce = parameters["nonce"]
+    qty = parameters["qty"]
+    entry_fill = broker.place_order(
+        Order(
+            symbol=live_product.symbol,
+            side=OrderSide.BUY,
+            qty=qty,
+            type=OrderType.MARKET,
+            client_id=f"testnet-entry-{nonce}",
+        )
+    )
+    state["entry_fill"] = entry_fill
+    _assert_rehearsal_fill_valid(
+        live_product,
+        entry_fill,
+        label="entry",
+        expected_side=OrderSide.BUY,
+        expected_qty=qty,
+    )
+    entry_qty = float(entry_fill.qty)
+    stop_trigger_price = parameters["stop_trigger_price"]
+    if stop_trigger_price >= float(entry_fill.price):
+        raise RuntimeError("normalized protective-stop trigger is not below the actual entry fill")
+    stop_client_id = f"testnet-stop-{nonce}"
+    state["stop_client_id"] = stop_client_id
+    state["stop_trigger_price"] = stop_trigger_price
+    placed_stop = broker.place_protective_stop(
+        symbol=live_product.symbol,
+        side=OrderSide.SELL,
+        qty=entry_qty,
+        trigger_price=stop_trigger_price,
+        client_id=stop_client_id,
+    )
+    state["placed_stop"] = placed_stop
+    evidence["placed"] = _protective_order_payload(placed_stop)
+    _assert_rehearsal_protective_order_valid(
+        live_product,
+        placed_stop,
+        label="placed",
+        expected_qty=entry_qty,
+        expected_trigger_price=stop_trigger_price,
+        expected_client_id=stop_client_id,
+        expected_status=ProtectiveOrderStatus.OPEN,
+    )
+    fetched_open_stop = broker.get_protective_stop(
+        symbol=live_product.symbol,
+        order_id=placed_stop.order_id,
+        client_id=stop_client_id,
+    )
+    state["fetched_open_stop"] = fetched_open_stop
+    evidence["fetched_open"] = _protective_order_payload(fetched_open_stop)
+    _assert_rehearsal_protective_order_valid(
+        live_product,
+        fetched_open_stop,
+        label="fetched-open",
+        expected_qty=entry_qty,
+        expected_trigger_price=stop_trigger_price,
+        expected_client_id=stop_client_id,
+        expected_status=ProtectiveOrderStatus.OPEN,
+        expected_order_id=placed_stop.order_id,
+    )
+    evidence["open_verified"] = True
+
+
+def _close_rehearsal_position(
+    live_product: ProductConfig,
+    broker: Broker,
+    state: dict[str, Any],
+) -> None:
+    entry_fill = state["entry_fill"]
+    entry_qty = float(entry_fill.qty)
+    close_fill = broker.close_position(live_product.symbol)
+    state["close_fill"] = close_fill
+    _assert_rehearsal_fill_valid(
+        live_product,
+        close_fill,
+        label="close",
+        expected_side=OrderSide.SELL,
+        expected_qty=entry_qty,
+    )
+    final_position = broker.get_position(live_product.symbol)
+    state["final_position"] = final_position
+    if not final_position.is_flat:
+        raise RuntimeError(f"position is not flat after reduce-only close: qty {final_position.qty:g}")
+    placed_stop = state["placed_stop"]
+    stop_client_id = state["stop_client_id"]
+    cancel_result = broker.cancel_protective_stop(
+        symbol=live_product.symbol,
+        order_id=placed_stop.order_id,
+        client_id=stop_client_id,
+    )
+    state["cancel_result"] = cancel_result
+    evidence = state["native_stop_evidence"]
+    evidence["cancel_result"] = _protective_order_payload(cancel_result)
+    stop_trigger_price = state["stop_trigger_price"]
+    _assert_rehearsal_protective_order_valid(
+        live_product,
+        cancel_result,
+        label="cancel-result",
+        expected_qty=entry_qty,
+        expected_trigger_price=stop_trigger_price,
+        expected_client_id=stop_client_id,
+        expected_status=ProtectiveOrderStatus.CANCELED,
+        expected_order_id=placed_stop.order_id,
+    )
+    fetched_terminal_stop = broker.get_protective_stop(
+        symbol=live_product.symbol,
+        order_id=placed_stop.order_id,
+        client_id=stop_client_id,
+    )
+    state["fetched_terminal_stop"] = fetched_terminal_stop
+    evidence["fetched_terminal"] = _protective_order_payload(fetched_terminal_stop)
+    _assert_rehearsal_protective_order_valid(
+        live_product,
+        fetched_terminal_stop,
+        label="fetched-terminal",
+        expected_qty=entry_qty,
+        expected_trigger_price=stop_trigger_price,
+        expected_client_id=stop_client_id,
+        expected_status=ProtectiveOrderStatus.CANCELED,
+        expected_order_id=placed_stop.order_id,
+        allowed_statuses=frozenset(
+            {
+                ProtectiveOrderStatus.CANCELED,
+                ProtectiveOrderStatus.EXPIRED,
+                ProtectiveOrderStatus.REJECTED,
+            }
+        ),
+    )
+    evidence["canceled_verified"] = True
+    final_position = broker.get_position(live_product.symbol)
+    state["final_position"] = final_position
+    if not final_position.is_flat:
+        raise RuntimeError(
+            f"position changed after protective-stop cancellation: qty {final_position.qty:g}"
+        )
+
+
+def _execute_rehearsal_orders(
+    live_product: ProductConfig,
+    broker: Broker,
+    state: dict[str, Any],
+    *,
+    notional_usd: float,
+) -> None:
+    parameters = _rehearsal_order_parameters(
+        live_product,
+        broker,
+        notional_usd=notional_usd,
+        state=state,
+    )
+    state["parameters"] = parameters
+    _place_rehearsal_entry_stop(live_product, broker, state, parameters)
+    _close_rehearsal_position(live_product, broker, state)
+
+
+def _recover_rehearsal_position(
+    live_product: ProductConfig,
+    broker: Broker,
+    state: dict[str, Any],
+) -> tuple[dict[str, str], Fill | None]:
+    recovery_errors: dict[str, str] = {}
+    recovery_close_fill: Fill | None = None
+    if state["entry_fill"] is None:
+        return recovery_errors, recovery_close_fill
+    try:
+        current_position = broker.get_position(live_product.symbol)
+        if not current_position.is_flat:
+            recovery_close_fill = broker.close_position(live_product.symbol)
+        state["final_position"] = broker.get_position(live_product.symbol)
+    except Exception as recovery_exc:
+        recovery_errors["close"] = f"{type(recovery_exc).__name__}: {recovery_exc}"
+        try:
+            state["final_position"] = broker.get_position(live_product.symbol)
+        except Exception as position_exc:
+            recovery_errors["position_reconciliation"] = (
+                f"{type(position_exc).__name__}: {position_exc}"
+            )
+    return recovery_errors, recovery_close_fill
+
+
+def _recover_rehearsal_stop(
+    live_product: ProductConfig,
+    broker: Broker,
+    state: dict[str, Any],
+    recovery_errors: dict[str, str],
+) -> None:
+    final_position = state["final_position"]
+    stop_client_id = state["stop_client_id"]
+    if (
+        final_position is not None
+        and final_position.is_flat
+        and stop_client_id is not None
+        and state["native_stop_evidence"]["canceled_verified"] is not True
+    ):
+        try:
+            placed_stop = state["placed_stop"]
+            recovery_cancel = broker.cancel_protective_stop(
+                symbol=live_product.symbol,
+                order_id=placed_stop.order_id if placed_stop is not None else None,
+                client_id=stop_client_id,
+            )
+            evidence = state["native_stop_evidence"]
+            evidence["recovery_cancel_result"] = _protective_order_payload(recovery_cancel)
+            entry_fill = state["entry_fill"]
+            stop_trigger_price = state["stop_trigger_price"]
+            if stop_trigger_price is not None:
+                _assert_rehearsal_protective_order_valid(
+                    live_product,
+                    recovery_cancel,
+                    label="recovery-cancel",
+                    expected_qty=float(entry_fill.qty),
+                    expected_trigger_price=stop_trigger_price,
+                    expected_client_id=stop_client_id,
+                    expected_status=ProtectiveOrderStatus.CANCELED,
+                    expected_order_id=placed_stop.order_id if placed_stop is not None else None,
+                )
+                recovery_fetched = broker.get_protective_stop(
+                    symbol=live_product.symbol,
+                    order_id=recovery_cancel.order_id,
+                    client_id=stop_client_id,
+                )
+                evidence["recovery_fetched_terminal"] = _protective_order_payload(
+                    recovery_fetched
+                )
+                _assert_rehearsal_protective_order_valid(
+                    live_product,
+                    recovery_fetched,
+                    label="recovery-fetched-terminal",
+                    expected_qty=float(entry_fill.qty),
+                    expected_trigger_price=stop_trigger_price,
+                    expected_client_id=stop_client_id,
+                    expected_status=ProtectiveOrderStatus.CANCELED,
+                    expected_order_id=recovery_cancel.order_id,
+                    allowed_statuses=frozenset(
+                        {
+                            ProtectiveOrderStatus.CANCELED,
+                            ProtectiveOrderStatus.EXPIRED,
+                            ProtectiveOrderStatus.REJECTED,
+                        }
+                    ),
+                )
+                evidence["canceled_verified"] = True
+        except Exception as recovery_exc:
+            recovery_errors["protective_stop_cancel"] = (
+                f"{type(recovery_exc).__name__}: {recovery_exc}"
+            )
+    elif (
+        state["placed_stop"] is not None
+        and final_position is not None
+        and not final_position.is_flat
+    ):
+        state["native_stop_evidence"]["left_open_to_protect_non_flat_position"] = True
+
+
+def _rehearsal_recovery_report(
+    live_product: ProductConfig,
+    broker: Broker,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    recovery_errors, recovery_close_fill = _recover_rehearsal_position(
+        live_product,
+        broker,
+        state,
+    )
+    _recover_rehearsal_stop(live_product, broker, state, recovery_errors)
+    recovery: dict[str, Any] = {
+        "attempted": state["entry_fill"] is not None,
+        "close_fill": _fill_payload(recovery_close_fill),
+    }
+    final_position = state["final_position"]
+    if final_position is not None:
+        recovery.update(
+            {
+                "final_position_qty": final_position.qty,
+                "final_position_avg_price": final_position.avg_price,
+                "final_position_flat": final_position.is_flat,
+            }
+        )
+    if recovery_errors:
+        recovery["errors"] = recovery_errors
+    return recovery
+
+
+def _successful_rehearsal_report(
+    context: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    notional_usd: float,
+) -> dict[str, Any]:
+    exchange_cfg = context["exchange_cfg"]
+    final_position = state["final_position"]
+    evidence = state["native_stop_evidence"]
+    ok = (
+        state["close_fill"] is not None
+        and final_position.is_flat
+        and evidence["open_verified"] is True
+        and evidence["canceled_verified"] is True
+    )
+    report = {
+        "generated_at": utc_now(),
+        "generated_ts": time.time(),
+        "ok": ok,
+        "product": _product_status(context["product"]),
+        "exchange": exchange_cfg.exchange,
+        "testnet": exchange_cfg.testnet,
+        "risk_controls": _risk_controls_payload(exchange_cfg),
+        "notional_usd": float(notional_usd),
+        "reference_price": state["parameters"]["price"],
+        "balance_before_entry": state["parameters"]["balance"],
+        "raw_order_qty": state["parameters"]["raw_qty"],
+        "order_qty": state["parameters"]["qty"],
+        "entry_fill": _fill_payload(state["entry_fill"]),
+        "close_fill": _fill_payload(state["close_fill"]),
+        "native_protective_stop": evidence,
+        "final_position_qty": final_position.qty,
+        "preflight": context["preflight"],
+    }
+    if not ok:
+        report["error"] = "final_position_not_flat_after_close"
+    return report
+
+
 def run_testnet_rehearsal(
     config: AutopilotConfig,
     *,
@@ -1216,388 +1721,47 @@ def run_testnet_rehearsal(
     output_path: Path | None = None,
     broker_builder: Callable[[ProductConfig], Broker] | None = None,
 ) -> dict[str, Any]:
-    def finish(report: dict[str, Any]) -> dict[str, Any]:
-        if output_path is not None:
-            _write_rehearsal_report(output_path, report)
-        return report
-
-    product = _selected_product(config, product_name)
-    if product is None:
-        return finish(_fail(None, f"product not found: {product_name}"))
-    product_error = _validate_product(product)
-    if product_error:
-        return finish(_fail(product, product_error))
-    if not confirm:
-        return finish(
-            _fail(
-                product,
-                "explicit confirmation is required because this places testnet orders",
-                required_flag="--confirm",
-            )
-        )
-
-    try:
-        approved_artifact = load_artifact(product.strategies_path)
-        assert_loaded_artifact_live_approved(
-            approved_artifact,
-            product.strategies_path,
-            config.approval_ledger,
-            product=product,
-        )
-    except (ApprovalError, FileNotFoundError, json.JSONDecodeError) as exc:
-        return finish(_fail(product, f"approval_failed: {exc}"))
-
-    exchange_cfg, env_error = _validate_rehearsal_env(notional_usd)
-    if env_error:
-        return finish(_fail(product, env_error))
-
-    live_product = replace(product, execution_mode="live")
-    if broker_builder is None:
-        from src.autopilot.runtime import build_live_broker
-
-        builder = build_live_broker
-    else:
-        builder = broker_builder
-    broker_cache: dict[str, Broker] = {}
-
-    def cached_builder(selected: ProductConfig) -> Broker:
-        if "broker" not in broker_cache:
-            broker_cache["broker"] = builder(selected)
-        return broker_cache["broker"]
-
-    from src.autopilot.preflight import run_preflight
-
-    preflight = run_preflight(
+    context, failure = _prepare_rehearsal_context(
         config,
-        product_name=product.name,
-        assume_live=True,
-        connect=True,
-        require_testnet=True,
-        broker_builder=cached_builder,
+        product_name=product_name,
+        notional_usd=notional_usd,
+        confirm=confirm,
+        broker_builder=broker_builder,
     )
-    if not preflight.get("ok"):
-        return finish(_fail(product, "preflight_failed", preflight=preflight))
-
-    broker = cached_builder(live_product)
-    initial_position = broker.get_position(live_product.symbol)
-    if not initial_position.is_flat:
-        return finish(
-            _fail(
-                product,
-                "initial_position_not_flat",
-                initial_position_qty=initial_position.qty,
-                initial_position_avg_price=initial_position.avg_price,
-                preflight=preflight,
-            )
-        )
-
-    entry_fill: Fill | None = None
-    close_fill: Fill | None = None
-    recovery_close_fill: Fill | None = None
-    placed_stop: ProtectiveOrder | None = None
-    fetched_open_stop: ProtectiveOrder | None = None
-    cancel_result: ProtectiveOrder | None = None
-    fetched_terminal_stop: ProtectiveOrder | None = None
-    stop_client_id: str | None = None
-    stop_trigger_price: float | None = None
-    native_stop_evidence: dict[str, Any] = {
-        "capability_supported": False,
-        "native": True,
-        "reduce_only": True,
-        "trigger_distance_fraction": TESTNET_PROTECTIVE_STOP_DISTANCE_FRACTION,
-        "open_verified": False,
-        "canceled_verified": False,
-        "placed": None,
-        "fetched_open": None,
-        "cancel_result": None,
-        "fetched_terminal": None,
-    }
-    final_position = None
+    if failure is not None:
+        return _finish_rehearsal_report(output_path, failure)
+    if context is None:  # pragma: no cover - failure and context are paired
+        raise RuntimeError("testnet rehearsal setup returned no context")
+    product = context["product"]
+    live_product = context["live_product"]
+    broker = context["broker"]
+    preflight = context["preflight"]
+    state = _new_rehearsal_order_state()
     try:
-        capability_supported = broker.supports_native_protective_stops()
-        native_stop_evidence["capability_supported"] = capability_supported
-        if capability_supported is not True:
-            raise RuntimeError("connected broker does not support exchange-native protective stops")
-        price = broker.get_price(live_product.symbol)
-        balance = broker.get_balance()
-        raw_stop_trigger_price = float(price) * (1.0 - TESTNET_PROTECTIVE_STOP_DISTANCE_FRACTION)
-        stop_trigger_price = _finite_float(
-            broker.normalize_order_price(
-                live_product.symbol,
-                raw_stop_trigger_price,
-            )
-        )
-        if (
-            stop_trigger_price is None
-            or stop_trigger_price <= 0
-            or stop_trigger_price >= float(price)
-        ):
-            raise RuntimeError(
-                "broker returned an invalid normalized protective-stop trigger price"
-            )
-        raw_qty = _order_qty(notional_usd, price)
-        normalized_qty = _finite_float(
-            broker.normalize_order_qty(
-                live_product.symbol,
-                raw_qty,
-                price=price,
-            )
-        )
-        if normalized_qty is None or normalized_qty <= 0:
-            raise RuntimeError("broker returned an invalid normalized order quantity")
-        qty = normalized_qty
-        native_stop_evidence["trigger_reference_price"] = float(price)
-        native_stop_evidence["raw_trigger_price"] = raw_stop_trigger_price
-        native_stop_evidence["normalized_trigger_price"] = stop_trigger_price
-        nonce = int(time.time() * 1000)
-        entry_fill = broker.place_order(
-            Order(
-                symbol=live_product.symbol,
-                side=OrderSide.BUY,
-                qty=qty,
-                type=OrderType.MARKET,
-                client_id=f"testnet-entry-{nonce}",
-            )
-        )
-        _assert_rehearsal_fill_valid(
+        _execute_rehearsal_orders(
             live_product,
-            entry_fill,
-            label="entry",
-            expected_side=OrderSide.BUY,
-            expected_qty=qty,
+            broker,
+            state,
+            notional_usd=notional_usd,
         )
-        entry_qty = float(entry_fill.qty)
-        if stop_trigger_price >= float(entry_fill.price):
-            raise RuntimeError(
-                "normalized protective-stop trigger is not below the actual entry fill"
-            )
-        stop_client_id = f"testnet-stop-{nonce}"
-        placed_stop = broker.place_protective_stop(
-            symbol=live_product.symbol,
-            side=OrderSide.SELL,
-            qty=entry_qty,
-            trigger_price=stop_trigger_price,
-            client_id=stop_client_id,
-        )
-        native_stop_evidence["placed"] = _protective_order_payload(placed_stop)
-        _assert_rehearsal_protective_order_valid(
-            live_product,
-            placed_stop,
-            label="placed",
-            expected_qty=entry_qty,
-            expected_trigger_price=stop_trigger_price,
-            expected_client_id=stop_client_id,
-            expected_status=ProtectiveOrderStatus.OPEN,
-        )
-        fetched_open_stop = broker.get_protective_stop(
-            symbol=live_product.symbol,
-            order_id=placed_stop.order_id,
-            client_id=stop_client_id,
-        )
-        native_stop_evidence["fetched_open"] = _protective_order_payload(fetched_open_stop)
-        _assert_rehearsal_protective_order_valid(
-            live_product,
-            fetched_open_stop,
-            label="fetched-open",
-            expected_qty=entry_qty,
-            expected_trigger_price=stop_trigger_price,
-            expected_client_id=stop_client_id,
-            expected_status=ProtectiveOrderStatus.OPEN,
-            expected_order_id=placed_stop.order_id,
-        )
-        native_stop_evidence["open_verified"] = True
-
-        close_fill = broker.close_position(live_product.symbol)
-        _assert_rehearsal_fill_valid(
-            live_product,
-            close_fill,
-            label="close",
-            expected_side=OrderSide.SELL,
-            expected_qty=entry_qty,
-        )
-        final_position = broker.get_position(live_product.symbol)
-        if not final_position.is_flat:
-            raise RuntimeError(
-                f"position is not flat after reduce-only close: qty {final_position.qty:g}"
-            )
-
-        cancel_result = broker.cancel_protective_stop(
-            symbol=live_product.symbol,
-            order_id=placed_stop.order_id,
-            client_id=stop_client_id,
-        )
-        native_stop_evidence["cancel_result"] = _protective_order_payload(cancel_result)
-        _assert_rehearsal_protective_order_valid(
-            live_product,
-            cancel_result,
-            label="cancel-result",
-            expected_qty=entry_qty,
-            expected_trigger_price=stop_trigger_price,
-            expected_client_id=stop_client_id,
-            expected_status=ProtectiveOrderStatus.CANCELED,
-            expected_order_id=placed_stop.order_id,
-        )
-        fetched_terminal_stop = broker.get_protective_stop(
-            symbol=live_product.symbol,
-            order_id=placed_stop.order_id,
-            client_id=stop_client_id,
-        )
-        native_stop_evidence["fetched_terminal"] = _protective_order_payload(fetched_terminal_stop)
-        _assert_rehearsal_protective_order_valid(
-            live_product,
-            fetched_terminal_stop,
-            label="fetched-terminal",
-            expected_qty=entry_qty,
-            expected_trigger_price=stop_trigger_price,
-            expected_client_id=stop_client_id,
-            expected_status=ProtectiveOrderStatus.CANCELED,
-            expected_order_id=placed_stop.order_id,
-            allowed_statuses=frozenset(
-                {
-                    ProtectiveOrderStatus.CANCELED,
-                    ProtectiveOrderStatus.EXPIRED,
-                    ProtectiveOrderStatus.REJECTED,
-                }
-            ),
-        )
-        native_stop_evidence["canceled_verified"] = True
-        final_position = broker.get_position(live_product.symbol)
-        if not final_position.is_flat:
-            raise RuntimeError(
-                f"position changed after protective-stop cancellation: qty {final_position.qty:g}"
-            )
     except Exception as exc:
-        recovery_errors: dict[str, str] = {}
-        if entry_fill is not None:
-            try:
-                current_position = broker.get_position(live_product.symbol)
-                if not current_position.is_flat:
-                    recovery_close_fill = broker.close_position(live_product.symbol)
-                final_position = broker.get_position(live_product.symbol)
-            except Exception as recovery_exc:
-                recovery_errors["close"] = f"{type(recovery_exc).__name__}: {recovery_exc}"
-                try:
-                    final_position = broker.get_position(live_product.symbol)
-                except Exception as position_exc:
-                    recovery_errors["position_reconciliation"] = (
-                        f"{type(position_exc).__name__}: {position_exc}"
-                    )
-
-        if (
-            final_position is not None
-            and final_position.is_flat
-            and stop_client_id is not None
-            and native_stop_evidence["canceled_verified"] is not True
-        ):
-            try:
-                recovery_cancel = broker.cancel_protective_stop(
-                    symbol=live_product.symbol,
-                    order_id=placed_stop.order_id if placed_stop is not None else None,
-                    client_id=stop_client_id,
-                )
-                native_stop_evidence["recovery_cancel_result"] = _protective_order_payload(
-                    recovery_cancel
-                )
-                if stop_trigger_price is not None:
-                    _assert_rehearsal_protective_order_valid(
-                        live_product,
-                        recovery_cancel,
-                        label="recovery-cancel",
-                        expected_qty=float(entry_fill.qty),
-                        expected_trigger_price=stop_trigger_price,
-                        expected_client_id=stop_client_id,
-                        expected_status=ProtectiveOrderStatus.CANCELED,
-                        expected_order_id=(
-                            placed_stop.order_id if placed_stop is not None else None
-                        ),
-                    )
-                    recovery_fetched = broker.get_protective_stop(
-                        symbol=live_product.symbol,
-                        order_id=recovery_cancel.order_id,
-                        client_id=stop_client_id,
-                    )
-                    native_stop_evidence["recovery_fetched_terminal"] = _protective_order_payload(
-                        recovery_fetched
-                    )
-                    _assert_rehearsal_protective_order_valid(
-                        live_product,
-                        recovery_fetched,
-                        label="recovery-fetched-terminal",
-                        expected_qty=float(entry_fill.qty),
-                        expected_trigger_price=stop_trigger_price,
-                        expected_client_id=stop_client_id,
-                        expected_status=ProtectiveOrderStatus.CANCELED,
-                        expected_order_id=recovery_cancel.order_id,
-                        allowed_statuses=frozenset(
-                            {
-                                ProtectiveOrderStatus.CANCELED,
-                                ProtectiveOrderStatus.EXPIRED,
-                                ProtectiveOrderStatus.REJECTED,
-                            }
-                        ),
-                    )
-                    native_stop_evidence["canceled_verified"] = True
-            except Exception as recovery_exc:
-                recovery_errors["protective_stop_cancel"] = (
-                    f"{type(recovery_exc).__name__}: {recovery_exc}"
-                )
-        elif placed_stop is not None and final_position is not None and not final_position.is_flat:
-            native_stop_evidence["left_open_to_protect_non_flat_position"] = True
-
-        recovery: dict[str, Any] = {
-            "attempted": entry_fill is not None,
-            "close_fill": _fill_payload(recovery_close_fill),
-        }
-        if final_position is not None:
-            recovery.update(
-                {
-                    "final_position_qty": final_position.qty,
-                    "final_position_avg_price": final_position.avg_price,
-                    "final_position_flat": final_position.is_flat,
-                }
-            )
-        if recovery_errors:
-            recovery["errors"] = recovery_errors
-        return finish(
+        recovery = _rehearsal_recovery_report(live_product, broker, state)
+        return _finish_rehearsal_report(
+            output_path,
             _fail(
                 product,
                 f"order_rehearsal_failed: {exc}",
                 preflight=preflight,
-                entry_fill=_fill_payload(entry_fill),
-                close_fill=_fill_payload(close_fill),
-                native_protective_stop=native_stop_evidence,
+                entry_fill=_fill_payload(state["entry_fill"]),
+                close_fill=_fill_payload(state["close_fill"]),
+                native_protective_stop=state["native_stop_evidence"],
                 recovery=recovery,
-            )
+            ),
         )
-
-    ok = (
-        close_fill is not None
-        and final_position.is_flat
-        and native_stop_evidence["open_verified"] is True
-        and native_stop_evidence["canceled_verified"] is True
+    return _finish_rehearsal_report(
+        output_path,
+        _successful_rehearsal_report(context, state, notional_usd=notional_usd),
     )
-    report = {
-        "generated_at": utc_now(),
-        "generated_ts": time.time(),
-        "ok": ok,
-        "product": _product_status(product),
-        "exchange": exchange_cfg.exchange if exchange_cfg else None,
-        "testnet": exchange_cfg.testnet if exchange_cfg else None,
-        "risk_controls": _risk_controls_payload(exchange_cfg),
-        "notional_usd": float(notional_usd),
-        "reference_price": price,
-        "balance_before_entry": balance,
-        "raw_order_qty": raw_qty,
-        "order_qty": qty,
-        "entry_fill": _fill_payload(entry_fill),
-        "close_fill": _fill_payload(close_fill),
-        "native_protective_stop": native_stop_evidence,
-        "final_position_qty": final_position.qty,
-        "preflight": preflight,
-    }
-    if not ok:
-        report["error"] = "final_position_not_flat_after_close"
-    return finish(report)
 
 
 def parse_args() -> argparse.Namespace:
