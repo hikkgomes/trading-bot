@@ -267,14 +267,23 @@ class ApprovedLiveExecution:
             supports_stops = getattr(venue.broker, "supports_native_protective_stops", None)
             if not callable(supports_stops) or not supports_stops():
                 raise PermissionError("live futures entry requires native protective stops")
-        current_assignment = self.assignments.active(
-            product_id,
-            execution_mode="live",
-            at=authority_at,
+        requested_strategy_id = str(payload.get("strategy_version_id") or "")
+        live_assignments = self.assignments.active_assignments(product_id, at=authority_at)
+        current_assignment = next(
+            (
+                item
+                for item in live_assignments
+                if item["execution_mode"] == "live"
+                and item.get("instrument_id") == order.instrument_id
+                and (
+                    not requested_strategy_id
+                    or item["strategy_version_id"] == requested_strategy_id
+                )
+            ),
+            None,
         )
         if current_assignment is None:
-            raise PermissionError("live product has no active canonical assignment")
-        requested_strategy_id = str(payload.get("strategy_version_id") or "")
+            raise PermissionError("live instrument has no active canonical assignment")
         if (
             requested_strategy_id
             and requested_strategy_id != current_assignment["strategy_version_id"]
@@ -292,6 +301,7 @@ class ApprovedLiveExecution:
             artefact_hash=str(current_assignment["artefact_hash"]),
             execution_mode="live",
             at=authority_at,
+            instrument_id=order.instrument_id,
         )
         artifact = self.artefacts.get(str(assignment["artefact_hash"]))
         declared_hash = artifact.get("artefact_hash")

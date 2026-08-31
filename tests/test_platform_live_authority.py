@@ -132,6 +132,7 @@ def _fixture(tmp_path: Path, monkeypatch) -> tuple[PlatformDatabase, PlatformLiv
         NOW,
         "manual-live-authority",
         execution_mode="paper",
+        sleeve_id="directional",
     )
     from src.research.canonical import SqlActiveStrategyAssignmentRepository
 

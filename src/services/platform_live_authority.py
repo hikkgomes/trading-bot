@@ -338,6 +338,8 @@ class PlatformLiveAuthority:
             product_id,
             at=assigned_at,
             assignment_reason="paper authority replaced by live canary",
+            sleeve_id=sleeve_id,
+            instrument_id=instrument_id,
         )
         assignment_id = self.assignments.assign(
             product_id=product_id,

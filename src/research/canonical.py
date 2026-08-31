@@ -1810,7 +1810,10 @@ class SqlActiveStrategyAssignmentRepository:
     def _lock_key(record: Mapping[str, Any]) -> str:
         product_id = str(record["product_id"])
         if record["execution_mode"] == "live":
-            return f"active-assignment-live:{product_id}"
+            return (
+                f"active-assignment-live:{product_id}:{record['portfolio_id']}:"
+                f"{record['sleeve_id']}:{record['instrument_id'] or record['universe_id']}"
+            )
         return (
             f"active-assignment:{product_id}:{record['portfolio_id']}:{record['sleeve_id']}:"
             f"{record['strategy_version_id']}:{record['instrument_id'] or record['universe_id']}:"
@@ -1990,12 +1993,18 @@ class SqlActiveStrategyAssignmentRepository:
     @staticmethod
     def _assert_no_live_conflict(connection, record: Mapping[str, Any]) -> None:
         product_id = str(record["product_id"])
+        portfolio_id = str(record["portfolio_id"])
+        sleeve_id = str(record["sleeve_id"])
+        scope_id = str(record["assignment_scope_id"])
         assigned_at = str(record["assigned_at"])
         rows = (
             connection.execute(
                 select(active_strategy_assignment)
                 .where(
                     active_strategy_assignment.c.product_id == product_id,
+                    active_strategy_assignment.c.portfolio_id == portfolio_id,
+                    active_strategy_assignment.c.sleeve_id == sleeve_id,
+                    active_strategy_assignment.c.assignment_scope_id == scope_id,
                     active_strategy_assignment.c.execution_mode == "live",
                 )
                 .order_by(
@@ -2181,6 +2190,9 @@ class SqlActiveStrategyAssignmentRepository:
         *,
         at: str | None = None,
         assignment_reason: str = "deactivated",
+        sleeve_id: str | None = None,
+        instrument_id: str | None = None,
+        universe_id: str | None = None,
     ) -> None:
         """Remove execution authority while retaining the assignment history."""
         deactivated_at = (
@@ -2189,6 +2201,12 @@ class SqlActiveStrategyAssignmentRepository:
             else dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
         )
         active = self.active_assignments(product_id, at=deactivated_at)
+        if sleeve_id is not None:
+            active = tuple(row for row in active if row["sleeve_id"] == sleeve_id)
+        if instrument_id is not None:
+            active = tuple(row for row in active if row["instrument_id"] == instrument_id)
+        if universe_id is not None:
+            active = tuple(row for row in active if row["universe_id"] == universe_id)
         with self.engine.begin() as connection:
             for row in active:
                 existing_payload = (
@@ -2223,8 +2241,25 @@ class SqlActiveStrategyAssignmentRepository:
         artefact_hash: str,
         execution_mode: str,
         at: str | None = None,
+        instrument_id: str | None = None,
+        sleeve_id: str | None = None,
     ) -> dict[str, Any]:
-        row = self.active(product_id, execution_mode=execution_mode, at=at)
+        candidates = tuple(
+            item
+            for item in self.active_assignments(product_id, at=at)
+            if item["execution_mode"] == execution_mode
+            and (instrument_id is None or item.get("instrument_id") == instrument_id)
+            and (sleeve_id is None or item.get("sleeve_id") == sleeve_id)
+        )
+        row = next(
+            (
+                item
+                for item in candidates
+                if item["strategy_version_id"] == strategy_version_id
+                and item["artefact_hash"] == artefact_hash
+            ),
+            candidates[0] if candidates else None,
+        )
         if row is None:
             raise CanonicalEvidenceError(
                 f"no active canonical strategy assignment for {product_id}"
