@@ -314,9 +314,7 @@ class ResearchFactoryConfig:
     dynamic_active_income_universe: bool = False
 
 
-def load_factory_config(path: Path = DEFAULT_CONFIG) -> ResearchFactoryConfig:
-    path = Path(path)
-    payload = _strict_json_file(path, maximum_bytes=MAX_CONFIG_BYTES, label="research config")
+def _factory_header(payload: Mapping[str, Any]) -> bool:
     allowed = {
         "version",
         "memory_path",
@@ -335,118 +333,142 @@ def load_factory_config(path: Path = DEFAULT_CONFIG) -> ResearchFactoryConfig:
         )
     if payload.get("version") != 1:
         raise ResearchFactoryConfigError("research config version must be 1")
-    dynamic_universe = payload.get("dynamic_active_income_universe", False)
-    if not isinstance(dynamic_universe, bool):
+    dynamic = payload.get("dynamic_active_income_universe", False)
+    if not isinstance(dynamic, bool):
         raise ResearchFactoryConfigError("dynamic_active_income_universe must be a boolean")
-    holdout = payload.get("holdout_policy")
     required_holdout = {
         "canonical_behavior_claims": True,
         "retire_exposed_lineages": True,
         "exclude_holdout_results_from_generation": True,
         "paper_forward_test_is_final_adaptive_free_gate": True,
     }
-    if holdout != required_holdout:
+    if payload.get("holdout_policy") != required_holdout:
         raise ResearchFactoryConfigError(
             "holdout_policy must retain every fail-closed protected-data invariant"
         )
-    spaces_payload = payload.get("search_spaces")
-    if not isinstance(spaces_payload, list) or not spaces_payload:
+    return dynamic
+
+
+def _expand_search_space_item(index: int, item: Any) -> list[SearchSpace]:
+    if not isinstance(item, Mapping):
+        raise ResearchFactoryConfigError(f"search_spaces[{index}] must be an object")
+    unknown = sorted(set(item) - SEARCH_SPACE_CONFIG_FIELDS)
+    if unknown:
+        raise ResearchFactoryConfigError(
+            f"search_spaces[{index}] has unknown fields: {', '.join(unknown)}"
+        )
+    missing = sorted(REQUIRED_SEARCH_SPACE_FIELDS - set(item))
+    if missing:
+        raise ResearchFactoryConfigError(
+            f"search_spaces[{index}] is missing fields: {', '.join(missing)}"
+        )
+    raw_symbols = item.get("symbols")
+    if raw_symbols is not None and "symbol" in item:
+        raise ResearchFactoryConfigError(
+            f"search_spaces[{index}] cannot define both symbol and symbols"
+        )
+    if raw_symbols is None:
+        symbols = [item.get("symbol", "BTCUSDT")]
+    elif (
+        not isinstance(raw_symbols, list)
+        or not raw_symbols
+        or any(not isinstance(value, str) or not value.strip() for value in raw_symbols)
+    ):
+        raise ResearchFactoryConfigError(
+            f"search_spaces[{index}].symbols must be a non-empty list of strings"
+        )
+    else:
+        symbols = raw_symbols
+    try:
+        return [
+            SearchSpace.from_dict(
+                {
+                    **{key: value for key, value in item.items() if key != "symbols"},
+                    "symbol": str(raw_symbol).strip().upper(),
+                    **(
+                        {"name": f"{item['name']}_{str(raw_symbol).strip().lower()}"}
+                        if len(symbols) > 1 and str(raw_symbol).strip().upper() != "BTCUSDT"
+                        else {}
+                    ),
+                }
+            )
+            for raw_symbol in symbols
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ResearchFactoryConfigError(f"search_spaces[{index}] is invalid: {exc}") from exc
+
+
+def _factory_search_spaces(raw_spaces: Any) -> tuple[SearchSpace, ...]:
+    if not isinstance(raw_spaces, list) or not raw_spaces:
         raise ResearchFactoryConfigError("search_spaces must be a non-empty list")
-    spaces_list: list[SearchSpace] = []
-    for index, item in enumerate(spaces_payload):
-        if not isinstance(item, Mapping):
-            raise ResearchFactoryConfigError(f"search_spaces[{index}] must be an object")
-        unknown_space_fields = sorted(set(item) - SEARCH_SPACE_CONFIG_FIELDS)
-        if unknown_space_fields:
-            raise ResearchFactoryConfigError(
-                f"search_spaces[{index}] has unknown fields: {', '.join(unknown_space_fields)}"
-            )
-        missing_space_fields = sorted(REQUIRED_SEARCH_SPACE_FIELDS - set(item))
-        if missing_space_fields:
-            raise ResearchFactoryConfigError(
-                f"search_spaces[{index}] is missing fields: {', '.join(missing_space_fields)}"
-            )
-        raw_symbols = item.get("symbols")
-        if raw_symbols is not None and "symbol" in item:
-            raise ResearchFactoryConfigError(
-                f"search_spaces[{index}] cannot define both symbol and symbols"
-            )
-        if raw_symbols is None:
-            symbols = [item.get("symbol", "BTCUSDT")]
-        elif (
-            not isinstance(raw_symbols, list)
-            or not raw_symbols
-            or any(not isinstance(value, str) or not value.strip() for value in raw_symbols)
-        ):
-            raise ResearchFactoryConfigError(
-                f"search_spaces[{index}].symbols must be a non-empty list of strings"
-            )
-        else:
-            symbols = raw_symbols
-        try:
-            for raw_symbol in symbols:
-                expanded = {key: value for key, value in item.items() if key != "symbols"}
-                expanded["symbol"] = str(raw_symbol).strip().upper()
-                if len(symbols) > 1 and expanded["symbol"] != "BTCUSDT":
-                    expanded["name"] = f"{item['name']}_{expanded['symbol'].lower()}"
-                spaces_list.append(SearchSpace.from_dict(expanded))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ResearchFactoryConfigError(f"search_spaces[{index}] is invalid: {exc}") from exc
-    spaces = tuple(spaces_list)
+    spaces = tuple(
+        space
+        for index, item in enumerate(raw_spaces)
+        for space in _expand_search_space_item(index, item)
+    )
     names = [space.name for space in spaces]
     if len(set(names)) != len(names):
         raise ResearchFactoryConfigError("search-space names must be unique")
-    required_products = {"active_income", "btc_accumulation"}
-    products = {space.product for space in spaces}
-    if products != required_products:
+    return spaces
+
+
+def _validate_factory_space(space: SearchSpace) -> None:
+    if space.product == "active_income" and (space.market != "futures" or space.pnl_unit != "usdt"):
+        raise ResearchFactoryConfigError(
+            f"{space.name}: active_income must use futures market and usdt PnL"
+        )
+    if space.product == "btc_accumulation" and (
+        space.market != "spot"
+        or space.pnl_unit != "btc"
+        or space.symbol != "BTCUSDT"
+        or space.opportunity_type != "btc_accumulation"
+        or set(space.directions) != {"short"}
+    ):
+        raise ResearchFactoryConfigError(
+            f"{space.name}: btc_accumulation must use spot/btc, short-only step-aside research"
+        )
+
+
+def _validate_factory_space_catalogue(spaces: tuple[SearchSpace, ...]) -> None:
+    if {space.product for space in spaces} != {"active_income", "btc_accumulation"}:
         raise ResearchFactoryConfigError(
             "search spaces must cover exactly active_income and btc_accumulation"
         )
     for space in spaces:
-        if space.product == "active_income" and (
-            space.market != "futures" or space.pnl_unit != "usdt"
-        ):
-            raise ResearchFactoryConfigError(
-                f"{space.name}: active_income must use futures market and usdt PnL"
-            )
-        if space.product == "btc_accumulation" and (
-            space.market != "spot"
-            or space.pnl_unit != "btc"
-            or space.symbol != "BTCUSDT"
-            or space.opportunity_type != "btc_accumulation"
-            or set(space.directions) != {"short"}
-        ):
-            raise ResearchFactoryConfigError(
-                f"{space.name}: btc_accumulation must use spot/btc, short-only step-aside research"
-            )
-    required_active_horizons = {
-        "scalping": "1m",
-        "day_trading": "5m",
-        "swing_trading": "1h",
-    }
+        _validate_factory_space(space)
+    required_horizons = {"scalping": "1m", "day_trading": "5m", "swing_trading": "1h"}
     active_spaces = [space for space in spaces if space.product == "active_income"]
     for symbol in sorted({space.symbol for space in active_spaces}):
         symbol_spaces = [space for space in active_spaces if space.symbol == symbol]
-        opportunities = {space.opportunity_type for space in symbol_spaces}
-        if opportunities != set(required_active_horizons):
+        if {space.opportunity_type for space in symbol_spaces} != set(required_horizons):
             raise ResearchFactoryConfigError(
                 f"{symbol} active-income spaces must cover exactly scalp, day, and swing research"
             )
-        for opportunity, expected_base in required_active_horizons.items():
-            configured_bases = {
+        for opportunity, expected_base in required_horizons.items():
+            configured = {
                 space.base_timeframe
                 for space in symbol_spaces
                 if space.opportunity_type == opportunity
             }
-            if configured_bases != {expected_base}:
+            if configured != {expected_base}:
                 raise ResearchFactoryConfigError(
                     f"{symbol} {opportunity} search spaces must use base_timeframe {expected_base}"
                 )
-    btc_bases = {space.base_timeframe for space in spaces if space.product == "btc_accumulation"}
-    if btc_bases != {"1h", "4h"}:
+    if {space.base_timeframe for space in spaces if space.product == "btc_accumulation"} != {
+        "1h",
+        "4h",
+    }:
         raise ResearchFactoryConfigError(
             "btc_accumulation search spaces must cover exactly 1h and 4h base timeframes"
         )
+
+
+def load_factory_config(path: Path = DEFAULT_CONFIG) -> ResearchFactoryConfig:
+    path = Path(path)
+    payload = _strict_json_file(path, maximum_bytes=MAX_CONFIG_BYTES, label="research config")
+    dynamic_universe = _factory_header(payload)
+    spaces = _factory_search_spaces(payload.get("search_spaces"))
+    _validate_factory_space_catalogue(spaces)
     return ResearchFactoryConfig(
         path=path.resolve(),
         memory_path=_project_path(payload.get("memory_path"), label="memory_path"),
@@ -865,6 +887,101 @@ def _motif_for_proposal(proposal: Mapping[str, Any]) -> str:
     return "hybrid"
 
 
+def _compile_openclaw_spec(
+    proposal: Mapping[str, Any],
+    space: SearchSpace,
+    *,
+    untrusted: dict[str, Any],
+    parent: Mapping[str, Any] | None,
+    available_features: Mapping[str, Iterable[str]] | None,
+    limits: GrammarLimits,
+) -> GeneratedIdea:
+    trusted = dict(untrusted)
+    trusted.update(
+        id="OPENCLAW_PENDING_ID",
+        family="generated_openclaw",
+        idea=str(proposal.get("thesis") or "OpenClaw research proposal")[:1000],
+        market_logic=(
+            "An optional OpenClaw research suggestion compiled into the same bounded, "
+            "non-executable strategy grammar as native ideas."
+        ),
+        expected_holding=space.opportunity_type.replace("_", " "),
+        expected_frequency="unknown until measured on training data",
+        invalidation="trusted risk/exit rules or loss of compiled entry conditions",
+        tags=["autonomous_generation", "openclaw_proposal", space.name],
+    )
+    try:
+        hypothesis = Hypothesis.from_dict(trusted)
+    except ExperimentMemoryError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise UntrustedProposalCompileError(
+            f"suggested spec failed trusted schema compilation: {type(exc).__name__}: {exc}"
+        ) from exc
+    problems = validate_hypothesis_against_space(
+        hypothesis,
+        space,
+        available_features=available_features,
+        limits=limits,
+    )
+    if problems:
+        raise UntrustedProposalCompileError(
+            f"suggested spec violates search-space limits: {', '.join(problems)}"
+        )
+    idea = GeneratedIdea(
+        hypothesis=hypothesis,
+        generation_method=(
+            "openclaw_compiled_revision" if parent is not None else "openclaw_compiled_proposal"
+        ),
+        grammar_keys=tuple(
+            str(item)[:128]
+            for item in proposal.get("suggested_primitives") or []
+            if isinstance(item, str)
+        ),
+        motif=_motif_for_proposal(proposal),
+    )
+    if parent is not None:
+        return dataclasses.replace(
+            idea,
+            parent_hashes=(str(parent["behavior_hash"]),),
+            adaptation_reasons=tuple(str(item)[:128] for item in proposal.get("changes") or []),
+        )
+    return idea
+
+
+def _compile_openclaw_revision(
+    proposal: Mapping[str, Any],
+    space: SearchSpace,
+    *,
+    parent: Mapping[str, Any],
+    rng: random.Random,
+    available_features: Mapping[str, Iterable[str]] | None,
+    feedback_weights: Mapping[str, float],
+    limits: GrammarLimits,
+) -> GeneratedIdea:
+    parent_hypothesis = _parent_hypothesis(parent)
+    if parent_hypothesis is None:
+        raise UntrustedProposalCompileError("revision parent has no valid hypothesis")
+    latest = parent.get("latest_evaluation")
+    failure_reasons = (
+        tuple(str(item) for item in latest.get("rejection_reasons") or [])
+        if isinstance(latest, Mapping)
+        else ()
+    )
+    failure_reasons = (*failure_reasons, *(str(item) for item in proposal.get("changes") or []))
+    idea = mutate_hypothesis(
+        parent_hypothesis,
+        space,
+        parent_hash=str(parent["behavior_hash"]),
+        rng=rng,
+        available_features=available_features,
+        feedback_weights=feedback_weights,
+        limits=limits,
+        failure_reasons=failure_reasons,
+    )
+    return dataclasses.replace(idea, generation_method="openclaw_guided_revision")
+
+
 def _compile_openclaw_proposal(
     proposal: Mapping[str, Any],
     space: SearchSpace,
@@ -882,6 +999,10 @@ def _compile_openclaw_proposal(
         raise UntrustedProposalCompileError("suggested spec has too many top-level fields")
     if untrusted:
         unknown = sorted(set(untrusted) - SPEC_KEYS)
+        if unknown:
+            raise UntrustedProposalCompileError(
+                f"suggested spec has unknown fields: {', '.join(unknown)}"
+            )
         required = {
             "direction",
             "base_timeframe",
@@ -893,88 +1014,25 @@ def _compile_openclaw_proposal(
             "trigger",
             "exit",
         }
-        if unknown:
-            raise UntrustedProposalCompileError(
-                f"suggested spec has unknown fields: {', '.join(unknown)}"
-            )
         if required.issubset(untrusted):
-            trusted = dict(untrusted)
-            trusted.update(
-                id="OPENCLAW_PENDING_ID",
-                family="generated_openclaw",
-                idea=str(proposal.get("thesis") or "OpenClaw research proposal")[:1000],
-                market_logic=(
-                    "An optional OpenClaw research suggestion compiled into the same bounded, "
-                    "non-executable strategy grammar as native ideas."
-                ),
-                expected_holding=space.opportunity_type.replace("_", " "),
-                expected_frequency="unknown until measured on training data",
-                invalidation="trusted risk/exit rules or loss of compiled entry conditions",
-                tags=["autonomous_generation", "openclaw_proposal", space.name],
-            )
-            try:
-                hypothesis = Hypothesis.from_dict(trusted)
-            except ExperimentMemoryError:
-                raise
-            except (KeyError, TypeError, ValueError) as exc:
-                raise UntrustedProposalCompileError(
-                    f"suggested spec failed trusted schema compilation: {type(exc).__name__}: {exc}"
-                ) from exc
-            problems = validate_hypothesis_against_space(
-                hypothesis,
+            return _compile_openclaw_spec(
+                proposal,
                 space,
+                untrusted=untrusted,
+                parent=parent,
                 available_features=available_features,
                 limits=limits,
             )
-            if problems:
-                raise UntrustedProposalCompileError(
-                    f"suggested spec violates search-space limits: {', '.join(problems)}"
-                )
-            idea = GeneratedIdea(
-                hypothesis=hypothesis,
-                generation_method="openclaw_compiled_proposal",
-                grammar_keys=tuple(
-                    str(item)[:128]
-                    for item in proposal.get("suggested_primitives") or []
-                    if isinstance(item, str)
-                ),
-                motif=_motif_for_proposal(proposal),
-            )
-            if parent is not None:
-                return dataclasses.replace(
-                    idea,
-                    generation_method="openclaw_compiled_revision",
-                    parent_hashes=(str(parent["behavior_hash"]),),
-                    adaptation_reasons=tuple(
-                        str(item)[:128] for item in proposal.get("changes") or []
-                    ),
-                )
-            return idea
     if parent is not None:
-        parent_hypothesis = _parent_hypothesis(parent)
-        if parent_hypothesis is None:
-            raise UntrustedProposalCompileError("revision parent has no valid hypothesis")
-        latest = parent.get("latest_evaluation")
-        failure_reasons = (
-            tuple(str(item) for item in latest.get("rejection_reasons") or [])
-            if isinstance(latest, Mapping)
-            else ()
-        )
-        failure_reasons = (
-            *failure_reasons,
-            *(str(item) for item in proposal.get("changes") or []),
-        )
-        idea = mutate_hypothesis(
-            parent_hypothesis,
+        return _compile_openclaw_revision(
+            proposal,
             space,
-            parent_hash=str(parent["behavior_hash"]),
+            parent=parent,
             rng=rng,
             available_features=available_features,
             feedback_weights=feedback_weights,
             limits=limits,
-            failure_reasons=failure_reasons,
         )
-        return dataclasses.replace(idea, generation_method="openclaw_guided_revision")
     # A high-level thesis is a seed, not executable input.  Native grammar owns
     # the actual structure, so OpenClaw can be absent or wrong without widening
     # the trusted language.
@@ -1310,14 +1368,13 @@ def _candidate_payload_from_pending(
     }
 
 
-def build_generation(
+def _generation_setup(
     config: ResearchFactoryConfig,
     *,
-    seed: int | None = None,
-    now: str | None = None,
-    market_universe_report: Path = DEFAULT_MARKET_UNIVERSE_REPORT,
+    seed: int | None,
+    generated_at: str,
+    market_universe_report: Path,
 ) -> dict[str, Any]:
-    generated_at = now or _utc_now()
     cycle_seed = _seed_for_cycle(config, generated_at, seed)
     cycle_spaces = _search_spaces_for_cycle(
         config,
@@ -1335,58 +1392,75 @@ def build_generation(
         rng.shuffle(active_spaces)
         cycle_spaces = (*btc_spaces, *active_spaces)
     budgets = config.budgets
-    limits = GrammarLimits(max_total_predicates=budgets.max_total_predicates)
-    deadline = time.monotonic() + budgets.max_generation_seconds
-    attempts = 0
-    rejected: list[dict[str, Any]] = []
-    accepted: list[dict[str, Any]] = []
-    by_space: Counter[str] = Counter()
-    by_method: Counter[str] = Counter()
     proposal_state = _proposal_state(config.proposal_state_path)
     processed = proposal_state.setdefault("processed", {})
     if not isinstance(processed, dict):
         raise ResearchFactoryConfigError("proposal state processed must be an object")
-    proposals_purged = _purge_processed_proposals(
-        config.openclaw_accepted_dir,
-        set(processed),
-    )
+    return {
+        "cycle_seed": cycle_seed,
+        "generated_at": generated_at,
+        "cycle_spaces": cycle_spaces,
+        "universe_context": universe_context,
+        "rng": rng,
+        "limits": GrammarLimits(max_total_predicates=budgets.max_total_predicates),
+        "budgets": budgets,
+        "deadline": time.monotonic() + budgets.max_generation_seconds,
+        "proposal_state": proposal_state,
+        "processed": processed,
+        "proposals_purged": _purge_processed_proposals(
+            config.openclaw_accepted_dir, set(processed)
+        ),
+    }
 
-    with ExperimentMemory(config.memory_path) as memory:
-        memory_before = config.memory_path.stat().st_size
-        memory_maintenance: dict[str, Any] = {
-            "triggered": False,
-            "before_bytes": memory_before,
-            "after_bytes": memory_before,
-            "rows_compacted": 0,
-        }
-        if memory_before >= int(budgets.max_memory_bytes * MEMORY_COMPACTION_TRIGGER_FRACTION):
-            compacted = memory.compact_storage(
+
+def _generation_memory_context(
+    config: ResearchFactoryConfig,
+    memory: ExperimentMemory,
+    cycle_spaces: tuple[SearchSpace, ...],
+    limits: GrammarLimits,
+) -> dict[str, Any]:
+    budgets = config.budgets
+    memory_before = config.memory_path.stat().st_size
+    maintenance: dict[str, Any] = {
+        "triggered": False,
+        "before_bytes": memory_before,
+        "after_bytes": memory_before,
+        "rows_compacted": 0,
+    }
+    if memory_before >= int(budgets.max_memory_bytes * MEMORY_COMPACTION_TRIGGER_FRACTION):
+        maintenance = {
+            "triggered": True,
+            **memory.compact_storage(
                 maximum_rows=MAX_MEMORY_COMPACTION_ROWS_PER_CYCLE,
                 vacuum=True,
-            )
-            memory_maintenance = {"triggered": True, **compacted}
-        memory_size = config.memory_path.stat().st_size
-        if memory_size > budgets.max_memory_bytes:
-            raise ResearchFactoryConfigError(
-                "experiment memory remains above max_memory_bytes after bounded, "
-                "integrity-checked compaction; generation is paused fail closed: "
-                f"{memory_size} > {budgets.max_memory_bytes}"
-            )
-        research_engine_digest = execution_engine_digest()
-        feedback = memory.generator_feedback(research_engine_digest=research_engine_digest)
-        weights = _feedback_weights(feedback)
-        features_by_space = {
-            space.name: _feature_inventory_for_space(space) for space in cycle_spaces
+            ),
         }
-        dedup_by_space = {
+    memory_size = config.memory_path.stat().st_size
+    if memory_size > budgets.max_memory_bytes:
+        raise ResearchFactoryConfigError(
+            "experiment memory remains above max_memory_bytes after bounded, "
+            "integrity-checked compaction; generation is paused fail closed: "
+            f"{memory_size} > {budgets.max_memory_bytes}"
+        )
+    engine_digest = execution_engine_digest()
+    feedback = memory.generator_feedback(research_engine_digest=engine_digest)
+    return {
+        "maintenance": maintenance,
+        "research_engine_digest": engine_digest,
+        "feedback": feedback,
+        "weights": _feedback_weights(feedback),
+        "features_by_space": {
+            space.name: _feature_inventory_for_space(space) for space in cycle_spaces
+        },
+        "dedup_by_space": {
             space.name: [
                 item
                 for item in memory.dedup_population(product=space.product)
                 if (item.get("metadata") or {}).get("symbol", "BTCUSDT") == space.symbol
             ]
             for space in cycle_spaces
-        }
-        parents_by_space = {
+        },
+        "parents_by_space": {
             space.name: [
                 item
                 for item in memory.candidate_parents(
@@ -1396,348 +1470,497 @@ def build_generation(
                     exclude_holdout_exposed=True,
                     exclude_retired=True,
                     latest_outcomes=("reject", "inconclusive", "pre_holdout_pass"),
-                    research_engine_digest=research_engine_digest,
+                    research_engine_digest=engine_digest,
                 )
                 if (item.get("metadata") or {}).get("symbol", "BTCUSDT") == space.symbol
             ]
             for space in cycle_spaces
-        }
+        },
+        "limits": limits,
+    }
 
-        # Backpressure first: a candidate registered before a crash/restart is
-        # resumed before creating more work.
-        for space in cycle_spaces:
-            revalidations_for_space = 0
-            for item in _pending_for_space(
-                memory,
-                space,
-                limit=budgets.max_candidates_per_space,
-                research_engine_digest=research_engine_digest,
-            ):
-                if len(accepted) >= budgets.max_candidates_per_cycle:
-                    break
-                candidate = _candidate_payload_from_pending(item, space)
-                if candidate is None:
-                    continue
-                if candidate["metadata"].get("revalidation_pending"):
-                    # Keep one slot in every search space available for genuinely
-                    # new exploration. A per-space budget of one therefore does
-                    # not consume stale-engine revalidation work.
-                    revalidation_limit = min(
-                        1,
-                        max(0, budgets.max_candidates_per_space - 1),
-                    )
-                    if revalidations_for_space >= revalidation_limit:
-                        continue
-                    revalidations_for_space += 1
-                accepted.append(candidate)
-                by_space[space.name] += 1
-                by_method[
-                    "revalidation_pending"
-                    if candidate["metadata"].get("revalidation_pending")
-                    else "resumed_pending"
-                ] += 1
 
-        # OpenClaw is optional and never blocks native generation.
-        proposals = _load_accepted_proposals(config.openclaw_accepted_dir, set(processed))
-        for proposal in proposals:
-            proposal_id = str(proposal["proposal_id"])
-            action = str(proposal.get("action") or "new")
-            parent_hypothesis_id = proposal.get("parent_hypothesis_id")
-            disposition: dict[str, Any] = {
-                "processed_at": generated_at,
-                "action": action,
-                **{
-                    key: _disposition_value(proposal.get(key))
-                    for key in (
-                        "parent_hypothesis_id",
-                        "objective",
-                        "opportunity_type",
-                        "symbol",
-                        "thesis",
-                        "reasoning",
-                        "changes",
-                        "expected_outcome",
-                        "falsification_criteria",
-                    )
-                    if key in proposal
-                },
-            }
-            space = _space_for_proposal(proposal, cycle_spaces)
-            if space is None:
-                disposition.update(status="rejected", reason="no_matching_search_space")
-                processed[proposal_id] = disposition
-                rejected.append(
-                    {"reason": "openclaw_no_matching_space", "proposal_id": proposal_id}
-                )
-                continue
-            parent: dict[str, Any] | None = None
-            try:
-                if action != "new":
-                    if not isinstance(parent_hypothesis_id, str):
-                        raise ValueError(f"{action} requires parent_hypothesis_id")
-                    parent = memory.get_strategy(parent_hypothesis_id)
-                    parent_metadata = parent.get("metadata")
-                    if not isinstance(parent_metadata, Mapping):
-                        raise ValueError("parent has invalid metadata")
-                    if (
-                        parent_metadata.get("product") != space.product
-                        or parent_metadata.get("opportunity_type") != space.opportunity_type
-                        or parent_metadata.get("base_timeframe") != space.base_timeframe
-                        or parent_metadata.get("symbol", "BTCUSDT") != space.symbol
-                    ):
-                        raise ValueError("parent does not match the requested research space")
-                    if action != "retire" and (
-                        parent.get("retired_at") is not None
-                        or parent.get("holdout_exposed_at") is not None
-                    ):
-                        raise ValueError(
-                            "retired or protected-holdout-exposed parent cannot be adapted"
-                        )
-                if action == "retire":
-                    memory.retire_strategy(
-                        str(parent_hypothesis_id),
-                        reason=f"Alfred research retirement: {proposal.get('reasoning')}"[:512],
-                    )
-                    disposition.update(status="retired", strategy_hash=parent_hypothesis_id)
-                    processed[proposal_id] = disposition
-                    continue
-                if (
-                    len(accepted) >= budgets.max_candidates_per_cycle
-                    or by_space[space.name] >= budgets.max_candidates_per_space
-                ):
-                    # Leave it unprocessed so the next bounded cycle can consume it.
-                    continue
-                if action in {"retry", "request_test"}:
-                    if parent is None:
-                        raise ValueError(f"{action} requires an available parent")
-                    candidate = _candidate_payload_from_pending(parent, space)
-                    if candidate is None:
-                        raise ValueError("parent cannot be reconstructed for a trusted test")
-                    candidate["metadata"].update(
-                        proposal_id=proposal_id,
-                        proposal_digest=proposal.get("content_digest"),
-                        proposal_source="openclaw",
-                        research_action=action,
-                        requested_test=True,
-                        requested_test_reason=proposal.get("reasoning"),
-                    )
-                    rejection = None
-                    idea = None
-                else:
-                    if action not in {"new", "revise"}:
-                        raise ValueError(f"unsupported research action: {action}")
-                    idea = _compile_openclaw_proposal(
-                        proposal,
-                        space,
-                        parent=parent if action == "revise" else None,
-                        rng=rng,
-                        available_features=features_by_space[space.name],
-                        feedback_weights=weights,
-                        limits=limits,
-                    )
-                    parent_pool = parents_by_space[space.name]
-                    if parent is not None and all(
-                        item.get("behavior_hash") != parent.get("behavior_hash")
-                        for item in parent_pool
-                    ):
-                        parent_pool = [parent, *parent_pool]
-                    candidate, rejection = _try_register(
-                        memory,
-                        idea,
-                        space,
-                        parents=parent_pool,
-                        dedup_population=dedup_by_space[space.name],
-                        budgets=budgets,
-                        extra_metadata={
-                            "proposal_id": proposal_id,
-                            "proposal_digest": proposal.get("content_digest"),
-                            "proposal_source": "openclaw",
-                            "research_action": action,
-                            "research_reasoning": proposal.get("reasoning"),
-                            "expected_outcome": proposal.get("expected_outcome"),
-                            "falsification_criteria": proposal.get("falsification_criteria"),
-                            "requested_changes": proposal.get("changes") or [],
-                        },
-                    )
-            except ExperimentMemoryError:
-                raise
-            except (KeyError, TypeError, ValueError) as exc:
-                candidate = None
-                rejection = {
-                    "reason": "openclaw_compile_rejected",
-                    "detail": f"{type(exc).__name__}: {exc}"[:500],
-                }
-            if candidate is None:
-                disposition.update(status="rejected", **(rejection or {"reason": "unknown"}))
-                rejected.append({"proposal_id": proposal_id, **(rejection or {})})
-            else:
-                disposition.update(
-                    status="queued_for_test",
-                    strategy_hash=candidate["metadata"]["strategy_hash"],
-                )
-                accepted.append(candidate)
-                by_space[space.name] += 1
-                by_method[idea.generation_method if idea is not None else f"openclaw_{action}"] += 1
-            processed[proposal_id] = disposition
-
-        schedule = _method_schedule(
-            budgets.max_candidates_per_cycle,
-            budgets,
-            rng,
-            feedback=feedback,
-        )
-        space_cursor = 0
-        while (
-            len(accepted) < budgets.max_candidates_per_cycle
-            and attempts < budgets.max_generation_attempts
-            and time.monotonic() < deadline
+def _resume_pending_candidates(
+    memory: ExperimentMemory,
+    config: ResearchFactoryConfig,
+    setup: dict[str, Any],
+    memory_context: dict[str, Any],
+    accepted: list[dict[str, Any]],
+    by_space: Counter[str],
+    by_method: Counter[str],
+) -> None:
+    budgets = config.budgets
+    for space in setup["cycle_spaces"]:
+        revalidations_for_space = 0
+        for item in _pending_for_space(
+            memory,
+            space,
+            limit=budgets.max_candidates_per_space,
+            research_engine_digest=memory_context["research_engine_digest"],
         ):
-            attempts += 1
-            space = cycle_spaces[space_cursor % len(cycle_spaces)]
-            space_cursor += 1
-            if by_space[space.name] >= budgets.max_candidates_per_space:
-                continue
-            method = schedule[(attempts - 1) % len(schedule)]
-            parents = parents_by_space[space.name]
-            usable = [
-                parent
-                for parent in parents
-                if _parent_hypothesis(parent) is not None
-                and _lineage_depth(parent) < budgets.max_lineage_depth
-                and parent.get("latest_evaluation") is not None
-            ]
-            try:
-                if method == "recursive_mutation" and usable:
-                    parent = _choose_parent(usable, feedback=feedback, rng=rng)
-                    parent_hypothesis = _parent_hypothesis(parent)
-                    if parent_hypothesis is None:
-                        raise ValueError("selected mutation parent has no valid hypothesis")
-                    latest = parent.get("latest_evaluation")
-                    failure_reasons = (
-                        tuple(str(item) for item in latest.get("rejection_reasons") or [])
-                        if isinstance(latest, Mapping)
-                        else ()
-                    )
-                    idea = mutate_hypothesis(
-                        parent_hypothesis,
-                        space,
-                        parent_hash=str(parent["behavior_hash"]),
-                        rng=rng,
-                        available_features=features_by_space[space.name],
-                        feedback_weights=weights,
-                        limits=limits,
-                        failure_reasons=failure_reasons,
-                    )
-                elif method == "crossover" and len(usable) >= 2:
-                    parent_feedback = _parent_feedback_by_hash(feedback)
-                    compatible_pairs = [
-                        (first, second)
-                        for index, first in enumerate(usable)
-                        for second in usable[index + 1 :]
-                        if _parent_hypothesis(first).direction  # type: ignore[union-attr]
-                        == _parent_hypothesis(second).direction  # type: ignore[union-attr]
-                    ]
-                    if not compatible_pairs:
-                        raise ValueError("no compatible crossover parent pair")
-                    pair_weights = [
-                        _parent_weight(first, parent_feedback)
-                        * _parent_weight(second, parent_feedback)
-                        for first, second in compatible_pairs
-                    ]
-                    first, second = rng.choices(compatible_pairs, weights=pair_weights, k=1)[0]
-                    first_hypothesis = _parent_hypothesis(first)
-                    second_hypothesis = _parent_hypothesis(second)
-                    if first_hypothesis is None or second_hypothesis is None:
-                        raise ValueError("selected crossover parent has no valid hypothesis")
-                    idea = crossover_hypotheses(
-                        first_hypothesis,
-                        second_hypothesis,
-                        space,
-                        parent_hashes=(
-                            str(first["behavior_hash"]),
-                            str(second["behavior_hash"]),
-                        ),
-                        rng=rng,
-                        available_features=features_by_space[space.name],
-                        feedback_weights=weights,
-                        limits=limits,
-                    )
-                else:
-                    idea = build_fresh_hypothesis(
-                        space,
-                        rng=rng,
-                        available_features=features_by_space[space.name],
-                        feedback_weights=weights,
-                        limits=limits,
-                        motif=rng.choice(MOTIFS),
-                    )
-                candidate, rejection = _try_register(
-                    memory,
-                    idea,
-                    space,
-                    parents=parents,
-                    dedup_population=dedup_by_space[space.name],
-                    budgets=budgets,
-                )
-            except Exception as exc:
-                candidate = None
-                rejection = {
-                    "reason": "generation_error",
-                    "method": method,
-                    "space": space.name,
-                    "detail": f"{type(exc).__name__}: {exc}"[:500],
-                }
+            if len(accepted) >= budgets.max_candidates_per_cycle:
+                break
+            candidate = _candidate_payload_from_pending(item, space)
             if candidate is None:
-                if len(rejected) < 200:
-                    rejected.append({"space": space.name, "method": method, **(rejection or {})})
                 continue
+            if candidate["metadata"].get("revalidation_pending"):
+                revalidation_limit = min(1, max(0, budgets.max_candidates_per_space - 1))
+                if revalidations_for_space >= revalidation_limit:
+                    continue
+                revalidations_for_space += 1
             accepted.append(candidate)
             by_space[space.name] += 1
-            by_method[idea.generation_method] += 1
-            parents_by_space[space.name].insert(
-                0,
-                {
-                    "behavior_hash": candidate["metadata"]["strategy_hash"],
-                    "submitted_spec": strategy_behavior_spec(candidate["hypothesis"], space),
-                    "metadata": candidate["metadata"],
-                    "parent_hashes": candidate["metadata"].get("parent_hashes", []),
-                    "latest_evaluation": None,
-                },
-            )
+            by_method[
+                "revalidation_pending"
+                if candidate["metadata"].get("revalidation_pending")
+                else "resumed_pending"
+            ] += 1
 
-        final_feedback = memory.generator_feedback(research_engine_digest=research_engine_digest)
-        integrity = memory.integrity_check(deep=False)
 
-    _save_proposal_state(config.proposal_state_path, proposal_state)
-    proposals_purged += _purge_processed_proposals(
-        config.openclaw_accepted_dir,
-        set(proposal_state.get("processed") or {}),
+def _generation_idea(
+    method: str,
+    *,
+    space: SearchSpace,
+    parents: list[Mapping[str, Any]],
+    memory_context: dict[str, Any],
+    setup: dict[str, Any],
+) -> GeneratedIdea:
+    rng = setup["rng"]
+    features = memory_context["features_by_space"][space.name]
+    common = {
+        "available_features": features,
+        "feedback_weights": memory_context["weights"],
+        "limits": setup["limits"],
+    }
+    usable = [
+        parent
+        for parent in parents
+        if _parent_hypothesis(parent) is not None
+        and _lineage_depth(parent) < setup["budgets"].max_lineage_depth
+        and parent.get("latest_evaluation") is not None
+    ]
+    if method == "recursive_mutation" and usable:
+        parent = _choose_parent(usable, feedback=memory_context["feedback"], rng=rng)
+        hypothesis = _parent_hypothesis(parent)
+        if hypothesis is None:
+            raise ValueError("selected mutation parent has no valid hypothesis")
+        latest = parent.get("latest_evaluation")
+        failure_reasons = (
+            tuple(str(item) for item in latest.get("rejection_reasons") or [])
+            if isinstance(latest, Mapping)
+            else ()
+        )
+        return mutate_hypothesis(
+            hypothesis,
+            space,
+            parent_hash=str(parent["behavior_hash"]),
+            rng=rng,
+            **common,
+            failure_reasons=failure_reasons,
+        )
+    if method == "crossover" and len(usable) >= 2:
+        parent_feedback = _parent_feedback_by_hash(memory_context["feedback"])
+        pairs = [
+            (first, second)
+            for index, first in enumerate(usable)
+            for second in usable[index + 1 :]
+            if _parent_hypothesis(first).direction == _parent_hypothesis(second).direction
+        ]
+        if not pairs:
+            raise ValueError("no compatible crossover parent pair")
+        weights = [
+            _parent_weight(first, parent_feedback) * _parent_weight(second, parent_feedback)
+            for first, second in pairs
+        ]
+        first, second = rng.choices(pairs, weights=weights, k=1)[0]
+        first_hypothesis = _parent_hypothesis(first)
+        second_hypothesis = _parent_hypothesis(second)
+        if first_hypothesis is None or second_hypothesis is None:
+            raise ValueError("selected crossover parent has no valid hypothesis")
+        return crossover_hypotheses(
+            first_hypothesis,
+            second_hypothesis,
+            space,
+            parent_hashes=(str(first["behavior_hash"]), str(second["behavior_hash"])),
+            rng=rng,
+            **common,
+        )
+    return build_fresh_hypothesis(space, rng=rng, motif=rng.choice(MOTIFS), **common)
+
+
+def _generate_fresh_candidates(
+    memory: ExperimentMemory,
+    config: ResearchFactoryConfig,
+    setup: dict[str, Any],
+    memory_context: dict[str, Any],
+    accepted: list[dict[str, Any]],
+    rejected: list[dict[str, Any]],
+    by_space: Counter[str],
+    by_method: Counter[str],
+) -> int:
+    budgets = config.budgets
+    attempts = 0
+    schedule = _method_schedule(
+        budgets.max_candidates_per_cycle,
+        budgets,
+        setup["rng"],
+        feedback=memory_context["feedback"],
     )
-    hypotheses = [item["hypothesis"].to_dict() for item in accepted]
+    space_cursor = 0
+    while (
+        len(accepted) < budgets.max_candidates_per_cycle
+        and attempts < budgets.max_generation_attempts
+        and time.monotonic() < setup["deadline"]
+    ):
+        attempts += 1
+        space = setup["cycle_spaces"][space_cursor % len(setup["cycle_spaces"])]
+        space_cursor += 1
+        if by_space[space.name] >= budgets.max_candidates_per_space:
+            continue
+        method = schedule[(attempts - 1) % len(schedule)]
+        parents = memory_context["parents_by_space"][space.name]
+        try:
+            idea = _generation_idea(
+                method,
+                space=space,
+                parents=parents,
+                memory_context=memory_context,
+                setup={**setup, "budgets": budgets},
+            )
+            candidate, rejection = _try_register(
+                memory,
+                idea,
+                space,
+                parents=parents,
+                dedup_population=memory_context["dedup_by_space"][space.name],
+                budgets=budgets,
+            )
+        except Exception as exc:
+            candidate = None
+            rejection = {
+                "reason": "generation_error",
+                "method": method,
+                "space": space.name,
+                "detail": f"{type(exc).__name__}: {exc}"[:500],
+            }
+        if candidate is None:
+            if len(rejected) < 200:
+                rejected.append({"space": space.name, "method": method, **(rejection or {})})
+            continue
+        accepted.append(candidate)
+        by_space[space.name] += 1
+        by_method[idea.generation_method] += 1
+        memory_context["parents_by_space"][space.name].insert(
+            0,
+            {
+                "behavior_hash": candidate["metadata"]["strategy_hash"],
+                "submitted_spec": strategy_behavior_spec(candidate["hypothesis"], space),
+                "metadata": candidate["metadata"],
+                "parent_hashes": candidate["metadata"].get("parent_hashes", []),
+                "latest_evaluation": None,
+            },
+        )
+    return attempts
+
+
+def _proposal_disposition(proposal: Mapping[str, Any], *, generated_at: str) -> dict[str, Any]:
+    return {
+        "processed_at": generated_at,
+        "action": str(proposal.get("action") or "new"),
+        **{
+            key: _disposition_value(proposal.get(key))
+            for key in (
+                "parent_hypothesis_id",
+                "objective",
+                "opportunity_type",
+                "symbol",
+                "thesis",
+                "reasoning",
+                "changes",
+                "expected_outcome",
+                "falsification_criteria",
+            )
+            if key in proposal
+        },
+    }
+
+
+def _proposal_parent(
+    memory: ExperimentMemory,
+    proposal: Mapping[str, Any],
+    space: SearchSpace,
+) -> dict[str, Any] | None:
+    action = str(proposal.get("action") or "new")
+    if action == "new":
+        return None
+    parent_id = proposal.get("parent_hypothesis_id")
+    if not isinstance(parent_id, str):
+        raise ValueError(f"{action} requires parent_hypothesis_id")
+    parent = memory.get_strategy(parent_id)
+    metadata = parent.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("parent has invalid metadata")
+    if (
+        metadata.get("product") != space.product
+        or metadata.get("opportunity_type") != space.opportunity_type
+        or metadata.get("base_timeframe") != space.base_timeframe
+        or metadata.get("symbol", "BTCUSDT") != space.symbol
+    ):
+        raise ValueError("parent does not match the requested research space")
+    if action != "retire" and (
+        parent.get("retired_at") is not None or parent.get("holdout_exposed_at") is not None
+    ):
+        raise ValueError("retired or protected-holdout-exposed parent cannot be adapted")
+    return parent
+
+
+def _proposal_candidate(
+    memory: ExperimentMemory,
+    proposal: Mapping[str, Any],
+    space: SearchSpace,
+    *,
+    parent: dict[str, Any] | None,
+    setup: dict[str, Any],
+    memory_context: dict[str, Any],
+    accepted: list[dict[str, Any]],
+    by_space: Counter[str],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, GeneratedIdea | None]:
+    action = str(proposal.get("action") or "new")
+    budgets = setup["budgets"]
+    if (
+        len(accepted) >= budgets.max_candidates_per_cycle
+        or by_space[space.name] >= budgets.max_candidates_per_space
+    ):
+        return None, None, None
+    if action in {"retry", "request_test"}:
+        if parent is None:
+            raise ValueError(f"{action} requires an available parent")
+        candidate = _candidate_payload_from_pending(parent, space)
+        if candidate is None:
+            raise ValueError("parent cannot be reconstructed for a trusted test")
+        candidate["metadata"].update(
+            proposal_id=str(proposal["proposal_id"]),
+            proposal_digest=proposal.get("content_digest"),
+            proposal_source="openclaw",
+            research_action=action,
+            requested_test=True,
+            requested_test_reason=proposal.get("reasoning"),
+        )
+        return candidate, None, None
+    if action not in {"new", "revise"}:
+        raise ValueError(f"unsupported research action: {action}")
+    idea = _compile_openclaw_proposal(
+        proposal,
+        space,
+        parent=parent if action == "revise" else None,
+        rng=setup["rng"],
+        available_features=memory_context["features_by_space"][space.name],
+        feedback_weights=memory_context["weights"],
+        limits=setup["limits"],
+    )
+    parent_pool = memory_context["parents_by_space"][space.name]
+    if parent is not None and all(
+        item.get("behavior_hash") != parent.get("behavior_hash") for item in parent_pool
+    ):
+        parent_pool = [parent, *parent_pool]
+    candidate, rejection = _try_register(
+        memory,
+        idea,
+        space,
+        parents=parent_pool,
+        dedup_population=memory_context["dedup_by_space"][space.name],
+        budgets=budgets,
+        extra_metadata={
+            "proposal_id": proposal["proposal_id"],
+            "proposal_digest": proposal.get("content_digest"),
+            "proposal_source": "openclaw",
+            "research_action": action,
+            "research_reasoning": proposal.get("reasoning"),
+            "expected_outcome": proposal.get("expected_outcome"),
+            "falsification_criteria": proposal.get("falsification_criteria"),
+            "requested_changes": proposal.get("changes") or [],
+        },
+    )
+    return candidate, rejection, idea
+
+
+def _process_openclaw_proposal(
+    memory: ExperimentMemory,
+    proposal: Mapping[str, Any],
+    *,
+    setup: dict[str, Any],
+    memory_context: dict[str, Any],
+    accepted: list[dict[str, Any]],
+    rejected: list[dict[str, Any]],
+    by_space: Counter[str],
+    by_method: Counter[str],
+) -> None:
+    proposal_id = str(proposal["proposal_id"])
+    disposition = _proposal_disposition(proposal, generated_at=setup["generated_at"])
+    space = _space_for_proposal(proposal, setup["cycle_spaces"])
+    if space is None:
+        disposition.update(status="rejected", reason="no_matching_search_space")
+        setup["processed"][proposal_id] = disposition
+        rejected.append({"reason": "openclaw_no_matching_space", "proposal_id": proposal_id})
+        return
+    try:
+        parent = _proposal_parent(memory, proposal, space)
+        action = str(proposal.get("action") or "new")
+        if action == "retire":
+            memory.retire_strategy(
+                str(proposal["parent_hypothesis_id"]),
+                reason=f"Alfred research retirement: {proposal.get('reasoning')}"[:512],
+            )
+            disposition.update(status="retired", strategy_hash=proposal["parent_hypothesis_id"])
+            setup["processed"][proposal_id] = disposition
+            return
+        candidate, rejection, idea = _proposal_candidate(
+            memory,
+            proposal,
+            space,
+            parent=parent,
+            setup=setup,
+            memory_context=memory_context,
+            accepted=accepted,
+            by_space=by_space,
+        )
+    except ExperimentMemoryError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        candidate = None
+        idea = None
+        rejection = {
+            "reason": "openclaw_compile_rejected",
+            "detail": f"{type(exc).__name__}: {exc}"[:500],
+        }
+    if candidate is None and rejection is None:
+        return
+    if candidate is None:
+        disposition.update(status="rejected", **(rejection or {"reason": "unknown"}))
+        rejected.append({"proposal_id": proposal_id, **(rejection or {})})
+    else:
+        disposition.update(
+            status="queued_for_test",
+            strategy_hash=candidate["metadata"]["strategy_hash"],
+        )
+        accepted.append(candidate)
+        by_space[space.name] += 1
+        by_method[
+            idea.generation_method
+            if idea is not None
+            else f"openclaw_{proposal.get('action', 'new')}"
+        ] += 1
+    setup["processed"][proposal_id] = disposition
+
+
+def _process_openclaw_proposals(
+    memory: ExperimentMemory,
+    config: ResearchFactoryConfig,
+    setup: dict[str, Any],
+    memory_context: dict[str, Any],
+    accepted: list[dict[str, Any]],
+    rejected: list[dict[str, Any]],
+    by_space: Counter[str],
+    by_method: Counter[str],
+) -> list[dict[str, Any]]:
+    proposals = _load_accepted_proposals(config.openclaw_accepted_dir, set(setup["processed"]))
+    for proposal in proposals:
+        _process_openclaw_proposal(
+            memory,
+            proposal,
+            setup=setup,
+            memory_context=memory_context,
+            accepted=accepted,
+            rejected=rejected,
+            by_space=by_space,
+            by_method=by_method,
+        )
+    return proposals
+
+
+def _generation_counter_summary(
+    metadata: list[dict[str, Any]],
+    *,
+    by_space: Counter[str],
+    by_method: Counter[str],
+    proposals: list[Mapping[str, Any]],
+    proposals_purged: int,
+    feedback: dict[str, Any],
+    rejected_attempts: int,
+) -> dict[str, Any]:
+    return {
+        "hypotheses": len(metadata),
+        "new_hypotheses": sum(
+            1
+            for item in metadata
+            if not item.get("resumed_pending") and not item.get("revalidation_pending")
+        ),
+        "resumed_pending": sum(1 for item in metadata if item.get("resumed_pending")),
+        "revalidation_pending": sum(1 for item in metadata if item.get("revalidation_pending")),
+        "rejected_attempts": rejected_attempts,
+        "by_space": dict(sorted(by_space.items())),
+        "by_product": dict(Counter(str(item.get("product")) for item in metadata).most_common()),
+        "by_method": dict(sorted(by_method.items())),
+        "openclaw_proposals_seen": len(proposals),
+        "openclaw_accepted_files_purged": proposals_purged,
+        "cumulative_trials": int((feedback.get("totals") or {}).get("evaluations") or 0),
+        "unique_behavioral_specs": int((feedback.get("totals") or {}).get("strategies") or 0),
+    }
+
+
+def _build_generation_report(
+    config: ResearchFactoryConfig,
+    *,
+    setup: dict[str, Any],
+    memory_context: dict[str, Any],
+    accepted: list[dict[str, Any]],
+    rejected: list[dict[str, Any]],
+    by_space: Counter[str],
+    by_method: Counter[str],
+    proposals: list[dict[str, Any]],
+    integrity: dict[str, Any],
+    final_feedback: dict[str, Any],
+    attempts: int,
+) -> dict[str, Any]:
+    budgets = config.budgets
     metadata = [
         {
             **item["metadata"],
-            "universe_snapshot_id": universe_context["snapshot_id"],
-            "universe_generated_at": universe_context["generated_at"],
-            "universe_selection_mode": universe_context["selection_mode"],
+            "universe_snapshot_id": setup["universe_context"]["snapshot_id"],
+            "universe_generated_at": setup["universe_context"]["generated_at"],
+            "universe_selection_mode": setup["universe_context"]["selection_mode"],
         }
         for item in accepted
     ]
-    elapsed = max(0.0, budgets.max_generation_seconds - max(0.0, deadline - time.monotonic()))
-    timed_out = time.monotonic() >= deadline
+    hypotheses = [item["hypothesis"].to_dict() for item in accepted]
+    elapsed = max(
+        0.0,
+        budgets.max_generation_seconds - max(0.0, setup["deadline"] - time.monotonic()),
+    )
+    timed_out = time.monotonic() >= setup["deadline"]
+    summary = _generation_counter_summary(
+        metadata,
+        by_space=by_space,
+        by_method=by_method,
+        proposals=proposals,
+        proposals_purged=setup["proposals_purged"],
+        feedback=final_feedback,
+        rejected_attempts=len(rejected),
+    )
+    summary["openclaw_available"] = config.openclaw_accepted_dir.exists()
     return {
         "ok": True,
         "schema": BATCH_SCHEMA,
-        "generated_at": generated_at,
-        "seed": cycle_seed,
+        "generated_at": setup["generated_at"],
+        "seed": setup["cycle_seed"],
         **SAFETY,
         "source": {
             "config": str(config.path),
             "memory": str(config.memory_path),
-            "research_engine_digest": research_engine_digest,
+            "research_engine_digest": memory_context["research_engine_digest"],
             "openclaw_optional": True,
-            "eligible_search_spaces": [space.name for space in cycle_spaces],
-            "market_universe": universe_context,
+            "eligible_search_spaces": [space.name for space in setup["cycle_spaces"]],
+            "market_universe": setup["universe_context"],
         },
         "budget": {
             "candidate_limit": budgets.max_candidates_per_cycle,
@@ -1750,40 +1973,97 @@ def build_generation(
             "elapsed_seconds": round(elapsed, 6),
             "wall_time_exhausted": timed_out,
         },
-        "summary": {
-            "hypotheses": len(hypotheses),
-            "new_hypotheses": sum(
-                1
-                for item in metadata
-                if not item.get("resumed_pending") and not item.get("revalidation_pending")
-            ),
-            "resumed_pending": sum(1 for item in metadata if item.get("resumed_pending")),
-            "revalidation_pending": sum(1 for item in metadata if item.get("revalidation_pending")),
-            "rejected_attempts": len(rejected),
-            "by_space": dict(sorted(by_space.items())),
-            "by_product": dict(
-                Counter(str(item.get("product")) for item in metadata).most_common()
-            ),
-            "by_method": dict(sorted(by_method.items())),
-            "openclaw_proposals_seen": len(proposals),
-            "openclaw_accepted_files_purged": proposals_purged,
-            "openclaw_available": config.openclaw_accepted_dir.exists(),
-            "cumulative_trials": int((final_feedback.get("totals") or {}).get("evaluations") or 0),
-            "unique_behavioral_specs": int(
-                (final_feedback.get("totals") or {}).get("strategies") or 0
-            ),
-        },
+        "summary": summary,
         "memory": {
             "integrity": integrity,
-            "maintenance": memory_maintenance,
-            # generator_feedback has a hard contract excluding protected
-            # holdout evaluations; this summary is safe for selection/reporting.
+            "maintenance": memory_context["maintenance"],
             "feedback": final_feedback,
         },
         "generation_metadata": metadata,
         "rejected": rejected,
         "hypotheses": hypotheses,
     }
+
+
+def build_generation(
+    config: ResearchFactoryConfig,
+    *,
+    seed: int | None = None,
+    now: str | None = None,
+    market_universe_report: Path = DEFAULT_MARKET_UNIVERSE_REPORT,
+) -> dict[str, Any]:
+    generated_at = now or _utc_now()
+    setup = _generation_setup(
+        config,
+        seed=seed,
+        generated_at=generated_at,
+        market_universe_report=market_universe_report,
+    )
+    rejected: list[dict[str, Any]] = []
+    accepted: list[dict[str, Any]] = []
+    by_space: Counter[str] = Counter()
+    by_method: Counter[str] = Counter()
+
+    with ExperimentMemory(config.memory_path) as memory:
+        memory_context = _generation_memory_context(
+            config, memory, setup["cycle_spaces"], setup["limits"]
+        )
+
+        _resume_pending_candidates(
+            memory,
+            config,
+            setup,
+            memory_context,
+            accepted,
+            by_space,
+            by_method,
+        )
+
+        proposals = _process_openclaw_proposals(
+            memory,
+            config,
+            setup,
+            memory_context,
+            accepted,
+            rejected,
+            by_space,
+            by_method,
+        )
+
+        attempts = _generate_fresh_candidates(
+            memory,
+            config,
+            setup,
+            memory_context,
+            accepted,
+            rejected,
+            by_space,
+            by_method,
+        )
+
+        final_feedback = memory.generator_feedback(
+            research_engine_digest=memory_context["research_engine_digest"]
+        )
+        integrity = memory.integrity_check(deep=False)
+
+    _save_proposal_state(config.proposal_state_path, setup["proposal_state"])
+    setup["proposals_purged"] += _purge_processed_proposals(
+        config.openclaw_accepted_dir,
+        set(setup["proposal_state"].get("processed") or {}),
+    )
+    return _build_generation_report(
+        config,
+        setup=setup,
+        memory_context=memory_context,
+        accepted=accepted,
+        rejected=rejected,
+        by_space=by_space,
+        by_method=by_method,
+        proposals=proposals,
+        integrity=integrity,
+        final_feedback=final_feedback,
+        attempts=attempts,
+    )
 
 
 def run_factory(
