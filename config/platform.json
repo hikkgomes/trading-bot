@@ -110,6 +110,8 @@
     "postgresql_schedule": "hourly",
     "parquet_schedule": "daily",
     "retention_days": 30,
-    "restore_test_schedule": "weekly"
+    "restore_test_schedule": "weekly",
+    "maximum_age_seconds": 172800,
+    "minimum_free_bytes": 536870912
   }
 }

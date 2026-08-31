@@ -864,6 +864,9 @@ def _report_cycle(
     risk_configuration: Mapping[str, Any] | None = None,
     alerts: SqlAlertService | None = None,
     alerting_configuration: Mapping[str, Any] | None = None,
+    backup_root: Path | None = None,
+    backup_max_age_seconds: int = 172_800,
+    minimum_free_bytes: int = 536_870_912,
 ) -> Callable[[], dict[str, Any]]:
     queue = DatabaseJobQueue(database.engine)
     worker_id = f"{node_id}:report-worker"
@@ -889,6 +892,9 @@ def _report_cycle(
         minimum_valid_screenings_before_progress=int(
             (alerting_configuration or {}).get("minimum_valid_screenings_before_progress", 10)
         ),
+        backup_root=backup_root,
+        backup_max_age_seconds=backup_max_age_seconds,
+        minimum_free_bytes=minimum_free_bytes,
     )
     return lambda: worker.run_once(now=utc_now())
 
@@ -1168,6 +1174,9 @@ def run(args: argparse.Namespace) -> int:
             risk_configuration=split_configuration["risk"],
             alerts=alerts,
             alerting_configuration=config.alerting,
+            backup_root=Path(config.paths["backups"]),
+            backup_max_age_seconds=int(config.backup.get("maximum_age_seconds", 172_800)),
+            minimum_free_bytes=int(config.backup.get("minimum_free_bytes", 536_870_912)),
         )
     elif args.service in {"research-worker", "ml-worker", "event-replay-worker"}:
         work = _research_cycle(

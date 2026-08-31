@@ -187,6 +187,9 @@ def _build_research_work(
             node_id=node_id,
             risk_configuration=configuration["risk"],
             alerting_configuration=config.alerting,
+            backup_root=Path(config.paths["backups"]),
+            backup_max_age_seconds=int(config.backup.get("maximum_age_seconds", 172_800)),
+            minimum_free_bytes=int(config.backup.get("minimum_free_bytes", 536_870_912)),
         ),
     }
     return work

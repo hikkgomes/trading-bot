@@ -78,12 +78,18 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
     assert "s|/opt/trading-bot|$REPO|g" in installer
     assert "s|ProtectHome=true|ProtectHome=$PROTECT_HOME|g" in installer
     assert (
-        'install_platform_unit "$REPO/deploy/systemd/trading-platform-runtime.service"'
+        'install_platform_unit "$REPO/deploy/systemd/trading-platform-runtime.service"' in installer
+    )
+    assert (
+        'install_platform_unit "$REPO/deploy/systemd/trading-platform-research.service"'
         in installer
     )
-    assert 'install_platform_unit "$REPO/deploy/systemd/trading-platform-research.service"' in installer
-    assert 'install_platform_unit "$REPO/deploy/systemd/trading-platform-agent.service"' in installer
-    assert 'install_platform_unit "$REPO/deploy/systemd/trading-platform-control.service"' in installer
+    assert (
+        'install_platform_unit "$REPO/deploy/systemd/trading-platform-agent.service"' in installer
+    )
+    assert (
+        'install_platform_unit "$REPO/deploy/systemd/trading-platform-control.service"' in installer
+    )
     assert "systemctl enable trading-platform-runtime.service" in installer
     assert "systemctl enable trading-platform-research.service" in installer
     assert "systemctl disable --now" in installer

@@ -237,6 +237,18 @@ class PlatformConfig:
             raise ValueError(
                 "platform.alerting.minimum_valid_screenings_before_progress must be positive"
             )
+        backup = _mapping(data.get("backup"), field="platform.backup")
+        for field_name in ("maximum_age_seconds", "retention_days"):
+            value = backup.get(field_name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"platform.backup.{field_name} must be a positive integer")
+        minimum_free_bytes = backup.get("minimum_free_bytes", 0)
+        if (
+            not isinstance(minimum_free_bytes, int)
+            or isinstance(minimum_free_bytes, bool)
+            or minimum_free_bytes < 0
+        ):
+            raise ValueError("platform.backup.minimum_free_bytes must be a non-negative integer")
         return cls(
             schema=_string(data.get("schema"), field="platform.schema"),
             nodes=nodes,
@@ -249,7 +261,7 @@ class PlatformConfig:
             logging=_mapping(data.get("logging"), field="platform.logging"),
             metrics=_mapping(data.get("metrics"), field="platform.metrics"),
             alerting=alerting,
-            backup=_mapping(data.get("backup"), field="platform.backup"),
+            backup=backup,
             resource_limits=_mapping(
                 data.get("resource_limits", {}), field="platform.resource_limits"
             ),

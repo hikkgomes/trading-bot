@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
+import shutil
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +32,9 @@ class DatabaseReportWorker:
         market_data_stale_after_seconds: int = 5,
         alerts: SqlAlertService | None = None,
         minimum_valid_screenings_before_progress: int = 10,
+        backup_root: Path | None = None,
+        backup_max_age_seconds: int = 172_800,
+        minimum_free_bytes: int = 536_870_912,
     ) -> None:
         self.report = DatabasePlatformReport(
             engine,
@@ -43,6 +49,11 @@ class DatabaseReportWorker:
         if minimum_valid_screenings_before_progress <= 0:
             raise ValueError("minimum valid screenings threshold must be positive")
         self.minimum_valid_screenings_before_progress = minimum_valid_screenings_before_progress
+        self.backup_root = backup_root.resolve() if backup_root is not None else None
+        if backup_max_age_seconds <= 0 or minimum_free_bytes < 0:
+            raise ValueError("backup and disk thresholds are invalid")
+        self.backup_max_age_seconds = backup_max_age_seconds
+        self.minimum_free_bytes = minimum_free_bytes
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         now = timestamp(now, field="now")
@@ -59,6 +70,10 @@ class DatabaseReportWorker:
             if claimed is None:
                 return {"reason_code": "report_queue_empty"}
         report = {**self.report.build(now=now), "generated_at": now}
+        operations = report.setdefault("operations", {})
+        operations["disk"] = self._disk_status()
+        if self.backup_root is not None:
+            operations["backups"] = self._backup_status(now)
         report_hash = canonical_hash(report)
         date = now[:10]
         destination = self.root / date / f"{report_hash.removeprefix('sha256:')}.json"
@@ -88,6 +103,47 @@ class DatabaseReportWorker:
             self.queue.complete(claimed, completed_at=now)
             result["job_id"] = claimed.job_id
         return result
+
+    def _disk_status(self) -> dict[str, Any]:
+        path = self.root if self.root.exists() else self.root.parent
+        try:
+            usage = shutil.disk_usage(path)
+        except OSError as exc:
+            return {
+                "healthy": False,
+                "path": str(path),
+                "reason": f"disk_usage_failed:{type(exc).__name__}",
+            }
+        return {
+            "healthy": usage.free >= self.minimum_free_bytes,
+            "path": str(path),
+            "free_bytes": usage.free,
+            "total_bytes": usage.total,
+            "minimum_free_bytes": self.minimum_free_bytes,
+        }
+
+    def _backup_status(self, now: str) -> dict[str, Any]:
+        assert self.backup_root is not None
+        latest: dict[str, float] = {}
+        if self.backup_root.is_dir():
+            for path in self.backup_root.iterdir():
+                if path.is_symlink() or not path.is_dir() or not (path / "manifest.json").is_file():
+                    continue
+                kind = path.name.split("-", 1)[0]
+                if kind in {"postgresql", "parquet"}:
+                    latest[kind] = max(latest.get(kind, 0.0), path.stat().st_mtime)
+        current = dt.datetime.fromisoformat(now).timestamp()
+        ages = {kind: max(0.0, current - observed) for kind, observed in sorted(latest.items())}
+        missing = sorted({"postgresql", "parquet"} - set(ages))
+        stale = sorted(kind for kind, age in ages.items() if age > self.backup_max_age_seconds)
+        return {
+            "healthy": not missing and not stale,
+            "root": str(self.backup_root),
+            "ages_seconds": ages,
+            "missing": missing,
+            "stale": stale,
+            "maximum_age_seconds": self.backup_max_age_seconds,
+        }
 
     def _emit_sli_alerts(self, report: dict[str, Any], *, now: str) -> list[str]:
         if self.alerts is None:
@@ -231,6 +287,49 @@ class DatabaseReportWorker:
                     message="old and new execution authorities are active together",
                     now=now,
                     payload={"execution_authority_conflicts": conflicts},
+                )
+            )
+        disk = operations.get("disk", {})
+        if isinstance(disk, Mapping) and disk.get("healthy") is False:
+            emitted.append(
+                self._emit(
+                    event_type="disk_capacity_low",
+                    severity=AlertSeverity.CRITICAL,
+                    dedupe_key="platform:disk-capacity-low",
+                    target="control-monitoring",
+                    message="platform disk capacity is below the configured minimum",
+                    now=now,
+                    payload={"disk": disk},
+                )
+            )
+        backups = operations.get("backups", {})
+        if isinstance(backups, Mapping) and backups.get("healthy") is False:
+            emitted.append(
+                self._emit(
+                    event_type="backup_failure_or_stale",
+                    severity=AlertSeverity.CRITICAL,
+                    dedupe_key="platform:backup-failure-or-stale",
+                    target="control-monitoring",
+                    message="a required platform backup is missing or stale",
+                    now=now,
+                    payload={"backups": backups},
+                )
+            )
+        delivery_failures = [
+            item
+            for item in operations.get("alerts", [])
+            if isinstance(item, Mapping) and item.get("event_type") == "delivery_failed"
+        ]
+        if delivery_failures:
+            emitted.append(
+                self._emit(
+                    event_type="alert_delivery_failed",
+                    severity=AlertSeverity.CRITICAL,
+                    dedupe_key="platform:alert-delivery-failed",
+                    target="control-monitoring",
+                    message="external alert delivery failures are recorded",
+                    now=now,
+                    payload={"count": len(delivery_failures)},
                 )
             )
         return emitted
