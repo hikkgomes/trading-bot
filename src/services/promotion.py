@@ -132,6 +132,10 @@ class PromotionPolicy:
     maximum_forward_slippage: float = 1.0
     minimum_forward_data_uptime: float = 0.0
     maximum_forward_rejected_orders: int = 0
+    minimum_forward_trading_days: int = 0
+    minimum_forward_cycles: int = 0
+    minimum_forward_effective_episodes: int = 0
+    maximum_forward_tail_loss: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -177,6 +181,10 @@ class PromotionEvidence:
     forward_slippage: float = 0.0
     forward_data_uptime: float = 0.0
     forward_rejected_orders: int = 0
+    forward_trading_days: int = 0
+    forward_cycles: int = 0
+    forward_effective_episodes: int = 0
+    forward_tail_loss: float = 0.0
     supported_instruments: tuple[str, ...] = ()
 
 
@@ -220,6 +228,10 @@ class SqlPromotionPolicyStore:
                 "maximum_forward_slippage": policy.maximum_forward_slippage,
                 "minimum_forward_data_uptime": policy.minimum_forward_data_uptime,
                 "maximum_forward_rejected_orders": policy.maximum_forward_rejected_orders,
+                "minimum_forward_trading_days": policy.minimum_forward_trading_days,
+                "minimum_forward_cycles": policy.minimum_forward_cycles,
+                "minimum_forward_effective_episodes": policy.minimum_forward_effective_episodes,
+                "maximum_forward_tail_loss": policy.maximum_forward_tail_loss,
             },
             field="promotion policy",
         )
@@ -586,6 +598,12 @@ class SqlCanonicalPromotionEvidence:
             forward_slippage=float(summary_payload.get("slippage", 0.0)),
             forward_data_uptime=float(summary_payload.get("data_uptime", 0.0)),
             forward_rejected_orders=int(summary_payload.get("rejected_orders", 0)),
+            forward_trading_days=int(summary_payload.get("trading_days", 0)),
+            forward_cycles=int(summary_payload.get("cycles", 0)),
+            forward_effective_episodes=int(
+                summary_payload.get("effective_independent_episodes", 0)
+            ),
+            forward_tail_loss=float(summary_payload.get("tail_loss", 0.0)),
             supported_instruments=tuple(
                 sorted(
                     str(value)
@@ -903,14 +921,11 @@ def _forward_evidence_failures(
         or evidence.forward_objective_excess is None
         or evidence.forward_objective_excess_fraction is None
     )
-    objective_failure = (
-        objective_missing
-        or (
-            requires_objective
-            and evidence.forward_objective_excess_fraction is not None
-            and evidence.forward_objective_excess_fraction
-            <= policy.minimum_forward_objective_excess_fraction
-        )
+    objective_failure = objective_missing or (
+        requires_objective
+        and evidence.forward_objective_excess_fraction is not None
+        and evidence.forward_objective_excess_fraction
+        <= policy.minimum_forward_objective_excess_fraction
     )
     checks = (
         (evidence.forward_summary_id is None, "forward_summary_missing"),
@@ -921,6 +936,18 @@ def _forward_evidence_failures(
         (
             evidence.forward_independent_decisions < policy.minimum_forward_independent_decisions,
             "forward_decisions_insufficient",
+        ),
+        (
+            evidence.forward_trading_days < policy.minimum_forward_trading_days,
+            "forward_trading_days_insufficient",
+        ),
+        (
+            evidence.forward_cycles < policy.minimum_forward_cycles,
+            "forward_cycles_insufficient",
+        ),
+        (
+            evidence.forward_effective_episodes < policy.minimum_forward_effective_episodes,
+            "forward_independent_episodes_insufficient",
         ),
         (
             objective_failure
@@ -935,6 +962,7 @@ def _forward_evidence_failures(
             ),
         ),
         (evidence.forward_data_gaps > policy.maximum_forward_data_gaps, "forward_data_gaps"),
+        (evidence.forward_tail_loss > policy.maximum_forward_tail_loss, "forward_tail_loss_limit"),
         (not evidence.forward_evidence_accepted, "forward_evidence_not_accepted"),
         (
             evidence.forward_effective_trades < policy.minimum_forward_effective_trades,

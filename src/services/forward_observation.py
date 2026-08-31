@@ -317,6 +317,10 @@ class DatabaseForwardSummaryWorker:
                 maximum_slippage=float(policy.get("maximum_forward_slippage", 1.0)),
                 minimum_data_uptime=float(policy.get("minimum_forward_data_uptime", 0.0)),
                 maximum_rejected_orders=int(policy.get("maximum_forward_rejected_orders", 0)),
+                minimum_trading_days=int(policy.get("minimum_forward_trading_days", 0)),
+                minimum_cycles=int(policy.get("minimum_forward_cycles", 0)),
+                minimum_effective_episodes=int(policy.get("minimum_forward_effective_episodes", 0)),
+                maximum_tail_loss=float(policy.get("maximum_forward_tail_loss", 1.0)),
             )
         except Exception as exc:
             self.queue.fail(

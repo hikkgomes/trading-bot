@@ -512,6 +512,10 @@ class ForwardPaperSummary:
     benchmark_value: float | None = None
     objective_excess: float | None = None
     objective_excess_fraction: float | None = None
+    trading_days: int = 0
+    cycles: int = 0
+    effective_independent_episodes: int = 0
+    tail_loss: float = 0.0
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -544,6 +548,10 @@ class ForwardPaperSummary:
             "benchmark_value": self.benchmark_value,
             "objective_excess": self.objective_excess,
             "objective_excess_fraction": self.objective_excess_fraction,
+            "trading_days": self.trading_days,
+            "cycles": self.cycles,
+            "effective_independent_episodes": self.effective_independent_episodes,
+            "tail_loss": self.tail_loss,
         }
 
 
@@ -711,6 +719,7 @@ class SqlForwardEvidenceRepository:
             "risk_budget_available",
             "strategy_decay",
             "slippage",
+            "tail_loss",
         ):
             payload[field_name] = _finite_nonnegative(
                 payload.get(field_name, 0.0), field=f"summary {field_name}"
@@ -721,6 +730,10 @@ class SqlForwardEvidenceRepository:
                 raise CanonicalEvidenceError(f"summary {field_name} must be at most one")
             payload[field_name] = value
         for field_name in ("effective_trades", "rejected_orders"):
+            payload[field_name] = int(
+                _finite_nonnegative(payload.get(field_name, 0), field=f"summary {field_name}")
+            )
+        for field_name in ("trading_days", "cycles", "effective_independent_episodes"):
             payload[field_name] = int(
                 _finite_nonnegative(payload.get(field_name, 0), field=f"summary {field_name}")
             )
@@ -887,21 +900,13 @@ class SqlForwardEvidenceRepository:
             value(payload, "benchmark_pnl", "benchmark_return") for payload in payloads
         ]
         objective_units = tuple(
-            str(
-                payload["observation"]["facts"]["metrics"].get("objective_unit")
-            )
+            str(payload["observation"]["facts"]["metrics"].get("objective_unit"))
             for payload in payloads
             if payload["observation"]["facts"]["metrics"].get("objective_unit") is not None
         )
-        objective_values = [
-            optional_value(payload, "objective_value") for payload in payloads
-        ]
-        benchmark_values = [
-            optional_value(payload, "benchmark_value") for payload in payloads
-        ]
-        objective_excesses = [
-            optional_value(payload, "objective_excess") for payload in payloads
-        ]
+        objective_values = [optional_value(payload, "objective_value") for payload in payloads]
+        benchmark_values = [optional_value(payload, "benchmark_value") for payload in payloads]
+        objective_excesses = [optional_value(payload, "objective_excess") for payload in payloads]
         objective_excess_fractions = [
             optional_value(payload, "objective_excess_fraction") for payload in payloads
         ]
@@ -955,6 +960,12 @@ class SqlForwardEvidenceRepository:
                 else 0.0
             ),
             rejected_orders=int(sum(value(payload, "rejected_orders") for payload in payloads)),
+            trading_days=int(sum(value(payload, "trading_days") for payload in payloads)),
+            cycles=int(sum(value(payload, "cycles") for payload in payloads)),
+            effective_independent_episodes=int(
+                sum(value(payload, "effective_independent_episodes") for payload in payloads)
+            ),
+            tail_loss=max(value(payload, "tail_loss") for payload in payloads),
             objective_unit=objective_units[-1] if objective_units and complete_objective else None,
             objective_value=objective_values[-1] if complete_objective else None,
             benchmark_value=benchmark_values[-1] if complete_objective else None,
@@ -1108,6 +1119,10 @@ class SqlForwardEvidenceRepository:
         maximum_slippage: float = 1.0,
         minimum_data_uptime: float = 0.0,
         maximum_rejected_orders: int = 0,
+        minimum_trading_days: int = 0,
+        minimum_cycles: int = 0,
+        minimum_effective_episodes: int = 0,
+        maximum_tail_loss: float = 1.0,
     ) -> tuple[str, bool, str | None]:
         if isinstance(minimum_days, bool) or minimum_days < 0:
             raise CanonicalEvidenceError("minimum forward days must be non-negative")
@@ -1137,6 +1152,16 @@ class SqlForwardEvidenceRepository:
             raise CanonicalEvidenceError("minimum forward data uptime must be at most one")
         if isinstance(maximum_rejected_orders, bool) or maximum_rejected_orders < 0:
             raise CanonicalEvidenceError("maximum rejected forward orders must be non-negative")
+        for value, field_name in (
+            (minimum_trading_days, "minimum forward trading days"),
+            (minimum_cycles, "minimum forward cycles"),
+            (minimum_effective_episodes, "minimum forward independent episodes"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise CanonicalEvidenceError(f"{field_name} must be a non-negative integer")
+        maximum_tail_loss = _finite_nonnegative(
+            maximum_tail_loss, field="maximum forward tail loss"
+        )
         with self.engine.connect() as connection:
             payload = connection.execute(
                 select(forward_paper_summary.c.payload).where(
@@ -1153,12 +1178,15 @@ class SqlForwardEvidenceRepository:
             objective_failed = (
                 expected_unit is None
                 or payload.get("objective_unit") != expected_unit
-                or not all(payload.get(field) is not None for field in (
-                    "objective_value",
-                    "benchmark_value",
-                    "objective_excess",
-                    "objective_excess_fraction",
-                ))
+                or not all(
+                    payload.get(field) is not None
+                    for field in (
+                        "objective_value",
+                        "benchmark_value",
+                        "objective_excess",
+                        "objective_excess_fraction",
+                    )
+                )
                 or float(payload.get("objective_excess_fraction", 0.0))
                 <= float(minimum_objective_excess_fraction)
             )
@@ -1172,6 +1200,18 @@ class SqlForwardEvidenceRepository:
                 "forward_decisions_insufficient",
             ),
             (
+                int(payload.get("trading_days", 0)) < minimum_trading_days,
+                "forward_trading_days_insufficient",
+            ),
+            (
+                int(payload.get("cycles", 0)) < minimum_cycles,
+                "forward_cycles_insufficient",
+            ),
+            (
+                int(payload.get("effective_independent_episodes", 0)) < minimum_effective_episodes,
+                "forward_independent_episodes_insufficient",
+            ),
+            (
                 objective_failed
                 if objective_required
                 else float(payload.get("net_pnl", 0.0)) <= minimum_net_pnl,
@@ -1182,6 +1222,10 @@ class SqlForwardEvidenceRepository:
                 ),
             ),
             (float(payload.get("drawdown", 0.0)) > maximum_drawdown, "forward_drawdown_limit"),
+            (
+                float(payload.get("tail_loss", 0.0)) > maximum_tail_loss,
+                "forward_tail_loss_limit",
+            ),
             (int(payload.get("data_gaps", 0)) > maximum_data_gaps, "forward_data_gaps"),
             (
                 int(payload.get("effective_trades", 0)) < minimum_effective_trades,

@@ -21,6 +21,10 @@
       "maximum_forward_slippage": 0.005,
       "minimum_forward_data_uptime": 0.99,
       "maximum_forward_rejected_orders": 0,
+      "minimum_forward_trading_days": 0,
+      "minimum_forward_cycles": 8,
+      "minimum_forward_effective_episodes": 8,
+      "maximum_forward_tail_loss": 0.05,
       "retirement_conditions": ["evidence_expired", "risk_breach", "persistent_drift"],
       "capital_increase_policy": "manual_approval_required"
     },
@@ -44,6 +48,10 @@
       "maximum_forward_slippage": 0.005,
       "minimum_forward_data_uptime": 0.99,
       "maximum_forward_rejected_orders": 0,
+      "minimum_forward_trading_days": 0,
+      "minimum_forward_cycles": 0,
+      "minimum_forward_effective_episodes": 60,
+      "maximum_forward_tail_loss": 0.05,
       "retirement_conditions": ["evidence_expired", "risk_breach", "persistent_drift"],
       "capital_increase_policy": "manual_approval_required"
     }

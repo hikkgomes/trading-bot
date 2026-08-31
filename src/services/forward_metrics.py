@@ -49,6 +49,10 @@ class ForwardEvidenceMetrics:
     benchmark_value: float | None = None
     objective_excess: float | None = None
     objective_excess_fraction: float | None = None
+    trading_days: int = 0
+    cycles: int = 0
+    effective_independent_episodes: int = 0
+    tail_loss: float = 0.0
 
     def to_payload(
         self, *, forecast: Mapping[str, Any], target: Mapping[str, Any] | None
@@ -76,6 +80,10 @@ class ForwardEvidenceMetrics:
                 "benchmark_value": self.benchmark_value,
                 "objective_excess": self.objective_excess,
                 "objective_excess_fraction": self.objective_excess_fraction,
+                "trading_days": self.trading_days,
+                "cycles": self.cycles,
+                "effective_independent_episodes": self.effective_independent_episodes,
+                "tail_loss": self.tail_loss,
             },
             "forecast_hash": canonical_hash(dict(forecast)),
             "target_hash": canonical_hash(dict(target)) if target is not None else None,
@@ -181,6 +189,11 @@ class ForwardEvidenceCollector:
         capacity = _positive_or_zero(assignment.get("capital_limit"))
         configured_budget = _positive_or_zero(assignment.get("risk_budget"))
         risk_budget = min(capacity, configured_budget or capacity)
+        trading_days = len(
+            {str(row.get("created_at") or row.get("observed_at"))[:10] for row in market_rows}
+        )
+        cycles = self._cycles(fills)
+        ledger_returns = self._ledger_returns(ledger_rows)
         return ForwardEvidenceMetrics(
             net_pnl=net_pnl,
             benchmark_pnl=benchmark_pnl,
@@ -202,6 +215,10 @@ class ForwardEvidenceCollector:
             benchmark_value=objective[2],
             objective_excess=objective[3],
             objective_excess_fraction=objective[4],
+            trading_days=trading_days,
+            cycles=cycles,
+            effective_independent_episodes=len(ledger_returns) or len(fills),
+            tail_loss=self._tail_loss(ledger_returns),
         )
 
     def latest_observed_at(
@@ -367,6 +384,42 @@ class ForwardEvidenceCollector:
         return total
 
     @staticmethod
+    def _ledger_returns(rows: tuple[Mapping[str, Any], ...]) -> tuple[float, ...]:
+        values: list[float] = []
+        for row in rows:
+            payload = row["payload"]
+            metadata = payload.get("metadata") if isinstance(payload, Mapping) else None
+            if isinstance(metadata, Mapping) and metadata.get("pnl_effect") is not None:
+                values.append(_number(metadata["pnl_effect"], "ledger pnl_effect"))
+        return tuple(values)
+
+    @staticmethod
+    def _cycles(rows: tuple[Mapping[str, Any], ...]) -> int:
+        previous: dict[str, str] = {}
+        cycles = 0
+        for row in rows:
+            payload = row.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            symbol = str(payload.get("symbol") or payload.get("instrument_id") or "*")
+            side = str(payload.get("side") or "").casefold()
+            if side == "buy" and previous.get(symbol) == "sell":
+                cycles += 1
+            elif side == "sell" and previous.get(symbol) == "buy":
+                cycles += 1
+            if side in {"buy", "sell"}:
+                previous[symbol] = side
+        return cycles
+
+    @staticmethod
+    def _tail_loss(values: tuple[float, ...]) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        count = max(1, math.ceil(len(ordered) * 0.05))
+        return max(0.0, -sum(ordered[:count]) / count)
+
+    @staticmethod
     def _benchmark_pnl(
         product_id: str,
         rows: tuple[Mapping[str, Any], ...],
@@ -436,9 +489,7 @@ class ForwardEvidenceCollector:
                     return value
         return max(_positive_or_zero(assignment.get("capital_limit")), 1.0)
 
-    def _account_snapshot_rows(
-        self, *, account_id: str, at: str
-    ) -> tuple[Mapping[str, Any], ...]:
+    def _account_snapshot_rows(self, *, account_id: str, at: str) -> tuple[Mapping[str, Any], ...]:
         if not account_id:
             return ()
         with self.engine.connect() as connection:
@@ -517,9 +568,7 @@ class ForwardEvidenceCollector:
         if not isinstance(balances, Mapping) or price <= 0.0:
             return None
         btc = _positive_or_zero(balances.get("BTC"))
-        stable = _positive_or_zero(
-            balances.get("USDT", balances.get("USDC", balances.get("BUSD")))
-        )
+        stable = _positive_or_zero(balances.get("USDT", balances.get("USDC", balances.get("BUSD"))))
         return btc + stable / price
 
     @staticmethod

@@ -345,12 +345,29 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
                 raise ValueError(
                     f"promotion policy {policy_id}.{field} must be a number between zero and one"
                 )
-        for field in ("minimum_forward_effective_trades", "maximum_forward_rejected_orders"):
+        for field in (
+            "minimum_forward_effective_trades",
+            "maximum_forward_rejected_orders",
+            "minimum_forward_trading_days",
+            "minimum_forward_cycles",
+            "minimum_forward_effective_episodes",
+        ):
             value = policy.get(field, 0)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(
                     f"promotion policy {policy_id}.{field} must be a non-negative integer"
                 )
+        maximum_tail_loss = policy.get("maximum_forward_tail_loss", 1.0)
+        if (
+            not isinstance(maximum_tail_loss, int | float)
+            or isinstance(maximum_tail_loss, bool)
+            or not math.isfinite(float(maximum_tail_loss))
+            or float(maximum_tail_loss) < 0
+        ):
+            raise ValueError(
+                f"promotion policy {policy_id}.maximum_forward_tail_loss "
+                "must be finite and non-negative"
+            )
         minimum_decisions = policy.get("minimum_forward_independent_decisions", 1)
         if (
             not isinstance(minimum_decisions, int)
