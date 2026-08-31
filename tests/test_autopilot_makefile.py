@@ -1,69 +1,60 @@
 from pathlib import Path
 
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_preflight_make_target_always_runs_connected_checks():
-    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
-
-    assert "--connect $(if $(REQUIRE_TESTNET),--require-testnet,)" in makefile
-    assert "$(if $(CONNECT),--connect,)" not in makefile
+def _makefile() -> str:
+    return (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
 
 
-def test_control_make_target_uses_config_for_selector_validation():
-    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
+def test_makefile_exposes_postgresql_as_the_operational_authority():
+    makefile = _makefile()
 
-    assert "$(PY) -m src.autopilot.control --config config/autopilot.json $(ARGS)" in makefile
-
-
-def test_testnet_status_make_target_is_read_only():
-    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
-
-    assert ".PHONY: testnet-status" in makefile
-    assert "--output runtime/testnet_rehearsal_report.json --status" in makefile
+    assert makefile.startswith("# PostgreSQL-authoritative platform")
+    assert "PLATFORM_CONFIG ?= config/platform.json" in makefile
+    assert "src.services.control_cli --config $(PLATFORM_CONFIG)" in makefile
+    assert "src.autopilot.control --config config/autopilot.json" not in makefile
 
 
-def test_service_dry_run_make_target_uses_local_unit_dir():
-    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
+def test_live_release_commands_are_explicit_and_readiness_bound():
+    makefile = _makefile()
 
-    assert ".PHONY: service-dry-run" in makefile
-    assert 'UNIT_DIR="$(CURDIR)/runtime/systemd-dry-run"' in makefile
-    assert "DRY_RUN=1 bash scripts/install_autopilot_service.sh" in makefile
-
-
-def test_candidate_activation_make_target_requires_explicit_confirmation():
-    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
-
-    assert ".PHONY: activate-candidate" in makefile
-    assert 'if [ "$(CONFIRM)" != "1" ]' in makefile
-    assert 'if [ -z "$(CANDIDATE_DIGEST)" ]' in makefile
-    assert "-m src.autopilot.candidate_activation" in makefile
-    assert '--expected-candidate-digest "$(CANDIDATE_DIGEST)" --confirm' in makefile
+    assert "platform-readiness-live" in makefile
+    assert "src.services.readiness --config $(PLATFORM_CONFIG) --live" in makefile
+    assert "platform-testnet-connected" in makefile
+    assert 'test "$(CONFIRM)" = "1"' in makefile
+    assert "src.services.platform_testnet_connected" in makefile
 
 
-def test_autonomous_research_targets_generate_then_validate_typed_batch():
-    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
+def test_platform_installation_uses_the_grouped_linux_installer():
+    makefile = _makefile()
 
-    assert ".PHONY: research-factory-validate" in makefile
-    assert (
-        "-m src.autopilot.research_factory --config config/research_factory.json --validate"
-        in makefile
-    )
-    assert ".PHONY: research-generate" in makefile
-    assert "--output runtime/research/generated_hypotheses.json" in makefile
-    assert "--include-generated --include-mutations" in makefile
-    assert "--generated-only" not in makefile
-    assert "research-once: research-generate research-cycle" in makefile
+    assert "platform-install-dry-run" in makefile
+    assert 'DRY_RUN=1 REPO="$(CURDIR)" bash scripts/install_platform_services.sh' in makefile
+    assert "install_autopilot_service.sh" not in makefile
+
+
+def test_legacy_operations_are_only_explicit_migration_or_aliases():
+    makefile = _makefile()
+
+    assert "sqlite-import:" in makefile
+    assert "src.research.sqlite_import" in makefile
+    assert "autopilot-validate: platform-validate" in makefile
+    assert "autopilot-once:" in makefile
+    assert "activate-candidate" not in makefile
+    assert "research-factory-validate" not in makefile
 
 
 def test_platform_ci_contains_all_required_quality_gates():
-    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
+    makefile = _makefile()
 
-    assert ".PHONY: lint-complexity" in makefile
-    assert "$(PY) -m ruff check . --select C901" in makefile
-    assert ".PHONY: research-policy-check" in makefile
+    assert "lint-complexity:" in makefile
+    assert "$(PY) -m ruff check . --select C90" in makefile
     assert "$(MAKE) typecheck-platform" in makefile
+    assert "$(MAKE) research-policy-check" in makefile
     assert "$(MAKE) db-alembic" in makefile
+    assert "$(MAKE) db-migration-check" in makefile
     assert "$(MAKE) platform-smoke" in makefile
     assert "$(MAKE) platform-testnet-rehearsal" in makefile
     assert "$(MAKE) test" in makefile
