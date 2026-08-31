@@ -1187,44 +1187,24 @@ class SqlForwardEvidenceRepository:
         minimum_effective_episodes: int = 0,
         maximum_tail_loss: float = 1.0,
     ) -> tuple[str, bool, str | None]:
-        if isinstance(minimum_days, bool) or minimum_days < 0:
-            raise CanonicalEvidenceError("minimum forward days must be non-negative")
-        if isinstance(minimum_decisions, bool) or minimum_decisions < 0:
-            raise CanonicalEvidenceError("minimum forward decisions must be non-negative")
-        minimum_net_pnl = _finite_number(minimum_net_pnl, field="minimum forward net_pnl")
-        if minimum_objective_excess_fraction is not None:
-            minimum_objective_excess_fraction = _finite_number(
-                minimum_objective_excess_fraction,
-                field="minimum forward objective excess fraction",
-            )
-        maximum_drawdown = _finite_nonnegative(maximum_drawdown, field="maximum forward drawdown")
-        if isinstance(maximum_data_gaps, bool) or maximum_data_gaps < 0:
-            raise CanonicalEvidenceError("maximum forward data gaps must be non-negative")
-        if isinstance(minimum_effective_trades, bool) or minimum_effective_trades < 0:
-            raise CanonicalEvidenceError("minimum effective forward trades must be non-negative")
-        minimum_fill_rate = _finite_nonnegative(
-            minimum_fill_rate, field="minimum forward fill rate"
+        limits = _normalise_decision_limits(
+            minimum_days=minimum_days,
+            minimum_decisions=minimum_decisions,
+            minimum_net_pnl=minimum_net_pnl,
+            minimum_objective_excess_fraction=minimum_objective_excess_fraction,
+            maximum_drawdown=maximum_drawdown,
+            maximum_data_gaps=maximum_data_gaps,
+            minimum_effective_trades=minimum_effective_trades,
+            minimum_fill_rate=minimum_fill_rate,
+            maximum_slippage=maximum_slippage,
+            minimum_data_uptime=minimum_data_uptime,
+            maximum_rejected_orders=maximum_rejected_orders,
+            minimum_trading_days=minimum_trading_days,
+            minimum_cycles=minimum_cycles,
+            minimum_effective_episodes=minimum_effective_episodes,
+            maximum_tail_loss=maximum_tail_loss,
         )
-        if minimum_fill_rate > 1:
-            raise CanonicalEvidenceError("minimum forward fill rate must be at most one")
-        maximum_slippage = _finite_nonnegative(maximum_slippage, field="maximum forward slippage")
-        minimum_data_uptime = _finite_nonnegative(
-            minimum_data_uptime, field="minimum forward data uptime"
-        )
-        if minimum_data_uptime > 1:
-            raise CanonicalEvidenceError("minimum forward data uptime must be at most one")
-        if isinstance(maximum_rejected_orders, bool) or maximum_rejected_orders < 0:
-            raise CanonicalEvidenceError("maximum rejected forward orders must be non-negative")
-        for value, field_name in (
-            (minimum_trading_days, "minimum forward trading days"),
-            (minimum_cycles, "minimum forward cycles"),
-            (minimum_effective_episodes, "minimum forward independent episodes"),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise CanonicalEvidenceError(f"{field_name} must be a non-negative integer")
-        maximum_tail_loss = _finite_nonnegative(
-            maximum_tail_loss, field="maximum forward tail loss"
-        )
+        decided_at = timestamp(decided_at, field="forward decision timestamp")
         with self.engine.connect() as connection:
             payload = connection.execute(
                 select(forward_paper_summary.c.payload).where(
@@ -1233,88 +1213,7 @@ class SqlForwardEvidenceRepository:
             ).scalar_one_or_none()
         if not isinstance(payload, Mapping):
             raise CanonicalEvidenceError("forward summary does not exist")
-        product_id = str(payload.get("product_id") or "")
-        objective_required = minimum_objective_excess_fraction is not None
-        objective_failed = False
-        if objective_required:
-            objective_threshold = float(
-                minimum_objective_excess_fraction
-                if minimum_objective_excess_fraction is not None
-                else 0.0
-            )
-            expected_unit = objective_unit(product_id)
-            objective_failed = (
-                expected_unit is None
-                or payload.get("objective_unit") != expected_unit
-                or not all(
-                    payload.get(field) is not None
-                    for field in (
-                        "objective_value",
-                        "benchmark_value",
-                        "objective_excess",
-                        "objective_excess_fraction",
-                    )
-                )
-                or float(payload.get("objective_excess_fraction", 0.0)) <= objective_threshold
-            )
-        checks = (
-            (
-                float(payload.get("elapsed_days", 0.0)) < minimum_days,
-                "forward_evidence_duration_insufficient",
-            ),
-            (
-                int(payload.get("independent_decisions", 0)) < minimum_decisions,
-                "forward_decisions_insufficient",
-            ),
-            (
-                int(payload.get("trading_days", 0)) < minimum_trading_days,
-                "forward_trading_days_insufficient",
-            ),
-            (
-                int(payload.get("cycles", 0)) < minimum_cycles,
-                "forward_cycles_insufficient",
-            ),
-            (
-                int(payload.get("effective_independent_episodes", 0)) < minimum_effective_episodes,
-                "forward_independent_episodes_insufficient",
-            ),
-            (
-                objective_failed
-                if objective_required
-                else float(payload.get("net_pnl", 0.0)) <= minimum_net_pnl,
-                (
-                    "forward_objective_excess_threshold"
-                    if objective_required
-                    else "forward_net_pnl_threshold"
-                ),
-            ),
-            (float(payload.get("drawdown", 0.0)) > maximum_drawdown, "forward_drawdown_limit"),
-            (
-                float(payload.get("tail_loss", 0.0)) > maximum_tail_loss,
-                "forward_tail_loss_limit",
-            ),
-            (int(payload.get("data_gaps", 0)) > maximum_data_gaps, "forward_data_gaps"),
-            (
-                int(payload.get("effective_trades", 0)) < minimum_effective_trades,
-                "forward_effective_trades_insufficient",
-            ),
-            (
-                float(payload.get("fill_rate", 0.0)) < minimum_fill_rate,
-                "forward_fill_rate_insufficient",
-            ),
-            (
-                float(payload.get("slippage", 0.0)) > maximum_slippage,
-                "forward_slippage_limit",
-            ),
-            (
-                float(payload.get("data_uptime", 0.0)) < minimum_data_uptime,
-                "forward_data_uptime_insufficient",
-            ),
-            (
-                int(payload.get("rejected_orders", 0)) > maximum_rejected_orders,
-                "forward_rejected_orders_limit",
-            ),
-        )
+        checks = _forward_decision_checks(payload, limits)
         reason = next((reason for failed, reason in checks if failed), None)
         decision_id = self.append_decision(
             summary_id=summary_id,
@@ -1323,6 +1222,197 @@ class SqlForwardEvidenceRepository:
             reason_code=reason,
         )
         return decision_id, reason is None, reason
+
+
+@dataclass(frozen=True)
+class _ForwardDecisionLimits:
+    minimum_days: int
+    minimum_decisions: int
+    minimum_net_pnl: float
+    minimum_objective_excess_fraction: float | None
+    maximum_drawdown: float
+    maximum_data_gaps: int
+    minimum_effective_trades: int
+    minimum_fill_rate: float
+    maximum_slippage: float
+    minimum_data_uptime: float
+    maximum_rejected_orders: int
+    minimum_trading_days: int
+    minimum_cycles: int
+    minimum_effective_episodes: int
+    maximum_tail_loss: float
+
+
+def _decision_integer(value: int, *, message: str) -> int:
+    if isinstance(value, bool) or value < 0:
+        raise CanonicalEvidenceError(message)
+    return value
+
+
+def _decision_fraction(value: float, *, field: str, at_most_one: bool = False) -> float:
+    result = _finite_nonnegative(value, field=field)
+    if at_most_one and result > 1:
+        raise CanonicalEvidenceError(f"{field} must be at most one")
+    return result
+
+
+def _normalise_decision_limits(
+    *,
+    minimum_days: int,
+    minimum_decisions: int,
+    minimum_net_pnl: float,
+    minimum_objective_excess_fraction: float | None,
+    maximum_drawdown: float,
+    maximum_data_gaps: int,
+    minimum_effective_trades: int,
+    minimum_fill_rate: float,
+    maximum_slippage: float,
+    minimum_data_uptime: float,
+    maximum_rejected_orders: int,
+    minimum_trading_days: int,
+    minimum_cycles: int,
+    minimum_effective_episodes: int,
+    maximum_tail_loss: float,
+) -> _ForwardDecisionLimits:
+    objective = (
+        None
+        if minimum_objective_excess_fraction is None
+        else _finite_number(
+            minimum_objective_excess_fraction,
+            field="minimum forward objective excess fraction",
+        )
+    )
+    return _ForwardDecisionLimits(
+        minimum_days=_decision_integer(
+            minimum_days, message="minimum forward days must be non-negative"
+        ),
+        minimum_decisions=_decision_integer(
+            minimum_decisions, message="minimum forward decisions must be non-negative"
+        ),
+        minimum_net_pnl=_finite_number(minimum_net_pnl, field="minimum forward net_pnl"),
+        minimum_objective_excess_fraction=objective,
+        maximum_drawdown=_finite_nonnegative(maximum_drawdown, field="maximum forward drawdown"),
+        maximum_data_gaps=_decision_integer(
+            maximum_data_gaps, message="maximum forward data gaps must be non-negative"
+        ),
+        minimum_effective_trades=_decision_integer(
+            minimum_effective_trades,
+            message="minimum effective forward trades must be non-negative",
+        ),
+        minimum_fill_rate=_decision_fraction(
+            minimum_fill_rate, field="minimum forward fill rate", at_most_one=True
+        ),
+        maximum_slippage=_finite_nonnegative(maximum_slippage, field="maximum forward slippage"),
+        minimum_data_uptime=_decision_fraction(
+            minimum_data_uptime, field="minimum forward data uptime", at_most_one=True
+        ),
+        maximum_rejected_orders=_decision_integer(
+            maximum_rejected_orders,
+            message="maximum rejected forward orders must be non-negative",
+        ),
+        minimum_trading_days=_decision_integer(
+            minimum_trading_days,
+            message="minimum forward trading days must be a non-negative integer",
+        ),
+        minimum_cycles=_decision_integer(
+            minimum_cycles,
+            message="minimum forward cycles must be a non-negative integer",
+        ),
+        minimum_effective_episodes=_decision_integer(
+            minimum_effective_episodes,
+            message="minimum forward independent episodes must be a non-negative integer",
+        ),
+        maximum_tail_loss=_finite_nonnegative(maximum_tail_loss, field="maximum forward tail loss"),
+    )
+
+
+def _objective_decision_failed(payload: Mapping[str, Any], threshold: float | None) -> bool:
+    if threshold is None:
+        return False
+    expected_unit = objective_unit(str(payload.get("product_id") or ""))
+    return (
+        expected_unit is None
+        or payload.get("objective_unit") != expected_unit
+        or not all(
+            payload.get(field) is not None
+            for field in (
+                "objective_value",
+                "benchmark_value",
+                "objective_excess",
+                "objective_excess_fraction",
+            )
+        )
+        or float(payload.get("objective_excess_fraction", 0.0)) <= threshold
+    )
+
+
+def _forward_decision_checks(
+    payload: Mapping[str, Any], limits: _ForwardDecisionLimits
+) -> tuple[tuple[bool, str], ...]:
+    objective_required = limits.minimum_objective_excess_fraction is not None
+    objective_failed = _objective_decision_failed(payload, limits.minimum_objective_excess_fraction)
+    return (
+        (
+            float(payload.get("elapsed_days", 0.0)) < limits.minimum_days,
+            "forward_evidence_duration_insufficient",
+        ),
+        (
+            int(payload.get("independent_decisions", 0)) < limits.minimum_decisions,
+            "forward_decisions_insufficient",
+        ),
+        (
+            int(payload.get("trading_days", 0)) < limits.minimum_trading_days,
+            "forward_trading_days_insufficient",
+        ),
+        (
+            int(payload.get("cycles", 0)) < limits.minimum_cycles,
+            "forward_cycles_insufficient",
+        ),
+        (
+            int(payload.get("effective_independent_episodes", 0))
+            < limits.minimum_effective_episodes,
+            "forward_independent_episodes_insufficient",
+        ),
+        (
+            objective_failed
+            if objective_required
+            else float(payload.get("net_pnl", 0.0)) <= limits.minimum_net_pnl,
+            (
+                "forward_objective_excess_threshold"
+                if objective_required
+                else "forward_net_pnl_threshold"
+            ),
+        ),
+        (
+            float(payload.get("drawdown", 0.0)) > limits.maximum_drawdown,
+            "forward_drawdown_limit",
+        ),
+        (
+            float(payload.get("tail_loss", 0.0)) > limits.maximum_tail_loss,
+            "forward_tail_loss_limit",
+        ),
+        (int(payload.get("data_gaps", 0)) > limits.maximum_data_gaps, "forward_data_gaps"),
+        (
+            int(payload.get("effective_trades", 0)) < limits.minimum_effective_trades,
+            "forward_effective_trades_insufficient",
+        ),
+        (
+            float(payload.get("fill_rate", 0.0)) < limits.minimum_fill_rate,
+            "forward_fill_rate_insufficient",
+        ),
+        (
+            float(payload.get("slippage", 0.0)) > limits.maximum_slippage,
+            "forward_slippage_limit",
+        ),
+        (
+            float(payload.get("data_uptime", 0.0)) < limits.minimum_data_uptime,
+            "forward_data_uptime_insufficient",
+        ),
+        (
+            int(payload.get("rejected_orders", 0)) > limits.maximum_rejected_orders,
+            "forward_rejected_orders_limit",
+        ),
+    )
 
 
 class SqlStrategyArtefactRepository:
