@@ -69,7 +69,17 @@ def aggregate_forecasts(forecasts: Iterable[AlphaForecast]) -> tuple[AlphaForeca
             "contributors": [item.strategy_version_id for item in items],
             "contributor_count": len(items),
             "agreement": agreement,
+            "assignment_ids": sorted(
+                {
+                    str(item.metadata["assignment_id"])
+                    for item in items
+                    if item.metadata.get("assignment_id")
+                }
+            ),
         }
+        assignment_ids = metadata["assignment_ids"]
+        if len(assignment_ids) == 1:
+            metadata["assignment_id"] = assignment_ids[0]
         result.append(
             replace(
                 reference,

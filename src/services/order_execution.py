@@ -169,6 +169,11 @@ class DatabaseExecutionWorker:
                     "fee_in_base": product_id == "btc_accumulation",
                     "order_group_id": order.group_id,
                     "strategy_version_ids": sorted(order.strategy_contributions),
+                    "strategy_version_id": (
+                        next(iter(order.strategy_contributions))
+                        if len(order.strategy_contributions) == 1
+                        else None
+                    ),
                     "assignment_id": order.metadata.get("target_metadata", {}).get("assignment_id")
                     if isinstance(order.metadata.get("target_metadata"), Mapping)
                     else None,
