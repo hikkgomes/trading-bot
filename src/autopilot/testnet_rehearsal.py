@@ -109,17 +109,11 @@ def _protective_order_payload(order: ProtectiveOrder | None) -> dict[str, Any] |
     }
 
 
-def _assert_rehearsal_protective_order_valid(
+def _assert_rehearsal_protective_identity(
     product: ProductConfig,
     order: ProtectiveOrder,
     *,
     label: str,
-    expected_qty: float,
-    expected_trigger_price: float,
-    expected_client_id: str,
-    expected_status: ProtectiveOrderStatus,
-    expected_order_id: str | None = None,
-    allowed_statuses: frozenset[ProtectiveOrderStatus] | None = None,
 ) -> None:
     if not isinstance(order, ProtectiveOrder):
         raise RuntimeError(f"{label} protective-stop evidence must be a ProtectiveOrder.")
@@ -130,6 +124,15 @@ def _assert_rehearsal_protective_order_valid(
     side = order.side.value if isinstance(order.side, OrderSide) else str(order.side)
     if side != OrderSide.SELL.value:
         raise RuntimeError(f"{label} protective-stop side mismatch: expected sell, got {side}.")
+
+
+def _assert_rehearsal_protective_prices(
+    order: ProtectiveOrder,
+    *,
+    label: str,
+    expected_qty: float,
+    expected_trigger_price: float,
+) -> None:
     qty = _finite_float(order.qty)
     qty_tolerance = max(abs(expected_qty) * 1e-6, 1e-9)
     if qty is None or qty <= 0 or abs(qty - expected_qty) > qty_tolerance:
@@ -147,6 +150,17 @@ def _assert_rehearsal_protective_order_valid(
             f"{label} protective-stop trigger mismatch: expected {expected_trigger_price:g}, "
             f"got {order.trigger_price!r}."
         )
+
+
+def _assert_rehearsal_protective_identity_fields(
+    order: ProtectiveOrder,
+    *,
+    label: str,
+    expected_client_id: str,
+    expected_status: ProtectiveOrderStatus,
+    expected_order_id: str | None,
+    allowed_statuses: frozenset[ProtectiveOrderStatus] | None,
+) -> None:
     if not isinstance(order.order_id, str) or not order.order_id.strip():
         raise RuntimeError(f"{label} protective-stop order id is missing.")
     if expected_order_id is not None and order.order_id != expected_order_id:
@@ -169,12 +183,49 @@ def _assert_rehearsal_protective_order_valid(
         raise RuntimeError(
             f"{label} protective-stop status mismatch: expected one of {expected}, got {status}."
         )
+
+
+def _assert_rehearsal_protective_unfilled(
+    order: ProtectiveOrder,
+    *,
+    label: str,
+) -> None:
     filled_qty = _finite_float(order.filled_qty)
     fee = _finite_float(order.fee)
     if filled_qty is None or filled_qty != 0:
         raise RuntimeError(f"{label} protective stop unexpectedly reports a fill.")
     if fee is None or fee < 0:
         raise RuntimeError(f"{label} protective-stop fee must be finite and non-negative.")
+
+
+def _assert_rehearsal_protective_order_valid(
+    product: ProductConfig,
+    order: ProtectiveOrder,
+    *,
+    label: str,
+    expected_qty: float,
+    expected_trigger_price: float,
+    expected_client_id: str,
+    expected_status: ProtectiveOrderStatus,
+    expected_order_id: str | None = None,
+    allowed_statuses: frozenset[ProtectiveOrderStatus] | None = None,
+) -> None:
+    _assert_rehearsal_protective_identity(product, order, label=label)
+    _assert_rehearsal_protective_prices(
+        order,
+        label=label,
+        expected_qty=expected_qty,
+        expected_trigger_price=expected_trigger_price,
+    )
+    _assert_rehearsal_protective_identity_fields(
+        order,
+        label=label,
+        expected_client_id=expected_client_id,
+        expected_status=expected_status,
+        expected_order_id=expected_order_id,
+        allowed_statuses=allowed_statuses,
+    )
+    _assert_rehearsal_protective_unfilled(order, label=label)
 
 
 def _fill_side_value(fill: Fill) -> str:
@@ -279,28 +330,22 @@ def _fill_qty_mismatch_reasons(
     return reasons
 
 
-def _native_protective_stop_invalid_reasons(
-    evidence: Any,
-    *,
-    order_qty: float | None,
-    entry_fill: dict[str, Any],
-    expected_product: ProductConfig | None,
-) -> list[str]:
-    if not isinstance(evidence, dict):
-        return ["missing_native_protective_stop"]
-
+def _native_stop_flag_invalid_reasons(evidence: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
-    if evidence.get("capability_supported") is not True:
-        reasons.append("native_stop_capability_not_supported")
-    if evidence.get("native") is not True:
-        reasons.append("native_stop_not_native")
-    if evidence.get("reduce_only") is not True:
-        reasons.append("native_stop_not_reduce_only")
-    if evidence.get("open_verified") is not True:
-        reasons.append("native_stop_open_not_verified")
-    if evidence.get("canceled_verified") is not True:
-        reasons.append("native_stop_cancel_not_verified")
+    for key, reason in (
+        ("capability_supported", "native_stop_capability_not_supported"),
+        ("native", "native_stop_not_native"),
+        ("reduce_only", "native_stop_not_reduce_only"),
+        ("open_verified", "native_stop_open_not_verified"),
+        ("canceled_verified", "native_stop_cancel_not_verified"),
+    ):
+        if evidence.get(key) is not True:
+            reasons.append(reason)
+    return reasons
 
+
+def _native_stop_trigger_invalid_reasons(evidence: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
     distance = _finite_float(evidence.get("trigger_distance_fraction"))
     if distance is None or not 0 < distance < 1:
         reasons.append("native_stop_invalid_trigger_distance")
@@ -313,70 +358,168 @@ def _native_protective_stop_invalid_reasons(
     normalized_trigger = _finite_float(evidence.get("normalized_trigger_price"))
     if normalized_trigger is None or normalized_trigger <= 0:
         reasons.append("native_stop_invalid_normalized_trigger")
+    return reasons
 
-    snapshots = (
-        ("placed", frozenset({"open"}), "open"),
-        ("fetched_open", frozenset({"open"}), "open"),
-        ("cancel_result", frozenset({"canceled"}), "canceled"),
-        (
-            "fetched_terminal",
-            frozenset({"canceled", "expired", "rejected"}),
-            "terminal",
-        ),
+
+def _native_stop_snapshot_invalid_reasons(
+    snapshot: Any,
+    *,
+    label: str,
+    expected_statuses: frozenset[str],
+    expected_label: str,
+    order_qty: float | None,
+    expected_product: ProductConfig | None,
+    canonical_order_id: str | None,
+    canonical_client_id: str | None,
+    canonical_trigger: float | None,
+) -> list[str]:
+    if not isinstance(snapshot, dict):
+        return [f"native_stop_missing_{label}"]
+    reasons = _native_stop_snapshot_basic_reasons(
+        snapshot,
+        label=label,
+        expected_statuses=expected_statuses,
+        expected_label=expected_label,
+        order_qty=order_qty,
+        expected_product=expected_product,
     )
-    canonical_order_id: str | None = None
-    canonical_client_id: str | None = None
-    canonical_trigger: float | None = None
-    for label, expected_statuses, expected_label in snapshots:
-        snapshot = evidence.get(label)
-        if not isinstance(snapshot, dict):
-            reasons.append(f"native_stop_missing_{label}")
-            continue
-        symbol = str(snapshot.get("symbol") or "").strip().upper()
-        if expected_product is not None and symbol != expected_product.symbol.upper():
-            reasons.append(f"native_stop_{label}_symbol_mismatch")
-        if str(snapshot.get("side") or "").strip().lower() != "sell":
-            reasons.append(f"native_stop_{label}_side_not_sell")
-        qty = _finite_float(snapshot.get("qty"))
-        if qty is None or qty <= 0:
-            reasons.append(f"native_stop_{label}_invalid_qty")
-        elif order_qty is not None:
-            tolerance = max(abs(order_qty) * 1e-6, 1e-9)
-            if abs(qty - order_qty) > tolerance:
-                reasons.append(f"native_stop_{label}_qty_mismatch")
-        trigger = _finite_float(snapshot.get("trigger_price"))
-        if trigger is None or trigger <= 0:
-            reasons.append(f"native_stop_{label}_invalid_trigger")
-        status = str(snapshot.get("status") or "").strip().lower()
-        if status not in expected_statuses:
-            reasons.append(f"native_stop_{label}_status_not_{expected_label}")
+    reasons.extend(
+        _native_stop_snapshot_consistency_reasons(
+            snapshot,
+            label=label,
+            canonical_order_id=canonical_order_id,
+            canonical_client_id=canonical_client_id,
+            canonical_trigger=canonical_trigger,
+        )
+    )
+    return reasons
+
+
+def _native_stop_snapshot_basic_reasons(
+    snapshot: dict[str, Any],
+    *,
+    label: str,
+    expected_statuses: frozenset[str],
+    expected_label: str,
+    order_qty: float | None,
+    expected_product: ProductConfig | None,
+) -> list[str]:
+    reasons = _native_stop_snapshot_shape_reasons(
+        snapshot,
+        label=label,
+        expected_product=expected_product,
+    )
+    reasons.extend(
+        _native_stop_snapshot_quantity_reasons(snapshot, label=label, order_qty=order_qty)
+    )
+    reasons.extend(
+        _native_stop_snapshot_state_reasons(
+            snapshot,
+            label=label,
+            expected_statuses=expected_statuses,
+            expected_label=expected_label,
+        )
+    )
+    return reasons
+
+
+def _native_stop_snapshot_shape_reasons(
+    snapshot: dict[str, Any],
+    *,
+    label: str,
+    expected_product: ProductConfig | None,
+) -> list[str]:
+    reasons: list[str] = []
+    symbol = str(snapshot.get("symbol") or "").strip().upper()
+    if expected_product is not None and symbol != expected_product.symbol.upper():
+        reasons.append(f"native_stop_{label}_symbol_mismatch")
+    if str(snapshot.get("side") or "").strip().lower() != "sell":
+        reasons.append(f"native_stop_{label}_side_not_sell")
+    return reasons
+
+
+def _native_stop_snapshot_quantity_reasons(
+    snapshot: dict[str, Any],
+    *,
+    label: str,
+    order_qty: float | None,
+) -> list[str]:
+    reasons: list[str] = []
+    qty = _finite_float(snapshot.get("qty"))
+    if qty is None or qty <= 0:
+        reasons.append(f"native_stop_{label}_invalid_qty")
+    elif order_qty is not None:
+        tolerance = max(abs(order_qty) * 1e-6, 1e-9)
+        if abs(qty - order_qty) > tolerance:
+            reasons.append(f"native_stop_{label}_qty_mismatch")
+    return reasons
+
+
+def _native_stop_snapshot_state_reasons(
+    snapshot: dict[str, Any],
+    *,
+    label: str,
+    expected_statuses: frozenset[str],
+    expected_label: str,
+) -> list[str]:
+    reasons: list[str] = []
+    trigger = _finite_float(snapshot.get("trigger_price"))
+    if trigger is None or trigger <= 0:
+        reasons.append(f"native_stop_{label}_invalid_trigger")
+    status = str(snapshot.get("status") or "").strip().lower()
+    if status not in expected_statuses:
+        reasons.append(f"native_stop_{label}_status_not_{expected_label}")
+    order_id = str(snapshot.get("order_id") or "").strip()
+    client_id = str(snapshot.get("client_id") or "").strip()
+    if not order_id:
+        reasons.append(f"native_stop_{label}_missing_order_id")
+    if not client_id:
+        reasons.append(f"native_stop_{label}_missing_client_id")
+    filled_qty = _finite_float(snapshot.get("filled_qty"))
+    if filled_qty is None or filled_qty != 0:
+        reasons.append(f"native_stop_{label}_unexpected_fill")
+    fee = _finite_float(snapshot.get("fee"))
+    if fee is None or fee < 0:
+        reasons.append(f"native_stop_{label}_invalid_fee")
+    return reasons
+
+
+def _native_stop_snapshot_consistency_reasons(
+    snapshot: dict[str, Any],
+    *,
+    label: str,
+    canonical_order_id: str | None,
+    canonical_client_id: str | None,
+    canonical_trigger: float | None,
+) -> list[str]:
+    if label == "placed":
+        return []
+    reasons: list[str] = []
+    if label != "placed":
         order_id = str(snapshot.get("order_id") or "").strip()
         client_id = str(snapshot.get("client_id") or "").strip()
-        if not order_id:
-            reasons.append(f"native_stop_{label}_missing_order_id")
-        if not client_id:
-            reasons.append(f"native_stop_{label}_missing_client_id")
-        filled_qty = _finite_float(snapshot.get("filled_qty"))
-        if filled_qty is None or filled_qty != 0:
-            reasons.append(f"native_stop_{label}_unexpected_fill")
-        fee = _finite_float(snapshot.get("fee"))
-        if fee is None or fee < 0:
-            reasons.append(f"native_stop_{label}_invalid_fee")
+        trigger = _finite_float(snapshot.get("trigger_price"))
+        if canonical_order_id is not None and order_id != canonical_order_id:
+            reasons.append(f"native_stop_{label}_order_id_mismatch")
+        if canonical_client_id is not None and client_id != canonical_client_id:
+            reasons.append(f"native_stop_{label}_client_id_mismatch")
+        if canonical_trigger is not None and trigger is not None:
+            tolerance = max(abs(canonical_trigger) * 1e-8, 1e-8)
+            if abs(trigger - canonical_trigger) > tolerance:
+                reasons.append(f"native_stop_{label}_trigger_mismatch")
+    return reasons
 
-        if label == "placed":
-            canonical_order_id = order_id or None
-            canonical_client_id = client_id or None
-            canonical_trigger = trigger
-        else:
-            if canonical_order_id is not None and order_id != canonical_order_id:
-                reasons.append(f"native_stop_{label}_order_id_mismatch")
-            if canonical_client_id is not None and client_id != canonical_client_id:
-                reasons.append(f"native_stop_{label}_client_id_mismatch")
-            if canonical_trigger is not None and trigger is not None:
-                tolerance = max(abs(canonical_trigger) * 1e-8, 1e-8)
-                if abs(trigger - canonical_trigger) > tolerance:
-                    reasons.append(f"native_stop_{label}_trigger_mismatch")
 
+def _native_stop_relationship_invalid_reasons(
+    *,
+    canonical_trigger: float | None,
+    trigger_reference: float | None,
+    distance: float | None,
+    raw_trigger: float | None,
+    normalized_trigger: float | None,
+    entry_fill: dict[str, Any],
+) -> list[str]:
+    reasons: list[str] = []
     entry_price = _finite_float(entry_fill.get("price")) if entry_fill else None
     if canonical_trigger is not None and entry_price is not None:
         if canonical_trigger >= entry_price:
@@ -395,6 +538,71 @@ def _native_protective_stop_invalid_reasons(
         tolerance = max(abs(canonical_trigger) * 1e-8, 1e-8)
         if abs(normalized_trigger - canonical_trigger) > tolerance:
             reasons.append("native_stop_normalized_trigger_mismatch")
+    return reasons
+
+
+def _native_protective_stop_invalid_reasons(
+    evidence: Any,
+    *,
+    order_qty: float | None,
+    entry_fill: dict[str, Any],
+    expected_product: ProductConfig | None,
+) -> list[str]:
+    if not isinstance(evidence, dict):
+        return ["missing_native_protective_stop"]
+
+    reasons = _native_stop_flag_invalid_reasons(evidence)
+    distance = _finite_float(evidence.get("trigger_distance_fraction"))
+    trigger_reference = _finite_float(evidence.get("trigger_reference_price"))
+    raw_trigger = _finite_float(evidence.get("raw_trigger_price"))
+    normalized_trigger = _finite_float(evidence.get("normalized_trigger_price"))
+    reasons.extend(_native_stop_trigger_invalid_reasons(evidence))
+
+    snapshots = (
+        ("placed", frozenset({"open"}), "open"),
+        ("fetched_open", frozenset({"open"}), "open"),
+        ("cancel_result", frozenset({"canceled"}), "canceled"),
+        (
+            "fetched_terminal",
+            frozenset({"canceled", "expired", "rejected"}),
+            "terminal",
+        ),
+    )
+    canonical_order_id: str | None = None
+    canonical_client_id: str | None = None
+    canonical_trigger: float | None = None
+    for label, expected_statuses, expected_label in snapshots:
+        snapshot = evidence.get(label)
+        reasons.extend(
+            _native_stop_snapshot_invalid_reasons(
+                snapshot,
+                label=label,
+                expected_statuses=expected_statuses,
+                expected_label=expected_label,
+                order_qty=order_qty,
+                expected_product=expected_product,
+                canonical_order_id=canonical_order_id,
+                canonical_client_id=canonical_client_id,
+                canonical_trigger=canonical_trigger,
+            )
+        )
+        if label == "placed" and isinstance(snapshot, dict):
+            order_id = str(snapshot.get("order_id") or "").strip()
+            client_id = str(snapshot.get("client_id") or "").strip()
+            trigger = _finite_float(snapshot.get("trigger_price"))
+            canonical_order_id = order_id or None
+            canonical_client_id = client_id or None
+            canonical_trigger = trigger
+    reasons.extend(
+        _native_stop_relationship_invalid_reasons(
+            canonical_trigger=canonical_trigger,
+            trigger_reference=trigger_reference,
+            distance=distance,
+            raw_trigger=raw_trigger,
+            normalized_trigger=normalized_trigger,
+            entry_fill=entry_fill,
+        )
+    )
     return reasons
 
 
