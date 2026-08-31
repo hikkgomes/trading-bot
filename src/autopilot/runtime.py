@@ -907,6 +907,12 @@ def _core_job_error_messages(job_name: str, job: JobConfig | None) -> list[str]:
             f"{job_name}: required job must run python module {expected_module}"
             f" (got {actual_module or 'none'})"
         )
+    errors.extend(_core_job_flag_errors(job_name, job))
+    return errors
+
+
+def _core_job_flag_errors(job_name: str, job: JobConfig) -> list[str]:
+    errors: list[str] = []
     for flag in REQUIRED_CORE_JOB_PRESENCE_FLAGS.get(job_name, ()):
         if not _job_has_flag(job.command, flag):
             errors.append(f"{job_name}: required job must include {flag}")
@@ -972,19 +978,12 @@ def build_live_broker(product: ProductConfig):
     return CcxtBroker(cfg)
 
 
-def assert_live_environment(
+def _live_environment_errors(
     product: ProductConfig,
+    cfg: Any,
     *,
-    require_production: bool = False,
-) -> dict[str, Any]:
-    market_type = "spot" if product.objective == "btc_accumulation" else "futures"
-    try:
-        from src.execution.config import ExchangeConfig
-
-        cfg = ExchangeConfig.from_env(market_type=market_type)
-    except (OSError, ValueError) as exc:
-        raise RuntimeError(f"{product.name}: invalid live exchange environment: {exc}") from exc
-
+    require_production: bool,
+) -> list[str]:
     errors: list[str] = []
     if not cfg.live:
         errors.append("TRADING_LIVE must be 1")
@@ -1011,10 +1010,10 @@ def assert_live_environment(
     if not cfg.api_key or not cfg.api_secret:
         errors.append("EXCHANGE_API_KEY and EXCHANGE_API_SECRET are required")
     errors.extend(validate_exchange_policy(product, cfg))
-    if errors:
-        raise RuntimeError(
-            f"{product.name}: live execution environment is not ready: " + "; ".join(errors)
-        )
+    return errors
+
+
+def _live_environment_detail(cfg: Any) -> dict[str, Any]:
     detail = {
         "ok": True,
         "exchange": cfg.exchange,
@@ -1029,6 +1028,27 @@ def assert_live_environment(
         detail["max_futures_leverage"] = cfg.max_futures_leverage
         detail["futures_margin_mode"] = cfg.futures_margin_mode
     return detail
+
+
+def assert_live_environment(
+    product: ProductConfig,
+    *,
+    require_production: bool = False,
+) -> dict[str, Any]:
+    market_type = "spot" if product.objective == "btc_accumulation" else "futures"
+    try:
+        from src.execution.config import ExchangeConfig
+
+        cfg = ExchangeConfig.from_env(market_type=market_type)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"{product.name}: invalid live exchange environment: {exc}") from exc
+
+    errors = _live_environment_errors(product, cfg, require_production=require_production)
+    if errors:
+        raise RuntimeError(
+            f"{product.name}: live execution environment is not ready: " + "; ".join(errors)
+        )
+    return _live_environment_detail(cfg)
 
 
 def _assert_current_environment_matches_preflight(
@@ -1152,17 +1172,12 @@ def _positive_evidence_float(value: Any) -> float | None:
     return number if math.isfinite(number) and number > 0 else None
 
 
-def _assert_preflight_exchange_evidence(
+def _assert_preflight_exchange_identity(
     product: ProductConfig,
-    matched: dict[str, Any],
+    detail: dict[str, Any],
     *,
     label: str,
-    require_testnet: bool = False,
-) -> dict[str, Any]:
-    check = _preflight_check_by_name(matched, "exchange_environment", label=label, product=product)
-    detail = check.get("detail")
-    if not isinstance(detail, dict):
-        raise RuntimeError(f"{product.name}: {label} exchange environment evidence is missing.")
+) -> str:
     if detail.get("custom_checker"):
         raise RuntimeError(
             f"{product.name}: {label} exchange environment evidence used a custom checker."
@@ -1197,33 +1212,79 @@ def _assert_preflight_exchange_evidence(
         raise RuntimeError(
             f"{product.name}: {label} exchange mismatch: {exchange or '<missing>'} not in {allowed}."
         )
+    return expected_market
+
+
+def _assert_preflight_testnet_flags(
+    product: ProductConfig,
+    detail: dict[str, Any],
+    *,
+    label: str,
+    require_testnet: bool,
+) -> None:
     if require_testnet and detail.get("require_testnet") is not True:
         raise RuntimeError(f"{product.name}: {label} did not require testnet during preflight.")
     if require_testnet and detail.get("testnet") is not True:
         raise RuntimeError(f"{product.name}: {label} was not run against testnet.")
+
+
+def _assert_preflight_exchange_limits(
+    product: ProductConfig,
+    detail: dict[str, Any],
+    *,
+    label: str,
+    expected_market: str,
+) -> None:
     if _positive_evidence_float(detail.get("max_notional_usd")) is None:
         raise RuntimeError(f"{product.name}: {label} max_notional_usd evidence is invalid.")
     if _positive_evidence_float(detail.get("max_fill_slippage_bps")) is None:
         raise RuntimeError(f"{product.name}: {label} max_fill_slippage_bps evidence is invalid.")
-    if expected_market == "futures":
-        try:
-            leverage = int(detail.get("max_futures_leverage"))
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"{product.name}: {label} max_futures_leverage evidence is invalid."
-            ) from exc
-        if not (1 <= leverage <= 3):
-            raise RuntimeError(f"{product.name}: {label} max_futures_leverage evidence is invalid.")
-        if product.objective == "active_income" and leverage != ACTIVE_INCOME_MAX_FUTURES_LEVERAGE:
-            raise RuntimeError(
-                f"{product.name}: {label} max_futures_leverage evidence must be "
-                f"{ACTIVE_INCOME_MAX_FUTURES_LEVERAGE}."
-            )
-        margin_mode = str(detail.get("futures_margin_mode") or "").lower()
-        if margin_mode != "isolated":
-            raise RuntimeError(
-                f"{product.name}: {label} futures margin mode evidence is not isolated."
-            )
+    if expected_market != "futures":
+        return
+    try:
+        leverage = int(detail.get("max_futures_leverage"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"{product.name}: {label} max_futures_leverage evidence is invalid."
+        ) from exc
+    if not (1 <= leverage <= 3):
+        raise RuntimeError(f"{product.name}: {label} max_futures_leverage evidence is invalid.")
+    if product.objective == "active_income" and leverage != ACTIVE_INCOME_MAX_FUTURES_LEVERAGE:
+        raise RuntimeError(
+            f"{product.name}: {label} max_futures_leverage evidence must be "
+            f"{ACTIVE_INCOME_MAX_FUTURES_LEVERAGE}."
+        )
+    margin_mode = str(detail.get("futures_margin_mode") or "").lower()
+    if margin_mode != "isolated":
+        raise RuntimeError(
+            f"{product.name}: {label} futures margin mode evidence is not isolated."
+        )
+
+
+def _assert_preflight_exchange_evidence(
+    product: ProductConfig,
+    matched: dict[str, Any],
+    *,
+    label: str,
+    require_testnet: bool = False,
+) -> dict[str, Any]:
+    check = _preflight_check_by_name(matched, "exchange_environment", label=label, product=product)
+    detail = check.get("detail")
+    if not isinstance(detail, dict):
+        raise RuntimeError(f"{product.name}: {label} exchange environment evidence is missing.")
+    expected_market = _assert_preflight_exchange_identity(product, detail, label=label)
+    _assert_preflight_testnet_flags(
+        product,
+        detail,
+        label=label,
+        require_testnet=require_testnet,
+    )
+    _assert_preflight_exchange_limits(
+        product,
+        detail,
+        label=label,
+        expected_market=expected_market,
+    )
     return detail
 
 
@@ -1400,15 +1461,9 @@ def _assert_preflight_position_inventory_evidence(
     return detail
 
 
-def assert_recent_preflight(
+def _load_recent_preflight_report(
     product: ProductConfig,
-    *,
-    artifact: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    if not product.require_preflight:
-        if product.execution_mode == "live":
-            raise RuntimeError(f"{product.name}: live execution requires require_preflight=true.")
-        return {"required": False, "ok": True}
+) -> tuple[dict[str, Any], float]:
     if product.preflight_report is None:
         raise RuntimeError(f"{product.name}: live execution requires a preflight_report path.")
     if product.preflight_report.is_symlink():
@@ -1419,7 +1474,6 @@ def assert_recent_preflight(
         raise RuntimeError(
             f"{product.name}: preflight report not found: {product.preflight_report}"
         )
-
     try:
         report = json.loads(product.preflight_report.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -1431,6 +1485,13 @@ def assert_recent_preflight(
     generated_ts = report.get("generated_ts")
     if generated_ts is None:
         raise RuntimeError(f"{product.name}: preflight report has no generated_ts.")
+    age_seconds = _preflight_report_age(product, generated_ts)
+    if not report.get("ok"):
+        raise RuntimeError(f"{product.name}: preflight report failed.")
+    return report, age_seconds
+
+
+def _preflight_report_age(product: ProductConfig, generated_ts: Any) -> float:
     try:
         generated_ts_float = float(generated_ts)
     except (TypeError, ValueError) as exc:
@@ -1450,30 +1511,105 @@ def assert_recent_preflight(
             f"{product.name}: preflight report is stale "
             f"({age_seconds:.0f}s > {product.preflight_max_age_seconds}s)."
         )
-    if not report.get("ok"):
-        raise RuntimeError(f"{product.name}: preflight report failed.")
+    return age_seconds
 
+
+def _match_preflight_product(
+    product: ProductConfig,
+    report: dict[str, Any],
+    *,
+    label: str,
+    product_failure_message: str,
+) -> dict[str, Any]:
     products = report.get("products", [])
     if not isinstance(products, list):
-        raise RuntimeError(f"{product.name}: preflight report products must be a list.")
+        raise RuntimeError(f"{product.name}: {label} products must be a list.")
     matched = None
     for item in products:
         if not isinstance(item, dict):
-            raise RuntimeError(
-                f"{product.name}: preflight report products must contain JSON objects."
-            )
+            raise RuntimeError(f"{product.name}: {label} products must contain JSON objects.")
         item_product = item.get("product", {})
         if not isinstance(item_product, dict):
             raise RuntimeError(
-                f"{product.name}: preflight report product payload must be a JSON object."
+                f"{product.name}: {label} product payload must be a JSON object."
             )
         if item_product.get("name") == product.name:
             matched = item
             break
     if matched is None:
-        raise RuntimeError(f"{product.name}: preflight report does not include this product.")
+        raise RuntimeError(f"{product.name}: {label} does not include this product.")
     if not matched.get("ok"):
-        raise RuntimeError(f"{product.name}: product preflight failed.")
+        raise RuntimeError(f"{product.name}: {product_failure_message}")
+    return matched
+
+
+def _assert_preflight_artifact_binding(
+    product: ProductConfig,
+    matched: dict[str, Any],
+    *,
+    artifact: dict[str, Any] | None,
+    report_label: str,
+    artifact_label: str,
+) -> tuple[list[str], str]:
+    reported_product = _assert_preflight_product_identity(
+        product,
+        matched.get("product"),
+        label=report_label,
+    )
+    report_artifact = reported_product.get("strategies_path")
+    if report_artifact:
+        expected = product.strategies_path.resolve()
+        actual = Path(report_artifact).resolve()
+        if actual != expected:
+            raise RuntimeError(
+                f"{product.name}: {artifact_label} artifact mismatch: {actual} != {expected}."
+            )
+    reported_fingerprints = matched.get("artifact_fingerprints")
+    if not isinstance(reported_fingerprints, list) or not reported_fingerprints:
+        raise RuntimeError(f"{product.name}: {report_label} has no artifact_fingerprints.")
+    artifact_snapshot = artifact if artifact is not None else load_artifact(product.strategies_path)
+    current_artifact_digest = artifact_digest(artifact_snapshot)
+    reported_artifact_digest = matched.get("artifact_digest")
+    if not isinstance(reported_artifact_digest, str) or not reported_artifact_digest:
+        raise RuntimeError(f"{product.name}: {report_label} has no artifact_digest.")
+    if current_artifact_digest != reported_artifact_digest:
+        raise RuntimeError(
+            f"{product.name}: {artifact_label} artifact digest does not match current artifact."
+        )
+    reported_engine_digest = matched.get("execution_engine_digest")
+    current_engine_digest = execution_engine_digest()
+    if not isinstance(reported_engine_digest, str) or not reported_engine_digest:
+        raise RuntimeError(f"{product.name}: {report_label} has no execution_engine_digest.")
+    if reported_engine_digest != current_engine_digest:
+        raise RuntimeError(
+            f"{product.name}: {artifact_label} execution engine digest does not match current code."
+        )
+    current_fingerprints = [
+        strategy_fingerprint(strategy) for strategy in artifact_snapshot.get("strategies", [])
+    ]
+    if current_fingerprints != list(reported_fingerprints):
+        raise RuntimeError(
+            f"{product.name}: {artifact_label} strategy fingerprints do not match current artifact."
+        )
+    return current_fingerprints, current_engine_digest
+
+
+def assert_recent_preflight(
+    product: ProductConfig,
+    *,
+    artifact: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not product.require_preflight:
+        if product.execution_mode == "live":
+            raise RuntimeError(f"{product.name}: live execution requires require_preflight=true.")
+        return {"required": False, "ok": True}
+    report, age_seconds = _load_recent_preflight_report(product)
+    matched = _match_preflight_product(
+        product,
+        report,
+        label="preflight report",
+        product_failure_message="product preflight failed.",
+    )
     passed_checks = _assert_preflight_checks_passed(product, matched, label="preflight report")
     exchange_evidence = _assert_preflight_exchange_evidence(
         product, matched, label="preflight report"
@@ -1481,7 +1617,7 @@ def assert_recent_preflight(
     connectivity_evidence = _assert_preflight_connectivity_evidence(
         product, matched, label="preflight report"
     )
-    reported_product = _assert_preflight_product_identity(
+    _assert_preflight_product_identity(
         product,
         matched.get("product"),
         label="preflight report",
@@ -1501,41 +1637,13 @@ def assert_recent_preflight(
         matched,
         label="preflight report",
     )
-    report_artifact = reported_product.get("strategies_path")
-    if report_artifact:
-        expected = product.strategies_path.resolve()
-        actual = Path(report_artifact).resolve()
-        if actual != expected:
-            raise RuntimeError(
-                f"{product.name}: preflight artifact mismatch: {actual} != {expected}."
-            )
-    reported_fingerprints = matched.get("artifact_fingerprints")
-    if not isinstance(reported_fingerprints, list) or not reported_fingerprints:
-        raise RuntimeError(f"{product.name}: preflight report has no artifact_fingerprints.")
-    artifact_snapshot = artifact if artifact is not None else load_artifact(product.strategies_path)
-    current_artifact_digest = artifact_digest(artifact_snapshot)
-    reported_artifact_digest = matched.get("artifact_digest")
-    if not isinstance(reported_artifact_digest, str) or not reported_artifact_digest:
-        raise RuntimeError(f"{product.name}: preflight report has no artifact_digest.")
-    if current_artifact_digest != reported_artifact_digest:
-        raise RuntimeError(
-            f"{product.name}: preflight artifact digest does not match current artifact."
-        )
-    reported_engine_digest = matched.get("execution_engine_digest")
-    current_engine_digest = execution_engine_digest()
-    if not isinstance(reported_engine_digest, str) or not reported_engine_digest:
-        raise RuntimeError(f"{product.name}: preflight report has no execution_engine_digest.")
-    if reported_engine_digest != current_engine_digest:
-        raise RuntimeError(
-            f"{product.name}: preflight execution engine digest does not match current code."
-        )
-    current_fingerprints = [
-        strategy_fingerprint(strategy) for strategy in artifact_snapshot.get("strategies", [])
-    ]
-    if current_fingerprints != list(reported_fingerprints):
-        raise RuntimeError(
-            f"{product.name}: preflight strategy fingerprints do not match current artifact."
-        )
+    current_fingerprints, current_engine_digest = _assert_preflight_artifact_binding(
+        product,
+        matched,
+        artifact=artifact,
+        report_label="preflight report",
+        artifact_label="preflight",
+    )
     return {
         "required": True,
         "ok": True,
@@ -1552,100 +1660,132 @@ def assert_recent_preflight(
     }
 
 
-def assert_recent_testnet_rehearsal(
-    product: ProductConfig,
-    *,
-    artifact: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    def fail(message: str) -> None:
-        next_action = testnet_rehearsal_next_action()
-        raise RuntimeError(
-            f"{message} Next: {next_action['preflight_command']} && "
-            f"{next_action['rehearsal_command']} && {next_action['status_command']}"
-        )
+def _raise_testnet_rehearsal_gate(product: ProductConfig, message: str) -> None:
+    next_action = testnet_rehearsal_next_action()
+    raise RuntimeError(
+        f"{message} Next: {next_action['preflight_command']} && "
+        f"{next_action['rehearsal_command']} && {next_action['status_command']}"
+    )
 
+
+def _load_testnet_rehearsal_status(product: ProductConfig) -> dict[str, Any]:
     if not product.require_testnet_rehearsal:
         if (
             product.execution_mode == "live"
             and product.objective == "active_income"
             and product.market == "futures"
         ):
-            fail(
-                f"{product.name}: active-income live execution requires require_testnet_rehearsal=true."
+            _raise_testnet_rehearsal_gate(
+                product,
+                f"{product.name}: active-income live execution requires require_testnet_rehearsal=true.",
             )
         return {"required": False, "ok": True}
     if product.objective != "active_income" or product.market != "futures":
-        fail(f"{product.name}: testnet rehearsal gate is only supported for active_income futures.")
+        _raise_testnet_rehearsal_gate(
+            product,
+            f"{product.name}: testnet rehearsal gate is only supported for active_income futures.",
+        )
     if product.testnet_rehearsal_report is None:
-        fail(f"{product.name}: live execution requires a testnet_rehearsal_report path.")
+        _raise_testnet_rehearsal_gate(
+            product,
+            f"{product.name}: live execution requires a testnet_rehearsal_report path.",
+        )
     if product.testnet_rehearsal_report.is_symlink():
-        fail(
-            f"{product.name}: testnet rehearsal report must not be a symlink: {product.testnet_rehearsal_report}"
+        _raise_testnet_rehearsal_gate(
+            product,
+            f"{product.name}: testnet rehearsal report must not be a symlink: "
+            f"{product.testnet_rehearsal_report}",
         )
     status = summarize_testnet_rehearsal_report(
         product.testnet_rehearsal_report,
         max_age_seconds=product.testnet_rehearsal_max_age_seconds,
         expected_product=product,
     )
+    status["required"] = True
     if not status.get("exists"):
-        fail(
-            f"{product.name}: testnet rehearsal report not found: {product.testnet_rehearsal_report}"
+        _raise_testnet_rehearsal_gate(
+            product,
+            f"{product.name}: testnet rehearsal report not found: "
+            f"{product.testnet_rehearsal_report}",
         )
     if status.get("status") == "read_error":
         detail = f"; {status.get('error')}" if status.get("error") else ""
-        fail(f"{product.name}: testnet rehearsal gate failed: read_error{detail}")
+        _raise_testnet_rehearsal_gate(
+            product,
+            f"{product.name}: testnet rehearsal gate failed: read_error{detail}",
+        )
+    return status
+
+
+def _assert_testnet_rehearsal_status(
+    product: ProductConfig,
+    status: dict[str, Any],
+) -> None:
     if status.get("product") not in {None, product.name}:
-        fail(
-            f"{product.name}: testnet rehearsal product mismatch: {status.get('product')} != {product.name}."
+        _raise_testnet_rehearsal_gate(
+            product,
+            f"{product.name}: testnet rehearsal product mismatch: "
+            f"{status.get('product')} != {product.name}.",
         )
     if status.get("testnet") is not True:
-        fail(f"{product.name}: testnet rehearsal report was not produced on testnet.")
+        _raise_testnet_rehearsal_gate(
+            product,
+            f"{product.name}: testnet rehearsal report was not produced on testnet.",
+        )
     rehearsal_exchange = str(status.get("exchange") or "").lower()
     if rehearsal_exchange not in ACTIVE_INCOME_FUTURES_EXCHANGES:
         allowed = ", ".join(sorted(ACTIVE_INCOME_FUTURES_EXCHANGES))
-        fail(
+        _raise_testnet_rehearsal_gate(
+            product,
             f"{product.name}: testnet rehearsal exchange mismatch: "
-            f"{rehearsal_exchange or '<missing>'} not in {allowed}."
+            f"{rehearsal_exchange or '<missing>'} not in {allowed}.",
         )
     if status.get("final_position_flat") is not True:
-        fail(f"{product.name}: testnet rehearsal final position is not flat.")
-    if not status.get("ok"):
-        reason = status.get("status") or "failed"
-        error = status.get("error")
-        invalid_reasons = status.get("invalid_reasons")
-        detail = f"; {error}" if error else ""
-        if invalid_reasons:
-            detail = f"{detail}; invalid_reasons={','.join(map(str, invalid_reasons))}"
-        fail(f"{product.name}: testnet rehearsal gate failed: {reason}{detail}")
+        _raise_testnet_rehearsal_gate(
+            product,
+            f"{product.name}: testnet rehearsal final position is not flat.",
+        )
+    if status.get("ok"):
+        return
+    reason = status.get("status") or "failed"
+    error = status.get("error")
+    invalid_reasons = status.get("invalid_reasons")
+    detail = f"; {error}" if error else ""
+    if invalid_reasons:
+        detail = f"{detail}; invalid_reasons={','.join(map(str, invalid_reasons))}"
+    _raise_testnet_rehearsal_gate(
+        product,
+        f"{product.name}: testnet rehearsal gate failed: {reason}{detail}",
+    )
+
+
+def _load_embedded_testnet_preflight(product: ProductConfig) -> dict[str, Any]:
+    if product.testnet_rehearsal_report is None:  # pragma: no cover - guarded by caller
+        raise RuntimeError(f"{product.name}: testnet rehearsal report path is unavailable.")
     report = json.loads(product.testnet_rehearsal_report.read_text(encoding="utf-8"))
     preflight = report.get("preflight")
     if not isinstance(preflight, dict):
         raise RuntimeError(f"{product.name}: testnet rehearsal report has no embedded preflight.")
     if preflight.get("ok") is not True:
         raise RuntimeError(f"{product.name}: testnet rehearsal embedded preflight failed.")
-    products = preflight.get("products", [])
-    if not isinstance(products, list):
-        raise RuntimeError(f"{product.name}: testnet rehearsal preflight products must be a list.")
-    matched = None
-    for item in products:
-        if not isinstance(item, dict):
-            raise RuntimeError(
-                f"{product.name}: testnet rehearsal preflight products must contain JSON objects."
-            )
-        item_product = item.get("product", {})
-        if not isinstance(item_product, dict):
-            raise RuntimeError(
-                f"{product.name}: testnet rehearsal preflight product payload must be a JSON object."
-            )
-        if item_product.get("name") == product.name:
-            matched = item
-            break
-    if matched is None:
-        raise RuntimeError(
-            f"{product.name}: testnet rehearsal preflight does not include this product."
-        )
-    if matched.get("ok") is not True:
-        raise RuntimeError(f"{product.name}: testnet rehearsal embedded product preflight failed.")
+    return _match_preflight_product(
+        product,
+        preflight,
+        label="testnet rehearsal preflight",
+        product_failure_message="testnet rehearsal embedded product preflight failed.",
+    )
+
+
+def assert_recent_testnet_rehearsal(
+    product: ProductConfig,
+    *,
+    artifact: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    status = _load_testnet_rehearsal_status(product)
+    if not status.get("required"):
+        return status
+    _assert_testnet_rehearsal_status(product, status)
+    matched = _load_embedded_testnet_preflight(product)
     passed_checks = _assert_preflight_checks_passed(
         product, matched, label="testnet rehearsal preflight"
     )
@@ -1655,7 +1795,7 @@ def assert_recent_testnet_rehearsal(
         label="testnet rehearsal preflight",
         require_testnet=True,
     )
-    reported_product = _assert_preflight_product_identity(
+    _assert_preflight_product_identity(
         product,
         matched.get("product"),
         label="testnet rehearsal preflight",
@@ -1675,45 +1815,13 @@ def assert_recent_testnet_rehearsal(
         matched,
         label="testnet rehearsal preflight",
     )
-    report_artifact = reported_product.get("strategies_path")
-    if report_artifact:
-        expected = product.strategies_path.resolve()
-        actual = Path(report_artifact).resolve()
-        if actual != expected:
-            raise RuntimeError(
-                f"{product.name}: testnet rehearsal preflight artifact mismatch: {actual} != {expected}."
-            )
-    reported_fingerprints = matched.get("artifact_fingerprints")
-    if not isinstance(reported_fingerprints, list) or not reported_fingerprints:
-        raise RuntimeError(
-            f"{product.name}: testnet rehearsal preflight has no artifact_fingerprints."
-        )
-    artifact_snapshot = artifact if artifact is not None else load_artifact(product.strategies_path)
-    current_artifact_digest = artifact_digest(artifact_snapshot)
-    reported_artifact_digest = matched.get("artifact_digest")
-    if not isinstance(reported_artifact_digest, str) or not reported_artifact_digest:
-        raise RuntimeError(f"{product.name}: testnet rehearsal preflight has no artifact_digest.")
-    if current_artifact_digest != reported_artifact_digest:
-        raise RuntimeError(
-            f"{product.name}: testnet rehearsal preflight artifact digest does not match current artifact."
-        )
-    reported_engine_digest = matched.get("execution_engine_digest")
-    current_engine_digest = execution_engine_digest()
-    if not isinstance(reported_engine_digest, str) or not reported_engine_digest:
-        raise RuntimeError(
-            f"{product.name}: testnet rehearsal preflight has no execution_engine_digest."
-        )
-    if reported_engine_digest != current_engine_digest:
-        raise RuntimeError(
-            f"{product.name}: testnet rehearsal execution engine digest does not match current code."
-        )
-    current_fingerprints = [
-        strategy_fingerprint(strategy) for strategy in artifact_snapshot.get("strategies", [])
-    ]
-    if current_fingerprints != list(reported_fingerprints):
-        raise RuntimeError(
-            f"{product.name}: testnet rehearsal strategy fingerprints do not match current artifact."
-        )
+    current_fingerprints, current_engine_digest = _assert_preflight_artifact_binding(
+        product,
+        matched,
+        artifact=artifact,
+        report_label="testnet rehearsal preflight",
+        artifact_label="testnet rehearsal preflight",
+    )
     return {
         "required": True,
         "ok": True,
