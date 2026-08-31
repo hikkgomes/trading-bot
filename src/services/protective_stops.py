@@ -169,7 +169,9 @@ class LiveProtectiveStopService:
                 )
                 results.append(self._apply_native_status(product_id, stop, native, at))
             except Exception as exc:
-                self.stop_manager.mark_failure(stop.stop_id, reason=f"stop reconciliation failed: {exc}")
+                self.stop_manager.mark_failure(
+                    stop.stop_id, reason=f"stop reconciliation failed: {exc}"
+                )
                 self._enqueue_reduction(
                     product_id=product_id,
                     stop=stop,
@@ -206,14 +208,18 @@ class LiveProtectiveStopService:
         status = _protective_status(values)
         if status is ProtectiveOrderStatus.TRIGGERED:
             if stop.status is not StopStatus.TRIGGERED:
-                stop = self.stop_manager.triggered(stop.stop_id, triggered_at=event.exchange_timestamp)
+                stop = self.stop_manager.triggered(
+                    stop.stop_id, triggered_at=event.exchange_timestamp
+                )
             return {"reason_code": "protective_stop_triggered", "stop_id": stop.stop_id}
         if status in {
             ProtectiveOrderStatus.CANCELED,
             ProtectiveOrderStatus.EXPIRED,
             ProtectiveOrderStatus.REJECTED,
         }:
-            self.stop_manager.mark_failure(stop.stop_id, reason=f"native protective stop {status.value}")
+            self.stop_manager.mark_failure(
+                stop.stop_id, reason=f"native protective stop {status.value}"
+            )
             self._enqueue_reduction(
                 product_id=product_id,
                 stop=stop,
@@ -298,7 +304,9 @@ class LiveProtectiveStopService:
                             client_id=str(stop.native_client_id or ""),
                         )
                         if ProtectiveOrderStatus(native.status) is ProtectiveOrderStatus.OPEN:
-                            raise ProtectiveStopError("protective stop remained open after flat close")
+                            raise ProtectiveStopError(
+                                "protective stop remained open after flat close"
+                            )
                     except Exception as exc:
                         self.stop_manager.mark_failure(
                             stop.stop_id, reason=f"stop cancellation after flat close failed: {exc}"
@@ -314,9 +322,14 @@ class LiveProtectiveStopService:
                 self.stop_manager.cancel(stop.stop_id)
             return None
         for stop in stops:
-            if stop.status is StopStatus.PROTECTED and abs(stop.protected_quantity - abs(position_quantity)) > 1e-12:
+            if (
+                stop.status is StopStatus.PROTECTED
+                and abs(stop.protected_quantity - abs(position_quantity)) > 1e-12
+            ):
                 self.stop_manager.resize(stop.stop_id, quantity=abs(position_quantity))
-                return self._place(product_id, self.stop_manager.get(stop.stop_id), position_quantity, at)
+                return self._place(
+                    product_id, self.stop_manager.get(stop.stop_id), position_quantity, at
+                )
         return stops[0]
 
     def _fail_unprotected(
@@ -372,7 +385,9 @@ class LiveProtectiveStopService:
             if stop.status is not StopStatus.TRIGGERED:
                 self.stop_manager.triggered(stop.stop_id, triggered_at=at)
             return {"stop_id": stop.stop_id, "status": "triggered"}
-        self.stop_manager.mark_failure(stop.stop_id, reason=f"native protective stop {status.value}")
+        self.stop_manager.mark_failure(
+            stop.stop_id, reason=f"native protective stop {status.value}"
+        )
         self._enqueue_reduction(
             product_id=product_id,
             stop=stop,
@@ -477,11 +492,21 @@ def _exchange_symbol(venue: Any, instrument_id: str) -> str:
 
 
 def _stop_id(product_id: str, entry_order_id: str) -> str:
-    return "stop:" + canonical_hash({"product_id": product_id, "entry_order_id": entry_order_id}).removeprefix("sha256:")[:32]
+    return (
+        "stop:"
+        + canonical_hash({"product_id": product_id, "entry_order_id": entry_order_id}).removeprefix(
+            "sha256:"
+        )[:32]
+    )
 
 
 def _native_client_id(product_id: str, entry_order_id: str) -> str:
-    return "s" + canonical_hash({"product_id": product_id, "entry_order_id": entry_order_id}).removeprefix("sha256:")[:35]
+    return (
+        "s"
+        + canonical_hash({"product_id": product_id, "entry_order_id": entry_order_id}).removeprefix(
+            "sha256:"
+        )[:35]
+    )
 
 
 def _reference_price(order: OrderIntent) -> float:
@@ -514,7 +539,11 @@ def _trigger_price(order: OrderIntent) -> float:
 
 
 def _validate_trigger(side: OrderSide, trigger_price: float, reference_price: float) -> None:
-    valid = trigger_price < reference_price if side is OrderSide.BUY else trigger_price > reference_price
+    valid = (
+        trigger_price < reference_price
+        if side is OrderSide.BUY
+        else trigger_price > reference_price
+    )
     if not valid:
         raise ProtectiveStopError("protective stop trigger is on the wrong side of the entry")
 

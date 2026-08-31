@@ -71,9 +71,7 @@ class ExposureBudgetGuard:
     ) -> ExposureBudgetAssessment:
         if order.portfolio_id != str(product.get("portfolio_id") or ""):
             raise ExposureBudgetError("live order portfolio does not match product")
-        position_rows = tuple(
-            item for item in positions if item.portfolio_id == order.portfolio_id
-        )
+        position_rows = tuple(item for item in positions if item.portfolio_id == order.portfolio_id)
         order_rows = tuple(orders)
         price = _order_reference_price(order)
         equity = _account_equity(
@@ -153,9 +151,7 @@ class ExposureBudgetGuard:
         for name, limit in limits.items():
             value = abs(net) if name == "net_notional" else gross
             if value > limit + max(1e-9, abs(limit) * 1e-12):
-                raise ExposureBudgetError(
-                    f"live order exceeds {name}: {value:g} > {limit:g}"
-                )
+                raise ExposureBudgetError(f"live order exceeds {name}: {value:g} > {limit:g}")
         return assessment
 
     def enforce(self, **kwargs: Any) -> ExposureBudgetAssessment:
@@ -174,7 +170,9 @@ def _account_equity(
     balances = account_payload.get("balances")
     if not isinstance(balances, Mapping):
         raise ExposureBudgetError("live account snapshot has no balances")
-    clean = {str(key).upper(): _finite(value, field=f"balance {key}") for key, value in balances.items()}
+    clean = {
+        str(key).upper(): _finite(value, field=f"balance {key}") for key, value in balances.items()
+    }
     if product_id == "btc_accumulation" or str(account.get("market")) == "spot":
         equity = clean.get("USDT", 0.0) + clean.get("BTC", 0.0) * price
     else:
@@ -227,7 +225,9 @@ def _order_reference_price(order: OrderIntent) -> float:
     )
     for candidate in candidates:
         if candidate is not None:
-            return _finite(candidate, field=f"order {order.order_id} reference price", positive=True)
+            return _finite(
+                candidate, field=f"order {order.order_id} reference price", positive=True
+            )
     raise ExposureBudgetError(f"live order {order.order_id} has no reference price")
 
 
@@ -254,10 +254,10 @@ def _limits(
     sleeve_limits = _mapping(risk_configuration.get("sleeve"), "risk sleeve")
     assignment_cap = _positive_cap(assignment.get("capital_limit"), "assignment capital_limit")
     assignment_risk = _positive_cap(assignment.get("risk_budget"), "assignment risk_budget")
-    sleeve_cap = equity * _fraction_cap(sleeve_limits.get("maximum_fraction"), "sleeve maximum_fraction")
-    product_gross_raw = product_limits.get(
-        "maximum_gross", product_limits.get("maximum_exposure")
+    sleeve_cap = equity * _fraction_cap(
+        sleeve_limits.get("maximum_fraction"), "sleeve maximum_fraction"
     )
+    product_gross_raw = product_limits.get("maximum_gross", product_limits.get("maximum_exposure"))
     product_gross = equity * _fraction_cap(product_gross_raw, "product gross exposure")
     product_net_raw = product_limits.get("maximum_net")
     instrument_limits = _mapping(risk_configuration.get("instrument"), "risk instrument")

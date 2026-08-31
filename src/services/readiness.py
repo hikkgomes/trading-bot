@@ -583,8 +583,7 @@ def build_readiness(
                     )
             schedule_rows = connection.execute(select(platform_schedule)).mappings().all()
             activity_rows = connection.execute(
-                select(strategy_definition.c.product_id, experiment.c.submitted_at)
-                .select_from(
+                select(strategy_definition.c.product_id, experiment.c.submitted_at).select_from(
                     experiment.join(
                         strategy_version,
                         experiment.c.strategy_version_id == strategy_version.c.id,
@@ -595,15 +594,18 @@ def build_readiness(
                 )
             ).all()
             stage_activity_rows = connection.execute(
-                select(strategy_definition.c.product_id, validation_stage.c.evaluated_at)
-                .select_from(
+                select(
+                    strategy_definition.c.product_id, validation_stage.c.evaluated_at
+                ).select_from(
                     validation_stage.join(
                         experiment,
                         validation_stage.c.experiment_id == experiment.c.id,
-                    ).join(
+                    )
+                    .join(
                         strategy_version,
                         experiment.c.strategy_version_id == strategy_version.c.id,
-                    ).join(
+                    )
+                    .join(
                         strategy_definition,
                         strategy_version.c.definition_id == strategy_definition.c.id,
                     )
@@ -725,8 +727,7 @@ def build_readiness(
             name = str(row["job_name"])
             updated_at = timestamp(str(row["updated_at"]), field=f"schedule.{name}.updated_at")
             age = (
-                dt.datetime.fromisoformat(current)
-                - dt.datetime.fromisoformat(updated_at)
+                dt.datetime.fromisoformat(current) - dt.datetime.fromisoformat(updated_at)
             ).total_seconds()
             maximum_age = max(
                 maximum_heartbeat_age * 2.0,
@@ -741,10 +742,9 @@ def build_readiness(
                 "maximum_age_seconds": maximum_age,
                 "fresh": fresh,
             }
-        schedule_authority_ok = (
-            {str(row["job_name"]) for row in schedule_rows} == required_schedule_names
-            and schedule_fresh
-        )
+        schedule_authority_ok = {
+            str(row["job_name"]) for row in schedule_rows
+        } == required_schedule_names and schedule_fresh
         checks.append(
             _check(
                 "autonomous_scheduler_authority",
@@ -794,20 +794,19 @@ def build_readiness(
         progress_ok = True
         maximum_progress_age = 86_400.0
         for product_key in sorted(required_products):
-            observed_at = latest_activity.get(product_key)
-            age = (
+            latest_at = latest_activity.get(product_key)
+            progress_age = (
                 (
-                    dt.datetime.fromisoformat(current)
-                    - dt.datetime.fromisoformat(observed_at)
+                    dt.datetime.fromisoformat(current) - dt.datetime.fromisoformat(latest_at)
                 ).total_seconds()
-                if observed_at is not None
+                if latest_at is not None
                 else None
             )
-            progressed = age is not None and 0 <= age <= maximum_progress_age
+            progressed = progress_age is not None and 0 <= progress_age <= maximum_progress_age
             progress_ok = progress_ok and progressed
             progress_details[product_key] = {
-                "latest_activity_at": observed_at,
-                "age_seconds": age,
+                "latest_activity_at": latest_at,
+                "age_seconds": progress_age,
                 "maximum_age_seconds": maximum_progress_age,
                 "progressed": progressed,
             }

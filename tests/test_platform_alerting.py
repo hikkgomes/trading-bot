@@ -27,7 +27,9 @@ class FakeSink:
 def _service(tmp_path, sink=None):
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'alerts.sqlite3'}")
     database.create_schema()
-    service = SqlAlertService(database.engine, sinks=(sink,) if sink else (), default_cooldown_seconds=60)
+    service = SqlAlertService(
+        database.engine, sinks=(sink,) if sink else (), default_cooldown_seconds=60
+    )
     return database, service
 
 
@@ -84,7 +86,10 @@ def test_acknowledgement_is_an_append_only_event(tmp_path) -> None:
         )
         assert acknowledgement.event_type == "acknowledged"
         assert acknowledgement.parent_alert_id == emitted.alert_id
-        assert [item.event_type for item in service.events()] == ["control_mode_changed", "acknowledged"]
+        assert [item.event_type for item in service.events()] == [
+            "control_mode_changed",
+            "acknowledged",
+        ]
     finally:
         database.dispose()
 

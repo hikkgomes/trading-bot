@@ -503,7 +503,11 @@ def validate_job_payload(name: str, payload: Mapping[str, Any]) -> dict[str, Any
         unsigned.pop("content_hash", None)
         if content_hash != canonical_hash(unsigned):
             raise JobSchemaError("emergency reduction content_hash does not match its payload")
-        return {**dict(payload), "position_quantity": numeric_quantity, "evaluated_at": evaluated_at}
+        return {
+            **dict(payload),
+            "position_quantity": numeric_quantity,
+            "evaluated_at": evaluated_at,
+        }
     return json_value(dict(payload), field=f"{name} payload")
 
 

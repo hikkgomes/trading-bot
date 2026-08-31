@@ -68,8 +68,7 @@ class AlertSink(Protocol):
 
     name: str
 
-    def send(self, record: AlertRecord) -> None:
-        ...
+    def send(self, record: AlertRecord) -> None: ...
 
 
 class WebhookAlertSink:
@@ -150,9 +149,7 @@ class SqlAlertService:
             else _cooldown_seconds(cooldown_seconds)
         )
         previous = self._latest_emission(dedupe_key)
-        if previous is not None and _within_cooldown(
-            previous.emitted_at, emitted_at, cooldown
-        ):
+        if previous is not None and _within_cooldown(previous.emitted_at, emitted_at, cooldown):
             return AlertRecord(
                 alert_id=previous.alert_id,
                 event_type=previous.event_type,
@@ -262,8 +259,7 @@ class SqlAlertService:
         records = [
             record
             for record in self.events(dedupe_key=dedupe_key)
-            if record.event_type != "delivery_failed"
-            and record.event_type != "acknowledged"
+            if record.event_type != "delivery_failed" and record.event_type != "acknowledged"
         ]
         return records[-1] if records else None
 
@@ -377,9 +373,7 @@ def _record_from_payload(payload: Mapping[str, Any]) -> AlertRecord:
         emitted_at=timestamp(payload["emitted_at"], field="emitted_at"),
         payload=json_value(dict(payload.get("payload") or {}), field="alert payload"),
         parent_alert_id=(
-            str(payload["parent_alert_id"])
-            if payload.get("parent_alert_id") is not None
-            else None
+            str(payload["parent_alert_id"]) if payload.get("parent_alert_id") is not None else None
         ),
         suppressed=bool(payload.get("suppressed", False)),
         delivery_status=str(payload.get("delivery_status") or "persisted"),

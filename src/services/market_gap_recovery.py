@@ -109,7 +109,11 @@ class BinanceMarketGapRepair:
             "b": payload.get("bids", []),
             "a": payload.get("asks", []),
         }
-        return (self._normalise(raw, market=market, stream=f"{symbol.lower()}@depth20@100ms", request=request),)
+        return (
+            self._normalise(
+                raw, market=market, stream=f"{symbol.lower()}@depth20@100ms", request=request
+            ),
+        )
 
     def _aggregate_trades(
         self, request: Mapping[str, Any], *, market: str, symbol: str
@@ -204,7 +208,11 @@ class BinanceMarketGapRepair:
                     "x": int(row[6]) <= self.clock_ms(),
                 },
             }
-            events.append(self._normalise(raw, market=market, stream=f"{symbol.lower()}@kline_{interval}", request=request))
+            events.append(
+                self._normalise(
+                    raw, market=market, stream=f"{symbol.lower()}@kline_{interval}", request=request
+                )
+            )
         return tuple(events)
 
     def _mark_price(
@@ -223,7 +231,11 @@ class BinanceMarketGapRepair:
             "r": payload.get("lastFundingRate", 0.0),
             "T": payload.get("nextFundingTime", self.clock_ms()),
         }
-        return (self._normalise(raw, market=market, stream=f"{symbol.lower()}@markPrice@1s", request=request),)
+        return (
+            self._normalise(
+                raw, market=market, stream=f"{symbol.lower()}@markPrice@1s", request=request
+            ),
+        )
 
     def _book_ticker(
         self, request: Mapping[str, Any], *, market: str, symbol: str
@@ -241,7 +253,11 @@ class BinanceMarketGapRepair:
             "B": payload.get("bidQty", 0.0),
             "A": payload.get("askQty", 0.0),
         }
-        return (self._normalise(raw, market=market, stream=f"{symbol.lower()}@bookTicker", request=request),)
+        return (
+            self._normalise(
+                raw, market=market, stream=f"{symbol.lower()}@bookTicker", request=request
+            ),
+        )
 
     @staticmethod
     def _normalise(

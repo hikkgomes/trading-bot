@@ -1174,6 +1174,11 @@ class SqlForwardEvidenceRepository:
         objective_required = minimum_objective_excess_fraction is not None
         objective_failed = False
         if objective_required:
+            objective_threshold = float(
+                minimum_objective_excess_fraction
+                if minimum_objective_excess_fraction is not None
+                else 0.0
+            )
             expected_unit = objective_unit(product_id)
             objective_failed = (
                 expected_unit is None
@@ -1187,8 +1192,7 @@ class SqlForwardEvidenceRepository:
                         "objective_excess_fraction",
                     )
                 )
-                or float(payload.get("objective_excess_fraction", 0.0))
-                <= float(minimum_objective_excess_fraction)
+                or float(payload.get("objective_excess_fraction", 0.0)) <= objective_threshold
             )
         checks = (
             (
@@ -1869,11 +1873,8 @@ class SqlActiveStrategyAssignmentRepository:
         self, product_id: str, *, at: str | None = None
     ) -> tuple[dict[str, Any], ...]:
         with self.engine.connect() as connection:
-            statement = (
-                select(active_strategy_assignment)
-                .where(
-                    active_strategy_assignment.c.product_id == product_id,
-                )
+            statement = select(active_strategy_assignment).where(
+                active_strategy_assignment.c.product_id == product_id,
             )
             if at is not None:
                 at = timestamp(at, field="assignment timestamp")
@@ -1965,9 +1966,7 @@ class SqlActiveStrategyAssignmentRepository:
                     "active": False,
                     "assigned_at": deactivated_at,
                     "active_until": deactivated_at,
-                    "assignment_reason": non_empty(
-                        assignment_reason, field="assignment_reason"
-                    ),
+                    "assignment_reason": non_empty(assignment_reason, field="assignment_reason"),
                     "payload": existing_payload,
                 }
                 identity = _hash(event, field="assignment deactivation")

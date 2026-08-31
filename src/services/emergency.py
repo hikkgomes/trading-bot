@@ -164,7 +164,9 @@ class DatabaseEmergencyFlattenWorker:
         for position in self.positions.all():
             if position.portfolio_id != portfolio_id or abs(position.quantity) <= 1e-12:
                 continue
-            quantity = self._reduction_quantity(product_id, position.instrument_id, position.quantity)
+            quantity = self._reduction_quantity(
+                product_id, position.instrument_id, position.quantity
+            )
             if quantity <= 1e-12:
                 continue
             side = OrderSide.SELL if position.quantity > 0 else OrderSide.BUY
@@ -179,16 +181,17 @@ class DatabaseEmergencyFlattenWorker:
             }
             order_id = "emergency:" + canonical_hash(unsigned).removeprefix("sha256:")[:40]
             existing = next(
-                (
-                    order
-                    for order in self.order_manager.all()
-                    if order.order_id == order_id
-                ),
+                (order for order in self.order_manager.all() if order.order_id == order_id),
                 None,
             )
             if existing is not None:
                 results.append(
-                    {"product_id": product_id, "instrument_id": position.instrument_id, "order_id": order_id, "status": existing.status.value}
+                    {
+                        "product_id": product_id,
+                        "instrument_id": position.instrument_id,
+                        "order_id": order_id,
+                        "status": existing.status.value,
+                    }
                 )
                 continue
             intent = OrderIntent(
@@ -212,7 +215,12 @@ class DatabaseEmergencyFlattenWorker:
             self.order_manager.persist_for_submission(intent.order_id)
             venue.submit(intent)
             results.append(
-                {"product_id": product_id, "instrument_id": position.instrument_id, "order_id": order_id, "status": "submitted"}
+                {
+                    "product_id": product_id,
+                    "instrument_id": position.instrument_id,
+                    "order_id": order_id,
+                    "status": "submitted",
+                }
             )
         return results
 

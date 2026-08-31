@@ -149,7 +149,9 @@ class DatabaseControlPlane:
                 )
             except Exception:
                 pass
-        return ControlState(target, mode is not ControlMode.RUN, reason_code, changed_at, mode.value)
+        return ControlState(
+            target, mode is not ControlMode.RUN, reason_code, changed_at, mode.value
+        )
 
     def cancel_all_entry_orders(
         self,
@@ -166,9 +168,12 @@ class DatabaseControlPlane:
             requested_by=requested_by,
             changed_at=changed_at,
         )
-        control_id = "control-cancel:" + hashlib.sha256(
-            f"{state.target}|{state.changed_at}|{requested_by}".encode()
-        ).hexdigest()
+        control_id = (
+            "control-cancel:"
+            + hashlib.sha256(
+                f"{state.target}|{state.changed_at}|{requested_by}".encode()
+            ).hexdigest()
+        )
         self._enqueue_control_job(
             name="cancel_entry_orders",
             control_id=control_id,
@@ -216,7 +221,11 @@ class DatabaseControlPlane:
                 payload = dict(row["payload"])
                 target = str(payload.get("target") or "")
                 action = payload.get("action")
-                if target and target not in latest and (action in {"pause", "resume", "mode_change"}):
+                if (
+                    target
+                    and target not in latest
+                    and (action in {"pause", "resume", "mode_change"})
+                ):
                     mode = str(payload.get("mode") or "")
                     if not mode:
                         mode = (
@@ -244,7 +253,10 @@ class DatabaseControlPlane:
         return max(modes, key=_mode_rank, default=ControlMode.RUN)
 
     def blocks_new_risk(self, *, product_id: str, strategy_id: str | None = None) -> bool:
-        return self.effective_mode(product_id=product_id, strategy_id=strategy_id) is not ControlMode.RUN
+        return (
+            self.effective_mode(product_id=product_id, strategy_id=strategy_id)
+            is not ControlMode.RUN
+        )
 
     def service_is_paused(self, service: str) -> bool:
         if service in _CRITICAL_SERVICES:

@@ -2635,6 +2635,7 @@ def test_market_data_writer_persists_a_sequence_gap_repair(tmp_path: Path) -> No
         capabilities=("market_event_write", "market_data_gap_recovery"),
         observed_at=NOW,
     )
+
     def depth(sequence: int) -> MarketEvent:
         return normalise_public_event(
             market="futures",

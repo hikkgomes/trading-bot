@@ -202,9 +202,7 @@ class DatabasePlatformReport:
             bundles=research["dataset_bundles"],
             snapshots=self._rows(dataset_snapshot),
         )
-        scheduled_jobs = [
-            row for row in jobs if str(row.get("id") or "").startswith("scheduled:")
-        ]
+        scheduled_jobs = [row for row in jobs if str(row.get("id") or "").startswith("scheduled:")]
         started_job_ids = {str(row.get("job_id")) for row in attempts}
         scheduled_by_schedule = _scheduled_job_progress(scheduled_jobs, started_job_ids)
         candidate_job_ids = {
@@ -270,8 +268,7 @@ class DatabasePlatformReport:
             "forward_paper_count": len(research["forward_paper_observations"]),
             "active_forward_count": active_forward_count,
             "strategy_promotions": sum(
-                _promotion_advanced(row.get("payload"))
-                for row in research["promotion_events"]
+                _promotion_advanced(row.get("payload")) for row in research["promotion_events"]
             ),
             "first_blocked_stage": first_blocked,
             "jobs_waiting": sum(row.get("state") == "pending" for row in jobs),
@@ -300,14 +297,10 @@ class DatabasePlatformReport:
             "scheduled_versus_started_jobs": {
                 "scheduled": len(scheduled_jobs),
                 "started": len(started_job_ids & {str(row["id"]) for row in scheduled_jobs}),
-                "not_started": len(
-                    {str(row["id"]) for row in scheduled_jobs} - started_job_ids
-                ),
+                "not_started": len({str(row["id"]) for row in scheduled_jobs} - started_job_ids),
                 "by_schedule": scheduled_by_schedule,
             },
-            "schedule_states": {
-                str(row["job_name"]): str(row["state"]) for row in schedules
-            },
+            "schedule_states": {str(row["job_name"]): str(row["state"]) for row in schedules},
             "candidates_without_job_or_reason": candidates_without_job_or_reason,
         }
 
@@ -435,8 +428,12 @@ class DatabasePlatformReport:
         stale: list[dict[str, Any]] = []
         for account_id, row in sorted(latest.items()):
             age = _age_seconds(str(row["observed_at"]), now)
-            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
-            if payload.get("account_state_known") is not True or age > self.account_stale_after_seconds:
+            raw_payload = row.get("payload")
+            payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
+            if (
+                payload.get("account_state_known") is not True
+                or age > self.account_stale_after_seconds
+            ):
                 stale.append(
                     {
                         "account_id": account_id,
@@ -457,7 +454,8 @@ class DatabasePlatformReport:
         rows = self._rows(risk_snapshot, order_by=risk_snapshot.c.created_at.desc())
         latest: dict[tuple[str, str], dict[str, Any]] = {}
         for row in rows:
-            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            raw_payload = row.get("payload")
+            payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
             if payload.get("kind") != "market_data_input":
                 continue
             key = (str(payload.get("product_id") or ""), str(payload.get("instrument_id") or ""))
@@ -578,11 +576,7 @@ def _missing_stage_datasets(
         if not stage_ids:
             bundle = bundle_by_id.get(str(candidate.get("dataset_bundle_id") or ""))
             payload = bundle.get("payload") if isinstance(bundle, dict) else None
-            stage_ids = (
-                payload.get("stage_snapshot_ids", {})
-                if isinstance(payload, dict)
-                else {}
-            )
+            stage_ids = payload.get("stage_snapshot_ids", {}) if isinstance(payload, dict) else {}
         value = stage_ids.get(role)
         values = value if isinstance(value, list | tuple) else [value]
         if not values or any(item is None or str(item) not in snapshot_ids for item in values):
@@ -615,25 +609,26 @@ def _candidates_without_job_or_reason(
             metadata.get("dataset_waiting") or metadata.get("blocked_reason")
         )
         state = str(row.get("state") or "")
-        if candidate_id not in candidate_job_ids and not has_reason and state not in {
-            "completed",
-            "rejected",
-            "retired",
-        }:
+        if (
+            candidate_id not in candidate_job_ids
+            and not has_reason
+            and state
+            not in {
+                "completed",
+                "rejected",
+                "retired",
+            }
+        ):
             missing.append(candidate_id)
     return sorted(missing)
 
 
-def _latest_statuses(
-    rows: list[dict[str, Any]], *, key: str, status: str
-) -> list[dict[str, Any]]:
+def _latest_statuses(rows: list[dict[str, Any]], *, key: str, status: str) -> list[dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
     for row in rows:
         identity = str(row.get(key) or row.get("id") or "")
         previous = latest.get(identity)
-        if previous is None or int(row.get("sequence") or 0) >= int(
-            previous.get("sequence") or 0
-        ):
+        if previous is None or int(row.get("sequence") or 0) >= int(previous.get("sequence") or 0):
             latest[identity] = row
     return [
         {key: identity, "status": row.get("status"), "event_id": row.get("id")}
@@ -649,8 +644,7 @@ def _execution_authority_conflicts(
     old_services = sorted(role for role in roles if role in {"autopilot", "legacy-execution"})
     new_services = sorted(role for role in roles if role in {"execution-engine", "live-execution"})
     active_live = sum(
-        row.get("active") is True and row.get("execution_mode") == "live"
-        for row in assignments
+        row.get("active") is True and row.get("execution_mode") == "live" for row in assignments
     )
     return {
         "conflict": bool(old_services and new_services),

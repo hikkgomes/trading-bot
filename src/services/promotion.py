@@ -720,7 +720,7 @@ def decide_promotion(
             evidence,
         )
     if evidence.drawdown > policy.maximum_drawdown:
-        next_state = (
+        drawdown_next_state = (
             LifecycleState.SUSPENDED
             if current_state
             in {
@@ -734,7 +734,7 @@ def decide_promotion(
         return _decision(
             strategy_version_id,
             current_state,
-            next_state,
+            drawdown_next_state,
             False,
             "drawdown_limit",
             evaluated_at,
@@ -1183,7 +1183,8 @@ class DatabasePromotionWorker:
                         )
                     execution_mode = (
                         "live"
-                        if decision.next_state in {
+                        if decision.next_state
+                        in {
                             LifecycleState.LIVE_CANARY,
                             LifecycleState.LIVE,
                         }
@@ -1216,9 +1217,7 @@ class DatabasePromotionWorker:
                                 decision.capital_limit,
                                 evidence.risk_budget_available,
                             ),
-                            assignment_reason=(
-                                f"canonical promotion: {decision.reason_code}"
-                            ),
+                            assignment_reason=(f"canonical promotion: {decision.reason_code}"),
                             payload={
                                 "promotion_event_id": identity,
                                 "source": "canonical_promotion_worker",

@@ -223,9 +223,7 @@ def test_report_worker_alerts_on_funnel_and_live_safety_slis(tmp_path) -> None:
     result = worker.run_once(now=NOW)
 
     assert result["reason_code"] == "operator_report_written"
-    assert {
-        record.event_type for record in alerts.events()
-    } == {
+    assert {record.event_type for record in alerts.events()} == {
         "candidate_funnel_stalled",
         "research_dataset_missing",
         "research_candidate_without_job",

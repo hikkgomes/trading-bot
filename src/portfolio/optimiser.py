@@ -301,9 +301,7 @@ def _protective_stop_metadata(
 ) -> dict[str, float]:
     if price <= 0:
         raise ValueError("protective stop reference price must be positive")
-    trigger = price * (
-        1.0 - stop_fraction if signed_fraction > 0 else 1.0 + stop_fraction
-    )
+    trigger = price * (1.0 - stop_fraction if signed_fraction > 0 else 1.0 + stop_fraction)
     return {
         "reference_price": price,
         "protective_stop_price": trigger,

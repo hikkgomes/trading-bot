@@ -134,9 +134,7 @@ def registered_strategy_provenance(name: str) -> dict[str, object]:
 
     repository = Path(__file__).resolve().parents[2]
     identity_payload = _registered_strategy_identity_payload(name)
-    source_hash = "sha256:" + hashlib.sha256(
-        repr(identity_payload).encode("utf-8")
-    ).hexdigest()
+    source_hash = "sha256:" + hashlib.sha256(repr(identity_payload).encode("utf-8")).hexdigest()
     return {
         "source_hash": source_hash,
         "git_commit": _repository_commit(repository),

@@ -103,8 +103,7 @@ class PositionReturnLedger:
             for position, market_return in zip(held_positions, held_returns, strict=False)
         )
         period_turnover = tuple(
-            abs(position_values[index + 1] - position_values[index])
-            for index in range(aligned)
+            abs(position_values[index + 1] - position_values[index]) for index in range(aligned)
         )
         turnover = sum(period_turnover)
         fee_rate = _rate(self.fee_rate, field="fee_rate")
@@ -115,8 +114,7 @@ class PositionReturnLedger:
         slippage = sum(period_slippage)
         funding_values = self._funding_values(funding_rates, aligned)
         period_funding_pnl = tuple(
-            -position * rate
-            for position, rate in zip(held_positions, funding_values, strict=False)
+            -position * rate for position, rate in zip(held_positions, funding_values, strict=False)
         )
         funding_pnl = sum(period_funding_pnl)
         net_returns = tuple(

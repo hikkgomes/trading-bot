@@ -67,9 +67,7 @@ def _configuration(
         "sleeve_id": "directional",
     }
     risk = {
-        "products": {
-            "active-income": {"maximum_gross": product_gross, "maximum_net": 1.0}
-        },
+        "products": {"active-income": {"maximum_gross": product_gross, "maximum_net": 1.0}},
         "accounts": {"futures-account": {"maximum_margin_fraction": account_margin}},
         "sleeve": {"maximum_fraction": sleeve_fraction},
         "instrument": {"maximum_fraction": instrument_fraction},
@@ -113,7 +111,14 @@ def _assess(guard: ExposureBudgetGuard, product, account, assignment, risk, snap
 
 @pytest.mark.parametrize(
     "keyword",
-    ("assignment_capital_notional", "assignment_risk_notional", "sleeve_notional", "product_gross_notional", "instrument_notional", "account_margin_notional"),
+    (
+        "assignment_capital_notional",
+        "assignment_risk_notional",
+        "sleeve_notional",
+        "product_gross_notional",
+        "instrument_notional",
+        "account_margin_notional",
+    ),
 )
 def test_live_budget_debits_open_and_pending_exposure(keyword: str) -> None:
     limits = {

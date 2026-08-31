@@ -105,5 +105,8 @@ def test_emergency_flatten_is_reduce_only_and_idempotent_after_restart(tmp_path)
     assert restarted.run_once(now=NOW)["reason_code"] == "emergency_queue_empty"
     assert len(venue.submitted) == 1
     with database.engine.connect() as connection:
-        assert connection.execute(select(job.c.state).where(job.c.id == "flatten-1")).scalar_one() == "completed"
+        assert (
+            connection.execute(select(job.c.state).where(job.c.id == "flatten-1")).scalar_one()
+            == "completed"
+        )
     database.dispose()

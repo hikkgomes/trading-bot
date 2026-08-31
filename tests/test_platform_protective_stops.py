@@ -156,7 +156,10 @@ def test_stop_failure_is_durable_and_latches_unprotected_state() -> None:
     service.prepare_entry("active_income", order, NOW)
     with pytest.raises(ProtectiveStopError, match="exchange unavailable"):
         service.on_fill("active_income", order, 1.0, NOW)
-    assert manager.get(manager.for_entry_order(order.order_id)[0].stop_id).status is StopStatus.CONFIRMATION_FAILED
+    assert (
+        manager.get(manager.for_entry_order(order.order_id)[0].stop_id).status
+        is StopStatus.CONFIRMATION_FAILED
+    )
 
 
 def test_unknown_algo_update_is_not_silently_ignored() -> None:
@@ -167,7 +170,10 @@ def test_unknown_algo_update_is_not_silently_ignored() -> None:
         exchange_timestamp=NOW,
         receive_timestamp=NOW,
         sequence=1,
-        payload={"event": "ALGO_UPDATE", "data": {"a": {"s": "BTCUSDT", "aid": "unknown", "algoStatus": "TRIGGERED"}}},
+        payload={
+            "event": "ALGO_UPDATE",
+            "data": {"a": {"s": "BTCUSDT", "aid": "unknown", "algoStatus": "TRIGGERED"}},
+        },
     )
     result = service.on_algo_update("active_income", event)
     assert result["reason_code"] == "unknown_protective_algo_update"

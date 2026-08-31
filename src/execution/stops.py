@@ -77,7 +77,9 @@ class ProtectiveStop:
         if self.protected_quantity < 0 or self.protected_quantity > self.quantity + 1e-12:
             raise ValueError("protected quantity must be between zero and stop quantity")
         if self.failure_reason is not None:
-            object.__setattr__(self, "failure_reason", non_empty(self.failure_reason, field="failure_reason"))
+            object.__setattr__(
+                self, "failure_reason", non_empty(self.failure_reason, field="failure_reason")
+            )
 
     def is_triggered_by(self, price: float) -> bool:
         if self.status not in {

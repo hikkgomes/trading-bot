@@ -155,9 +155,9 @@ def plan_orders(
                 decided_at=decided_at,
                 order_type=order_type,
                 limit_price=float(limit_price) if limit_price is not None else None,
-                reference_price=price if price > 0 else (
-                    float(limit_price) if limit_price is not None else None
-                ),
+                reference_price=price
+                if price > 0
+                else (float(limit_price) if limit_price is not None else None),
                 depends_on_order_id=(reversal_close_id if phase == "open_after_reversal" else None),
             )
             intents.append(intent)

@@ -390,11 +390,7 @@ def _returns(values: list[float]) -> list[float]:
 def _correlations_from_returns(
     returns: Mapping[str, list[float]],
 ) -> dict[str, dict[str, float]]:
-    result = {
-        key: {key: 1.0}
-        for key, values in returns.items()
-        if len(values) >= 2
-    }
+    result = {key: {key: 1.0} for key, values in returns.items() if len(values) >= 2}
     keys = sorted(returns)
     for index, left in enumerate(keys):
         for right in keys[index + 1 :]:

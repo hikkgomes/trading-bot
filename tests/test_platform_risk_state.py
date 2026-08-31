@@ -75,9 +75,7 @@ def test_risk_measurements_use_ledger_marks_and_pending_orders(tmp_path) -> None
         account={"paper_starting_balances": {"USDT": 10_000.0}},
         balances={"USDT": 9_800.0},
         positions={"BTCUSDT": 1.0},
-        open_orders=(
-            {"instrument_id": "BTCUSDT", "quantity": 1.0, "price": 99.0},
-        ),
+        open_orders=({"instrument_id": "BTCUSDT", "quantity": 1.0, "price": 99.0},),
         market={
             "BTCUSDT": {
                 "price": 99.0,

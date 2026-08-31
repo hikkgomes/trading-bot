@@ -53,7 +53,10 @@ def test_strategy_suspend_has_precedence_and_resume_requires_confirmation(tmp_pa
             requested_by="operator",
             changed_at=LATER,
         )
-        assert control.effective_mode(product_id="active_income", strategy_id="strategy-1") is ControlMode.SUSPENDED
+        assert (
+            control.effective_mode(product_id="active_income", strategy_id="strategy-1")
+            is ControlMode.SUSPENDED
+        )
         with pytest.raises(PermissionError, match="confirmation"):
             control.set_mode(
                 target="global",
