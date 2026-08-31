@@ -88,7 +88,8 @@
   },
   "alerting": {
     "enabled": true,
-    "sink": "existing_autopilot_alerts"
+    "sink": "existing_autopilot_alerts",
+    "minimum_valid_screenings_before_progress": 10
   },
   "backup": {
     "postgresql_schedule": "hourly",

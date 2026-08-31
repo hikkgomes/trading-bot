@@ -397,6 +397,7 @@ class DatabasePlatformReport:
         jobs = self._rows(job, order_by=job.c.available_at)
         account_authority = self._stale_account_authority(now)
         market_data = self._stale_market_data(now)
+        missing_risk_data = self._missing_risk_data()
         recovery = self._unresolved_recovery()
         authority_conflicts = _execution_authority_conflicts(
             self._rows(worker), self._rows(active_strategy_assignment)
@@ -414,6 +415,7 @@ class DatabasePlatformReport:
                 "unresolved_recovery": recovery,
                 "stale_account_authority": account_authority,
                 "stale_market_data": market_data,
+                "missing_risk_data": missing_risk_data,
                 "execution_authority_conflicts": authority_conflicts,
             },
         }
@@ -500,6 +502,29 @@ class DatabasePlatformReport:
             "orders": recovery_orders,
             "protective_stops": failed_stops,
         }
+
+    def _missing_risk_data(self) -> dict[str, Any]:
+        missing: list[dict[str, Any]] = []
+        for row in self._rows(risk_snapshot, order_by=risk_snapshot.c.created_at.desc()):
+            payload = row.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            if payload.get("kind") != "canonical_portfolio_risk_state":
+                continue
+            values = payload.get("risk_data_missing")
+            if payload.get("risk_data_available") is False or values:
+                missing.append(
+                    {
+                        "snapshot_id": row["id"],
+                        "product_id": payload.get("product_id"),
+                        "observed_at": payload.get("observed_at", row.get("created_at")),
+                        "risk_data_available": payload.get("risk_data_available"),
+                        "risk_data_missing": list(values)
+                        if isinstance(values, list | tuple)
+                        else [],
+                    }
+                )
+        return {"count": len(missing), "snapshots": missing}
 
     def _count(self, table) -> int:
         with self.engine.connect() as connection:

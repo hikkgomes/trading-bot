@@ -38,7 +38,7 @@
   "network": {"transport": "local"},
   "logging": {"format": "json", "level": "INFO"},
   "metrics": {"bind": "127.0.0.1:9108", "heartbeat_seconds": 15, "stale_after_seconds": 60},
-  "alerting": {"enabled": true, "sink": "existing_autopilot_alerts"},
+  "alerting": {"enabled": true, "sink": "existing_autopilot_alerts", "minimum_valid_screenings_before_progress": 10},
   "backup": {"postgresql_schedule": "hourly", "parquet_schedule": "daily", "retention_days": 30, "restore_test_schedule": "weekly"},
   "resource_limits": {"memory_mb": 8192, "heavy_compute_slots": 1, "research_job_memory_mb": 3072, "numerical_threads": 2}
 }

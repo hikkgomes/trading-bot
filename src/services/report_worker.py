@@ -28,7 +28,7 @@ class DatabaseReportWorker:
         account_stale_after_seconds: int = 60,
         market_data_stale_after_seconds: int = 5,
         alerts: SqlAlertService | None = None,
-        candidate_progress_after_seconds: int = 3_600,
+        minimum_valid_screenings_before_progress: int = 10,
     ) -> None:
         self.report = DatabasePlatformReport(
             engine,
@@ -40,9 +40,9 @@ class DatabaseReportWorker:
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
         self.alerts = alerts
-        if candidate_progress_after_seconds <= 0:
-            raise ValueError("candidate progress threshold must be positive")
-        self.candidate_progress_after_seconds = candidate_progress_after_seconds
+        if minimum_valid_screenings_before_progress <= 0:
+            raise ValueError("minimum valid screenings threshold must be positive")
+        self.minimum_valid_screenings_before_progress = minimum_valid_screenings_before_progress
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         now = timestamp(now, field="now")
@@ -105,14 +105,6 @@ class DatabaseReportWorker:
             "waiting_for_dataset:robustness",
             "waiting_for_dataset:protected_holdout",
         }
-        blocking_age = max(
-            (
-                float(values.get("oldest_seconds", 0.0))
-                for state, values in age_by_state.items()
-                if state in blocking_states and isinstance(values, dict)
-            ),
-            default=0.0,
-        )
         progressed = sum(
             int(values.get("count", 0))
             for state, values in age_by_state.items()
@@ -120,8 +112,9 @@ class DatabaseReportWorker:
         )
         if (
             int(funnel.get("candidates_generated", 0)) > 0
+            and int(funnel.get("candidates_compiled", 0))
+            >= self.minimum_valid_screenings_before_progress
             and progressed == 0
-            and blocking_age >= self.candidate_progress_after_seconds
         ):
             emitted.append(
                 self._emit(
@@ -131,7 +124,10 @@ class DatabaseReportWorker:
                     target="research",
                     message="no research candidate has reached development",
                     now=now,
-                    payload={"oldest_blocking_candidate_seconds": blocking_age},
+                    payload={
+                        "valid_screenings": int(funnel.get("candidates_compiled", 0)),
+                        "minimum_valid_screenings": self.minimum_valid_screenings_before_progress,
+                    },
                 )
             )
         if int(funnel.get("missing_stage_dataset_count", 0)) > 0:
@@ -209,6 +205,19 @@ class DatabaseReportWorker:
                     message="market data authority is stale",
                     now=now,
                     payload={"stale_market_data": stale_market},
+                )
+            )
+        missing_risk = slis.get("missing_risk_data", {})
+        if int(missing_risk.get("count", 0)) > 0:
+            emitted.append(
+                self._emit(
+                    event_type="risk_state_data_missing",
+                    severity=AlertSeverity.CRITICAL,
+                    dedupe_key="risk:state-data-missing",
+                    target="portfolio-state-service",
+                    message="portfolio risk state contains unavailable measurements",
+                    now=now,
+                    payload={"missing_risk_data": missing_risk},
                 )
             )
         conflicts = slis.get("execution_authority_conflicts", {})

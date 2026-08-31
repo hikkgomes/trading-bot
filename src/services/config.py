@@ -178,6 +178,16 @@ class PlatformConfig:
         ]
         if set(domain_services) != expected or len(domain_services) != len(expected):
             raise ValueError("each service must belong to exactly one security domain")
+        alerting = _mapping(data.get("alerting"), field="platform.alerting")
+        minimum_screenings = alerting.get("minimum_valid_screenings_before_progress", 10)
+        if (
+            not isinstance(minimum_screenings, int)
+            or isinstance(minimum_screenings, bool)
+            or minimum_screenings <= 0
+        ):
+            raise ValueError(
+                "platform.alerting.minimum_valid_screenings_before_progress must be positive"
+            )
         return cls(
             schema=_string(data.get("schema"), field="platform.schema"),
             nodes=nodes,
@@ -189,7 +199,7 @@ class PlatformConfig:
             network=_mapping(data.get("network"), field="platform.network"),
             logging=_mapping(data.get("logging"), field="platform.logging"),
             metrics=_mapping(data.get("metrics"), field="platform.metrics"),
-            alerting=_mapping(data.get("alerting"), field="platform.alerting"),
+            alerting=alerting,
             backup=_mapping(data.get("backup"), field="platform.backup"),
             resource_limits=_mapping(
                 data.get("resource_limits", {}), field="platform.resource_limits"

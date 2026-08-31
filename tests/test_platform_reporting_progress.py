@@ -193,13 +193,14 @@ def test_report_worker_alerts_on_funnel_and_live_safety_slis(tmp_path) -> None:
         engine=database.engine,
         root=tmp_path / "reports",
         alerts=alerts,
-        candidate_progress_after_seconds=60,
+        minimum_valid_screenings_before_progress=10,
     )
     worker.report.build = lambda **_kwargs: {
         "schema": "platform.operator_report/v1",
         "research": {
             "funnel": {
                 "candidates_generated": 1,
+                "candidates_compiled": 10,
                 "candidate_age_by_state": {"queued": {"count": 1, "oldest_seconds": 120}},
                 "missing_stage_dataset_count": 1,
                 "missing_stage_datasets": {"development": 1},
@@ -213,6 +214,7 @@ def test_report_worker_alerts_on_funnel_and_live_safety_slis(tmp_path) -> None:
                 "unresolved_recovery": {"count": 1},
                 "stale_account_authority": {"count": 1},
                 "stale_market_data": {"count": 1},
+                "missing_risk_data": {"count": 1, "snapshots": []},
                 "execution_authority_conflicts": {"conflict": True},
             }
         },
@@ -231,7 +233,8 @@ def test_report_worker_alerts_on_funnel_and_live_safety_slis(tmp_path) -> None:
         "live_recovery_required",
         "account_authority_stale",
         "market_data_stale",
+        "risk_state_data_missing",
         "execution_authority_conflict",
     }
-    assert len(result["alert_ids"]) == 8
+    assert len(result["alert_ids"]) == 9
     database.dispose()
