@@ -2508,20 +2508,22 @@ def _strict_flatten_number(
     return number
 
 
-def _validated_futures_flatten_intent(
-    product: ProductConfig,
+def _validate_flatten_intent_mapping(
     raw: Any,
-    *,
-    position: dict[str, Any],
+    keys: frozenset[str],
 ) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise RuntimeError("flatten_intent must be an object")
-    missing = sorted(FUTURES_FLATTEN_INTENT_KEYS - set(raw))
-    unexpected = sorted(set(raw) - FUTURES_FLATTEN_INTENT_KEYS)
+    missing = sorted(keys - set(raw))
+    unexpected = sorted(set(raw) - keys)
     if missing:
         raise RuntimeError(f"flatten_intent is missing required key(s): {', '.join(missing)}")
     if unexpected:
         raise RuntimeError(f"flatten_intent has unexpected key(s): {', '.join(unexpected)}")
+    return raw
+
+
+def _futures_flatten_header(product: ProductConfig, raw: dict[str, Any]) -> dict[str, Any]:
     if raw.get("version") != 1:
         raise RuntimeError("flatten_intent.version must be 1")
     phase = raw.get("phase")
@@ -2550,6 +2552,23 @@ def _validated_futures_flatten_intent(
         raise RuntimeError("flatten_intent.client_id is unsafe")
     qty = _strict_flatten_number(raw.get("qty"), field="qty", positive=True)
     _strict_flatten_number(raw.get("created_ts"), field="created_ts", positive=True)
+    return {
+        "phase": phase,
+        "strategy_id": strategy_id,
+        "fingerprint": fingerprint,
+        "client_id": client_id,
+        "qty": qty,
+        "submission_kind": submission_kind,
+    }
+
+
+def _futures_flatten_position_evidence(
+    product: ProductConfig,
+    raw: dict[str, Any],
+    *,
+    position: dict[str, Any],
+    qty: float,
+) -> dict[str, Any]:
     position_digest = raw.get("position_digest")
     expected_digest = _flatten_state_digest(position, label="Emergency flatten position")
     if position_digest != expected_digest:
@@ -2582,76 +2601,141 @@ def _validated_futures_flatten_intent(
         field="quote_balance_before",
         non_negative=True,
     )
+    return {
+        "position_digest": position_digest,
+        "position_before": position_before,
+        "before_qty": before_qty,
+        "expected_side": expected_side,
+        "qty_tolerance": qty_tolerance,
+        "quote_before": quote_before,
+    }
 
+
+def _futures_flatten_fill_evidence(
+    product: ProductConfig,
+    raw: dict[str, Any],
+    *,
+    expected_side: OrderSide,
+    qty: float,
+    qty_tolerance: float,
+    quote_before: float,
+) -> None:
     fill = raw.get("fill")
     position_after = raw.get("position_after")
     quote_after = raw.get("quote_balance_after")
     account_delta = raw.get("realized_account_delta")
-    proven_ts = raw.get("proven_ts")
-    if phase == "prepared":
-        if any(
-            value is not None
-            for value in (fill, position_after, quote_after, account_delta, proven_ts)
-        ):
-            raise RuntimeError("prepared flatten_intent contains unproven broker evidence")
-    else:
-        if not isinstance(fill, dict) or set(fill) != {
-            "symbol",
-            "side",
-            "qty",
-            "price",
-            "fee",
-            "timestamp",
-        }:
-            raise RuntimeError("flatten_intent.fill is invalid")
-        if fill.get("symbol") != product.symbol or fill.get("side") != expected_side.value:
-            raise RuntimeError("flatten_intent.fill identity is invalid")
-        fill_qty = _strict_flatten_number(fill.get("qty"), field="fill.qty", positive=True)
-        _strict_flatten_number(fill.get("price"), field="fill.price", positive=True)
-        _strict_flatten_number(fill.get("fee"), field="fill.fee", non_negative=True)
-        _strict_flatten_number(fill.get("timestamp"), field="fill.timestamp", positive=True)
-        if abs(fill_qty - qty) > qty_tolerance:
-            raise RuntimeError("flatten_intent.fill qty does not match its order")
-        if not isinstance(position_after, dict) or set(position_after) != {
-            "symbol",
-            "qty",
-            "avg_price",
-        }:
-            raise RuntimeError("flatten_intent.position_after is invalid")
-        if position_after.get("symbol") != product.symbol:
-            raise RuntimeError("flatten_intent.position_after symbol is invalid")
-        after_qty = _strict_flatten_number(position_after.get("qty"), field="position_after.qty")
-        after_avg = _strict_flatten_number(
-            position_after.get("avg_price"),
-            field="position_after.avg_price",
-            non_negative=True,
-        )
-        if abs(after_qty) >= 1e-12 or after_avg != 0:
-            raise RuntimeError("flatten_intent does not prove a flat broker position")
-        quote_after_number = _strict_flatten_number(
-            quote_after,
-            field="quote_balance_after",
-            non_negative=True,
-        )
-        delta_number = _strict_flatten_number(
-            account_delta,
-            field="realized_account_delta",
-        )
-        delta_tolerance = max(abs(quote_before) * 1e-12, 1e-9)
-        if abs((quote_after_number - quote_before) - delta_number) > delta_tolerance:
-            raise RuntimeError("flatten_intent realized account delta is inconsistent")
-        _strict_flatten_number(proven_ts, field="proven_ts", positive=True)
+    if not isinstance(fill, dict) or set(fill) != {
+        "symbol",
+        "side",
+        "qty",
+        "price",
+        "fee",
+        "timestamp",
+    }:
+        raise RuntimeError("flatten_intent.fill is invalid")
+    if fill.get("symbol") != product.symbol or fill.get("side") != expected_side.value:
+        raise RuntimeError("flatten_intent.fill identity is invalid")
+    fill_qty = _strict_flatten_number(fill.get("qty"), field="fill.qty", positive=True)
+    _strict_flatten_number(fill.get("price"), field="fill.price", positive=True)
+    _strict_flatten_number(fill.get("fee"), field="fill.fee", non_negative=True)
+    _strict_flatten_number(fill.get("timestamp"), field="fill.timestamp", positive=True)
+    if abs(fill_qty - qty) > qty_tolerance:
+        raise RuntimeError("flatten_intent.fill qty does not match its order")
+    if not isinstance(position_after, dict) or set(position_after) != {
+        "symbol",
+        "qty",
+        "avg_price",
+    }:
+        raise RuntimeError("flatten_intent.position_after is invalid")
+    if position_after.get("symbol") != product.symbol:
+        raise RuntimeError("flatten_intent.position_after symbol is invalid")
+    after_qty = _strict_flatten_number(position_after.get("qty"), field="position_after.qty")
+    after_avg = _strict_flatten_number(
+        position_after.get("avg_price"),
+        field="position_after.avg_price",
+        non_negative=True,
+    )
+    if abs(after_qty) >= 1e-12 or after_avg != 0:
+        raise RuntimeError("flatten_intent does not prove a flat broker position")
+    quote_after_number = _strict_flatten_number(
+        quote_after,
+        field="quote_balance_after",
+        non_negative=True,
+    )
+    delta_number = _strict_flatten_number(
+        account_delta,
+        field="realized_account_delta",
+    )
+    delta_tolerance = max(abs(quote_before) * 1e-12, 1e-9)
+    if abs((quote_after_number - quote_before) - delta_number) > delta_tolerance:
+        raise RuntimeError("flatten_intent realized account delta is inconsistent")
+    _strict_flatten_number(raw.get("proven_ts"), field="proven_ts", positive=True)
 
-    if submission_kind == "reduce_only_market":
+
+def _validate_futures_flatten_phase_evidence(
+    product: ProductConfig,
+    raw: dict[str, Any],
+    *,
+    phase: str,
+    expected_side: OrderSide,
+    qty: float,
+    qty_tolerance: float,
+    quote_before: float,
+) -> None:
+    evidence = (
+        raw.get("fill"),
+        raw.get("position_after"),
+        raw.get("quote_balance_after"),
+        raw.get("realized_account_delta"),
+        raw.get("proven_ts"),
+    )
+    if phase == "prepared":
+        if any(value is not None for value in evidence):
+            raise RuntimeError("prepared flatten_intent contains unproven broker evidence")
+        return
+    _futures_flatten_fill_evidence(
+        product,
+        raw,
+        expected_side=expected_side,
+        qty=qty,
+        qty_tolerance=qty_tolerance,
+        quote_before=quote_before,
+    )
+
+
+def _validated_futures_flatten_intent(
+    product: ProductConfig,
+    raw: Any,
+    *,
+    position: dict[str, Any],
+) -> dict[str, Any]:
+    raw = _validate_flatten_intent_mapping(raw, FUTURES_FLATTEN_INTENT_KEYS)
+    header = _futures_flatten_header(product, raw)
+    position_evidence = _futures_flatten_position_evidence(
+        product,
+        raw,
+        position=position,
+        qty=header["qty"],
+    )
+    _validate_futures_flatten_phase_evidence(
+        product,
+        raw,
+        phase=header["phase"],
+        expected_side=position_evidence["expected_side"],
+        qty=header["qty"],
+        qty_tolerance=position_evidence["qty_tolerance"],
+        quote_before=position_evidence["quote_before"],
+    )
+    if header["submission_kind"] == "reduce_only_market":
         expected_client_id = _futures_flatten_client_id(
-            strategy_id=strategy_id,
+            strategy_id=header["strategy_id"],
             symbol=product.symbol,
-            side=expected_side,
-            qty=qty,
-            position_digest=position_digest,
-            broker_account_fingerprint=fingerprint,
+            side=position_evidence["expected_side"],
+            qty=header["qty"],
+            position_digest=position_evidence["position_digest"],
+            broker_account_fingerprint=header["fingerprint"],
         )
-        if client_id != expected_client_id:
+        if header["client_id"] != expected_client_id:
             raise RuntimeError("flatten_intent.client_id does not match its deterministic intent")
     return dict(raw)
 
