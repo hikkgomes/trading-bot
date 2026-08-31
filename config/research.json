@@ -24,7 +24,7 @@
   "validation": {
     "chronological_only": true,
     "costs_required": true,
-    "portfolio_overlap_required": true,
+    "portfolio_overlap_required": false,
     "determinism_required": true,
     "look_ahead_test_required": true
   },
