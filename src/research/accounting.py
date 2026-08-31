@@ -12,7 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from src.domain._codec import canonical_hash, timestamp
@@ -639,6 +639,7 @@ class BtcAccumulationAccounting:
     def _normalise_marks(
         marks: Iterable[Mapping[str, Any]] | Mapping[str, Any],
     ) -> tuple[tuple[str, float, Mapping[str, Any]], ...]:
+        source: tuple[Mapping[str, Any], ...]
         if isinstance(marks, Mapping):
             source = tuple({"timestamp": key, "price": value} for key, value in marks.items())
         else:
@@ -692,6 +693,316 @@ class FuturesAccountingReport:
         return self.net_pnl
 
 
+@dataclass(frozen=True)
+class _FuturesEvaluationOptions:
+    starting_cash: float
+    leverage: float
+    maintenance: float
+    participation: float
+    funding_schedule: frozenset[str] | None
+    margin_limit: float
+    target_value: float | None
+    target_by_symbol: Mapping[str, float]
+    margin_mode: str
+    liquidation_buffer: float
+
+
+@dataclass
+class _FuturesEvaluationState:
+    cash: float
+    positions: dict[str, tuple[float, float]]
+    marks: dict[str, float]
+    realised: float = 0.0
+    funding_pnl: float = 0.0
+    fees: float = 0.0
+    spread: float = 0.0
+    slippage: float = 0.0
+    fills: int = 0
+    partials: int = 0
+    capacity_violations: int = 0
+    max_leverage: float = 0.0
+    observed_max_margin_fraction: float = 0.0
+    liquidation: bool = False
+    observations: int = 0
+    turnover_notional: float = 0.0
+    receipts: list[Mapping[str, Any]] = field(default_factory=list)
+
+
+def _prepare_futures_evaluation(
+    *,
+    events: Iterable[Mapping[str, Any]],
+    initial_cash: float,
+    leverage: float,
+    maintenance_margin_fraction: float,
+    max_participation_fraction: float,
+    funding_timestamps: Iterable[str] | None,
+    max_margin_fraction: float,
+    target_notional: float | Mapping[str, float] | None,
+    margin_mode: str,
+    liquidation_buffer_fraction: float,
+) -> tuple[
+    _FuturesEvaluationOptions, tuple[tuple[str, Mapping[str, Any]], ...], _FuturesEvaluationState
+]:
+    starting_cash = _number(initial_cash, field_name="initial_cash", minimum=0.0)
+    leverage_value = _number(leverage, field_name="leverage", minimum=1e-12)
+    maintenance = _number(
+        maintenance_margin_fraction,
+        field_name="maintenance_margin_fraction",
+        minimum=0.0,
+    )
+    participation = _number(
+        max_participation_fraction,
+        field_name="max_participation_fraction",
+        minimum=0.0,
+    )
+    funding_schedule = _funding_schedule(funding_timestamps)
+    margin_limit = _number(max_margin_fraction, field_name="max_margin_fraction", minimum=0.0)
+    if margin_limit > 1.0:
+        raise ProductAccountingError("max_margin_fraction must be at most 1")
+    mode = str(margin_mode).strip().casefold()
+    if mode not in {"isolated", "cross"}:
+        raise ProductAccountingError("margin_mode must be isolated or cross")
+    liquidation_buffer = _number(
+        liquidation_buffer_fraction,
+        field_name="liquidation_buffer_fraction",
+        minimum=0.0,
+    )
+    if liquidation_buffer > 1.0:
+        raise ProductAccountingError("liquidation_buffer_fraction must be at most 1")
+    target_value, target_by_symbol = _target_notionals(target_notional)
+    ordered = _events(events)
+    if not ordered:
+        raise ProductAccountingError("futures accounting requires events")
+    options = _FuturesEvaluationOptions(
+        starting_cash=starting_cash,
+        leverage=leverage_value,
+        maintenance=maintenance,
+        participation=participation,
+        funding_schedule=funding_schedule,
+        margin_limit=margin_limit,
+        target_value=target_value,
+        target_by_symbol=target_by_symbol,
+        margin_mode=mode,
+        liquidation_buffer=liquidation_buffer,
+    )
+    state = _FuturesEvaluationState(cash=starting_cash, positions={}, marks={})
+    return options, ordered, state
+
+
+def _funding_schedule(values: Iterable[str] | None) -> frozenset[str] | None:
+    if values is None:
+        return None
+    if isinstance(values, str):
+        raise ProductAccountingError("funding_timestamps must be an iterable of timestamps")
+    return frozenset(timestamp(str(value), field="funding_timestamps[]") for value in values)
+
+
+def _target_notionals(
+    value: float | Mapping[str, float] | None,
+) -> tuple[float | None, dict[str, float]]:
+    if isinstance(value, Mapping):
+        return None, {
+            str(symbol): _number(amount, field_name=f"target_notional[{symbol}]", minimum=0.0)
+            for symbol, amount in value.items()
+        }
+    if value is None:
+        return None, {}
+    return _number(value, field_name="target_notional", minimum=0.0), {}
+
+
+def _apply_futures_fill(
+    state: _FuturesEvaluationState,
+    options: _FuturesEvaluationOptions,
+    event: Mapping[str, Any],
+) -> None:
+    side = str(event.get("side", "")).casefold()
+    if side not in {"buy", "sell"}:
+        raise ProductAccountingError("futures fill side must be buy or sell")
+    quantity = _quantity(event)
+    price = _price(event)
+    signed = quantity if side == "buy" else -quantity
+    symbol = str(event.get("instrument_id", event.get("symbol", "BTCUSDT")))
+    old_quantity, old_entry = state.positions.get(symbol, (0.0, 0.0))
+    realised_delta, new_quantity, new_entry = FuturesIncomeAccounting._apply_fill(
+        old_quantity, old_entry, signed, price
+    )
+    state.realised += realised_delta
+    state.positions[symbol] = (new_quantity, new_entry)
+    state.marks[symbol] = price
+    state.turnover_notional += quantity * price
+    state.cash += realised_delta
+    fill_fee = _fee(event)
+    state.fees += fill_fee
+    state.cash -= fill_fee
+    spread_delta = FuturesIncomeAccounting._cost(
+        event, signed, price, "expected_price", "spread_cost"
+    )
+    slippage_delta = FuturesIncomeAccounting._cost(
+        event, signed, price, "reference_price", "slippage_cost"
+    )
+    state.spread += spread_delta
+    state.slippage += slippage_delta
+    state.cash -= spread_delta + slippage_delta
+    state.fills += 1
+    requested = event.get("requested_quantity", event.get("order_quantity"))
+    if requested is not None and quantity + 1e-12 < _number(
+        requested, field_name="requested_quantity", minimum=0.0
+    ):
+        state.partials += 1
+    visible_depth = event.get("visible_depth", event.get("available_depth"))
+    if visible_depth is not None and options.participation > 0:
+        depth = _number(visible_depth, field_name="visible_depth", minimum=0.0)
+        if quantity > depth * options.participation + 1e-12:
+            state.capacity_violations += 1
+
+
+def _apply_futures_funding(
+    state: _FuturesEvaluationState,
+    options: _FuturesEvaluationOptions,
+    observed_at: str,
+    event: Mapping[str, Any],
+) -> tuple[bool, float]:
+    symbol = str(event.get("instrument_id", event.get("symbol", "BTCUSDT")))
+    mark = _price(event, field_name="mark_price")
+    state.marks[symbol] = mark
+    quantity = state.positions.get(symbol, (0.0, 0.0))[0]
+    rate = _number(event.get("funding_rate", event.get("rate", 0.0)), field_name="funding_rate")
+    applied = options.funding_schedule is None or observed_at in options.funding_schedule
+    if not applied:
+        state.observations += 1
+        return False, 0.0
+    amount = -quantity * mark * rate
+    if event.get("funding_pnl") is not None:
+        amount = _number(event["funding_pnl"], field_name="funding_pnl")
+    state.funding_pnl += amount
+    state.cash += amount
+    state.observations += 1
+    return True, amount
+
+
+def _apply_futures_event(
+    state: _FuturesEvaluationState,
+    options: _FuturesEvaluationOptions,
+    observed_at: str,
+    event: Mapping[str, Any],
+) -> tuple[str, str, bool | None, float]:
+    kind = _event_kind(event)
+    symbol = str(event.get("instrument_id", event.get("symbol", "BTCUSDT")))
+    funding_applied: bool | None = None
+    funding_amount = 0.0
+    if kind in {"fill", "trade", "execution", "order_fill"}:
+        _apply_futures_fill(state, options, event)
+    elif kind in {"mark", "mark_price", "price"}:
+        state.marks[symbol] = _price(event, field_name="mark_price")
+        state.observations += 1
+    elif kind in {"funding", "funding_rate"}:
+        funding_applied, funding_amount = _apply_futures_funding(state, options, observed_at, event)
+    elif kind in {"fee", "commission"}:
+        amount = _fee(event)
+        state.fees += amount
+        state.cash -= amount
+    elif kind in {"liquidation", "liquidated"}:
+        state.liquidation = True
+        state.observations += 1
+    else:
+        raise ProductAccountingError(f"unsupported futures accounting event type: {kind}")
+    return kind, symbol, funding_applied, funding_amount
+
+
+def _record_futures_event(
+    state: _FuturesEvaluationState,
+    options: _FuturesEvaluationOptions,
+    observed_at: str,
+    event: Mapping[str, Any],
+    *,
+    kind: str,
+    symbol: str,
+    funding_applied: bool | None,
+    funding_amount: float,
+) -> None:
+    equity, unrealised, notional = FuturesIncomeAccounting._equity(
+        state.cash, state.positions, state.marks
+    )
+    margin = notional / options.leverage
+    symbol_target = options.target_by_symbol.get(symbol, options.target_value)
+    event_target = event.get("target_notional")
+    if event_target is not None:
+        symbol_target = _number(event_target, field_name="target_notional", minimum=0.0)
+    if symbol_target is not None and notional > symbol_target + 1e-12:
+        state.capacity_violations += 1
+    if equity > 0:
+        state.max_leverage = max(state.max_leverage, notional / equity)
+        if notional > equity * options.leverage + 1e-12:
+            state.capacity_violations += 1
+    state.observed_max_margin_fraction = max(
+        state.observed_max_margin_fraction,
+        margin / equity if equity > 0 else 0.0,
+    )
+    if equity > 0 and margin / equity > options.margin_limit + 1e-12:
+        state.capacity_violations += 1
+    if equity <= (options.maintenance + options.liquidation_buffer) * margin and notional > 0:
+        state.liquidation = True
+    receipt = {
+        "event_hash": canonical_hash(dict(event)),
+        "occurred_at": observed_at,
+        "event_type": kind,
+        "equity": equity,
+        "unrealised_pnl": unrealised,
+        "notional": notional,
+        "margin": margin,
+        "target_notional": symbol_target,
+        "liquidation_buffer_fraction": options.liquidation_buffer,
+    }
+    if funding_applied is not None:
+        receipt.update({"funding_applied": funding_applied, "funding_pnl": funding_amount})
+    state.receipts.append(receipt)
+
+
+def _build_futures_report(
+    state: _FuturesEvaluationState,
+    options: _FuturesEvaluationOptions,
+) -> FuturesAccountingReport:
+    final_equity, unrealised, _ = FuturesIncomeAccounting._equity(
+        state.cash, state.positions, state.marks
+    )
+    implementation_shortfall = state.fees + state.spread + state.slippage
+    return FuturesAccountingReport(
+        initial_equity=options.starting_cash,
+        final_equity=final_equity,
+        net_pnl=final_equity - options.starting_cash,
+        return_fraction=(
+            final_equity / options.starting_cash - 1.0 if options.starting_cash else 0.0
+        ),
+        realised_pnl=state.realised,
+        unrealised_pnl=unrealised,
+        fees=state.fees,
+        funding_pnl=state.funding_pnl,
+        spread_cost=state.spread,
+        slippage_cost=state.slippage,
+        fills=state.fills,
+        partial_fills=state.partials,
+        capacity_violations=state.capacity_violations,
+        max_leverage=state.max_leverage,
+        max_margin_fraction=state.observed_max_margin_fraction,
+        liquidation=state.liquidation,
+        effective_observations=state.observations + state.fills,
+        event_receipts=tuple(state.receipts),
+        turnover_notional=state.turnover_notional,
+        implementation_shortfall=implementation_shortfall,
+        capital_efficiency=(
+            (final_equity - options.starting_cash) / state.turnover_notional
+            if state.turnover_notional > 0.0
+            else 0.0
+        ),
+        funding_adjusted_expectancy=(
+            (final_equity - options.starting_cash) / state.fills if state.fills > 0 else 0.0
+        ),
+        margin_mode=options.margin_mode,
+        target_notional=options.target_value,
+        liquidation_buffer_fraction=options.liquidation_buffer,
+    )
+
+
 class FuturesIncomeAccounting:
     """Account signed linear futures fills, funding, margin, and liquidation."""
 
@@ -709,217 +1020,33 @@ class FuturesIncomeAccounting:
         margin_mode: str = "isolated",
         liquidation_buffer_fraction: float = 0.0,
     ) -> FuturesAccountingReport:
-        starting_cash = _number(initial_cash, field_name="initial_cash", minimum=0.0)
-        cash = starting_cash
-        leverage = _number(leverage, field_name="leverage", minimum=1e-12)
-        maintenance = _number(
-            maintenance_margin_fraction,
-            field_name="maintenance_margin_fraction",
-            minimum=0.0,
-        )
-        participation = _number(
-            max_participation_fraction,
-            field_name="max_participation_fraction",
-            minimum=0.0,
-        )
-        if isinstance(funding_timestamps, str):
-            raise ProductAccountingError("funding_timestamps must be an iterable of timestamps")
-        funding_schedule = (
-            None
-            if funding_timestamps is None
-            else frozenset(
-                timestamp(str(value), field="funding_timestamps[]") for value in funding_timestamps
-            )
-        )
-        margin_limit = _number(
-            max_margin_fraction,
-            field_name="max_margin_fraction",
-            minimum=0.0,
-        )
-        if margin_limit > 1.0:
-            raise ProductAccountingError("max_margin_fraction must be at most 1")
-        margin_mode = str(margin_mode).strip().casefold()
-        if margin_mode not in {"isolated", "cross"}:
-            raise ProductAccountingError("margin_mode must be isolated or cross")
-        liquidation_buffer = _number(
-            liquidation_buffer_fraction,
-            field_name="liquidation_buffer_fraction",
-            minimum=0.0,
-        )
-        if liquidation_buffer > 1.0:
-            raise ProductAccountingError("liquidation_buffer_fraction must be at most 1")
-        target_value: float | None = None
-        target_by_symbol: dict[str, float] = {}
-        if isinstance(target_notional, Mapping):
-            for symbol, value in target_notional.items():
-                target_by_symbol[str(symbol)] = _number(
-                    value, field_name=f"target_notional[{symbol}]", minimum=0.0
-                )
-        elif target_notional is not None:
-            target_value = _number(target_notional, field_name="target_notional", minimum=0.0)
-        ordered = _events(events)
-        if not ordered:
-            raise ProductAccountingError("futures accounting requires events")
-        positions: dict[str, tuple[float, float]] = {}
-        marks: dict[str, float] = {}
-        realised = 0.0
-        funding_pnl = 0.0
-        fees = 0.0
-        spread = 0.0
-        slippage = 0.0
-        fills = 0
-        partials = 0
-        capacity_violations = 0
-        max_leverage = 0.0
-        observed_max_margin_fraction = 0.0
-        liquidation = False
-        observations = 0
-        turnover_notional = 0.0
-        receipts: list[Mapping[str, Any]] = []
-
-        for observed_at, event in ordered:
-            kind = _event_kind(event)
-            symbol = str(event.get("instrument_id", event.get("symbol", "BTCUSDT")))
-            funding_applied: bool | None = None
-            funding_amount = 0.0
-            if kind in {"fill", "trade", "execution", "order_fill"}:
-                side = str(event.get("side", "")).casefold()
-                if side not in {"buy", "sell"}:
-                    raise ProductAccountingError("futures fill side must be buy or sell")
-                quantity = _quantity(event)
-                price = _price(event)
-                signed = quantity if side == "buy" else -quantity
-                old_quantity, old_entry = positions.get(symbol, (0.0, 0.0))
-                realised_delta, new_quantity, new_entry = self._apply_fill(
-                    old_quantity, old_entry, signed, price
-                )
-                realised += realised_delta
-                positions[symbol] = (new_quantity, new_entry)
-                marks[symbol] = price
-                turnover_notional += quantity * price
-                cash += realised_delta
-                fill_fee = _fee(event)
-                fees += fill_fee
-                cash -= fill_fee
-                spread_delta = self._cost(event, signed, price, "expected_price", "spread_cost")
-                slippage_delta = self._cost(
-                    event, signed, price, "reference_price", "slippage_cost"
-                )
-                spread += spread_delta
-                slippage += slippage_delta
-                cash -= spread_delta + slippage_delta
-                fills += 1
-                requested = event.get("requested_quantity", event.get("order_quantity"))
-                if requested is not None:
-                    requested_value = _number(
-                        requested, field_name="requested_quantity", minimum=0.0
-                    )
-                    if quantity + 1e-12 < requested_value:
-                        partials += 1
-                visible_depth = event.get("visible_depth", event.get("available_depth"))
-                if visible_depth is not None and participation > 0:
-                    depth = _number(visible_depth, field_name="visible_depth", minimum=0.0)
-                    if quantity > depth * participation + 1e-12:
-                        capacity_violations += 1
-            elif kind in {"mark", "mark_price", "price"}:
-                marks[symbol] = _price(event, field_name="mark_price")
-                observations += 1
-            elif kind in {"funding", "funding_rate"}:
-                mark = _price(event, field_name="mark_price")
-                marks[symbol] = mark
-                quantity = positions.get(symbol, (0.0, 0.0))[0]
-                rate = _number(
-                    event.get("funding_rate", event.get("rate", 0.0)), field_name="funding_rate"
-                )
-                funding_applied = funding_schedule is None or observed_at in funding_schedule
-                if funding_applied:
-                    amount = -quantity * mark * rate
-                    if event.get("funding_pnl") is not None:
-                        amount = _number(event["funding_pnl"], field_name="funding_pnl")
-                    funding_amount = amount
-                    funding_pnl += amount
-                    cash += amount
-                observations += 1
-            elif kind in {"fee", "commission"}:
-                amount = _fee(event)
-                fees += amount
-                cash -= amount
-            elif kind in {"liquidation", "liquidated"}:
-                liquidation = True
-                observations += 1
-            else:
-                raise ProductAccountingError(f"unsupported futures accounting event type: {kind}")
-            equity, unrealised, notional = self._equity(cash, positions, marks)
-            margin = notional / leverage
-            symbol_target = target_by_symbol.get(symbol, target_value)
-            event_target = event.get("target_notional")
-            if event_target is not None:
-                symbol_target = _number(event_target, field_name="target_notional", minimum=0.0)
-            if symbol_target is not None and notional > symbol_target + 1e-12:
-                capacity_violations += 1
-            if equity > 0:
-                max_leverage = max(max_leverage, notional / equity)
-                if notional > equity * leverage + 1e-12:
-                    capacity_violations += 1
-            observed_max_margin_fraction = max(
-                observed_max_margin_fraction,
-                margin / equity if equity > 0 else 0.0,
-            )
-            if equity > 0 and margin / equity > margin_limit + 1e-12:
-                capacity_violations += 1
-            if equity <= (maintenance + liquidation_buffer) * margin and notional > 0:
-                liquidation = True
-            receipt = {
-                "event_hash": canonical_hash(dict(event)),
-                "occurred_at": observed_at,
-                "event_type": kind,
-                "equity": equity,
-                "unrealised_pnl": unrealised,
-                "notional": notional,
-                "margin": margin,
-                "target_notional": symbol_target,
-                "liquidation_buffer_fraction": liquidation_buffer,
-            }
-            if funding_applied is not None:
-                receipt.update({"funding_applied": funding_applied, "funding_pnl": funding_amount})
-            receipts.append(receipt)
-
-        final_equity, unrealised, _ = self._equity(cash, positions, marks)
-        target_report = target_value if target_value is not None else None
-        implementation_shortfall = fees + spread + slippage
-        return FuturesAccountingReport(
-            initial_equity=starting_cash,
-            final_equity=final_equity,
-            net_pnl=final_equity - starting_cash,
-            return_fraction=(final_equity / starting_cash - 1.0 if starting_cash else 0.0),
-            realised_pnl=realised,
-            unrealised_pnl=unrealised,
-            fees=fees,
-            funding_pnl=funding_pnl,
-            spread_cost=spread,
-            slippage_cost=slippage,
-            fills=fills,
-            partial_fills=partials,
-            capacity_violations=capacity_violations,
-            max_leverage=max_leverage,
-            max_margin_fraction=observed_max_margin_fraction,
-            liquidation=liquidation,
-            effective_observations=observations + fills,
-            event_receipts=tuple(receipts),
-            turnover_notional=turnover_notional,
-            implementation_shortfall=implementation_shortfall,
-            capital_efficiency=(
-                (final_equity - starting_cash) / turnover_notional
-                if turnover_notional > 0.0
-                else 0.0
-            ),
-            funding_adjusted_expectancy=(
-                (final_equity - starting_cash) / fills if fills > 0 else 0.0
-            ),
+        options, ordered, state = _prepare_futures_evaluation(
+            events=events,
+            initial_cash=initial_cash,
+            leverage=leverage,
+            maintenance_margin_fraction=maintenance_margin_fraction,
+            max_participation_fraction=max_participation_fraction,
+            funding_timestamps=funding_timestamps,
+            max_margin_fraction=max_margin_fraction,
+            target_notional=target_notional,
             margin_mode=margin_mode,
-            target_notional=target_report,
-            liquidation_buffer_fraction=liquidation_buffer,
+            liquidation_buffer_fraction=liquidation_buffer_fraction,
         )
+        for observed_at, event in ordered:
+            kind, symbol, funding_applied, funding_amount = _apply_futures_event(
+                state, options, observed_at, event
+            )
+            _record_futures_event(
+                state,
+                options,
+                observed_at,
+                event,
+                kind=kind,
+                symbol=symbol,
+                funding_applied=funding_applied,
+                funding_amount=funding_amount,
+            )
+        return _build_futures_report(state, options)
 
     @staticmethod
     def _apply_fill(
