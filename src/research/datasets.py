@@ -29,11 +29,18 @@ DATASET_ROLES = frozenset(
     }
 )
 
-RESEARCH_BUNDLE_ROLES = (
+CORE_RESEARCH_BUNDLE_ROLES = (
     "screening",
     "development",
     "robustness",
     "protected_holdout",
+)
+
+# Forward data is created after an artefact is sealed.  Keep the inclusive
+# export for existing diagnostic callers, while readiness only requires the
+# four pre-artefact research roles.
+RESEARCH_BUNDLE_ROLES = (
+    *CORE_RESEARCH_BUNDLE_ROLES,
     "forward_observation",
 )
 
@@ -216,7 +223,11 @@ class CandidateDatasetPlan:
             development_snapshot_ids=(bundle.stage_snapshot_ids["development"],),
             robustness_snapshot_ids=(bundle.stage_snapshot_ids["robustness"],),
             protected_holdout_snapshot_id=protected,
-            forward_snapshot_ids=(bundle.stage_snapshot_ids["forward_observation"],),
+            forward_snapshot_ids=(
+                (bundle.stage_snapshot_ids["forward_observation"],)
+                if "forward_observation" in bundle.stage_snapshot_ids
+                else ()
+            ),
             product_id=bundle.product_id,
             universe_snapshot_id=bundle.universe_snapshot_id,
             feature_manifest_id=bundle.feature_manifest_id,
@@ -291,7 +302,9 @@ class DatasetBundle:
         if not set(stages).issubset(set(RESEARCH_BUNDLE_ROLES)):
             raise DatasetResolutionError("dataset bundle contains an unsupported research role")
         object.__setattr__(self, "stage_snapshot_ids", stages)
-        if state is DatasetLifecycleState.READY and len(stages) != len(RESEARCH_BUNDLE_ROLES):
+        if state is DatasetLifecycleState.READY and not set(CORE_RESEARCH_BUNDLE_ROLES).issubset(
+            stages
+        ):
             raise DatasetResolutionError("ready dataset bundles must be complete")
         object.__setattr__(self, "lifecycle_state", state)
         partitions = tuple(
@@ -330,7 +343,7 @@ class DatasetBundle:
 class CanonicalResearchDatasetBuilder:
     """Build deterministic, non-overlapping role snapshots and one bundle."""
 
-    REQUIRED_ROLES = frozenset(RESEARCH_BUNDLE_ROLES)
+    REQUIRED_ROLES = frozenset(CORE_RESEARCH_BUNDLE_ROLES)
 
     def __init__(self, engine: Engine, *, default_engine_version: str = "research-engine/v1"):
         self.engine = engine
@@ -356,7 +369,7 @@ class CanonicalResearchDatasetBuilder:
         product_id = non_empty(product_id, field="product_id")
         state = DatasetLifecycleState(lifecycle_state)
         roles = set(payload_by_role)
-        unsupported = sorted(roles - self.REQUIRED_ROLES)
+        unsupported = sorted(roles - set(RESEARCH_BUNDLE_ROLES))
         if unsupported:
             raise DatasetResolutionError(
                 "dataset bundle contains unsupported roles: " + ", ".join(unsupported)

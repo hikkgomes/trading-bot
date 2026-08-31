@@ -13,6 +13,29 @@ class MarketType(StrEnum):
     FUTURES = "futures"
 
 
+def canonical_instrument_id(
+    exchange_symbol: str,
+    *,
+    market_type: MarketType | str,
+    venue: str = "binance",
+    settlement_asset: str | None = None,
+) -> str:
+    """Build the durable platform identity for an exchange symbol."""
+
+    symbol = non_empty(exchange_symbol, field="exchange_symbol").upper()
+    market = MarketType(market_type)
+    venue_name = non_empty(venue, field="venue").lower()
+    settlement = (
+        non_empty(settlement_asset, field="settlement_asset").upper()
+        if settlement_asset is not None
+        else None
+    )
+    if market is MarketType.SPOT and settlement is not None:
+        raise ValueError("spot instruments cannot have a settlement asset")
+    suffix = f":{settlement}" if settlement else ""
+    return f"{venue_name}:{market.value}:{symbol}{suffix}"
+
+
 @dataclass(frozen=True)
 class Instrument:
     venue: str

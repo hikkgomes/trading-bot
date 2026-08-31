@@ -7,7 +7,14 @@ from typing import Any
 
 from sqlalchemy import insert, select
 
-from src.data.database import account_snapshot, balance_snapshot, reconciliation_event
+from src.data.database import (
+    account_snapshot,
+    balance_snapshot,
+    instrument,
+    reconciliation_event,
+    universe_member,
+    universe_snapshot,
+)
 from src.domain._codec import canonical_hash, finite, json_value, timestamp
 from src.execution.ccxt_broker import CcxtBroker
 from src.execution.order_manager import OrderManager, SqlOrderStore
@@ -52,7 +59,7 @@ class AccountReconciliationService:
             account_id = str(product["account_id"])
             account = self.accounts[account_id]
             if product.get("execution_mode") == "live":
-                payload = self._authenticated(account, product)
+                payload = self._authenticated(account, product, observed_at=now)
                 source = "authenticated_rest"
             else:
                 payload = self._paper(account, product)
@@ -90,7 +97,11 @@ class AccountReconciliationService:
         }
 
     def _authenticated(
-        self, account: Mapping[str, Any], product: Mapping[str, Any]
+        self,
+        account: Mapping[str, Any],
+        product: Mapping[str, Any],
+        *,
+        observed_at: str,
     ) -> dict[str, Any]:
         api_key_name = str(account.get("api_key_env") or "")
         api_secret_name = str(account.get("api_secret_env") or "")
@@ -105,7 +116,12 @@ class AccountReconciliationService:
             )
         market = "spot" if account.get("market") == "spot" else "futures"
         broker = self.broker_factory(account, market)
-        expected_symbols = (str(product.get("exchange_symbol") or "BTCUSDT"),)
+        expected_symbols = self._expected_symbols(
+            product_id=str(product["product_id"]),
+            product=product,
+            account=account,
+            observed_at=observed_at,
+        )
         reader = getattr(broker, "account_snapshot", None)
         if not callable(reader):
             raise AccountAuthorityError("live broker has no authenticated account_snapshot reader")
@@ -140,6 +156,82 @@ class AccountReconciliationService:
             )
         reconciled = self._reconcile_platform_exposure(payload=dict(payload), product=product)
         return json_value(reconciled, field="authenticated account snapshot")
+
+    def _expected_symbols(
+        self,
+        *,
+        product_id: str,
+        product: Mapping[str, Any],
+        account: Mapping[str, Any],
+        observed_at: str | None,
+    ) -> tuple[str, ...]:
+        """Resolve the exact exchange scope owned by the current assignment."""
+
+        configured = product.get("exchange_symbols")
+        if isinstance(configured, list | tuple):
+            symbols = tuple(sorted({str(value).strip().upper() for value in configured if str(value).strip()}))
+            if symbols:
+                return symbols
+        direct = str(product.get("exchange_symbol") or "").strip().upper()
+        if direct:
+            return (direct,)
+        from src.research.canonical import SqlActiveStrategyAssignmentRepository
+
+        assignments = SqlActiveStrategyAssignmentRepository(self.engine).active_assignments(
+            product_id,
+            at=observed_at,
+        )
+        instrument_ids = {
+            str(row["instrument_id"])
+            for row in assignments
+            if row.get("instrument_id")
+        }
+        universe_ids = {
+            str(row["universe_id"])
+            for row in assignments
+            if row.get("universe_id")
+        }
+        if universe_ids:
+            with self.engine.connect() as connection:
+                latest_snapshots = connection.execute(
+                    select(universe_snapshot.c.id)
+                    .where(
+                        universe_snapshot.c.universe_id.in_(universe_ids),
+                        *([universe_snapshot.c.observed_at <= observed_at] if observed_at else []),
+                    )
+                    .order_by(
+                        universe_snapshot.c.universe_id,
+                        universe_snapshot.c.observed_at.desc(),
+                        universe_snapshot.c.id.desc(),
+                    )
+                ).scalars()
+                snapshot_ids = tuple(dict.fromkeys(str(value) for value in latest_snapshots))
+                if snapshot_ids:
+                    instrument_ids.update(
+                        str(value)
+                        for value in connection.execute(
+                            select(universe_member.c.instrument_id).where(
+                                universe_member.c.snapshot_id.in_(snapshot_ids),
+                                universe_member.c.eligible.is_(True),
+                            )
+                        ).scalars()
+                    )
+        if not instrument_ids:
+            if account.get("market") != "spot":
+                raise AccountAuthorityError(
+                    f"live futures product {product_id} has no active instrument scope"
+                )
+            return ("BTCUSDT",)
+        with self.engine.connect() as connection:
+            symbols = connection.execute(
+                select(instrument.c.exchange_symbol).where(instrument.c.id.in_(instrument_ids))
+            ).scalars()
+        result = tuple(sorted({str(value).upper() for value in symbols if str(value).strip()}))
+        if not result:
+            raise AccountAuthorityError(
+                f"live product {product_id} has no persisted symbols for its active scope"
+            )
+        return result
 
     def _reconcile_platform_exposure(
         self,

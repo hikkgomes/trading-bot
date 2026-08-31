@@ -783,7 +783,7 @@ class PlatformScheduler:
             )
             return {
                 **base,
-                "instrument_universe": self._universe_symbols(product, now),
+                "instrument_universe": self._universe_symbols(product_id, product, now),
                 "dataset_snapshot_hashes": snapshot_ids,
                 "dataset_bundle_id": str(row["id"]) if row is not None else None,
                 "universe_snapshot_id": (
@@ -796,7 +796,11 @@ class PlatformScheduler:
             }
         return base
 
-    def _universe_symbols(self, product: Mapping[str, Any], now: str) -> list[str]:
+    def _universe_symbols(
+        self, product_id: str, product: Mapping[str, Any], now: str
+    ) -> list[str]:
+        if product_id == "btc_accumulation":
+            return ["BTCUSDT"]
         universe_id = str(product.get("universe_id") or "")
         with self.engine.connect() as connection:
             row = connection.execute(

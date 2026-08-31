@@ -84,6 +84,14 @@ class DatabaseUniverseService:
                 maximum_symbols=int(payload.get("maximum_symbols", 100)),
                 market_type=str(payload.get("market_type") or "futures"),
             )
+            if str(payload.get("product_id") or "") == "btc_accumulation":
+                observations = tuple(
+                    item
+                    for item in observations
+                    if item.instrument.exchange_symbol == "BTCUSDT"
+                )
+                if not observations:
+                    raise RuntimeError("BTC accumulation universe has no BTCUSDT observation")
             snapshot_id = self.record_snapshot(
                 universe_id=str(payload["universe_id"]),
                 observed_at=now,

@@ -13,6 +13,7 @@ from sqlalchemy.engine import Engine
 
 from src.data.database import generation_feedback, strategy_identity
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp, to_primitive
+from src.domain.instruments import MarketType, canonical_instrument_id
 from src.domain.strategies import (
     MechanismCategory,
     ResearchThesis,
@@ -571,6 +572,8 @@ class HypothesisGenerator:
         self.instrument_universe = tuple(sorted(set(instrument_universe)))
         if any(not item for item in self.instrument_universe):
             raise GenerationError("instrument universe contains an empty symbol")
+        if self.product == "btc_accumulation" and self.instrument_universe != ("BTCUSDT",):
+            raise GenerationError("BTC accumulation research is restricted to BTCUSDT spot")
         self.allocator = allocator or GenerationAllocator()
         self.memory = memory
         self.feedback_store = feedback_store
@@ -740,11 +743,24 @@ def build_hypothesis(
         "rule": rule,
         "generator_schema": "bounded_hypothesis/v1",
     }
-    universe: dict[str, Any] = {"type": "fixed", "symbols": list(instrument_universe)}
+    market_type = MarketType.SPOT if campaign.product == "btc_accumulation" else MarketType.FUTURES
+    universe: dict[str, Any] = {
+        "type": "fixed",
+        "symbols": list(instrument_universe),
+        "instrument_ids": [
+            canonical_instrument_id(
+                symbol,
+                market_type=market_type,
+                settlement_asset="USDT" if market_type is MarketType.FUTURES else None,
+            )
+            for symbol in instrument_universe
+        ],
+    }
     if universe_snapshot_id is not None:
         universe = {
             "type": "point_in_time",
             "symbols": list(instrument_universe),
+            "instrument_ids": list(universe["instrument_ids"]),
             "universe_snapshot_id": universe_snapshot_id,
         }
     definition = StrategyDefinition(

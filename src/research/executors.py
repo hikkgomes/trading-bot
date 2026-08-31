@@ -341,11 +341,26 @@ def _measured_result(
         randomiser.shuffle(permuted)
         monte_carlo_drawdowns.append(_maximum_drawdown(permuted))
         monte_carlo_tail_losses.append(_tail_loss(permuted))
-    declared_universe = candidate.definition.universe.get("symbols")
+    declared_symbols = candidate.definition.universe.get("symbols")
+    declared_instrument_ids = candidate.definition.universe.get("instrument_ids")
+    declared_values = tuple(
+        str(item)
+        for values in (declared_symbols, declared_instrument_ids)
+        if isinstance(values, list | tuple)
+        for item in values
+    )
     scope = tuple(str(item) for item in context.get("instrument_scope", ()))
-    predeclared = isinstance(declared_universe, list | tuple) and bool(declared_universe)
+    predeclared = bool(declared_values)
     if scope:
-        predeclared = predeclared and set(scope).issubset({str(item) for item in declared_universe})
+        predeclared = predeclared and all(
+            observed in declared_values
+            or any(
+                observed.endswith(f":{declared_symbol}")
+                or observed.endswith(f":{declared_symbol}:USDT")
+                for declared_symbol in declared_values
+            )
+            for observed in scope
+        )
     feature_inputs = any(
         context.get(name) is not None for name in ("feature_rows", "feature_vector", "market_frame")
     )
@@ -425,7 +440,8 @@ def _measured_result(
         "universe_evidence": {
             "passed": predeclared,
             "predeclared": predeclared,
-            "declared_symbols": list(declared_universe or ()),
+            "declared_symbols": list(declared_symbols or ()),
+            "declared_instrument_ids": list(declared_instrument_ids or ()),
             "observed_symbols": list(scope),
         },
         "portfolio_overlap": portfolio_overlap,

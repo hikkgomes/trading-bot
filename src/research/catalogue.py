@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from src.domain._codec import canonical_hash
+from src.domain.instruments import MarketType, canonical_instrument_id
 from src.domain.strategies import (
     ResearchThesis,
     StrategyDefinition,
@@ -37,6 +38,8 @@ def registered_strategy_theses(
     universe = tuple(sorted(set(instrument_universe)))
     if not universe:
         raise ValueError("registered strategy research requires a predeclared universe")
+    if product == "btc_accumulation" and universe != ("BTCUSDT",):
+        raise ValueError("BTC accumulation research is restricted to BTCUSDT spot")
     assert_manifest_complete()
     manifest = manifest_by_name()
     factory = StrategyThesisFactory.default()
@@ -195,6 +198,8 @@ def registered_strategy_candidates(
     descriptions = describe()
     manifest = manifest_by_name()
     universe = tuple(sorted(set(instrument_universe)))
+    if product == "btc_accumulation" and universe != ("BTCUSDT",):
+        raise ValueError("BTC accumulation research is restricted to BTCUSDT spot")
     theses = registered_strategy_theses(product=product, instrument_universe=universe)
     candidates: list[Candidate] = []
     # Only executable registry entries enter research. The manifest is
@@ -208,7 +213,19 @@ def registered_strategy_candidates(
         feature_nodes, _ = registered_feature_contract(name)
         strategy_class = get(name)
         parameters = strategy_class.default_params()
-        universe_definition = {"type": "fixed", "symbols": list(universe)}
+        market_type = MarketType.SPOT if product == "btc_accumulation" else MarketType.FUTURES
+        universe_definition = {
+            "type": "fixed",
+            "symbols": list(universe),
+            "instrument_ids": [
+                canonical_instrument_id(
+                    symbol,
+                    market_type=market_type,
+                    settlement_asset="USDT" if market_type is MarketType.FUTURES else None,
+                )
+                for symbol in universe
+            ],
+        }
         if universe_snapshot_id is not None:
             universe_definition["type"] = "point_in_time"
             universe_definition["universe_snapshot_id"] = universe_snapshot_id
