@@ -443,80 +443,98 @@ def _market_snapshot_values(event: MarketEvent) -> dict[str, float] | None:
     raw_data = event.payload.get("data")
     if not isinstance(raw_data, Mapping):
         return None
-    values: dict[str, float] = {}
-
-    def number(*names: str) -> float | None:
-        for name in names:
-            value = raw_data.get(name)
-            if value is None or isinstance(value, bool):
-                continue
-            try:
-                parsed = float(value)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(parsed):
-                return parsed
-        return None
-
-    candle = raw_data.get("k")
     if event.event_type is MarketEventType.CANDLE:
-        if not isinstance(candle, Mapping) or candle.get("x") is not True:
-            return None
-        close = candle.get("c")
-        if close is None or isinstance(close, bool):
-            return None
-        try:
-            values["close"] = float(close)
-        except (TypeError, ValueError):
-            return None
+        values = _candle_snapshot_values(raw_data)
     elif event.event_type in {MarketEventType.BEST_BID_ASK, MarketEventType.DEPTH_UPDATE}:
-        bid = number("bid_price", "b")
-        ask = number("ask_price", "a")
-        bid_depth = number("bid_depth", "B")
-        ask_depth = number("ask_depth", "A")
-        if event.event_type is MarketEventType.DEPTH_UPDATE:
-            bid_levels = raw_data.get("b", raw_data.get("bids"))
-            ask_levels = raw_data.get("a", raw_data.get("asks"))
-            if isinstance(bid_levels, list) and bid_levels:
-                bid, bid_depth = _book_level(bid_levels[0])
-            if isinstance(ask_levels, list) and ask_levels:
-                ask, ask_depth = _book_level(ask_levels[0])
-        if bid is None or ask is None or bid <= 0 or ask < bid:
-            return None
-        midpoint = (bid + ask) / 2.0
-        values.update(
-            {
-                "close": midpoint,
-                "spread_bps": (ask - bid) / midpoint * 10_000.0,
-                "visible_depth": max(0.0, bid_depth or 0.0) + max(0.0, ask_depth or 0.0),
-            }
-        )
+        values = _book_snapshot_values(event, raw_data)
     elif event.event_type is MarketEventType.MARK_PRICE:
-        price = number("mark_price", "markPrice", "p")
-        if price is None or price <= 0:
-            return None
-        values["close"] = price
-        funding = number("funding_rate", "fundingRate", "r")
-        if funding is not None:
-            values["funding"] = funding
+        values = _mark_snapshot_values(raw_data)
     elif event.event_type is MarketEventType.FUNDING_RATE:
-        funding = number("funding_rate", "fundingRate", "r")
-        if funding is None:
-            return None
-        values["funding"] = funding
+        values = _funding_snapshot_values(raw_data)
     elif event.event_type in {MarketEventType.TRADE, MarketEventType.AGGREGATE_TRADE}:
-        price = number("price", "p")
-        if price is None or price <= 0:
-            return None
-        values["close"] = price
+        values = _trade_snapshot_values(raw_data)
     else:
         return None
-
+    if values is None:
+        return None
     if "close" in values and values["close"] <= 0:
         return None
     if values.get("visible_depth", 0.0) < 0:
         return None
     return values
+
+
+def _market_number(raw_data: Mapping[str, Any], *names: str) -> float | None:
+    for name in names:
+        value = raw_data.get(name)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed):
+            return parsed
+    return None
+
+
+def _candle_snapshot_values(raw_data: Mapping[str, Any]) -> dict[str, float] | None:
+    candle = raw_data.get("k")
+    if not isinstance(candle, Mapping) or candle.get("x") is not True:
+        return None
+    close = candle.get("c")
+    if close is None or isinstance(close, bool):
+        return None
+    try:
+        parsed = float(close)
+    except (TypeError, ValueError):
+        return None
+    return {"close": parsed} if math.isfinite(parsed) else None
+
+
+def _book_snapshot_values(
+    event: MarketEvent, raw_data: Mapping[str, Any]
+) -> dict[str, float] | None:
+    bid = _market_number(raw_data, "bid_price", "b")
+    ask = _market_number(raw_data, "ask_price", "a")
+    bid_depth = _market_number(raw_data, "bid_depth", "B")
+    ask_depth = _market_number(raw_data, "ask_depth", "A")
+    if event.event_type is MarketEventType.DEPTH_UPDATE:
+        bid_level = raw_data.get("b", raw_data.get("bids"))
+        ask_level = raw_data.get("a", raw_data.get("asks"))
+        if isinstance(bid_level, list) and bid_level:
+            bid, bid_depth = _book_level(bid_level[0])
+        if isinstance(ask_level, list) and ask_level:
+            ask, ask_depth = _book_level(ask_level[0])
+    if bid is None or ask is None or bid <= 0 or ask < bid:
+        return None
+    midpoint = (bid + ask) / 2.0
+    return {
+        "close": midpoint,
+        "spread_bps": (ask - bid) / midpoint * 10_000.0,
+        "visible_depth": max(0.0, bid_depth or 0.0) + max(0.0, ask_depth or 0.0),
+    }
+
+
+def _mark_snapshot_values(raw_data: Mapping[str, Any]) -> dict[str, float] | None:
+    price = _market_number(raw_data, "mark_price", "markPrice", "p")
+    if price is None or price <= 0:
+        return None
+    values = {"close": price}
+    funding = _market_number(raw_data, "funding_rate", "fundingRate", "r")
+    if funding is not None:
+        values["funding"] = funding
+    return values
+
+
+def _funding_snapshot_values(raw_data: Mapping[str, Any]) -> dict[str, float] | None:
+    funding = _market_number(raw_data, "funding_rate", "fundingRate", "r")
+    return {"funding": funding} if funding is not None else None
+
+
+def _trade_snapshot_values(raw_data: Mapping[str, Any]) -> dict[str, float] | None:
+    price = _market_number(raw_data, "price", "p")
+    return {"close": price} if price is not None and price > 0 else None
 
 
 def _book_level(value: object) -> tuple[float | None, float | None]:
