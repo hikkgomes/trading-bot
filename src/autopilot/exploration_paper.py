@@ -188,26 +188,87 @@ def _identity_digest(artifact: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def build_exploration_manifest(
+def _build_exploration_candidate(
     config: AutopilotConfig,
     *,
-    incubation_path: Path = DEFAULT_INCUBATION,
-    log_path: Path = DEFAULT_LOG,
-    root: Path = DEFAULT_ROOT,
-    max_per_product: int = DEFAULT_MAX_PER_PRODUCT,
-) -> dict[str, Any]:
-    """Compile the research-attention queue into isolated paper-only artifacts."""
+    product_name: str,
+    candidate: dict[str, Any],
+    records: dict[tuple[str, str, str, str], dict[str, Any]],
+    seen_digests: set[str],
+    artifacts_dir: Path,
+    states_dir: Path,
+    trades_dir: Path,
+) -> tuple[dict[str, Any] | None, dict[str, str] | None, dict[str, str] | None]:
+    hypothesis_id = str(candidate.get("id") or "")
+    market = str(candidate.get("market") or "").lower()
+    symbol = str(candidate.get("symbol") or "BTCUSDT").upper()
+    pnl_unit = str(candidate.get("pnl_unit") or "").lower()
+    record = records.get((hypothesis_id, market, symbol, pnl_unit))
+    if record is None:
+        return None, {"product": product_name, "symbol": symbol, "id": hypothesis_id}, None
+    product = _paper_product(config, product_name=product_name, market=market, symbol=symbol)
+    artifact = _artifact_for_record(record, product)
+    try:
+        assert_loaded_strategy_artifact_allowed(product, artifact, require_live_eligible=False)
+    except StrategyPolicyError as exc:
+        return (
+            None,
+            None,
+            {
+                "product": product_name,
+                "symbol": symbol,
+                "id": hypothesis_id,
+                "reason": "strategy_policy_rejected",
+                "detail": str(exc),
+            },
+        )
+    digest = _identity_digest(artifact)
+    if digest in seen_digests:
+        return None, None, None
+    seen_digests.add(digest)
+    stem = f"{_safe_key(product.name)}__{digest[:16]}"
+    artifact_path = artifacts_dir / f"{stem}.json"
+    state_path = states_dir / f"{stem}.json"
+    trade_path = trades_dir / f"{stem}.csv"
+    write_json_atomic(artifact_path, artifact)
+    return (
+        {
+            "product": product.name,
+            "base_product": product_name,
+            "objective": product.objective,
+            "base_asset": product.base_asset,
+            "market": product.market,
+            "symbol": product.symbol,
+            "starting_equity": product.starting_equity,
+            "regime_guard": product.regime_guard,
+            "regime_mayer_top": product.regime_mayer_top,
+            "hypothesis_id": hypothesis_id,
+            "artifact_digest": f"sha256:{digest}",
+            "artifact": str(artifact_path),
+            "state": str(state_path),
+            "trade_log": str(trade_path),
+            "adaptive_evidence": True,
+            "promotion_eligible": False,
+        },
+        None,
+        None,
+    )
+
+
+def _prepare_exploration_manifest_inputs(
+    *,
+    incubation_path: Path,
+    log_path: Path,
+    root: Path,
+    max_per_product: int,
+) -> (
+    tuple[dict[str, list[Any]], dict[tuple[str, str, str, str], dict[str, Any]], Path, Path, Path]
+    | None
+):
     if max_per_product < 1 or max_per_product > 100:
         raise ValueError("max_per_product must be in [1, 100]")
     if not incubation_path.exists():
-        return {
-            "schema": MANIFEST_SCHEMA,
-            "generated_at": utc_now(),
-            "ok": True,
-            "skipped": True,
-            "reason": "waiting_for_incubation_queue",
-            "candidates": [],
-        }
+        return None
     queue = _read_object(incubation_path, label="incubation queue")
     if (
         queue.get("schema") != "autopilot.incubation_candidates/v1"
@@ -220,13 +281,39 @@ def build_exploration_manifest(
     products = queue.get("products")
     if not isinstance(products, dict):
         raise ValueError("incubation queue products must be an object")
-    records = _latest_records(log_path)
     artifacts_dir = root / "artifacts"
     states_dir = root / "states"
     trades_dir = root / "trades"
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    states_dir.mkdir(parents=True, exist_ok=True)
-    trades_dir.mkdir(parents=True, exist_ok=True)
+    for directory in (artifacts_dir, states_dir, trades_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    return products, _latest_records(log_path), artifacts_dir, states_dir, trades_dir
+
+
+def build_exploration_manifest(
+    config: AutopilotConfig,
+    *,
+    incubation_path: Path = DEFAULT_INCUBATION,
+    log_path: Path = DEFAULT_LOG,
+    root: Path = DEFAULT_ROOT,
+    max_per_product: int = DEFAULT_MAX_PER_PRODUCT,
+) -> dict[str, Any]:
+    """Compile the research-attention queue into isolated paper-only artifacts."""
+    prepared = _prepare_exploration_manifest_inputs(
+        incubation_path=incubation_path,
+        log_path=log_path,
+        root=root,
+        max_per_product=max_per_product,
+    )
+    if prepared is None:
+        return {
+            "schema": MANIFEST_SCHEMA,
+            "generated_at": utc_now(),
+            "ok": True,
+            "skipped": True,
+            "reason": "waiting_for_incubation_queue",
+            "candidates": [],
+        }
+    products, records, artifacts_dir, states_dir, trades_dir = prepared
     candidates: list[dict[str, Any]] = []
     missing_records: list[dict[str, str]] = []
     policy_rejected_candidates: list[dict[str, str]] = []
@@ -237,70 +324,22 @@ def build_exploration_manifest(
         for candidate in items[:max_per_product]:
             if not isinstance(candidate, dict):
                 continue
-            hypothesis_id = str(candidate.get("id") or "")
-            market = str(candidate.get("market") or "").lower()
-            symbol = str(candidate.get("symbol") or "BTCUSDT").upper()
-            pnl_unit = str(candidate.get("pnl_unit") or "").lower()
-            key = (hypothesis_id, market, symbol, pnl_unit)
-            record = records.get(key)
-            if record is None:
-                missing_records.append(
-                    {"product": str(product_name), "symbol": symbol, "id": hypothesis_id}
-                )
-                continue
-            product = _paper_product(
+            built, missing, rejected = _build_exploration_candidate(
                 config,
                 product_name=str(product_name),
-                market=market,
-                symbol=symbol,
+                candidate=candidate,
+                records=records,
+                seen_digests=seen_digests,
+                artifacts_dir=artifacts_dir,
+                states_dir=states_dir,
+                trades_dir=trades_dir,
             )
-            artifact = _artifact_for_record(record, product)
-            try:
-                assert_loaded_strategy_artifact_allowed(
-                    product,
-                    artifact,
-                    require_live_eligible=False,
-                )
-            except StrategyPolicyError as exc:
-                policy_rejected_candidates.append(
-                    {
-                        "product": str(product_name),
-                        "symbol": symbol,
-                        "id": hypothesis_id,
-                        "reason": "strategy_policy_rejected",
-                        "detail": str(exc),
-                    }
-                )
-                continue
-            digest = _identity_digest(artifact)
-            if digest in seen_digests:
-                continue
-            seen_digests.add(digest)
-            stem = f"{_safe_key(product.name)}__{digest[:16]}"
-            artifact_path = artifacts_dir / f"{stem}.json"
-            state_path = states_dir / f"{stem}.json"
-            trade_path = trades_dir / f"{stem}.csv"
-            write_json_atomic(artifact_path, artifact)
-            candidates.append(
-                {
-                    "product": product.name,
-                    "base_product": product_name,
-                    "objective": product.objective,
-                    "base_asset": product.base_asset,
-                    "market": product.market,
-                    "symbol": product.symbol,
-                    "starting_equity": product.starting_equity,
-                    "regime_guard": product.regime_guard,
-                    "regime_mayer_top": product.regime_mayer_top,
-                    "hypothesis_id": hypothesis_id,
-                    "artifact_digest": f"sha256:{digest}",
-                    "artifact": str(artifact_path),
-                    "state": str(state_path),
-                    "trade_log": str(trade_path),
-                    "adaptive_evidence": True,
-                    "promotion_eligible": False,
-                }
-            )
+            if built is not None:
+                candidates.append(built)
+            if missing is not None:
+                missing_records.append(missing)
+            if rejected is not None:
+                policy_rejected_candidates.append(rejected)
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "generated_at": utc_now(),
@@ -524,6 +563,102 @@ def _candidate_feedback(
     return feedback
 
 
+def _run_exploration_candidate(
+    config: AutopilotConfig,
+    candidate: dict[str, Any],
+    *,
+    previous_feedback: dict[str, Any],
+    observed_at: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
+    item: dict[str, Any] = {
+        "product": candidate.get("product"),
+        "symbol": candidate.get("symbol"),
+        "hypothesis_id": candidate.get("hypothesis_id"),
+        "artifact_digest": candidate.get("artifact_digest"),
+        "ok": True,
+    }
+    try:
+        product = _manifest_product(config, candidate)
+        artifact_path = Path(str(candidate["artifact"]))
+        artifact = _read_object(artifact_path, label="exploration artifact")
+        if (
+            artifact.get("exploration_only") is not True
+            or artifact.get("adaptive_evidence") is not True
+            or artifact.get("live_allowed") is not False
+            or artifact.get("promotion_eligible") is not False
+        ):
+            raise ValueError("exploration artifact safety contract is invalid")
+        assert_loaded_strategy_artifact_allowed(
+            product,
+            artifact,
+            artifact_path=artifact_path,
+            require_live_eligible=False,
+        )
+        bot = PaperTradingBot(
+            strategies_path=artifact_path,
+            state_file=Path(str(candidate["state"])),
+            trade_log=Path(str(candidate["trade_log"])),
+            starting_equity=float(candidate["starting_equity"]),
+            regime_guard=bool(candidate["regime_guard"]),
+            regime_mayer_top=float(candidate["regime_mayer_top"]),
+            symbol=product.symbol,
+            market=product.market,
+            objective=product.objective,
+            base_asset=product.base_asset,
+            artifact_payload=artifact,
+        )
+        bot.run_cycle()
+        item.update(
+            decision_trace=bot.decision_trace,
+            equity=bot.state.get("equity"),
+            open_positions=len(bot.state.get("open_positions", {})),
+            drawdown_halted=bot.state.get("drawdown_halted"),
+            trade_log=str(candidate["trade_log"]),
+        )
+        digest = str(candidate.get("artifact_digest") or "")
+        feedback = _candidate_feedback(
+            previous_feedback.get(digest)
+            if isinstance(previous_feedback.get(digest), dict)
+            else {},
+            candidate,
+            bot.decision_trace,
+            observed_at=observed_at,
+        )
+        return item, feedback, bot.decision_trace
+    except Exception as exc:
+        item.update(ok=False, error=f"{type(exc).__name__}: {exc}")
+        return item, None, None
+
+
+def _prepare_exploration_run(
+    manifest_path: Path,
+    previous_status_path: Path | None,
+    report: dict[str, Any],
+) -> tuple[list[Any], dict[str, Any]] | None:
+    if not manifest_path.exists():
+        return None
+    manifest = _read_object(manifest_path, label="exploration manifest")
+    if (
+        manifest.get("schema") != MANIFEST_SCHEMA
+        or manifest.get("live_allowed") is not False
+        or manifest.get("promotion_eligible") is not False
+        or manifest.get("adaptive_evidence") is not True
+    ):
+        raise ValueError("exploration manifest safety contract is invalid")
+    previous_feedback: dict[str, Any] = {}
+    if previous_status_path is not None and previous_status_path.exists():
+        previous = _read_object(previous_status_path, label="exploration status")
+        if previous.get("schema") == SCHEMA and isinstance(previous.get("aggregate"), dict):
+            report["aggregate"] = dict(previous["aggregate"])
+            report["aggregate"]["cycles"] = int(report["aggregate"].get("cycles", 0)) + 1
+            if isinstance(previous.get("candidate_feedback"), dict):
+                previous_feedback = previous["candidate_feedback"]
+    candidates = manifest.get("candidates")
+    if not isinstance(candidates, list):
+        raise ValueError("exploration manifest candidates must be a list")
+    return candidates, previous_feedback
+
+
 def run_exploration_paper(
     config: AutopilotConfig,
     *,
@@ -550,87 +685,23 @@ def run_exploration_paper(
             "failed_stages": {},
         },
     }
-    if not manifest_path.exists():
+    prepared = _prepare_exploration_run(manifest_path, previous_status_path, report)
+    if prepared is None:
         return {**report, "skipped": True, "reason": "waiting_for_exploration_manifest"}
-    manifest = _read_object(manifest_path, label="exploration manifest")
-    if (
-        manifest.get("schema") != MANIFEST_SCHEMA
-        or manifest.get("live_allowed") is not False
-        or manifest.get("promotion_eligible") is not False
-        or manifest.get("adaptive_evidence") is not True
-    ):
-        raise ValueError("exploration manifest safety contract is invalid")
-    previous_feedback: dict[str, Any] = {}
-    if previous_status_path is not None and previous_status_path.exists():
-        previous = _read_object(previous_status_path, label="exploration status")
-        if previous.get("schema") == SCHEMA and isinstance(previous.get("aggregate"), dict):
-            report["aggregate"] = dict(previous["aggregate"])
-            report["aggregate"]["cycles"] = int(report["aggregate"].get("cycles", 0)) + 1
-            if isinstance(previous.get("candidate_feedback"), dict):
-                previous_feedback = previous["candidate_feedback"]
-    candidates = manifest.get("candidates")
-    if not isinstance(candidates, list):
-        raise ValueError("exploration manifest candidates must be a list")
+    candidates, previous_feedback = prepared
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
-        item: dict[str, Any] = {
-            "product": candidate.get("product"),
-            "symbol": candidate.get("symbol"),
-            "hypothesis_id": candidate.get("hypothesis_id"),
-            "artifact_digest": candidate.get("artifact_digest"),
-            "ok": True,
-        }
-        try:
-            product = _manifest_product(config, candidate)
-            artifact_path = Path(str(candidate["artifact"]))
-            artifact = _read_object(artifact_path, label="exploration artifact")
-            if (
-                artifact.get("exploration_only") is not True
-                or artifact.get("adaptive_evidence") is not True
-                or artifact.get("live_allowed") is not False
-                or artifact.get("promotion_eligible") is not False
-            ):
-                raise ValueError("exploration artifact safety contract is invalid")
-            assert_loaded_strategy_artifact_allowed(
-                product,
-                artifact,
-                artifact_path=artifact_path,
-                require_live_eligible=False,
-            )
-            bot = PaperTradingBot(
-                strategies_path=artifact_path,
-                state_file=Path(str(candidate["state"])),
-                trade_log=Path(str(candidate["trade_log"])),
-                starting_equity=float(candidate["starting_equity"]),
-                regime_guard=bool(candidate["regime_guard"]),
-                regime_mayer_top=float(candidate["regime_mayer_top"]),
-                symbol=product.symbol,
-                market=product.market,
-                objective=product.objective,
-                base_asset=product.base_asset,
-                artifact_payload=artifact,
-            )
-            bot.run_cycle()
-            item.update(
-                decision_trace=bot.decision_trace,
-                equity=bot.state.get("equity"),
-                open_positions=len(bot.state.get("open_positions", {})),
-                drawdown_halted=bot.state.get("drawdown_halted"),
-                trade_log=str(candidate["trade_log"]),
-            )
-            _aggregate_trace(report["aggregate"], bot.decision_trace)
-            digest = str(candidate.get("artifact_digest") or "")
-            report["candidate_feedback"][digest] = _candidate_feedback(
-                previous_feedback.get(digest)
-                if isinstance(previous_feedback.get(digest), dict)
-                else {},
-                candidate,
-                bot.decision_trace,
-                observed_at=report["generated_at"],
-            )
-        except Exception as exc:
-            item.update(ok=False, error=f"{type(exc).__name__}: {exc}")
+        item, feedback, trace = _run_exploration_candidate(
+            config,
+            candidate,
+            previous_feedback=previous_feedback,
+            observed_at=report["generated_at"],
+        )
+        if trace is not None:
+            _aggregate_trace(report["aggregate"], trace)
+            report["candidate_feedback"][str(candidate.get("artifact_digest") or "")] = feedback
+        if not item.get("ok"):
             report["ok"] = False
         report["products"].append(item)
     diagnoses = Counter(
