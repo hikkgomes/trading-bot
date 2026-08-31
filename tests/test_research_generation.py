@@ -26,6 +26,32 @@ from src.services.scheduler import ClaimedJob
 NOW = dt.datetime(2026, 8, 23, tzinfo=dt.UTC).isoformat()
 
 
+def test_campaign_catalogue_covers_the_declared_research_families() -> None:
+    names = {campaign.name for campaign in CAMPAIGNS}
+
+    assert {
+        "btc_risk_off_reentry",
+        "futures_breakout",
+        "futures_mean_reversion",
+        "cross_sectional_momentum",
+        "funding_carry",
+        "basis_convergence",
+        "pairs_mean_reversion",
+        "event_microstructure",
+        "ensemble_regime",
+    } <= names
+    assert {campaign.evidence_type for campaign in CAMPAIGNS} >= {
+        "btc_allocation",
+        "swing",
+        "intraday",
+        "cross_sectional",
+        "funding_carry",
+        "pairs",
+        "scalping",
+    }
+    assert all(campaign.required_data for campaign in CAMPAIGNS)
+
+
 def _database(tmp_path) -> PlatformDatabase:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'generation.sqlite3'}")
     database.create_schema()
