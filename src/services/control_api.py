@@ -335,6 +335,53 @@ def _control_target(target: str) -> str:
     return clean
 
 
+class ControlRequestHandler(BaseHTTPRequestHandler):
+    """Authenticated HTTP adapter around one database control plane."""
+
+    def _authorised(self) -> bool:
+        return self.headers.get("Authorization") == f"Bearer {getattr(self.server, 'bearer_token')}"
+
+    def _reply(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, sort_keys=True).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if not self._authorised():
+            self._reply(HTTPStatus.UNAUTHORIZED, {"reason_code": "unauthorised"})
+            return
+        response = _get_route(getattr(self.server, "control_plane"), self.path)
+        if response is None:
+            self._reply(HTTPStatus.NOT_FOUND, {"reason_code": "not_found"})
+            return
+        self._reply(HTTPStatus.OK, response)
+
+    def do_POST(self) -> None:  # noqa: N802
+        if not self._authorised():
+            self._reply(HTTPStatus.UNAUTHORIZED, {"reason_code": "unauthorised"})
+            return
+        if self.path not in _POST_ROUTES:
+            self._reply(HTTPStatus.NOT_FOUND, {"reason_code": "not_found"})
+            return
+        try:
+            response = _post_route(
+                getattr(self.server, "control_plane"), self.path, _request_payload(self)
+            )
+        except (UnicodeDecodeError, PermissionError, ValueError, json.JSONDecodeError) as exc:
+            self._reply(
+                HTTPStatus.BAD_REQUEST,
+                {"reason_code": "invalid_request", "error": str(exc)},
+            )
+            return
+        self._reply(HTTPStatus.OK, response)
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
 def build_control_server(
     *,
     bind: tuple[str, int],
@@ -343,104 +390,89 @@ def build_control_server(
 ) -> ThreadingHTTPServer:
     if not bearer_token:
         raise ValueError("control API bearer token cannot be empty")
+    server = ThreadingHTTPServer(bind, ControlRequestHandler)
+    server.control_plane = control_plane
+    server.bearer_token = bearer_token
+    return server
 
-    class Handler(BaseHTTPRequestHandler):
-        def _authorised(self) -> bool:
-            return self.headers.get("Authorization") == f"Bearer {bearer_token}"
 
-        def _reply(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
-            body = json.dumps(payload, sort_keys=True).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+_POST_ROUTES = frozenset(
+    {
+        "/pause",
+        "/resume",
+        "/block-new-risk",
+        "/management-only",
+        "/suspend-strategy",
+        "/emergency-flatten",
+        "/cancel-all-entry-orders",
+        "/agent/proposals",
+    }
+)
 
-        def do_GET(self) -> None:  # noqa: N802
-            if not self._authorised():
-                self._reply(HTTPStatus.UNAUTHORIZED, {"reason_code": "unauthorised"})
-                return
-            routes = {
-                "/health": control_plane.status,
-                "/status": control_plane.status,
-                "/configuration": control_plane.configuration_view,
-                "/reports": control_plane.report,
-                "/agent/reviews": control_plane.agent_reviews,
-            }
-            handler = routes.get(self.path)
-            if handler is None:
-                self._reply(HTTPStatus.NOT_FOUND, {"reason_code": "not_found"})
-                return
-            self._reply(HTTPStatus.OK, handler())
 
-        def do_POST(self) -> None:  # noqa: N802
-            if not self._authorised():
-                self._reply(HTTPStatus.UNAUTHORIZED, {"reason_code": "unauthorised"})
-                return
-            if self.path not in {
-                "/pause",
-                "/resume",
-                "/block-new-risk",
-                "/management-only",
-                "/suspend-strategy",
-                "/emergency-flatten",
-                "/cancel-all-entry-orders",
-                "/agent/proposals",
-            }:
-                self._reply(HTTPStatus.NOT_FOUND, {"reason_code": "not_found"})
-                return
-            try:
-                size = int(self.headers.get("Content-Length", "0"))
-                if not 1 <= size <= 16_384:
-                    raise ValueError("request size is invalid")
-                payload = json.loads(self.rfile.read(size))
-                if not isinstance(payload, dict):
-                    raise ValueError("request must be an object")
-                if self.path == "/agent/proposals":
-                    response = control_plane.ingest_agent_proposal(payload)
-                else:
-                    target = str(payload.get("target") or "")
-                    if self.path == "/suspend-strategy":
-                        strategy_id = str(payload.get("strategy_id") or "").strip()
-                        if not strategy_id:
-                            raise ValueError("strategy_id is required")
-                        target = f"strategy:{strategy_id}"
-                    if self.path == "/cancel-all-entry-orders":
-                        response = control_plane.cancel_all_entry_orders(
-                            target=target,
-                            reason_code=str(payload.get("reason_code") or ""),
-                            requested_by=str(payload.get("requested_by") or ""),
-                            changed_at=str(payload.get("changed_at") or ""),
-                        )
-                    else:
-                        mode = {
-                            "/pause": ControlMode.MANAGEMENT_ONLY,
-                            "/resume": ControlMode.RUN,
-                            "/block-new-risk": ControlMode.BLOCK_NEW_RISK,
-                            "/management-only": ControlMode.MANAGEMENT_ONLY,
-                            "/suspend-strategy": ControlMode.SUSPENDED,
-                            "/emergency-flatten": ControlMode.EMERGENCY_FLATTEN,
-                        }[self.path]
-                        response = control_plane.set_mode(
-                            target=target,
-                            mode=mode,
-                            reason_code=str(payload.get("reason_code") or ""),
-                            requested_by=str(payload.get("requested_by") or ""),
-                            changed_at=str(payload.get("changed_at") or ""),
-                            confirm_resume=bool(payload.get("confirm_resume", False)),
-                        ).__dict__
-            except (UnicodeDecodeError, PermissionError, ValueError, json.JSONDecodeError) as exc:
-                self._reply(
-                    HTTPStatus.BAD_REQUEST,
-                    {"reason_code": "invalid_request", "error": str(exc)},
-                )
-                return
-            self._reply(HTTPStatus.OK, response)
+def _get_route(control_plane: DatabaseControlPlane, path: str) -> dict[str, Any] | None:
+    routes = {
+        "/health": control_plane.status,
+        "/status": control_plane.status,
+        "/configuration": control_plane.configuration_view,
+        "/reports": control_plane.report,
+        "/agent/reviews": control_plane.agent_reviews,
+    }
+    handler = routes.get(path)
+    return handler() if handler is not None else None
 
-        def log_message(self, format: str, *args: object) -> None:
-            return
 
-    return ThreadingHTTPServer(bind, Handler)
+def _request_payload(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
+    size = int(handler.headers.get("Content-Length", "0"))
+    if not 1 <= size <= 16_384:
+        raise ValueError("request size is invalid")
+    payload = json.loads(handler.rfile.read(size))
+    if not isinstance(payload, dict):
+        raise ValueError("request must be an object")
+    return payload
+
+
+def _post_route(
+    control_plane: DatabaseControlPlane, path: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if path == "/agent/proposals":
+        return control_plane.ingest_agent_proposal(payload)
+    target = _post_target(path, payload)
+    if path == "/cancel-all-entry-orders":
+        return control_plane.cancel_all_entry_orders(
+            target=target,
+            reason_code=str(payload.get("reason_code") or ""),
+            requested_by=str(payload.get("requested_by") or ""),
+            changed_at=str(payload.get("changed_at") or ""),
+        )
+    return control_plane.set_mode(
+        target=target,
+        mode=_post_mode(path),
+        reason_code=str(payload.get("reason_code") or ""),
+        requested_by=str(payload.get("requested_by") or ""),
+        changed_at=str(payload.get("changed_at") or ""),
+        confirm_resume=bool(payload.get("confirm_resume", False)),
+    ).__dict__
+
+
+def _post_target(path: str, payload: Mapping[str, Any]) -> str:
+    if path != "/suspend-strategy":
+        return str(payload.get("target") or "")
+    strategy_id = str(payload.get("strategy_id") or "").strip()
+    if not strategy_id:
+        raise ValueError("strategy_id is required")
+    return f"strategy:{strategy_id}"
+
+
+def _post_mode(path: str) -> ControlMode:
+    return {
+        "/pause": ControlMode.MANAGEMENT_ONLY,
+        "/resume": ControlMode.RUN,
+        "/block-new-risk": ControlMode.BLOCK_NEW_RISK,
+        "/management-only": ControlMode.MANAGEMENT_ONLY,
+        "/suspend-strategy": ControlMode.SUSPENDED,
+        "/emergency-flatten": ControlMode.EMERGENCY_FLATTEN,
+    }[path]
 
 
 def _redact_configuration(value: Any, *, key: str = "") -> Any:
