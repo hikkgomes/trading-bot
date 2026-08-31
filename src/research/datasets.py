@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -340,6 +341,21 @@ class DatasetBundle:
         return {"bundle_id": self.bundle_id, "content_hash": self.content_hash, **self.content}
 
 
+def _bar_timestamp(value: Any, *, field: str) -> str:
+    if isinstance(value, bool):
+        raise DatasetResolutionError(f"{field} must be a timestamp")
+    if isinstance(value, int | float):
+        try:
+            return (
+                dt.datetime.fromtimestamp(float(value) / 1_000, dt.UTC)
+                .replace(microsecond=0)
+                .isoformat()
+            )
+        except (OverflowError, OSError, ValueError) as exc:
+            raise DatasetResolutionError(f"{field} is invalid") from exc
+    return timestamp(str(value), field=field)
+
+
 class CanonicalResearchDatasetBuilder:
     """Build deterministic, non-overlapping role snapshots and one bundle."""
 
@@ -505,9 +521,14 @@ class CanonicalResearchDatasetBuilder:
         with a partial bundle.
         """
 
+        if hasattr(bars, "to_pylist"):
+            bars = bars.to_pylist()
         if isinstance(bars, Mapping) or isinstance(bars, str):
             raise DatasetResolutionError("bars must be an iterable of row objects")
-        materialised = tuple(dict(row) for row in bars if isinstance(row, Mapping))
+        materialised_rows = tuple(bars)
+        if any(not isinstance(row, Mapping) for row in materialised_rows):
+            raise DatasetResolutionError("bars must contain only row objects")
+        materialised = tuple(dict(row) for row in materialised_rows)
         if not materialised:
             raise DatasetResolutionError("dataset data_pending: no immutable bars are available")
         created = timestamp(created_at, field="created_at")
@@ -525,8 +546,8 @@ class CanonicalResearchDatasetBuilder:
                 available = row.get("availability_time", row.get("available_at", observed))
                 if observed is None or available is None:
                     continue
-                observed_at = timestamp(str(observed), field=f"{role}.bar_timestamp")
-                available_at = timestamp(str(available), field=f"{role}.availability_time")
+                observed_at = _bar_timestamp(observed, field=f"{role}.bar_timestamp")
+                available_at = _bar_timestamp(available, field=f"{role}.availability_time")
                 if interval["start"] <= observed_at < interval["end"] and available_at <= created:
                     selected.append(row)
             if not selected:
