@@ -71,6 +71,17 @@ class PlatformTestnetRehearsal:
 
     def run(self, *, now: str) -> PlatformTestnetRehearsalReport:
         now = timestamp(now, field="now")
+        stages = self._run_stages(now)
+        proof = self._build_proof(stages)
+        ok = self._is_complete(stages, proof)
+        return PlatformTestnetRehearsalReport(
+            schema="platform.testnet-rehearsal/v1",
+            ok=ok,
+            stages=tuple(stages),
+            proof=tuple(sorted(proof)),
+        )
+
+    def _run_stages(self, now: str) -> list[Mapping[str, Any]]:
         stages: list[Mapping[str, Any]] = []
         for name, worker in (
             ("active_assignment", self.active_assignment),
@@ -87,17 +98,27 @@ class PlatformTestnetRehearsal:
             ("accounting", self.has_pending_accounting, self.accounting),
             ("recovery", self.has_pending_recovery, self.recovery),
         ):
-            for _ in range(self.maximum_drain_cycles):
-                if not pending():
-                    break
-                stages.append({"stage": name, **dict(worker.run_once(now=now))})
-            else:
-                stages.append(
-                    {
-                        "stage": name,
-                        "reason_code": "rehearsal_drain_limit_exceeded",
-                    }
-                )
+            stages.extend(self._drain_stage(name, pending, worker, now=now))
+        return stages
+
+    def _drain_stage(
+        self,
+        name: str,
+        pending: Callable[[], bool],
+        worker: RehearsalWorker,
+        *,
+        now: str,
+    ) -> list[Mapping[str, Any]]:
+        stages: list[Mapping[str, Any]] = []
+        for _ in range(self.maximum_drain_cycles):
+            if not pending():
+                return stages
+            stages.append({"stage": name, **dict(worker.run_once(now=now))})
+        stages.append({"stage": name, "reason_code": "rehearsal_drain_limit_exceeded"})
+        return stages
+
+    @staticmethod
+    def _build_proof(stages: list[Mapping[str, Any]]) -> set[str]:
         proof: set[str] = set()
         for stage in stages:
             name = str(stage.get("stage"))
@@ -112,21 +133,30 @@ class PlatformTestnetRehearsal:
                 or reason_code.endswith(("acknowledged", "recorded", "created", "loaded"))
             ):
                 proof.add(name)
-            if name == "live_order_submission" and reason_code.endswith("acknowledged"):
-                proof.add("broker_acknowledgement")
-            if name == "user_stream" and reason_code.endswith("recorded"):
-                proof.add("user_stream")
-                order_result = stage.get("order_result")
-                if isinstance(order_result, Mapping):
-                    order_reason = str(order_result.get("reason_code") or "")
-                    if order_reason.endswith("filled"):
-                        proof.add("fill")
-                    if "position_quantity" in order_result:
-                        proof.add("position")
-            if name == "accounting" and reason_code.endswith("recorded"):
-                proof.add("accounting")
-            if name == "recovery" and reason_code.endswith("created"):
-                proof.add("recovery")
+            PlatformTestnetRehearsal._add_order_proof(proof, name, reason_code, stage)
+        return proof
+
+    @staticmethod
+    def _add_order_proof(
+        proof: set[str], name: str, reason_code: str, stage: Mapping[str, Any]
+    ) -> None:
+        if name == "live_order_submission" and reason_code.endswith("acknowledged"):
+            proof.add("broker_acknowledgement")
+        if name == "user_stream" and reason_code.endswith("recorded"):
+            proof.add("user_stream")
+            order_result = stage.get("order_result")
+            if isinstance(order_result, Mapping):
+                if str(order_result.get("reason_code") or "").endswith("filled"):
+                    proof.add("fill")
+                if "position_quantity" in order_result:
+                    proof.add("position")
+        if name == "accounting" and reason_code.endswith("recorded"):
+            proof.add("accounting")
+        if name == "recovery" and reason_code.endswith("created"):
+            proof.add("recovery")
+
+    @staticmethod
+    def _is_complete(stages: list[Mapping[str, Any]], proof: set[str]) -> bool:
         required = {
             "active_assignment",
             "strategy_evaluation",
@@ -150,23 +180,14 @@ class PlatformTestnetRehearsal:
             "recovery",
         }
         completed = {str(stage.get("stage")) for stage in stages}
-        ok = (
-            required.issubset(completed)
-            and required_proof.issubset(proof)
-            and all(
-                stage.get("ok") is True
-                or str(stage.get("reason_code", "")).endswith(
-                    ("acknowledged", "recorded", "created", "loaded", "filled")
-                )
-                for stage in stages
+        accepted = all(
+            stage.get("ok") is True
+            or str(stage.get("reason_code", "")).endswith(
+                ("acknowledged", "recorded", "created", "loaded", "filled")
             )
+            for stage in stages
         )
-        return PlatformTestnetRehearsalReport(
-            schema="platform.testnet-rehearsal/v1",
-            ok=ok,
-            stages=tuple(stages),
-            proof=tuple(sorted(proof)),
-        )
+        return required.issubset(completed) and required_proof.issubset(proof) and accepted
 
 
 def validate_testnet_rehearsal_configuration(configuration: Mapping[str, Any]) -> dict[str, Any]:
