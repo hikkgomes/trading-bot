@@ -403,6 +403,25 @@ class EvidenceStatus(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+def _stage_snapshots(request: EvaluationRequest) -> tuple[tuple[str, ...], str | None]:
+    stage_snapshot_ids = request.snapshot_ids_for_stage(request.requested_stage)
+    if request.requested_stage != "protected":
+        return stage_snapshot_ids, None
+    protected_snapshot_id = (
+        request.protected_snapshot_id()
+        if request.dataset_roles
+        else request.dataset_snapshot_ids[0]
+    )
+    return (
+        tuple(
+            snapshot_id
+            for snapshot_id in request.dataset_snapshot_ids
+            if snapshot_id != protected_snapshot_id
+        ),
+        protected_snapshot_id,
+    )
+
+
 @dataclass(frozen=True)
 class EvidencePolicy:
     """Typed acceptance thresholds for measured research evidence."""
@@ -1141,36 +1160,7 @@ class CanonicalResearchEvaluator:
             return ()
 
     def evaluate(self, request: EvaluationRequest) -> StageEvaluation:
-        if request.dataset_roles:
-            expected_role = {
-                "screening": "screening",
-                "development": "development",
-                "robustness": "robustness",
-                "protected": "protected_holdout",
-                "forward": "forward_observation",
-            }[request.requested_stage]
-            if sum(role == expected_role for role in request.dataset_roles.values()) != 1:
-                raise EvaluationContractError(
-                    f"dataset_roles must contain exactly one {expected_role} snapshot"
-                )
-            if request.requested_stage != "protected" and "protected_holdout" in set(
-                request.dataset_roles.values()
-            ):
-                raise EvaluationContractError(
-                    "adaptive evaluation cannot contain a protected_holdout snapshot"
-                )
-            if request.requested_stage == "forward" and any(
-                role != "forward_observation" for role in request.dataset_roles.values()
-            ):
-                raise EvaluationContractError(
-                    "forward evaluation requests may contain only forward_observation snapshots"
-                )
-            if request.requested_stage != "forward" and "forward_observation" in set(
-                request.dataset_roles.values()
-            ):
-                raise EvaluationContractError(
-                    "adaptive evaluation cannot contain a forward_observation snapshot"
-                )
+        self._validate_request_scope(request)
         candidate = self.store.get_candidate(request.candidate_id)
         if not set(request.dataset_snapshot_ids).issubset(set(candidate.dataset_snapshot_hashes)):
             raise EvaluationContractError(
@@ -1179,75 +1169,19 @@ class CanonicalResearchEvaluator:
         existing_stages = {
             row["stage"]: row for row in self.validation.stages(request.candidate_id)
         }
-        stage_index = STAGES.index(request.requested_stage)
-        for prior_stage in STAGES[:stage_index]:
-            prior = existing_stages.get(prior_stage)
-            if prior is None:
-                raise EvaluationContractError(f"prior stage is missing: {prior_stage}")
-            if prior["accepted"] is not True:
-                raise EvaluationContractError(f"prior stage was rejected: {prior_stage}")
+        self._validate_prior_stages(request.requested_stage, existing_stages)
         definition = candidate.definition
         family, horizon, evidence_type = _evidence_dimensions(candidate)
-        stage_snapshot_ids = request.snapshot_ids_for_stage(request.requested_stage)
-        protected_snapshot_id = (
-            (
-                request.protected_snapshot_id()
-                if request.dataset_roles
-                else request.dataset_snapshot_ids[0]
-            )
-            if request.requested_stage == "protected"
-            else None
+        stage_snapshot_ids, protected_snapshot_id = _stage_snapshots(request)
+        context = self._evaluation_context(
+            request,
+            definition=definition,
+            family=family,
+            horizon=horizon,
+            evidence_type=evidence_type,
+            stage_snapshot_ids=stage_snapshot_ids,
+            thesis_id=candidate.thesis_id,
         )
-        if request.requested_stage == "protected":
-            stage_snapshot_ids = tuple(
-                snapshot_id
-                for snapshot_id in request.dataset_snapshot_ids
-                if snapshot_id != protected_snapshot_id
-            )
-        adaptive_roles = {
-            snapshot_id: request.dataset_roles[snapshot_id]
-            for snapshot_id in stage_snapshot_ids
-            if request.dataset_roles and snapshot_id in request.dataset_roles
-        }
-        context = {
-            "candidate_id": request.candidate_id,
-            "strategy_version_id": definition.strategy_version_id,
-            "product_id": definition.product,
-            "strategy_family": family,
-            "strategy_horizon": horizon,
-            "evidence_type": evidence_type,
-            "evaluation_policy_id": request.evaluation_policy_id,
-            "dataset_snapshot_ids": list(stage_snapshot_ids),
-            "dataset_roles": adaptive_roles,
-            "evidence_policy_hash": self.evidence_policy.policy_hash,
-            "maximum_portfolio_correlation": self.evidence_policy.maximum_portfolio_correlation,
-            "minimum_bootstrap_observations": self.evidence_policy.minimum_bootstrap_observations,
-            "walk_forward_windows": self.evidence_policy.minimum_walk_forward_windows,
-            "minimum_walk_forward_pass_fraction": (
-                self.evidence_policy.minimum_walk_forward_pass_fraction
-            ),
-            "maximum_backtest_overfitting_probability": (
-                self.evidence_policy.maximum_backtest_overfitting_probability
-            ),
-            "minimum_deflated_sharpe": self.evidence_policy.minimum_deflated_sharpe,
-            "bootstrap_method": self.evidence_policy.bootstrap_method,
-            "multiple_testing_method": self.evidence_policy.multiple_testing_method,
-            "pbo_method": self.evidence_policy.pbo_method,
-            "negative_controls": list(self._negative_controls(candidate.thesis_id)),
-            "requested_stage": request.requested_stage,
-            "evaluated_at": request.evaluated_at,
-            "code_hash": request.code_hash or definition.source_hash,
-            "feature_set_hash": request.feature_set_hash,
-            "cost_model_hash": request.cost_model_hash,
-            "feature_manifest_id": request.feature_manifest_id,
-            "cost_model_id": request.cost_model_id,
-            "parameter_set_id": request.parameter_set_id,
-            "evaluator_version": request.evaluator_version,
-            "producer_identity": request.producer_identity,
-            "content_hash": request.content_hash,
-            "artefact_hash": request.artefact_hash,
-            "artefact_created_at": request.artefact_created_at,
-        }
         evidence, accepted, reason_code, receipt, metrics = self._calculate_stage(
             request.requested_stage,
             candidate,
@@ -1294,6 +1228,102 @@ class CanonicalResearchEvaluator:
             evidence_hash=canonical_hash(evidence),
             evidence={**dict(evidence), "validation_stage_id": stage_id},
         )
+
+    def _validate_request_scope(self, request: EvaluationRequest) -> None:
+        if not request.dataset_roles:
+            return
+        expected_role = {
+            "screening": "screening",
+            "development": "development",
+            "robustness": "robustness",
+            "protected": "protected_holdout",
+            "forward": "forward_observation",
+        }[request.requested_stage]
+        roles = tuple(request.dataset_roles.values())
+        if sum(role == expected_role for role in roles) != 1:
+            raise EvaluationContractError(
+                f"dataset_roles must contain exactly one {expected_role} snapshot"
+            )
+        if request.requested_stage == "protected" and (
+            len(roles) != 1 or roles[0] != "protected_holdout"
+        ):
+            raise EvaluationContractError(
+                "protected evaluation requests may contain only the protected_holdout snapshot"
+            )
+        if request.requested_stage != "protected" and "protected_holdout" in roles:
+            raise EvaluationContractError(
+                "adaptive evaluation cannot contain a protected_holdout snapshot"
+            )
+        if request.requested_stage == "forward" and any(
+            role != "forward_observation" for role in roles
+        ):
+            raise EvaluationContractError(
+                "forward evaluation requests may contain only forward_observation snapshots"
+            )
+        if request.requested_stage != "forward" and "forward_observation" in roles:
+            raise EvaluationContractError(
+                "adaptive evaluation cannot contain a forward_observation snapshot"
+            )
+
+    @staticmethod
+    def _validate_prior_stages(stage: str, existing: Mapping[str, Mapping[str, Any]]) -> None:
+        for prior_stage in STAGES[: STAGES.index(stage)]:
+            prior = existing.get(prior_stage)
+            if prior is None:
+                raise EvaluationContractError(f"prior stage is missing: {prior_stage}")
+            if prior["accepted"] is not True:
+                raise EvaluationContractError(f"prior stage was rejected: {prior_stage}")
+
+    def _evaluation_context(
+        self,
+        request: EvaluationRequest,
+        *,
+        definition: Any,
+        family: str,
+        horizon: str,
+        evidence_type: str,
+        stage_snapshot_ids: tuple[str, ...],
+        thesis_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "candidate_id": request.candidate_id,
+            "strategy_version_id": definition.strategy_version_id,
+            "product_id": definition.product,
+            "strategy_family": family,
+            "strategy_horizon": horizon,
+            "evidence_type": evidence_type,
+            "evaluation_policy_id": request.evaluation_policy_id,
+            "dataset_snapshot_ids": list(stage_snapshot_ids),
+            "dataset_roles": {
+                snapshot_id: request.dataset_roles[snapshot_id]
+                for snapshot_id in stage_snapshot_ids
+                if request.dataset_roles and snapshot_id in request.dataset_roles
+            },
+            "evidence_policy_hash": self.evidence_policy.policy_hash,
+            "maximum_portfolio_correlation": self.evidence_policy.maximum_portfolio_correlation,
+            "minimum_bootstrap_observations": self.evidence_policy.minimum_bootstrap_observations,
+            "walk_forward_windows": self.evidence_policy.minimum_walk_forward_windows,
+            "minimum_walk_forward_pass_fraction": self.evidence_policy.minimum_walk_forward_pass_fraction,
+            "maximum_backtest_overfitting_probability": self.evidence_policy.maximum_backtest_overfitting_probability,
+            "minimum_deflated_sharpe": self.evidence_policy.minimum_deflated_sharpe,
+            "bootstrap_method": self.evidence_policy.bootstrap_method,
+            "multiple_testing_method": self.evidence_policy.multiple_testing_method,
+            "pbo_method": self.evidence_policy.pbo_method,
+            "negative_controls": list(self._negative_controls(thesis_id)),
+            "requested_stage": request.requested_stage,
+            "evaluated_at": request.evaluated_at,
+            "code_hash": request.code_hash or definition.source_hash,
+            "feature_set_hash": request.feature_set_hash,
+            "cost_model_hash": request.cost_model_hash,
+            "feature_manifest_id": request.feature_manifest_id,
+            "cost_model_id": request.cost_model_id,
+            "parameter_set_id": request.parameter_set_id,
+            "evaluator_version": request.evaluator_version,
+            "producer_identity": request.producer_identity,
+            "content_hash": request.content_hash,
+            "artefact_hash": request.artefact_hash,
+            "artefact_created_at": request.artefact_created_at,
+        }
 
     def _execute_stage(
         self,
