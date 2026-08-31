@@ -5697,15 +5697,13 @@ def _auto_clear_successful_flatten_requests(
     return results
 
 
-def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any]:
-    errors = validate_config(config, validate_jobs=run_jobs)
-    if errors:
-        return {"ok": False, "errors": errors, "products": []}
-
+def _initial_cycle_state(
+    config: AutopilotConfig,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     previous_status = _previous_status(config.status_file)
     control = load_control(config.control_file)
     report: dict[str, Any] = {
-        "ok": True,
+        "ok": not bool(config.job_config_errors),
         "control": control,
         "job_config_errors": list(config.job_config_errors),
         "data_update": None,
@@ -5713,177 +5711,231 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
         "products": [],
         "active_income_portfolio": _active_income_portfolio_status(config),
     }
-    if config.job_config_errors:
-        # Continue product management, but make the isolated job failure loud
-        # in the supervisor heartbeat and alert stream.
-        report["ok"] = False
+    return previous_status, control, report
+
+
+def _validate_cycle_control(
+    config: AutopilotConfig,
+    control: dict[str, Any],
+    report: dict[str, Any],
+) -> None:
     if control.get("control_error"):
         report["ok"] = False
         report["control_error"] = control["control_error"]
-    elif unknown_selectors := unknown_control_selectors(control, config):
-        control["paused"] = True
-        control["pause_jobs"] = True
-        control["reason"] = "unknown_control_selector"
-        control["control_error"] = "unknown control selectors: " + json.dumps(
-            unknown_selectors, sort_keys=True
-        )
-        report["ok"] = False
-        report["control_error"] = control["control_error"]
-        report["unknown_control_selectors"] = unknown_selectors
+        return
+    unknown_selectors = unknown_control_selectors(control, config)
+    if not unknown_selectors:
+        return
+    control["paused"] = True
+    control["pause_jobs"] = True
+    control["reason"] = "unknown_control_selector"
+    control["control_error"] = "unknown control selectors: " + json.dumps(
+        unknown_selectors, sort_keys=True
+    )
+    report["ok"] = False
+    report["control_error"] = control["control_error"]
+    report["unknown_control_selectors"] = unknown_selectors
 
+
+def _cycle_flatten_product_status(
+    product: ProductConfig,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        product_status = flatten_product_once(product)
+    except (ValueError, RuntimeError, OSError) as exc:
+        LOGGER.exception("Product flatten failed: %s", product.name)
+        product_status = {
+            "product": _product_to_status(product),
+            "action": "flatten",
+            "ok": False,
+            "error": str(exc),
+        }
+    flatten_result = {
+        "product_name": product.name,
+        "ok": bool(product_status.get("ok")),
+        "skipped": product_status.get("skipped"),
+        "reason": product_status.get("reason"),
+        "error": product_status.get("error") or product_status.get("close_error"),
+    }
+    return product_status, flatten_result
+
+
+def _cycle_paused_product_status(
+    product: ProductConfig,
+    config: AutopilotConfig,
+    control: dict[str, Any],
+) -> dict[str, Any]:
+    if not _local_state_requires_management(product):
+        return {
+            "product": _product_to_status(product),
+            "ok": True,
+            "skipped": True,
+            "reason": "paused",
+        }
+    try:
+        management_kwargs: dict[str, Any] = {
+            "approval_ledger": config.approval_ledger,
+            "allow_entries": False,
+        }
+        if product.execution_mode == "live":
+            management_kwargs["config"] = config
+        product_status = run_product_once(product, **management_kwargs)
+        product_status["paused"] = True
+        return product_status
+    except (
+        ApprovalError,
+        FileNotFoundError,
+        StrategyPolicyError,
+        ValueError,
+        RuntimeError,
+    ) as exc:
+        LOGGER.exception("Paused product risk-management cycle failed: %s", product.name)
+        return {
+            "product": _product_to_status(product),
+            "ok": False,
+            "paused": True,
+            "entries_allowed": False,
+            "error": str(exc),
+        }
+
+
+def _cycle_active_income_setup(
+    product: ProductConfig,
+    config: AutopilotConfig,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    portfolio_gate: dict[str, Any] | None = None
+    product_kwargs: dict[str, Any] = {"approval_ledger": config.approval_ledger}
+    if product.objective == "active_income":
+        portfolio_gate = _active_income_portfolio_status(config)
+        if not portfolio_gate["entry_capacity_available"]:
+            product_kwargs["allow_entries"] = False
+    if product.execution_mode == "live" or product.objective == "active_income":
+        product_kwargs["config"] = config
+    return portfolio_gate, product_kwargs
+
+
+def _cycle_normal_product_status(
+    product: ProductConfig,
+    config: AutopilotConfig,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    portfolio_gate, product_kwargs = _cycle_active_income_setup(product, config)
+    try:
+        product_status = run_product_once(product, **product_kwargs)
+        if portfolio_gate is not None:
+            product_status["portfolio_entry_gate"] = portfolio_gate
+    except (
+        ApprovalError,
+        FileNotFoundError,
+        StrategyPolicyError,
+        ValueError,
+        RuntimeError,
+    ) as exc:
+        LOGGER.exception("Product cycle failed: %s", product.name)
+        product_status = {
+            "product": _product_to_status(product),
+            "ok": False,
+            "error": str(exc),
+        }
+    return product_status, None
+
+
+def _cycle_product_status(
+    product: ProductConfig,
+    config: AutopilotConfig,
+    control: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    if should_flatten_product(control, product.name):
+        return _cycle_flatten_product_status(product)
+    if is_product_paused(control, product.name):
+        return _cycle_paused_product_status(product, config, control), None
+    return _cycle_normal_product_status(product, config)
+
+
+def _run_cycle_products(
+    config: AutopilotConfig,
+    control: dict[str, Any],
+    report: dict[str, Any],
+) -> list[dict[str, Any]]:
     flatten_results: list[dict[str, Any]] = []
     for product in config.products:
-        if should_flatten_product(control, product.name):
-            try:
-                product_status = flatten_product_once(product)
-            except (ValueError, RuntimeError, OSError) as exc:
-                LOGGER.exception("Product flatten failed: %s", product.name)
-                product_status = {
-                    "product": _product_to_status(product),
-                    "action": "flatten",
-                    "ok": False,
-                    "error": str(exc),
-                }
-            report["products"].append(product_status)
-            report["ok"] = report["ok"] and bool(product_status.get("ok"))
-            flatten_results.append(
-                {
-                    "product_name": product.name,
-                    "ok": bool(product_status.get("ok")),
-                    "skipped": product_status.get("skipped"),
-                    "reason": product_status.get("reason"),
-                    "error": product_status.get("error") or product_status.get("close_error"),
-                }
-            )
-            continue
-        if is_product_paused(control, product.name):
-            if not _local_state_requires_management(product):
-                report["products"].append(
-                    {
-                        "product": _product_to_status(product),
-                        "ok": True,
-                        "skipped": True,
-                        "reason": "paused",
-                    }
-                )
-                continue
-            try:
-                management_kwargs: dict[str, Any] = {
-                    "approval_ledger": config.approval_ledger,
-                    "allow_entries": False,
-                }
-                if product.execution_mode == "live":
-                    management_kwargs["config"] = config
-                product_status = run_product_once(product, **management_kwargs)
-                product_status["paused"] = True
-            except (
-                ApprovalError,
-                FileNotFoundError,
-                StrategyPolicyError,
-                ValueError,
-                RuntimeError,
-            ) as exc:
-                LOGGER.exception("Paused product risk-management cycle failed: %s", product.name)
-                product_status = {
-                    "product": _product_to_status(product),
-                    "ok": False,
-                    "paused": True,
-                    "entries_allowed": False,
-                    "error": str(exc),
-                }
-            report["products"].append(product_status)
-            report["ok"] = report["ok"] and bool(product_status.get("ok"))
-            continue
-        try:
-            product_kwargs: dict[str, Any] = {
-                "approval_ledger": config.approval_ledger,
-            }
-            portfolio_gate: dict[str, Any] | None = None
-            if product.objective == "active_income":
-                portfolio_gate = _active_income_portfolio_status(config)
-                if not portfolio_gate["entry_capacity_available"]:
-                    product_kwargs["allow_entries"] = False
-            # Active-income paper trading is part of the same portfolio risk
-            # process as live execution.  Pass the config so the paper bot
-            # receives the allocator callback rather than only the coarse
-            # pre-cycle capacity check.
-            if product.execution_mode == "live" or product.objective == "active_income":
-                product_kwargs["config"] = config
-            product_status = run_product_once(product, **product_kwargs)
-            if portfolio_gate is not None:
-                product_status["portfolio_entry_gate"] = portfolio_gate
-        except (
-            ApprovalError,
-            FileNotFoundError,
-            StrategyPolicyError,
-            ValueError,
-            RuntimeError,
-        ) as exc:
-            LOGGER.exception("Product cycle failed: %s", product.name)
-            product_status = {
-                "product": _product_to_status(product),
-                "ok": False,
-                "error": str(exc),
-            }
+        product_status, flatten_result = _cycle_product_status(product, config, control)
         report["products"].append(product_status)
         report["ok"] = report["ok"] and bool(product_status.get("ok"))
-        if product.objective == "active_income":
+        if flatten_result is not None:
+            flatten_results.append(flatten_result)
+        if product.objective == "active_income" and not flatten_result:
             report["active_income_portfolio"] = _active_income_portfolio_status(config)
+    return flatten_results
 
-    if config.alerts_enabled and config.position_change_alerts_enabled:
-        position_alerts = _emit_position_change_alerts(config, report["products"])
-        if position_alerts:
-            report["position_alerts"] = position_alerts
 
-    # Product supervision and emergency flattening always run before bounded
-    # maintenance/research work.  A slow data job must never postpone the first
-    # risk-management pass of a cycle.
+def _run_cycle_jobs(
+    config: AutopilotConfig,
+    control: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    run_jobs: bool,
+) -> None:
     if run_jobs and config.run_data_update and not control.get("paused"):
         report["data_update"] = run_data_update()
         report["ok"] = report["ok"] and bool(report["data_update"]["ok"])
+    if not run_jobs or control.get("paused"):
+        return
+    try:
+        paused_jobs = {job.name for job in config.jobs if is_job_paused(control, job.name)}
+        report["jobs"] = run_due_jobs(
+            config.jobs,
+            config.job_state_file,
+            paused_jobs=paused_jobs,
+            max_jobs_per_cycle=config.max_jobs_per_cycle,
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        LOGGER.exception("Autopilot jobs failed")
+        report["jobs"] = [
+            {
+                "name": "scheduler",
+                "ok": False,
+                "error": str(exc),
+                "state_file": str(config.job_state_file),
+            }
+        ]
+        report["ok"] = False
+    for job_result in report["jobs"]:
+        report["ok"] = report["ok"] and bool(job_result.get("ok"))
 
-    if run_jobs and not control.get("paused"):
-        try:
-            paused_jobs = {job.name for job in config.jobs if is_job_paused(control, job.name)}
-            report["jobs"] = run_due_jobs(
-                config.jobs,
-                config.job_state_file,
-                paused_jobs=paused_jobs,
-                max_jobs_per_cycle=config.max_jobs_per_cycle,
-            )
-        except (OSError, ValueError, RuntimeError) as exc:
-            LOGGER.exception("Autopilot jobs failed")
-            report["jobs"] = [
-                {
-                    "name": "scheduler",
-                    "ok": False,
-                    "error": str(exc),
-                    "state_file": str(config.job_state_file),
-                }
-            ]
-            report["ok"] = False
-        for job_result in report["jobs"]:
-            report["ok"] = report["ok"] and bool(job_result.get("ok"))
 
+def _run_cycle_diagnostics(
+    config: AutopilotConfig,
+    control: dict[str, Any],
+    report: dict[str, Any],
+    flatten_results: list[dict[str, Any]],
+) -> None:
     control_clear = _auto_clear_successful_flatten_requests(config, control, flatten_results)
     if control_clear:
         report["control_clear"] = control_clear
         report["ok"] = report["ok"] and all(bool(item.get("ok")) for item in control_clear)
+    if not config.trade_starvation_enabled:
+        return
+    try:
+        report["trade_starvation"] = update_trade_starvation(config, report)
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        LOGGER.exception("Trade-starvation diagnostic failed")
+        report["trade_starvation"] = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "history": str(config.trade_starvation_history_file),
+            "report": str(config.trade_starvation_report_file),
+        }
+        report["ok"] = False
 
-    if config.trade_starvation_enabled:
-        try:
-            report["trade_starvation"] = update_trade_starvation(config, report)
-        except (OSError, UnicodeError, ValueError, TypeError) as exc:
-            LOGGER.exception("Trade-starvation diagnostic failed")
-            report["trade_starvation"] = {
-                "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
-                "history": str(config.trade_starvation_history_file),
-                "report": str(config.trade_starvation_report_file),
-            }
-            report["ok"] = False
 
-    if config.alerts_enabled and not report["ok"]:
+def _emit_cycle_health_alert(
+    config: AutopilotConfig,
+    report: dict[str, Any],
+    previous_status: dict[str, Any],
+) -> None:
+    if not config.alerts_enabled:
+        return
+    if not report["ok"]:
         incident_key = _cycle_failure_dedupe_key(report)
         previous_incident_key = (
             _cycle_failure_dedupe_key(previous_status)
@@ -5905,112 +5957,141 @@ def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any
                 cooldown_seconds=0,
                 dedupe_key=incident_key,
             )
-    elif config.alerts_enabled and previous_status.get("ok") is False:
-        previous_incident_key = _cycle_failure_dedupe_key(previous_status)
-        report["recovery_alert"] = _emit_runtime_alert(
+        return
+    if previous_status.get("ok") is not False:
+        return
+    previous_incident_key = _cycle_failure_dedupe_key(previous_status)
+    report["recovery_alert"] = _emit_runtime_alert(
+        config,
+        severity="info",
+        title="autopilot cycle recovered",
+        detail={
+            "cleared_incident": previous_incident_key,
+            "operator_action_required": False,
+        },
+        cooldown_seconds=0,
+        dedupe_key=f"cycle-recovered:{previous_incident_key}:{utc_now()}",
+    )
+
+
+def _emit_report_advisory_alerts(
+    config: AutopilotConfig,
+    report: dict[str, Any],
+) -> bool:
+    reports_need_refresh = False
+    if (
+        config.alerts_enabled
+        and config.advisory_alerts_enabled
+        and _report_json_available(
+            report.get("reporting", {}),
+            "readiness_report_json",
+            config.readiness_report_json_file,
+        )
+    ):
+        readiness_report = json.loads(
+            config.readiness_report_json_file.read_text(encoding="utf-8")
+        )
+        readiness_detail = readiness_warning_detail(readiness_report)
+        if readiness_detail["warnings"]:
+            report["readiness_alert"] = _emit_runtime_alert(
+                config,
+                severity="warning",
+                title="autopilot readiness warnings",
+                detail=readiness_detail,
+            )
+            reports_need_refresh = True
+    if not config.alerts_enabled or not _report_json_available(
+        report.get("reporting", {}),
+        "operator_report_json",
+        config.operator_report_json_file,
+    ):
+        return reports_need_refresh
+    operator_report = json.loads(
+        config.operator_report_json_file.read_text(encoding="utf-8")
+    )
+    for detail_factory, title, report_key in (
+        (
+            research_handoff_warning_detail,
+            "autopilot research handoff warnings",
+            "research_handoff",
+        ),
+        (
+            research_progress_warning_detail,
+            "autopilot research progress warnings",
+            "research_progress",
+        ),
+        (
+            required_testnet_rehearsal_warning_detail,
+            "autopilot testnet rehearsal warnings",
+            "testnet_rehearsal",
+        ),
+        (promotion_warning_detail, "autopilot promotion review warnings", "promotion"),
+    ):
+        detail = detail_factory(operator_report)
+        if config.advisory_alerts_enabled and detail["warnings"]:
+            report[f"{report_key}_alert"] = _emit_runtime_alert(
+                config,
+                severity="warning",
+                title=title,
+                detail=detail,
+            )
+            reports_need_refresh = True
+    if config.daily_digest_enabled:
+        digest_period = int(time.time() // config.daily_digest_cadence_seconds)
+        digest_alert = _emit_runtime_alert(
             config,
             severity="info",
-            title="autopilot cycle recovered",
-            detail={
-                "cleared_incident": previous_incident_key,
-                "operator_action_required": False,
-            },
-            cooldown_seconds=0,
-            dedupe_key=f"cycle-recovered:{previous_incident_key}:{utc_now()}",
+            title="autopilot daily digest",
+            detail=_daily_digest_detail(operator_report),
+            cooldown_seconds=config.daily_digest_cadence_seconds * 2,
+            dedupe_key=f"daily-digest:{digest_period}",
         )
+        report["daily_digest_alert"] = digest_alert
+        reports_need_refresh = reports_need_refresh or bool(digest_alert.get("sent"))
+    return reports_need_refresh
+
+
+def _write_cycle_observability(
+    config: AutopilotConfig,
+    report: dict[str, Any],
+) -> dict[str, Any]:
     write_status(config.status_file, report)
-    if config.auto_report_enabled:
-        try:
+    if not config.auto_report_enabled:
+        return report
+    try:
+        report["reporting"] = write_cycle_reports(config)
+        if _emit_report_advisory_alerts(config, report):
+            write_status(config.status_file, report)
             report["reporting"] = write_cycle_reports(config)
-            reports_need_refresh = False
-            if (
-                config.alerts_enabled
-                and config.advisory_alerts_enabled
-                and _report_json_available(
-                    report.get("reporting", {}),
-                    "readiness_report_json",
-                    config.readiness_report_json_file,
-                )
-            ):
-                readiness_report = json.loads(
-                    config.readiness_report_json_file.read_text(encoding="utf-8")
-                )
-                readiness_detail = readiness_warning_detail(readiness_report)
-                if readiness_detail["warnings"]:
-                    report["readiness_alert"] = _emit_runtime_alert(
-                        config,
-                        severity="warning",
-                        title="autopilot readiness warnings",
-                        detail=readiness_detail,
-                    )
-                    reports_need_refresh = True
-            if config.alerts_enabled and _report_json_available(
-                report.get("reporting", {}),
-                "operator_report_json",
-                config.operator_report_json_file,
-            ):
-                operator_report = json.loads(
-                    config.operator_report_json_file.read_text(encoding="utf-8")
-                )
-                research_handoff_detail = research_handoff_warning_detail(operator_report)
-                if config.advisory_alerts_enabled and research_handoff_detail["warnings"]:
-                    report["research_handoff_alert"] = _emit_runtime_alert(
-                        config,
-                        severity="warning",
-                        title="autopilot research handoff warnings",
-                        detail=research_handoff_detail,
-                    )
-                    reports_need_refresh = True
-                research_progress_detail = research_progress_warning_detail(operator_report)
-                if config.advisory_alerts_enabled and research_progress_detail["warnings"]:
-                    report["research_progress_alert"] = _emit_runtime_alert(
-                        config,
-                        severity="warning",
-                        title="autopilot research progress warnings",
-                        detail=research_progress_detail,
-                    )
-                    reports_need_refresh = True
-                testnet_rehearsal_detail = required_testnet_rehearsal_warning_detail(
-                    operator_report
-                )
-                if config.advisory_alerts_enabled and testnet_rehearsal_detail["warnings"]:
-                    report["testnet_rehearsal_alert"] = _emit_runtime_alert(
-                        config,
-                        severity="warning",
-                        title="autopilot testnet rehearsal warnings",
-                        detail=testnet_rehearsal_detail,
-                    )
-                    reports_need_refresh = True
-                promotion_detail = promotion_warning_detail(operator_report)
-                if config.advisory_alerts_enabled and promotion_detail["warnings"]:
-                    report["promotion_alert"] = _emit_runtime_alert(
-                        config,
-                        severity="warning",
-                        title="autopilot promotion review warnings",
-                        detail=promotion_detail,
-                    )
-                    reports_need_refresh = True
-                if config.daily_digest_enabled:
-                    digest_period = int(time.time() // config.daily_digest_cadence_seconds)
-                    digest_alert = _emit_runtime_alert(
-                        config,
-                        severity="info",
-                        title="autopilot daily digest",
-                        detail=_daily_digest_detail(operator_report),
-                        cooldown_seconds=config.daily_digest_cadence_seconds * 2,
-                        dedupe_key=f"daily-digest:{digest_period}",
-                    )
-                    report["daily_digest_alert"] = digest_alert
-                    if digest_alert.get("sent"):
-                        reports_need_refresh = True
-            if reports_need_refresh:
-                write_status(config.status_file, report)
-                report["reporting"] = write_cycle_reports(config)
-        except Exception as exc:  # reporting must never crash trading supervision
-            LOGGER.exception("Failed to write cycle reports")
-            report["reporting"] = {"ok": False, "error": str(exc)}
-        write_status(config.status_file, report)
+    except Exception as exc:  # reporting must never crash trading supervision
+        LOGGER.exception("Failed to write cycle reports")
+        report["reporting"] = {"ok": False, "error": str(exc)}
+    write_status(config.status_file, report)
     return report
+
+
+def run_once(config: AutopilotConfig, *, run_jobs: bool = True) -> dict[str, Any]:
+    errors = validate_config(config, validate_jobs=run_jobs)
+    if errors:
+        return {"ok": False, "errors": errors, "products": []}
+
+    previous_status, control, report = _initial_cycle_state(config)
+    _validate_cycle_control(config, control, report)
+    flatten_results = _run_cycle_products(config, control, report)
+
+    if config.alerts_enabled and config.position_change_alerts_enabled:
+        position_alerts = _emit_position_change_alerts(config, report["products"])
+        if position_alerts:
+            report["position_alerts"] = position_alerts
+
+    # Product supervision and emergency flattening always run before bounded
+    # maintenance/research work. A slow data job must never postpone the first
+    # risk-management pass of a cycle.
+    _run_cycle_jobs(config, control, report, run_jobs=run_jobs)
+    _run_cycle_diagnostics(config, control, report, flatten_results)
+
+    _emit_cycle_health_alert(config, report, previous_status)
+    return _write_cycle_observability(config, report)
 
 
 def parse_args() -> argparse.Namespace:
