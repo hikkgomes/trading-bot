@@ -3,9 +3,10 @@ import itertools
 import json
 import logging
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -340,55 +341,22 @@ def simulate_trades(
         if not should_enter or entry_index < next_allowed_entry or entry_index > max_entry_index:
             continue
         entry = open_[entry_index]
-        exit_index = entry_index + horizon_bars
-        exit_price = close[exit_index]
-        exit_reason = "time"
-
-        if can_use_labels:
-            label = int(data[label_column].iloc[signal_index])
-            bars_to_exit = int(data[bars_column].iloc[signal_index])
-            exit_index = min(entry_index + max(1, bars_to_exit), len(data) - 1)
-            if label > 0:
-                exit_reason = "take_profit"
-                exit_price = (
-                    entry * (1 + take_profit) if direction == "long" else entry * (1 - take_profit)
-                )
-            elif label < 0:
-                exit_reason = "stop"
-                exit_price = (
-                    entry * (1 - stop_loss) if direction == "long" else entry * (1 + stop_loss)
-                )
-            else:
-                exit_reason = "time"
-                exit_price = close[exit_index]
-        else:
-            for index in range(entry_index, entry_index + horizon_bars + 1):
-                if direction == "long":
-                    stop_hit = low[index] <= entry * (1 - stop_loss)
-                    take_hit = high[index] >= entry * (1 + take_profit)
-                    if stop_hit:
-                        exit_index = index
-                        exit_price = entry * (1 - stop_loss)
-                        exit_reason = "stop"
-                        break
-                    if take_hit:
-                        exit_index = index
-                        exit_price = entry * (1 + take_profit)
-                        exit_reason = "take_profit"
-                        break
-                else:
-                    stop_hit = high[index] >= entry * (1 + stop_loss)
-                    take_hit = low[index] <= entry * (1 - take_profit)
-                    if stop_hit:
-                        exit_index = index
-                        exit_price = entry * (1 + stop_loss)
-                        exit_reason = "stop"
-                        break
-                    if take_hit:
-                        exit_index = index
-                        exit_price = entry * (1 - take_profit)
-                        exit_reason = "take_profit"
-                        break
+        exit_index, exit_price, exit_reason = _resolve_trade_exit(
+            data=data,
+            entry=entry,
+            entry_index=entry_index,
+            signal_index=signal_index,
+            horizon_bars=horizon_bars,
+            direction=direction,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+            low=low,
+            high=high,
+            close=close,
+            can_use_labels=can_use_labels,
+            label_column=label_column,
+            bars_column=bars_column,
+        )
 
         gross_return = gross_return_for_pnl_unit(
             entry,
@@ -414,6 +382,128 @@ def simulate_trades(
         next_allowed_entry = exit_index + 1
 
     return pd.DataFrame(trades)
+
+
+def _resolve_trade_exit(
+    *,
+    data: pd.DataFrame,
+    entry: float,
+    entry_index: int,
+    signal_index: int,
+    horizon_bars: int,
+    direction: str,
+    take_profit: float,
+    stop_loss: float,
+    low: np.ndarray,
+    high: np.ndarray,
+    close: np.ndarray,
+    can_use_labels: bool,
+    label_column: str,
+    bars_column: str,
+) -> tuple[int, float, str]:
+    if can_use_labels:
+        return _label_trade_exit(
+            data,
+            entry=entry,
+            entry_index=entry_index,
+            signal_index=signal_index,
+            direction=direction,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+            label_column=label_column,
+            bars_column=bars_column,
+        )
+    return _scan_trade_exit(
+        entry=entry,
+        entry_index=entry_index,
+        horizon_bars=horizon_bars,
+        direction=direction,
+        take_profit=take_profit,
+        stop_loss=stop_loss,
+        low=low,
+        high=high,
+        close=close,
+    )
+
+
+def _label_trade_exit(
+    data: pd.DataFrame,
+    *,
+    entry: float,
+    entry_index: int,
+    signal_index: int,
+    direction: str,
+    take_profit: float,
+    stop_loss: float,
+    label_column: str,
+    bars_column: str,
+) -> tuple[int, float, str]:
+    label = int(data[label_column].iloc[signal_index])
+    bars_to_exit = int(data[bars_column].iloc[signal_index])
+    exit_index = min(entry_index + max(1, bars_to_exit), len(data) - 1)
+    if label > 0:
+        return (
+            exit_index,
+            entry * (1 + take_profit if direction == "long" else 1 - take_profit),
+            "take_profit",
+        )
+    if label < 0:
+        return (
+            exit_index,
+            entry * (1 - stop_loss if direction == "long" else 1 + stop_loss),
+            "stop",
+        )
+    return exit_index, float(data["tf_15m_close"].iloc[exit_index]), "time"
+
+
+def _scan_trade_exit(
+    *,
+    entry: float,
+    entry_index: int,
+    horizon_bars: int,
+    direction: str,
+    take_profit: float,
+    stop_loss: float,
+    low: np.ndarray,
+    high: np.ndarray,
+    close: np.ndarray,
+) -> tuple[int, float, str]:
+    exit_index = entry_index + horizon_bars
+    exit_price = close[exit_index]
+    for index in range(entry_index, entry_index + horizon_bars + 1):
+        stop_hit, take_hit = _barrier_hits(
+            direction,
+            entry=entry,
+            index=index,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+            low=low,
+            high=high,
+        )
+        if stop_hit:
+            return index, entry * (1 - stop_loss if direction == "long" else 1 + stop_loss), "stop"
+        if take_hit:
+            return (
+                index,
+                entry * (1 + take_profit if direction == "long" else 1 - take_profit),
+                "take_profit",
+            )
+    return exit_index, exit_price, "time"
+
+
+def _barrier_hits(
+    direction: str,
+    *,
+    entry: float,
+    index: int,
+    take_profit: float,
+    stop_loss: float,
+    low: np.ndarray,
+    high: np.ndarray,
+) -> tuple[bool, bool]:
+    if direction == "long":
+        return low[index] <= entry * (1 - stop_loss), high[index] >= entry * (1 + take_profit)
+    return high[index] >= entry * (1 + stop_loss), low[index] <= entry * (1 - take_profit)
 
 
 def returns_metrics(returns: np.ndarray) -> dict[str, float]:
@@ -724,152 +814,25 @@ def make_candidates(
     candidates: list[StrategyCandidate] = []
     for horizon in horizons:
         for direction in directions:
-            LOGGER.info(
-                "Ranking features for direction=%s horizon=%s method=%s",
-                direction,
-                horizon,
-                ranking_method,
-            )
-            ranked_features = _rank_features(
-                train,
-                all_features,
-                horizon,
-                direction,
-                max_features,
-                ranking_method,
-                rank_sample_rows,
-            )
-            if shap_screen:
-                from src.feature_screener import screen_features
-
-                train = train.copy()
-                label_column = f"screen_label_{direction}_{horizon}"
-                if shap_target == "triple-barrier":
-                    matching = [
-                        col
-                        for col in train.columns
-                        if col.startswith(f"label_{direction}_") and col.endswith(f"_h{horizon}")
-                    ]
-                    if matching:
-                        label_column = matching[0]
-                    else:
-                        LOGGER.warning(
-                            "No triple-barrier SHAP target for direction=%s horizon=%s; using sign target",
-                            direction,
-                            horizon,
-                        )
-                        target = train[f"future_return_{horizon}_bars"]
-                        train[label_column] = (
-                            (target > 0).astype(int)
-                            if direction == "long"
-                            else (target < 0).astype(int)
-                        )
-                else:
-                    target = train[f"future_return_{horizon}_bars"]
-                    train[label_column] = (
-                        (target > 0).astype(int)
-                        if direction == "long"
-                        else (target < 0).astype(int)
-                    )
-                ranked_features = screen_features(
-                    train,
-                    label_column,
-                    ranked_features,
-                    max_features=max(1, min(max_features, len(ranked_features))),
+            candidates.extend(
+                _make_direction_candidates(
+                    train=train,
+                    all_features=all_features,
+                    horizon=horizon,
+                    direction=direction,
+                    max_features=max_features,
+                    top_conditions=top_conditions,
+                    max_pairs=max_pairs,
+                    max_triples=max_triples,
+                    condition_depths=condition_depths,
+                    ranking_method=ranking_method,
+                    rank_sample_rows=rank_sample_rows,
+                    cross_tf_mode=cross_tf_mode,
+                    enabled_kinds=enabled_kinds,
+                    shap_screen=shap_screen,
+                    shap_target=shap_target,
                 )
-
-            cross_pairs = (
-                detect_cross_feature_pairs(ranked_features)
-                if "cross" in enabled_kinds or "ratio" in enabled_kinds
-                else None
             )
-            conditions = _build_conditions_for_features(
-                train,
-                ranked_features,
-                enabled_kinds,
-                cross_pairs,
-            )
-            selected_indices = _score_and_select_conditions(
-                train,
-                conditions,
-                horizon,
-                direction,
-                top_conditions,
-            )
-            LOGGER.info(
-                "Selected %s base conditions for direction=%s horizon=%s",
-                len(selected_indices),
-                direction,
-                horizon,
-            )
-
-            if 1 in condition_depths:
-                for index in selected_indices:
-                    candidates.append(StrategyCandidate(direction, horizon, (conditions[index],)))
-
-            if 2 in condition_depths or 3 in condition_depths:
-                if cross_tf_mode == "pool":
-                    selected_pairs = _generate_pairs_pool(
-                        conditions,
-                        selected_indices,
-                        max_pairs,
-                    )
-                elif cross_tf_mode == "shap":
-                    selected_pairs = _generate_pairs_shap(
-                        train,
-                        conditions,
-                        selected_indices,
-                        all_features,
-                        horizon,
-                        max_pairs,
-                    )
-                else:
-                    selected_pairs = _generate_pairs_flat(
-                        conditions,
-                        selected_indices,
-                        max_pairs,
-                    )
-
-                if 2 in condition_depths:
-                    for left_index, right_index in selected_pairs:
-                        candidates.append(
-                            StrategyCandidate(
-                                direction,
-                                horizon,
-                                (conditions[left_index], conditions[right_index]),
-                            )
-                        )
-
-                if 3 in condition_depths:
-                    triple_count = 0
-                    seen_triples: set = set()
-                    for left_index, right_index in selected_pairs:
-                        used_features = {
-                            conditions[left_index].feature,
-                            conditions[right_index].feature,
-                        }
-                        for third_index in selected_indices:
-                            if third_index in {left_index, right_index}:
-                                continue
-                            third = conditions[third_index]
-                            if third.feature in used_features:
-                                continue
-                            triple = tuple(sorted((left_index, right_index, third_index)))
-                            if triple in seen_triples:
-                                continue
-                            seen_triples.add(triple)
-                            candidates.append(
-                                StrategyCandidate(
-                                    direction,
-                                    horizon,
-                                    tuple(conditions[index] for index in triple),
-                                )
-                            )
-                            triple_count += 1
-                            if triple_count >= max_triples:
-                                break
-                        if triple_count >= max_triples:
-                            break
     seen = set()
     deduped: list[StrategyCandidate] = []
     for candidate in candidates:
@@ -883,6 +846,211 @@ def make_candidates(
         seen.add(signature)
         deduped.append(candidate)
     return deduped
+
+
+def _make_direction_candidates(
+    *,
+    train: pd.DataFrame,
+    all_features: list[str],
+    horizon: int,
+    direction: str,
+    max_features: int,
+    top_conditions: int,
+    max_pairs: int,
+    max_triples: int,
+    condition_depths: Sequence[int],
+    ranking_method: str,
+    rank_sample_rows: int,
+    cross_tf_mode: str,
+    enabled_kinds: set[str],
+    shap_screen: bool,
+    shap_target: str,
+) -> list[StrategyCandidate]:
+    LOGGER.info(
+        "Ranking features for direction=%s horizon=%s method=%s",
+        direction,
+        horizon,
+        ranking_method,
+    )
+    ranked_features = _rank_features(
+        train,
+        all_features,
+        horizon,
+        direction,
+        max_features,
+        ranking_method,
+        rank_sample_rows,
+    )
+    if shap_screen:
+        ranked_features = _shap_screen_features(
+            train,
+            ranked_features,
+            horizon=horizon,
+            direction=direction,
+            shap_target=shap_target,
+            max_features=max_features,
+        )
+    cross_pairs = (
+        detect_cross_feature_pairs(ranked_features)
+        if "cross" in enabled_kinds or "ratio" in enabled_kinds
+        else None
+    )
+    conditions = _build_conditions_for_features(train, ranked_features, enabled_kinds, cross_pairs)
+    selected_indices = _score_and_select_conditions(
+        train, conditions, horizon, direction, top_conditions
+    )
+    LOGGER.info(
+        "Selected %s base conditions for direction=%s horizon=%s",
+        len(selected_indices),
+        direction,
+        horizon,
+    )
+    return _depth_candidates(
+        train=train,
+        conditions=conditions,
+        selected_indices=selected_indices,
+        direction=direction,
+        horizon=horizon,
+        max_pairs=max_pairs,
+        max_triples=max_triples,
+        condition_depths=condition_depths,
+        cross_tf_mode=cross_tf_mode,
+        all_features=all_features,
+    )
+
+
+def _shap_screen_features(
+    train: pd.DataFrame,
+    ranked_features: list[str],
+    *,
+    horizon: int,
+    direction: str,
+    shap_target: str,
+    max_features: int,
+) -> list[str]:
+    from src.feature_screener import screen_features
+
+    train = train.copy()
+    label_column = f"screen_label_{direction}_{horizon}"
+    matching = [
+        col
+        for col in train.columns
+        if col.startswith(f"label_{direction}_") and col.endswith(f"_h{horizon}")
+    ]
+    if shap_target == "triple-barrier" and matching:
+        label_column = matching[0]
+    else:
+        if shap_target == "triple-barrier":
+            LOGGER.warning(
+                "No triple-barrier SHAP target for direction=%s horizon=%s; using sign target",
+                direction,
+                horizon,
+            )
+        target = train[f"future_return_{horizon}_bars"]
+        train[label_column] = (
+            (target > 0).astype(int) if direction == "long" else (target < 0).astype(int)
+        )
+    return screen_features(
+        train,
+        label_column,
+        ranked_features,
+        max_features=max(1, min(max_features, len(ranked_features))),
+    )
+
+
+def _depth_candidates(
+    *,
+    train: pd.DataFrame,
+    conditions: list[Condition],
+    selected_indices: list[int],
+    direction: str,
+    horizon: int,
+    max_pairs: int,
+    max_triples: int,
+    condition_depths: Sequence[int],
+    cross_tf_mode: str,
+    all_features: list[str],
+) -> list[StrategyCandidate]:
+    candidates = (
+        [StrategyCandidate(direction, horizon, (conditions[index],)) for index in selected_indices]
+        if 1 in condition_depths
+        else []
+    )
+    if not ({2, 3} & set(condition_depths)):
+        return candidates
+    selected_pairs = _selected_condition_pairs(
+        train,
+        conditions,
+        selected_indices,
+        horizon=horizon,
+        max_pairs=max_pairs,
+        cross_tf_mode=cross_tf_mode,
+        all_features=all_features,
+    )
+    if 2 in condition_depths:
+        candidates.extend(
+            StrategyCandidate(direction, horizon, (conditions[left], conditions[right]))
+            for left, right in selected_pairs
+        )
+    if 3 in condition_depths:
+        candidates.extend(
+            _triple_condition_candidates(
+                conditions,
+                selected_indices,
+                selected_pairs,
+                direction=direction,
+                horizon=horizon,
+                max_triples=max_triples,
+            )
+        )
+    return candidates
+
+
+def _selected_condition_pairs(
+    train: pd.DataFrame,
+    conditions: list[Condition],
+    selected_indices: list[int],
+    *,
+    horizon: int,
+    max_pairs: int,
+    cross_tf_mode: str,
+    all_features: list[str],
+) -> list[tuple[int, int]]:
+    if cross_tf_mode == "pool":
+        return _generate_pairs_pool(conditions, selected_indices, max_pairs)
+    if cross_tf_mode == "shap":
+        return _generate_pairs_shap(
+            train, conditions, selected_indices, all_features, horizon, max_pairs
+        )
+    return _generate_pairs_flat(conditions, selected_indices, max_pairs)
+
+
+def _triple_condition_candidates(
+    conditions: list[Condition],
+    selected_indices: list[int],
+    selected_pairs: list[tuple[int, int]],
+    *,
+    direction: str,
+    horizon: int,
+    max_triples: int,
+) -> list[StrategyCandidate]:
+    triples: list[StrategyCandidate] = []
+    seen: set[tuple[int, int, int]] = set()
+    for left, right in selected_pairs:
+        used = {conditions[left].feature, conditions[right].feature}
+        for third in selected_indices:
+            if third in {left, right} or conditions[third].feature in used:
+                continue
+            triple = tuple(sorted((left, right, third)))
+            if triple in seen:
+                continue
+            seen.add(triple)
+            triples.append(
+                StrategyCandidate(direction, horizon, tuple(conditions[index] for index in triple))
+            )
+            if len(triples) >= max_triples:
+                return triples
+    return triples
 
 
 def _conditions_payload(candidate: StrategyCandidate) -> str:
@@ -1484,6 +1652,204 @@ def _evaluate_holdout(
     return out
 
 
+def _report_header(
+    btc_mode: bool, rejection_summary: dict[str, int], diagnostics: pd.DataFrame
+) -> list[str]:
+    if btc_mode:
+        title = "# BTC Position Trading Report"
+        subtitle = (
+            "BTC-denominated strategy: hold BTC, swap to USDT on short signals to dodge pullbacks. "
+            "Returns represent extra BTC accumulated above buy-and-hold."
+        )
+    else:
+        title = "# Strategy Search Report"
+        subtitle = "Ranks long and short indicator/timeframe patterns by fee-adjusted test trades."
+    lines = [title, "", subtitle, "", "## Filter Summary", "", "```text"]
+    lines.extend(f"{key}: {value}" for key, value in rejection_summary.items())
+    if not diagnostics.empty and "pool_pbo" in diagnostics.columns:
+        pool_pbo = diagnostics["pool_pbo"].dropna()
+        if not pool_pbo.empty:
+            lines.append(f"pool_pbo: {float(pool_pbo.iloc[0]):.4f}")
+    lines.extend(["```", ""])
+    return lines
+
+
+def _btc_summary(strategies: pd.DataFrame, *, btc_mode: bool, walk_forward: bool) -> list[str]:
+    if not btc_mode or strategies.empty:
+        return []
+    best = strategies.iloc[0]
+    if walk_forward:
+        lines = [
+            "## BTC Accumulation Summary (Best Strategy)",
+            "",
+            f"- Walk-forward window pass rate: **{float(best.get('wf_pass_rate', np.nan)):.0%}**",
+            f"- Avg extra BTC per trade (per-window expectancy): **{float(best.get('wf_expectancy', np.nan)):.4%}**",
+            f"- Avg trades per window: {float(best.get('wf_avg_trades', np.nan)):.0f}",
+        ]
+        if "holdout_total_return" in strategies.columns and pd.notna(
+            best.get("holdout_total_return")
+        ):
+            lines.append(
+                f"- Holdout extra BTC accumulated (untouched data): **{float(best['holdout_total_return']):.2%}**"
+            )
+        lines.append("")
+        return lines
+    total_trades = int(best["train_trades"] + best["test_trades"])
+    total_return = best["train_total_return"] + best["test_total_return"]
+    return [
+        "## BTC Accumulation Summary (Best Strategy)",
+        "",
+        f"- Extra BTC accumulated (train+test): **{total_return:.2%}**",
+        f"- Total trades: {total_trades}",
+        f"- Trades per year: ~{total_trades / 6:.0f}",
+        "",
+    ]
+
+
+def _strategy_report_section(
+    strategies: pd.DataFrame, *, btc_mode: bool, walk_forward: bool
+) -> list[str]:
+    lines = ["## Top Passing Strategies", ""]
+    if strategies.empty:
+        lines.append("No strategies passed the filters.")
+        return lines
+    display, columns = _strategy_display(strategies, btc_mode=btc_mode, walk_forward=walk_forward)
+    available = [column for column in columns if column in display.columns]
+    lines.extend(["```text", display[available].head(30).to_string(index=False), "```"])
+    return lines
+
+
+def _strategy_display(
+    strategies: pd.DataFrame, *, btc_mode: bool, walk_forward: bool
+) -> tuple[pd.DataFrame, list[str]]:
+    if walk_forward:
+        return strategies, [
+            "direction",
+            "horizon_bars",
+            "take_profit",
+            "stop_loss",
+            "timeframes",
+            "wf_pass_rate",
+            "wf_expectancy",
+            "wf_profit_factor_median",
+            "wf_max_drawdown_worst",
+            "wf_avg_trades",
+            "wf_windows",
+            "dsr",
+            "holdout_total_return",
+            "holdout_trades",
+            "rule",
+        ]
+    if btc_mode:
+        return strategies.rename(
+            columns={
+                "train_total_return": "train_btc_accumulated",
+                "test_total_return": "test_btc_accumulated",
+                "test_avg_net_return": "test_avg_btc_gain",
+            }
+        ), [
+            "horizon_bars",
+            "take_profit",
+            "stop_loss",
+            "timeframes",
+            "train_trades",
+            "train_btc_accumulated",
+            "test_trades",
+            "test_btc_accumulated",
+            "test_win_rate",
+            "test_avg_btc_gain",
+            "test_max_drawdown",
+            "dsr",
+            "rule",
+        ]
+    return strategies, [
+        "direction",
+        "horizon_bars",
+        "take_profit",
+        "stop_loss",
+        "timeframes",
+        "train_trades",
+        "train_total_return",
+        "test_trades",
+        "test_total_return",
+        "test_win_rate",
+        "test_avg_net_return",
+        "test_max_drawdown",
+        "dsr",
+        "rule",
+    ]
+
+
+def _near_miss_section(diagnostics: pd.DataFrame, *, walk_forward: bool) -> list[str]:
+    lines = ["", "## Best Near Misses", ""]
+    if diagnostics.empty:
+        lines.append("No scored candidates were produced.")
+        return lines
+    columns = (
+        [
+            "direction",
+            "horizon_bars",
+            "take_profit",
+            "stop_loss",
+            "timeframes",
+            "wf_pass_rate",
+            "wf_expectancy",
+            "wf_profit_factor_median",
+            "wf_max_drawdown_worst",
+            "wf_avg_trades",
+            "dsr",
+            "passes_filters",
+            "rule",
+        ]
+        if walk_forward
+        else [
+            "direction",
+            "horizon_bars",
+            "take_profit",
+            "stop_loss",
+            "timeframes",
+            "train_trades",
+            "train_total_return",
+            "test_trades",
+            "test_total_return",
+            "test_win_rate",
+            "test_avg_net_return",
+            "test_max_drawdown",
+            "passes_filters",
+            "rule",
+        ]
+    )
+    available = [column for column in columns if column in diagnostics.columns]
+    lines.extend(["```text", diagnostics[available].head(30).to_string(index=False), "```"])
+    return lines
+
+
+def _year_breakdown_section(yearly: pd.DataFrame) -> list[str]:
+    if yearly.empty:
+        return []
+    columns = [
+        "strategy_rank",
+        "year",
+        "direction",
+        "horizon_bars",
+        "take_profit",
+        "stop_loss",
+        "trades",
+        "total_return",
+        "win_rate",
+        "avg_net_return",
+        "max_drawdown",
+    ]
+    return [
+        "",
+        "## Year Breakdown",
+        "",
+        "```text",
+        yearly[columns].to_string(index=False),
+        "```",
+    ]
+
+
 def write_report(
     strategies: pd.DataFrame,
     yearly: pd.DataFrame,
@@ -1496,194 +1862,976 @@ def write_report(
     walk_forward: bool = False,
 ) -> None:
     btc_mode = mode == "btc-position" or pnl_unit == "btc"
-    if btc_mode:
-        title = "# BTC Position Trading Report"
-        subtitle = (
-            "BTC-denominated strategy: hold BTC, swap to USDT on short signals to dodge pullbacks. "
-            "Returns represent extra BTC accumulated above buy-and-hold."
-        )
-    else:
-        title = "# Strategy Search Report"
-        subtitle = "Ranks long and short indicator/timeframe patterns by fee-adjusted test trades."
-    lines = [
-        title,
-        "",
-        subtitle,
-        "",
-        "## Filter Summary",
-        "",
-        "```text",
-    ]
-    for key, value in rejection_summary.items():
-        lines.append(f"{key}: {value}")
-    if not diagnostics.empty and "pool_pbo" in diagnostics.columns:
-        pool_pbo = diagnostics["pool_pbo"].dropna()
-        if not pool_pbo.empty:
-            lines.append(f"pool_pbo: {float(pool_pbo.iloc[0]):.4f}")
-    lines.extend(["```", ""])
-    if btc_mode and not strategies.empty:
-        best = strategies.iloc[0]
-        if walk_forward:
-            lines.extend(
-                [
-                    "## BTC Accumulation Summary (Best Strategy)",
-                    "",
-                    f"- Walk-forward window pass rate: **{float(best.get('wf_pass_rate', np.nan)):.0%}**",
-                    f"- Avg extra BTC per trade (per-window expectancy): **{float(best.get('wf_expectancy', np.nan)):.4%}**",
-                    f"- Avg trades per window: {float(best.get('wf_avg_trades', np.nan)):.0f}",
-                ]
-            )
-            if "holdout_total_return" in strategies.columns and pd.notna(
-                best.get("holdout_total_return")
-            ):
-                lines.append(
-                    f"- Holdout extra BTC accumulated (untouched data): **{float(best['holdout_total_return']):.2%}**"
-                )
-            lines.append("")
-        else:
-            total_trades = int(best["train_trades"] + best["test_trades"])
-            total_return = best["train_total_return"] + best["test_total_return"]
-            lines.extend(
-                [
-                    "## BTC Accumulation Summary (Best Strategy)",
-                    "",
-                    f"- Extra BTC accumulated (train+test): **{total_return:.2%}**",
-                    f"- Total trades: {total_trades}",
-                    f"- Trades per year: ~{total_trades / 6:.0f}",
-                    "",
-                ]
-            )
-    lines.extend(["## Top Passing Strategies", ""])
-    if strategies.empty:
-        lines.append("No strategies passed the filters.")
-    else:
-        if walk_forward:
-            display = strategies
-            columns = [
-                "direction",
-                "horizon_bars",
-                "take_profit",
-                "stop_loss",
-                "timeframes",
-                "wf_pass_rate",
-                "wf_expectancy",
-                "wf_profit_factor_median",
-                "wf_max_drawdown_worst",
-                "wf_avg_trades",
-                "wf_windows",
-                "dsr",
-                "holdout_total_return",
-                "holdout_trades",
-                "rule",
-            ]
-        elif btc_mode:
-            display = strategies.copy()
-            display = display.rename(
-                columns={
-                    "train_total_return": "train_btc_accumulated",
-                    "test_total_return": "test_btc_accumulated",
-                    "test_avg_net_return": "test_avg_btc_gain",
-                }
-            )
-            columns = [
-                "horizon_bars",
-                "take_profit",
-                "stop_loss",
-                "timeframes",
-                "train_trades",
-                "train_btc_accumulated",
-                "test_trades",
-                "test_btc_accumulated",
-                "test_win_rate",
-                "test_avg_btc_gain",
-                "test_max_drawdown",
-                "dsr",
-                "rule",
-            ]
-        else:
-            display = strategies
-            columns = [
-                "direction",
-                "horizon_bars",
-                "take_profit",
-                "stop_loss",
-                "timeframes",
-                "train_trades",
-                "train_total_return",
-                "test_trades",
-                "test_total_return",
-                "test_win_rate",
-                "test_avg_net_return",
-                "test_max_drawdown",
-                "dsr",
-                "rule",
-            ]
-        available = [column for column in columns if column in display.columns]
-        lines.append("```text")
-        lines.append(display[available].head(30).to_string(index=False))
-        lines.append("```")
-    lines.extend(["", "## Best Near Misses", ""])
-    if diagnostics.empty:
-        lines.append("No scored candidates were produced.")
-    else:
-        if walk_forward:
-            columns = [
-                "direction",
-                "horizon_bars",
-                "take_profit",
-                "stop_loss",
-                "timeframes",
-                "wf_pass_rate",
-                "wf_expectancy",
-                "wf_profit_factor_median",
-                "wf_max_drawdown_worst",
-                "wf_avg_trades",
-                "dsr",
-                "passes_filters",
-                "rule",
-            ]
-        else:
-            columns = [
-                "direction",
-                "horizon_bars",
-                "take_profit",
-                "stop_loss",
-                "timeframes",
-                "train_trades",
-                "train_total_return",
-                "test_trades",
-                "test_total_return",
-                "test_win_rate",
-                "test_avg_net_return",
-                "test_max_drawdown",
-                "passes_filters",
-                "rule",
-            ]
-        available = [column for column in columns if column in diagnostics.columns]
-        lines.append("```text")
-        lines.append(diagnostics[available].head(30).to_string(index=False))
-        lines.append("```")
-    if not yearly.empty:
-        lines.extend(["", "## Year Breakdown", "", "```text"])
-        lines.append(
-            yearly[
-                [
-                    "strategy_rank",
-                    "year",
-                    "direction",
-                    "horizon_bars",
-                    "take_profit",
-                    "stop_loss",
-                    "trades",
-                    "total_return",
-                    "win_rate",
-                    "avg_net_return",
-                    "max_drawdown",
-                ]
-            ].to_string(index=False)
-        )
-        lines.append("```")
+    lines = _report_header(btc_mode, rejection_summary, diagnostics)
+    lines.extend(_btc_summary(strategies, btc_mode=btc_mode, walk_forward=walk_forward))
+    lines.extend(_strategy_report_section(strategies, btc_mode=btc_mode, walk_forward=walk_forward))
+    lines.extend(_near_miss_section(diagnostics, walk_forward=walk_forward))
+    lines.extend(_year_breakdown_section(yearly))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _prepare_search_inputs(
+    *,
+    input_path: Path,
+    horizons: Sequence[int],
+    train_fraction: float,
+    take_profits: Sequence[float],
+    stop_losses: Sequence[float],
+    mode: str,
+    regime_conditional: bool,
+    walk_forward: bool,
+    purged_kfold: bool,
+    holdout_fraction: float,
+    wf_train_bars: int,
+    wf_test_bars: int,
+    wf_step_bars: int,
+    wf_min_windows: int,
+    wf_pass_rate: float,
+    embargo_bars: int | None,
+) -> dict[str, Any]:
+    data = load_dataset(input_path, horizons)
+    if regime_conditional and "tf_1d_regime_id" not in data.columns:
+        LOGGER.warning(
+            "--regime-conditional requested but tf_1d_regime_id is missing; skipping regime breakdown"
+        )
+        regime_conditional = False
+    embargo_bars = max(horizons) if embargo_bars is None else embargo_bars
+    directions = ("short",) if mode == "btc-position" else ("long", "short")
+    scenarios = list(itertools.product(take_profits, stop_losses))
+    wf_engine_mode = walk_forward and not purged_kfold
+    holdout = data.iloc[0:0]
+    core = data
+    windows: list[tuple[slice, slice]] = []
+    train = test = None
+    if wf_engine_mode:
+        core_rows = (
+            len(data) - int(len(data) * holdout_fraction) if holdout_fraction > 0 else len(data)
+        )
+        core = data.iloc[:core_rows]
+        holdout = data.iloc[core_rows:]
+        wf_config = WalkForwardConfig(
+            train_bars=wf_train_bars,
+            test_bars=wf_test_bars,
+            step_bars=wf_step_bars,
+            min_windows=wf_min_windows,
+            pass_rate=wf_pass_rate,
+            embargo_bars=embargo_bars,
+        )
+        windows = generate_windows(len(core), wf_config)
+        candidate_frame = core.iloc[windows[0][0]]
+        LOGGER.info(
+            "Walk-forward: %s windows over %s core rows, %s holdout rows reserved",
+            len(windows),
+            len(core),
+            len(holdout),
+        )
+    else:
+        train, test = split_train_test(data, train_fraction)
+        candidate_frame = train
+    return {
+        "data": data,
+        "core": core,
+        "holdout": holdout,
+        "windows": windows,
+        "train": train,
+        "test": test,
+        "candidate_frame": candidate_frame,
+        "directions": directions,
+        "scenarios": scenarios,
+        "wf_engine_mode": wf_engine_mode,
+        "embargo_bars": embargo_bars,
+        "regime_conditional": regime_conditional,
+    }
+
+
+def _build_run_candidates(
+    *,
+    candidate_frame: pd.DataFrame,
+    horizons: Sequence[int],
+    directions: Sequence[str],
+    max_features: int,
+    top_conditions: int,
+    max_pairs: int,
+    max_triples: int,
+    rank_sample_rows: int,
+    condition_depths: Sequence[int],
+    ranking_method: str,
+    cross_tf_mode: str,
+    enabled_kinds: set[str],
+    shap_screen: bool,
+    shap_target: str,
+) -> list[StrategyCandidate]:
+    return make_candidates(
+        candidate_frame,
+        horizons,
+        directions=directions,
+        max_features=max_features,
+        top_conditions=top_conditions,
+        max_pairs=max_pairs,
+        max_triples=max_triples,
+        rank_sample_rows=rank_sample_rows,
+        condition_depths=condition_depths,
+        ranking_method=ranking_method,
+        cross_tf_mode=cross_tf_mode,
+        enabled_kinds=enabled_kinds,
+        shap_screen=shap_screen,
+        shap_target=shap_target,
+    )
+
+
+def _warn_missing_barrier_labels(
+    data: pd.DataFrame,
+    *,
+    directions: Sequence[str],
+    horizons: Sequence[int],
+    scenarios: Sequence[tuple[float, float]],
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+    missing: list[str] = []
+    for direction in directions:
+        for horizon in horizons:
+            for take_profit, stop_loss in scenarios:
+                suffix = (
+                    f"{direction}_tp{int(round(take_profit * 10_000))}"
+                    f"_sl{int(round(stop_loss * 10_000))}_h{horizon}"
+                )
+                if (
+                    f"label_{suffix}" not in data.columns
+                    or f"bars_to_exit_{suffix}" not in data.columns
+                ):
+                    missing.append(suffix)
+    if missing:
+        LOGGER.warning(
+            "--use-triple-barrier-labels requested but %s label scenarios are missing; "
+            "those scenarios fall back to simulation",
+            len(missing),
+        )
+
+
+def _prune_search_data(
+    *,
+    data: pd.DataFrame,
+    core: pd.DataFrame,
+    holdout: pd.DataFrame,
+    candidates: Sequence[StrategyCandidate],
+    use_triple_barrier_labels: bool,
+    regime_conditional: bool,
+    wf_engine_mode: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
+    extra_columns: set[str] = set()
+    if use_triple_barrier_labels:
+        extra_columns |= {c for c in data.columns if c.startswith(("label_", "bars_to_exit_"))}
+    if regime_conditional and "tf_1d_regime_id" in data.columns:
+        extra_columns.add("tf_1d_regime_id")
+    worker_columns = sorted(
+        (candidate_feature_columns(candidates) & set(data.columns)) | extra_columns
+    )
+    if not wf_engine_mode:
+        return data, core, holdout, worker_columns
+    n_core = len(core)
+    keep = [c for c in data.columns if c in set(worker_columns) | set(BASE_COLUMNS)]
+    data = data[keep]
+    return data, data.iloc[:n_core], data.iloc[n_core:], worker_columns
+
+
+def _search_config(
+    *,
+    input_path: Path,
+    horizons: Sequence[int],
+    train_fraction: float,
+    max_features: int,
+    top_conditions: int,
+    max_pairs: int,
+    max_triples: int,
+    rank_sample_rows: int,
+    condition_depths: Sequence[int],
+    min_train_trades: int,
+    min_test_trades: int,
+    fee_bps: float,
+    slippage_bps: float,
+    take_profits: Sequence[float],
+    stop_losses: Sequence[float],
+    require_multitimeframe: bool,
+    ranking_method: str,
+    cross_tf_mode: str,
+    enabled_kinds: set[str],
+    mode: str,
+    pnl_unit: str,
+    shap_screen: bool,
+    shap_target: str,
+    regime_conditional: bool,
+    cluster_jaccard: float,
+    walk_forward: bool,
+    purged_kfold: bool,
+    wf_train_bars: int,
+    wf_test_bars: int,
+    wf_step_bars: int,
+    wf_min_windows: int,
+    wf_pass_rate: float,
+    embargo_bars: int,
+    use_triple_barrier_labels: bool,
+    dsr_threshold: float,
+    holdout_fraction: float,
+    n_jobs: int,
+    checkpoint_every: int,
+    resume: bool,
+    wf_engine_mode: bool,
+) -> dict[str, Any]:
+    return {
+        "git_sha": _get_git_sha(),
+        "search_timestamp": pd.Timestamp.now("UTC").isoformat(),
+        "input_path": str(input_path),
+        "horizons": list(horizons),
+        "train_fraction": train_fraction,
+        "max_features": max_features,
+        "top_conditions": top_conditions,
+        "max_pairs": max_pairs,
+        "max_triples": max_triples,
+        "rank_sample_rows": rank_sample_rows,
+        "condition_depths": list(condition_depths),
+        "min_train_trades": min_train_trades,
+        "min_test_trades": min_test_trades,
+        "fee_bps": fee_bps,
+        "slippage_bps": slippage_bps,
+        "take_profits": list(take_profits),
+        "stop_losses": list(stop_losses),
+        "require_multitimeframe": require_multitimeframe,
+        "ranking_method": ranking_method,
+        "cross_tf_mode": cross_tf_mode,
+        "enabled_kinds": sorted(enabled_kinds),
+        "mode": mode,
+        "pnl_unit": pnl_unit,
+        "shap_screen": shap_screen,
+        "shap_target": shap_target,
+        "regime_conditional": regime_conditional,
+        "cluster_jaccard": cluster_jaccard,
+        "walk_forward": walk_forward,
+        "purged_kfold": purged_kfold,
+        "wf_train_bars": wf_train_bars,
+        "wf_test_bars": wf_test_bars,
+        "wf_step_bars": wf_step_bars,
+        "wf_min_windows": wf_min_windows,
+        "wf_pass_rate": wf_pass_rate,
+        "embargo_bars": embargo_bars,
+        "use_triple_barrier_labels": use_triple_barrier_labels,
+        "dsr_threshold": dsr_threshold,
+        "holdout_fraction": holdout_fraction if wf_engine_mode else 0.0,
+        "n_jobs": n_jobs,
+        "checkpoint_every": checkpoint_every,
+        "resume": resume,
+    }
+
+
+def _prepare_scoring_state(
+    *,
+    output_dir: Path,
+    input_path: Path,
+    horizons: Sequence[int],
+    train_fraction: float,
+    max_features: int,
+    top_conditions: int,
+    max_pairs: int,
+    max_triples: int,
+    rank_sample_rows: int,
+    condition_depths: Sequence[int],
+    min_train_trades: int,
+    min_test_trades: int,
+    fee_bps: float,
+    slippage_bps: float,
+    take_profits: Sequence[float],
+    stop_losses: Sequence[float],
+    require_multitimeframe: bool,
+    ranking_method: str,
+    cross_tf_mode: str,
+    enabled_kinds: set[str],
+    mode: str,
+    pnl_unit: str,
+    shap_screen: bool,
+    shap_target: str,
+    regime_conditional: bool,
+    cluster_jaccard: float,
+    walk_forward: bool,
+    purged_kfold: bool,
+    wf_train_bars: int,
+    wf_test_bars: int,
+    wf_step_bars: int,
+    wf_min_windows: int,
+    wf_pass_rate: float,
+    embargo_bars: int,
+    use_triple_barrier_labels: bool,
+    dsr_threshold: float,
+    holdout_fraction: float,
+    n_jobs: int,
+    checkpoint_every: int,
+    resume: bool,
+    candidates: Sequence[StrategyCandidate],
+    scenarios: Sequence[tuple[float, float]],
+) -> dict[str, Any]:
+    wf_engine_mode = walk_forward and not purged_kfold
+    config = _search_config(
+        input_path=input_path,
+        horizons=horizons,
+        train_fraction=train_fraction,
+        max_features=max_features,
+        top_conditions=top_conditions,
+        max_pairs=max_pairs,
+        max_triples=max_triples,
+        rank_sample_rows=rank_sample_rows,
+        condition_depths=condition_depths,
+        min_train_trades=min_train_trades,
+        min_test_trades=min_test_trades,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        take_profits=take_profits,
+        stop_losses=stop_losses,
+        require_multitimeframe=require_multitimeframe,
+        ranking_method=ranking_method,
+        cross_tf_mode=cross_tf_mode,
+        enabled_kinds=enabled_kinds,
+        mode=mode,
+        pnl_unit=pnl_unit,
+        shap_screen=shap_screen,
+        shap_target=shap_target,
+        regime_conditional=regime_conditional,
+        cluster_jaccard=cluster_jaccard,
+        walk_forward=walk_forward,
+        purged_kfold=purged_kfold,
+        wf_train_bars=wf_train_bars,
+        wf_test_bars=wf_test_bars,
+        wf_step_bars=wf_step_bars,
+        wf_min_windows=wf_min_windows,
+        wf_pass_rate=wf_pass_rate,
+        embargo_bars=embargo_bars,
+        use_triple_barrier_labels=use_triple_barrier_labels,
+        dsr_threshold=dsr_threshold,
+        holdout_fraction=holdout_fraction,
+        n_jobs=n_jobs,
+        checkpoint_every=checkpoint_every,
+        resume=resume,
+        wf_engine_mode=wf_engine_mode,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / "checkpoint.csv"
+    meta_path = output_dir / "checkpoint_meta.json"
+    config_hash = _config_hash(config)
+    rows: list[dict[str, object]] = []
+    done: set[int] = set()
+    if resume:
+        rows, done = _load_checkpoint(checkpoint_path, meta_path, config_hash, len(scenarios))
+    elif checkpoint_path.exists():
+        checkpoint_path.unlink()
+        if meta_path.exists():
+            meta_path.unlink()
+    meta_path.write_text(
+        json.dumps(
+            {
+                "config_hash": config_hash,
+                "n_candidates": len(candidates),
+                "n_scenarios": len(scenarios),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    pending = [index for index in range(len(candidates)) if index not in done]
+    return {
+        "config": config,
+        "checkpoint_path": checkpoint_path,
+        "meta_path": meta_path,
+        "rows": rows,
+        "done": done,
+        "pending": pending,
+        "trade_config_payload": {
+            "fee_bps": fee_bps,
+            "slippage_bps": slippage_bps,
+            "take_profit": scenarios[0][0],
+            "stop_loss": scenarios[0][1],
+            "pnl_unit": pnl_unit,
+            "use_triple_barrier_labels": use_triple_barrier_labels,
+        },
+    }
+
+
+def _score_search_candidates(
+    *,
+    data: pd.DataFrame,
+    core: pd.DataFrame,
+    train: pd.DataFrame | None,
+    test: pd.DataFrame | None,
+    windows: list[tuple[slice, slice]],
+    candidates: Sequence[StrategyCandidate],
+    pending: Sequence[int],
+    scenarios: Sequence[tuple[float, float]],
+    fee_bps: float,
+    slippage_bps: float,
+    pnl_unit: str,
+    use_triple_barrier_labels: bool,
+    regime_conditional: bool,
+    wf_pass_rate: float,
+    purged_kfold: bool,
+    purged_kfold_splits: int,
+    embargo_bars: int,
+    wf_engine_mode: bool,
+    n_jobs: int,
+    checkpoint_every: int,
+    wf_train_bars: int,
+    wf_test_bars: int,
+    wf_step_bars: int,
+    wf_min_windows: int,
+    worker_columns: Sequence[str],
+    input_path: Path,
+    horizons: Sequence[int],
+    train_fraction: float,
+    trade_config_payload: Mapping[str, Any],
+    done: set[int],
+    checkpoint_path: Path,
+) -> list[dict[str, object]]:
+    LOGGER.info(
+        "Scoring %s strategy candidates across %s TP/SL scenarios (%s pending, n_jobs=%s)",
+        len(candidates),
+        len(scenarios),
+        len(pending),
+        n_jobs,
+    )
+    if purged_kfold:
+        return _score_purged_candidates(
+            data=data,
+            train=train,
+            test=test,
+            candidates=candidates,
+            pending=pending,
+            scenarios=scenarios,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            pnl_unit=pnl_unit,
+            use_triple_barrier_labels=use_triple_barrier_labels,
+            regime_conditional=regime_conditional,
+            wf_pass_rate=wf_pass_rate,
+            purged_kfold_splits=purged_kfold_splits,
+            embargo_bars=embargo_bars,
+            checkpoint_every=checkpoint_every,
+            done=done,
+            checkpoint_path=checkpoint_path,
+            total_candidates=len(candidates),
+        )
+    return _score_standard_candidates(
+        data=data,
+        core=core,
+        train=train,
+        test=test,
+        windows=windows,
+        candidates=candidates,
+        pending=pending,
+        scenarios=scenarios,
+        trade_config_payload=trade_config_payload,
+        wf_pass_rate=wf_pass_rate,
+        regime_conditional=regime_conditional,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        pnl_unit=pnl_unit,
+        wf_engine_mode=wf_engine_mode,
+        n_jobs=n_jobs,
+        checkpoint_every=checkpoint_every,
+        wf_train_bars=wf_train_bars,
+        wf_test_bars=wf_test_bars,
+        wf_step_bars=wf_step_bars,
+        wf_min_windows=wf_min_windows,
+        worker_columns=worker_columns,
+        input_path=input_path,
+        horizons=horizons,
+        train_fraction=train_fraction,
+        checkpoint_path=checkpoint_path,
+        embargo_bars=embargo_bars,
+    )
+
+
+def _score_purged_candidates(
+    *,
+    data: pd.DataFrame,
+    train: pd.DataFrame | None,
+    test: pd.DataFrame | None,
+    candidates: Sequence[StrategyCandidate],
+    pending: Sequence[int],
+    scenarios: Sequence[tuple[float, float]],
+    fee_bps: float,
+    slippage_bps: float,
+    pnl_unit: str,
+    use_triple_barrier_labels: bool,
+    regime_conditional: bool,
+    wf_pass_rate: float,
+    purged_kfold_splits: int,
+    embargo_bars: int,
+    checkpoint_every: int,
+    done: set[int],
+    checkpoint_path: Path,
+    total_candidates: int,
+) -> list[dict[str, object]]:
+    assert train is not None and test is not None
+    rows: list[dict[str, object]] = []
+    buffer: list[dict[str, object]] = []
+    for scored, index in enumerate(pending, start=1):
+        buffer.extend(
+            _purged_candidate_rows(
+                data=data,
+                train=train,
+                test=test,
+                candidate=candidates[index],
+                index=index,
+                scenarios=scenarios,
+                fee_bps=fee_bps,
+                slippage_bps=slippage_bps,
+                pnl_unit=pnl_unit,
+                use_triple_barrier_labels=use_triple_barrier_labels,
+                regime_conditional=regime_conditional,
+                wf_pass_rate=wf_pass_rate,
+                purged_kfold_splits=purged_kfold_splits,
+                embargo_bars=embargo_bars,
+            )
+        )
+        if scored % checkpoint_every == 0 or scored == len(pending):
+            _flush_rows(buffer, checkpoint_path)
+            rows.extend(buffer)
+            buffer = []
+            LOGGER.info("Scored candidate %s/%s", scored + len(done), total_candidates)
+    return rows
+
+
+def _purged_candidate_rows(
+    *,
+    data: pd.DataFrame,
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    candidate: StrategyCandidate,
+    index: int,
+    scenarios: Sequence[tuple[float, float]],
+    fee_bps: float,
+    slippage_bps: float,
+    pnl_unit: str,
+    use_triple_barrier_labels: bool,
+    regime_conditional: bool,
+    wf_pass_rate: float,
+    purged_kfold_splits: int,
+    embargo_bars: int,
+) -> list[dict[str, object]]:
+    kfold_windows = generate_purged_kfold_windows(
+        len(data), purged_kfold_splits, candidate.horizon_bars, embargo_bars
+    )
+    return [
+        _purged_scenario_row(
+            data=data,
+            train=train,
+            test=test,
+            candidate=candidate,
+            index=index,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+            kfold_windows=kfold_windows,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            pnl_unit=pnl_unit,
+            use_triple_barrier_labels=use_triple_barrier_labels,
+            regime_conditional=regime_conditional,
+            wf_pass_rate=wf_pass_rate,
+        )
+        for take_profit, stop_loss in scenarios
+    ]
+
+
+def _purged_scenario_row(
+    *,
+    data: pd.DataFrame,
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    candidate: StrategyCandidate,
+    index: int,
+    take_profit: float,
+    stop_loss: float,
+    kfold_windows: Sequence[tuple[np.ndarray, np.ndarray]],
+    fee_bps: float,
+    slippage_bps: float,
+    pnl_unit: str,
+    use_triple_barrier_labels: bool,
+    regime_conditional: bool,
+    wf_pass_rate: float,
+) -> dict[str, object]:
+    trade_config = TradeConfig(
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        take_profit=take_profit,
+        stop_loss=stop_loss,
+        pnl_unit=pnl_unit,
+        use_triple_barrier_labels=use_triple_barrier_labels,
+    )
+    row = score_candidate_with_config(train, test, candidate, trade_config)
+    test_returns = np.asarray(row.pop("test_returns"), dtype=float)
+    row.pop("train_returns")
+    row["test_sharpe_ci_low"], row["test_sharpe_ci_high"] = bootstrap_sharpe_ci(
+        test_returns, n_boot=200
+    )
+    window_results = []
+    for train_index, test_index in kfold_windows:
+        fold_row = score_candidate_with_config(
+            data.iloc[train_index].copy(), data.iloc[test_index].copy(), candidate, trade_config
+        )
+        fold_row.pop("train_returns")
+        fold_row.pop("test_returns")
+        window_results.append(fold_row)
+    wf_summary = aggregate_walk_forward_results(window_results, wf_pass_rate)
+    row.update({f"wf_{key}": value for key, value in wf_summary.items()})
+    row["wf_window_returns_json"] = json.dumps(
+        [
+            round(float(result.get("test_avg_net_return", 0.0) or 0.0), 8)
+            for result in window_results
+        ]
+    )
+    if regime_conditional:
+        row["regime_breakdown_json"] = json.dumps(
+            regime_breakdown(
+                data, candidate, fee_bps, slippage_bps, take_profit, stop_loss, pnl_unit=pnl_unit
+            ),
+            sort_keys=True,
+        )
+    row["conditions_json"] = _conditions_payload(candidate)
+    row["candidate_index"] = index
+    return row
+
+
+def _score_standard_candidates(
+    *,
+    data: pd.DataFrame,
+    core: pd.DataFrame,
+    train: pd.DataFrame | None,
+    test: pd.DataFrame | None,
+    windows: list[tuple[slice, slice]],
+    candidates: Sequence[StrategyCandidate],
+    pending: Sequence[int],
+    scenarios: Sequence[tuple[float, float]],
+    trade_config_payload: Mapping[str, Any],
+    wf_pass_rate: float,
+    regime_conditional: bool,
+    fee_bps: float,
+    slippage_bps: float,
+    pnl_unit: str,
+    wf_engine_mode: bool,
+    n_jobs: int,
+    wf_train_bars: int,
+    wf_test_bars: int,
+    wf_step_bars: int,
+    wf_min_windows: int,
+    checkpoint_every: int,
+    worker_columns: Sequence[str],
+    input_path: Path,
+    horizons: Sequence[int],
+    train_fraction: float,
+    checkpoint_path: Path,
+    embargo_bars: int,
+) -> list[dict[str, object]]:
+    worker_payload = {
+        "input_path": str(input_path),
+        "horizons": list(horizons),
+        "walk_forward": wf_engine_mode,
+        "train_fraction": train_fraction,
+        "columns": list(worker_columns),
+        "candidates": candidates,
+        "scenarios": scenarios,
+        "trade_config": dict(trade_config_payload),
+        "wf_pass_rate": wf_pass_rate,
+        "regime_conditional": regime_conditional,
+        "fee_bps": fee_bps,
+        "slippage_bps": slippage_bps,
+        "pnl_unit": pnl_unit,
+        "n_jobs": n_jobs,
+    }
+    if wf_engine_mode:
+        worker_payload["core_rows"] = len(core)
+        worker_payload["wf_config"] = {
+            "train_bars": wf_train_bars,
+            "test_bars": wf_test_bars,
+            "step_bars": wf_step_bars,
+            "min_windows": wf_min_windows,
+            "pass_rate": wf_pass_rate,
+            "embargo_bars": embargo_bars,
+        }
+    chunks = [
+        list(pending[start : start + checkpoint_every])
+        for start in range(0, len(pending), checkpoint_every)
+    ]
+    if n_jobs > 1:
+        return _score_chunks_parallel(worker_payload, chunks, checkpoint_path, len(candidates))
+    return _score_chunks_local(
+        worker_payload,
+        chunks,
+        data=data,
+        core=core,
+        train=train,
+        test=test,
+        windows=windows,
+        checkpoint_path=checkpoint_path,
+        total_candidates=len(candidates),
+    )
+
+
+def _score_chunks_parallel(
+    worker_payload: dict[str, Any],
+    chunks: Sequence[list[int]],
+    checkpoint_path: Path,
+    total_candidates: int,
+) -> list[dict[str, object]]:
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    rows: list[dict[str, object]] = []
+    with ProcessPoolExecutor(
+        max_workers=int(worker_payload.get("n_jobs", 1) or 1),
+        initializer=_worker_init,
+        initargs=(worker_payload,),
+    ) as pool:
+        futures = [pool.submit(_score_chunk, chunk) for chunk in chunks]
+        for future in as_completed(futures):
+            chunk_rows = future.result()
+            _flush_rows(chunk_rows, checkpoint_path)
+            rows.extend(chunk_rows)
+            LOGGER.info("Scored candidates through %s/%s", len(rows), total_candidates)
+    return rows
+
+
+def _score_chunks_local(
+    worker_payload: dict[str, Any],
+    chunks: Sequence[list[int]],
+    *,
+    data: pd.DataFrame,
+    core: pd.DataFrame,
+    train: pd.DataFrame | None,
+    test: pd.DataFrame | None,
+    windows: list[tuple[slice, slice]],
+    checkpoint_path: Path,
+    total_candidates: int,
+) -> list[dict[str, object]]:
+    _WORKER.clear()
+    _WORKER.update(worker_payload)
+    _WORKER["data"] = data
+    if worker_payload["walk_forward"]:
+        _WORKER["engine"] = WalkForwardEngine(core, windows)
+    else:
+        _WORKER["train"] = train
+        _WORKER["test"] = test
+        _WORKER["train_arrays"] = SimArrays.from_dataframe(train)
+        _WORKER["test_arrays"] = SimArrays.from_dataframe(test)
+    rows: list[dict[str, object]] = []
+    scored = 0
+    for chunk in chunks:
+        chunk_rows = _score_chunk(chunk)
+        _flush_rows(chunk_rows, checkpoint_path)
+        rows.extend(chunk_rows)
+        scored += len(chunk)
+        LOGGER.info("Scored candidate %s/%s", scored, total_candidates)
+    return rows
+
+
+def _finalise_search_results(
+    *,
+    rows: Sequence[dict[str, object]],
+    walk_forward: bool,
+    holdout: pd.DataFrame,
+    core: pd.DataFrame,
+    windows: list[tuple[slice, slice]],
+    data: pd.DataFrame,
+    min_train_trades: int,
+    min_test_trades: int,
+    require_multitimeframe: bool,
+    wf_pass_rate: float,
+    dsr_threshold: float,
+    fee_bps: float,
+    slippage_bps: float,
+    pnl_unit: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int], pd.DataFrame]:
+    strategies = _with_pool_pbo(
+        _attach_statistical_metrics(pd.DataFrame(rows), walk_forward=walk_forward),
+        walk_forward=walk_forward,
+    )
+    strategies, diagnostics = _filter_scored_strategies(
+        strategies,
+        walk_forward=walk_forward,
+        min_train_trades=min_train_trades,
+        min_test_trades=min_test_trades,
+        require_multitimeframe=require_multitimeframe,
+        wf_pass_rate=wf_pass_rate,
+        dsr_threshold=dsr_threshold,
+    )
+    rejection_summary = summarize_filter_rejections(
+        diagnostics,
+        min_train_trades,
+        min_test_trades,
+        require_multitimeframe,
+        walk_forward=walk_forward,
+    )
+    strategies = _holdout_results(
+        strategies,
+        holdout=holdout,
+        core=core,
+        windows=windows,
+        walk_forward=walk_forward,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        pnl_unit=pnl_unit,
+    )
+    yearly = (
+        pd.DataFrame()
+        if walk_forward
+        else add_year_metrics(
+            data,
+            strategies,
+            fee_bps,
+            slippage_bps,
+            top_n=10,
+            pnl_unit=pnl_unit,
+        )
+    )
+    return strategies, diagnostics, rejection_summary, yearly
+
+
+def _with_pool_pbo(strategies: pd.DataFrame, *, walk_forward: bool) -> pd.DataFrame:
+    if not walk_forward or strategies.empty or "wf_window_returns_json" not in strategies.columns:
+        strategies["pool_pbo"] = np.nan
+        return strategies
+    matrix = [json.loads(str(payload)) for payload in strategies["wf_window_returns_json"]]
+    if len({len(item) for item in matrix}) == 1:
+        strategies["pool_pbo"] = probability_backtest_overfitting(np.asarray(matrix, dtype=float))
+    else:
+        strategies["pool_pbo"] = np.nan
+    return strategies
+
+
+def _filter_scored_strategies(
+    strategies: pd.DataFrame,
+    *,
+    walk_forward: bool,
+    min_train_trades: int,
+    min_test_trades: int,
+    require_multitimeframe: bool,
+    wf_pass_rate: float,
+    dsr_threshold: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    diagnostics = strategies.copy()
+    if diagnostics.empty:
+        return strategies, diagnostics
+    if walk_forward:
+        diagnostics["passes_trade_count"] = diagnostics["wf_avg_trades"] >= min_test_trades
+        diagnostics["passes_profitability"] = (diagnostics["wf_pass_rate"] >= wf_pass_rate) & (
+            diagnostics["wf_expectancy"] > 0
+        )
+        sort_columns = [
+            "dsr",
+            "wf_pass_rate",
+            "wf_expectancy",
+            "wf_profit_factor_median",
+            "wf_avg_trades",
+        ]
+    else:
+        diagnostics["passes_trade_count"] = (diagnostics["train_trades"] >= min_train_trades) & (
+            diagnostics["test_trades"] >= min_test_trades
+        )
+        diagnostics["passes_profitability"] = (diagnostics["train_total_return"] > 0) & (
+            diagnostics["test_total_return"] > 0
+        )
+        sort_columns = ["dsr", "train_total_return", "train_avg_net_return", "train_trades"]
+    diagnostics["passes_multitimeframe"] = (
+        diagnostics["timeframe_count"] >= 2 if require_multitimeframe else True
+    )
+    diagnostics["passes_dsr"] = diagnostics["dsr"] >= dsr_threshold
+    diagnostics["passes_walk_forward_filter"] = (
+        diagnostics["wf_passes_walk_forward"].astype(bool)
+        if "wf_passes_walk_forward" in diagnostics.columns
+        else True
+    )
+    diagnostics["passes_filters"] = (
+        diagnostics["passes_trade_count"]
+        & diagnostics["passes_profitability"]
+        & diagnostics["passes_multitimeframe"]
+        & diagnostics["passes_dsr"]
+        & diagnostics["passes_walk_forward_filter"]
+    )
+    diagnostics = diagnostics.sort_values(
+        sort_columns, ascending=[False] * len(sort_columns)
+    ).reset_index(drop=True)
+    selected = diagnostics[diagnostics["passes_filters"]].copy()
+    if require_multitimeframe:
+        selected = selected[selected["timeframe_count"] >= 2].copy()
+    return selected.sort_values(sort_columns, ascending=[False] * len(sort_columns)).reset_index(
+        drop=True
+    ), diagnostics
+
+
+def _holdout_results(
+    strategies: pd.DataFrame,
+    *,
+    holdout: pd.DataFrame,
+    core: pd.DataFrame,
+    windows: list[tuple[slice, slice]],
+    walk_forward: bool,
+    fee_bps: float,
+    slippage_bps: float,
+    pnl_unit: str,
+) -> pd.DataFrame:
+    if not walk_forward or holdout.empty or strategies.empty:
+        return strategies
+    refit_frame = core.iloc[windows[-1][0]]
+    return _evaluate_holdout(
+        holdout,
+        refit_frame,
+        strategies,
+        fee_bps,
+        slippage_bps,
+        pnl_unit,
+    )
+
+
+def _write_search_outputs(
+    *,
+    output_dir: Path,
+    config: Mapping[str, Any],
+    strategies: pd.DataFrame,
+    diagnostics: pd.DataFrame,
+    rejection_summary: Mapping[str, int],
+    yearly: pd.DataFrame,
+    data: pd.DataFrame,
+    cluster_jaccard: float,
+    mode: str,
+    pnl_unit: str,
+    walk_forward: bool,
+    checkpoint_path: Path,
+    meta_path: Path,
+) -> pd.DataFrame:
+    (output_dir / "config.json").write_text(
+        json.dumps(dict(config), indent=2, sort_keys=True), encoding="utf-8"
+    )
+    heavy_columns = ["wf_window_returns_json"]
+    diagnostics.drop(columns=heavy_columns, errors="ignore").to_csv(
+        output_dir / "scored_strategies_all.csv", index=False
+    )
+    (output_dir / "filter_summary.json").write_text(
+        json.dumps(dict(rejection_summary), indent=2, sort_keys=True), encoding="utf-8"
+    )
+    clean_strategies = strategies.drop(columns=heavy_columns, errors="ignore")
+    clean_strategies.to_csv(output_dir / "ranked_strategies.csv", index=False)
+    cluster_ranked_strategies(data, clean_strategies, threshold=cluster_jaccard).to_csv(
+        output_dir / "ranked_strategies_clustered.csv", index=False
+    )
+    yearly.to_csv(output_dir / "ranked_strategies_by_year.csv", index=False)
+    write_report(
+        clean_strategies,
+        yearly,
+        diagnostics,
+        dict(rejection_summary),
+        output_dir / "report.md",
+        mode=mode,
+        pnl_unit=pnl_unit,
+        walk_forward=walk_forward,
+    )
+    checkpoint_path.unlink(missing_ok=True)
+    meta_path.unlink(missing_ok=True)
+    return clean_strategies
 
 
 def run(
@@ -1729,54 +2877,40 @@ def run(
     checkpoint_every: int = 25,
     resume: bool = False,
 ) -> pd.DataFrame:
-    data = load_dataset(input_path, horizons)
-    if regime_conditional and "tf_1d_regime_id" not in data.columns:
-        LOGGER.warning(
-            "--regime-conditional requested but tf_1d_regime_id is missing; skipping regime breakdown"
-        )
-        regime_conditional = False
-    if embargo_bars is None:
-        embargo_bars = max(horizons)
-    directions = ("short",) if mode == "btc-position" else ("long", "short")
-    scenarios = list(itertools.product(take_profits, stop_losses))
-    wf_engine_mode = walk_forward and not purged_kfold
+    prepared = _prepare_search_inputs(
+        input_path=input_path,
+        horizons=horizons,
+        train_fraction=train_fraction,
+        take_profits=take_profits,
+        stop_losses=stop_losses,
+        mode=mode,
+        regime_conditional=regime_conditional,
+        walk_forward=walk_forward,
+        purged_kfold=purged_kfold,
+        holdout_fraction=holdout_fraction,
+        wf_train_bars=wf_train_bars,
+        wf_test_bars=wf_test_bars,
+        wf_step_bars=wf_step_bars,
+        wf_min_windows=wf_min_windows,
+        wf_pass_rate=wf_pass_rate,
+        embargo_bars=embargo_bars,
+    )
+    data = prepared["data"]
+    core = prepared["core"]
+    holdout = prepared["holdout"]
+    windows = prepared["windows"]
+    train = prepared["train"]
+    test = prepared["test"]
+    candidate_frame = prepared["candidate_frame"]
+    directions = prepared["directions"]
+    scenarios = prepared["scenarios"]
+    wf_engine_mode = prepared["wf_engine_mode"]
+    embargo_bars = prepared["embargo_bars"]
+    regime_conditional = prepared["regime_conditional"]
 
-    holdout = data.iloc[0:0]
-    core = data
-    windows: list[tuple[slice, slice]] = []
-    wf_config: WalkForwardConfig | None = None
-    train = test = None
-    if wf_engine_mode:
-        core_rows = (
-            len(data) - int(len(data) * holdout_fraction) if holdout_fraction > 0 else len(data)
-        )
-        core = data.iloc[:core_rows]
-        holdout = data.iloc[core_rows:]
-        wf_config = WalkForwardConfig(
-            train_bars=wf_train_bars,
-            test_bars=wf_test_bars,
-            step_bars=wf_step_bars,
-            min_windows=wf_min_windows,
-            pass_rate=wf_pass_rate,
-            embargo_bars=embargo_bars,
-        )
-        windows = generate_windows(len(core), wf_config)
-        # Candidates come from the FIRST train window only, so no walk-forward
-        # test window (nor the holdout) ever influences candidate selection.
-        candidate_frame = core.iloc[windows[0][0]]
-        LOGGER.info(
-            "Walk-forward: %s windows over %s core rows, %s holdout rows reserved",
-            len(windows),
-            len(core),
-            len(holdout),
-        )
-    else:
-        train, test = split_train_test(data, train_fraction)
-        candidate_frame = train
-
-    candidates = make_candidates(
-        candidate_frame,
-        horizons,
+    candidates = _build_run_candidates(
+        candidate_frame=candidate_frame,
+        horizons=horizons,
         directions=directions,
         max_features=max_features,
         top_conditions=top_conditions,
@@ -1790,109 +2924,79 @@ def run(
         shap_screen=shap_screen,
         shap_target=shap_target,
     )
-    if use_triple_barrier_labels:
-        missing_labels = []
-        for direction in directions:
-            for horizon in horizons:
-                for take_profit, stop_loss in scenarios:
-                    suffix = f"{direction}_tp{int(round(take_profit * 10_000))}_sl{int(round(stop_loss * 10_000))}_h{horizon}"
-                    if (
-                        f"label_{suffix}" not in data.columns
-                        or f"bars_to_exit_{suffix}" not in data.columns
-                    ):
-                        missing_labels.append(suffix)
-        if missing_labels:
-            LOGGER.warning(
-                "--use-triple-barrier-labels requested but %s label scenarios are missing; those scenarios fall back to simulation",
-                len(missing_labels),
-            )
+    _warn_missing_barrier_labels(
+        data,
+        directions=directions,
+        horizons=horizons,
+        scenarios=scenarios,
+        enabled=use_triple_barrier_labels,
+    )
 
     # Scoring only touches the columns the candidates reference (plus OHLC).
     # The full table is thousands of columns; loading it once per worker
     # process exhausts RAM, so workers get a pruned column list and, in
     # walk-forward mode, the parent drops the unused columns too.
-    extra_columns: set[str] = set()
-    if use_triple_barrier_labels:
-        extra_columns |= {c for c in data.columns if c.startswith(("label_", "bars_to_exit_"))}
-    if regime_conditional and "tf_1d_regime_id" in data.columns:
-        extra_columns.add("tf_1d_regime_id")
-    worker_columns = sorted(
-        (candidate_feature_columns(candidates) & set(data.columns)) | extra_columns
+    data, core, holdout, worker_columns = _prune_search_data(
+        data=data,
+        core=core,
+        holdout=holdout,
+        candidates=candidates,
+        use_triple_barrier_labels=use_triple_barrier_labels,
+        regime_conditional=regime_conditional,
+        wf_engine_mode=wf_engine_mode,
     )
-    if wf_engine_mode:
-        n_core = len(core)
-        keep = [c for c in data.columns if c in set(worker_columns) | set(BASE_COLUMNS)]
-        data = data[keep]
-        core = data.iloc[:n_core]
-        holdout = data.iloc[n_core:]
 
-    config = {
-        "git_sha": _get_git_sha(),
-        "search_timestamp": pd.Timestamp.now("UTC").isoformat(),
-        "input_path": str(input_path),
-        "horizons": list(horizons),
-        "train_fraction": train_fraction,
-        "max_features": max_features,
-        "top_conditions": top_conditions,
-        "max_pairs": max_pairs,
-        "max_triples": max_triples,
-        "rank_sample_rows": rank_sample_rows,
-        "condition_depths": list(condition_depths),
-        "min_train_trades": min_train_trades,
-        "min_test_trades": min_test_trades,
-        "fee_bps": fee_bps,
-        "slippage_bps": slippage_bps,
-        "take_profits": list(take_profits),
-        "stop_losses": list(stop_losses),
-        "require_multitimeframe": require_multitimeframe,
-        "ranking_method": ranking_method,
-        "cross_tf_mode": cross_tf_mode,
-        "enabled_kinds": sorted(enabled_kinds),
-        "mode": mode,
-        "pnl_unit": pnl_unit,
-        "shap_screen": shap_screen,
-        "shap_target": shap_target,
-        "regime_conditional": regime_conditional,
-        "cluster_jaccard": cluster_jaccard,
-        "walk_forward": walk_forward,
-        "purged_kfold": purged_kfold,
-        "wf_train_bars": wf_train_bars,
-        "wf_test_bars": wf_test_bars,
-        "wf_step_bars": wf_step_bars,
-        "wf_min_windows": wf_min_windows,
-        "wf_pass_rate": wf_pass_rate,
-        "embargo_bars": embargo_bars,
-        "use_triple_barrier_labels": use_triple_barrier_labels,
-        "dsr_threshold": dsr_threshold,
-        "holdout_fraction": holdout_fraction if wf_engine_mode else 0.0,
-        "n_jobs": n_jobs,
-        "checkpoint_every": checkpoint_every,
-        "resume": resume,
-    }
-    output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = output_dir / "checkpoint.csv"
-    meta_path = output_dir / "checkpoint_meta.json"
-    config_hash = _config_hash(config)
-    rows: list[dict[str, object]] = []
-    done: set[int] = set()
-    if resume:
-        rows, done = _load_checkpoint(checkpoint_path, meta_path, config_hash, len(scenarios))
-    elif checkpoint_path.exists():
-        checkpoint_path.unlink()
-        if meta_path.exists():
-            meta_path.unlink()
-    meta_path.write_text(
-        json.dumps(
-            {
-                "config_hash": config_hash,
-                "n_candidates": len(candidates),
-                "n_scenarios": len(scenarios),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+    scoring = _prepare_scoring_state(
+        output_dir=output_dir,
+        input_path=input_path,
+        horizons=horizons,
+        train_fraction=train_fraction,
+        max_features=max_features,
+        top_conditions=top_conditions,
+        max_pairs=max_pairs,
+        max_triples=max_triples,
+        rank_sample_rows=rank_sample_rows,
+        condition_depths=condition_depths,
+        min_train_trades=min_train_trades,
+        min_test_trades=min_test_trades,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        take_profits=take_profits,
+        stop_losses=stop_losses,
+        require_multitimeframe=require_multitimeframe,
+        ranking_method=ranking_method,
+        cross_tf_mode=cross_tf_mode,
+        enabled_kinds=enabled_kinds,
+        mode=mode,
+        pnl_unit=pnl_unit,
+        shap_screen=shap_screen,
+        shap_target=shap_target,
+        regime_conditional=regime_conditional,
+        cluster_jaccard=cluster_jaccard,
+        walk_forward=walk_forward,
+        purged_kfold=purged_kfold,
+        wf_train_bars=wf_train_bars,
+        wf_test_bars=wf_test_bars,
+        wf_step_bars=wf_step_bars,
+        wf_min_windows=wf_min_windows,
+        wf_pass_rate=wf_pass_rate,
+        embargo_bars=embargo_bars,
+        use_triple_barrier_labels=use_triple_barrier_labels,
+        dsr_threshold=dsr_threshold,
+        holdout_fraction=holdout_fraction,
+        n_jobs=n_jobs,
+        checkpoint_every=checkpoint_every,
+        resume=resume,
+        candidates=candidates,
+        scenarios=scenarios,
     )
-    pending = [index for index in range(len(candidates)) if index not in done]
+    config = scoring["config"]
+    checkpoint_path = scoring["checkpoint_path"]
+    meta_path = scoring["meta_path"]
+    rows = scoring["rows"]
+    done = scoring["done"]
+    pending = scoring["pending"]
+    trade_config_payload = scoring["trade_config_payload"]
     LOGGER.info(
         "Scoring %s strategy candidates across %s TP/SL scenarios (%s pending, n_jobs=%s)",
         len(candidates),
@@ -1901,276 +3005,73 @@ def run(
         n_jobs,
     )
 
-    trade_config_payload = {
-        "fee_bps": fee_bps,
-        "slippage_bps": slippage_bps,
-        "take_profit": scenarios[0][0],
-        "stop_loss": scenarios[0][1],
-        "pnl_unit": pnl_unit,
-        "use_triple_barrier_labels": use_triple_barrier_labels,
-    }
-
-    if purged_kfold:
-        scored = 0
-        buffer: list[dict[str, object]] = []
-        for index in pending:
-            candidate = candidates[index]
-            conditions_json = _conditions_payload(candidate)
-            kfold_windows = generate_purged_kfold_windows(
-                len(data),
-                purged_kfold_splits,
-                candidate.horizon_bars,
-                embargo_bars,
-            )
-            for take_profit, stop_loss in scenarios:
-                trade_config = TradeConfig(
-                    fee_bps=fee_bps,
-                    slippage_bps=slippage_bps,
-                    take_profit=take_profit,
-                    stop_loss=stop_loss,
-                    pnl_unit=pnl_unit,
-                    use_triple_barrier_labels=use_triple_barrier_labels,
-                )
-                row = score_candidate_with_config(train, test, candidate, trade_config)
-                test_returns = np.asarray(row.pop("test_returns"), dtype=float)
-                row.pop("train_returns")
-                ci_low, ci_high = bootstrap_sharpe_ci(test_returns, n_boot=200)
-                row["test_sharpe_ci_low"] = ci_low
-                row["test_sharpe_ci_high"] = ci_high
-                window_results = []
-                for train_index, test_index in kfold_windows:
-                    fold_row = score_candidate_with_config(
-                        data.iloc[train_index].copy(),
-                        data.iloc[test_index].copy(),
-                        candidate,
-                        trade_config,
-                    )
-                    fold_row.pop("train_returns")
-                    fold_row.pop("test_returns")
-                    window_results.append(fold_row)
-                wf_summary = aggregate_walk_forward_results(window_results, wf_pass_rate)
-                row.update({f"wf_{key}": value for key, value in wf_summary.items()})
-                row["wf_window_returns_json"] = json.dumps(
-                    [
-                        round(float(result.get("test_avg_net_return", 0.0) or 0.0), 8)
-                        for result in window_results
-                    ]
-                )
-                if regime_conditional:
-                    row["regime_breakdown_json"] = json.dumps(
-                        regime_breakdown(
-                            data,
-                            candidate,
-                            fee_bps,
-                            slippage_bps,
-                            take_profit,
-                            stop_loss,
-                            pnl_unit=pnl_unit,
-                        ),
-                        sort_keys=True,
-                    )
-                row["conditions_json"] = conditions_json
-                row["candidate_index"] = index
-                buffer.append(row)
-            scored += 1
-            if scored % checkpoint_every == 0 or scored == len(pending):
-                _flush_rows(buffer, checkpoint_path)
-                rows.extend(buffer)
-                buffer = []
-                LOGGER.info("Scored candidate %s/%s", scored + len(done), len(candidates))
-    else:
-        worker_payload = {
-            "input_path": str(input_path),
-            "horizons": list(horizons),
-            "walk_forward": wf_engine_mode,
-            "train_fraction": train_fraction,
-            "columns": worker_columns,
-            "candidates": candidates,
-            "scenarios": scenarios,
-            "trade_config": trade_config_payload,
-            "wf_pass_rate": wf_pass_rate,
-            "regime_conditional": regime_conditional,
-            "fee_bps": fee_bps,
-            "slippage_bps": slippage_bps,
-            "pnl_unit": pnl_unit,
-        }
-        if wf_engine_mode:
-            worker_payload["core_rows"] = len(core)
-            worker_payload["wf_config"] = {
-                "train_bars": wf_train_bars,
-                "test_bars": wf_test_bars,
-                "step_bars": wf_step_bars,
-                "min_windows": wf_min_windows,
-                "pass_rate": wf_pass_rate,
-                "embargo_bars": embargo_bars,
-            }
-        chunks = [
-            pending[start : start + checkpoint_every]
-            for start in range(0, len(pending), checkpoint_every)
-        ]
-        scored = len(done)
-        if n_jobs > 1:
-            from concurrent.futures import ProcessPoolExecutor, as_completed
-
-            with ProcessPoolExecutor(
-                max_workers=n_jobs,
-                initializer=_worker_init,
-                initargs=(worker_payload,),
-            ) as pool:
-                futures = [pool.submit(_score_chunk, chunk) for chunk in chunks]
-                for future in as_completed(futures):
-                    chunk_rows = future.result()
-                    _flush_rows(chunk_rows, checkpoint_path)
-                    rows.extend(chunk_rows)
-                    scored += len({row["candidate_index"] for row in chunk_rows})
-                    LOGGER.info("Scored candidate %s/%s", scored, len(candidates))
-        else:
-            _WORKER.clear()
-            _WORKER.update(worker_payload)
-            _WORKER["data"] = data
-            if wf_engine_mode:
-                _WORKER["engine"] = WalkForwardEngine(core, windows)
-            else:
-                _WORKER["train"] = train
-                _WORKER["test"] = test
-                _WORKER["train_arrays"] = SimArrays.from_dataframe(train)
-                _WORKER["test_arrays"] = SimArrays.from_dataframe(test)
-            for chunk in chunks:
-                chunk_rows = _score_chunk(chunk)
-                _flush_rows(chunk_rows, checkpoint_path)
-                rows.extend(chunk_rows)
-                scored += len(chunk)
-                LOGGER.info("Scored candidate %s/%s", scored, len(candidates))
-
-    strategies = pd.DataFrame(rows)
-    strategies = _attach_statistical_metrics(strategies, walk_forward=wf_engine_mode)
-    if not strategies.empty and "wf_window_returns_json" in strategies.columns:
-        matrix = [json.loads(str(payload)) for payload in strategies["wf_window_returns_json"]]
-        lengths = {len(item) for item in matrix}
-        if len(lengths) == 1:
-            strategies["pool_pbo"] = probability_backtest_overfitting(
-                np.asarray(matrix, dtype=float)
-            )
-        else:
-            strategies["pool_pbo"] = np.nan
-    else:
-        strategies["pool_pbo"] = np.nan
-    diagnostics = strategies.copy()
-    if wf_engine_mode:
-        sort_columns = [
-            "dsr",
-            "wf_pass_rate",
-            "wf_expectancy",
-            "wf_profit_factor_median",
-            "wf_avg_trades",
-        ]
-    else:
-        # Rank on in-sample stats + DSR only; test metrics are reported, never
-        # used for selection (selecting on them un-blinds the test split).
-        sort_columns = ["dsr", "train_total_return", "train_avg_net_return", "train_trades"]
-    if not diagnostics.empty:
-        if wf_engine_mode:
-            diagnostics["passes_trade_count"] = diagnostics["wf_avg_trades"] >= min_test_trades
-            diagnostics["passes_profitability"] = (diagnostics["wf_pass_rate"] >= wf_pass_rate) & (
-                diagnostics["wf_expectancy"] > 0
-            )
-        else:
-            diagnostics["passes_trade_count"] = (
-                diagnostics["train_trades"] >= min_train_trades
-            ) & (diagnostics["test_trades"] >= min_test_trades)
-            diagnostics["passes_profitability"] = (diagnostics["train_total_return"] > 0) & (
-                diagnostics["test_total_return"] > 0
-            )
-        diagnostics["passes_multitimeframe"] = (
-            diagnostics["timeframe_count"] >= 2 if require_multitimeframe else True
-        )
-        diagnostics["passes_dsr"] = diagnostics["dsr"] >= dsr_threshold
-        if "wf_passes_walk_forward" in diagnostics.columns:
-            diagnostics["passes_walk_forward_filter"] = diagnostics[
-                "wf_passes_walk_forward"
-            ].astype(bool)
-        else:
-            diagnostics["passes_walk_forward_filter"] = True
-        diagnostics["passes_filters"] = (
-            diagnostics["passes_trade_count"]
-            & diagnostics["passes_profitability"]
-            & diagnostics["passes_multitimeframe"]
-            & diagnostics["passes_dsr"]
-            & diagnostics["passes_walk_forward_filter"]
-        )
-        diagnostics = diagnostics.sort_values(
-            sort_columns,
-            ascending=[False] * len(sort_columns),
-        ).reset_index(drop=True)
-        strategies = diagnostics[diagnostics["passes_filters"]].copy()
-        if require_multitimeframe:
-            strategies = strategies[strategies["timeframe_count"] >= 2].copy()
-        strategies = strategies.sort_values(
-            sort_columns,
-            ascending=[False] * len(sort_columns),
-        ).reset_index(drop=True)
-    rejection_summary = summarize_filter_rejections(
-        diagnostics,
-        min_train_trades,
-        min_test_trades,
-        require_multitimeframe,
-        walk_forward=wf_engine_mode,
-    )
-
-    if wf_engine_mode and not holdout.empty and not strategies.empty:
-        refit_frame = core.iloc[windows[-1][0]]
-        strategies = _evaluate_holdout(
-            holdout,
-            refit_frame,
-            strategies,
-            fee_bps,
-            slippage_bps,
-            pnl_unit,
-        )
-
-    if wf_engine_mode:
-        yearly = pd.DataFrame()
-    else:
-        yearly = add_year_metrics(
-            data,
-            strategies,
-            fee_bps,
-            slippage_bps,
-            top_n=10,
+    rows.extend(
+        _score_search_candidates(
+            data=data,
+            core=core,
+            train=train,
+            test=test,
+            windows=windows,
+            candidates=candidates,
+            pending=pending,
+            scenarios=scenarios,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
             pnl_unit=pnl_unit,
+            use_triple_barrier_labels=use_triple_barrier_labels,
+            regime_conditional=regime_conditional,
+            wf_pass_rate=wf_pass_rate,
+            purged_kfold=purged_kfold,
+            purged_kfold_splits=purged_kfold_splits,
+            embargo_bars=embargo_bars,
+            wf_engine_mode=wf_engine_mode,
+            n_jobs=n_jobs,
+            checkpoint_every=checkpoint_every,
+            wf_train_bars=wf_train_bars,
+            wf_test_bars=wf_test_bars,
+            wf_step_bars=wf_step_bars,
+            wf_min_windows=wf_min_windows,
+            worker_columns=worker_columns,
+            input_path=input_path,
+            horizons=horizons,
+            train_fraction=train_fraction,
+            trade_config_payload=trade_config_payload,
+            done=done,
+            checkpoint_path=checkpoint_path,
         )
-    (output_dir / "config.json").write_text(
-        json.dumps(config, indent=2, sort_keys=True),
-        encoding="utf-8",
     )
-    heavy_columns = ["wf_window_returns_json"]
-    diagnostics.drop(columns=heavy_columns, errors="ignore").to_csv(
-        output_dir / "scored_strategies_all.csv",
-        index=False,
+
+    strategies, diagnostics, rejection_summary, yearly = _finalise_search_results(
+        rows=rows,
+        walk_forward=wf_engine_mode,
+        holdout=holdout,
+        core=core,
+        windows=windows,
+        data=data,
+        min_train_trades=min_train_trades,
+        min_test_trades=min_test_trades,
+        require_multitimeframe=require_multitimeframe,
+        wf_pass_rate=wf_pass_rate,
+        dsr_threshold=dsr_threshold,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        pnl_unit=pnl_unit,
     )
-    (output_dir / "filter_summary.json").write_text(
-        json.dumps(rejection_summary, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    strategies = strategies.drop(columns=heavy_columns, errors="ignore")
-    strategies.to_csv(output_dir / "ranked_strategies.csv", index=False)
-    clustered = cluster_ranked_strategies(data, strategies, threshold=cluster_jaccard)
-    clustered.to_csv(output_dir / "ranked_strategies_clustered.csv", index=False)
-    yearly.to_csv(output_dir / "ranked_strategies_by_year.csv", index=False)
-    write_report(
-        strategies,
-        yearly,
-        diagnostics,
-        rejection_summary,
-        output_dir / "report.md",
+    strategies = _write_search_outputs(
+        output_dir=output_dir,
+        config=config,
+        strategies=strategies,
+        diagnostics=diagnostics,
+        rejection_summary=rejection_summary,
+        yearly=yearly,
+        data=data,
+        cluster_jaccard=cluster_jaccard,
         mode=mode,
         pnl_unit=pnl_unit,
         walk_forward=wf_engine_mode,
+        checkpoint_path=checkpoint_path,
+        meta_path=meta_path,
     )
-    if checkpoint_path.exists():
-        checkpoint_path.unlink()
-    if meta_path.exists():
-        meta_path.unlink()
     return strategies
 
 
