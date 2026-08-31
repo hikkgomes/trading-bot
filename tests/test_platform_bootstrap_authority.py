@@ -815,6 +815,7 @@ def test_authenticated_reconciliation_detects_external_product_exposure(
                 "portfolio_id": "active-income-portfolio",
                 "account_id": "futures",
                 "execution_mode": "live",
+                "exchange_symbols": ["BTCUSDT"],
             }
         },
         accounts={

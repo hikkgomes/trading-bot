@@ -231,6 +231,37 @@ def test_generation_worker_persists_a_typed_dataset_plan(tmp_path) -> None:
     )
 
 
+def test_catalogue_registration_waits_without_a_ready_dataset() -> None:
+    database = PlatformDatabase("sqlite+pysqlite:///:memory:")
+    database.create_schema()
+    claimed = ClaimedJob(
+        job_id="catalogue-job",
+        name="register_strategy_catalogue",
+        payload={
+            "product_id": "btc_accumulation",
+            "instrument_universe": ["BTCUSDT"],
+            "dataset_snapshot_hashes": [],
+            "catalogue_submitted_at": NOW,
+        },
+        worker_id="catalogue-worker",
+        attempt=1,
+        lease_expires_at="2026-08-23T00:01:00+00:00",
+    )
+
+    result = DatabaseResearchJobHandlers(
+        SqlResearchStore(database.engine)
+    ).register_strategy_catalogue(
+        claimed,
+        lambda: claimed,
+    )
+
+    assert result == {
+        "product_id": "btc_accumulation",
+        "state": "waiting_for_dataset",
+        "reason_code": "canonical_dataset_bundle_unavailable",
+    }
+
+
 def test_in_memory_thesis_budget_is_shared_by_descendants() -> None:
     root = build_hypothesis(
         CAMPAIGNS[0],

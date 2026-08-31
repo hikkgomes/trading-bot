@@ -173,6 +173,28 @@ class DatabaseResearchJobHandlers:
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
     ) -> dict[str, Any]:
         renew()
+        snapshot_ids = tuple(str(item) for item in claimed.payload["dataset_snapshot_hashes"])
+        bundle_id = claimed.payload.get("dataset_bundle_id")
+        plan = None
+        bundle = None
+        if not snapshot_ids:
+            return {
+                "product_id": str(claimed.payload["product_id"]),
+                "state": "waiting_for_dataset",
+                "reason_code": "canonical_dataset_bundle_unavailable",
+            }
+        if bundle_id:
+            bundle = SqlDatasetBundleRepository(self.store.engine).get(str(bundle_id))
+            if bundle.lifecycle_state is not DatasetLifecycleState.READY:
+                return {
+                    "product_id": str(claimed.payload["product_id"]),
+                    "state": "waiting_for_dataset",
+                    "reason_code": "canonical_dataset_bundle_not_ready",
+                    "dataset_bundle_id": str(bundle_id),
+                }
+            plan = CandidateDatasetPlan.from_bundle(bundle)
+            if set(snapshot_ids) != set(plan.all_snapshot_ids):
+                raise JobSchemaError("catalogue datasets do not match the canonical bundle")
         universe = tuple(claimed.payload.get("instrument_universe", ("BTCUSDT",)))
         theses = registered_strategy_theses(
             product=str(claimed.payload["product_id"]), instrument_universe=universe
@@ -182,7 +204,7 @@ class DatabaseResearchJobHandlers:
             thesis_registry.register(thesis)
         candidates = registered_strategy_candidates(
             product=str(claimed.payload["product_id"]),
-            dataset_snapshot_hashes=tuple(claimed.payload["dataset_snapshot_hashes"]),
+            dataset_snapshot_hashes=snapshot_ids,
             dataset_bundle_id=(
                 str(claimed.payload["dataset_bundle_id"])
                 if claimed.payload.get("dataset_bundle_id")
@@ -200,6 +222,16 @@ class DatabaseResearchJobHandlers:
                 else None
             ),
         )
+        if plan is not None:
+            candidates = tuple(
+                replace(
+                    candidate,
+                    dataset_snapshot_hashes=plan.all_snapshot_ids,
+                    dataset_bundle_id=bundle.bundle_id,
+                    dataset_plan=plan,
+                )
+                for candidate in candidates
+            )
         identities = ResearchCoordinator(self.store).register(candidates)
         return {"registered_candidates": len(identities), "candidate_ids": list(identities)}
 

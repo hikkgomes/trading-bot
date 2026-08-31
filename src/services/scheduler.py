@@ -13,7 +13,6 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
 
 from src.data.database import (
-    dataset_bundle,
     dataset_snapshot,
     experiment,
     forward_paper_observation,
@@ -28,6 +27,7 @@ from src.data.database import (
 )
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
+from src.research.datasets import SqlDatasetBundleRepository
 from src.research.store import SqlResearchStore
 from src.research.theses import StrategyThesisFactory
 from src.services.alerting import AlertSeverity, SqlAlertService, configured_alert_service
@@ -224,23 +224,29 @@ class PlatformScheduler:
             )
         if schedule_name == "candidate_generation":
             catalogue = self._payload("register_strategy_catalogue", product_id, product, now)
-            return (
+            jobs = [
                 (
                     f"scheduled:{schedule_name}:{product_id}:catalogue:{due_at}",
                     "register_strategy_catalogue",
                     catalogue,
                 ),
-                (
-                    f"scheduled:{schedule_name}:{product_id}:ml:{due_at}",
-                    "register_ml_candidate",
-                    self._ml_candidate_payload(product_id, product, catalogue),
-                ),
+            ]
+            if catalogue["dataset_snapshot_hashes"]:
+                jobs.append(
+                    (
+                        f"scheduled:{schedule_name}:{product_id}:ml:{due_at}",
+                        "register_ml_candidate",
+                        self._ml_candidate_payload(product_id, product, catalogue),
+                    )
+                )
+            jobs.append(
                 (
                     f"scheduled:{schedule_name}:{product_id}:hypotheses:{due_at}",
                     "generate_hypotheses",
                     self._hypothesis_generation_payload(product_id, product, catalogue),
-                ),
+                )
             )
+            return tuple(jobs)
         if schedule_name in {"bounded_backtest", "event_replay", "ml_research"}:
             return self._research_jobs(schedule_name, product_id, now, due_at)
         if schedule_name == "universe_refresh" and self._pending_universe_refresh(product_id):
@@ -755,50 +761,22 @@ class PlatformScheduler:
                 "maximum_symbols": 100,
             }
         if schedule_name == "register_strategy_catalogue":
-            with self.engine.connect() as connection:
-                row = (
-                    connection.execute(
-                        select(
-                            dataset_bundle.c.id,
-                            dataset_bundle.c.created_at,
-                            dataset_bundle.c.payload,
-                        )
-                        .where(dataset_bundle.c.product_id == product_id)
-                        .order_by(dataset_bundle.c.created_at.desc(), dataset_bundle.c.id.desc())
-                        .limit(1)
-                    )
-                    .mappings()
-                    .first()
-                )
-            bundle_payload = row["payload"] if row is not None else None
-            stage_ids = (
-                bundle_payload.get("stage_snapshot_ids")
-                if isinstance(bundle_payload, Mapping)
-                else None
-            )
-            snapshot_ids = (
-                list(dict.fromkeys(str(value) for value in stage_ids.values()))
-                if isinstance(stage_ids, Mapping)
-                else []
-            )
+            bundle = SqlDatasetBundleRepository(self.engine).latest_ready(product_id, at=now)
+            stage_ids = bundle.stage_snapshot_ids if bundle is not None else {}
+            snapshot_ids = list(dict.fromkeys(str(value) for value in stage_ids.values()))
             return {
                 **base,
                 "instrument_universe": self._universe_symbols(product_id, product, now),
                 "dataset_snapshot_hashes": snapshot_ids,
-                "dataset_bundle_id": str(row["id"]) if row is not None else None,
+                "dataset_bundle_id": bundle.bundle_id if bundle is not None else None,
                 "universe_snapshot_id": (
-                    str(bundle_payload["universe_snapshot_id"])
-                    if isinstance(bundle_payload, Mapping)
-                    and bundle_payload.get("universe_snapshot_id")
-                    else None
+                    bundle.universe_snapshot_id if bundle is not None else None
                 ),
-                "catalogue_submitted_at": (str(row["created_at"]) if row is not None else now),
+                "catalogue_submitted_at": bundle.created_at if bundle is not None else now,
             }
         return base
 
-    def _universe_symbols(
-        self, product_id: str, product: Mapping[str, Any], now: str
-    ) -> list[str]:
+    def _universe_symbols(self, product_id: str, product: Mapping[str, Any], now: str) -> list[str]:
         if product_id == "btc_accumulation":
             return ["BTCUSDT"]
         universe_id = str(product.get("universe_id") or "")
