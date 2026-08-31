@@ -167,21 +167,21 @@ class DatabaseEmergencyFlattenWorker:
         if venue is None:
             raise ValueError(f"no emergency venue for {product_id}")
         results: list[dict[str, Any]] = []
-        for position in self.positions.all():
-            if position.portfolio_id != portfolio_id or abs(position.quantity) <= 1e-12:
-                continue
-            quantity = self._reduction_quantity(
-                product_id, position.instrument_id, position.quantity
-            )
+        reduction_targets = self._reduction_targets(
+            portfolio_id=portfolio_id,
+            payload=payload,
+        )
+        for instrument_id, position_quantity in reduction_targets:
+            quantity = self._reduction_quantity(product_id, instrument_id, position_quantity)
             if quantity <= 1e-12:
                 continue
-            side = OrderSide.SELL if position.quantity > 0 else OrderSide.BUY
-            reference_price = _reference_price(venue, position.instrument_id)
+            side = OrderSide.SELL if position_quantity > 0 else OrderSide.BUY
+            reference_price = _reference_price(venue, instrument_id)
             control_id = str(payload.get("control_id") or payload.get("stop_id") or "emergency")
             unsigned = {
                 "control_id": control_id,
                 "product_id": product_id,
-                "instrument_id": position.instrument_id,
+                "instrument_id": instrument_id,
                 "quantity": quantity,
                 "side": side.value,
             }
@@ -194,7 +194,7 @@ class DatabaseEmergencyFlattenWorker:
                 results.append(
                     {
                         "product_id": product_id,
-                        "instrument_id": position.instrument_id,
+                        "instrument_id": instrument_id,
                         "order_id": order_id,
                         "status": existing.status.value,
                     }
@@ -203,7 +203,7 @@ class DatabaseEmergencyFlattenWorker:
             intent = OrderIntent(
                 order_id=order_id,
                 portfolio_id=portfolio_id,
-                instrument_id=position.instrument_id,
+                instrument_id=instrument_id,
                 side=side,
                 quantity=quantity,
                 order_type=OrderType.MARKET,
@@ -223,12 +223,28 @@ class DatabaseEmergencyFlattenWorker:
             results.append(
                 {
                     "product_id": product_id,
-                    "instrument_id": position.instrument_id,
+                    "instrument_id": instrument_id,
                     "order_id": order_id,
                     "status": "submitted",
                 }
             )
         return results
+
+    def _reduction_targets(
+        self, *, portfolio_id: str, payload: Mapping[str, Any]
+    ) -> tuple[tuple[str, float], ...]:
+        instrument_id = str(payload.get("instrument_id") or "").strip()
+        raw_quantity = payload.get("position_quantity")
+        if instrument_id and raw_quantity is not None:
+            quantity = float(raw_quantity)
+            if not math.isfinite(quantity):
+                raise ValueError("emergency position quantity must be finite")
+            return ((instrument_id, quantity),) if abs(quantity) > 1e-12 else ()
+        return tuple(
+            (position.instrument_id, position.quantity)
+            for position in self.positions.all()
+            if position.portfolio_id == portfolio_id and abs(position.quantity) > 1e-12
+        )
 
     def _reduction_quantity(self, product_id: str, instrument_id: str, quantity: float) -> float:
         if product_id != "btc_accumulation":

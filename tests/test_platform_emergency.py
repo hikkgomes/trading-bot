@@ -110,3 +110,47 @@ def test_emergency_flatten_is_reduce_only_and_idempotent_after_restart(tmp_path)
             == "completed"
         )
     database.dispose()
+
+
+def test_emergency_reduction_uses_authoritative_stop_quantity(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'emergency-target.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="emergency-1",
+        node_id="test-node",
+        role="emergency-control",
+        capabilities=("emergency_flatten",),
+        observed_at=NOW,
+    )
+    queue.enqueue(
+        job_id="reduction-1",
+        name="emergency_flatten",
+        payload={
+            "control_id": "stop-control-1",
+            "target": "product:active_income",
+            "instrument_id": INSTRUMENT,
+            "position_quantity": -0.25,
+            "reason_code": "stop_confirmation_failed",
+        },
+        available_at=NOW,
+        priority=200,
+    )
+    venue = _Venue()
+    worker = DatabaseEmergencyFlattenWorker(
+        queue=queue,
+        worker_id="emergency-1",
+        order_manager=OrderManager(SqlOrderStore(database.engine)),
+        positions=PositionManager(SqlPositionStore(database.engine)),
+        venues={"active_income": venue},
+        products={"active_income": {"portfolio_id": "active-income-portfolio"}},
+    )
+
+    result = worker.run_once(now=NOW)
+
+    assert result["reason_code"] == "emergency_action_completed"
+    assert len(venue.submitted) == 1
+    assert venue.submitted[0].instrument_id == INSTRUMENT
+    assert venue.submitted[0].quantity == 0.25
+    assert venue.submitted[0].side is OrderSide.BUY
+    database.dispose()
