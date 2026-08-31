@@ -47,6 +47,7 @@ from src.research.generation import (
     HypothesisGenerator,
     SqlGenerationFeedbackStore,
     SqlHypothesisMemory,
+    hypothesis_signature,
 )
 from src.research.ml import MlExperimentRunner
 from src.research.providers import provider_candidate
@@ -576,6 +577,20 @@ class DatabaseResearchJobHandlers:
                 request=request,
                 evidence=result.evidence,
             )
+        campaign = candidate.definition.metadata.get("campaign")
+        if isinstance(campaign, str) and campaign:
+            if not result.accepted or result.stage == "protected":
+                SqlGenerationFeedbackStore(self.store.engine).append(
+                    GenerationFeedback(
+                        campaign=campaign,
+                        outcome="accepted" if result.accepted else "rejected",
+                        observed_at=request.evaluated_at,
+                        candidate_id=candidate.candidate_id,
+                        reason_code=result.reason_code,
+                        semantic_signature=hypothesis_signature(candidate.definition),
+                        metadata={"stage": result.stage},
+                    )
+                )
         return response
 
     def _publish_strategy_artefact(
