@@ -615,6 +615,24 @@ def test_position_return_ledger_accumulates_signed_costs_once() -> None:
     assert report.slippage == pytest.approx(0.01)
     assert report.funding_pnl == pytest.approx(0.0)
     assert report.net_pnl == pytest.approx(0.12)
+    assert report.period_turnover == pytest.approx((2.0, 0.0))
+    assert report.period_fees == pytest.approx((0.02, 0.0))
+    assert report.period_slippage == pytest.approx((0.01, 0.0))
+    assert report.period_funding_pnl == pytest.approx((-0.01, 0.01))
+
+
+def test_position_return_ledger_keeps_funding_signed_per_period() -> None:
+    report = PositionReturnLedger(fee_rate=0.01).measure(
+        positions=(0.0, 1.0, 1.0),
+        market_returns=(0.10, -0.10),
+        funding_rates=(0.02, -0.03),
+    )
+
+    assert report.period_turnover == pytest.approx((1.0, 0.0))
+    assert report.period_fees == pytest.approx((0.01, 0.0))
+    assert report.period_funding_pnl == pytest.approx((0.0, 0.03))
+    assert report.net_returns == pytest.approx((-0.01, -0.07))
+    assert report.net_pnl == pytest.approx(-0.08)
 
 
 def test_dataset_bundle_supports_explicit_pending_lifecycle_and_verifies_stages(tmp_path) -> None:

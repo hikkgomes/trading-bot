@@ -162,16 +162,19 @@ def _measured_result(
     from src.research.returns import PositionReturnLedger, ReturnLedgerError
 
     try:
-        return_report = PositionReturnLedger(
+        return_ledger = PositionReturnLedger(
             fee_rate=max(0.0, float(context.get("fee_bps", 1.0))) / 10_000.0,
             slippage_rate=max(0.0, float(context.get("slippage_bps", 1.0))) / 10_000.0,
             funding_rate=float(context.get("funding_rate", 0.0)),
-        ).measure(signals, returns)
+        )
+        return_report = return_ledger.measure(signals, returns)
     except (ReturnLedgerError, TypeError, ValueError) as exc:
         raise ExecutorError(f"position return ledger input is invalid: {exc}") from exc
     aligned = return_report.effective_observations
     gross = list(return_report.gross_returns)
-    bootstrap_values = list(return_report.net_returns) or gross
+    net = list(return_report.net_returns)
+    analysis_returns = net or gross
+    bootstrap_values = analysis_returns
     fees = return_report.fees
     slippage = return_report.slippage
     funding_pnl = return_report.funding_pnl
@@ -181,7 +184,7 @@ def _measured_result(
     accounting = _product_accounting(context, fallback_return=return_report)
     if accounting is not None:
         net_return = float(accounting["return_fraction"])
-    window_returns = _window_sums(gross, 3)
+    window_returns = _window_sums(analysis_returns, 3)
     negative_controls = _negative_control_evidence(
         signals=signals[:aligned],
         returns=returns[:aligned],
@@ -189,12 +192,17 @@ def _measured_result(
         control_returns=context.get("negative_control_returns"),
         controls=_negative_control_names(candidate, context),
     )
-    delayed_gross = [signals[index - 1] * returns[index] for index in range(1, aligned)]
-    missing_data_gross = [value for index, value in enumerate(gross) if (index + 1) % 20]
+    delayed_report = (
+        return_ledger.measure(signals[:aligned], returns[1:aligned]) if aligned > 1 else None
+    )
+    delayed_net = list(delayed_report.net_returns) if delayed_report is not None else []
+    missing_data_returns = [
+        value for index, value in enumerate(analysis_returns) if (index + 1) % 20
+    ]
     parameter_stability = _parameter_stability(candidate, context, bootstrap_values)
     cross_symbol_stability = _cross_symbol_stability(context, bootstrap_values)
-    portfolio_overlap = _portfolio_overlap(context, gross)
-    walk_forward = _purged_walk_forward(gross, context)
+    portfolio_overlap = _portfolio_overlap(context, analysis_returns)
+    walk_forward = _purged_walk_forward(analysis_returns, context)
     bootstrap_low, bootstrap_high = bootstrap_sharpe_ci(
         bootstrap_values,
         n_boot=int(context.get("bootstrap_iterations", 1_000)),
@@ -226,8 +234,8 @@ def _measured_result(
         }
     else:
         pbo = probability_backtest_overfitting(pbo_matrix)
-    skew, kurtosis = _skew_kurtosis(gross)
-    trial_sharpes = _trial_sharpes(context, parameter_stability, gross)
+    skew, kurtosis = _skew_kurtosis(analysis_returns)
+    trial_sharpes = _trial_sharpes(context, parameter_stability, analysis_returns)
     trial_count = max(
         1,
         int(
@@ -244,11 +252,11 @@ def _measured_result(
     if "trial_sharpe_std" not in context and len(trial_sharpes) >= 2:
         trial_sharpe_std = statistics.pstdev(trial_sharpes)
     dsr = deflated_sharpe_ratio(
-        sharpe_ratio(gross),
+        sharpe_ratio(analysis_returns),
         n_trials=trial_count,
         skew=skew,
         kurt=kurtosis,
-        n_obs=len(gross),
+        n_obs=len(analysis_returns),
         sr_std_trials=trial_sharpe_std,
     )
     expected_definition_hash = candidate.definition.definition_hash
@@ -359,7 +367,7 @@ def _measured_result(
         "slippage": slippage,
         "funding": funding,
         "funding_pnl": funding_pnl,
-        "regime_breakdown": {"passed": bool(gross), "regimes": {"all": net_return}},
+        "regime_breakdown": {"passed": bool(analysis_returns), "regimes": {"all": net_return}},
         "parameter_stability": parameter_stability,
         "sample_evidence": {
             "passed": aligned >= 3,
@@ -384,13 +392,13 @@ def _measured_result(
                     "kind": "sample_evidence/v1",
                     "candidate_id": candidate.candidate_id,
                     "dataset_snapshot_ids": list(snapshots),
-                    "returns": gross,
+                    "returns": analysis_returns,
                 }
             ),
             "input_hash": canonical_hash(
                 {
                     "dataset_snapshot_ids": list(snapshots),
-                    "returns": gross,
+                    "returns": analysis_returns,
                 }
             ),
         },
@@ -406,26 +414,28 @@ def _measured_result(
         "purged": int(walk_forward.get("purged_rows", 0)) > 0,
         "embargo": int(walk_forward.get("embargo_rows", 0)),
         "cost_stress": {
-            "passed": sum(gross) - 2 * fees - 2 * slippage - funding >= 0,
+            "passed": sum(analysis_returns) - fees - slippage >= 0,
             "multiplier": 2.0,
+            "cost_adjusted_return": sum(analysis_returns) - fees - slippage,
         },
         "delay_stress": {
-            "passed": bool(delayed_gross) and sum(delayed_gross) - fees - slippage - funding >= 0,
+            "passed": bool(delayed_net) and sum(delayed_net) >= 0,
             "delay_bars": 1,
-            "cost_adjusted_return": sum(delayed_gross) - fees - slippage - funding,
+            "cost_adjusted_return": sum(delayed_net),
         },
         "adverse_fill_stress": {
-            "passed": sum(gross) - fees - 2 * slippage - funding >= 0,
+            "passed": sum(analysis_returns) - slippage >= 0,
             "multiplier": 2.0,
+            "cost_adjusted_return": sum(analysis_returns) - slippage,
         },
         "missing_data_stress": {
-            "passed": bool(missing_data_gross)
-            and sum(missing_data_gross) - fees - slippage - funding >= 0,
-            "removed_fraction": 1.0 - len(missing_data_gross) / max(1, len(gross)),
+            "passed": bool(missing_data_returns) and sum(missing_data_returns) >= 0,
+            "removed_fraction": 1.0 - len(missing_data_returns) / max(1, len(analysis_returns)),
         },
         "funding_stress": {
-            "passed": sum(gross) - fees - slippage - 2 * funding >= 0,
+            "passed": sum(analysis_returns) - funding >= 0,
             "multiplier": 2.0,
+            "cost_adjusted_return": sum(analysis_returns) - funding,
         },
         "monte_carlo_trade_order": {
             "passed": bool(monte_carlo_drawdowns) and net_return >= 0,

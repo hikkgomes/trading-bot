@@ -54,6 +54,10 @@ class PositionReturnReport:
     gross_pnl: float
     net_pnl: float
     maximum_drawdown: float
+    period_turnover: tuple[float, ...] = ()
+    period_fees: tuple[float, ...] = ()
+    period_slippage: tuple[float, ...] = ()
+    period_funding_pnl: tuple[float, ...] = ()
 
     @property
     def effective_observations(self) -> int:
@@ -98,28 +102,33 @@ class PositionReturnLedger:
             position * market_return
             for position, market_return in zip(held_positions, held_returns, strict=False)
         )
-        changes = tuple(
-            abs(position_values[index] - position_values[index - 1])
-            for index in range(1, len(position_values))
+        period_turnover = tuple(
+            abs(position_values[index + 1] - position_values[index])
+            for index in range(aligned)
         )
-        turnover = sum(changes)
+        turnover = sum(period_turnover)
         fee_rate = _rate(self.fee_rate, field="fee_rate")
         slippage_rate = _rate(self.slippage_rate, field="slippage_rate")
-        fees = turnover * fee_rate
-        slippage = turnover * slippage_rate
+        period_fees = tuple(value * fee_rate for value in period_turnover)
+        period_slippage = tuple(value * slippage_rate for value in period_turnover)
+        fees = sum(period_fees)
+        slippage = sum(period_slippage)
         funding_values = self._funding_values(funding_rates, aligned)
-        funding_pnl = -sum(
-            position * rate
+        period_funding_pnl = tuple(
+            -position * rate
             for position, rate in zip(held_positions, funding_values, strict=False)
         )
-        costs = fees + slippage
-        net_returns = list(gross_returns)
-        if net_returns:
-            period_cost = costs / len(net_returns)
-            net_returns = [value - period_cost for value in net_returns]
-            net_returns[-1] += funding_pnl
-        elif funding_pnl:
-            net_returns = [funding_pnl - costs]
+        funding_pnl = sum(period_funding_pnl)
+        net_returns = tuple(
+            gross - fee - slip + funding
+            for gross, fee, slip, funding in zip(
+                gross_returns,
+                period_fees,
+                period_slippage,
+                period_funding_pnl,
+                strict=True,
+            )
+        )
         net_pnl = sum(net_returns)
         maximum_drawdown = self._maximum_drawdown(net_returns)
         return PositionReturnReport(
@@ -134,6 +143,10 @@ class PositionReturnLedger:
             gross_pnl=sum(gross_returns),
             net_pnl=net_pnl,
             maximum_drawdown=maximum_drawdown,
+            period_turnover=period_turnover,
+            period_fees=period_fees,
+            period_slippage=period_slippage,
+            period_funding_pnl=period_funding_pnl,
         )
 
     def _funding_values(
