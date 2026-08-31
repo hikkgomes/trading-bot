@@ -101,21 +101,8 @@ class EvaluationRequest:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> EvaluationRequest:
-        if not isinstance(payload, Mapping):
-            raise EvaluationContractError("evaluate_candidate payload must be an object")
-        forbidden = sorted(set(payload) & FORBIDDEN_SUBMITTED_FIELDS)
-        if forbidden:
-            raise EvaluationContractError(
-                "submitted validation outcomes are not accepted: " + ", ".join(forbidden)
-            )
-        unknown = sorted(set(payload) - ALLOWED_REQUEST_FIELDS)
-        if unknown:
-            raise EvaluationContractError(
-                "evaluate_candidate payload contains unsupported fields: " + ", ".join(unknown)
-            )
-        candidate_id = non_empty(str(payload.get("candidate_id") or ""), field="candidate_id")
-        if not candidate_id.startswith("sha256:") or len(candidate_id) != 71:
-            raise EvaluationContractError("candidate_id must be a sha256: identity")
+        payload = _validate_evaluation_request_payload(payload)
+        candidate_id = _request_identity(payload, "candidate_id")
         policy_id = non_empty(
             str(
                 payload.get("evaluation_policy_id")
@@ -123,110 +110,21 @@ class EvaluationRequest:
             ),
             field="evaluation_policy_id",
         )
-        raw_snapshots = payload.get("dataset_snapshot_ids")
-        if not isinstance(raw_snapshots, list | tuple) or not raw_snapshots:
-            raise EvaluationContractError("dataset_snapshot_ids must be a non-empty list")
-        snapshots = tuple(
-            non_empty(str(value), field="dataset_snapshot_ids[]") for value in raw_snapshots
-        )
-        if len(set(snapshots)) != len(snapshots) or any(
-            not value.startswith("sha256:") or len(value) != 71 for value in snapshots
-        ):
-            raise EvaluationContractError(
-                "dataset_snapshot_ids must contain unique sha256: identities"
-            )
-        stage = non_empty(str(payload.get("requested_stage") or ""), field="requested_stage")
-        if stage not in STAGES:
-            raise EvaluationContractError(f"requested_stage must be one of {STAGES}")
+        snapshots = _request_snapshot_ids(payload)
+        stage = _request_stage(payload)
         evaluated_at = timestamp(str(payload.get("evaluated_at") or ""), field="evaluated_at")
-        hashes: dict[str, str | None] = {}
-        for field in (
-            "code_hash",
-            "feature_set_hash",
-            "cost_model_hash",
-            "feature_manifest_id",
-            "cost_model_id",
-            "parameter_set_id",
-        ):
-            value = payload.get(field)
-            if value is not None:
-                value = non_empty(str(value), field=field)
-                if not value.startswith("sha256:") or len(value) != 71:
-                    raise EvaluationContractError(f"{field} must be a sha256: identity")
-            hashes[field] = value
+        hashes = _request_hashes(payload)
         evaluator_version = non_empty(
             str(payload.get("evaluator_version") or ""), field="evaluator_version"
         )
         producer_identity = non_empty(
             str(payload.get("producer_identity") or ""), field="producer_identity"
         )
-        content_hash = non_empty(str(payload.get("content_hash") or ""), field="content_hash")
-        if not content_hash.startswith("sha256:") or len(content_hash) != 71:
-            raise EvaluationContractError("content_hash must be a sha256: identity")
-        unsigned = dict(payload)
-        unsigned.pop("content_hash", None)
-        if canonical_hash(unsigned) != content_hash:
-            raise EvaluationContractError("content_hash does not match the evaluation request")
-        raw_roles = payload.get("dataset_roles")
-        roles: dict[str, str] | None = None
-        if raw_roles is None:
-            raise EvaluationContractError(
-                "evaluate_candidate requests require explicit dataset roles"
-            )
-        if raw_roles is not None:
-            if not isinstance(raw_roles, Mapping) or set(raw_roles) != set(snapshots):
-                raise EvaluationContractError(
-                    "dataset_roles must map every dataset snapshot identity to one role"
-                )
-            allowed_roles = {
-                "screening",
-                "development",
-                "robustness",
-                "protected_holdout",
-                "forward_observation",
-                "unspecified",
-            }
-            roles = {str(key): str(value) for key, value in raw_roles.items()}
-            if any(value not in allowed_roles for value in roles.values()):
-                raise EvaluationContractError("dataset_roles contains an unsupported role")
-            expected_role = {
-                "screening": "screening",
-                "development": "development",
-                "robustness": "robustness",
-                "protected": "protected_holdout",
-                "forward": "forward_observation",
-            }[stage]
-            if sum(value == expected_role for value in roles.values()) != 1:
-                raise EvaluationContractError(
-                    f"dataset_roles must contain exactly one {expected_role} snapshot"
-                )
-            if stage == "protected" and (
-                len(snapshots) != 1 or roles.get(snapshots[0]) != "protected_holdout"
-            ):
-                raise EvaluationContractError(
-                    "protected evaluation requests may contain only the protected_holdout snapshot"
-                )
-            if stage != "protected" and "protected_holdout" in roles.values():
-                raise EvaluationContractError(
-                    "adaptive evaluation cannot contain a protected_holdout snapshot"
-                )
-        artefact_hash = payload.get("artefact_hash")
-        if artefact_hash is not None:
-            artefact_hash = non_empty(str(artefact_hash), field="artefact_hash")
-            if not artefact_hash.startswith("sha256:") or len(artefact_hash) != 71:
-                raise EvaluationContractError("artefact_hash must be a sha256: identity")
-        artefact_created_at = payload.get("artefact_created_at")
-        if artefact_created_at is not None:
-            artefact_created_at = timestamp(str(artefact_created_at), field="artefact_created_at")
-        if stage == "forward":
-            if artefact_hash is None or artefact_created_at is None:
-                raise EvaluationContractError(
-                    "forward evaluations require the exact artefact hash and creation time"
-                )
-            if artefact_created_at >= evaluated_at:
-                raise EvaluationContractError(
-                    "forward artefact creation must precede evaluation time"
-                )
+        content_hash = _request_content_hash(payload)
+        roles = _request_dataset_roles(payload, snapshots=snapshots, stage=stage)
+        artefact_hash, artefact_created_at = _request_artefact(
+            payload, stage=stage, evaluated_at=evaluated_at
+        )
         return cls(
             candidate_id=candidate_id,
             evaluation_policy_id=policy_id,
@@ -267,6 +165,138 @@ class EvaluationRequest:
         if len(values) != 1:
             raise EvaluationContractError("exactly one protected_holdout snapshot is required")
         return values[0]
+
+
+def _validate_evaluation_request_payload(payload: object) -> Mapping[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise EvaluationContractError("evaluate_candidate payload must be an object")
+    forbidden = sorted(set(payload) & FORBIDDEN_SUBMITTED_FIELDS)
+    if forbidden:
+        raise EvaluationContractError(
+            "submitted validation outcomes are not accepted: " + ", ".join(forbidden)
+        )
+    unknown = sorted(set(payload) - ALLOWED_REQUEST_FIELDS)
+    if unknown:
+        raise EvaluationContractError(
+            "evaluate_candidate payload contains unsupported fields: " + ", ".join(unknown)
+        )
+    return payload
+
+
+def _request_identity(payload: Mapping[str, Any], field: str) -> str:
+    value = non_empty(str(payload.get(field) or ""), field=field)
+    if not value.startswith("sha256:") or len(value) != 71:
+        raise EvaluationContractError(f"{field} must be a sha256: identity")
+    return value
+
+
+def _request_snapshot_ids(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    raw_snapshots = payload.get("dataset_snapshot_ids")
+    if not isinstance(raw_snapshots, list | tuple) or not raw_snapshots:
+        raise EvaluationContractError("dataset_snapshot_ids must be a non-empty list")
+    snapshots = tuple(
+        non_empty(str(value), field="dataset_snapshot_ids[]") for value in raw_snapshots
+    )
+    if len(set(snapshots)) != len(snapshots) or any(
+        not value.startswith("sha256:") or len(value) != 71 for value in snapshots
+    ):
+        raise EvaluationContractError("dataset_snapshot_ids must contain unique sha256: identities")
+    return snapshots
+
+
+def _request_stage(payload: Mapping[str, Any]) -> str:
+    stage = non_empty(str(payload.get("requested_stage") or ""), field="requested_stage")
+    if stage not in STAGES:
+        raise EvaluationContractError(f"requested_stage must be one of {STAGES}")
+    return stage
+
+
+def _request_hashes(payload: Mapping[str, Any]) -> dict[str, str | None]:
+    hashes: dict[str, str | None] = {}
+    for field in (
+        "code_hash",
+        "feature_set_hash",
+        "cost_model_hash",
+        "feature_manifest_id",
+        "cost_model_id",
+        "parameter_set_id",
+    ):
+        value = payload.get(field)
+        hashes[field] = None if value is None else _request_identity({field: value}, field)
+    return hashes
+
+
+def _request_content_hash(payload: Mapping[str, Any]) -> str:
+    content_hash = _request_identity(payload, "content_hash")
+    unsigned = dict(payload)
+    unsigned.pop("content_hash", None)
+    if canonical_hash(unsigned) != content_hash:
+        raise EvaluationContractError("content_hash does not match the evaluation request")
+    return content_hash
+
+
+def _request_dataset_roles(
+    payload: Mapping[str, Any], *, snapshots: tuple[str, ...], stage: str
+) -> dict[str, str]:
+    raw_roles = payload.get("dataset_roles")
+    if raw_roles is None:
+        raise EvaluationContractError("evaluate_candidate requests require explicit dataset roles")
+    if not isinstance(raw_roles, Mapping) or set(raw_roles) != set(snapshots):
+        raise EvaluationContractError(
+            "dataset_roles must map every dataset snapshot identity to one role"
+        )
+    allowed_roles = {
+        "screening",
+        "development",
+        "robustness",
+        "protected_holdout",
+        "forward_observation",
+        "unspecified",
+    }
+    roles = {str(key): str(value) for key, value in raw_roles.items()}
+    if any(value not in allowed_roles for value in roles.values()):
+        raise EvaluationContractError("dataset_roles contains an unsupported role")
+    expected_role = {
+        "screening": "screening",
+        "development": "development",
+        "robustness": "robustness",
+        "protected": "protected_holdout",
+        "forward": "forward_observation",
+    }[stage]
+    if sum(value == expected_role for value in roles.values()) != 1:
+        raise EvaluationContractError(
+            f"dataset_roles must contain exactly one {expected_role} snapshot"
+        )
+    if stage == "protected" and (
+        len(snapshots) != 1 or roles.get(snapshots[0]) != "protected_holdout"
+    ):
+        raise EvaluationContractError(
+            "protected evaluation requests may contain only the protected_holdout snapshot"
+        )
+    if stage != "protected" and "protected_holdout" in roles.values():
+        raise EvaluationContractError(
+            "adaptive evaluation cannot contain a protected_holdout snapshot"
+        )
+    return roles
+
+
+def _request_artefact(
+    payload: Mapping[str, Any], *, stage: str, evaluated_at: str
+) -> tuple[str | None, str | None]:
+    artefact_hash = payload.get("artefact_hash")
+    if artefact_hash is not None:
+        artefact_hash = _request_identity({"artefact_hash": artefact_hash}, "artefact_hash")
+    artefact_created_at = payload.get("artefact_created_at")
+    if artefact_created_at is not None:
+        artefact_created_at = timestamp(str(artefact_created_at), field="artefact_created_at")
+    if stage == "forward":
+        if artefact_hash is None or artefact_created_at is None:
+            raise EvaluationContractError(
+                "forward evaluations require the exact artefact hash and creation time"
+            )
+        if artefact_created_at >= evaluated_at:
+            raise EvaluationContractError("forward artefact creation must precede evaluation time")
+    return artefact_hash, artefact_created_at
 
 
 @dataclass(frozen=True)
