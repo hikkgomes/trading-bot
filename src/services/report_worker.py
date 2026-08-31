@@ -105,7 +105,7 @@ class DatabaseReportWorker:
         return result
 
     def _disk_status(self) -> dict[str, Any]:
-        path = self.root if self.root.exists() else self.root.parent
+        path = self.root.parent
         try:
             usage = shutil.disk_usage(path)
         except OSError as exc:
@@ -117,8 +117,8 @@ class DatabaseReportWorker:
         return {
             "healthy": usage.free >= self.minimum_free_bytes,
             "path": str(path),
-            "free_bytes": usage.free,
-            "total_bytes": usage.total,
+            "free_bytes": usage.free // (1024 * 1024) * (1024 * 1024),
+            "total_bytes": usage.total // (1024 * 1024) * (1024 * 1024),
             "minimum_free_bytes": self.minimum_free_bytes,
         }
 
