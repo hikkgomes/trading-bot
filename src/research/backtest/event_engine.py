@@ -123,6 +123,15 @@ class EventSimulationResult:
     metrics: Mapping[str, float] = field(default_factory=dict)
 
 
+@dataclass
+class _OrderSimulationState:
+    remaining: float
+    queue_ahead: float
+    fills: list[SimulatedEventFill] = field(default_factory=list)
+    status: SimulatedOrderStatus = SimulatedOrderStatus.OPEN
+    reason: str = "no_executable_event"
+
+
 class EventReplayEngine:
     def __init__(
         self,
@@ -196,98 +205,117 @@ class EventReplayEngine:
         order: SimulatedLimitOrder,
         events: tuple[ReplayEvent, ...],
     ) -> SimulatedOrderResult:
-        remaining = order.quantity
-        queue_ahead = order.queue_ahead_quantity
-        fills: list[SimulatedEventFill] = []
-        status = SimulatedOrderStatus.OPEN
-        reason = "no_executable_event"
+        state = _OrderSimulationState(order.quantity, order.queue_ahead_quantity)
         for index, event in enumerate(events):
+            if self._order_event_stops(order, event, state):
+                break
             if (
                 event.instrument_id != order.instrument_id
                 or event.receive_time < order.submitted_at
             ):
                 continue
-            if event.receive_time >= order.expires_at:
-                status = SimulatedOrderStatus.EXPIRED
-                reason = "order_expired"
-                break
-            if order.cancel_requested_at is not None:
-                cancel_effective = _plus_seconds(
-                    order.cancel_requested_at, self.cancel_latency_seconds
-                )
-                if event.receive_time >= cancel_effective:
-                    status = SimulatedOrderStatus.CANCELLED
-                    reason = "cancel_effective"
-                    break
             if not event.connected:
-                reason = "connection_gap"
                 continue
-            traded = (
-                event.traded_at_bid if order.side is SimulatedOrderSide.BUY else event.traded_at_ask
-            )
-            touches = (
-                event.best_ask is not None and order.limit_price >= event.best_ask
-                if order.side is SimulatedOrderSide.BUY
-                else event.best_bid is not None and order.limit_price <= event.best_bid
-            )
-            if not touches and traded <= queue_ahead:
-                queue_ahead = max(0.0, queue_ahead - traded)
-                continue
-            executable = traded - queue_ahead if traded > queue_ahead else 0.0
-            queue_ahead = max(0.0, queue_ahead - traded)
-            if touches:
-                visible_depth = (
-                    event.ask_depth if order.side is SimulatedOrderSide.BUY else event.bid_depth
-                )
-                executable = max(executable, visible_depth)
-            quantity = min(remaining, max(0.0, executable))
-            if quantity <= 0:
-                continue
-            if event.best_ask is None or event.best_bid is None:
-                raise ValueError("trade event has no executable top of book")
-            touch_price = (
-                float(event.best_ask)
-                if order.side is SimulatedOrderSide.BUY
-                else float(event.best_bid)
-            )
-            depth = max(
-                event.ask_depth if order.side is SimulatedOrderSide.BUY else event.bid_depth,
-                quantity,
-            )
-            impact_fraction = quantity / depth * self.impact_bps_per_depth_fraction / 10_000
-            sign = 1.0 if order.side is SimulatedOrderSide.BUY else -1.0
-            price = (
-                min(order.limit_price, touch_price * (1 + impact_fraction))
-                if sign > 0
-                else max(order.limit_price, touch_price * (1 - impact_fraction))
-            )
-            mid = (
-                (event.best_bid + event.best_ask) / 2
-                if event.best_bid is not None and event.best_ask is not None
-                else touch_price
-            )
-            future_mark = self._future_mark(events, index, order.instrument_id, fallback=mid)
-            fills.append(
-                SimulatedEventFill(
-                    order_id=order.order_id,
-                    instrument_id=order.instrument_id,
-                    quantity=quantity,
-                    price=price,
-                    occurred_at=event.receive_time,
-                    spread_cost=abs(price - mid) * quantity,
-                    market_impact=abs(price - touch_price) * quantity,
-                    adverse_selection=sign * (future_mark - price) * quantity,
-                )
-            )
-            remaining -= quantity
-            if remaining <= 1e-12:
-                status = SimulatedOrderStatus.FILLED
-                reason = "fully_filled"
-                remaining = 0.0
+            if self._simulate_fill_event(order, event, index, events, state):
                 break
-            status = SimulatedOrderStatus.PARTIAL
-            reason = "partial_fill"
-        return SimulatedOrderResult(order, status, tuple(fills), remaining, reason)
+        return SimulatedOrderResult(
+            order, state.status, tuple(state.fills), state.remaining, state.reason
+        )
+
+    def _order_event_stops(
+        self,
+        order: SimulatedLimitOrder,
+        event: ReplayEvent,
+        state: _OrderSimulationState,
+    ) -> bool:
+        if event.instrument_id != order.instrument_id or event.receive_time < order.submitted_at:
+            return False
+        if event.receive_time >= order.expires_at:
+            state.status = SimulatedOrderStatus.EXPIRED
+            state.reason = "order_expired"
+            return True
+        if order.cancel_requested_at is not None:
+            cancel_effective = _plus_seconds(order.cancel_requested_at, self.cancel_latency_seconds)
+            if event.receive_time >= cancel_effective:
+                state.status = SimulatedOrderStatus.CANCELLED
+                state.reason = "cancel_effective"
+                return True
+        if not event.connected:
+            state.reason = "connection_gap"
+        return False
+
+    def _simulate_fill_event(
+        self,
+        order: SimulatedLimitOrder,
+        event: ReplayEvent,
+        index: int,
+        events: tuple[ReplayEvent, ...],
+        state: _OrderSimulationState,
+    ) -> bool:
+        traded = (
+            event.traded_at_bid if order.side is SimulatedOrderSide.BUY else event.traded_at_ask
+        )
+        touches = (
+            event.best_ask is not None and order.limit_price >= event.best_ask
+            if order.side is SimulatedOrderSide.BUY
+            else event.best_bid is not None and order.limit_price <= event.best_bid
+        )
+        if not touches and traded <= state.queue_ahead:
+            state.queue_ahead = max(0.0, state.queue_ahead - traded)
+            return False
+        executable = traded - state.queue_ahead if traded > state.queue_ahead else 0.0
+        state.queue_ahead = max(0.0, state.queue_ahead - traded)
+        if touches:
+            visible_depth = (
+                event.ask_depth if order.side is SimulatedOrderSide.BUY else event.bid_depth
+            )
+            executable = max(executable, visible_depth)
+        quantity = min(state.remaining, max(0.0, executable))
+        if quantity <= 0:
+            return False
+        if event.best_ask is None or event.best_bid is None:
+            raise ValueError("trade event has no executable top of book")
+        touch_price = (
+            float(event.best_ask) if order.side is SimulatedOrderSide.BUY else float(event.best_bid)
+        )
+        depth = max(
+            event.ask_depth if order.side is SimulatedOrderSide.BUY else event.bid_depth,
+            quantity,
+        )
+        impact_fraction = quantity / depth * self.impact_bps_per_depth_fraction / 10_000
+        sign = 1.0 if order.side is SimulatedOrderSide.BUY else -1.0
+        price = (
+            min(order.limit_price, touch_price * (1 + impact_fraction))
+            if sign > 0
+            else max(order.limit_price, touch_price * (1 - impact_fraction))
+        )
+        mid = (
+            (event.best_bid + event.best_ask) / 2
+            if event.best_bid is not None and event.best_ask is not None
+            else touch_price
+        )
+        future_mark = self._future_mark(events, index, order.instrument_id, fallback=mid)
+        state.fills.append(
+            SimulatedEventFill(
+                order_id=order.order_id,
+                instrument_id=order.instrument_id,
+                quantity=quantity,
+                price=price,
+                occurred_at=event.receive_time,
+                spread_cost=abs(price - mid) * quantity,
+                market_impact=abs(price - touch_price) * quantity,
+                adverse_selection=sign * (future_mark - price) * quantity,
+            )
+        )
+        state.remaining -= quantity
+        if state.remaining <= 1e-12:
+            state.status = SimulatedOrderStatus.FILLED
+            state.reason = "fully_filled"
+            state.remaining = 0.0
+            return True
+        state.status = SimulatedOrderStatus.PARTIAL
+        state.reason = "partial_fill"
+        return False
 
     def _future_mark(
         self,
