@@ -66,19 +66,9 @@ class PaperBroker(Broker):
         return ref * (1 + slip) if side == OrderSide.BUY else ref * (1 - slip)
 
     def place_order(self, order: Order) -> Fill:
-        if not math.isfinite(float(order.qty)) or order.qty <= 0:
-            raise ValueError("Order qty must be positive.")
-        if order.type == OrderType.LIMIT:
-            if order.price is None:
-                raise ValueError("Limit order price is required.")
-            ref = float(order.price)
-        else:
-            ref = self.get_price(order.symbol)
-        if not math.isfinite(ref) or ref <= 0:
-            raise ValueError(f"Order price must be finite and positive, got {ref:g}.")
-        fill_price = self._fill_price(order.side, ref)
-        if not math.isfinite(fill_price) or fill_price <= 0:
-            raise ValueError(f"Fill price must be finite and positive, got {fill_price:g}.")
+        self._validate_quantity(order)
+        ref = self._reference_price(order)
+        fill_price = self._validated_fill_price(order.side, ref)
         if self._enforces_reduce_only() and order.reduce_only:
             self._assert_reduce_only_order(order)
         fee = fill_price * order.qty * (self.fee_bps / 10_000.0)
@@ -89,21 +79,8 @@ class PaperBroker(Broker):
         new_qty = pos.qty + signed
 
         # Realise PnL on the portion that reduces/closes the existing position.
-        if pos.qty != 0 and (pos.qty > 0) != (signed > 0):
-            closing = min(abs(signed), abs(pos.qty))
-            direction = 1 if pos.qty > 0 else -1
-            self._balance += direction * closing * (fill_price - pos.avg_price)
-
-        if new_qty == 0:
-            avg = 0.0
-        elif (pos.qty >= 0) == (new_qty >= 0) and abs(new_qty) > abs(pos.qty):
-            # Adding to the position -> weighted-average entry.
-            avg = (pos.avg_price * abs(pos.qty) + fill_price * order.qty) / abs(new_qty)
-        elif (pos.qty > 0) != (new_qty > 0) and new_qty != 0:
-            # Flipped through zero -> new entry at fill price.
-            avg = fill_price
-        else:
-            avg = pos.avg_price  # reduced but same side
+        self._realise_pnl(pos, signed, fill_price)
+        avg = self._average_entry(pos, new_qty, fill_price, order.qty)
 
         self._positions[order.symbol] = Position(symbol=order.symbol, qty=new_qty, avg_price=avg)
         fill = Fill(
@@ -117,6 +94,49 @@ class PaperBroker(Broker):
         )
         self.fills.append(fill)
         return fill
+
+    @staticmethod
+    def _validate_quantity(order: Order) -> None:
+        if not math.isfinite(float(order.qty)) or order.qty <= 0:
+            raise ValueError("Order qty must be positive.")
+
+    def _reference_price(self, order: Order) -> float:
+        if order.type == OrderType.LIMIT:
+            if order.price is None:
+                raise ValueError("Limit order price is required.")
+            reference = float(order.price)
+        else:
+            reference = self.get_price(order.symbol)
+        if not math.isfinite(reference) or reference <= 0:
+            raise ValueError(f"Order price must be finite and positive, got {reference:g}.")
+        return reference
+
+    def _validated_fill_price(self, side: OrderSide, reference: float) -> float:
+        fill_price = self._fill_price(side, reference)
+        if not math.isfinite(fill_price) or fill_price <= 0:
+            raise ValueError(f"Fill price must be finite and positive, got {fill_price:g}.")
+        return fill_price
+
+    def _realise_pnl(self, position: Position, signed: float, fill_price: float) -> None:
+        if position.qty == 0 or (position.qty > 0) == (signed > 0):
+            return
+        closing = min(abs(signed), abs(position.qty))
+        direction = 1 if position.qty > 0 else -1
+        self._balance += direction * closing * (fill_price - position.avg_price)
+
+    @staticmethod
+    def _average_entry(
+        position: Position, new_quantity: float, fill_price: float, order_quantity: float
+    ) -> float:
+        if new_quantity == 0:
+            return 0.0
+        if (position.qty >= 0) == (new_quantity >= 0) and abs(new_quantity) > abs(position.qty):
+            return (position.avg_price * abs(position.qty) + fill_price * order_quantity) / abs(
+                new_quantity
+            )
+        if (position.qty > 0) != (new_quantity > 0):
+            return fill_price
+        return position.avg_price
 
     def _enforces_reduce_only(self) -> bool:
         return getattr(getattr(self, "config", None), "market_type", "futures") == "futures"

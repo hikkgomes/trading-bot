@@ -246,6 +246,39 @@ def _fill_from_dict(payload: object) -> Fill:
     return Fill(**values)
 
 
+def _validate_replay_event(
+    previous: OrderIntent | None,
+    event_type: object,
+    intent: OrderIntent,
+    line_number: int,
+) -> None:
+    if previous is None:
+        _validate_replay_start(event_type, intent, line_number)
+        return
+    if event_type == "fill":
+        if intent != previous:
+            raise ValueError(f"fill event snapshot differs from order state at line {line_number}")
+        return
+    if event_type == "client_id_bound":
+        if intent.status is not previous.status:
+            raise ValueError(f"client binding changed order status at line {line_number}")
+        return
+    if intent.status not in _ALLOWED_TRANSITIONS[previous.status]:
+        raise ValueError(
+            f"invalid replayed order transition {previous.status.value}->{intent.status.value} "
+            f"at line {line_number}"
+        )
+    if event_type != intent.status.value:
+        raise ValueError(f"order journal event type mismatch at line {line_number}")
+
+
+def _validate_replay_start(event_type: object, intent: OrderIntent, line_number: int) -> None:
+    if event_type != "created" or intent.status is not OrderStatus.CREATED:
+        raise ValueError(
+            f"order journal starts {intent.order_id} without a created event at line {line_number}"
+        )
+
+
 class OrderManager:
     """Own order state and persist every transition before side effects."""
 
@@ -269,38 +302,28 @@ class OrderManager:
             event_type = event.get("event_type")
             intent = _intent_from_dict(event.get("intent"))
             previous = self._orders.get(intent.order_id)
-            if previous is None:
-                if event_type != "created" or intent.status is not OrderStatus.CREATED:
-                    raise ValueError(
-                        f"order journal starts {intent.order_id} without a created event "
-                        f"at line {line_number}"
-                    )
-            elif event_type == "fill":
-                if intent != previous:
-                    raise ValueError(
-                        f"fill event snapshot differs from order state at line {line_number}"
-                    )
-            elif event_type == "client_id_bound":
-                if intent.status is not previous.status:
-                    raise ValueError(f"client binding changed order status at line {line_number}")
-            else:
-                if intent.status not in _ALLOWED_TRANSITIONS[previous.status]:
-                    raise ValueError(
-                        f"invalid replayed order transition {previous.status.value}->"
-                        f"{intent.status.value} at line {line_number}"
-                    )
-                if event_type != intent.status.value:
-                    raise ValueError(f"order journal event type mismatch at line {line_number}")
+            _validate_replay_event(previous, event_type, intent, line_number)
             self._orders[intent.order_id] = intent
             if event_type == "fill":
-                fill = _fill_from_dict(event.get("fill"))
-                if fill.order_id != intent.order_id:
-                    raise ValueError(f"fill order identity mismatch at line {line_number}")
-                if fill.fill_id in seen_fills:
-                    raise ValueError(f"duplicate fill identity at line {line_number}")
-                seen_fills.add(fill.fill_id)
-                self._fills.setdefault(fill.order_id, []).append(fill)
-                self._fill_sequence.append(fill)
+                self._record_replay_fill(
+                    event.get("fill"), intent.order_id, seen_fills, line_number
+                )
+
+    def _record_replay_fill(
+        self,
+        payload: object,
+        order_id: str,
+        seen_fills: set[str],
+        line_number: int,
+    ) -> None:
+        fill = _fill_from_dict(payload)
+        if fill.order_id != order_id:
+            raise ValueError(f"fill order identity mismatch at line {line_number}")
+        if fill.fill_id in seen_fills:
+            raise ValueError(f"duplicate fill identity at line {line_number}")
+        seen_fills.add(fill.fill_id)
+        self._fills.setdefault(fill.order_id, []).append(fill)
+        self._fill_sequence.append(fill)
 
     def get(self, order_id: str) -> OrderIntent:
         return self._orders[order_id]
