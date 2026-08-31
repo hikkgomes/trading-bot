@@ -1828,21 +1828,10 @@ class SqlActiveStrategyAssignmentRepository:
                     raise CanonicalEvidenceError(
                         "live assignment cannot predate existing live authority"
                     )
-                latest: dict[tuple[str, ...], Mapping[str, Any]] = {}
-                for row in rows:
-                    key = (
-                        str(row["product_id"]),
-                        str(row["portfolio_id"]),
-                        str(row["sleeve_id"]),
-                        str(row["strategy_version_id"]),
-                        str(row["assignment_scope_id"]),
-                        str(row["execution_mode"]),
-                    )
-                    latest[key] = row
                 if any(
                     row["active"]
                     and (row["active_until"] is None or row["active_until"] > assigned_at)
-                    for row in latest.values()
+                    for row in self._current_assignment_rows(rows)
                 ):
                     raise CanonicalEvidenceError(
                         f"product {product_id} already has an active live assignment"
@@ -1885,10 +1874,6 @@ class SqlActiveStrategyAssignmentRepository:
                 .where(
                     active_strategy_assignment.c.product_id == product_id,
                 )
-                .order_by(
-                    active_strategy_assignment.c.assigned_at,
-                    active_strategy_assignment.c.id,
-                )
             )
             if at is not None:
                 at = timestamp(at, field="assignment timestamp")
@@ -1896,9 +1881,39 @@ class SqlActiveStrategyAssignmentRepository:
                     active_strategy_assignment.c.assigned_at <= at,
                 )
             rows = connection.execute(statement).mappings().all()
-        latest: dict[tuple[str, ...], dict[str, Any]] = {}
-        for raw in rows:
-            row = dict(raw)
+        return tuple(
+            row
+            for row in self._current_assignment_rows(rows)
+            if row["active"]
+            and (at is None or row["active_until"] is None or row["active_until"] > at)
+        )
+
+    @staticmethod
+    def _current_assignment_rows(rows: list[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
+        """Resolve immutable assignment events into the current active events."""
+
+        materialised = [dict(row) for row in rows]
+        superseded = {
+            str(payload["supersedes_assignment_id"])
+            for row in materialised
+            if not row["active"]
+            and isinstance(row.get("payload"), Mapping)
+            and (payload := row["payload"]).get("supersedes_assignment_id")
+        }
+        current: dict[tuple[str, ...], dict[str, Any]] = {}
+        lifecycle_rank = {
+            "registered": 0,
+            "development": 1,
+            "forward_paper": 2,
+            "live_ready": 3,
+            "live_canary": 4,
+            "live": 5,
+            "suspended": 6,
+            "retired": 7,
+        }
+        for row in materialised:
+            if not row["active"] or str(row["id"]) in superseded:
+                continue
             key = (
                 str(row["product_id"]),
                 str(row["portfolio_id"]),
@@ -1907,26 +1922,53 @@ class SqlActiveStrategyAssignmentRepository:
                 str(row["assignment_scope_id"]),
                 str(row["execution_mode"]),
             )
-            latest[key] = row
-        return tuple(
-            row
-            for _, row in sorted(latest.items())
-            if row["active"]
-            and (at is None or row["active_until"] is None or row["active_until"] > at)
-        )
+            previous = current.get(key)
+            if previous is None or (
+                str(row["assigned_at"]),
+                lifecycle_rank.get(str(row["lifecycle_state"]), -1),
+                str(row["id"]),
+            ) > (
+                str(previous["assigned_at"]),
+                lifecycle_rank.get(str(previous["lifecycle_state"]), -1),
+                str(previous["id"]),
+            ):
+                current[key] = row
+        return tuple(current.values())
 
-    def deactivate(self, product_id: str) -> None:
+    def deactivate(
+        self,
+        product_id: str,
+        *,
+        at: str | None = None,
+        assignment_reason: str = "deactivated",
+    ) -> None:
         """Remove execution authority while retaining the assignment history."""
-        active = self.active_assignments(product_id)
-        deactivated_at = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+        deactivated_at = (
+            timestamp(at, field="deactivation timestamp")
+            if at is not None
+            else dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+        )
+        active = self.active_assignments(product_id, at=deactivated_at)
         with self.engine.begin() as connection:
             for row in active:
+                existing_payload = (
+                    dict(row["payload"]) if isinstance(row.get("payload"), Mapping) else {}
+                )
+                existing_payload.update(
+                    {
+                        "supersedes_assignment_id": str(row["id"]),
+                        "deactivation_timestamp": deactivated_at,
+                    }
+                )
                 event = {
                     **{key: value for key, value in row.items() if key != "id"},
                     "active": False,
                     "assigned_at": deactivated_at,
                     "active_until": deactivated_at,
-                    "assignment_reason": "deactivated",
+                    "assignment_reason": non_empty(
+                        assignment_reason, field="assignment_reason"
+                    ),
+                    "payload": existing_payload,
                 }
                 identity = _hash(event, field="assignment deactivation")
                 _immutable_insert(

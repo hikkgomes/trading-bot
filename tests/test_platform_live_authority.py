@@ -267,6 +267,55 @@ def test_manual_authority_records_exact_preflight_approval_and_live_assignment(
         database.dispose()
 
 
+def test_live_assignment_replacement_is_ordered_and_single_authority(
+    tmp_path: Path, monkeypatch
+) -> None:
+    database, authority, selection = _fixture(tmp_path, monkeypatch)
+    try:
+        preflight, approval = _preflight_and_approve(authority, selection)
+        authority.assign(
+            **selection,
+            expected_preflight_id=preflight["preflight_id"],
+            expected_approval_id=approval["approval_id"],
+            capital_limit=0.01,
+            risk_budget=0.01,
+            assigned_by="henrique",
+            assigned_at=ASSIGNED_AT,
+            confirm=True,
+        )
+        authority.assignments.deactivate("active_income", at=ASSIGNED_AT)
+        artefact = authority.artefacts.get(selection["artefact_hash"])
+        replacement_id = authority.assignments.assign(
+            product_id="active_income",
+            portfolio_id=str(artefact["portfolio_id"]),
+            sleeve_id=selection["sleeve_id"],
+            strategy_version_id=str(artefact["strategy_version_id"]),
+            instrument_id=selection["instrument_id"],
+            artefact_hash=selection["artefact_hash"],
+            lifecycle_state="live",
+            execution_mode="live",
+            capital_limit=0.01,
+            risk_budget=0.01,
+            assigned_at=ASSIGNED_AT,
+            assigned_by="henrique",
+            assignment_reason="promotion transition to live",
+            payload={
+                "approval_id": approval["approval_id"],
+                "preflight_id": preflight["preflight_id"],
+            },
+        )
+
+        active = authority.assignments.active(
+            "active_income", execution_mode="live", at=ASSIGNED_AT
+        )
+        assert active is not None
+        assert active["id"] == replacement_id
+        assert active["lifecycle_state"] == "live"
+        assert len(authority.assignments.active_assignments("active_income", at=ASSIGNED_AT)) == 1
+    finally:
+        database.dispose()
+
+
 def test_manual_authority_requires_confirmation_and_human_actor(
     tmp_path: Path, monkeypatch
 ) -> None:

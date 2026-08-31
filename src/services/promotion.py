@@ -1170,13 +1170,34 @@ class DatabasePromotionWorker:
             identity = self.store.append(decision)
             if self.strict_identity_contract:
                 assignments = SqlActiveStrategyAssignmentRepository(self.store.engine)
-                if decision.accepted and decision.next_state in {
+                assignable_states = {
                     LifecycleState.FORWARD_PAPER,
                     LifecycleState.LIVE_READY,
-                }:
+                    LifecycleState.LIVE_CANARY,
+                    LifecycleState.LIVE,
+                }
+                if decision.accepted and decision.next_state in assignable_states:
                     if not evidence.product_id or not evidence.portfolio_id:
                         raise ValueError(
                             "accepted promotion evidence lacks product/portfolio identity"
+                        )
+                    execution_mode = (
+                        "live"
+                        if decision.next_state in {
+                            LifecycleState.LIVE_CANARY,
+                            LifecycleState.LIVE,
+                        }
+                        else "paper"
+                    )
+                    if execution_mode == "live" and not evidence.supported_instruments:
+                        raise ValueError(
+                            "live promotion evidence lacks exact supported instruments"
+                        )
+                    if execution_mode == "live" and current_state is LifecycleState.LIVE_CANARY:
+                        assignments.deactivate(
+                            evidence.product_id,
+                            at=decision.evaluated_at,
+                            assignment_reason="promotion transition to live",
                         )
                     instrument_ids = evidence.supported_instruments or (None,)
                     for instrument_id in instrument_ids:
@@ -1186,7 +1207,7 @@ class DatabasePromotionWorker:
                             strategy_version_id=decision.strategy_version_id,
                             artefact_hash=evidence.strategy_artefact_hash,
                             lifecycle_state=decision.next_state.value,
-                            execution_mode="paper",
+                            execution_mode=execution_mode,
                             capital_limit=decision.capital_limit,
                             assigned_at=decision.evaluated_at,
                             assigned_by=self.worker_id,
@@ -1194,6 +1215,9 @@ class DatabasePromotionWorker:
                             risk_budget=min(
                                 decision.capital_limit,
                                 evidence.risk_budget_available,
+                            ),
+                            assignment_reason=(
+                                f"canonical promotion: {decision.reason_code}"
                             ),
                             payload={
                                 "promotion_event_id": identity,
