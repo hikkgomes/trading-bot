@@ -206,126 +206,16 @@ def build_payload(
     min_holdout_return: float | None = 0.0,
     prefer_clustered: bool = True,
 ) -> dict:
-    try:
-        top_k_value = float(top_k)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("top_k must be a positive integer.") from exc
-    if not math.isfinite(top_k_value) or top_k_value != int(top_k_value) or top_k_value <= 0:
-        raise ValueError("top_k must be a positive integer.")
-    top_k = int(top_k_value)
-    if min_dsr is not None and not math.isfinite(float(min_dsr)):
-        raise ValueError("min_dsr must be finite.")
-    if min_holdout_return is not None and not math.isfinite(float(min_holdout_return)):
-        raise ValueError("min_holdout_return must be finite.")
-
-    config_path = search_dir / "config.json"
-    ranked_path = _ranked_path(search_dir, prefer_clustered=prefer_clustered)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Missing {config_path}")
-    if not ranked_path.exists():
-        raise FileNotFoundError(f"Missing {ranked_path}")
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    ranked = pd.read_csv(ranked_path)
-    if ranked.empty:
-        raise ValueError(
-            f"{ranked_path} contains no strategies — nothing passed the search filters."
-        )
-    if "passes_filters" in ranked.columns:
-        ranked = ranked[ranked["passes_filters"].astype(bool)]
-    if not ranked.empty:
-        if "wf_expectancy" in ranked.columns and ranked["wf_expectancy"].notna().any():
-            expectancy_column = "wf_expectancy"
-        elif "test_avg_net_return" in ranked.columns:
-            expectancy_column = "test_avg_net_return"
-        else:
-            expectancy_column = None
-        if expectancy_column is not None:
-            ranked = ranked[ranked[expectancy_column] > 0]
-    if min_dsr is not None and not ranked.empty and "dsr" in ranked.columns:
-        ranked = ranked[ranked["dsr"] >= min_dsr]
-    if min_holdout_return is not None and not ranked.empty:
-        # The holdout GATES admission. A strategy that lost on its own untouched
-        # holdout must never ship (the old report-only behaviour was the
-        # documented flaw that put losing strategies in front of the bots).
-        if "holdout_total_return" not in ranked.columns:
-            raise ValueError(
-                f"{ranked_path} has no holdout_total_return column — rerun the search "
-                "with --holdout-fraction, or explicitly disable the gate with "
-                "--no-holdout-gate if you accept exporting unvalidated strategies."
-            )
-        ranked = ranked[
-            ranked["holdout_total_return"].notna()
-            & (ranked["holdout_total_return"] > min_holdout_return)
-        ]
-    if ranked.empty:
-        raise ValueError(
-            f"No exportable strategies in {ranked_path}: all rows fail the "
-            "passes_filters / positive-expectancy / min-dsr / positive-holdout gates."
-        )
-    if "conditions_json" not in ranked.columns:
-        raise ValueError(f"{ranked_path} is missing conditions_json — cannot reconstruct rules.")
-
-    base_timeframe = _normalize_non_empty_string(
-        config.get("base_timeframe"), field="base_timeframe", default="15m"
+    top_k = _validate_export_arguments(top_k, min_dsr, min_holdout_return)
+    config, ranked_path, ranked = _load_export_data(
+        search_dir,
+        min_dsr=min_dsr,
+        min_holdout_return=min_holdout_return,
+        prefer_clustered=prefer_clustered,
     )
-    pnl_unit = _normalize_pnl_unit(config.get("pnl_unit"))
-    market = _normalize_market(config.get("market"), pnl_unit=pnl_unit)
-    symbol = _normalize_non_empty_string(config.get("symbol"), field="symbol", default="BTCUSDT")
-    default_risk = _default_risk(pnl_unit)
-    risk = _normalize_risk(config, default_risk)
-    fees = _normalize_fees(config)
-    strategies = []
-    for rank, (_, row) in enumerate(ranked.head(top_k).iterrows(), start=1):
-        direction = _normalize_non_empty_string(row.get("direction"), field="direction")
-        if direction not in {"long", "short"}:
-            raise ValueError(f"direction must be 'long' or 'short', got {direction!r}.")
-        rule = _normalize_non_empty_string(row.get("rule"), field="rule")
-        horizon_bars = _positive_row_int(row, "horizon_bars")
-        take_profit = _positive_row_float(row, "take_profit")
-        stop_loss = _positive_row_float(row, "stop_loss")
-        conditions = json.loads(row["conditions_json"])
-        if not isinstance(conditions, list) or not conditions:
-            raise ValueError("conditions_json must decode to a non-empty list.")
-        metrics = {
-            name: _row_metric(row, name)
-            for name in (
-                "dsr",
-                "wf_pass_rate",
-                "wf_expectancy",
-                "wf_avg_trades",
-                "test_total_return",
-                "test_avg_net_return",
-                "test_win_rate",
-                "holdout_total_return",
-                "holdout_win_rate",
-                "pool_pbo",
-            )
-        }
-        exported_metrics = _with_benchmark_metrics(
-            {name: value for name, value in metrics.items() if value is not None},
-            pnl_unit,
-        )
-        strategies.append(
-            {
-                "id": f"{base_timeframe}_{direction}_r{rank}",
-                "rank": rank,
-                "market": market,
-                "symbol": symbol,
-                "base_timeframe": base_timeframe,
-                "direction": direction,
-                "horizon_bars": horizon_bars,
-                "take_profit": take_profit,
-                "stop_loss": stop_loss,
-                "use_atr_tp_sl": bool(config.get("use_atr_tp_sl", False)),
-                "pnl_unit": pnl_unit,
-                "conditions": conditions,
-                "rule": rule,
-                "risk": risk,
-                "fees": fees,
-                "metrics": exported_metrics,
-                "baseline_win_rate": _baseline_win_rate(row),
-            }
-        )
+    settings = _export_settings(config)
+    strategies = _build_exported_strategies(ranked.head(top_k), config=config, settings=settings)
+    base_timeframe, pnl_unit, market, symbol, risk, fees = settings
     return {
         "version": SCHEMA_VERSION,
         "generated_at": datetime.datetime.now(datetime.UTC).isoformat(),
@@ -342,6 +232,165 @@ def build_payload(
         "promotion_eligible": True,
         "strategies": strategies,
     }
+
+
+def _validate_export_arguments(
+    top_k: int, min_dsr: float | None, min_holdout_return: float | None
+) -> int:
+    try:
+        top_k_value = float(top_k)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("top_k must be a positive integer.") from exc
+    if not math.isfinite(top_k_value) or top_k_value != int(top_k_value) or top_k_value <= 0:
+        raise ValueError("top_k must be a positive integer.")
+    if min_dsr is not None and not math.isfinite(float(min_dsr)):
+        raise ValueError("min_dsr must be finite.")
+    if min_holdout_return is not None and not math.isfinite(float(min_holdout_return)):
+        raise ValueError("min_holdout_return must be finite.")
+    return int(top_k_value)
+
+
+def _load_export_data(
+    search_dir: Path,
+    *,
+    min_dsr: float | None,
+    min_holdout_return: float | None,
+    prefer_clustered: bool,
+) -> tuple[dict, Path, pd.DataFrame]:
+    config_path = search_dir / "config.json"
+    ranked_path = _ranked_path(search_dir, prefer_clustered=prefer_clustered)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Missing {config_path}")
+    if not ranked_path.exists():
+        raise FileNotFoundError(f"Missing {ranked_path}")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    ranked = pd.read_csv(ranked_path)
+    if ranked.empty:
+        raise ValueError(
+            f"{ranked_path} contains no strategies — nothing passed the search filters."
+        )
+    ranked = _filter_export_rows(
+        ranked,
+        ranked_path=ranked_path,
+        min_dsr=min_dsr,
+        min_holdout_return=min_holdout_return,
+    )
+    if ranked.empty:
+        raise ValueError(
+            f"No exportable strategies in {ranked_path}: all rows fail the "
+            "passes_filters / positive-expectancy / min-dsr / positive-holdout gates."
+        )
+    if "conditions_json" not in ranked.columns:
+        raise ValueError(f"{ranked_path} is missing conditions_json — cannot reconstruct rules.")
+    return config, ranked_path, ranked
+
+
+def _filter_export_rows(
+    ranked: pd.DataFrame,
+    *,
+    ranked_path: Path,
+    min_dsr: float | None,
+    min_holdout_return: float | None,
+) -> pd.DataFrame:
+    if "passes_filters" in ranked.columns:
+        ranked = ranked[ranked["passes_filters"].astype(bool)]
+    if not ranked.empty:
+        expectancy_column = (
+            "wf_expectancy"
+            if "wf_expectancy" in ranked.columns and ranked["wf_expectancy"].notna().any()
+            else "test_avg_net_return"
+            if "test_avg_net_return" in ranked.columns
+            else None
+        )
+        if expectancy_column is not None:
+            ranked = ranked[ranked[expectancy_column] > 0]
+    if min_dsr is not None and not ranked.empty and "dsr" in ranked.columns:
+        ranked = ranked[ranked["dsr"] >= min_dsr]
+    if min_holdout_return is not None and not ranked.empty:
+        if "holdout_total_return" not in ranked.columns:
+            raise ValueError(
+                f"{ranked_path} has no holdout_total_return column — rerun the search "
+                "with --holdout-fraction, or explicitly disable the gate with "
+                "--no-holdout-gate if you accept exporting unvalidated strategies."
+            )
+        ranked = ranked[
+            ranked["holdout_total_return"].notna()
+            & (ranked["holdout_total_return"] > min_holdout_return)
+        ]
+    return ranked
+
+
+def _export_settings(config: dict) -> tuple[str, str, str, str, dict, dict]:
+    base_timeframe = _normalize_non_empty_string(
+        config.get("base_timeframe"), field="base_timeframe", default="15m"
+    )
+    pnl_unit = _normalize_pnl_unit(config.get("pnl_unit"))
+    market = _normalize_market(config.get("market"), pnl_unit=pnl_unit)
+    symbol = _normalize_non_empty_string(config.get("symbol"), field="symbol", default="BTCUSDT")
+    return (
+        base_timeframe,
+        pnl_unit,
+        market,
+        symbol,
+        _normalize_risk(config, _default_risk(pnl_unit)),
+        _normalize_fees(config),
+    )
+
+
+def _build_exported_strategies(
+    ranked: pd.DataFrame,
+    *,
+    config: dict,
+    settings: tuple[str, str, str, str, dict, dict],
+) -> list[dict]:
+    base_timeframe, pnl_unit, market, symbol, risk, fees = settings
+    strategies = []
+    for rank, (_, row) in enumerate(ranked.iterrows(), start=1):
+        direction = _normalize_non_empty_string(row.get("direction"), field="direction")
+        if direction not in {"long", "short"}:
+            raise ValueError(f"direction must be 'long' or 'short', got {direction!r}.")
+        conditions = json.loads(row["conditions_json"])
+        if not isinstance(conditions, list) or not conditions:
+            raise ValueError("conditions_json must decode to a non-empty list.")
+        metric_names = (
+            "dsr",
+            "wf_pass_rate",
+            "wf_expectancy",
+            "wf_avg_trades",
+            "test_total_return",
+            "test_avg_net_return",
+            "test_win_rate",
+            "holdout_total_return",
+            "holdout_win_rate",
+            "pool_pbo",
+        )
+        metrics = {
+            name: _row_metric(row, name)
+            for name in metric_names
+            if _row_metric(row, name) is not None
+        }
+        strategies.append(
+            {
+                "id": f"{base_timeframe}_{direction}_r{rank}",
+                "rank": rank,
+                "market": market,
+                "symbol": symbol,
+                "base_timeframe": base_timeframe,
+                "direction": direction,
+                "horizon_bars": _positive_row_int(row, "horizon_bars"),
+                "take_profit": _positive_row_float(row, "take_profit"),
+                "stop_loss": _positive_row_float(row, "stop_loss"),
+                "use_atr_tp_sl": bool(config.get("use_atr_tp_sl", False)),
+                "pnl_unit": pnl_unit,
+                "conditions": conditions,
+                "rule": _normalize_non_empty_string(row.get("rule"), field="rule"),
+                "risk": risk,
+                "fees": fees,
+                "metrics": _with_benchmark_metrics(metrics, pnl_unit),
+                "baseline_win_rate": _baseline_win_rate(row),
+            }
+        )
+    return strategies
 
 
 def run(
