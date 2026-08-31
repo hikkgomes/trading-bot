@@ -284,6 +284,61 @@ REQUIRED_NEGATIVE_CONTROLS = (
     "cross_instrument",
 )
 
+FAMILY_NEGATIVE_CONTROLS = {
+    "time_series": (
+        "block_permutation",
+        "synthetic_autocorrelated_null",
+        "feature_ablation",
+        "parameter_neighbourhood",
+    ),
+    "mean_reversion": (
+        "block_permutation",
+        "synthetic_autocorrelated_null",
+        "feature_ablation",
+        "parameter_neighbourhood",
+    ),
+    "cross_sectional": (
+        "block_permutation",
+        "predeclared_universe_holdout",
+        "cross_instrument",
+    ),
+    "relative_value": (
+        "block_permutation",
+        "synthetic_autocorrelated_null",
+        "feature_ablation",
+        "parameter_neighbourhood",
+    ),
+    "microstructure": (
+        "placebo_event_times",
+        "feature_ablation",
+        "cross_instrument",
+    ),
+    "machine_learning": (
+        "block_permutation",
+        "synthetic_autocorrelated_null",
+        "feature_ablation",
+        "predeclared_universe_holdout",
+    ),
+    "advanced_alpha": (
+        "block_permutation",
+        "feature_ablation",
+        "synthetic_autocorrelated_null",
+    ),
+    "meta_strategy": (
+        "block_permutation",
+        "feature_ablation",
+    ),
+    "execution": (
+        "placebo_event_times",
+        "feature_ablation",
+    ),
+    "market_making": (
+        "placebo_event_times",
+        "feature_ablation",
+        "cross_instrument",
+    ),
+}
+
 
 ThesisBuilder = Callable[[str, tuple[str, ...], str], ResearchThesis]
 
@@ -474,7 +529,7 @@ def _build_family_thesis(name: str, universe: tuple[str, ...], product: str) -> 
             "cost stress",
             "mechanism-specific negative controls",
         ),
-        negative_controls=REQUIRED_NEGATIVE_CONTROLS,
+        negative_controls=FAMILY_NEGATIVE_CONTROLS[family],
         execution_capacity_assumptions={
             "maximum_participation": 0.01,
             "market_impact_model_required": True,

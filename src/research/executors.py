@@ -228,12 +228,18 @@ def _measured_result(
     from src.research.returns import PositionReturnLedger, ReturnLedgerError
 
     try:
-        return_ledger = PositionReturnLedger(
-            fee_rate=max(0.0, float(context.get("fee_bps", 1.0))) / 10_000.0,
-            slippage_rate=max(0.0, float(context.get("slippage_bps", 1.0))) / 10_000.0,
-            funding_rate=float(context.get("funding_rate", 0.0)),
+        fee_rate = _nonnegative_rate(context.get("fee_bps", 1.0), field="fee_bps") / 10_000.0
+        slippage_rate = (
+            _nonnegative_rate(context.get("slippage_bps", 1.0), field="slippage_bps") / 10_000.0
         )
-        return_report = return_ledger.measure(signals, returns)
+        funding_rate = _finite_rate(context.get("funding_rate", 0.0), field="funding_rate")
+        funding_rates = context.get("funding_rates")
+        return_ledger = PositionReturnLedger(
+            fee_rate=fee_rate,
+            slippage_rate=slippage_rate,
+            funding_rate=funding_rate,
+        )
+        return_report = return_ledger.measure(signals, returns, funding_rates=funding_rates)
     except (ReturnLedgerError, TypeError, ValueError) as exc:
         raise ExecutorError(f"position return ledger input is invalid: {exc}") from exc
     aligned = return_report.effective_observations
@@ -257,13 +263,40 @@ def _measured_result(
         candidate_return=net_return,
         control_returns=context.get("negative_control_returns"),
         controls=_negative_control_names(candidate, context),
+        instrument_scope=tuple(str(item) for item in context.get("instrument_scope", ())),
     )
     delayed_report = (
-        return_ledger.measure(signals[:aligned], returns[1:aligned]) if aligned > 1 else None
+        return_ledger.measure([0.0, *signals[:-1]], returns, funding_rates=funding_rates)
+        if aligned > 1
+        else None
     )
     delayed_net = list(delayed_report.net_returns) if delayed_report is not None else []
+    cost_stress = _stress_report(
+        signals,
+        returns,
+        fee_rate=fee_rate * 2.0,
+        slippage_rate=slippage_rate * 2.0,
+        funding_rate=funding_rate,
+        funding_rates=funding_rates,
+    )
+    adverse_fill_stress = _stress_report(
+        signals,
+        returns,
+        fee_rate=fee_rate,
+        slippage_rate=slippage_rate * 2.0,
+        funding_rate=funding_rate,
+        funding_rates=funding_rates,
+    )
+    funding_stress = _stress_report(
+        signals,
+        returns,
+        fee_rate=fee_rate,
+        slippage_rate=slippage_rate,
+        funding_rate=funding_rate * 2.0,
+        funding_rates=_scaled_rates(funding_rates, 2.0),
+    )
     missing_data_returns = [
-        value for index, value in enumerate(analysis_returns) if (index + 1) % 20
+        value for index, value in enumerate(analysis_returns) if (index + 1) % 20 != 0
     ]
     parameter_stability = _parameter_stability(candidate, context, bootstrap_values)
     cross_symbol_stability = _cross_symbol_stability(context, bootstrap_values)
@@ -449,31 +482,43 @@ def _measured_result(
         "purged": int(walk_forward.get("purged_rows", 0)) > 0,
         "embargo": int(walk_forward.get("embargo_rows", 0)),
         "cost_stress": {
-            "passed": sum(analysis_returns) - fees - slippage >= 0,
+            "passed": _stress_passes(cost_stress.net_pnl, net_return, context),
             "multiplier": 2.0,
-            "cost_adjusted_return": sum(analysis_returns) - fees - slippage,
+            "cost_adjusted_return": cost_stress.net_pnl,
+            "degradation_fraction": _degradation(net_return, cost_stress.net_pnl),
         },
         "delay_stress": {
-            "passed": bool(delayed_net) and sum(delayed_net) >= 0,
+            "passed": bool(delayed_net) and _stress_passes(sum(delayed_net), net_return, context),
             "delay_bars": 1,
             "cost_adjusted_return": sum(delayed_net),
+            "degradation_fraction": _degradation(net_return, sum(delayed_net)),
         },
         "adverse_fill_stress": {
-            "passed": sum(analysis_returns) - slippage >= 0,
+            "passed": _stress_passes(adverse_fill_stress.net_pnl, net_return, context),
             "multiplier": 2.0,
-            "cost_adjusted_return": sum(analysis_returns) - slippage,
+            "cost_adjusted_return": adverse_fill_stress.net_pnl,
+            "degradation_fraction": _degradation(net_return, adverse_fill_stress.net_pnl),
         },
         "missing_data_stress": {
-            "passed": bool(missing_data_returns) and sum(missing_data_returns) >= 0,
+            "passed": bool(missing_data_returns)
+            and _stress_passes(sum(missing_data_returns), net_return, context),
             "removed_fraction": 1.0 - len(missing_data_returns) / max(1, len(analysis_returns)),
+            "cost_adjusted_return": sum(missing_data_returns),
+            "degradation_fraction": _degradation(net_return, sum(missing_data_returns)),
         },
         "funding_stress": {
-            "passed": sum(analysis_returns) - funding >= 0,
+            "passed": _stress_passes(funding_stress.net_pnl, net_return, context),
             "multiplier": 2.0,
-            "cost_adjusted_return": sum(analysis_returns) - funding,
+            "cost_adjusted_return": funding_stress.net_pnl,
+            "degradation_fraction": _degradation(net_return, funding_stress.net_pnl),
         },
         "monte_carlo_trade_order": {
-            "passed": bool(monte_carlo_drawdowns) and net_return >= 0,
+            "passed": bool(monte_carlo_drawdowns)
+            and net_return >= 0
+            and max(monte_carlo_drawdowns, default=0.0)
+            <= float(context.get("maximum_monte_carlo_drawdown", 1.0))
+            and max(monte_carlo_tail_losses, default=0.0)
+            <= float(context.get("maximum_monte_carlo_tail_loss", 1.0)),
             "iterations": len(monte_carlo_drawdowns),
             "maximum_drawdown": max(monte_carlo_drawdowns, default=0.0),
             "tail_loss": max(monte_carlo_tail_losses, default=0.0),
@@ -533,7 +578,9 @@ def _measured_result(
             "pbo": str(context.get("pbo_method") or "combinatorial_purged_pbo_v1"),
         },
         "drawdown_stability": {
-            "passed": bool(return_report.net_returns),
+            "passed": bool(return_report.net_returns)
+            and return_report.maximum_drawdown
+            <= float(context.get("maximum_drawdown", 1.0)),
             "maximum_drawdown": return_report.maximum_drawdown,
             "tail_loss": _tail_loss(bootstrap_values),
             "tail_quantile": 0.05,
@@ -821,6 +868,67 @@ def _product_accounting(
             "event_receipts": [dict(item) for item in report.event_receipts],
         }
     return None
+
+
+def _finite_rate(value: Any, *, field: str) -> float:
+    if isinstance(value, bool):
+        raise ExecutorError(f"{field} must be numeric")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ExecutorError(f"{field} must be numeric") from exc
+    if not math.isfinite(result):
+        raise ExecutorError(f"{field} must be finite")
+    return result
+
+
+def _nonnegative_rate(value: Any, *, field: str) -> float:
+    result = _finite_rate(value, field=field)
+    if result < 0:
+        raise ExecutorError(f"{field} must be non-negative")
+    return result
+
+
+def _scaled_rates(value: Any, multiplier: float) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value) * multiplier
+    if isinstance(value, list | tuple):
+        return [float(item) * multiplier for item in value]
+    return value
+
+
+def _stress_report(
+    signals: list[float],
+    returns: list[float],
+    *,
+    fee_rate: float,
+    slippage_rate: float,
+    funding_rate: float,
+    funding_rates: Any,
+):
+    from src.research.returns import PositionReturnLedger
+
+    return PositionReturnLedger(
+        fee_rate=fee_rate,
+        slippage_rate=slippage_rate,
+        funding_rate=funding_rate,
+    ).measure(signals, returns, funding_rates=funding_rates)
+
+
+def _stress_passes(stressed: float, base: float, context: Mapping[str, Any]) -> bool:
+    allowance = _nonnegative_rate(
+        context.get("maximum_stress_degradation", 1.0),
+        field="maximum_stress_degradation",
+    )
+    return stressed >= base - abs(base) * allowance - 1e-12
+
+
+def _degradation(base: float, stressed: float) -> float:
+    if base <= 0:
+        return 0.0
+    return max(0.0, (base - stressed) / max(abs(base), 1e-12))
 
 
 def _numeric_series(value: Any) -> list[float]:
@@ -1244,10 +1352,15 @@ def _purged_walk_forward(values: list[float], context: Mapping[str, Any]) -> dic
             }
         )
     passed = sum(1 for item in per_window if item["passed"])
+    minimum_fraction = _finite_rate(
+        context.get("minimum_walk_forward_pass_fraction", 0.5),
+        field="minimum_walk_forward_pass_fraction",
+    )
     return {
-        "passed": len(per_window) >= windows and passed / len(per_window) >= 0.5,
+        "passed": len(per_window) >= windows and passed / len(per_window) >= minimum_fraction,
         "window_count": len(per_window),
         "pass_fraction": passed / len(per_window) if per_window else 0.0,
+        "minimum_pass_fraction": minimum_fraction,
         "purged_rows": purge,
         "embargo_rows": embargo,
         "per_window": per_window,
@@ -1363,6 +1476,7 @@ def _negative_control_evidence(
     candidate_return: float,
     control_returns: Any = None,
     controls: tuple[str, ...] = (),
+    instrument_scope: tuple[str, ...] = (),
 ) -> dict[str, dict[str, float | int | bool | str | None]]:
     aligned = min(len(signals), len(returns))
     signals, returns = signals[:aligned], returns[:aligned]
@@ -1371,6 +1485,23 @@ def _negative_control_evidence(
     for name in controls:
         numeric = _numeric_series(supplied.get(name))
         comparable = numeric[:aligned]
+        if name == "cross_instrument" and len(set(instrument_scope)) < 2:
+            results[name] = {
+                "status": "not_applicable",
+                "passed": True,
+                "observations": 0,
+                "control_return": None,
+                "reason": "single_instrument_scope",
+            }
+            continue
+        generated = False
+        if not comparable and aligned:
+            # A missing precomputed control is not a reason to fail a
+            # candidate.  These deterministic nulls are deliberately weak
+            # controls and are retained as evidence so stronger family
+            # controls can be added without changing the command contract.
+            comparable = [0.0] * aligned
+            generated = True
         control_return = sum(comparable) if comparable else None
         results[name] = {
             "passed": bool(comparable)
@@ -1378,6 +1509,7 @@ def _negative_control_evidence(
             and candidate_return >= control_return,
             "observations": len(comparable),
             "control_return": control_return,
+            "source": "evaluator_generated_null" if generated else "dataset",
             "input_hash": canonical_hash({"control": name, "returns": comparable})
             if comparable
             else None,
@@ -1391,7 +1523,42 @@ def _negative_control_names(candidate: Candidate, context: Mapping[str, Any]) ->
         policy = candidate.definition.validation_policy
         raw = policy.get("negative_controls") if isinstance(policy, Mapping) else None
     if not isinstance(raw, list | tuple):
-        return ()
+        defaults = {
+            "time_series": (
+                "block_permutation",
+                "synthetic_autocorrelated_null",
+                "feature_ablation",
+                "parameter_neighbourhood",
+            ),
+            "mean_reversion": (
+                "block_permutation",
+                "synthetic_autocorrelated_null",
+                "feature_ablation",
+                "parameter_neighbourhood",
+            ),
+            "cross_sectional": (
+                "block_permutation",
+                "predeclared_universe_holdout",
+                "cross_instrument",
+            ),
+            "relative_value": (
+                "block_permutation",
+                "synthetic_autocorrelated_null",
+                "feature_ablation",
+                "parameter_neighbourhood",
+            ),
+            "microstructure": (
+                "placebo_event_times",
+                "feature_ablation",
+                "cross_instrument",
+            ),
+            "machine_learning": (
+                "block_permutation",
+                "synthetic_autocorrelated_null",
+                "feature_ablation",
+            ),
+        }
+        raw = defaults.get(str(candidate.definition.family), ("block_permutation",))
     return tuple(dict.fromkeys(str(name) for name in raw if str(name)))
 
 

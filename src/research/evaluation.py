@@ -144,6 +144,16 @@ _REQUIRED_STAGE_FIELDS: dict[str, tuple[str, ...]] = {
         "sample_evidence",
         "forward_duration",
     ),
+    "protected": (
+        "chronological",
+        "data_integrity",
+        "semantic_parity",
+        "realistic_costs",
+        "family_evidence",
+        "cost_adjusted_return",
+        "sample_evidence",
+        "drawdown_stability",
+    ),
 }
 
 
@@ -511,7 +521,12 @@ class EvidencePolicy:
             for status in required_statuses.values()
         ):
             return False
-        if product_id is not None and stage in {"development", "robustness", "forward"}:
+        if product_id is not None and stage in {
+            "development",
+            "robustness",
+            "protected",
+            "forward",
+        }:
             profile = self.profile_for(
                 stage,
                 product_id=product_id,
@@ -564,7 +579,12 @@ class EvidencePolicy:
                 statuses[name] = (
                     EvidenceStatus.PASS if validator(value, self, profile) else EvidenceStatus.FAIL
                 )
-        if product_id is not None and stage in {"development", "robustness", "forward"}:
+        if product_id is not None and stage in {
+            "development",
+            "robustness",
+            "protected",
+            "forward",
+        }:
             if not objective_is_available(evidence, product_id=product_id):
                 statuses["objective_excess_fraction"] = EvidenceStatus.UNAVAILABLE
             else:
@@ -971,6 +991,16 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
         "evidence_units": _positive,
         "sample_evidence": _sample_evidence_passes,
         "forward_duration": _forward_duration_passes,
+    },
+    "protected": {
+        "chronological": _true,
+        "data_integrity": _data_integrity_passes,
+        "semantic_parity": _semantic_parity_passes,
+        "realistic_costs": _realistic_costs_passes,
+        "family_evidence": _family_evidence_passes,
+        "cost_adjusted_return": _return_passes,
+        "sample_evidence": _sample_evidence_passes,
+        "drawdown_stability": _drawdown_passes,
     },
 }
 

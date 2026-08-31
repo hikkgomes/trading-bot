@@ -441,7 +441,7 @@ class DatabaseResearchJobHandlers:
                 )
             )
             accepted = self.evidence_policy.accepts(
-                "development",
+                "protected",
                 measured,
                 (),
                 product_id=candidate.definition.product if requires_objective else None,

@@ -21,6 +21,7 @@ from src.domain.strategies import (
     StrategySourceType,
 )
 from src.research.coordinator import Candidate
+from src.research.theses import FAMILY_NEGATIVE_CONTROLS
 
 
 class GenerationError(ValueError):
@@ -689,14 +690,9 @@ def campaign_thesis(
             "cost stress",
             "mechanism-specific negative controls",
         ),
-        negative_controls=(
-            "block_permutation",
-            "synthetic_autocorrelated_null",
-            "placebo_event_times",
-            "feature_ablation",
-            "parameter_neighbourhood",
-            "predeclared_universe_holdout",
-            "cross_instrument",
+        negative_controls=FAMILY_NEGATIVE_CONTROLS.get(
+            campaign.family,
+            ("block_permutation", "feature_ablation"),
         ),
         execution_capacity_assumptions={
             "maximum_participation": 0.01,
