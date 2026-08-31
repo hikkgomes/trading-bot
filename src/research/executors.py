@@ -232,7 +232,11 @@ def _measured_result(
         1,
         int(
             context.get(
-                "trial_count", len(trial_sharpes) or parameter_stability["neighbours_tested"] + 1
+                "trial_count",
+                context.get(
+                    "global_trial_count",
+                    len(trial_sharpes) or parameter_stability["neighbours_tested"] + 1,
+                ),
             )
         ),
     )

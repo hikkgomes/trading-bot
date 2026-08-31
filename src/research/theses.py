@@ -193,6 +193,24 @@ class SqlThesisRegistry:
             )
             return ThesisTrial(thesis_id, candidate_id, lineage_id, ordinal)
 
+    def lineage_trial_count(self, thesis_id: str) -> int:
+        """Return every registered trial in the thesis lineage for DSR/PBO."""
+
+        with self.engine.connect() as connection:
+            lineage_ids = _sql_lineage_ids(connection, thesis_id)
+            return int(
+                connection.execute(
+                    select(func.count())
+                    .select_from(thesis_trial)
+                    .where(thesis_trial.c.thesis_id.in_(lineage_ids))
+                ).scalar_one()
+            )
+
+    def trial_count(self, thesis_id: str) -> int:
+        """Compatibility-free name for the authoritative lineage count."""
+
+        return self.lineage_trial_count(thesis_id)
+
 
 def _thesis_from_payload(payload: dict[str, object]) -> ResearchThesis:
     def strings(name: str) -> tuple[str, ...]:

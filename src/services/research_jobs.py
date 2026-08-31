@@ -20,7 +20,7 @@ from src.research.backtest.event_engine import (
     SimulatedLimitOrder,
     SimulatedOrderSide,
 )
-from src.research.canonical import SqlStrategyArtefactRepository
+from src.research.canonical import SqlStrategyArtefactRepository, SqlValidationRepository
 from src.research.catalogue import registered_strategy_candidates, registered_strategy_theses
 from src.research.coordinator import Candidate, CandidateEvaluationView, ResearchCoordinator
 from src.research.datasets import (
@@ -35,6 +35,7 @@ from src.research.evaluation import (
     EvidencePolicy,
     ProtectedHoldoutWorker,
 )
+from src.research.evidence import holdout_degradation_passes
 from src.research.executors import (
     ExecutorError,
     ProviderContextBuilderRegistry,
@@ -405,6 +406,9 @@ class DatabaseResearchJobHandlers:
             **dict(context),
             "artefact_hash": request.artefact_hash,
             "artefact_created_at": request.artefact_created_at,
+            "global_trial_count": SqlThesisRegistry(self.store.engine).lineage_trial_count(
+                candidate.thesis_id
+            ),
         }
 
         def evaluate_protected(claim: Mapping[str, Any]) -> tuple[bool, Mapping[str, Any]]:
@@ -441,7 +445,51 @@ class DatabaseResearchJobHandlers:
                 measured,
                 (),
                 product_id=candidate.definition.product if requires_objective else None,
+                family=str(candidate.definition.family),
+                horizon=str(
+                    candidate.definition.position_model.get("horizon")
+                    or candidate.definition.position_model.get("horizon_bars")
+                    or "*"
+                ),
+                evidence_type=str(
+                    candidate.definition.validation_policy.get("evidence_type") or ""
+                ),
             )
+            if accepted:
+                stages = SqlValidationRepository(self.store.engine).stages(candidate.candidate_id)
+                development = next(
+                    (
+                        row.get("payload", {}).get("evidence")
+                        for row in stages
+                        if row.get("stage") == "development"
+                        and isinstance(row.get("payload"), Mapping)
+                        and isinstance(row["payload"].get("evidence"), Mapping)
+                    ),
+                    None,
+                )
+                if isinstance(development, Mapping):
+                    dimensions = (
+                        str(candidate.definition.family),
+                        str(
+                            candidate.definition.position_model.get("horizon")
+                            or candidate.definition.position_model.get("horizon_bars")
+                            or "*"
+                        ),
+                        str(candidate.definition.validation_policy.get("evidence_type") or ""),
+                    )
+                    accepted = holdout_degradation_passes(
+                        development,
+                        measured,
+                        self.evidence_policy.profile_for(
+                            "protected",
+                            product_id=(
+                                candidate.definition.product if requires_objective else None
+                            ),
+                            family=dimensions[0],
+                            horizon=dimensions[1],
+                            evidence_type=dimensions[2],
+                        ),
+                    )
             sealed = {
                 "passed": accepted,
                 "evidence_hash": canonical_hash(measured),
