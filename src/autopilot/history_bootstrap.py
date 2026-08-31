@@ -124,19 +124,12 @@ def _last_closed_open(now: pd.Timestamp, timeframe: str) -> pd.Timestamp:
     return _aligned_open_at_or_before(now, timeframe) - TIMEFRAME_DELTAS[timeframe]
 
 
-def build_default_requirements(
-    *,
-    config_path: Path = DEFAULT_FACTORY_CONFIG,
-    markets: Iterable[str] | None = None,
-    timeframes: Iterable[str] | None = None,
-    exclude_timeframes: Iterable[str] | None = None,
-    now: str | pd.Timestamp | None = None,
-    symbol: str = SYMBOL,
-    search_spaces: Iterable[Any] | None = None,
-) -> tuple[HistoryRequirement, ...]:
-    """Derive native datasets from the authoritative factory search spaces."""
-
-    factory_config = load_factory_config(config_path)
+def _select_history_dimensions(
+    factory_config: Any,
+    markets: Iterable[str] | None,
+    timeframes: Iterable[str] | None,
+    exclude_timeframes: Iterable[str] | None,
+) -> tuple[set[str], set[str]]:
     selected_markets = (
         set(markets)
         if markets is not None
@@ -156,15 +149,21 @@ def build_default_requirements(
     selected_timeframes -= excluded_timeframes
     if not selected_timeframes:
         raise ValueError("timeframe selection cannot be empty")
+    return selected_markets, selected_timeframes
 
+
+def _collect_history_space_requirements(
+    resolved_spaces: Iterable[Any],
+    selected_markets: set[str],
+    selected_timeframes: set[str],
+) -> tuple[
+    dict[tuple[str, str], pd.Timestamp],
+    dict[tuple[str, str], set[str]],
+    dict[tuple[str, str], set[str]],
+]:
     starts: dict[tuple[str, str], pd.Timestamp] = {}
     features: dict[tuple[str, str], set[str]] = defaultdict(set)
     scenario_names: dict[tuple[str, str], set[str]] = defaultdict(set)
-    resolved_spaces = (
-        tuple(search_spaces)
-        if search_spaces is not None
-        else search_spaces_for_symbol(factory_config, symbol)
-    )
     for space in resolved_spaces:
         if space.market not in selected_markets:
             continue
@@ -188,20 +187,34 @@ def build_default_requirements(
             starts[key] = min(starts.get(key, warm_start), warm_start)
             features[key].update(DEFAULT_FEATURES)
             scenario_names[key].add(space.name)
+    return starts, features, scenario_names
 
-    # The runtime freshness watchdog intentionally uses a tiny 1m canary.  Spot
-    # research itself remains coarse: this is seven days, not a multi-year 1m
-    # reconstruction.  Its single volume canary is used by readiness checks.
-    reference = _utc_timestamp(now if now is not None else pd.Timestamp.now(tz="UTC"))
-    if "spot" in selected_markets and "1m" in selected_timeframes:
-        key = ("spot", "1m")
-        if key not in starts:
-            starts[key] = _aligned_open_at_or_before(
-                reference - pd.Timedelta(days=OPERATIONAL_SEED_DAYS), "1m"
-            )
-            scenario_names[key].add("operational_freshness_seed")
-            features[key].add("volume_z_20")
 
+def _add_operational_history_seed(
+    starts: dict[tuple[str, str], pd.Timestamp],
+    features: dict[tuple[str, str], set[str]],
+    scenario_names: dict[tuple[str, str], set[str]],
+    selected_markets: set[str],
+    selected_timeframes: set[str],
+    reference: pd.Timestamp,
+) -> None:
+    if "spot" not in selected_markets or "1m" not in selected_timeframes:
+        return
+    key = ("spot", "1m")
+    if key in starts:
+        return
+    starts[key] = _aligned_open_at_or_before(
+        reference - pd.Timedelta(days=OPERATIONAL_SEED_DAYS), "1m"
+    )
+    scenario_names[key].add("operational_freshness_seed")
+    features[key].add("volume_z_20")
+
+
+def _build_history_requirements(
+    starts: dict[tuple[str, str], pd.Timestamp],
+    features: dict[tuple[str, str], set[str]],
+    scenario_names: dict[tuple[str, str], set[str]],
+) -> tuple[HistoryRequirement, ...]:
     requirements = []
     for market, timeframe in sorted(
         starts,
@@ -226,6 +239,51 @@ def build_default_requirements(
     return tuple(requirements)
 
 
+def build_default_requirements(
+    *,
+    config_path: Path = DEFAULT_FACTORY_CONFIG,
+    markets: Iterable[str] | None = None,
+    timeframes: Iterable[str] | None = None,
+    exclude_timeframes: Iterable[str] | None = None,
+    now: str | pd.Timestamp | None = None,
+    symbol: str = SYMBOL,
+    search_spaces: Iterable[Any] | None = None,
+) -> tuple[HistoryRequirement, ...]:
+    """Derive native datasets from the authoritative factory search spaces."""
+
+    factory_config = load_factory_config(config_path)
+    selected_markets, selected_timeframes = _select_history_dimensions(
+        factory_config,
+        markets,
+        timeframes,
+        exclude_timeframes,
+    )
+    resolved_spaces = (
+        tuple(search_spaces)
+        if search_spaces is not None
+        else search_spaces_for_symbol(factory_config, symbol)
+    )
+    starts, features, scenario_names = _collect_history_space_requirements(
+        resolved_spaces,
+        selected_markets,
+        selected_timeframes,
+    )
+
+    # The runtime freshness watchdog intentionally uses a tiny 1m canary.  Spot
+    # research itself remains coarse: this is seven days, not a multi-year 1m
+    # reconstruction.  Its single volume canary is used by readiness checks.
+    reference = _utc_timestamp(now if now is not None else pd.Timestamp.now(tz="UTC"))
+    _add_operational_history_seed(
+        starts,
+        features,
+        scenario_names,
+        selected_markets,
+        selected_timeframes,
+        reference,
+    )
+    return _build_history_requirements(starts, features, scenario_names)
+
+
 def _frame_with_timestamp(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
     if "timestamp" not in out.columns:
@@ -235,13 +293,12 @@ def _frame_with_timestamp(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def validate_candle_frame(
+def _validate_candle_timestamps(
     frame: pd.DataFrame,
     timeframe: str,
-    *,
     label: str,
-    require_contiguous: bool = True,
-) -> pd.DataFrame:
+    require_contiguous: bool,
+) -> tuple[pd.DataFrame, pd.DatetimeIndex]:
     if timeframe not in TIMEFRAME_DELTAS:
         raise ValueError(f"{label}: unsupported timeframe {timeframe!r}")
     if frame.empty:
@@ -262,7 +319,10 @@ def validate_candle_frame(
         deltas = timestamps.diff().iloc[1:]
         if not (deltas == TIMEFRAME_DELTAS[timeframe]).all():
             raise ValueError(f"{label}: timestamps must be contiguous {timeframe} intervals")
+    return out, timestamps
 
+
+def _validate_candle_numeric_values(out: pd.DataFrame, label: str) -> dict[str, pd.Series]:
     numeric: dict[str, pd.Series] = {}
     for column in bbid.CANDLE_COLUMNS[1:]:
         values = pd.to_numeric(out[column], errors="coerce")
@@ -290,6 +350,18 @@ def validate_candle_frame(
         | (numeric["low"] > numeric["close"])
     ).any():
         raise ValueError(f"{label}: OHLC values are internally inconsistent")
+    return numeric
+
+
+def validate_candle_frame(
+    frame: pd.DataFrame,
+    timeframe: str,
+    *,
+    label: str,
+    require_contiguous: bool = True,
+) -> pd.DataFrame:
+    out, timestamps = _validate_candle_timestamps(frame, timeframe, label, require_contiguous)
+    _validate_candle_numeric_values(out, label)
     out["timestamp"] = timestamps
     return out[bbid.CANDLE_COLUMNS].set_index("timestamp")
 
@@ -405,33 +477,19 @@ def _request_retry_delay(
     return min(retry_max_seconds, bounded + random_uniform(0.0, jitter_ceiling))
 
 
-def fetch_kline_page(
+def _request_kline_response(
+    endpoint: str,
+    params: dict[str, int | str],
     *,
-    symbol: str,
     market: str,
     timeframe: str,
-    start_ms: int,
-    end_ms: int,
-    limit: int = KLINE_LIMIT,
-    request_get: Callable[..., Any] = requests.get,
-    max_attempts: int = DEFAULT_REQUEST_MAX_ATTEMPTS,
-    retry_base_seconds: float = DEFAULT_RETRY_BASE_SECONDS,
-    retry_max_seconds: float = DEFAULT_RETRY_MAX_SECONDS,
-    sleep: Callable[[float], None] = time.sleep,
-    random_uniform: Callable[[float, float], float] = random.uniform,
-) -> pd.DataFrame:
-    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
-        raise ValueError("max_attempts must be a positive integer")
-    if retry_base_seconds < 0 or retry_max_seconds < retry_base_seconds:
-        raise ValueError("retry delays must be non-negative and max must be at least base")
-    endpoint = _endpoint(market)
-    params = {
-        "symbol": symbol,
-        "interval": timeframe,
-        "startTime": int(start_ms),
-        "endTime": int(end_ms),
-        "limit": int(limit),
-    }
+    request_get: Callable[..., Any],
+    max_attempts: int,
+    retry_base_seconds: float,
+    retry_max_seconds: float,
+    sleep: Callable[[float], None],
+    random_uniform: Callable[[float, float], float],
+) -> Any:
     response: Any | None = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -487,6 +545,16 @@ def fetch_kline_page(
         sleep(delay)
     if response is None:
         raise RuntimeError(f"Binance {market} {timeframe} request produced no response")
+    return response
+
+
+def _parse_kline_response(
+    response: Any,
+    *,
+    symbol: str,
+    market: str,
+    timeframe: str,
+) -> pd.DataFrame:
     payload = response.json()
     if not isinstance(payload, list):
         raise ValueError(f"Binance {market} {timeframe} response must be a list")
@@ -518,6 +586,53 @@ def fetch_kline_page(
             max_missing_fraction=None,
         )
     return page
+
+
+def fetch_kline_page(
+    *,
+    symbol: str,
+    market: str,
+    timeframe: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = KLINE_LIMIT,
+    request_get: Callable[..., Any] = requests.get,
+    max_attempts: int = DEFAULT_REQUEST_MAX_ATTEMPTS,
+    retry_base_seconds: float = DEFAULT_RETRY_BASE_SECONDS,
+    retry_max_seconds: float = DEFAULT_RETRY_MAX_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    random_uniform: Callable[[float, float], float] = random.uniform,
+) -> pd.DataFrame:
+    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
+        raise ValueError("max_attempts must be a positive integer")
+    if retry_base_seconds < 0 or retry_max_seconds < retry_base_seconds:
+        raise ValueError("retry delays must be non-negative and max must be at least base")
+    endpoint = _endpoint(market)
+    params = {
+        "symbol": symbol,
+        "interval": timeframe,
+        "startTime": int(start_ms),
+        "endTime": int(end_ms),
+        "limit": int(limit),
+    }
+    response = _request_kline_response(
+        endpoint,
+        params,
+        market=market,
+        timeframe=timeframe,
+        request_get=request_get,
+        max_attempts=max_attempts,
+        retry_base_seconds=retry_base_seconds,
+        retry_max_seconds=retry_max_seconds,
+        sleep=sleep,
+        random_uniform=random_uniform,
+    )
+    return _parse_kline_response(
+        response,
+        symbol=symbol,
+        market=market,
+        timeframe=timeframe,
+    )
 
 
 def _load_candles(
@@ -627,20 +742,14 @@ def _missing_ranges(
     return [(left, right) for left, right in ranges if left <= right]
 
 
-def _download_ranges(
-    requirement: HistoryRequirement,
-    ranges: list[tuple[pd.Timestamp, pd.Timestamp]],
+def _validate_download_parameters(
     *,
-    symbol: str,
-    checkpoint_path: Path,
-    checkpoint: pd.DataFrame,
+    requirement: HistoryRequirement,
     checkpoint_pages: int,
     request_delay_seconds: float,
     max_request_pages: int,
-    fetch_page: Callable[..., pd.DataFrame],
-    request_pages_used: int = 0,
-    deadline_monotonic: float | None = None,
-) -> tuple[pd.DataFrame, int]:
+    request_pages_used: int,
+) -> int:
     if checkpoint_pages <= 0:
         raise ValueError("checkpoint_pages must be positive")
     if request_delay_seconds < 0:
@@ -657,52 +766,117 @@ def _download_ranges(
         or not 0 <= request_pages_used <= max_request_pages
     ):
         raise ValueError("request_pages_used must be an integer within the page budget")
-    period_ms = int(TIMEFRAME_DELTAS[requirement.timeframe].total_seconds() * 1_000)
+    return int(TIMEFRAME_DELTAS[requirement.timeframe].total_seconds() * 1_000)
+
+
+def _download_one_range(
+    requirement: HistoryRequirement,
+    range_start: pd.Timestamp,
+    range_end: pd.Timestamp,
+    *,
+    symbol: str,
+    checkpoint_path: Path,
+    checkpoint: pd.DataFrame,
+    checkpoint_pages: int,
+    request_delay_seconds: float,
+    max_request_pages: int,
+    fetch_page: Callable[..., pd.DataFrame],
+    request_pages: int,
+    pages_since_checkpoint: int,
+    period_ms: int,
+    deadline_monotonic: float | None,
+) -> tuple[pd.DataFrame, int, int]:
+    cursor_ms = int(range_start.value // 1_000_000)
+    end_ms = int(range_end.value // 1_000_000)
+    downloaded = checkpoint
+    while cursor_ms <= end_ms:
+        _defer_if_deadline_reached(
+            deadline_monotonic,
+            market=requirement.market,
+            timeframe=requirement.timeframe,
+        )
+        if request_pages >= max_request_pages:
+            # Persist the page that was already downloaded even when the
+            # configured checkpoint cadence has not been reached.  The next
+            # bounded run must resume from the last durable candle rather than
+            # repeating work or losing the partial result.
+            if not downloaded.empty:
+                write_parquet_atomic(downloaded, checkpoint_path)
+            raise RuntimeError(
+                f"{requirement.market} {requirement.timeframe}: API page budget "
+                f"exhausted at {max_request_pages}; rerun to resume the checkpoint"
+            )
+        page = fetch_page(
+            symbol=symbol,
+            market=requirement.market,
+            timeframe=requirement.timeframe,
+            start_ms=cursor_ms,
+            end_ms=end_ms,
+            limit=KLINE_LIMIT,
+        )
+        request_pages += 1
+        if not page.empty:
+            page = page.loc[(page.index >= range_start) & (page.index <= range_end)]
+        if page.empty:
+            break
+        last_ms = int(page.index.max().value // 1_000_000)
+        if last_ms < cursor_ms:
+            raise RuntimeError(
+                f"{requirement.market} {requirement.timeframe}: Binance page did not advance"
+            )
+        downloaded = _merge_frames(downloaded, page)
+        cursor_ms = last_ms + period_ms
+        pages_since_checkpoint += 1
+        if pages_since_checkpoint >= checkpoint_pages:
+            write_parquet_atomic(downloaded, checkpoint_path)
+            pages_since_checkpoint = 0
+        if request_delay_seconds:
+            time.sleep(request_delay_seconds)
+    return downloaded, request_pages, pages_since_checkpoint
+
+
+def _download_ranges(
+    requirement: HistoryRequirement,
+    ranges: list[tuple[pd.Timestamp, pd.Timestamp]],
+    *,
+    symbol: str,
+    checkpoint_path: Path,
+    checkpoint: pd.DataFrame,
+    checkpoint_pages: int,
+    request_delay_seconds: float,
+    max_request_pages: int,
+    fetch_page: Callable[..., pd.DataFrame],
+    request_pages_used: int = 0,
+    deadline_monotonic: float | None = None,
+) -> tuple[pd.DataFrame, int]:
+    period_ms = _validate_download_parameters(
+        requirement=requirement,
+        checkpoint_pages=checkpoint_pages,
+        request_delay_seconds=request_delay_seconds,
+        max_request_pages=max_request_pages,
+        request_pages_used=request_pages_used,
+    )
     downloaded = checkpoint
     pages_since_checkpoint = 0
     request_pages = request_pages_used
     try:
         for range_start, range_end in ranges:
-            cursor_ms = int(range_start.value // 1_000_000)
-            end_ms = int(range_end.value // 1_000_000)
-            while cursor_ms <= end_ms:
-                _defer_if_deadline_reached(
-                    deadline_monotonic,
-                    market=requirement.market,
-                    timeframe=requirement.timeframe,
-                )
-                if request_pages >= max_request_pages:
-                    raise RuntimeError(
-                        f"{requirement.market} {requirement.timeframe}: API page budget "
-                        f"exhausted at {max_request_pages}; rerun to resume the checkpoint"
-                    )
-                page = fetch_page(
-                    symbol=symbol,
-                    market=requirement.market,
-                    timeframe=requirement.timeframe,
-                    start_ms=cursor_ms,
-                    end_ms=end_ms,
-                    limit=KLINE_LIMIT,
-                )
-                request_pages += 1
-                if page.empty:
-                    break
-                page = page.loc[(page.index >= range_start) & (page.index <= range_end)]
-                if page.empty:
-                    break
-                last_ms = int(page.index.max().value // 1_000_000)
-                if last_ms < cursor_ms:
-                    raise RuntimeError(
-                        f"{requirement.market} {requirement.timeframe}: Binance page did not advance"
-                    )
-                downloaded = _merge_frames(downloaded, page)
-                cursor_ms = last_ms + period_ms
-                pages_since_checkpoint += 1
-                if pages_since_checkpoint >= checkpoint_pages:
-                    write_parquet_atomic(downloaded, checkpoint_path)
-                    pages_since_checkpoint = 0
-                if request_delay_seconds:
-                    time.sleep(request_delay_seconds)
+            downloaded, request_pages, pages_since_checkpoint = _download_one_range(
+                requirement,
+                range_start,
+                range_end,
+                symbol=symbol,
+                checkpoint_path=checkpoint_path,
+                checkpoint=downloaded,
+                checkpoint_pages=checkpoint_pages,
+                request_delay_seconds=request_delay_seconds,
+                max_request_pages=max_request_pages,
+                fetch_page=fetch_page,
+                request_pages=request_pages,
+                pages_since_checkpoint=pages_since_checkpoint,
+                period_ms=period_ms,
+                deadline_monotonic=deadline_monotonic,
+            )
     except Exception:
         if not downloaded.empty:
             write_parquet_atomic(downloaded, checkpoint_path)

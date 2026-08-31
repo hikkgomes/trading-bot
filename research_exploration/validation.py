@@ -784,7 +784,13 @@ def validate_hypothesis(
         return _finish_validation(result, "reject", reason)
     reason = _holdout_gate(result, segs["holdout"], hyp, cfg, eval_cfg, before_holdout)
     if reason is not None:
-        inconclusive = reason in {"holdout_already_consumed", "insufficient_holdout_trades"}
+        # A caller-provided holdout reservation can be unavailable for
+        # operational reasons such as a sealed cohort or exhausted budget.
+        # Those conditions are inconclusive, not statistical rejection.  The
+        # evaluated holdout failures remain explicit rejects.
+        inconclusive = reason in {"holdout_already_consumed", "insufficient_holdout_trades"} or (
+            reason.startswith("holdout_") and reason != "holdout_failed"
+        )
         return _finish_validation(result, "inconclusive" if inconclusive else "reject", reason)
     return _finish_validation(result, "keep")
 
