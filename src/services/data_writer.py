@@ -6,7 +6,7 @@ import datetime as dt
 import json
 import math
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,7 @@ from src.data.parquet_store import (
 from src.domain._codec import canonical_hash
 from src.domain.market_events import ExchangeSequenceTracker, MarketEvent, MarketEventType
 from src.risk.engine import SqlRiskSnapshotStore
+from src.services.market_gap_recovery import BinanceMarketGapRepair
 from src.services.scheduler import DatabaseJobQueue
 
 _PARTITION_TOKEN = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -32,6 +33,7 @@ class DatabaseMarketDataWriter:
         root: Path,
         snapshot_store: SqlRiskSnapshotStore | None = None,
         product_ids_by_market: Mapping[str, Iterable[str]] | None = None,
+        gap_repair: Callable[[Mapping[str, Any]], Iterable[MarketEvent]] | None = None,
         lease_seconds: int = 60,
     ) -> None:
         self.queue = queue
@@ -45,16 +47,23 @@ class DatabaseMarketDataWriter:
         }
         self.lease_seconds = lease_seconds
         self.sequence_tracker = ExchangeSequenceTracker()
+        self.gap_repair = gap_repair or BinanceMarketGapRepair()
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.lease_seconds,
-            names=("market_event_batch_write", "market_event_write"),
+            names=(
+                "market_event_batch_write",
+                "market_event_write",
+                "market_data_gap_recovery",
+            ),
         )
         if claimed is None:
             return {"reason_code": "market_event_queue_empty"}
+        if claimed.name == "market_data_gap_recovery":
+            return self._run_gap_recovery(claimed, now=now)
         try:
             if claimed.name == "market_event_batch_write":
                 result = self._write_batch(claimed.payload)
@@ -68,7 +77,9 @@ class DatabaseMarketDataWriter:
             if not isinstance(raw_event, dict):
                 raise ValueError("market-event job has no event object")
             event = MarketEvent(**raw_event)
-            sequence_status = self.sequence_tracker.observe(event)
+            contiguous = _has_contiguous_sequence(event)
+            previous_sequence = self.sequence_tracker.last_sequence(event)
+            sequence_status = self.sequence_tracker.observe(event, contiguous=contiguous)
             venue = str(claimed.payload["venue"])
             market = str(claimed.payload["market"])
             symbol = str(claimed.payload["symbol"])
@@ -88,6 +99,15 @@ class DatabaseMarketDataWriter:
                 market=market,
                 symbol=symbol,
             )
+            gap_recovery_job_id = None
+            if sequence_status in {"gap", "out_of_order"}:
+                gap_recovery_job_id = self._enqueue_gap_recovery(
+                    event=event,
+                    venue=venue,
+                    market=market,
+                    symbol=symbol,
+                    previous_sequence=previous_sequence,
+                )
         except Exception as exc:
             self.queue.fail(
                 claimed,
@@ -109,6 +129,7 @@ class DatabaseMarketDataWriter:
             "bar_path": str(bar_path) if bar_path is not None else None,
             "feature_job_id": feature_job_id,
             "sequence_status": sequence_status,
+            "gap_recovery_job_id": gap_recovery_job_id,
             "market_snapshot_ids": list(market_snapshot_ids),
         }
 
@@ -121,6 +142,7 @@ class DatabaseMarketDataWriter:
         if canonical_hash(body) != str(payload["segment_hash"]):
             raise ValueError("market batch segment content hash is invalid")
         events = []
+        gap_recovery_job_ids: list[str] = []
         dropped_rows = 0
         for row in rows:
             event = row.get("event")
@@ -144,7 +166,21 @@ class DatabaseMarketDataWriter:
                     str(row["symbol"]),
                 )
             )
-            self.sequence_tracker.observe(canonical_event)
+            previous_sequence = self.sequence_tracker.last_sequence(canonical_event)
+            sequence_status = self.sequence_tracker.observe(
+                canonical_event,
+                contiguous=_has_contiguous_sequence(canonical_event),
+            )
+            if sequence_status in {"gap", "out_of_order"}:
+                gap_recovery_job_ids.append(
+                    self._enqueue_gap_recovery(
+                        event=canonical_event,
+                        venue=str(row["venue"]),
+                        market=str(row["market"]),
+                        symbol=str(row["symbol"]),
+                        previous_sequence=previous_sequence,
+                    )
+                )
         paths = self.store.put_batch(events) if events else ()
         for event, venue, market, symbol in events:
             if _is_closed_candle(event):
@@ -162,7 +198,98 @@ class DatabaseMarketDataWriter:
             "events": len(events),
             "dropped_rows": dropped_rows,
             "paths": [str(path) for path in paths],
+            "gap_recovery_job_ids": gap_recovery_job_ids,
             "market_snapshot_ids": snapshot_ids,
+        }
+
+    def _enqueue_gap_recovery(
+        self,
+        *,
+        event: MarketEvent,
+        venue: str,
+        market: str,
+        symbol: str,
+        previous_sequence: int | None,
+    ) -> str:
+        payload = {
+            "venue": venue,
+            "market": market,
+            "symbol": symbol,
+            "instrument_id": event.instrument_id,
+            "event_type": event.event_type.value,
+            "previous_sequence": previous_sequence,
+            "sequence": event.sequence,
+            "event": event.payload,
+            "observed_at": event.receive_timestamp,
+        }
+        identity = canonical_hash(payload).removeprefix("sha256:")
+        job_id = f"market-gap:{identity}"
+        self.queue.enqueue_if_absent(
+            job_id=job_id,
+            name="market_data_gap_recovery",
+            payload=payload,
+            available_at=event.receive_timestamp,
+            priority=90,
+            producer_identity="market-data-writer",
+        )
+        return job_id
+
+    def _run_gap_recovery(self, claimed, *, now: str) -> dict[str, Any]:
+        try:
+            repaired = tuple(self.gap_repair(claimed.payload))
+            if not repaired:
+                raise RuntimeError("REST gap repair returned no events")
+            paths: list[str] = []
+            for event in repaired:
+                if event.instrument_id != claimed.payload["instrument_id"]:
+                    raise ValueError("REST gap repair changed the instrument identity")
+                self.sequence_tracker.observe(
+                    event,
+                    contiguous=_has_contiguous_sequence(event),
+                )
+                path = self.store.put(
+                    event,
+                    venue=str(claimed.payload["venue"]),
+                    market=str(claimed.payload["market"]),
+                    symbol=str(claimed.payload["symbol"]),
+                )
+                paths.append(str(path))
+                if _is_closed_candle(event):
+                    self.bar_store.put(
+                        event,
+                        venue=str(claimed.payload["venue"]),
+                        market=str(claimed.payload["market"]),
+                        symbol=str(claimed.payload["symbol"]),
+                    )
+                self._publish_market_snapshots(
+                    event=event,
+                    market=str(claimed.payload["market"]),
+                )
+                self._enqueue_closed_candle_features(
+                    event=event,
+                    venue=str(claimed.payload["venue"]),
+                    market=str(claimed.payload["market"]),
+                    symbol=str(claimed.payload["symbol"]),
+                )
+        except Exception as exc:
+            self.queue.fail(
+                claimed,
+                completed_at=now,
+                error=f"{type(exc).__name__}: {exc}",
+                retry_at=_retry_at(now, self.lease_seconds),
+            )
+            return {
+                "reason_code": "market_gap_recovery_failed",
+                "job_id": claimed.job_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        self.queue.complete(claimed, completed_at=now)
+        return {
+            "reason_code": "market_gap_recovered",
+            "job_id": claimed.job_id,
+            "repaired_events": len(repaired),
+            "paths": paths,
         }
 
     def _publish_market_snapshots(self, *, event: MarketEvent, market: str) -> tuple[str, ...]:
@@ -295,6 +422,20 @@ def _is_closed_candle(event: MarketEvent) -> bool:
         event.event_type is MarketEventType.CANDLE
         and isinstance(candle, dict)
         and candle.get("x") is True
+    )
+
+
+def _has_contiguous_sequence(event: MarketEvent) -> bool:
+    """Only Binance depth updates expose a contiguous update-id range."""
+
+    if event.event_type is not MarketEventType.DEPTH_UPDATE:
+        return False
+    raw_data = event.payload.get("data")
+    if not isinstance(raw_data, Mapping):
+        return False
+    return all(
+        isinstance(raw_data.get(field), int) and not isinstance(raw_data.get(field), bool)
+        for field in ("U", "u")
     )
 
 

@@ -134,6 +134,35 @@ class DatabaseGatewaySink:
         self.events += 1
         self.bytes += len(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
+    def mark_user_stream_recovery(
+        self,
+        *,
+        account_id: str,
+        market: str,
+        observed_at: str,
+        reason_code: str,
+    ) -> str:
+        """Queue authenticated REST reconciliation after a stream restart."""
+
+        payload = {
+            "account_id": account_id,
+            "market": market,
+            "recovery_kind": "user_stream_reconnect",
+            "reason_code": reason_code,
+            "observed_at": observed_at,
+        }
+        identity = canonical_hash(payload).removeprefix("sha256:")
+        job_id = f"{self.user_stream_job_prefix}:recovery:{identity}"
+        self.queue.enqueue_if_absent(
+            job_id=job_id,
+            name="live_order_recovery",
+            payload=payload,
+            available_at=observed_at,
+            priority=100,
+            producer_identity=f"{self.user_stream_job_prefix}:recovery",
+        )
+        return job_id
+
     def _enqueue_market_event(
         self, event: MarketEvent, *, venue: str, market: str, symbol: str
     ) -> None:
@@ -355,6 +384,23 @@ def _stream_endpoints(account: UserStreamAccount) -> tuple[str, str]:
     return endpoints[account.market]
 
 
+def _mark_stream_recovery(
+    sink: DatabaseGatewaySink | Any,
+    *,
+    account: UserStreamAccount,
+    reason_code: str,
+) -> None:
+    marker = getattr(sink, "mark_user_stream_recovery", None)
+    if not callable(marker):
+        return
+    marker(
+        account_id=account.account_id,
+        market=account.market,
+        observed_at=dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
+        reason_code=reason_code,
+    )
+
+
 def funding_event_from_mark_price(event: MarketEvent) -> MarketEvent | None:
     if event.event_type is not MarketEventType.MARK_PRICE:
         return None
@@ -566,6 +612,11 @@ class DatabaseMarketGateway:
                     sink=sink,
                     maximum_seconds=3_600,
                 )
+                _mark_stream_recovery(
+                    sink,
+                    account=account,
+                    reason_code="user_stream_reconnect",
+                )
                 delay = 1.0
             except asyncio.CancelledError:
                 raise
@@ -577,6 +628,11 @@ class DatabaseMarketGateway:
                 json.JSONDecodeError,
             ):
                 self.user_streams._listen_keys.pop(account.account_id, None)
+                _mark_stream_recovery(
+                    sink,
+                    account=account,
+                    reason_code="user_stream_disconnect",
+                )
                 sink.flush()
                 await asyncio.sleep(delay)
                 delay = min(30.0, delay * 2)

@@ -32,7 +32,12 @@ class ExchangeSequenceTracker:
 
     _last: dict[tuple[str, str], int] = field(default_factory=dict)
 
-    def observe(self, event: MarketEvent) -> str:
+    def last_sequence(self, event: MarketEvent) -> int | None:
+        return self._last.get((event.instrument_id, event.event_type.value))
+
+    def observe(self, event: MarketEvent, *, contiguous: bool = True) -> str:
+        if not contiguous:
+            return "untracked"
         key = (event.instrument_id, event.event_type.value)
         previous = self._last.get(key)
         if previous is not None and event.sequence <= previous:

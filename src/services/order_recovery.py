@@ -48,6 +48,14 @@ class DatabaseLiveRecoveryWorker:
             reconciliation = self.reconcile_product(product_id)
             plan = plan_recovery(reconciliation, created_at=now, store=self.store)
             if plan is None:
+                if claimed.payload.get("recovery_kind") == "user_stream_reconnect":
+                    self.queue.complete(claimed, completed_at=now)
+                    return {
+                        "reason_code": "live_recovery_verified",
+                        "job_id": claimed.job_id,
+                        "product_id": product_id,
+                        "recovery_kind": "user_stream_reconnect",
+                    }
                 raise ValueError("recovery job found no exchange-state difference")
         except Exception as exc:
             self.queue.fail(

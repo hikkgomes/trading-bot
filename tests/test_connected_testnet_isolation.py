@@ -106,3 +106,35 @@ def test_connected_gateway_uses_private_user_stream_identity_and_name() -> None:
 
     assert queue.enqueued[0]["name"] == "connected_user_stream"
     assert queue.enqueued[0]["job_id"].startswith("connected-event:")
+
+
+def test_user_stream_reconnect_queues_rest_reconciliation() -> None:
+    queue = EmptyClaimQueue()
+    sink = DatabaseGatewaySink(
+        queue,
+        user_stream_job_prefix="connected-event",
+    )
+
+    job_id = sink.mark_user_stream_recovery(
+        account_id="testnet-futures",
+        market="futures",
+        observed_at=NOW,
+        reason_code="user_stream_disconnect",
+    )
+
+    assert queue.enqueued == [
+        {
+            "job_id": job_id,
+            "name": "live_order_recovery",
+            "payload": {
+                "account_id": "testnet-futures",
+                "market": "futures",
+                "recovery_kind": "user_stream_reconnect",
+                "reason_code": "user_stream_disconnect",
+                "observed_at": NOW,
+            },
+            "available_at": NOW,
+            "priority": 100,
+            "producer_identity": "connected-event:recovery",
+        }
+    ]

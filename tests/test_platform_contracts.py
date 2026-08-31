@@ -26,7 +26,7 @@ from src.data.universe import InstrumentObservation, SqlUniverseStore, UniverseE
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.domain.instruments import Instrument, MarketType
-from src.domain.market_events import MarketEventType
+from src.domain.market_events import MarketEvent, MarketEventType
 from src.domain.orders import OrderSide, OrderStatus
 from src.domain.portfolios import TargetPosition
 from src.domain.risk import RiskDecision
@@ -100,6 +100,7 @@ from src.services.data_writer import DatabaseMarketDataWriter
 from src.services.execution_service import ExecutionService
 from src.services.feature_worker import DatabaseFeatureWorker
 from src.services.health import DatabaseHeartbeatStore
+from src.services.market_gap_recovery import BinanceMarketGapRepair
 from src.services.market_gateway import funding_event_from_mark_price
 from src.services.order_execution import (
     DatabaseExecutionWorker,
@@ -581,6 +582,50 @@ def test_live_recovery_worker_reconciles_missing_exchange_order(tmp_path: Path):
     assert result["operator_review_required"] is True
     assert plans[0].actions[0].action_type is RecoveryActionType.RECONCILE_ORDER
     assert plans[0].actions[0].target == "missing-order"
+
+
+def test_live_recovery_worker_verifies_a_user_stream_reconnect_without_difference(
+    tmp_path: Path,
+):
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'stream-recovery.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="linux-optiplex:execution-engine",
+        node_id="linux-optiplex",
+        role="execution-engine",
+        capabilities=("live_order_recovery",),
+        observed_at=NOW,
+    )
+    queue.enqueue(
+        job_id="stream-recovery-1",
+        name="live_order_recovery",
+        payload={
+            "account_id": "binance-futures-main",
+            "market": "futures",
+            "recovery_kind": "user_stream_reconnect",
+            "reason_code": "user_stream_disconnect",
+            "observed_at": NOW,
+        },
+        available_at=NOW,
+    )
+    worker = DatabaseLiveRecoveryWorker(
+        queue=queue,
+        worker_id="linux-optiplex:execution-engine",
+        store=SqlRecoveryStore(database.engine),
+        reconcile_product=lambda _product_id: reconcile_account(
+            local_positions={},
+            exchange_positions={},
+            local_open_order_ids=set(),
+            exchange_open_order_ids=set(),
+        ),
+        account_products={"binance-futures-main": "active_income"},
+    )
+
+    result = worker.run_once(now=NOW)
+
+    assert result["reason_code"] == "live_recovery_verified"
+    database.dispose()
 
 
 def test_rejected_risk_stops_before_order_planning(tmp_path: Path):
@@ -2512,6 +2557,133 @@ def test_closed_candle_persistence_enqueues_and_builds_live_features(tmp_path: P
         )
         == 3
     )
+
+
+def test_market_gap_repair_uses_bounded_rest_identity() -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "a": 2,
+                    "p": "101",
+                    "q": "0.1",
+                    "f": 10,
+                    "l": 10,
+                    "T": 1_800_000_001_000,
+                    "m": False,
+                    "M": True,
+                },
+                {
+                    "a": 3,
+                    "p": "102",
+                    "q": "0.2",
+                    "f": 11,
+                    "l": 11,
+                    "T": 1_800_000_002_000,
+                    "m": True,
+                    "M": True,
+                },
+            ]
+
+    class Session:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def get(self, url: str, *, params: dict[str, object], timeout: float) -> Response:
+            self.calls.append({"url": url, "params": params, "timeout": timeout})
+            return Response()
+
+    session = Session()
+    repair = BinanceMarketGapRepair(
+        session=session,
+        base_urls={"spot": "https://spot.test", "futures": "https://futures.test"},
+        clock_ms=lambda: 1_800_000_010_000,
+    )
+
+    events = repair(
+        {
+            "market": "spot",
+            "symbol": "BTCUSDT",
+            "event_type": "aggregate_trade",
+            "previous_sequence": 1,
+            "sequence": 4,
+            "observed_at": NOW,
+        }
+    )
+
+    assert [event.sequence for event in events] == [2, 3]
+    assert session.calls == [
+        {
+            "url": "https://spot.test/api/v3/aggTrades",
+            "params": {"symbol": "BTCUSDT", "limit": 1_000, "fromId": 2, "toId": 3},
+            "timeout": 10.0,
+        }
+    ]
+
+
+def test_market_data_writer_persists_a_sequence_gap_repair(tmp_path: Path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'gap.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="linux-data",
+        node_id="linux-optiplex",
+        role="data-writer",
+        capabilities=("market_event_write", "market_data_gap_recovery"),
+        observed_at=NOW,
+    )
+    def depth(sequence: int) -> MarketEvent:
+        return normalise_public_event(
+            market="futures",
+            stream="btcusdt@depth20@100ms",
+            payload={
+                "e": "depthUpdate",
+                "E": 1_800_000_000_000 + sequence,
+                "s": "BTCUSDT",
+                "U": sequence,
+                "u": sequence,
+                "b": [["100", "1"]],
+                "a": [["101", "1"]],
+            },
+            receive_timestamp=NOW,
+        )
+
+    repaired = depth(2)
+    writer = DatabaseMarketDataWriter(
+        queue=queue,
+        worker_id="linux-data",
+        root=tmp_path / "data",
+        gap_repair=lambda _payload: (repaired,),
+    )
+    for sequence in (1, 3):
+        event = depth(sequence)
+        queue.enqueue(
+            job_id=f"depth-{sequence}",
+            name="market_event_write",
+            payload={
+                "venue": "binance",
+                "market": "futures",
+                "symbol": "BTCUSDT",
+                "event": to_primitive(event),
+            },
+            available_at=NOW,
+        )
+
+        result = writer.run_once(now=NOW)
+        if sequence == 1:
+            assert result["sequence_status"] == "ok"
+        else:
+            assert result["sequence_status"] == "gap"
+            assert result["gap_recovery_job_id"].startswith("market-gap:")
+
+    recovery = writer.run_once(now=NOW)
+
+    assert recovery["reason_code"] == "market_gap_recovered"
+    assert recovery["repaired_events"] == 1
+    database.dispose()
 
 
 def test_live_and_historical_feature_workers_produce_the_same_values(tmp_path: Path):
