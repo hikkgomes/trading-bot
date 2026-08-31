@@ -137,15 +137,81 @@ class ProviderExecutorRegistry:
         return registry
 
 
+def _pbo_measurements(
+    context: Mapping[str, Any],
+    parameter_stability: Mapping[str, Any],
+    window_returns: list[float],
+) -> tuple[float | dict[str, Any], list[list[float]]]:
+    strategy_window_returns = context.get("strategy_window_returns")
+    if isinstance(strategy_window_returns, list | tuple):
+        pbo_matrix = [
+            _numeric_series(row) for row in strategy_window_returns if _numeric_series(row)
+        ]
+    else:
+        pbo_matrix = []
+    if len(pbo_matrix) < 2:
+        pbo_matrix = [
+            _numeric_series(item.get("window_returns"))
+            for item in parameter_stability["results"]
+            if isinstance(item, Mapping) and _numeric_series(item.get("window_returns"))
+        ]
+        pbo_matrix.insert(0, window_returns)
+    width = min((len(row) for row in pbo_matrix), default=0)
+    pbo_matrix = [row[:width] for row in pbo_matrix if width >= 2]
+    if len(pbo_matrix) < 2:
+        return (
+            {
+                "status": "not_applicable",
+                "passed": True,
+                "reason": "no_valid_configuration_cohort",
+                "cohort_size": len(pbo_matrix),
+            },
+            pbo_matrix,
+        )
+    from src.metrics import probability_backtest_overfitting
+
+    return probability_backtest_overfitting(pbo_matrix), pbo_matrix
+
+
+def _trial_statistics(
+    context: Mapping[str, Any],
+    parameter_stability: Mapping[str, Any],
+    analysis_returns: list[float],
+) -> tuple[list[float], int, float, float]:
+    from src.metrics import deflated_sharpe_ratio, sharpe_ratio
+
+    trial_sharpes = _trial_sharpes(context, parameter_stability, analysis_returns)
+    trial_count = max(
+        1,
+        int(
+            context.get(
+                "trial_count",
+                context.get(
+                    "global_trial_count",
+                    len(trial_sharpes) or parameter_stability["neighbours_tested"] + 1,
+                ),
+            )
+        ),
+    )
+    trial_sharpe_std = float(context.get("trial_sharpe_std", 0.0))
+    if "trial_sharpe_std" not in context and len(trial_sharpes) >= 2:
+        trial_sharpe_std = statistics.pstdev(trial_sharpes)
+    skew, kurtosis = _skew_kurtosis(analysis_returns)
+    dsr = deflated_sharpe_ratio(
+        sharpe_ratio(analysis_returns),
+        n_trials=trial_count,
+        skew=skew,
+        kurt=kurtosis,
+        n_obs=len(analysis_returns),
+        sr_std_trials=trial_sharpe_std,
+    )
+    return trial_sharpes, trial_count, trial_sharpe_std, dsr
+
+
 def _measured_result(
     candidate: Candidate, context: Mapping[str, Any], output: Any
 ) -> ExecutionResult:
-    from src.metrics import (
-        bootstrap_sharpe_ci,
-        deflated_sharpe_ratio,
-        probability_backtest_overfitting,
-        sharpe_ratio,
-    )
+    from src.metrics import bootstrap_sharpe_ci
 
     snapshots = tuple(str(item) for item in context.get("dataset_snapshot_ids", ()))
     if not snapshots:
@@ -208,56 +274,9 @@ def _measured_result(
         n_boot=int(context.get("bootstrap_iterations", 1_000)),
         random_state=int(candidate.candidate_id[7:15], 16),
     )
-    strategy_window_returns = context.get("strategy_window_returns")
-    if isinstance(strategy_window_returns, list | tuple):
-        pbo_matrix = [
-            _numeric_series(row) for row in strategy_window_returns if _numeric_series(row)
-        ]
-    else:
-        pbo_matrix = []
-    if len(pbo_matrix) < 2:
-        pbo_matrix = [
-            _numeric_series(item.get("window_returns"))
-            for item in parameter_stability["results"]
-            if isinstance(item, Mapping) and _numeric_series(item.get("window_returns"))
-        ]
-        pbo_matrix.insert(0, window_returns)
-    width = min((len(row) for row in pbo_matrix), default=0)
-    pbo_matrix = [row[:width] for row in pbo_matrix if width >= 2]
-    pbo: float | dict[str, Any]
-    if len(pbo_matrix) < 2:
-        pbo = {
-            "status": "not_applicable",
-            "passed": True,
-            "reason": "no_valid_configuration_cohort",
-            "cohort_size": len(pbo_matrix),
-        }
-    else:
-        pbo = probability_backtest_overfitting(pbo_matrix)
-    skew, kurtosis = _skew_kurtosis(analysis_returns)
-    trial_sharpes = _trial_sharpes(context, parameter_stability, analysis_returns)
-    trial_count = max(
-        1,
-        int(
-            context.get(
-                "trial_count",
-                context.get(
-                    "global_trial_count",
-                    len(trial_sharpes) or parameter_stability["neighbours_tested"] + 1,
-                ),
-            )
-        ),
-    )
-    trial_sharpe_std = float(context.get("trial_sharpe_std", 0.0))
-    if "trial_sharpe_std" not in context and len(trial_sharpes) >= 2:
-        trial_sharpe_std = statistics.pstdev(trial_sharpes)
-    dsr = deflated_sharpe_ratio(
-        sharpe_ratio(analysis_returns),
-        n_trials=trial_count,
-        skew=skew,
-        kurt=kurtosis,
-        n_obs=len(analysis_returns),
-        sr_std_trials=trial_sharpe_std,
+    pbo, pbo_matrix = _pbo_measurements(context, parameter_stability, window_returns)
+    trial_sharpes, trial_count, trial_sharpe_std, dsr = _trial_statistics(
+        context, parameter_stability, analysis_returns
     )
     expected_definition_hash = candidate.definition.definition_hash
     observed_definition_hash = str(context.get("strategy_definition_hash") or "")
@@ -870,21 +889,122 @@ def _trial_sharpes(
     return [sharpe_ratio(values) for values in series if _numeric_series(values)]
 
 
-def _parameter_stability(
-    candidate: Candidate, context: Mapping[str, Any], base_returns: list[float]
-) -> dict[str, Any]:
+def _tunable_parameter_names(candidate: Candidate, context: Mapping[str, Any]) -> tuple[str, ...]:
     parameters = candidate.definition.signal_model.get("parameters", {})
     declared_tunable = context.get("tunable_parameters")
     if isinstance(declared_tunable, list | tuple):
-        tunable = tuple(str(name) for name in declared_tunable)
-    elif isinstance(parameters, Mapping):
-        tunable = tuple(
+        return tuple(str(name) for name in declared_tunable)
+    if isinstance(parameters, Mapping):
+        return tuple(
             str(name)
             for name, value in parameters.items()
             if isinstance(value, int | float) and not isinstance(value, bool)
         )
-    else:
-        tunable = ()
+    return ()
+
+
+def _declared_parameter_neighbours(context: Mapping[str, Any]) -> dict[str, list[float]]:
+    raw = context.get("parameter_neighbour_returns", context.get("neighbour_returns", {}))
+    if not isinstance(raw, Mapping):
+        return {}
+    return {
+        str(name): numeric for name, values in raw.items() if (numeric := _numeric_series(values))
+    }
+
+
+def _generated_parameter_neighbours(
+    candidate: Candidate,
+    context: Mapping[str, Any],
+    parameters: Mapping[str, Any],
+) -> dict[str, list[float]]:
+    frame = context.get("market_frame")
+    strategy_name = candidate.definition.signal_model.get("registered_strategy")
+    if frame is None or not isinstance(strategy_name, str):
+        return {}
+    neighbours: dict[str, list[float]] = {}
+    try:
+        for name, value in parameters.items():
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                continue
+            step = 1 if isinstance(value, int) else max(abs(float(value)) * 0.1, 0.01)
+            for direction in (-1, 1):
+                varied = dict(parameters)
+                varied[str(name)] = value + direction * step
+                if isinstance(value, int):
+                    varied[str(name)] = max(1, int(varied[str(name)]))
+                varied_behaviour = RegisteredStrategyBehaviour(
+                    name=strategy_name,
+                    parameters=varied,
+                    source_hash=candidate.definition.source_hash,
+                )
+                signals = varied_behaviour.generate_signals(frame)
+                numeric_signals = _numeric_series(signals)
+                returns = _market_price_returns(context, len(numeric_signals))
+                aligned = min(len(returns), max(0, len(numeric_signals) - 1))
+                neighbours[f"{name}:{direction:+d}"] = [
+                    numeric_signals[index] * returns[index] for index in range(aligned)
+                ]
+    except (ExecutorError, KeyError, TypeError, ValueError, StrategyBehaviourError):
+        return {}
+    return neighbours
+
+
+def _parameter_neighbours(
+    candidate: Candidate, context: Mapping[str, Any]
+) -> dict[str, list[float]]:
+    neighbours = _declared_parameter_neighbours(context)
+    if neighbours:
+        return neighbours
+    parameters = candidate.definition.signal_model.get("parameters", {})
+    if not isinstance(parameters, Mapping):
+        return {}
+    return _generated_parameter_neighbours(candidate, context, parameters)
+
+
+def _parameter_stability_results(
+    candidate: Candidate,
+    context: Mapping[str, Any],
+    base_returns: list[float],
+    neighbours: Mapping[str, list[float]],
+) -> list[dict[str, Any]]:
+    results = []
+    base_total = sum(base_returns)
+    snapshots = list(context.get("dataset_snapshot_ids", ()))
+    for name, values in sorted(neighbours.items()):
+        comparable = values[: len(base_returns)]
+        results.append(
+            {
+                "name": name,
+                "run_id": canonical_hash(
+                    {
+                        "kind": "parameter_neighbour_backtest/v1",
+                        "candidate_id": candidate.candidate_id,
+                        "dataset_snapshot_ids": snapshots,
+                        "neighbour": name,
+                        "returns": comparable,
+                    }
+                ),
+                "observations": len(comparable),
+                "return": sum(comparable),
+                "passed": bool(comparable) and sum(comparable) >= base_total * 0.5,
+                "window_returns": _window_sums(comparable, 3),
+                "input_hash": canonical_hash(
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "dataset_snapshot_ids": snapshots,
+                        "neighbour": name,
+                        "returns": comparable,
+                    }
+                ),
+            }
+        )
+    return results
+
+
+def _parameter_stability(
+    candidate: Candidate, context: Mapping[str, Any], base_returns: list[float]
+) -> dict[str, Any]:
+    tunable = _tunable_parameter_names(candidate, context)
     if not tunable:
         return {
             "status": "not_applicable",
@@ -894,70 +1014,9 @@ def _parameter_stability(
             "results": [],
             "base_window_returns": _window_sums(base_returns, 3),
         }
-    raw = context.get("parameter_neighbour_returns", context.get("neighbour_returns", {}))
-    neighbours: dict[str, list[float]] = {}
-    if isinstance(raw, Mapping):
-        for name, values in raw.items():
-            numeric = _numeric_series(values)
-            if numeric:
-                neighbours[str(name)] = numeric
-    if not neighbours:
-        frame = context.get("market_frame")
-        strategy_name = candidate.definition.signal_model.get("registered_strategy")
-        if isinstance(parameters, Mapping) and frame is not None and isinstance(strategy_name, str):
-            try:
-                for name, value in parameters.items():
-                    if isinstance(value, bool) or not isinstance(value, int | float):
-                        continue
-                    step = 1 if isinstance(value, int) else max(abs(float(value)) * 0.1, 0.01)
-                    for direction in (-1, 1):
-                        varied = dict(parameters)
-                        varied[str(name)] = value + direction * step
-                        if isinstance(value, int):
-                            varied[str(name)] = max(1, int(varied[str(name)]))
-                        varied_behaviour = RegisteredStrategyBehaviour(
-                            name=strategy_name,
-                            parameters=varied,
-                            source_hash=candidate.definition.source_hash,
-                        )
-                        signals = varied_behaviour.generate_signals(frame)
-                        numeric_signals = _numeric_series(signals)
-                        returns = _market_price_returns(context, len(numeric_signals))
-                        aligned = min(len(returns), max(0, len(numeric_signals) - 1))
-                        neighbours[f"{name}:{direction:+d}"] = [
-                            numeric_signals[index] * returns[index] for index in range(aligned)
-                        ]
-            except (ExecutorError, KeyError, TypeError, ValueError, StrategyBehaviourError):
-                neighbours = {}
-    results = []
+    neighbours = _parameter_neighbours(candidate, context)
+    results = _parameter_stability_results(candidate, context, base_returns, neighbours)
     base_total = sum(base_returns)
-    for name, values in sorted(neighbours.items()):
-        comparable = values[: len(base_returns)]
-        result = {
-            "name": name,
-            "run_id": canonical_hash(
-                {
-                    "kind": "parameter_neighbour_backtest/v1",
-                    "candidate_id": candidate.candidate_id,
-                    "dataset_snapshot_ids": list(context.get("dataset_snapshot_ids", ())),
-                    "neighbour": name,
-                    "returns": comparable,
-                }
-            ),
-            "observations": len(comparable),
-            "return": sum(comparable),
-            "passed": bool(comparable) and sum(comparable) >= base_total * 0.5,
-            "window_returns": _window_sums(comparable, 3),
-            "input_hash": canonical_hash(
-                {
-                    "candidate_id": candidate.candidate_id,
-                    "dataset_snapshot_ids": list(context.get("dataset_snapshot_ids", ())),
-                    "neighbour": name,
-                    "returns": comparable,
-                }
-            ),
-        }
-        results.append(result)
     neighbour_returns = [float(item["return"]) for item in results]
     median_return = statistics.median(neighbour_returns) if neighbour_returns else None
     worst_return = min(neighbour_returns) if neighbour_returns else None
@@ -1298,7 +1357,9 @@ def _negative_control_evidence(
         comparable = numeric[:aligned]
         control_return = sum(comparable) if comparable else None
         results[name] = {
-            "passed": bool(comparable) and candidate_return >= float(control_return),
+            "passed": bool(comparable)
+            and control_return is not None
+            and candidate_return >= control_return,
             "observations": len(comparable),
             "control_return": control_return,
             "input_hash": canonical_hash({"control": name, "returns": comparable})
