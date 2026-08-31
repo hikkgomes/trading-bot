@@ -521,45 +521,24 @@ class CanonicalResearchDatasetBuilder:
         with a partial bundle.
         """
 
-        if hasattr(bars, "to_pylist"):
-            bars = bars.to_pylist()
-        if isinstance(bars, Mapping) or isinstance(bars, str):
-            raise DatasetResolutionError("bars must be an iterable of row objects")
-        materialised_rows = tuple(bars)
-        if any(not isinstance(row, Mapping) for row in materialised_rows):
-            raise DatasetResolutionError("bars must contain only row objects")
-        materialised = tuple(dict(row) for row in materialised_rows)
-        if not materialised:
-            raise DatasetResolutionError("dataset data_pending: no immutable bars are available")
+        materialised = self._materialise_bars(bars)
         created = timestamp(created_at, field="created_at")
         scope = {str(item) for item in instrument_scope}
         payload_by_role: dict[str, Any] = {}
         availability: dict[str, str] = {}
         for role, raw_interval in intervals.items():
             interval = self._interval(raw_interval, field=f"intervals.{role}")
-            selected = []
-            for row in materialised:
-                instrument_id = str(row.get("instrument_id") or row.get("symbol") or "")
-                if instrument_id not in scope:
-                    continue
-                observed = row.get("close_timestamp", row.get("timestamp"))
-                available = row.get("availability_time", row.get("available_at", observed))
-                if observed is None or available is None:
-                    continue
-                observed_at = _bar_timestamp(observed, field=f"{role}.bar_timestamp")
-                available_at = _bar_timestamp(available, field=f"{role}.availability_time")
-                if interval["start"] <= observed_at < interval["end"] and available_at <= created:
-                    selected.append(row)
+            selected = self._select_bars(
+                materialised,
+                role=role,
+                interval=interval,
+                scope=scope,
+                created=created,
+            )
             if not selected:
                 raise DatasetResolutionError(
                     f"dataset data_pending: no available bars for role {role}"
                 )
-            selected.sort(
-                key=lambda row: (
-                    str(row.get("close_timestamp", row.get("timestamp"))),
-                    str(row.get("instrument_id", row.get("symbol", ""))),
-                )
-            )
             payload_by_role[role] = {
                 "bars": selected,
                 "independent_units": len(selected),
@@ -578,6 +557,67 @@ class CanonicalResearchDatasetBuilder:
             created_at=created,
             engine_version=engine_version,
             source_partition_hashes=source_partition_hashes,
+        )
+
+    @staticmethod
+    def _materialise_bars(bars: Any) -> tuple[dict[str, Any], ...]:
+        if hasattr(bars, "to_pylist"):
+            bars = bars.to_pylist()
+        if isinstance(bars, Mapping) or isinstance(bars, str):
+            raise DatasetResolutionError("bars must be an iterable of row objects")
+        rows = tuple(bars)
+        if any(not isinstance(row, Mapping) for row in rows):
+            raise DatasetResolutionError("bars must contain only row objects")
+        materialised = tuple(dict(row) for row in rows)
+        if not materialised:
+            raise DatasetResolutionError("dataset data_pending: no immutable bars are available")
+        return materialised
+
+    @classmethod
+    def _select_bars(
+        cls,
+        rows: tuple[dict[str, Any], ...],
+        *,
+        role: str,
+        interval: Mapping[str, str],
+        scope: set[str],
+        created: str,
+    ) -> list[dict[str, Any]]:
+        selected: list[dict[str, Any]] = []
+        for row in rows:
+            if cls._bar_is_available(
+                row, role=role, interval=interval, scope=scope, created=created
+            ):
+                selected.append(row)
+        selected.sort(key=cls._bar_sort_key)
+        return selected
+
+    @staticmethod
+    def _bar_is_available(
+        row: Mapping[str, Any],
+        *,
+        role: str,
+        interval: Mapping[str, str],
+        scope: set[str],
+        created: str,
+    ) -> bool:
+        instrument_id = str(row.get("instrument_id") or row.get("symbol") or "")
+        if instrument_id not in scope:
+            return False
+        observed = row.get("close_timestamp", row.get("timestamp"))
+        available = row.get("availability_time", row.get("available_at", observed))
+        if observed is None or available is None:
+            return False
+        observed_at = _bar_timestamp(observed, field=f"{role}.bar_timestamp")
+        available_at = _bar_timestamp(available, field=f"{role}.availability_time")
+        return interval["start"] <= observed_at < interval["end"] and available_at <= created
+
+    @staticmethod
+    def _bar_sort_key(row: Mapping[str, Any]) -> tuple[str, str]:
+        observed = row.get("close_timestamp", row.get("timestamp"))
+        return (
+            _bar_timestamp(observed, field="bar_timestamp") if observed is not None else "",
+            str(row.get("instrument_id", row.get("symbol", ""))),
         )
 
     @staticmethod

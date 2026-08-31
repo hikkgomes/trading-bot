@@ -30,34 +30,51 @@ class PortfolioConstraints:
     min_score: float = 0.0
 
     def __post_init__(self) -> None:
-        if not self.portfolio_id:
-            raise ValueError("portfolio_id cannot be empty")
-        if self.equity <= 0:
-            raise ValueError("equity must be positive")
-        if not 1 <= self.max_positions <= 1_000:
-            raise ValueError("max_positions must be in [1, 1000]")
-        for field in (
-            "max_net_fraction",
-            "max_symbol_fraction",
-            "max_correlation",
-            "max_turnover_fraction",
-            "max_abs_funding_rate",
-            "max_cluster_fraction",
-            "max_drawdown_fraction",
-        ):
-            value = float(getattr(self, field))
-            if not 0 < value <= 1:
-                raise ValueError(f"{field} must be in (0, 1]")
-        for field in ("max_gross_fraction", "max_abs_beta"):
-            value = float(getattr(self, field))
-            if not 0 < value <= 3:
-                raise ValueError(f"{field} must be in (0, 3]")
-        if not 0 < float(self.max_margin_fraction) <= 1:
-            raise ValueError("max_margin_fraction must be in (0, 1]")
-        for field in ("min_confidence", "min_score"):
-            value = float(getattr(self, field))
-            if not 0 <= value <= 1:
-                raise ValueError(f"{field} must be in [0, 1]")
+        _validate_identity(self)
+        _validate_position_limit(self.max_positions)
+        _validate_fraction_fields(self)
+        _validate_bounded_fields(self)
+
+
+def _validate_identity(constraints: PortfolioConstraints) -> None:
+    if not constraints.portfolio_id:
+        raise ValueError("portfolio_id cannot be empty")
+    if constraints.equity <= 0:
+        raise ValueError("equity must be positive")
+
+
+def _validate_position_limit(max_positions: int) -> None:
+    if not 1 <= max_positions <= 1_000:
+        raise ValueError("max_positions must be in [1, 1000]")
+
+
+def _validate_fraction_fields(constraints: PortfolioConstraints) -> None:
+    fields = (
+        "max_net_fraction",
+        "max_symbol_fraction",
+        "max_correlation",
+        "max_turnover_fraction",
+        "max_abs_funding_rate",
+        "max_cluster_fraction",
+        "max_drawdown_fraction",
+    )
+    for field in fields:
+        value = float(getattr(constraints, field))
+        if not 0 < value <= 1:
+            raise ValueError(f"{field} must be in (0, 1]")
+
+
+def _validate_bounded_fields(constraints: PortfolioConstraints) -> None:
+    for field in ("max_gross_fraction", "max_abs_beta"):
+        value = float(getattr(constraints, field))
+        if not 0 < value <= 3:
+            raise ValueError(f"{field} must be in (0, 3]")
+    if not 0 < float(constraints.max_margin_fraction) <= 1:
+        raise ValueError("max_margin_fraction must be in (0, 1]")
+    for field in ("min_confidence", "min_score"):
+        value = float(getattr(constraints, field))
+        if not 0 <= value <= 1:
+            raise ValueError(f"{field} must be in [0, 1]")
 
 
 def _correlation(correlations: Mapping[str, Mapping[str, float]], first: str, second: str) -> float:
