@@ -210,6 +210,26 @@ def _validate_json(value: Any, *, label: str) -> Any:
         raise ValueError(f"{label} must contain only finite JSON values: {exc}") from exc
 
 
+def _normalise_behavior_mapping(value: Mapping[str, Any], *, depth: int) -> dict[str, Any]:
+    normalised: dict[str, Any] = {}
+    ignored = _TOP_LEVEL_NON_BEHAVIORAL if depth == 0 else _NESTED_NON_BEHAVIORAL
+    for child_key in sorted(value):
+        if not isinstance(child_key, str):
+            raise ValueError("strategy spec object keys must be strings")
+        if child_key not in ignored:
+            normalised[child_key] = _normalise_behavior(
+                value[child_key], key=child_key, depth=depth + 1
+            )
+    return normalised
+
+
+def _normalise_behavior_sequence(value: Sequence[Any], *, key: str | None, depth: int) -> list[Any]:
+    items = [_normalise_behavior(item, depth=depth + 1) for item in value]
+    if key in _COMMUTATIVE_LIST_FIELDS:
+        items.sort(key=_canonical_json)
+    return items
+
+
 def _normalise_behavior(value: Any, *, key: str | None = None, depth: int = 0) -> Any:
     if value is None or isinstance(value, str | bool | int):
         return value
@@ -218,26 +238,11 @@ def _normalise_behavior(value: Any, *, key: str | None = None, depth: int = 0) -
             raise ValueError("strategy spec contains a non-finite number")
         if value == 0:
             return 0
-        if value.is_integer():
-            return int(value)
-        return value
+        return int(value) if value.is_integer() else value
     if isinstance(value, Mapping):
-        normalised: dict[str, Any] = {}
-        ignored = _TOP_LEVEL_NON_BEHAVIORAL if depth == 0 else _NESTED_NON_BEHAVIORAL
-        for child_key in sorted(value):
-            if not isinstance(child_key, str):
-                raise ValueError("strategy spec object keys must be strings")
-            if child_key in ignored:
-                continue
-            normalised[child_key] = _normalise_behavior(
-                value[child_key], key=child_key, depth=depth + 1
-            )
-        return normalised
+        return _normalise_behavior_mapping(value, depth=depth)
     if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        items = [_normalise_behavior(item, depth=depth + 1) for item in value]
-        if key in _COMMUTATIVE_LIST_FIELDS:
-            items.sort(key=_canonical_json)
-        return items
+        return _normalise_behavior_sequence(value, key=key, depth=depth)
     raise ValueError(f"strategy spec contains unsupported value {type(value).__name__}")
 
 
@@ -1062,7 +1067,22 @@ class ExperimentMemory:
         return {"ok": True, "path": str(self.path), "deep": deep, "schema_version": SCHEMA_VERSION}
 
     def _deep_integrity_check(self, connection: sqlite3.Connection) -> None:
-        strategy_hashes: set[str] = set()
+        strategy_hashes = self._integrity_strategy_hashes(connection)
+        self._integrity_identity_rows(connection, strategy_hashes)
+        self._integrity_lineage(connection, strategy_hashes)
+        holdout_cohorts = self._integrity_holdout_cohorts(connection, strategy_hashes)
+        protected_intervals = self._integrity_protected_intervals(connection, holdout_cohorts)
+        protected_hashes, expected_scopes = self._integrity_evaluations(
+            connection,
+            strategy_hashes,
+            holdout_cohorts,
+            protected_intervals,
+        )
+        self._integrity_engine_scopes(connection, expected_scopes)
+        self._integrity_protected_claims(connection, protected_hashes)
+
+    def _integrity_strategy_hashes(self, connection: sqlite3.Connection) -> set[str]:
+        hashes: set[str] = set()
         for row in connection.execute(
             "SELECT behavior_hash, canonical_spec_json, primary_spec_json FROM strategies"
         ):
@@ -1073,10 +1093,14 @@ class ExperimentMemory:
                 raise ExperimentMemoryCorruptionError(
                     f"strategy behavioral hash mismatch: {row['behavior_hash']}"
                 )
-            strategy_hashes.add(row["behavior_hash"])
+            hashes.add(row["behavior_hash"])
+        return hashes
 
+    @staticmethod
+    def _integrity_identity_rows(connection: sqlite3.Connection, strategy_hashes: set[str]) -> None:
         for row in connection.execute(
-            "SELECT strategy_id, behavior_hash, submitted_spec_json, parent_hashes_json FROM strategy_identities"
+            "SELECT strategy_id, behavior_hash, submitted_spec_json, parent_hashes_json "
+            "FROM strategy_identities"
         ):
             submitted = _stored_json(row["submitted_spec_json"], label="identity submitted JSON")
             parents = _stored_json(row["parent_hashes_json"], label="identity parent JSON")
@@ -1091,6 +1115,8 @@ class ExperimentMemory:
                     f"identity has invalid parents: {row['strategy_id']}"
                 )
 
+    @staticmethod
+    def _integrity_lineage(connection: sqlite3.Connection, strategy_hashes: set[str]) -> None:
         edges: dict[str, set[str]] = defaultdict(set)
         for row in connection.execute("SELECT child_hash, parent_hash FROM lineage_edges"):
             edges[row["child_hash"]].add(row["parent_hash"])
@@ -1111,17 +1137,18 @@ class ExperimentMemory:
         for behavior_hash in strategy_hashes:
             visit(behavior_hash)
 
-        holdout_cohorts: dict[str, tuple[set[str], set[str]]] = {}
+    @staticmethod
+    def _integrity_holdout_cohorts(
+        connection: sqlite3.Connection, strategy_hashes: set[str]
+    ) -> dict[str, tuple[set[str], set[str]]]:
+        cohorts: dict[str, tuple[set[str], set[str]]] = {}
         for row in connection.execute("SELECT * FROM holdout_cohorts"):
-            expected_scope_key = _holdout_scope_key(row["data_snapshot_id"])
-            if row["scope_key"] != expected_scope_key:
+            scope_key = _holdout_scope_key(row["data_snapshot_id"])
+            if row["scope_key"] != scope_key:
                 raise ExperimentMemoryCorruptionError(
                     f"holdout cohort scope mismatch: {row['scope_key']}"
                 )
-            members = _stored_json(
-                row["member_hashes_json"],
-                label="holdout cohort member JSON",
-            )
+            members = _stored_json(row["member_hashes_json"], label="holdout cohort member JSON")
             if (
                 not isinstance(members, list)
                 or not members
@@ -1131,14 +1158,13 @@ class ExperimentMemory:
                 raise ExperimentMemoryCorruptionError(
                     f"holdout cohort has invalid members: {row['scope_key']}"
                 )
-            protocol_hashes = _stored_json(
-                row["protocol_hashes_json"],
-                label="holdout cohort protocol JSON",
+            protocols = _stored_json(
+                row["protocol_hashes_json"], label="holdout cohort protocol JSON"
             )
             if (
-                not isinstance(protocol_hashes, list)
-                or not protocol_hashes
-                or protocol_hashes != sorted(set(protocol_hashes))
+                not isinstance(protocols, list)
+                or not protocols
+                or protocols != sorted(set(protocols))
             ):
                 raise ExperimentMemoryCorruptionError(
                     f"holdout cohort has invalid protocols: {row['scope_key']}"
@@ -1146,15 +1172,21 @@ class ExperimentMemory:
             try:
                 validated_protocols = {
                     _validate_hash(value, label="holdout cohort protocol_hash")
-                    for value in protocol_hashes
+                    for value in protocols
                 }
             except ValueError as exc:
                 raise ExperimentMemoryCorruptionError(
                     f"holdout cohort has invalid protocols: {row['scope_key']}"
                 ) from exc
-            holdout_cohorts[row["scope_key"]] = (set(members), validated_protocols)
+            cohorts[row["scope_key"]] = (set(members), validated_protocols)
+        return cohorts
 
-        protected_intervals: dict[str, sqlite3.Row] = {}
+    @staticmethod
+    def _integrity_protected_intervals(
+        connection: sqlite3.Connection,
+        cohorts: dict[str, tuple[set[str], set[str]]],
+    ) -> dict[str, sqlite3.Row]:
+        intervals: dict[str, sqlite3.Row] = {}
         for row in connection.execute("SELECT * FROM protected_intervals"):
             try:
                 market = _validate_text(row["market"], label="protected market", maximum=64)
@@ -1164,8 +1196,7 @@ class ExperimentMemory:
                     label="protected interval",
                 )
                 evidence = _stored_json(
-                    row["dataset_evidence_json"],
-                    label="protected interval evidence JSON",
+                    row["dataset_evidence_json"], label="protected interval evidence JSON"
                 )
                 if not isinstance(evidence, Mapping):
                     raise ValueError("protected evidence is not an object")
@@ -1180,23 +1211,23 @@ class ExperimentMemory:
                 raise ExperimentMemoryCorruptionError(
                     f"protected interval is invalid: {row['interval_key']}"
                 ) from exc
-            if (
-                market != market.lower()
-                or symbol != symbol.upper()
-                or start_utc != row["start_utc"]
-                or end_utc != row["end_utc"]
-                or interval_key != row["interval_key"]
-                or evidence_hash != row["evidence_hash"]
-                or canonical_evidence != evidence
-                or evidence.get("snapshot_id") != row["data_snapshot_id"]
-                or row["cohort_scope_key"] != _holdout_scope_key(row["data_snapshot_id"])
-                or row["cohort_scope_key"] not in holdout_cohorts
-            ):
+            valid = (
+                market == market.lower()
+                and symbol == symbol.upper()
+                and start_utc == row["start_utc"]
+                and end_utc == row["end_utc"]
+                and interval_key == row["interval_key"]
+                and evidence_hash == row["evidence_hash"]
+                and canonical_evidence == evidence
+                and evidence.get("snapshot_id") == row["data_snapshot_id"]
+                and row["cohort_scope_key"] == _holdout_scope_key(row["data_snapshot_id"])
+                and row["cohort_scope_key"] in cohorts
+            )
+            if not valid:
                 raise ExperimentMemoryCorruptionError(
                     f"protected interval identity mismatch: {row['interval_key']}"
                 )
-            protected_intervals[row["interval_key"]] = row
-
+            intervals[row["interval_key"]] = row
         overlap = connection.execute(
             """
             SELECT left_interval.interval_key AS left_key,
@@ -1225,9 +1256,72 @@ class ExperimentMemory:
                 "protected interval registry contains overlapping entries: "
                 f"{overlap['left_key']} and {overlap['right_key']}"
             )
+        return intervals
 
+    @staticmethod
+    def _integrity_evaluation_state(row: sqlite3.Row, reasons: Any) -> None:
+        if row["status"] == "completed":
+            if not row["completed_at"] or not row["outcome"]:
+                raise ExperimentMemoryCorruptionError(
+                    f"completed evaluation is incomplete: {row['evaluation_key']}"
+                )
+        elif row["completed_at"] or row["outcome"] or reasons:
+            raise ExperimentMemoryCorruptionError(
+                f"claimed evaluation contains premature outcome: {row['evaluation_key']}"
+            )
+
+    @staticmethod
+    def _integrity_protected_evaluation(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        dataset: Any,
+        window: Any,
+        holdout_cohorts: dict[str, tuple[set[str], set[str]]],
+        protected_intervals: dict[str, sqlite3.Row],
+    ) -> None:
+        scope_key = _holdout_scope_key(row["data_snapshot_id"])
+        cohort_members, cohort_protocols = holdout_cohorts.get(scope_key, (set(), set()))
+        if (
+            row["behavior_hash"] not in cohort_members
+            or row["protocol_hash"] not in cohort_protocols
+        ):
+            raise ExperimentMemoryCorruptionError(
+                f"protected evaluation is outside its frozen cohort: {row['evaluation_key']}"
+            )
+        start_utc, end_utc = _normalise_interval(window, label="protected evaluation window")
+        matches = [
+            item
+            for item in protected_intervals.values()
+            if item["cohort_scope_key"] == scope_key
+            and item["start_utc"] == start_utc
+            and item["end_utc"] == end_utc
+        ]
+        if len(matches) != 1:
+            raise ExperimentMemoryCorruptionError(
+                "protected evaluation is outside its wall-clock interval registry: "
+                f"{row['evaluation_key']}"
+            )
+        sealed_evidence = _stored_json(
+            matches[0]["dataset_evidence_json"],
+            label="protected interval evidence JSON",
+        )
+        if not _evidence_is_subset(_portable_evidence(dataset), sealed_evidence):
+            raise ExperimentMemoryCorruptionError(
+                "protected evaluation contradicts its sealed dataset evidence: "
+                f"{row['evaluation_key']}"
+            )
+
+    @classmethod
+    def _integrity_evaluations(
+        cls,
+        connection: sqlite3.Connection,
+        strategy_hashes: set[str],
+        holdout_cohorts: dict[str, tuple[set[str], set[str]]],
+        protected_intervals: dict[str, sqlite3.Row],
+    ) -> tuple[set[str], dict[str, tuple[str, str, str, str]]]:
         protected_hashes: set[str] = set()
-        expected_engine_scopes: dict[str, tuple[str, str, str, str]] = {}
+        expected_scopes: dict[str, tuple[str, str, str, str]] = {}
         for row in connection.execute("SELECT * FROM evaluations"):
             dataset = _stored_json(row["dataset_json"], label="evaluation dataset JSON")
             window = _stored_json(row["window_json"], label="evaluation window JSON")
@@ -1255,65 +1349,33 @@ class ExperimentMemory:
                 raise ExperimentMemoryCorruptionError(
                     f"evaluation context mismatch: {row['evaluation_key']}"
                 )
-            if row["status"] == "completed":
-                if not row["completed_at"] or not row["outcome"]:
-                    raise ExperimentMemoryCorruptionError(
-                        f"completed evaluation is incomplete: {row['evaluation_key']}"
-                    )
-            elif row["completed_at"] or row["outcome"] or reasons:
-                raise ExperimentMemoryCorruptionError(
-                    f"claimed evaluation contains premature outcome: {row['evaluation_key']}"
-                )
+            cls._integrity_evaluation_state(row, reasons)
             if row["phase"] in PROTECTED_PHASES:
                 protected_hashes.add(row["behavior_hash"])
-                scope_key = _holdout_scope_key(row["data_snapshot_id"])
-                cohort_members, cohort_protocols = holdout_cohorts.get(
-                    scope_key,
-                    (set(), set()),
+                cls._integrity_protected_evaluation(
+                    connection,
+                    row,
+                    dataset=dataset,
+                    window=window,
+                    holdout_cohorts=holdout_cohorts,
+                    protected_intervals=protected_intervals,
                 )
-                if (
-                    row["behavior_hash"] not in cohort_members
-                    or row["protocol_hash"] not in cohort_protocols
-                ):
-                    raise ExperimentMemoryCorruptionError(
-                        f"protected evaluation is outside its frozen cohort: {row['evaluation_key']}"
-                    )
-                start_utc, end_utc = _normalise_interval(
-                    window,
-                    label="protected evaluation window",
-                )
-                interval_matches = [
-                    item
-                    for item in protected_intervals.values()
-                    if item["cohort_scope_key"] == scope_key
-                    and item["start_utc"] == start_utc
-                    and item["end_utc"] == end_utc
-                ]
-                if len(interval_matches) != 1:
-                    raise ExperimentMemoryCorruptionError(
-                        "protected evaluation is outside its wall-clock interval registry: "
-                        f"{row['evaluation_key']}"
-                    )
-                protected_interval = interval_matches[0]
-                sealed_evidence = _stored_json(
-                    protected_interval["dataset_evidence_json"],
-                    label="protected interval evidence JSON",
-                )
-                if not _evidence_is_subset(_portable_evidence(dataset), sealed_evidence):
-                    raise ExperimentMemoryCorruptionError(
-                        "protected evaluation contradicts its sealed dataset evidence: "
-                        f"{row['evaluation_key']}"
-                    )
             digest = _research_engine_digest(protocol)
             if digest is not None:
-                expected_engine_scopes[row["evaluation_key"]] = (
+                expected_scopes[row["evaluation_key"]] = (
                     row["behavior_hash"],
                     digest,
                     row["phase"],
                     row["claimed_at"],
                 )
+        return protected_hashes, expected_scopes
 
-        actual_engine_scopes = {
+    @staticmethod
+    def _integrity_engine_scopes(
+        connection: sqlite3.Connection,
+        expected_scopes: dict[str, tuple[str, str, str, str]],
+    ) -> None:
+        actual_scopes = {
             row["evaluation_key"]: (
                 row["behavior_hash"],
                 row["research_engine_digest"],
@@ -1322,11 +1384,14 @@ class ExperimentMemory:
             )
             for row in connection.execute("SELECT * FROM evaluation_engine_scopes")
         }
-        if actual_engine_scopes != expected_engine_scopes:
+        if actual_scopes != expected_scopes:
             raise ExperimentMemoryCorruptionError(
                 "evaluation engine-scope index does not match immutable protocols"
             )
 
+    def _integrity_protected_claims(
+        self, connection: sqlite3.Connection, protected_hashes: set[str]
+    ) -> None:
         exposed = {
             row["behavior_hash"]
             for row in connection.execute(
@@ -1359,6 +1424,187 @@ class ExperimentMemory:
                     f"protected evaluation lacks lineage holdout claim: {row['evaluation_key']}"
                 )
 
+    @staticmethod
+    def _prepare_strategy_registration(
+        spec: Mapping[str, Any],
+        *,
+        strategy_id: str,
+        generation_method: str,
+        parent_hashes: Sequence[str],
+        metadata: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        strategy_id = _validate_text(strategy_id, label="strategy_id")
+        generation_method = _validate_text(
+            generation_method, label="generation_method", maximum=128
+        )
+        submitted_spec = _validate_json(dict(spec), label="strategy spec")
+        canonical_spec = canonical_strategy_spec(submitted_spec)
+        behavior_hash = _sha256_json(canonical_spec)
+        metadata = {} if metadata is None else metadata
+        if not isinstance(metadata, Mapping):
+            raise ValueError("metadata must be a JSON object")
+        metadata_json = _validate_json(dict(metadata), label="metadata")
+        for key in ("family", "product", "opportunity_type"):
+            if key not in metadata_json and isinstance(submitted_spec.get(key), str):
+                metadata_json[key] = submitted_spec[key]
+        parents = list(dict.fromkeys(parent_hashes))
+        if len(parents) > MAX_PARENTS:
+            raise ValueError(f"a strategy cannot have more than {MAX_PARENTS} parents")
+        for parent in parents:
+            _validate_hash(parent, label="parent_hash")
+        return {
+            "strategy_id": strategy_id,
+            "generation_method": generation_method,
+            "submitted_spec": submitted_spec,
+            "canonical_spec": canonical_spec,
+            "behavior_hash": behavior_hash,
+            "metadata": metadata_json,
+            "primitives": _extract_primitives(submitted_spec, metadata_json),
+            "parents": parents,
+            "now": _utc_now(),
+        }
+
+    def _existing_strategy_registration(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        strategy_id: str,
+        behavior_hash: str,
+    ) -> StrategyRegistration | None:
+        existing = connection.execute(
+            "SELECT behavior_hash, is_duplicate FROM strategy_identities WHERE strategy_id = ?",
+            (strategy_id,),
+        ).fetchone()
+        if existing is None:
+            return None
+        if existing["behavior_hash"] != behavior_hash:
+            raise StrategyIdentityConflictError(
+                f"strategy_id {strategy_id!r} already identifies different behavior"
+            )
+        row = self._strategy_row(connection, behavior_hash)
+        return StrategyRegistration(
+            strategy_id=strategy_id,
+            behavior_hash=behavior_hash,
+            created=False,
+            identity_created=False,
+            duplicate=bool(existing["is_duplicate"]),
+            novelty_score=float(row["novelty_score"]),
+            nearest_behavior_hash=row["nearest_behavior_hash"],
+        )
+
+    @staticmethod
+    def _validate_strategy_parents(connection: sqlite3.Connection, parents: list[str]) -> None:
+        missing = [
+            parent
+            for parent in parents
+            if connection.execute(
+                "SELECT 1 FROM strategies WHERE behavior_hash = ?", (parent,)
+            ).fetchone()
+            is None
+        ]
+        if missing:
+            raise ValueError(f"unknown parent strategy hash(es): {', '.join(missing)}")
+
+    def _persist_strategy_definition(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        strategy_id: str,
+        behavior_hash: str,
+        submitted_spec: dict[str, Any],
+        canonical_spec: dict[str, Any],
+        generation_method: str,
+        metadata: dict[str, Any],
+        primitives: list[str],
+        parents: list[str],
+        now: str,
+    ) -> tuple[bool, float, str | None]:
+        existing = connection.execute(
+            "SELECT * FROM strategies WHERE behavior_hash = ?", (behavior_hash,)
+        ).fetchone()
+        if existing is None:
+            novelty_score, nearest_hash = self._nearest_strategy(
+                connection, _novelty_tokens(canonical_spec)
+            )
+            connection.execute(
+                """
+                INSERT INTO strategies(
+                    behavior_hash, canonical_spec_json, primary_spec_json,
+                    primary_strategy_id, generation_method, metadata_json,
+                    primitive_tokens_json, novelty_tokens_json, novelty_score,
+                    nearest_behavior_hash, product, opportunity_type, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    behavior_hash,
+                    _canonical_json(canonical_spec),
+                    _canonical_json(submitted_spec),
+                    strategy_id,
+                    generation_method,
+                    _canonical_json(metadata),
+                    _canonical_json(primitives),
+                    _canonical_json(sorted(_novelty_tokens(canonical_spec))),
+                    novelty_score,
+                    nearest_hash,
+                    metadata.get("product") if isinstance(metadata.get("product"), str) else None,
+                    metadata.get("opportunity_type")
+                    if isinstance(metadata.get("opportunity_type"), str)
+                    else None,
+                    now,
+                ),
+            )
+            for ordinal, parent in enumerate(parents):
+                if parent != behavior_hash:
+                    connection.execute(
+                        """
+                        INSERT INTO lineage_edges(
+                            child_hash, parent_hash, parent_ordinal, generation_method, created_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (behavior_hash, parent, ordinal, generation_method, now),
+                    )
+            return True, novelty_score, nearest_hash
+        if (
+            _stored_json(existing["canonical_spec_json"], label="strategy canonical JSON")
+            != canonical_spec
+        ):
+            raise ExperimentMemoryCorruptionError(
+                f"behavioral hash collision detected: {behavior_hash}"
+            )
+        return False, float(existing["novelty_score"]), existing["nearest_behavior_hash"]
+
+    @staticmethod
+    def _persist_strategy_identity(
+        connection: sqlite3.Connection,
+        *,
+        strategy_id: str,
+        behavior_hash: str,
+        submitted_spec: dict[str, Any],
+        generation_method: str,
+        metadata: dict[str, Any],
+        parents: list[str],
+        duplicate: bool,
+        now: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO strategy_identities(
+                strategy_id, behavior_hash, submitted_spec_json, generation_method,
+                metadata_json, parent_hashes_json, is_duplicate, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                strategy_id,
+                behavior_hash,
+                _canonical_json(submitted_spec),
+                generation_method,
+                _canonical_json(metadata),
+                _canonical_json(parents),
+                int(duplicate),
+                now,
+            ),
+        )
+
     def register_strategy(
         self,
         spec: Mapping[str, Any],
@@ -1370,149 +1616,54 @@ class ExperimentMemory:
     ) -> StrategyRegistration:
         """Persist a generated identity and return exact-dedup/novelty evidence."""
 
-        strategy_id = _validate_text(strategy_id, label="strategy_id")
-        generation_method = _validate_text(
-            generation_method, label="generation_method", maximum=128
+        prepared = self._prepare_strategy_registration(
+            spec,
+            strategy_id=strategy_id,
+            generation_method=generation_method,
+            parent_hashes=parent_hashes,
+            metadata=metadata,
         )
-        submitted_spec = _validate_json(dict(spec), label="strategy spec")
-        canonical_spec = canonical_strategy_spec(submitted_spec)
-        behavior_hash = _sha256_json(canonical_spec)
-        if metadata is None:
-            metadata = {}
-        if not isinstance(metadata, Mapping):
-            raise ValueError("metadata must be a JSON object")
-        metadata_json = _validate_json(dict(metadata), label="metadata")
-        for key in ("family", "product", "opportunity_type"):
-            if key not in metadata_json and isinstance(submitted_spec.get(key), str):
-                metadata_json[key] = submitted_spec[key]
-        primitives = _extract_primitives(submitted_spec, metadata_json)
-        parents = list(dict.fromkeys(parent_hashes))
-        if len(parents) > MAX_PARENTS:
-            raise ValueError(f"a strategy cannot have more than {MAX_PARENTS} parents")
-        for parent in parents:
-            _validate_hash(parent, label="parent_hash")
-        now = _utc_now()
-
         with self._database(write=True) as connection:
-            existing_identity = connection.execute(
-                "SELECT behavior_hash FROM strategy_identities WHERE strategy_id = ?",
-                (strategy_id,),
-            ).fetchone()
-            if existing_identity is not None:
-                if existing_identity["behavior_hash"] != behavior_hash:
-                    raise StrategyIdentityConflictError(
-                        f"strategy_id {strategy_id!r} already identifies different behavior"
-                    )
-                row = self._strategy_row(connection, behavior_hash)
-                return StrategyRegistration(
-                    strategy_id=strategy_id,
-                    behavior_hash=behavior_hash,
-                    created=False,
-                    identity_created=False,
-                    duplicate=bool(
-                        connection.execute(
-                            "SELECT is_duplicate FROM strategy_identities WHERE strategy_id = ?",
-                            (strategy_id,),
-                        ).fetchone()[0]
-                    ),
-                    novelty_score=float(row["novelty_score"]),
-                    nearest_behavior_hash=row["nearest_behavior_hash"],
-                )
-
-            missing = [
-                parent
-                for parent in parents
-                if connection.execute(
-                    "SELECT 1 FROM strategies WHERE behavior_hash = ?", (parent,)
-                ).fetchone()
-                is None
-            ]
-            if missing:
-                raise ValueError(f"unknown parent strategy hash(es): {', '.join(missing)}")
-
-            existing = connection.execute(
-                "SELECT * FROM strategies WHERE behavior_hash = ?", (behavior_hash,)
-            ).fetchone()
-            created = existing is None
-            if created:
-                novelty_tokens = _novelty_tokens(canonical_spec)
-                novelty_score, nearest_hash = self._nearest_strategy(connection, novelty_tokens)
-                product = metadata_json.get("product")
-                opportunity_type = metadata_json.get("opportunity_type")
-                connection.execute(
-                    """
-                    INSERT INTO strategies(
-                        behavior_hash, canonical_spec_json, primary_spec_json,
-                        primary_strategy_id, generation_method, metadata_json,
-                        primitive_tokens_json, novelty_tokens_json, novelty_score,
-                        nearest_behavior_hash, product, opportunity_type, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        behavior_hash,
-                        _canonical_json(canonical_spec),
-                        _canonical_json(submitted_spec),
-                        strategy_id,
-                        generation_method,
-                        _canonical_json(metadata_json),
-                        _canonical_json(primitives),
-                        _canonical_json(sorted(novelty_tokens)),
-                        novelty_score,
-                        nearest_hash,
-                        product if isinstance(product, str) else None,
-                        opportunity_type if isinstance(opportunity_type, str) else None,
-                        now,
-                    ),
-                )
-                for ordinal, parent in enumerate(parents):
-                    if parent == behavior_hash:
-                        continue
-                    connection.execute(
-                        """
-                        INSERT INTO lineage_edges(
-                            child_hash, parent_hash, parent_ordinal, generation_method, created_at
-                        ) VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (behavior_hash, parent, ordinal, generation_method, now),
-                    )
-            else:
-                if (
-                    _stored_json(existing["canonical_spec_json"], label="strategy canonical JSON")
-                    != canonical_spec
-                ):
-                    raise ExperimentMemoryCorruptionError(
-                        f"behavioral hash collision detected: {behavior_hash}"
-                    )
-                novelty_score = float(existing["novelty_score"])
-                nearest_hash = existing["nearest_behavior_hash"]
-
-            connection.execute(
-                """
-                INSERT INTO strategy_identities(
-                    strategy_id, behavior_hash, submitted_spec_json, generation_method,
-                    metadata_json, parent_hashes_json, is_duplicate, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    strategy_id,
-                    behavior_hash,
-                    _canonical_json(submitted_spec),
-                    generation_method,
-                    _canonical_json(metadata_json),
-                    _canonical_json(parents),
-                    0 if created else 1,
-                    now,
-                ),
+            existing = self._existing_strategy_registration(
+                connection,
+                strategy_id=prepared["strategy_id"],
+                behavior_hash=prepared["behavior_hash"],
             )
-            return StrategyRegistration(
-                strategy_id=strategy_id,
-                behavior_hash=behavior_hash,
-                created=created,
-                identity_created=True,
+            if existing is not None:
+                return existing
+            self._validate_strategy_parents(connection, prepared["parents"])
+            created, novelty_score, nearest_hash = self._persist_strategy_definition(
+                connection,
+                strategy_id=prepared["strategy_id"],
+                behavior_hash=prepared["behavior_hash"],
+                submitted_spec=prepared["submitted_spec"],
+                canonical_spec=prepared["canonical_spec"],
+                generation_method=prepared["generation_method"],
+                metadata=prepared["metadata"],
+                primitives=prepared["primitives"],
+                parents=prepared["parents"],
+                now=prepared["now"],
+            )
+            self._persist_strategy_identity(
+                connection,
+                strategy_id=prepared["strategy_id"],
+                behavior_hash=prepared["behavior_hash"],
+                submitted_spec=prepared["submitted_spec"],
+                generation_method=prepared["generation_method"],
+                metadata=prepared["metadata"],
+                parents=prepared["parents"],
                 duplicate=not created,
-                novelty_score=novelty_score,
-                nearest_behavior_hash=nearest_hash,
+                now=prepared["now"],
             )
+        return StrategyRegistration(
+            strategy_id=prepared["strategy_id"],
+            behavior_hash=prepared["behavior_hash"],
+            created=created,
+            identity_created=True,
+            duplicate=not created,
+            novelty_score=novelty_score,
+            nearest_behavior_hash=nearest_hash,
+        )
 
     def _nearest_strategy(
         self, connection: sqlite3.Connection, tokens: set[str]
@@ -1656,6 +1807,202 @@ class ExperimentMemory:
             (evaluation_key, behavior_hash, digest, phase, claimed_at),
         )
 
+    @staticmethod
+    def _prepare_holdout_registration(
+        behavior_hashes: Sequence[str],
+        *,
+        dataset: Mapping[str, Any],
+        window: Mapping[str, Any],
+        protocol: Mapping[str, Any] | None,
+        phase: str,
+        min_seconds_since_last_seal: float | None,
+    ) -> dict[str, Any]:
+        if phase not in PROTECTED_PHASES:
+            raise ValueError(f"holdout phase must be one of {sorted(PROTECTED_PHASES)}")
+        if min_seconds_since_last_seal is not None and (
+            isinstance(min_seconds_since_last_seal, bool)
+            or not isinstance(min_seconds_since_last_seal, int | float)
+            or not math.isfinite(float(min_seconds_since_last_seal))
+        ):
+            raise ValueError("min_seconds_since_last_seal must be a finite number or None")
+        members = tuple(
+            sorted(
+                {
+                    _validate_hash(value, label="holdout cohort behavior_hash")
+                    for value in behavior_hashes
+                }
+            )
+        )
+        if not members:
+            raise ValueError("holdout cohort must contain at least one behavior")
+        dataset_json, window_json, protocol_json, snapshot_id, protocol_hash = _normalise_context(
+            dataset, window, protocol, phase
+        )
+        start_utc, end_utc = _normalise_interval(window_json, label="protected window")
+        market, symbol = _market_symbol(dataset_json, protocol_json)
+        interval_key, evidence, evidence_hash = _protected_interval_identity(
+            market=market,
+            symbol=symbol,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            dataset=dataset_json,
+        )
+        return {
+            "members": members,
+            "dataset_json": dataset_json,
+            "window_json": window_json,
+            "protocol_json": protocol_json,
+            "snapshot_id": snapshot_id,
+            "protocol_hash": protocol_hash,
+            "start_utc": start_utc,
+            "end_utc": end_utc,
+            "market": market,
+            "symbol": symbol,
+            "interval_key": interval_key,
+            "evidence": evidence,
+            "evidence_hash": evidence_hash,
+            "scope_key": _holdout_scope_key(snapshot_id),
+            "now": _utc_now(),
+            "min_seconds_since_last_seal": min_seconds_since_last_seal,
+        }
+
+    @staticmethod
+    def _load_holdout_cohort(
+        connection: sqlite3.Connection, context: dict[str, Any]
+    ) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+        members = context["members"]
+        snapshot_id = context["snapshot_id"]
+        protocol_hash = context["protocol_hash"]
+        scope_key = context["scope_key"]
+        existing = connection.execute(
+            "SELECT * FROM holdout_cohorts WHERE scope_key = ?", (scope_key,)
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO holdout_cohorts(
+                    scope_key, data_snapshot_id, protocol_hashes_json,
+                    member_hashes_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    scope_key,
+                    snapshot_id,
+                    _canonical_json([protocol_hash]),
+                    _canonical_json(list(members)),
+                    context["now"],
+                ),
+            )
+            return True, members, (protocol_hash,)
+        stored_members = _stored_json(
+            existing["member_hashes_json"], label="holdout cohort member JSON"
+        )
+        if not isinstance(stored_members, list) or any(
+            not isinstance(item, str) for item in stored_members
+        ):
+            raise ExperimentMemoryCorruptionError(
+                f"holdout cohort members are invalid: {scope_key}"
+            )
+        stored_protocols = _stored_json(
+            existing["protocol_hashes_json"], label="holdout cohort protocol JSON"
+        )
+        if not isinstance(stored_protocols, list) or any(
+            not isinstance(item, str) for item in stored_protocols
+        ):
+            raise ExperimentMemoryCorruptionError(
+                f"holdout cohort protocols are invalid: {scope_key}"
+            )
+        new_members = sorted(set(members) - set(stored_members))
+        if new_members:
+            raise EvaluationConflictError(
+                "protected evaluation scope is sealed against new candidates: "
+                f"snapshot={snapshot_id} behaviors={','.join(new_members)}"
+            )
+        if protocol_hash not in stored_protocols:
+            raise EvaluationConflictError(
+                "protected data snapshot is sealed to a different preregistered protocol: "
+                f"snapshot={snapshot_id}"
+            )
+        return False, tuple(stored_members), tuple(stored_protocols)
+
+    def _seal_holdout_interval(
+        self,
+        connection: sqlite3.Connection,
+        context: dict[str, Any],
+        *,
+        cohort_created: bool,
+    ) -> None:
+        scope_key = context["scope_key"]
+        scope_evidence = connection.execute(
+            "SELECT evidence_hash FROM protected_intervals WHERE cohort_scope_key = ? LIMIT 1",
+            (scope_key,),
+        ).fetchone()
+        if (
+            scope_evidence is not None
+            and scope_evidence["evidence_hash"] != context["evidence_hash"]
+        ):
+            raise EvaluationConflictError(
+                "immutable evidence changed for an already sealed data snapshot: "
+                f"snapshot={context['snapshot_id']}"
+            )
+        overlap = self._overlapping_protected_interval(
+            connection,
+            market=context["market"],
+            symbol=context["symbol"],
+            start_utc=context["start_utc"],
+            end_utc=context["end_utc"],
+        )
+        if overlap is not None:
+            if overlap["interval_key"] != context["interval_key"]:
+                raise EvaluationConflictError(
+                    "protected wall-clock interval overlaps an already sealed interval: "
+                    f"market={context['market']} symbol={context['symbol']} "
+                    f"start={context['start_utc']} end={context['end_utc']}"
+                )
+            if (
+                overlap["cohort_scope_key"] != scope_key
+                or overlap["data_snapshot_id"] != context["snapshot_id"]
+                or overlap["evidence_hash"] != context["evidence_hash"]
+            ):
+                raise EvaluationConflictError(
+                    "immutable evidence changed for an already sealed wall-clock interval: "
+                    f"market={context['market']} symbol={context['symbol']} "
+                    f"start={context['start_utc']} end={context['end_utc']}"
+                )
+            return
+        if not cohort_created and scope_evidence is None:
+            raise EvaluationConflictError(
+                "legacy protected cohort has no trustworthy wall-clock interval evidence: "
+                f"snapshot={context['snapshot_id']}"
+            )
+        self._assert_seal_budget_available(
+            connection,
+            market=context["market"],
+            symbol=context["symbol"],
+            min_seconds_since_last_seal=context["min_seconds_since_last_seal"],
+        )
+        connection.execute(
+            """
+            INSERT INTO protected_intervals(
+                interval_key, market, symbol, start_utc, end_utc,
+                data_snapshot_id, dataset_evidence_json, evidence_hash,
+                cohort_scope_key, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                context["interval_key"],
+                context["market"],
+                context["symbol"],
+                context["start_utc"],
+                context["end_utc"],
+                context["snapshot_id"],
+                _canonical_json(context["evidence"]),
+                context["evidence_hash"],
+                scope_key,
+                context["now"],
+            ),
+        )
+
     def register_holdout_cohort(
         self,
         behavior_hashes: Sequence[str],
@@ -1680,168 +2027,24 @@ class ExperimentMemory:
         both pass it.
         """
 
-        if phase not in PROTECTED_PHASES:
-            raise ValueError(f"holdout phase must be one of {sorted(PROTECTED_PHASES)}")
-        if min_seconds_since_last_seal is not None and (
-            isinstance(min_seconds_since_last_seal, bool)
-            or not isinstance(min_seconds_since_last_seal, int | float)
-            or not math.isfinite(float(min_seconds_since_last_seal))
-        ):
-            raise ValueError("min_seconds_since_last_seal must be a finite number or None")
-        members = tuple(
-            sorted(
-                {
-                    _validate_hash(value, label="holdout cohort behavior_hash")
-                    for value in behavior_hashes
-                }
-            )
+        context = self._prepare_holdout_registration(
+            behavior_hashes,
+            dataset=dataset,
+            window=window,
+            protocol=protocol,
+            phase=phase,
+            min_seconds_since_last_seal=min_seconds_since_last_seal,
         )
-        if not members:
-            raise ValueError("holdout cohort must contain at least one behavior")
-        dataset_json, window_json, protocol_json, snapshot_id, protocol_hash = _normalise_context(
-            dataset,
-            window,
-            protocol,
-            phase,
-        )
-        start_utc, end_utc = _normalise_interval(window_json, label="protected window")
-        market, symbol = _market_symbol(dataset_json, protocol_json)
-        interval_key, evidence, evidence_hash = _protected_interval_identity(
-            market=market,
-            symbol=symbol,
-            start_utc=start_utc,
-            end_utc=end_utc,
-            dataset=dataset_json,
-        )
-        scope_key = _holdout_scope_key(snapshot_id)
-        now = _utc_now()
         with self._database(write=True) as connection:
-            for behavior_hash in members:
+            for behavior_hash in context["members"]:
                 self._strategy_row(connection, behavior_hash)
-            overlap = self._overlapping_protected_interval(
-                connection,
-                market=market,
-                symbol=symbol,
-                start_utc=start_utc,
-                end_utc=end_utc,
+            cohort_created, stored_members, stored_protocols = self._load_holdout_cohort(
+                connection, context
             )
-            if overlap is not None and overlap["interval_key"] != interval_key:
-                raise EvaluationConflictError(
-                    "protected wall-clock interval overlaps an already sealed interval: "
-                    f"market={market} symbol={symbol} start={start_utc} end={end_utc}"
-                )
-            existing = connection.execute(
-                "SELECT * FROM holdout_cohorts WHERE scope_key = ?",
-                (scope_key,),
-            ).fetchone()
-            cohort_created = existing is None
-            if existing is None:
-                connection.execute(
-                    """
-                    INSERT INTO holdout_cohorts(
-                        scope_key, data_snapshot_id, protocol_hashes_json,
-                        member_hashes_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        scope_key,
-                        snapshot_id,
-                        _canonical_json([protocol_hash]),
-                        _canonical_json(list(members)),
-                        now,
-                    ),
-                )
-                stored_members = members
-                stored_protocols = (protocol_hash,)
-            else:
-                stored = _stored_json(
-                    existing["member_hashes_json"],
-                    label="holdout cohort member JSON",
-                )
-                if not isinstance(stored, list) or any(
-                    not isinstance(item, str) for item in stored
-                ):
-                    raise ExperimentMemoryCorruptionError(
-                        f"holdout cohort members are invalid: {scope_key}"
-                    )
-                stored_protocol_values = _stored_json(
-                    existing["protocol_hashes_json"],
-                    label="holdout cohort protocol JSON",
-                )
-                if not isinstance(stored_protocol_values, list) or any(
-                    not isinstance(item, str) for item in stored_protocol_values
-                ):
-                    raise ExperimentMemoryCorruptionError(
-                        f"holdout cohort protocols are invalid: {scope_key}"
-                    )
-                stored_members = tuple(stored)
-                stored_protocols = tuple(stored_protocol_values)
-                new_members = sorted(set(members) - set(stored_members))
-                if new_members:
-                    raise EvaluationConflictError(
-                        "protected evaluation scope is sealed against new candidates: "
-                        f"snapshot={snapshot_id} behaviors={','.join(new_members)}"
-                    )
-                if protocol_hash not in stored_protocols:
-                    raise EvaluationConflictError(
-                        "protected data snapshot is sealed to a different preregistered protocol: "
-                        f"snapshot={snapshot_id}"
-                    )
-
-            scope_evidence = connection.execute(
-                "SELECT evidence_hash FROM protected_intervals WHERE cohort_scope_key = ? LIMIT 1",
-                (scope_key,),
-            ).fetchone()
-            if scope_evidence is not None and scope_evidence["evidence_hash"] != evidence_hash:
-                raise EvaluationConflictError(
-                    "immutable evidence changed for an already sealed data snapshot: "
-                    f"snapshot={snapshot_id}"
-                )
-            if overlap is None:
-                if not cohort_created and scope_evidence is None:
-                    raise EvaluationConflictError(
-                        "legacy protected cohort has no trustworthy wall-clock interval evidence: "
-                        f"snapshot={snapshot_id}"
-                    )
-                self._assert_seal_budget_available(
-                    connection,
-                    market=market,
-                    symbol=symbol,
-                    min_seconds_since_last_seal=min_seconds_since_last_seal,
-                )
-                connection.execute(
-                    """
-                    INSERT INTO protected_intervals(
-                        interval_key, market, symbol, start_utc, end_utc,
-                        data_snapshot_id, dataset_evidence_json, evidence_hash,
-                        cohort_scope_key, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        interval_key,
-                        market,
-                        symbol,
-                        start_utc,
-                        end_utc,
-                        snapshot_id,
-                        _canonical_json(evidence),
-                        evidence_hash,
-                        scope_key,
-                        now,
-                    ),
-                )
-            elif (
-                overlap["cohort_scope_key"] != scope_key
-                or overlap["data_snapshot_id"] != snapshot_id
-                or overlap["evidence_hash"] != evidence_hash
-            ):
-                raise EvaluationConflictError(
-                    "immutable evidence changed for an already sealed wall-clock interval: "
-                    f"market={market} symbol={symbol} start={start_utc} end={end_utc}"
-                )
+            self._seal_holdout_interval(connection, context, cohort_created=cohort_created)
             return HoldoutCohort(
-                scope_key=scope_key,
-                data_snapshot_id=snapshot_id,
+                scope_key=context["scope_key"],
+                data_snapshot_id=context["snapshot_id"],
                 protocol_hashes=stored_protocols,
                 member_hashes=stored_members,
                 created=cohort_created,
@@ -2725,6 +2928,39 @@ class ExperimentMemory:
             )
         return True
 
+    @staticmethod
+    def _prepare_candidate_parent_query(
+        *,
+        product: str | None,
+        opportunity_type: str | None,
+        limit: int,
+        latest_outcomes: Sequence[str] | None,
+        research_engine_digest: str | None,
+    ) -> tuple[int, str, list[Any], set[str] | None, str | None]:
+        limit = _validate_limit(limit)
+        if product is not None:
+            product = _validate_text(product, label="product", maximum=128)
+        if opportunity_type is not None:
+            opportunity_type = _validate_text(
+                opportunity_type, label="opportunity_type", maximum=128
+            )
+        if research_engine_digest is not None:
+            research_engine_digest = _validate_hash(
+                research_engine_digest, label="research_engine_digest"
+            )
+        params: list[Any] = []
+        clauses: list[str] = []
+        for name, value in (("product", product), ("opportunity_type", opportunity_type)):
+            if value is not None:
+                clauses.append(f"{name} = ?")
+                params.append(value)
+        query = "SELECT * FROM strategies"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, behavior_hash"
+        allowed = None if latest_outcomes is None else set(latest_outcomes)
+        return limit, query, params, allowed, research_engine_digest
+
     def candidate_parents(
         self,
         *,
@@ -2738,31 +2974,15 @@ class ExperimentMemory:
     ) -> list[dict[str, Any]]:
         """Return bounded generator parents, excluding tainted ancestry by default."""
 
-        limit = _validate_limit(limit)
-        if product is not None:
-            product = _validate_text(product, label="product", maximum=128)
-        if opportunity_type is not None:
-            opportunity_type = _validate_text(
-                opportunity_type, label="opportunity_type", maximum=128
+        limit, query, params, allowed_outcomes, research_engine_digest = (
+            self._prepare_candidate_parent_query(
+                product=product,
+                opportunity_type=opportunity_type,
+                limit=limit,
+                latest_outcomes=latest_outcomes,
+                research_engine_digest=research_engine_digest,
             )
-        allowed_outcomes = None if latest_outcomes is None else set(latest_outcomes)
-        if research_engine_digest is not None:
-            research_engine_digest = _validate_hash(
-                research_engine_digest,
-                label="research_engine_digest",
-            )
-        params: list[Any] = []
-        where: list[str] = []
-        if product is not None:
-            where.append("product = ?")
-            params.append(product)
-        if opportunity_type is not None:
-            where.append("opportunity_type = ?")
-            params.append(opportunity_type)
-        query = "SELECT * FROM strategies"
-        if where:
-            query += " WHERE " + " AND ".join(where)
-        query += " ORDER BY created_at DESC, behavior_hash"
+        )
         results: list[dict[str, Any]] = []
         with self._database(write=False) as connection:
             for row in connection.execute(query, params):
@@ -3002,6 +3222,199 @@ class ExperimentMemory:
             "edges": [dict(row) for row in rows],
         }
 
+    @staticmethod
+    def _feedback_totals(connection: sqlite3.Connection) -> dict[str, int]:
+        queries = {
+            "strategies": "SELECT COUNT(*) FROM strategies",
+            "identities": "SELECT COUNT(*) FROM strategy_identities",
+            "duplicate_identities": "SELECT COUNT(*) FROM strategy_identities WHERE is_duplicate = 1",
+            "evaluations": "SELECT COUNT(*) FROM evaluations",
+            "claimed": "SELECT COUNT(*) FROM evaluations WHERE status = 'claimed'",
+            "completed": "SELECT COUNT(*) FROM evaluations WHERE status = 'completed'",
+            "holdout_exposed": "SELECT COUNT(*) FROM strategies WHERE holdout_exposed_at IS NOT NULL",
+            "retired": "SELECT COUNT(*) FROM strategies WHERE retired_at IS NOT NULL",
+        }
+        return {
+            name: int(connection.execute(query).fetchone()[0]) for name, query in queries.items()
+        }
+
+    @classmethod
+    def _feedback_strategy_info(
+        cls,
+        connection: sqlite3.Connection,
+        methods: dict[str, dict[str, Any]],
+        families: dict[str, dict[str, Any]],
+        primitives: dict[str, dict[str, Any]],
+    ) -> dict[str, tuple[str, str, list[str], float]]:
+        strategy_info: dict[str, tuple[str, str, list[str], float]] = {}
+        for row in connection.execute(
+            """
+            SELECT behavior_hash, generation_method, metadata_json,
+                   primitive_tokens_json, novelty_score FROM strategies
+            """
+        ):
+            metadata = _stored_json(row["metadata_json"], label="strategy metadata JSON")
+            family = str(metadata.get("family") or "unknown")
+            primitive_list = _stored_json(
+                row["primitive_tokens_json"], label="strategy primitive-token JSON"
+            )
+            method = row["generation_method"]
+            novelty = float(row["novelty_score"])
+            strategy_info[row["behavior_hash"]] = (method, family, primitive_list, novelty)
+            for bucket in [
+                methods[method],
+                families[family],
+                *(primitives[p] for p in primitive_list),
+            ]:
+                bucket["unique_strategies"] += 1
+                bucket["novelty_sum"] += novelty
+        return strategy_info
+
+    @staticmethod
+    def _feedback_identity_rows(
+        connection: sqlite3.Connection,
+        methods: dict[str, dict[str, Any]],
+        families: dict[str, dict[str, Any]],
+        primitives: dict[str, dict[str, Any]],
+    ) -> None:
+        for row in connection.execute(
+            """
+            SELECT identity.generation_method, identity.is_duplicate,
+                   identity.metadata_json, strategy.metadata_json AS strategy_metadata_json,
+                   strategy.primitive_tokens_json
+            FROM strategy_identities identity
+            JOIN strategies strategy ON strategy.behavior_hash = identity.behavior_hash
+            """
+        ):
+            bucket = methods[row["generation_method"]]
+            bucket["proposals"] += 1
+            bucket["duplicates"] += int(bool(row["is_duplicate"]))
+            identity_metadata = _stored_json(row["metadata_json"], label="identity metadata JSON")
+            strategy_metadata = _stored_json(
+                row["strategy_metadata_json"], label="strategy metadata JSON"
+            )
+            family = str(
+                identity_metadata.get("family") or strategy_metadata.get("family") or "unknown"
+            )
+            primitive_list = _stored_json(
+                row["primitive_tokens_json"], label="strategy primitive-token JSON"
+            )
+            for proposal_bucket in [families[family], *(primitives[p] for p in primitive_list)]:
+                proposal_bucket["proposals"] += 1
+                proposal_bucket["duplicates"] += int(bool(row["is_duplicate"]))
+
+    @classmethod
+    def _feedback_evaluations(
+        cls,
+        connection: sqlite3.Connection,
+        strategy_info: dict[str, tuple[str, str, list[str], float]],
+        methods: dict[str, dict[str, Any]],
+        families: dict[str, dict[str, Any]],
+        primitives: dict[str, dict[str, Any]],
+        *,
+        research_engine_digest: str | None,
+    ) -> tuple[Counter[str], Counter[str]]:
+        outcomes: Counter[str] = Counter()
+        reasons: Counter[str] = Counter()
+        placeholders = ",".join("?" for _ in PROTECTED_PHASES)
+        for row in connection.execute(
+            f"""
+            SELECT behavior_hash, outcome, rejection_reasons_json, protocol_json
+            FROM evaluations
+            WHERE status = 'completed' AND phase NOT IN ({placeholders})
+            """,
+            tuple(sorted(PROTECTED_PHASES)),
+        ):
+            if research_engine_digest is not None:
+                protocol = _stored_json(row["protocol_json"], label="evaluation protocol JSON")
+                if protocol.get("research_engine_digest") != research_engine_digest:
+                    continue
+            outcome = row["outcome"]
+            rejection_reasons = _stored_json(
+                row["rejection_reasons_json"], label="evaluation rejection-reason JSON"
+            )
+            outcomes[outcome] += 1
+            reasons.update(rejection_reasons)
+            info = strategy_info.get(row["behavior_hash"])
+            if info is None:
+                raise ExperimentMemoryCorruptionError("evaluation references unknown strategy")
+            method, family, primitive_list, _ = info
+            for bucket in [
+                methods[method],
+                families[family],
+                *(primitives[p] for p in primitive_list),
+            ]:
+                bucket["experiments"] += 1
+                bucket["outcomes"][outcome] += 1
+                bucket["rejection_reasons"].update(rejection_reasons)
+        return outcomes, reasons
+
+    @classmethod
+    def _feedback_parent_performance(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        research_engine_digest: str | None,
+    ) -> dict[str, dict[str, Any]]:
+        placeholders = ",".join("?" for _ in PROTECTED_PHASES)
+        protected_phases = tuple(sorted(PROTECTED_PHASES))
+        performance: dict[str, dict[str, Any]] = {}
+        for row in connection.execute(
+            "SELECT parent_hash, child_hash FROM lineage_edges ORDER BY parent_hash, child_hash"
+        ):
+            parent = performance.setdefault(
+                row["parent_hash"],
+                {
+                    "parent_hash": row["parent_hash"],
+                    "children": 0,
+                    "child_outcomes": Counter(),
+                    "child_rejection_reasons": Counter(),
+                },
+            )
+            parent["children"] += 1
+            for evaluation in connection.execute(
+                f"""
+                SELECT outcome, rejection_reasons_json, protocol_json FROM evaluations
+                WHERE behavior_hash = ? AND status = 'completed'
+                  AND phase NOT IN ({placeholders})
+                """,
+                (row["child_hash"], *protected_phases),
+            ):
+                if research_engine_digest is not None:
+                    protocol = _stored_json(
+                        evaluation["protocol_json"], label="evaluation protocol JSON"
+                    )
+                    if protocol.get("research_engine_digest") != research_engine_digest:
+                        continue
+                parent["child_outcomes"][evaluation["outcome"]] += 1
+                parent["child_rejection_reasons"].update(
+                    _stored_json(
+                        evaluation["rejection_reasons_json"],
+                        label="evaluation rejection-reason JSON",
+                    )
+                )
+        return performance
+
+    @staticmethod
+    def _render_parent_performance(
+        performance: Mapping[str, dict[str, Any]], limit: int
+    ) -> list[dict[str, Any]]:
+        rendered = []
+        for item in sorted(
+            performance.values(),
+            key=lambda value: (-value["children"], value["parent_hash"]),
+        )[:limit]:
+            rendered.append(
+                {
+                    **{key: value for key, value in item.items() if not isinstance(value, Counter)},
+                    "child_outcomes": dict(item["child_outcomes"].most_common(limit)),
+                    "child_rejection_reasons": dict(
+                        item["child_rejection_reasons"].most_common(limit)
+                    ),
+                }
+            )
+        return rendered
+
     def generator_feedback(
         self,
         *,
@@ -3013,167 +3426,26 @@ class ExperimentMemory:
         category_limit = _validate_limit(category_limit)
         if research_engine_digest is not None:
             research_engine_digest = _validate_hash(
-                research_engine_digest,
-                label="research_engine_digest",
+                research_engine_digest, label="research_engine_digest"
             )
         with self._database(write=False) as connection:
-            totals = {
-                "strategies": connection.execute("SELECT COUNT(*) FROM strategies").fetchone()[0],
-                "identities": connection.execute(
-                    "SELECT COUNT(*) FROM strategy_identities"
-                ).fetchone()[0],
-                "duplicate_identities": connection.execute(
-                    "SELECT COUNT(*) FROM strategy_identities WHERE is_duplicate = 1"
-                ).fetchone()[0],
-                "evaluations": connection.execute("SELECT COUNT(*) FROM evaluations").fetchone()[0],
-                "claimed": connection.execute(
-                    "SELECT COUNT(*) FROM evaluations WHERE status = 'claimed'"
-                ).fetchone()[0],
-                "completed": connection.execute(
-                    "SELECT COUNT(*) FROM evaluations WHERE status = 'completed'"
-                ).fetchone()[0],
-                "holdout_exposed": connection.execute(
-                    "SELECT COUNT(*) FROM strategies WHERE holdout_exposed_at IS NOT NULL"
-                ).fetchone()[0],
-                "retired": connection.execute(
-                    "SELECT COUNT(*) FROM strategies WHERE retired_at IS NOT NULL"
-                ).fetchone()[0],
-            }
-            outcome_counts: Counter[str] = Counter()
-            reason_counts: Counter[str] = Counter()
             methods: dict[str, dict[str, Any]] = defaultdict(self._feedback_bucket)
             families: dict[str, dict[str, Any]] = defaultdict(self._feedback_bucket)
             primitives: dict[str, dict[str, Any]] = defaultdict(self._feedback_bucket)
-            strategy_info: dict[str, tuple[str, str, list[str], float]] = {}
-
-            for row in connection.execute(
-                """
-                SELECT behavior_hash, generation_method, metadata_json,
-                       primitive_tokens_json, novelty_score FROM strategies
-                """
-            ):
-                metadata = _stored_json(row["metadata_json"], label="strategy metadata JSON")
-                family = str(metadata.get("family") or "unknown")
-                primitive_list = _stored_json(
-                    row["primitive_tokens_json"], label="strategy primitive-token JSON"
-                )
-                method = row["generation_method"]
-                novelty = float(row["novelty_score"])
-                strategy_info[row["behavior_hash"]] = (method, family, primitive_list, novelty)
-                for bucket in [
-                    methods[method],
-                    families[family],
-                    *(primitives[p] for p in primitive_list),
-                ]:
-                    bucket["unique_strategies"] += 1
-                    bucket["novelty_sum"] += novelty
-
-            for row in connection.execute(
-                """
-                SELECT identity.generation_method, identity.is_duplicate,
-                       identity.metadata_json, strategy.metadata_json AS strategy_metadata_json,
-                       strategy.primitive_tokens_json
-                FROM strategy_identities identity
-                JOIN strategies strategy ON strategy.behavior_hash = identity.behavior_hash
-                """
-            ):
-                bucket = methods[row["generation_method"]]
-                bucket["proposals"] += 1
-                if row["is_duplicate"]:
-                    bucket["duplicates"] += 1
-                identity_metadata = _stored_json(
-                    row["metadata_json"], label="identity metadata JSON"
-                )
-                strategy_metadata = _stored_json(
-                    row["strategy_metadata_json"], label="strategy metadata JSON"
-                )
-                family = str(
-                    identity_metadata.get("family") or strategy_metadata.get("family") or "unknown"
-                )
-                proposal_buckets = [
-                    families[family],
-                    *(
-                        primitives[primitive]
-                        for primitive in _stored_json(
-                            row["primitive_tokens_json"],
-                            label="strategy primitive-token JSON",
-                        )
-                    ),
-                ]
-                for proposal_bucket in proposal_buckets:
-                    proposal_bucket["proposals"] += 1
-                    if row["is_duplicate"]:
-                        proposal_bucket["duplicates"] += 1
-
-            protected_placeholders = ",".join("?" for _ in PROTECTED_PHASES)
-            protected_phases = tuple(sorted(PROTECTED_PHASES))
-            for row in connection.execute(
-                f"""
-                SELECT behavior_hash, outcome, rejection_reasons_json, protocol_json
-                FROM evaluations
-                WHERE status = 'completed' AND phase NOT IN ({protected_placeholders})
-                """,
-                protected_phases,
-            ):
-                if research_engine_digest is not None:
-                    protocol = _stored_json(row["protocol_json"], label="evaluation protocol JSON")
-                    if protocol.get("research_engine_digest") != research_engine_digest:
-                        continue
-                outcome = row["outcome"]
-                reasons = _stored_json(
-                    row["rejection_reasons_json"], label="evaluation rejection-reason JSON"
-                )
-                outcome_counts[outcome] += 1
-                reason_counts.update(reasons)
-                info = strategy_info.get(row["behavior_hash"])
-                if info is None:
-                    raise ExperimentMemoryCorruptionError("evaluation references unknown strategy")
-                method, family, primitive_list, _ = info
-                for bucket in [
-                    methods[method],
-                    families[family],
-                    *(primitives[p] for p in primitive_list),
-                ]:
-                    bucket["experiments"] += 1
-                    bucket["outcomes"][outcome] += 1
-                    bucket["rejection_reasons"].update(reasons)
-
-            parent_performance: dict[str, dict[str, Any]] = {}
-            for row in connection.execute(
-                "SELECT parent_hash, child_hash FROM lineage_edges ORDER BY parent_hash, child_hash"
-            ):
-                parent = parent_performance.setdefault(
-                    row["parent_hash"],
-                    {
-                        "parent_hash": row["parent_hash"],
-                        "children": 0,
-                        "child_outcomes": Counter(),
-                        "child_rejection_reasons": Counter(),
-                    },
-                )
-                parent["children"] += 1
-                for evaluation in connection.execute(
-                    f"""
-                    SELECT outcome, rejection_reasons_json, protocol_json FROM evaluations
-                    WHERE behavior_hash = ? AND status = 'completed'
-                      AND phase NOT IN ({protected_placeholders})
-                    """,
-                    (row["child_hash"], *protected_phases),
-                ):
-                    if research_engine_digest is not None:
-                        protocol = _stored_json(
-                            evaluation["protocol_json"], label="evaluation protocol JSON"
-                        )
-                        if protocol.get("research_engine_digest") != research_engine_digest:
-                            continue
-                    parent["child_outcomes"][evaluation["outcome"]] += 1
-                    parent["child_rejection_reasons"].update(
-                        _stored_json(
-                            evaluation["rejection_reasons_json"],
-                            label="evaluation rejection-reason JSON",
-                        )
-                    )
-
+            strategy_info = self._feedback_strategy_info(connection, methods, families, primitives)
+            self._feedback_identity_rows(connection, methods, families, primitives)
+            outcome_counts, reason_counts = self._feedback_evaluations(
+                connection,
+                strategy_info,
+                methods,
+                families,
+                primitives,
+                research_engine_digest=research_engine_digest,
+            )
+            parent_performance = self._feedback_parent_performance(
+                connection, research_engine_digest=research_engine_digest
+            )
+            totals = self._feedback_totals(connection)
         return {
             "schema_version": SCHEMA_VERSION,
             "research_engine_digest": research_engine_digest,
@@ -3184,19 +3456,9 @@ class ExperimentMemory:
             "generation_methods": self._render_feedback_groups(methods, category_limit),
             "families": self._render_feedback_groups(families, category_limit),
             "primitives": self._render_feedback_groups(primitives, category_limit),
-            "parent_performance": [
-                {
-                    **{k: v for k, v in item.items() if not isinstance(v, Counter)},
-                    "child_outcomes": dict(item["child_outcomes"].most_common(category_limit)),
-                    "child_rejection_reasons": dict(
-                        item["child_rejection_reasons"].most_common(category_limit)
-                    ),
-                }
-                for item in sorted(
-                    parent_performance.values(),
-                    key=lambda value: (-value["children"], value["parent_hash"]),
-                )[:category_limit]
-            ],
+            "parent_performance": self._render_parent_performance(
+                parent_performance, category_limit
+            ),
         }
 
     @staticmethod
