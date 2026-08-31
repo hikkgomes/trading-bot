@@ -34,7 +34,7 @@ from src.research.evidence import (
     select_profile,
     semantic_parity_passes,
 )
-from src.research.executors import ExecutorError, ProviderExecutorRegistry
+from src.research.executors import ExecutionResult, ExecutorError, ProviderExecutorRegistry
 from src.research.objectives import objective_is_available, objective_passes
 from src.research.store import SqlResearchStore
 from src.research.theses import SqlThesisRegistry, ThesisError
@@ -77,6 +77,74 @@ ALLOWED_REQUEST_FIELDS = frozenset(
 
 class EvaluationContractError(ValueError):
     """A research job tried to submit outcomes or an invalid identity."""
+
+
+@dataclass(frozen=True)
+class _ExecutionAttempt:
+    result: ExecutionResult | None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class _ProtectedClaim:
+    outcome_id: str | None
+    accepted: bool
+    error: str | None = None
+
+
+_REQUIRED_STAGE_FIELDS: dict[str, tuple[str, ...]] = {
+    "development": (
+        "chronological",
+        "data_integrity",
+        "semantic_parity",
+        "realistic_costs",
+        "family_evidence",
+        "cost_adjusted_return",
+        "funding",
+        "regime_breakdown",
+        "parameter_stability",
+        "sample_evidence",
+        "cross_symbol_stability",
+        "universe_evidence",
+    ),
+    "robustness": (
+        "data_integrity",
+        "semantic_parity",
+        "realistic_costs",
+        "family_evidence",
+        "walk_forward",
+        "purged",
+        "embargo",
+        "cost_stress",
+        "delay_stress",
+        "adverse_fill_stress",
+        "missing_data_stress",
+        "funding_stress",
+        "monte_carlo_trade_order",
+        "bootstrap_confidence",
+        "probability_backtest_overfitting",
+        "deflated_sharpe",
+        "drawdown_stability",
+        "null_results",
+        "negative_control_results",
+    ),
+    "forward": (
+        "data_integrity",
+        "semantic_parity",
+        "realistic_costs",
+        "family_evidence",
+        "production_equivalent",
+        "exact_strategy_identity",
+        "exact_artefact_hash",
+        "exact_engine_hash",
+        "exact_cost_model",
+        "drift_checks",
+        "duration",
+        "evidence_units",
+        "sample_evidence",
+        "forward_duration",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -1177,6 +1245,332 @@ class CanonicalResearchEvaluator:
             evidence={**dict(evidence), "validation_stage_id": stage_id},
         )
 
+    def _execute_stage(
+        self,
+        stage: str,
+        candidate,
+        context: Mapping[str, Any],
+    ) -> _ExecutionAttempt:
+        if stage not in {"screening", "development", "robustness", "forward"}:
+            return _ExecutionAttempt(None)
+        context_error = self.provider_context.get("provider_context_error")
+        if isinstance(context_error, str) and context_error:
+            return _ExecutionAttempt(None, context_error)
+        try:
+            return _ExecutionAttempt(
+                self.executors.execute(candidate, {**self.provider_context, **context})
+            )
+        except (ExecutorError, KeyError, ValueError, TypeError) as exc:
+            return _ExecutionAttempt(None, f"{type(exc).__name__}: {exc}")
+
+    def _screening_stage(
+        self,
+        candidate,
+        context: Mapping[str, Any],
+        *,
+        identity: str,
+        family: str,
+        horizon: str,
+        evidence_type: str,
+        execution: ExecutionResult,
+    ) -> tuple[
+        dict[str, Any],
+        bool,
+        str | None,
+        Mapping[str, Any] | None,
+        Mapping[str, float],
+    ]:
+        definition = candidate.definition
+        measured = dict(execution.evidence)
+        fields_valid = all(
+            isinstance(getattr(definition, field), Mapping)
+            for field in (
+                "universe",
+                "data_requirements",
+                "feature_graph",
+                "signal_model",
+                "position_model",
+                "execution_preferences",
+                "risk_policy",
+                "validation_policy",
+            )
+        )
+        causality_valid = not any(
+            token in json_value(definition.feature_graph, field="feature_graph").__repr__().lower()
+            for token in ("future", "lookahead", "leak")
+        )
+        evidence = {
+            "identity": identity,
+            **measured,
+            "features_contract_valid": fields_valid,
+            "causality_contract_valid": causality_valid,
+            "context": dict(context),
+            "execution_receipt": dict(execution.receipt),
+        }
+        accepted = (
+            fields_valid
+            and causality_valid
+            and self.evidence_policy.accepts(
+                "screening",
+                measured,
+                self._negative_controls(candidate.thesis_id),
+                product_id=definition.product,
+                family=family,
+                horizon=horizon,
+                evidence_type=evidence_type,
+            )
+        )
+        return (
+            evidence,
+            accepted,
+            None if accepted else "screening_measured_evidence_missing",
+            execution.receipt,
+            execution.metrics,
+        )
+
+    def _protected_stage(
+        self,
+        candidate,
+        context: Mapping[str, Any],
+        *,
+        identity: str,
+        protected_snapshot_id: str | None,
+    ) -> tuple[
+        dict[str, Any],
+        bool,
+        str | None,
+        Mapping[str, Any] | None,
+        Mapping[str, float],
+    ]:
+        definition = candidate.definition
+        source_hashes = {
+            "code_hash": str(context["code_hash"]),
+            "feature_manifest_id": str(context["feature_manifest_id"]),
+            "cost_model_id": str(context["cost_model_id"]),
+        }
+        claim = self._claim_protected_holdout(
+            definition,
+            context,
+            source_hashes=source_hashes,
+            protected_snapshot_id=protected_snapshot_id,
+        )
+        if claim.error is not None:
+            return (
+                {
+                    "identity": identity,
+                    "context": dict(context),
+                    "holdout_claim_error": claim.error,
+                },
+                False,
+                "protected_holdout_claim_failed",
+                None,
+                {},
+            )
+        claims = self.protected.claim_for(definition.strategy_version_id)
+        evidence = {
+            "identity": identity,
+            "frozen_cohort": bool(claims),
+            "holdout_claim": [row["id"] for row in claims],
+            "data_commitment": canonical_hash(
+                {
+                    "dataset_snapshot_id": protected_snapshot_id,
+                    "source_hashes": source_hashes,
+                }
+            ),
+            "code_hash": context["code_hash"],
+            "holdout_outcome_id": claim.outcome_id,
+            "sealed_outcome": {
+                "passed": claim.accepted,
+                "outcome_id": claim.outcome_id,
+            },
+            "context": dict(context),
+        }
+        accepted = bool(claims) and claim.accepted if self.protected_worker is not None else False
+        return (
+            evidence,
+            accepted,
+            None if accepted else "protected_holdout_outcome_missing",
+            None,
+            {},
+        )
+
+    def _claim_protected_holdout(
+        self,
+        definition,
+        context: Mapping[str, Any],
+        *,
+        source_hashes: Mapping[str, str],
+        protected_snapshot_id: str | None,
+    ) -> _ProtectedClaim:
+        try:
+            if self.protected_worker is not None:
+                _claim_id, outcome_id, accepted, _sealed_outcome = (
+                    self.protected_worker.claim_and_evaluate(
+                        strategy_version_id=definition.strategy_version_id,
+                        dataset_snapshot_id=str(protected_snapshot_id or ""),
+                        cohort_id=f"protected:{context['candidate_id']}",
+                        source_hashes=source_hashes,
+                        evaluated_at=str(context["evaluated_at"]),
+                    )
+                )
+                return _ProtectedClaim(outcome_id, accepted)
+            SqlHoldoutRepository(self.store.engine).claim(
+                strategy_version_id=definition.strategy_version_id,
+                data_snapshot_id=str(protected_snapshot_id or ""),
+                cohort_id=f"protected:{context['candidate_id']}",
+                source_hashes=source_hashes,
+                claimed_at=str(context["evaluated_at"]),
+            )
+            return _ProtectedClaim(None, False)
+        except Exception as exc:
+            return _ProtectedClaim(None, False, f"{type(exc).__name__}: {exc}")
+
+    def _authoritative_runs(
+        self, context: Mapping[str, Any], execution: ExecutionResult | None
+    ) -> tuple[list[dict[str, Any]], set[str]]:
+        runs = self.store.runs(context["candidate_id"])
+        authoritative_runs: list[dict[str, Any]] = []
+        for row in runs:
+            raw_payload = row.get("payload")
+            if not isinstance(raw_payload, Mapping):
+                continue
+            raw_receipt = raw_payload.get("receipt")
+            if not isinstance(raw_receipt, Mapping):
+                continue
+            if raw_receipt.get("candidate_id") != context["candidate_id"]:
+                continue
+            if tuple(raw_receipt.get("dataset_snapshot_ids", ())) != tuple(
+                context["dataset_snapshot_ids"]
+            ):
+                continue
+            authoritative_runs.append({"id": str(row["id"]), "payload": dict(raw_payload)})
+        run_names = {str(row["payload"].get("run_name")) for row in authoritative_runs}
+        if execution is not None:
+            authoritative_runs.append(
+                {
+                    "id": "executed:" + execution.receipt["input_hash"],
+                    "payload": {
+                        "run_name": "canonical-execution",
+                        "evidence": execution.evidence,
+                        "metrics": execution.metrics,
+                        "receipt": execution.receipt,
+                    },
+                }
+            )
+            run_names = run_names | {"canonical-execution"}
+        return authoritative_runs, run_names
+
+    @staticmethod
+    def _merge_authoritative_runs(
+        authoritative_runs: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, float], Mapping[str, Any] | None]:
+        run_measured: dict[str, Any] = {}
+        metrics: dict[str, float] = {}
+        receipt: Mapping[str, Any] | None = None
+        for row in authoritative_runs:
+            payload = cast(Mapping[str, Any], row["payload"])
+            run_evidence = payload.get("evidence")
+            if isinstance(run_evidence, Mapping):
+                run_measured.update(run_evidence)
+            run_metrics = payload.get("metrics")
+            if isinstance(run_metrics, Mapping):
+                for key, value in run_metrics.items():
+                    if isinstance(value, int | float) and not isinstance(value, bool):
+                        metrics[str(key)] = float(value)
+            raw_receipt = payload.get("receipt")
+            if receipt is None and isinstance(raw_receipt, Mapping) and raw_receipt:
+                receipt = raw_receipt
+        return run_measured, metrics, receipt
+
+    def _adaptive_stage(
+        self,
+        stage: str,
+        candidate,
+        context: Mapping[str, Any],
+        *,
+        identity: str,
+        family: str,
+        horizon: str,
+        evidence_type: str,
+        execution: ExecutionResult | None,
+    ) -> tuple[
+        dict[str, Any],
+        bool,
+        str | None,
+        Mapping[str, Any] | None,
+        Mapping[str, float],
+    ]:
+        required_runs = {
+            "development": ("bar_portfolio",),
+            "robustness": ("bar_portfolio", "event_replay"),
+            "forward": ("forward_paper",),
+        }
+        authoritative_runs, run_names = self._authoritative_runs(context, execution)
+        required_runs_for_stage = required_runs[stage]
+        missing_runs = (
+            []
+            if execution is not None
+            else [name for name in required_runs_for_stage if name not in run_names]
+        )
+        evidence = {
+            "identity": identity,
+            "authoritative_run_ids": [row["id"] for row in authoritative_runs],
+            "required_runs": list(required_runs_for_stage),
+            "available_runs": sorted(run_names),
+            "context": dict(context),
+        }
+        if missing_runs:
+            return evidence, False, "missing_authoritative_run", None, {}
+        run_measured, metrics, receipt = self._merge_authoritative_runs(authoritative_runs)
+        evidence.update(run_measured)
+        required_fields = _REQUIRED_STAGE_FIELDS[stage]
+        requires_objective = _requires_product_objective(candidate)
+        if requires_objective and stage in {"development", "robustness", "forward"}:
+            required_fields = (*required_fields, "objective_excess_fraction")
+        controls = self._negative_controls(candidate.thesis_id)
+        policy_fields = _STAGE_EVIDENCE_VALIDATORS[stage]
+        product_id = candidate.definition.product if requires_objective else None
+        evidence_status = self.evidence_policy.statuses(
+            stage,
+            evidence,
+            controls,
+            product_id=product_id,
+            family=family,
+            horizon=horizon,
+            evidence_type=evidence_type,
+        )
+        missing = [
+            field
+            for field in required_fields
+            if field not in policy_fields
+            and field != "objective_excess_fraction"
+            or evidence_status.get(field)
+            not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
+        ]
+        accepted = not missing and self.evidence_policy.accepts(
+            stage,
+            evidence,
+            controls,
+            product_id=product_id,
+            family=family,
+            horizon=horizon,
+            evidence_type=evidence_type,
+        )
+        evidence["missing_evidence"] = missing
+        evidence["evidence_status"] = {
+            field: status.value for field, status in evidence_status.items()
+        }
+        if execution is not None:
+            receipt = execution.receipt
+            metrics.update(execution.metrics)
+        return (
+            evidence,
+            accepted,
+            None if accepted else "measured_evidence_missing",
+            receipt,
+            metrics,
+        )
+
     def _calculate_stage(
         self,
         stage: str,
@@ -1199,321 +1593,45 @@ class CanonicalResearchEvaluator:
                 "context": dict(context),
             }
         )
-        if stage in {"screening", "development", "robustness", "forward"}:
-            context_error = self.provider_context.get("provider_context_error")
-            if isinstance(context_error, str) and context_error:
-                return (
-                    {
-                        "identity": identity,
-                        "context": dict(context),
-                        "executor_error": context_error,
-                    },
-                    False,
-                    "candidate_execution_failed",
-                    None,
-                    {},
-                )
-            try:
-                execution = self.executors.execute(candidate, {**self.provider_context, **context})
-            except (ExecutorError, KeyError, ValueError, TypeError) as exc:
-                return (
-                    {
-                        "identity": identity,
-                        "context": dict(context),
-                        "executor_error": f"{type(exc).__name__}: {exc}",
-                    },
-                    False,
-                    "candidate_execution_failed",
-                    None,
-                    {},
-                )
-        else:
-            execution = None
-        if stage == "screening":
-            assert execution is not None
-            measured = dict(execution.evidence)
-            fields_valid = all(
-                isinstance(getattr(definition, field), Mapping)
-                for field in (
-                    "universe",
-                    "data_requirements",
-                    "feature_graph",
-                    "signal_model",
-                    "position_model",
-                    "execution_preferences",
-                    "risk_policy",
-                    "validation_policy",
-                )
-            )
-            causality_valid = not any(
-                token
-                in json_value(definition.feature_graph, field="feature_graph").__repr__().lower()
-                for token in ("future", "lookahead", "leak")
-            )
-            evidence = {
-                "identity": identity,
-                **measured,
-                "features_contract_valid": fields_valid,
-                "causality_contract_valid": causality_valid,
-                "context": dict(context),
-                "execution_receipt": dict(execution.receipt),
-            }
-            accepted = (
-                fields_valid
-                and causality_valid
-                and self.evidence_policy.accepts(
-                    "screening",
-                    measured,
-                    self._negative_controls(candidate.thesis_id),
-                    product_id=definition.product,
-                    family=family,
-                    horizon=horizon,
-                    evidence_type=evidence_type,
-                )
-            )
+        attempt = self._execute_stage(stage, candidate, context)
+        if attempt.error is not None:
             return (
-                evidence,
-                accepted,
-                None if accepted else "screening_measured_evidence_missing",
-                execution.receipt,
-                execution.metrics,
-            )
-
-        required_runs = {
-            "development": ("bar_portfolio",),
-            "robustness": ("bar_portfolio", "event_replay"),
-            "forward": ("forward_paper",),
-        }
-        if stage == "protected":
-            try:
-                source_hashes = {
-                    "code_hash": str(context["code_hash"]),
-                    "feature_manifest_id": str(context["feature_manifest_id"]),
-                    "cost_model_id": str(context["cost_model_id"]),
-                }
-                if self.protected_worker is not None:
-                    _claim_id, outcome_id, holdout_accepted, _sealed_outcome = (
-                        self.protected_worker.claim_and_evaluate(
-                            strategy_version_id=definition.strategy_version_id,
-                            dataset_snapshot_id=str(protected_snapshot_id or ""),
-                            cohort_id=f"protected:{context['candidate_id']}",
-                            source_hashes=source_hashes,
-                            evaluated_at=str(context["evaluated_at"]),
-                        )
-                    )
-                else:
-                    _claim_id = SqlHoldoutRepository(self.store.engine).claim(
-                        strategy_version_id=definition.strategy_version_id,
-                        data_snapshot_id=str(protected_snapshot_id or ""),
-                        cohort_id=f"protected:{context['candidate_id']}",
-                        source_hashes=source_hashes,
-                        claimed_at=str(context["evaluated_at"]),
-                    )
-                    outcome_id = None
-                    holdout_accepted = False
-            except Exception as exc:
-                return (
-                    {
-                        "identity": identity,
-                        "context": dict(context),
-                        "holdout_claim_error": f"{type(exc).__name__}: {exc}",
-                    },
-                    False,
-                    "protected_holdout_claim_failed",
-                    None,
-                    {},
-                )
-            claims = self.protected.claim_for(definition.strategy_version_id)
-            evidence = {
-                "identity": identity,
-                "frozen_cohort": bool(claims),
-                "holdout_claim": [row["id"] for row in claims],
-                "data_commitment": canonical_hash(
-                    {
-                        "dataset_snapshot_id": protected_snapshot_id,
-                        "source_hashes": source_hashes,
-                    }
-                ),
-                "code_hash": context["code_hash"],
-                "holdout_outcome_id": outcome_id,
-                "sealed_outcome": {
-                    "passed": bool(holdout_accepted),
-                    "outcome_id": outcome_id,
-                },
-                "context": dict(context),
-            }
-            accepted = (
-                bool(claims) and holdout_accepted if self.protected_worker is not None else False
-            )
-            return (
-                evidence,
-                accepted,
-                None if accepted else "protected_holdout_outcome_missing",
+                {"identity": identity, "context": dict(context), "executor_error": attempt.error},
+                False,
+                "candidate_execution_failed",
                 None,
                 {},
             )
-
-        runs = self.store.runs(context["candidate_id"])
-        authoritative_runs: list[dict[str, Any]] = []
-        for row in runs:
-            raw_payload = row.get("payload")
-            if not isinstance(raw_payload, Mapping):
-                continue
-            raw_receipt = raw_payload.get("receipt")
-            if not isinstance(raw_receipt, Mapping):
-                continue
-            if raw_receipt.get("candidate_id") != context["candidate_id"]:
-                continue
-            if tuple(raw_receipt.get("dataset_snapshot_ids", ())) != tuple(
-                context["dataset_snapshot_ids"]
-            ):
-                continue
-            authoritative_runs.append({"id": str(row["id"]), "payload": dict(raw_payload)})
-        run_names = {str(row["payload"].get("run_name")) for row in authoritative_runs}
-        required_runs_for_stage = required_runs[stage]
-        if execution is not None:
-            authoritative_runs.append(
-                {
-                    "id": "executed:" + execution.receipt["input_hash"],
-                    "payload": {
-                        "run_name": "canonical-execution",
-                        "evidence": execution.evidence,
-                        "metrics": execution.metrics,
-                        "receipt": execution.receipt,
-                    },
-                }
+        execution = attempt.result
+        if stage == "screening":
+            assert execution is not None
+            return self._screening_stage(
+                candidate,
+                context,
+                identity=identity,
+                family=family,
+                horizon=horizon,
+                evidence_type=evidence_type,
+                execution=execution,
             )
-            run_names = run_names | {"canonical-execution"}
-        missing = (
-            []
-            if execution is not None
-            else [name for name in required_runs_for_stage if name not in run_names]
-        )
-        evidence = {
-            "identity": identity,
-            "authoritative_run_ids": [row["id"] for row in authoritative_runs],
-            "required_runs": list(required_runs_for_stage),
-            "available_runs": sorted(run_names),
-            "context": dict(context),
-        }
-        if missing:
-            return evidence, False, "missing_authoritative_run", None, {}
-        run_measured: dict[str, Any] = {}
-        metrics: dict[str, float] = {}
-        for row in authoritative_runs:
-            payload = cast(Mapping[str, Any], row["payload"])
-            run_evidence = payload.get("evidence")
-            if isinstance(run_evidence, Mapping):
-                run_measured.update(run_evidence)
-            run_metrics = payload.get("metrics")
-            if isinstance(run_metrics, Mapping):
-                for key, value in run_metrics.items():
-                    if isinstance(value, int | float) and not isinstance(value, bool):
-                        metrics[str(key)] = float(value)
-        evidence.update(run_measured)
-        required_fields: tuple[str, ...] = {
-            "development": (
-                "chronological",
-                "data_integrity",
-                "semantic_parity",
-                "realistic_costs",
-                "family_evidence",
-                "cost_adjusted_return",
-                "funding",
-                "regime_breakdown",
-                "parameter_stability",
-                "sample_evidence",
-                "cross_symbol_stability",
-                "universe_evidence",
-            ),
-            "robustness": (
-                "data_integrity",
-                "semantic_parity",
-                "realistic_costs",
-                "family_evidence",
-                "walk_forward",
-                "purged",
-                "embargo",
-                "cost_stress",
-                "delay_stress",
-                "adverse_fill_stress",
-                "missing_data_stress",
-                "funding_stress",
-                "monte_carlo_trade_order",
-                "bootstrap_confidence",
-                "probability_backtest_overfitting",
-                "deflated_sharpe",
-                "drawdown_stability",
-                "null_results",
-                "negative_control_results",
-            ),
-            "forward": (
-                "data_integrity",
-                "semantic_parity",
-                "realistic_costs",
-                "family_evidence",
-                "production_equivalent",
-                "exact_strategy_identity",
-                "exact_artefact_hash",
-                "exact_engine_hash",
-                "exact_cost_model",
-                "drift_checks",
-                "duration",
-                "evidence_units",
-                "sample_evidence",
-                "forward_duration",
-            ),
-        }[stage]
-        controls = self._negative_controls(candidate.thesis_id)
-        requires_objective = _requires_product_objective(candidate)
-        if requires_objective and stage in {"development", "robustness", "forward"}:
-            required_fields = (*required_fields, "objective_excess_fraction")
-        policy_fields = _STAGE_EVIDENCE_VALIDATORS[stage]
-        evidence_status = self.evidence_policy.statuses(
+
+        if stage == "protected":
+            return self._protected_stage(
+                candidate,
+                context,
+                identity=identity,
+                protected_snapshot_id=protected_snapshot_id,
+            )
+
+        return self._adaptive_stage(
             stage,
-            evidence,
-            controls,
-            product_id=candidate.definition.product if requires_objective else None,
+            candidate,
+            context,
+            identity=identity,
             family=family,
             horizon=horizon,
             evidence_type=evidence_type,
-        )
-        missing = [
-            field
-            for field in required_fields
-            if field not in policy_fields
-            and field != "objective_excess_fraction"
-            or evidence_status.get(field)
-            not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
-        ]
-        accepted = not missing and self.evidence_policy.accepts(
-            stage,
-            evidence,
-            controls,
-            product_id=candidate.definition.product if requires_objective else None,
-            family=family,
-            horizon=horizon,
-            evidence_type=evidence_type,
-        )
-        evidence["missing_evidence"] = missing
-        evidence["evidence_status"] = {
-            field: status.value for field, status in evidence_status.items()
-        }
-        receipt: Mapping[str, Any] | None = None
-        for row in authoritative_runs:
-            raw_receipt = cast(Mapping[str, Any], row["payload"]).get("receipt")
-            if isinstance(raw_receipt, Mapping) and raw_receipt:
-                receipt = raw_receipt
-                break
-        if execution is not None:
-            receipt = execution.receipt
-            metrics.update(execution.metrics)
-        return (
-            evidence,
-            accepted,
-            None if accepted else "measured_evidence_missing",
-            receipt,
-            metrics,
+            execution=execution,
         )
 
 
