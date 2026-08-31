@@ -131,11 +131,17 @@ class ForwardEvidenceCollector:
             product_id=product_id,
             start=window_start,
             at=evaluated_at,
+            strategy_version_id=strategy_version_id,
+            assignment_id=assignment_id,
+            instrument_id=instrument_id,
         )
         all_ledger_rows = self._ledger_rows(
             product_id=product_id,
             start=created_at,
             at=evaluated_at,
+            strategy_version_id=strategy_version_id,
+            assignment_id=assignment_id,
+            instrument_id=instrument_id,
         )
         all_market_rows = self._market_rows(
             product_id=product_id,
@@ -282,9 +288,7 @@ class ForwardEvidenceCollector:
                     isinstance(payload, Mapping)
                     and str(payload.get("portfolio_id")) == portfolio_id
                     and str(payload.get("instrument_id")) == instrument_id
-                    and _order_belongs_to_strategy(
-                        payload,
-                        strategy_version_id=strategy_version_id)
+                    and _order_belongs_to_strategy(payload, strategy_version_id=strategy_version_id)
                     and _order_belongs_to_assignment(payload, assignment_id=assignment_id)
                 ):
                     result.append(row)
@@ -308,7 +312,14 @@ class ForwardEvidenceCollector:
             return tuple(row for row in rows if isinstance(row["payload"], Mapping))
 
     def _ledger_rows(
-        self, *, product_id: str, start: str, at: str
+        self,
+        *,
+        product_id: str,
+        start: str,
+        at: str,
+        strategy_version_id: str | None = None,
+        assignment_id: str | None = None,
+        instrument_id: str | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -322,7 +333,17 @@ class ForwardEvidenceCollector:
                 )
                 .order_by(accounting_entry.c.created_at, accounting_entry.c.sequence)
             ).mappings()
-            return tuple(row for row in rows if isinstance(row["payload"], Mapping))
+            return tuple(
+                row
+                for row in rows
+                if isinstance(row["payload"], Mapping)
+                and _ledger_belongs_to_scope(
+                    row["payload"],
+                    strategy_version_id=strategy_version_id,
+                    assignment_id=assignment_id,
+                    instrument_id=instrument_id,
+                )
+            )
 
     def _market_rows(
         self, *, product_id: str, instrument_id: str, start: str, at: str
@@ -483,7 +504,7 @@ class ForwardEvidenceCollector:
         *,
         at: str | None = None,
     ) -> float:
-        account_id = str(assignment.get("account_id") or "")
+        account_id = _assignment_account_id(assignment)
         assignment_payload = assignment.get("payload")
         if not account_id and isinstance(assignment_payload, Mapping):
             account_id = str(assignment_payload.get("account_id") or "")
@@ -562,7 +583,7 @@ class ForwardEvidenceCollector:
         if product_id != "btc_accumulation":
             return (product_id, None, None, None, None, ())
         snapshots = self._account_snapshot_rows(
-            account_id=str(assignment.get("account_id") or ""), at=evaluation_time
+            account_id=_assignment_account_id(assignment), at=evaluation_time
         )
         prices = self._market_prices(market_rows)
         source_ids = tuple(str(row["id"]) for row in snapshots)
@@ -671,9 +692,7 @@ def _order_belongs_to_strategy(
     }
 
 
-def _order_belongs_to_assignment(
-    payload: Mapping[str, Any], *, assignment_id: str | None
-) -> bool:
+def _order_belongs_to_assignment(payload: Mapping[str, Any], *, assignment_id: str | None) -> bool:
     if assignment_id is None:
         return True
     declared = payload.get("assignment_id")
@@ -684,3 +703,39 @@ def _order_belongs_to_assignment(
         if declared is None and isinstance(target_metadata, Mapping):
             declared = target_metadata.get("assignment_id")
     return declared is not None and str(declared) == assignment_id
+
+
+def _assignment_account_id(assignment: Mapping[str, Any]) -> str:
+    account_id = str(assignment.get("account_id") or "").strip()
+    payload = assignment.get("payload")
+    if not account_id and isinstance(payload, Mapping):
+        account_id = str(payload.get("account_id") or "").strip()
+    return account_id
+
+
+def _ledger_belongs_to_scope(
+    payload: Mapping[str, Any],
+    *,
+    strategy_version_id: str | None,
+    assignment_id: str | None,
+    instrument_id: str | None,
+) -> bool:
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return not any((strategy_version_id, assignment_id, instrument_id))
+    if assignment_id is not None:
+        declared_assignment = metadata.get("assignment_id")
+        if declared_assignment is None or str(declared_assignment) != assignment_id:
+            return False
+    if strategy_version_id is not None:
+        declared_strategy = metadata.get("strategy_version_id", metadata.get("strategy"))
+        if declared_strategy is None or str(declared_strategy) not in {
+            strategy_version_id,
+            "ensemble",
+        }:
+            return False
+    if instrument_id is not None:
+        declared_instrument = metadata.get("instrument_id", metadata.get("symbol"))
+        if declared_instrument is None or str(declared_instrument) != instrument_id:
+            return False
+    return True

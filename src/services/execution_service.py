@@ -193,8 +193,12 @@ class ExecutionService:
         attribution = {
             "product": self.ledger.product_id,
             "symbol": order.instrument_id,
+            "instrument_id": order.instrument_id,
+            "order_id": order.order_id,
             "strategy": contributions[0] if len(contributions) == 1 else "ensemble",
+            "strategy_version_id": contributions[0] if len(contributions) == 1 else None,
             "sleeve": target_metadata.get("sleeve") or "unassigned",
+            "assignment_id": target_metadata.get("assignment_id"),
         }
         self.ledger.record_fee(
             entry_id=f"{fill.fill_id}:fee",
