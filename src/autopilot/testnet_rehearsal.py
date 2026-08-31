@@ -863,21 +863,13 @@ def _embedded_preflight_invalid_reasons(
     return reasons
 
 
-def summarize_testnet_rehearsal_report(
-    path: Path = DEFAULT_OUTPUT,
-    *,
-    max_age_seconds: int = DEFAULT_MAX_REPORT_AGE_SECONDS,
-    now_ts: float | None = None,
-    expected_product: ProductConfig | None = None,
-) -> dict[str, Any]:
+def _read_rehearsal_payload(path: Path) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     status: dict[str, Any] = {
         "path": str(path),
         "exists": path.exists(),
         "ok": False,
         "status": "missing",
     }
-    if max_age_seconds <= 0:
-        raise ValueError("max_age_seconds must be positive")
     if path.is_symlink():
         status.update(
             exists=True,
@@ -885,24 +877,34 @@ def summarize_testnet_rehearsal_report(
             error=f"testnet rehearsal report must not be a symlink: {path}",
             next_action=testnet_rehearsal_next_action(),
         )
-        return status
+        return None, status
     if not path.exists():
         status["next_action"] = testnet_rehearsal_next_action()
-        return status
+        return None, status
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         status.update(
             status="read_error", error=str(exc), next_action=testnet_rehearsal_next_action()
         )
-        return status
+        return None, status
     if not isinstance(payload, dict):
         status.update(
             status="read_error",
             error=f"TypeError: expected JSON object, got {type(payload).__name__}",
             next_action=testnet_rehearsal_next_action(),
         )
-        return status
+        return None, status
+    return payload, status
+
+
+def _rehearsal_measurements(
+    payload: dict[str, Any],
+    *,
+    max_age_seconds: int,
+    now_ts: float | None,
+    expected_product: ProductConfig | None,
+) -> dict[str, Any]:
     generated_ts = payload.get("generated_ts")
     age_seconds = None
     fresh = None
@@ -915,116 +917,191 @@ def summarize_testnet_rehearsal_report(
             generated_ts_float = float("nan")
         if math.isfinite(generated_ts_float):
             generated_ts_valid = True
-            now_ts = now_ts if now_ts is not None else time.time()
-            age_seconds = now_ts - generated_ts_float
+            effective_now = now_ts if now_ts is not None else time.time()
+            age_seconds = effective_now - generated_ts_float
             generated_ts_future = age_seconds < -TESTNET_REHEARSAL_CLOCK_SKEW_SECONDS
             fresh = age_seconds <= max_age_seconds
     report_product = payload.get("product") if isinstance(payload.get("product"), dict) else None
-    expected_product_payload = (
-        _expected_product_payload(expected_product) if expected_product is not None else None
-    )
     risk_controls = (
         payload.get("risk_controls") if isinstance(payload.get("risk_controls"), dict) else None
     )
     entry_fill = payload.get("entry_fill") if isinstance(payload.get("entry_fill"), dict) else {}
     close_fill = payload.get("close_fill") if isinstance(payload.get("close_fill"), dict) else {}
-    native_protective_stop = payload.get("native_protective_stop")
-    entry_side = str(entry_fill.get("side") or "").lower() if entry_fill else None
-    close_side = str(close_fill.get("side") or "").lower() if close_fill else None
-    try:
-        notional_usd = float(payload.get("notional_usd"))
-    except (TypeError, ValueError):
-        notional_usd = float("nan")
-    order_qty = _finite_float(payload.get("order_qty"))
+    notional_usd = _finite_float(payload.get("notional_usd"))
     final_position_qty = payload.get("final_position_qty")
-    try:
-        final_position_flat = abs(float(final_position_qty)) < 1e-12
-    except (TypeError, ValueError):
-        final_position_flat = False
-    payload_ok = bool(payload.get("ok"))
-    invalid_reasons: list[str] = []
-    if not generated_ts_valid:
-        invalid_reasons.append(
-            "missing_generated_ts" if generated_ts is None else "invalid_generated_ts"
-        )
-    elif generated_ts_future:
-        invalid_reasons.append("future_generated_ts")
-    if not math.isfinite(notional_usd) or notional_usd <= 0:
-        invalid_reasons.append("invalid_notional_usd")
-    if payload.get("testnet") is not True:
-        invalid_reasons.append("not_testnet")
-    invalid_reasons.extend(_product_invalid_reasons(report_product, expected_product))
-    invalid_reasons.extend(_risk_control_invalid_reasons(risk_controls, expected_product))
-    invalid_reasons.extend(_embedded_preflight_invalid_reasons(payload, expected_product))
+    final_position = _finite_float(final_position_qty)
+    return {
+        "age_seconds": age_seconds,
+        "fresh": fresh,
+        "generated_ts_valid": generated_ts_valid,
+        "generated_ts_future": generated_ts_future,
+        "report_product": report_product,
+        "expected_product_payload": (
+            _expected_product_payload(expected_product) if expected_product is not None else None
+        ),
+        "risk_controls": risk_controls,
+        "entry_fill": entry_fill,
+        "close_fill": close_fill,
+        "native_protective_stop": payload.get("native_protective_stop"),
+        "entry_side": str(entry_fill.get("side") or "").lower() if entry_fill else None,
+        "close_side": str(close_fill.get("side") or "").lower() if close_fill else None,
+        "notional_usd": notional_usd if notional_usd is not None else float("nan"),
+        "order_qty": _finite_float(payload.get("order_qty")),
+        "final_position_qty": final_position_qty,
+        "final_position_flat": final_position is not None and abs(final_position) < 1e-12,
+        "payload_ok": bool(payload.get("ok")),
+    }
+
+
+def _rehearsal_fill_invalid_reasons(
+    measurements: dict[str, Any],
+    expected_product: ProductConfig | None,
+) -> list[str]:
+    entry_fill = measurements["entry_fill"]
+    close_fill = measurements["close_fill"]
+    reasons: list[str] = []
     if not entry_fill:
-        invalid_reasons.append("missing_entry_fill")
-    elif entry_side != "buy":
-        invalid_reasons.append("entry_fill_side_not_buy")
+        reasons.append("missing_entry_fill")
+    elif measurements["entry_side"] != "buy":
+        reasons.append("entry_fill_side_not_buy")
     if entry_fill:
-        invalid_reasons.extend(
-            _fill_invalid_reasons(entry_fill, label="entry", expected_product=expected_product)
-        )
+        reasons.extend(_fill_invalid_reasons(entry_fill, label="entry", expected_product=expected_product))
     if not close_fill:
-        invalid_reasons.append("missing_close_fill")
-    elif close_side != "sell":
-        invalid_reasons.append("close_fill_side_not_sell")
+        reasons.append("missing_close_fill")
+    elif measurements["close_side"] != "sell":
+        reasons.append("close_fill_side_not_sell")
     if close_fill:
-        invalid_reasons.extend(
-            _fill_invalid_reasons(close_fill, label="close", expected_product=expected_product)
-        )
-    invalid_reasons.extend(
+        reasons.extend(_fill_invalid_reasons(close_fill, label="close", expected_product=expected_product))
+    reasons.extend(
         _fill_qty_mismatch_reasons(
             entry_fill,
             close_fill,
-            order_qty=order_qty,
+            order_qty=measurements["order_qty"],
             expected_product=expected_product,
         )
     )
-    if not final_position_flat:
-        invalid_reasons.append("final_position_not_flat")
-    if "native_protective_stop" in payload or not invalid_reasons:
-        invalid_reasons.extend(
+    return reasons
+
+
+def _rehearsal_structural_invalid_reasons(
+    payload: dict[str, Any],
+    measurements: dict[str, Any],
+    expected_product: ProductConfig | None,
+) -> list[str]:
+    reasons: list[str] = []
+    if not measurements["generated_ts_valid"]:
+        reasons.append(
+            "missing_generated_ts"
+            if payload.get("generated_ts") is None
+            else "invalid_generated_ts"
+        )
+    elif measurements["generated_ts_future"]:
+        reasons.append("future_generated_ts")
+    notional_usd = measurements["notional_usd"]
+    if not math.isfinite(notional_usd) or notional_usd <= 0:
+        reasons.append("invalid_notional_usd")
+    if payload.get("testnet") is not True:
+        reasons.append("not_testnet")
+    reasons.extend(_product_invalid_reasons(measurements["report_product"], expected_product))
+    reasons.extend(_risk_control_invalid_reasons(measurements["risk_controls"], expected_product))
+    reasons.extend(_embedded_preflight_invalid_reasons(payload, expected_product))
+    reasons.extend(_rehearsal_fill_invalid_reasons(measurements, expected_product))
+    if not measurements["final_position_flat"]:
+        reasons.append("final_position_not_flat")
+    if "native_protective_stop" in payload or not reasons:
+        reasons.extend(
             _native_protective_stop_invalid_reasons(
-                native_protective_stop,
-                order_qty=order_qty,
-                entry_fill=entry_fill,
+                measurements["native_protective_stop"],
+                order_qty=measurements["order_qty"],
+                entry_fill=measurements["entry_fill"],
                 expected_product=expected_product,
             )
         )
+    return reasons
+
+
+def _rehearsal_report_status(
+    payload: dict[str, Any],
+    measurements: dict[str, Any],
+    invalid_reasons: list[str],
+    *,
+    max_age_seconds: int,
+) -> dict[str, Any]:
     structurally_ok = not invalid_reasons
-    if payload_ok and fresh is False:
+    if measurements["payload_ok"] and measurements["fresh"] is False:
         report_status = "stale"
-    elif payload_ok and structurally_ok:
+    elif measurements["payload_ok"] and structurally_ok:
         report_status = "ok"
     else:
         report_status = "failed"
+    return {
+        "ok": measurements["payload_ok"] and structurally_ok and measurements["fresh"] is not False,
+        "status": report_status,
+        "fresh": measurements["fresh"],
+        "age_seconds": (
+            round(measurements["age_seconds"], 3)
+            if measurements["age_seconds"] is not None
+            else None
+        ),
+        "max_age_seconds": max_age_seconds,
+        "clock_skew_seconds": TESTNET_REHEARSAL_CLOCK_SKEW_SECONDS,
+        "generated_at": payload.get("generated_at"),
+        "product": (
+            measurements["report_product"].get("name")
+            if measurements["report_product"]
+            else None
+        ),
+        "report_product": measurements["report_product"],
+        "expected_product": measurements["expected_product_payload"],
+        "risk_controls": measurements["risk_controls"],
+        "exchange": payload.get("exchange"),
+        "testnet": payload.get("testnet"),
+        "notional_usd": payload.get("notional_usd"),
+        "order_qty": payload.get("order_qty"),
+        "entry_side": measurements["entry_side"],
+        "close_side": measurements["close_side"],
+        "native_protective_stop": (
+            measurements["native_protective_stop"]
+            if isinstance(measurements["native_protective_stop"], dict)
+            else None
+        ),
+        "final_position_qty": measurements["final_position_qty"],
+        "final_position_flat": measurements["final_position_flat"],
+        "error": payload.get("error"),
+        "invalid_reasons": invalid_reasons,
+    }
+
+
+def summarize_testnet_rehearsal_report(
+    path: Path = DEFAULT_OUTPUT,
+    *,
+    max_age_seconds: int = DEFAULT_MAX_REPORT_AGE_SECONDS,
+    now_ts: float | None = None,
+    expected_product: ProductConfig | None = None,
+) -> dict[str, Any]:
+    if max_age_seconds <= 0:
+        raise ValueError("max_age_seconds must be positive")
+    payload, status = _read_rehearsal_payload(path)
+    if payload is None:
+        return status
+    measurements = _rehearsal_measurements(
+        payload,
+        max_age_seconds=max_age_seconds,
+        now_ts=now_ts,
+        expected_product=expected_product,
+    )
+    invalid_reasons = _rehearsal_structural_invalid_reasons(
+        payload,
+        measurements,
+        expected_product,
+    )
     status.update(
-        {
-            "ok": payload_ok and structurally_ok and fresh is not False,
-            "status": report_status,
-            "fresh": fresh,
-            "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
-            "max_age_seconds": max_age_seconds,
-            "clock_skew_seconds": TESTNET_REHEARSAL_CLOCK_SKEW_SECONDS,
-            "generated_at": payload.get("generated_at"),
-            "product": report_product.get("name") if report_product else None,
-            "report_product": report_product,
-            "expected_product": expected_product_payload,
-            "risk_controls": risk_controls,
-            "exchange": payload.get("exchange"),
-            "testnet": payload.get("testnet"),
-            "notional_usd": payload.get("notional_usd"),
-            "order_qty": payload.get("order_qty"),
-            "entry_side": entry_side,
-            "close_side": close_side,
-            "native_protective_stop": (
-                native_protective_stop if isinstance(native_protective_stop, dict) else None
-            ),
-            "final_position_qty": final_position_qty,
-            "final_position_flat": final_position_flat,
-            "error": payload.get("error"),
-            "invalid_reasons": invalid_reasons,
-        }
+        _rehearsal_report_status(
+            payload,
+            measurements,
+            invalid_reasons,
+            max_age_seconds=max_age_seconds,
+        )
     )
     if not status["ok"]:
         status["next_action"] = testnet_rehearsal_next_action()
