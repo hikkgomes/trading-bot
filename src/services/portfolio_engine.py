@@ -60,133 +60,29 @@ class DatabasePortfolioTargetBuilder:
         }
 
     def __call__(self, payload: Mapping[str, Any]) -> TargetRiskReferences:
-        product_id = str(payload["product_id"])
-        product = self.product_configuration[product_id]
-        evaluated_at = timestamp(str(payload["evaluated_at"]), field="evaluated_at")
-        seed = self.repository.forecast(str(payload["forecast_id"]))
-        if seed.product_id != product_id:
-            raise ValueError("forecast product differs from target product")
-        forecasts = self.repository.active_forecasts(product_id=product_id, at=evaluated_at)
-        if seed not in forecasts:
-            raise ValueError("trigger forecast is not active at the rebalance timestamp")
+        product_id, product, evaluated_at, seed, forecasts = self._forecast_context(payload)
         state_id, state = self.snapshot_store.latest(
             kind="canonical_portfolio_risk_state", product_id=product_id, at=evaluated_at
         )
         clean = _canonical_portfolio_state(state, product_id=product_id)
-        product_family = str(product.get("product_family") or product_id)
-        maximum_age = float(clean["maximum_state_age_seconds"])
-        observed_at = dt.datetime.fromisoformat(str(clean["observed_at"]))
-        evaluated = dt.datetime.fromisoformat(evaluated_at)
-        age = (evaluated - observed_at).total_seconds()
-        if age < 0 or age > maximum_age:
-            raise ValueError("canonical portfolio/risk state is stale")
-
+        _assert_state_fresh(clean, evaluated_at)
         balances = {str(key): float(value) for key, value in clean["balances"].items()}
         current_positions = {str(key): float(value) for key, value in clean["positions"].items()}
         market = {str(key): dict(value) for key, value in clean["market"].items()}
-        if product_family == "active_income" and clean["risk_data_available"] is not True:
-            missing = ", ".join(str(value) for value in clean["risk_data_missing"])
-            raise ValueError(f"risk measurements are unavailable: {missing or 'unknown'}")
-        missing_market = sorted({item.instrument_id for item in forecasts} - set(market))
-        if missing_market:
-            raise ValueError("canonical market state is missing: " + ", ".join(missing_market))
-        prices = {key: float(value["price"]) for key, value in market.items()}
-        if any(value <= 0 for value in prices.values()):
-            raise ValueError("canonical market prices must be positive")
-        portfolio_id = str(product["portfolio_id"])
-        if product_family == "btc_accumulation":
-            btc_instrument = seed.instrument_id
-            btc_price = prices[btc_instrument]
-            current_positions = {
-                **current_positions,
-                btc_instrument: float(balances.get("BTC", 0.0)),
-            }
-            btc_equity = balances.get("BTC", 0.0) + balances.get("USDT", 0.0) / btc_price
-            if btc_equity <= 0:
-                raise ValueError("BTC accumulation equity must be positive")
-            btc_policy = BtcAllocationPolicy(
-                core_btc_fraction=float(product.get("btc_core_fraction", 1.0)),
-                max_tactical_fraction=float(product.get("btc_max_tactical_fraction", 0.0)),
-            )
-            allocation = target_btc_allocation(forecasts, policy=btc_policy)
-            target_quantity = max(0.0, allocation.target_btc_fraction * btc_equity)
-            target = TargetPosition(
-                portfolio_id=portfolio_id,
-                instrument_id=btc_instrument,
-                target_quantity=target_quantity,
-                target_notional=target_quantity * btc_price,
-                target_fraction=allocation.target_btc_fraction,
-                strategy_contributions=allocation.contributions,
-                risk_budget=float(clean["portfolio_risk_budget"]),
-                valid_until=min(item.valid_until for item in forecasts),
-                metadata={
-                    "product_id": product_id,
-                    "canonical_state_id": state_id,
-                    "assignment_id": seed.metadata.get("assignment_id"),
-                    "core_btc_fraction": allocation.core_btc_fraction,
-                    "tactical_btc_fraction": allocation.tactical_btc_fraction,
-                    "stablecoin_fraction": allocation.stablecoin_fraction,
-                    "quote_currency": "USDT",
-                    "actual_stablecoin_balance": balances.get("USDT", 0.0),
-                },
-            )
-            targets = (target,)
-            equity = btc_equity * btc_price
-        else:
-            equity = balances.get("USDT", 0.0)
-            if equity <= 0:
-                raise ValueError("active-income USDT equity must be positive")
-            combined = aggregate_forecasts(forecasts)
-            account = self.account_configuration.get(str(product["account_id"]), {})
-            constraints = PortfolioConstraints(
-                portfolio_id=portfolio_id,
-                equity=equity,
-                max_positions=int(product.get("maximum_positions", 12)),
-                max_gross_fraction=float(product.get("maximum_gross", 1.5)),
-                max_net_fraction=float(product.get("maximum_net", 0.5)),
-                max_symbol_fraction=float(clean["maximum_symbol_fraction"]),
-                max_abs_beta=float(clean["maximum_abs_beta"]),
-                max_correlation=float(clean["maximum_correlation"]),
-                max_margin_fraction=float(product.get("maximum_margin", 0.5)),
-                max_turnover_fraction=float(clean["maximum_turnover_fraction"]),
-                max_cluster_fraction=float(clean["maximum_cluster_fraction"]),
-                max_drawdown_fraction=float(clean["maximum_product_drawdown_fraction"]),
-            )
-            targets = optimise_targets(
-                combined,
-                prices=prices,
-                valid_until=min(item.valid_until for item in forecasts),
-                constraints=constraints,
-                correlations=clean["correlations"],
-                beta_by_instrument=clean["beta"],
-                observed_volatility={
-                    key: float(value["volatility"]) for key, value in market.items()
-                },
-                liquidity_fraction_caps={
-                    key: min(
-                        1.0,
-                        float(value["visible_depth"])
-                        * float(clean["maximum_depth_participation"])
-                        / equity,
-                    )
-                    for key, value in market.items()
-                },
-                funding_rates={key: float(value["funding"]) for key, value in market.items()},
-                current_quantities=current_positions,
-                sleeve_budgets=clean["sleeve_budgets"],
-                cluster_by_instrument=clean["clusters"],
-                cluster_fraction_caps=clean["cluster_fraction_caps"],
-                product_drawdown_fraction=float(clean["product_drawdown_fraction"]),
-                available_margin_fraction=max(0.0, 1.0 - float(clean["used_margin_fraction"])),
-                risk_budget=float(clean["portfolio_risk_budget"]),
-                protective_stop_fraction=float(product.get("protective_stop_fraction", 0.02)),
-                default_leverage=float(account.get("maximum_leverage", 1.0)),
-                leverage_by_instrument={
-                    key: float(value.get("leverage", account.get("maximum_leverage", 1.0)))
-                    for key, value in market.items()
-                    if isinstance(value, Mapping) and value.get("leverage") is not None
-                },
-            )
+        prices = _validated_prices(forecasts, market)
+        targets, equity, current_positions = self._product_targets(
+            product_id=product_id,
+            product=product,
+            product_family=str(product.get("product_family") or product_id),
+            seed=seed,
+            forecasts=forecasts,
+            clean=clean,
+            balances=balances,
+            current_positions=current_positions,
+            market=market,
+            prices=prices,
+            state_id=state_id,
+        )
         if not targets:
             raise ValueError("portfolio optimiser produced no targets")
 
@@ -194,69 +90,14 @@ class DatabasePortfolioTargetBuilder:
         target_ids = self.repository.save_targets(
             event_id=event_id, targets=targets, created_at=evaluated_at
         )
-        gross = sum(abs(item.target_fraction) for item in targets)
-        net = sum(item.target_fraction for item in targets)
-        turnover = sum(
-            abs(item.target_quantity - current_positions.get(item.instrument_id, 0.0))
-            * prices[item.instrument_id]
-            / equity
-            for item in targets
+        target_scopes = _target_risk_scopes(
+            targets=targets,
+            target_ids=target_ids,
+            current_positions=current_positions,
+            equity=equity,
+            market=market,
+            clean=clean,
         )
-        worst_spread = max(float(market[item.instrument_id]["spread_bps"]) for item in targets)
-        worst_volatility = max(float(market[item.instrument_id]["volatility"]) for item in targets)
-        depth_fraction = max(
-            abs(item.target_notional)
-            / max(float(market[item.instrument_id]["visible_depth"]), 1e-12)
-            for item in targets
-        )
-        maximum_position = max(abs(item.target_fraction) for item in targets)
-        maximum_funding = max(abs(float(market[item.instrument_id]["funding"])) for item in targets)
-        target_scopes = {
-            "strategy": {
-                "inputs": {
-                    "position_fraction": maximum_position,
-                    "turnover_fraction": turnover,
-                    "trades_today": int(clean["trades_today"]),
-                    "expected_slippage_bps": worst_spread,
-                    "expected_funding_cost_fraction": maximum_funding,
-                },
-                "decision_id": canonical_hash({"scope": "strategy", "target_ids": target_ids}),
-            },
-            "instrument": {
-                "inputs": {
-                    "position_notional": max(abs(item.target_notional) for item in targets),
-                    "order_notional": max(abs(item.target_notional) for item in targets),
-                    "visible_depth_fraction": depth_fraction,
-                    "spread_bps": worst_spread,
-                    "volatility": worst_volatility,
-                    "concentration_fraction": maximum_position,
-                },
-                "decision_id": canonical_hash({"scope": "instrument", "target_ids": target_ids}),
-            },
-            "sleeve": {
-                "inputs": {
-                    "capital_fraction": gross,
-                    "drawdown_fraction": float(clean["product_drawdown_fraction"]),
-                    "maximum_correlation": _maximum_correlation(clean["correlations"]),
-                    "beta": sum(
-                        item.target_fraction * float(clean["beta"].get(item.instrument_id, 0.0))
-                        for item in targets
-                    ),
-                    "turnover_fraction": turnover,
-                },
-                "decision_id": canonical_hash({"scope": "sleeve", "target_ids": target_ids}),
-            },
-            "product": {
-                "inputs": {
-                    "gross_fraction": gross,
-                    "net_fraction": net,
-                    "drawdown_fraction": float(clean["product_drawdown_fraction"]),
-                    "margin_fraction": float(clean["used_margin_fraction"]),
-                    "daily_pnl_fraction": float(clean["daily_pnl_fraction"]),
-                },
-                "decision_id": canonical_hash({"scope": "product", "target_ids": target_ids}),
-            },
-        }
         target_snapshot_id = self.snapshot_store.save(
             {
                 "kind": "target_position",
@@ -272,6 +113,206 @@ class DatabasePortfolioTargetBuilder:
             },
             created_at=evaluated_at,
         )
+        (
+            account_snapshot_id,
+            positions_snapshot_id,
+            balances_snapshot_id,
+            market_data_snapshot_id,
+        ) = self._save_risk_inputs(
+            product_id=product_id,
+            portfolio_id=str(product["portfolio_id"]),
+            account_id=str(product["account_id"]),
+            state_id=state_id,
+            evaluated_at=evaluated_at,
+            clean=clean,
+            balances=balances,
+            current_positions=current_positions,
+            market=market,
+        )
+        return TargetRiskReferences(
+            target_position_snapshot_id=target_snapshot_id,
+            account_snapshot_id=account_snapshot_id,
+            positions_snapshot_id=positions_snapshot_id,
+            balances_snapshot_id=balances_snapshot_id,
+            market_data_snapshot_id=market_data_snapshot_id,
+            risk_policy_ids=tuple(str(item) for item in clean["risk_policy_ids"]),
+        )
+
+    def _forecast_context(
+        self, payload: Mapping[str, Any]
+    ) -> tuple[str, Mapping[str, Any], str, Any, tuple[Any, ...]]:
+        product_id = str(payload["product_id"])
+        product = self.product_configuration[product_id]
+        evaluated_at = timestamp(str(payload["evaluated_at"]), field="evaluated_at")
+        seed = self.repository.forecast(str(payload["forecast_id"]))
+        if seed.product_id != product_id:
+            raise ValueError("forecast product differs from target product")
+        forecasts = self.repository.active_forecasts(product_id=product_id, at=evaluated_at)
+        if seed not in forecasts:
+            raise ValueError("trigger forecast is not active at the rebalance timestamp")
+        return product_id, product, evaluated_at, seed, forecasts
+
+    def _product_targets(
+        self,
+        *,
+        product_id: str,
+        product: Mapping[str, Any],
+        product_family: str,
+        seed: Any,
+        forecasts: tuple[Any, ...],
+        clean: Mapping[str, Any],
+        balances: Mapping[str, float],
+        current_positions: dict[str, float],
+        market: Mapping[str, Mapping[str, Any]],
+        prices: Mapping[str, float],
+        state_id: str,
+    ) -> tuple[tuple[TargetPosition, ...], float, dict[str, float]]:
+        if product_family == "btc_accumulation":
+            return self._btc_targets(
+                product_id=product_id,
+                product=product,
+                seed=seed,
+                forecasts=forecasts,
+                clean=clean,
+                balances=balances,
+                current_positions=current_positions,
+                prices=prices,
+                state_id=state_id,
+            )
+        return self._active_income_targets(
+            product=product,
+            forecasts=forecasts,
+            clean=clean,
+            balances=balances,
+            current_positions=current_positions,
+            market=market,
+            prices=prices,
+        )
+
+    def _btc_targets(
+        self,
+        *,
+        product_id: str,
+        product: Mapping[str, Any],
+        seed: Any,
+        forecasts: tuple[Any, ...],
+        clean: Mapping[str, Any],
+        balances: Mapping[str, float],
+        current_positions: dict[str, float],
+        prices: Mapping[str, float],
+        state_id: str,
+    ) -> tuple[tuple[TargetPosition, ...], float, dict[str, float]]:
+        instrument_id = seed.instrument_id
+        price = prices[instrument_id]
+        current_positions[instrument_id] = float(balances.get("BTC", 0.0))
+        equity_btc = balances.get("BTC", 0.0) + balances.get("USDT", 0.0) / price
+        if equity_btc <= 0:
+            raise ValueError("BTC accumulation equity must be positive")
+        policy = BtcAllocationPolicy(
+            core_btc_fraction=float(product.get("btc_core_fraction", 1.0)),
+            max_tactical_fraction=float(product.get("btc_max_tactical_fraction", 0.0)),
+        )
+        allocation = target_btc_allocation(forecasts, policy=policy)
+        quantity = max(0.0, allocation.target_btc_fraction * equity_btc)
+        target = TargetPosition(
+            portfolio_id=str(product["portfolio_id"]),
+            instrument_id=instrument_id,
+            target_quantity=quantity,
+            target_notional=quantity * price,
+            target_fraction=allocation.target_btc_fraction,
+            strategy_contributions=allocation.contributions,
+            risk_budget=float(clean["portfolio_risk_budget"]),
+            valid_until=min(item.valid_until for item in forecasts),
+            metadata={
+                "product_id": product_id,
+                "canonical_state_id": state_id,
+                "assignment_id": seed.metadata.get("assignment_id"),
+                "core_btc_fraction": allocation.core_btc_fraction,
+                "tactical_btc_fraction": allocation.tactical_btc_fraction,
+                "stablecoin_fraction": allocation.stablecoin_fraction,
+                "quote_currency": "USDT",
+                "actual_stablecoin_balance": balances.get("USDT", 0.0),
+            },
+        )
+        return (target,), equity_btc * price, current_positions
+
+    def _active_income_targets(
+        self,
+        *,
+        product: Mapping[str, Any],
+        forecasts: tuple[Any, ...],
+        clean: Mapping[str, Any],
+        balances: Mapping[str, float],
+        current_positions: Mapping[str, float],
+        market: Mapping[str, Mapping[str, Any]],
+        prices: Mapping[str, float],
+    ) -> tuple[tuple[TargetPosition, ...], float, dict[str, float]]:
+        equity = balances.get("USDT", 0.0)
+        if equity <= 0:
+            raise ValueError("active-income USDT equity must be positive")
+        account = self.account_configuration.get(str(product["account_id"]), {})
+        constraints = PortfolioConstraints(
+            portfolio_id=str(product["portfolio_id"]),
+            equity=equity,
+            max_positions=int(product.get("maximum_positions", 12)),
+            max_gross_fraction=float(product.get("maximum_gross", 1.5)),
+            max_net_fraction=float(product.get("maximum_net", 0.5)),
+            max_symbol_fraction=float(clean["maximum_symbol_fraction"]),
+            max_abs_beta=float(clean["maximum_abs_beta"]),
+            max_correlation=float(clean["maximum_correlation"]),
+            max_margin_fraction=float(product.get("maximum_margin", 0.5)),
+            max_turnover_fraction=float(clean["maximum_turnover_fraction"]),
+            max_cluster_fraction=float(clean["maximum_cluster_fraction"]),
+            max_drawdown_fraction=float(clean["maximum_product_drawdown_fraction"]),
+        )
+        targets = optimise_targets(
+            aggregate_forecasts(forecasts),
+            prices=prices,
+            valid_until=min(item.valid_until for item in forecasts),
+            constraints=constraints,
+            correlations=clean["correlations"],
+            beta_by_instrument=clean["beta"],
+            observed_volatility={key: float(value["volatility"]) for key, value in market.items()},
+            liquidity_fraction_caps={
+                key: min(
+                    1.0,
+                    float(value["visible_depth"])
+                    * float(clean["maximum_depth_participation"])
+                    / equity,
+                )
+                for key, value in market.items()
+            },
+            funding_rates={key: float(value["funding"]) for key, value in market.items()},
+            current_quantities=current_positions,
+            sleeve_budgets=clean["sleeve_budgets"],
+            cluster_by_instrument=clean["clusters"],
+            cluster_fraction_caps=clean["cluster_fraction_caps"],
+            product_drawdown_fraction=float(clean["product_drawdown_fraction"]),
+            available_margin_fraction=max(0.0, 1.0 - float(clean["used_margin_fraction"])),
+            risk_budget=float(clean["portfolio_risk_budget"]),
+            protective_stop_fraction=float(product.get("protective_stop_fraction", 0.02)),
+            default_leverage=float(account.get("maximum_leverage", 1.0)),
+            leverage_by_instrument={
+                key: float(value.get("leverage", account.get("maximum_leverage", 1.0)))
+                for key, value in market.items()
+                if isinstance(value, Mapping) and value.get("leverage") is not None
+            },
+        )
+        return tuple(targets), equity, dict(current_positions)
+
+    def _save_risk_inputs(
+        self,
+        *,
+        product_id: str,
+        portfolio_id: str,
+        account_id: str,
+        state_id: str,
+        evaluated_at: str,
+        clean: Mapping[str, Any],
+        balances: Mapping[str, float],
+        current_positions: Mapping[str, float],
+        market: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[str, str, str, str]:
         account_snapshot_id = self.snapshot_store.save(
             {
                 "kind": "account_risk_input",
@@ -292,7 +333,7 @@ class DatabasePortfolioTargetBuilder:
                 "kind": "positions",
                 "product_id": product_id,
                 "portfolio_id": portfolio_id,
-                "positions": current_positions,
+                "positions": dict(current_positions),
                 "open_orders": clean["open_orders"],
                 "canonical_state_id": state_id,
             },
@@ -302,8 +343,8 @@ class DatabasePortfolioTargetBuilder:
             {
                 "kind": "balances",
                 "product_id": product_id,
-                "account_id": str(product["account_id"]),
-                "balances": balances,
+                "account_id": account_id,
+                "balances": dict(balances),
                 "canonical_state_id": state_id,
             },
             created_at=evaluated_at,
@@ -324,18 +365,111 @@ class DatabasePortfolioTargetBuilder:
                 },
                 "decision_id": canonical_hash({"scope": "global", "state_id": state_id}),
                 "canonical_state_id": state_id,
-                "market": market,
+                "market": dict(market),
             },
             created_at=evaluated_at,
         )
-        return TargetRiskReferences(
-            target_position_snapshot_id=target_snapshot_id,
-            account_snapshot_id=account_snapshot_id,
-            positions_snapshot_id=positions_snapshot_id,
-            balances_snapshot_id=balances_snapshot_id,
-            market_data_snapshot_id=market_data_snapshot_id,
-            risk_policy_ids=tuple(str(item) for item in clean["risk_policy_ids"]),
+        return (
+            account_snapshot_id,
+            positions_snapshot_id,
+            balances_snapshot_id,
+            market_data_snapshot_id,
         )
+
+
+def _assert_state_fresh(clean: Mapping[str, Any], evaluated_at: str) -> None:
+    maximum_age = float(clean["maximum_state_age_seconds"])
+    observed_at = dt.datetime.fromisoformat(str(clean["observed_at"]))
+    evaluated = dt.datetime.fromisoformat(evaluated_at)
+    age = (evaluated - observed_at).total_seconds()
+    if age < 0 or age > maximum_age:
+        raise ValueError("canonical portfolio/risk state is stale")
+
+
+def _validated_prices(
+    forecasts: tuple[Any, ...], market: Mapping[str, Mapping[str, Any]]
+) -> dict[str, float]:
+    missing = sorted({item.instrument_id for item in forecasts} - set(market))
+    if missing:
+        raise ValueError("canonical market state is missing: " + ", ".join(missing))
+    prices = {key: float(value["price"]) for key, value in market.items()}
+    if any(value <= 0 for value in prices.values()):
+        raise ValueError("canonical market prices must be positive")
+    return prices
+
+
+def _target_risk_scopes(
+    *,
+    targets: tuple[TargetPosition, ...],
+    target_ids: tuple[str, ...],
+    current_positions: Mapping[str, float],
+    equity: float,
+    market: Mapping[str, Mapping[str, Any]],
+    clean: Mapping[str, Any],
+) -> dict[str, Any]:
+    gross = sum(abs(item.target_fraction) for item in targets)
+    net = sum(item.target_fraction for item in targets)
+    turnover = sum(
+        abs(item.target_quantity - current_positions.get(item.instrument_id, 0.0))
+        * float(market[item.instrument_id]["price"])
+        / equity
+        for item in targets
+    )
+    worst_spread = max(float(market[item.instrument_id]["spread_bps"]) for item in targets)
+    worst_volatility = max(float(market[item.instrument_id]["volatility"]) for item in targets)
+    depth_fraction = max(
+        abs(item.target_notional) / max(float(market[item.instrument_id]["visible_depth"]), 1e-12)
+        for item in targets
+    )
+    maximum_position = max(abs(item.target_fraction) for item in targets)
+    maximum_funding = max(abs(float(market[item.instrument_id]["funding"])) for item in targets)
+    identity = lambda scope: canonical_hash({"scope": scope, "target_ids": target_ids})
+    return {
+        "strategy": {
+            "inputs": {
+                "position_fraction": maximum_position,
+                "turnover_fraction": turnover,
+                "trades_today": int(clean["trades_today"]),
+                "expected_slippage_bps": worst_spread,
+                "expected_funding_cost_fraction": maximum_funding,
+            },
+            "decision_id": identity("strategy"),
+        },
+        "instrument": {
+            "inputs": {
+                "position_notional": max(abs(item.target_notional) for item in targets),
+                "order_notional": max(abs(item.target_notional) for item in targets),
+                "visible_depth_fraction": depth_fraction,
+                "spread_bps": worst_spread,
+                "volatility": worst_volatility,
+                "concentration_fraction": maximum_position,
+            },
+            "decision_id": identity("instrument"),
+        },
+        "sleeve": {
+            "inputs": {
+                "capital_fraction": gross,
+                "drawdown_fraction": float(clean["product_drawdown_fraction"]),
+                "maximum_correlation": _maximum_correlation(clean["correlations"]),
+                "beta": sum(
+                    item.target_fraction * float(clean["beta"].get(item.instrument_id, 0.0))
+                    for item in targets
+                ),
+                "turnover_fraction": turnover,
+            },
+            "decision_id": identity("sleeve"),
+        },
+        "product": {
+            "inputs": {
+                "gross_fraction": gross,
+                "net_fraction": net,
+                "drawdown_fraction": float(clean["product_drawdown_fraction"]),
+                "margin_fraction": float(clean["used_margin_fraction"]),
+                "daily_pnl_fraction": float(clean["daily_pnl_fraction"]),
+            },
+            "decision_id": identity("product"),
+        },
+    }
 
 
 _PORTFOLIO_STATE_FIELDS = frozenset(
@@ -383,14 +517,26 @@ _PORTFOLIO_STATE_FIELDS = frozenset(
 
 
 def _canonical_portfolio_state(state: Mapping[str, Any], *, product_id: str) -> dict[str, Any]:
+    _validate_state_identity(state, product_id)
+    clean = dict(state)
+    clean["observed_at"] = timestamp(str(clean["observed_at"]), field="observed_at")
+    _validate_state_shapes(clean)
+    _validate_state_sources(clean)
+    _validate_state_market(clean)
+    _validate_state_health(clean)
+    return clean
+
+
+def _validate_state_identity(state: Mapping[str, Any], product_id: str) -> None:
     missing = sorted(_PORTFOLIO_STATE_FIELDS - set(state))
     if missing:
         raise ValueError("canonical portfolio/risk state is missing: " + ", ".join(missing))
     if state["kind"] != "canonical_portfolio_risk_state" or state["product_id"] != product_id:
         raise ValueError("canonical portfolio/risk state has the wrong identity")
-    clean = dict(state)
-    clean["observed_at"] = timestamp(str(clean["observed_at"]), field="observed_at")
-    for field in (
+
+
+def _validate_state_shapes(clean: Mapping[str, Any]) -> None:
+    object_fields = (
         "balances",
         "positions",
         "unknown_exposure",
@@ -400,36 +546,41 @@ def _canonical_portfolio_state(state: Mapping[str, Any], *, product_id: str) -> 
         "sleeve_budgets",
         "clusters",
         "cluster_fraction_caps",
-    ):
-        if not isinstance(clean[field], Mapping):
-            raise ValueError(f"canonical portfolio/risk state {field} must be an object")
+    )
+    if any(not isinstance(clean[field], Mapping) for field in object_fields):
+        field = next(field for field in object_fields if not isinstance(clean[field], Mapping))
+        raise ValueError(f"canonical portfolio/risk state {field} must be an object")
     if not isinstance(clean["open_orders"], list | tuple):
         raise ValueError("canonical portfolio/risk state open_orders must be a list")
     if not isinstance(clean["risk_data_available"], bool):
         raise ValueError("canonical portfolio/risk state risk_data_available must be boolean")
-    if not isinstance(clean["risk_data_missing"], list | tuple):
-        raise ValueError("canonical portfolio/risk state risk_data_missing must be a list")
-    if any(not isinstance(value, str) or not value for value in clean["risk_data_missing"]):
+    missing = clean["risk_data_missing"]
+    if not isinstance(missing, list | tuple) or any(
+        not isinstance(value, str) or not value for value in missing
+    ):
         raise ValueError("canonical portfolio/risk state risk_data_missing has invalid values")
     if not isinstance(clean["risk_policy_ids"], list | tuple) or not clean["risk_policy_ids"]:
         raise ValueError("canonical portfolio/risk state needs risk_policy_ids")
-    required_sources = {
-        "balances",
-        "positions",
-        "open_orders",
-        "account",
-        "market",
-        "health",
-        "drift",
-    }
-    if set(clean["source_snapshot_ids"]) != required_sources or any(
-        not isinstance(value, str) or not value.startswith("sha256:") or len(value) != 71
-        for value in clean["source_snapshot_ids"].values()
+
+
+def _validate_state_sources(clean: Mapping[str, Any]) -> None:
+    required = {"balances", "positions", "open_orders", "account", "market", "health", "drift"}
+    source_ids = clean["source_snapshot_ids"]
+    if (
+        not isinstance(source_ids, Mapping)
+        or set(source_ids) != required
+        or any(
+            not isinstance(value, str) or not value.startswith("sha256:") or len(value) != 71
+            for value in source_ids.values()
+        )
     ):
         raise ValueError("canonical portfolio/risk state source identities are incomplete")
-    market_required = {"price", "spread_bps", "visible_depth", "volatility"}
+
+
+def _validate_state_market(clean: Mapping[str, Any]) -> None:
+    required = {"price", "spread_bps", "visible_depth", "volatility"}
     for instrument_id, values in clean["market"].items():
-        if not isinstance(values, Mapping) or not market_required.issubset(values):
+        if not isinstance(values, Mapping) or not required.issubset(values):
             raise ValueError(f"canonical market state is incomplete for {instrument_id}")
         market_type = str(values.get("market_type") or "")
         if not market_type:
@@ -440,6 +591,9 @@ def _canonical_portfolio_state(state: Mapping[str, Any], *, product_id: str) -> 
             raise ValueError(f"canonical futures market state has no funding for {instrument_id}")
         elif market_type not in {"spot", "futures"}:
             raise ValueError(f"canonical market type is unsupported for {instrument_id}")
+
+
+def _validate_state_health(clean: Mapping[str, Any]) -> None:
     if clean["unknown_exposure"]:
         raise ValueError("unknown exposure rejects new portfolio targets")
     if clean.get("account_state_known") is False:
@@ -448,7 +602,6 @@ def _canonical_portfolio_state(state: Mapping[str, Any], *, product_id: str) -> 
         raise ValueError("exchange and database health are required for new exposure")
     if clean["execution_drift"] or clean["model_drift"]:
         raise ValueError("execution or model drift rejects new portfolio targets")
-    return clean
 
 
 def _maximum_correlation(values: Mapping[str, Any]) -> float:
