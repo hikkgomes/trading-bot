@@ -450,6 +450,12 @@ def _completed_history_awaiting_research_due(
     scenarios = coverage.get("scenarios") if isinstance(coverage, dict) else {}
     if not isinstance(scenarios, dict):
         return False
+    return _changed_history_path_exists(job, scenarios, last_started)
+
+
+def _changed_history_path_exists(
+    job: JobConfig, scenarios: dict[str, Any], last_started: float
+) -> bool:
     for status in scenarios.values():
         if not isinstance(status, dict) or status.get("ok") is True:
             continue
@@ -511,6 +517,20 @@ def _open_position_blocked_export_due(job: JobConfig) -> bool:
     return True
 
 
+def _job_due_external_events(
+    job: JobConfig, entry: dict[str, Any], job_state: dict[str, Any]
+) -> bool:
+    if _missing_bootstrap_seed_due(job, entry) or _stale_research_handoff_due(job):
+        return True
+    if _stale_universe_history_due(job) or _mutation_batch_awaiting_research_due(job, job_state):
+        return True
+    if _openclaw_actions_awaiting_factory_due(job) or _generated_batch_awaiting_research_due(job):
+        return True
+    if _completed_history_awaiting_research_due(job, entry):
+        return True
+    return _open_position_blocked_export_due(job)
+
+
 def job_due(job: JobConfig, job_state: dict[str, Any], now: float | None = None) -> bool:
     if not job.enabled:
         return False
@@ -526,21 +546,7 @@ def job_due(job: JobConfig, job_state: dict[str, Any], now: float | None = None)
             and now - last_started < effective_job_cadence_seconds(job, entry)
         ):
             return False
-    if _missing_bootstrap_seed_due(job, entry):
-        return True
-    if _stale_research_handoff_due(job):
-        return True
-    if _stale_universe_history_due(job):
-        return True
-    if _mutation_batch_awaiting_research_due(job, job_state):
-        return True
-    if _openclaw_actions_awaiting_factory_due(job):
-        return True
-    if _generated_batch_awaiting_research_due(job):
-        return True
-    if _completed_history_awaiting_research_due(job, entry):
-        return True
-    if _open_position_blocked_export_due(job):
+    if _job_due_external_events(job, entry, job_state):
         return True
     if not entry or entry.get("last_started_ts") is None:
         return True
@@ -550,6 +556,32 @@ def job_due(job: JobConfig, job_state: dict[str, Any], now: float | None = None)
     if last_started > now:
         return True
     return now - last_started >= effective_job_cadence_seconds(job, entry)
+
+
+def _parse_structured_lines(stripped: str) -> dict[str, Any] | None:
+    for line in reversed(stripped.splitlines()):
+        candidate = line.strip()
+        if not candidate:
+            continue
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _parse_structured_fragment(stripped: str) -> dict[str, Any] | None:
+    decoder = json.JSONDecoder()
+    for index in reversed([position for position, char in enumerate(stripped) if char == "{"]):
+        try:
+            payload, end = decoder.raw_decode(stripped[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and not stripped[index + end :].strip():
+            return payload
+    return None
 
 
 def parse_structured_stdout(stdout: str) -> dict[str, Any] | None:
@@ -562,26 +594,8 @@ def parse_structured_stdout(stdout: str) -> dict[str, Any] | None:
         payload = None
     if isinstance(payload, dict):
         return payload
-
-    for line in reversed(stripped.splitlines()):
-        candidate = line.strip()
-        if not candidate:
-            continue
-        try:
-            payload = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            return payload
-    decoder = json.JSONDecoder()
-    for index in reversed([position for position, char in enumerate(stripped) if char == "{"]):
-        try:
-            payload, end = decoder.raw_decode(stripped[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict) and not stripped[index + end :].strip():
-            return payload
-    return None
+    payload = _parse_structured_lines(stripped)
+    return payload if payload is not None else _parse_structured_fragment(stripped)
 
 
 def _structured_report_size(payload: dict[str, Any]) -> int:
@@ -748,6 +762,109 @@ def run_job(job: JobConfig) -> dict[str, Any]:
             }
 
 
+def _deferred_job_result(
+    job: JobConfig,
+    state: dict[str, Any],
+    *,
+    state_path: Path,
+    now: float | None,
+) -> dict[str, Any]:
+    deferred_at = utc_now()
+    deferred_ts = now if now is not None else time.time()
+    previous_entry = state["jobs"].get(job.name, {})
+    previous_entry = previous_entry if isinstance(previous_entry, dict) else {}
+    try:
+        previous_deferrals = int(previous_entry.get("consecutive_deferrals") or 0)
+    except (TypeError, ValueError):
+        previous_deferrals = 0
+    state["jobs"][job.name] = {
+        **previous_entry,
+        "last_deferred_at": deferred_at,
+        "last_deferred_ts": deferred_ts,
+        "last_deferred_reason": "cycle_job_limit",
+        "consecutive_deferrals": previous_deferrals + 1,
+    }
+    save_job_state(state_path, state)
+    return {
+        "name": job.name,
+        "ok": True,
+        "skipped": True,
+        "reason": "cycle_job_limit",
+        "started_at": deferred_at,
+        "started_ts": deferred_ts,
+    }
+
+
+def _record_job_result(
+    job: JobConfig,
+    state: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    state_path: Path,
+    scheduler_now: float | None,
+) -> dict[str, Any]:
+    if scheduler_now is not None:
+        result["started_ts"] = scheduler_now
+    previous_entry = state["jobs"].get(job.name, {})
+    previous_entry = previous_entry if isinstance(previous_entry, dict) else {}
+    definition_fingerprint = job_definition_fingerprint(job)
+    definition_changed = bool(
+        previous_entry.get("definition_fingerprint")
+        and previous_entry.get("definition_fingerprint") != definition_fingerprint
+    )
+    structured_report = result.get("structured_report")
+    if not isinstance(structured_report, dict):
+        structured_report = result.get("structured_report_summary")
+    structured_report = structured_report if isinstance(structured_report, dict) else {}
+    try:
+        previous_failures = int(previous_entry.get("consecutive_failures") or 0)
+    except (TypeError, ValueError):
+        previous_failures = 0
+    if definition_changed:
+        previous_failures = 0
+    consecutive_failures = 0 if result["ok"] else previous_failures + 1
+    state["jobs"][job.name] = {
+        "last_started_at": result["started_at"],
+        "last_started_ts": result["started_ts"],
+        "last_ok": result["ok"],
+        "last_returncode": result["returncode"],
+        "last_duration_seconds": result["duration_seconds"],
+        "consecutive_failures": consecutive_failures,
+        "definition_fingerprint": definition_fingerprint,
+        **(
+            {"last_stdout_truncated": True, "last_stdout_bytes": result["stdout_bytes"]}
+            if result.get("stdout_truncated")
+            else {}
+        ),
+        **(
+            {"last_stderr_truncated": True, "last_stderr_bytes": result["stderr_bytes"]}
+            if result.get("stderr_truncated")
+            else {}
+        ),
+        **({"last_error": result["error"]} if result.get("error") else {}),
+        **({"last_reason": structured_report["reason"]} if structured_report.get("reason") else {}),
+        **structured_error_state(structured_report),
+    }
+    save_job_state(state_path, state)
+    return result
+
+
+def _run_due_job(
+    job: JobConfig,
+    state: dict[str, Any],
+    *,
+    state_path: Path,
+    scheduler_now: float | None,
+) -> dict[str, Any]:
+    return _record_job_result(
+        job,
+        state,
+        run_job(job),
+        state_path=state_path,
+        scheduler_now=scheduler_now,
+    )
+
+
 def run_due_jobs(
     jobs: list[JobConfig],
     state_path: Path,
@@ -782,87 +899,15 @@ def run_due_jobs(
         if not job_due(job, state, now=now):
             continue
         if max_jobs_per_cycle is not None and executed_jobs >= max_jobs_per_cycle:
-            deferred_at = utc_now()
-            deferred_ts = now if now is not None else time.time()
-            previous_entry = state["jobs"].get(job.name, {})
-            previous_entry = previous_entry if isinstance(previous_entry, dict) else {}
-            try:
-                previous_deferrals = int(previous_entry.get("consecutive_deferrals") or 0)
-            except (TypeError, ValueError):
-                previous_deferrals = 0
-            state["jobs"][job.name] = {
-                **previous_entry,
-                "last_deferred_at": deferred_at,
-                "last_deferred_ts": deferred_ts,
-                "last_deferred_reason": "cycle_job_limit",
-                "consecutive_deferrals": previous_deferrals + 1,
-            }
-            save_job_state(state_path, state)
-            results.append(
-                {
-                    "name": job.name,
-                    "ok": True,
-                    "skipped": True,
-                    "reason": "cycle_job_limit",
-                    "started_at": deferred_at,
-                    "started_ts": deferred_ts,
-                }
-            )
+            results.append(_deferred_job_result(job, state, state_path=state_path, now=now))
             continue
-        previous_entry = state["jobs"].get(job.name, {})
-        previous_entry = previous_entry if isinstance(previous_entry, dict) else {}
-        execution_definition_fingerprint = job_definition_fingerprint(job)
-        previous_definition_fingerprint = previous_entry.get("definition_fingerprint")
-        definition_changed = bool(
-            previous_definition_fingerprint
-            and previous_definition_fingerprint != execution_definition_fingerprint
+        result = _run_due_job(
+            job,
+            state,
+            state_path=state_path,
+            scheduler_now=scheduler_now,
         )
-
-        result = run_job(job)
         executed_jobs += 1
-        if scheduler_now is not None:
-            result["started_ts"] = scheduler_now
-        structured_report = result.get("structured_report")
-        if not isinstance(structured_report, dict):
-            structured_report = result.get("structured_report_summary")
-        if not isinstance(structured_report, dict):
-            structured_report = {}
-        if definition_changed:
-            previous_failures = 0
-        else:
-            try:
-                previous_failures = int(previous_entry.get("consecutive_failures") or 0)
-            except (TypeError, ValueError):
-                previous_failures = 0
-        consecutive_failures = 0 if result["ok"] else previous_failures + 1
-        state["jobs"][job.name] = {
-            "last_started_at": result["started_at"],
-            "last_started_ts": result["started_ts"],
-            "last_ok": result["ok"],
-            "last_returncode": result["returncode"],
-            "last_duration_seconds": result["duration_seconds"],
-            "consecutive_failures": consecutive_failures,
-            "definition_fingerprint": execution_definition_fingerprint,
-            **(
-                {"last_stdout_truncated": True, "last_stdout_bytes": result["stdout_bytes"]}
-                if result.get("stdout_truncated")
-                else {}
-            ),
-            **(
-                {"last_stderr_truncated": True, "last_stderr_bytes": result["stderr_bytes"]}
-                if result.get("stderr_truncated")
-                else {}
-            ),
-            **({"last_error": result["error"]} if result.get("error") else {}),
-            **(
-                {
-                    "last_reason": structured_report["reason"],
-                }
-                if structured_report.get("reason")
-                else {}
-            ),
-            **structured_error_state(structured_report),
-        }
         results.append(result)
         _set_scheduler_next_index(state, job_index=job_index, total_jobs=len(jobs))
         save_job_state(state_path, state)
