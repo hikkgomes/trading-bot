@@ -87,6 +87,57 @@ def _job_flag_value(command: list[str], flag: str) -> str | None:
     return command[index + 1]
 
 
+def _dynamic_snapshot_valid(
+    snapshot_value: Any,
+    *,
+    job: Any,
+    snapshot_id: Any,
+    payload: dict[str, Any],
+) -> bool:
+    if not isinstance(snapshot_value, str) or not snapshot_value:
+        return False
+    snapshot_path = Path(snapshot_value)
+    if not snapshot_path.is_absolute():
+        snapshot_path = job.working_dir / snapshot_path
+    try:
+        snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return bool(
+        not snapshot_path.is_symlink()
+        and isinstance(snapshot_payload, dict)
+        and (snapshot_payload.get("snapshot") or {}).get("id") == snapshot_id
+        and snapshot_payload.get("generated_at") == payload.get("generated_at")
+        and snapshot_payload.get("research_universe_symbols")
+        == payload.get("research_universe_symbols")
+        and snapshot_payload.get("eligible_research_symbols")
+        == payload.get("eligible_research_symbols")
+    )
+
+
+def _dynamic_symbol_statuses(
+    config: AutopilotConfig, symbols: list[str]
+) -> dict[str, Any]:
+    required = required_indicator_features_by_market(["futures"], jobs=config.jobs)["futures"]
+    return {
+        symbol: {
+            "ok": bool(
+                (market_data := build_market_data_status(market="futures", symbol=symbol)).get(
+                    "ok"
+                )
+                and (
+                    indicators := build_indicator_feature_status(
+                        required, market="futures", symbol=symbol
+                    )
+                ).get("ok")
+            ),
+            "market_data": market_data,
+            "indicator_features": indicators,
+        }
+        for symbol in symbols
+    }
+
+
 def _dynamic_universe_readiness(
     config: AutopilotConfig,
     factory: ResearchFactoryConfig | None,
@@ -135,25 +186,12 @@ def _dynamic_universe_readiness(
     snapshot = payload.get("snapshot")
     snapshot_id = snapshot.get("id") if isinstance(snapshot, dict) else None
     snapshot_value = snapshot.get("path") if isinstance(snapshot, dict) else None
-    snapshot_valid = False
-    if isinstance(snapshot_value, str) and snapshot_value:
-        snapshot_path = Path(snapshot_value)
-        if not snapshot_path.is_absolute():
-            snapshot_path = job.working_dir / snapshot_path
-        try:
-            snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-            snapshot_valid = bool(
-                not snapshot_path.is_symlink()
-                and isinstance(snapshot_payload, dict)
-                and (snapshot_payload.get("snapshot") or {}).get("id") == snapshot_id
-                and snapshot_payload.get("generated_at") == payload.get("generated_at")
-                and snapshot_payload.get("research_universe_symbols")
-                == payload.get("research_universe_symbols")
-                and snapshot_payload.get("eligible_research_symbols")
-                == payload.get("eligible_research_symbols")
-            )
-        except Exception:
-            snapshot_valid = False
+    snapshot_valid = _dynamic_snapshot_valid(
+        snapshot_value,
+        job=job,
+        snapshot_id=snapshot_id,
+        payload=payload,
+    )
     symbols = [
         str(symbol).upper()
         for symbol in (
@@ -174,26 +212,7 @@ def _dynamic_universe_readiness(
         and 0 <= age_seconds <= 48 * 3600
         and symbols
     )
-    required = required_indicator_features_by_market(
-        ["futures"],
-        jobs=config.jobs,
-    )["futures"]
-    symbol_statuses: dict[str, Any] = {}
-    for symbol in symbols:
-        market_data = build_market_data_status(
-            market="futures",
-            symbol=symbol,
-        )
-        indicators = build_indicator_feature_status(
-            required,
-            market="futures",
-            symbol=symbol,
-        )
-        symbol_statuses[symbol] = {
-            "ok": bool(market_data.get("ok") and indicators.get("ok")),
-            "market_data": market_data,
-            "indicator_features": indicators,
-        }
+    symbol_statuses = _dynamic_symbol_statuses(config, symbols)
     symbols_ready = bool(symbol_statuses) and all(item["ok"] for item in symbol_statuses.values())
     status.update(
         {
@@ -240,6 +259,168 @@ def _path_writable(path: Path) -> bool:
         return False
     parent = _nearest_existing_parent(path)
     return bool(parent and os.access(parent, os.W_OK))
+
+
+def _memory_cache_status(path: Path, *, backup_writable: bool) -> dict[str, Any] | None:
+    global _MEMORY_READINESS_CACHE_KEY, _MEMORY_READINESS_CACHE_VALUE
+    try:
+        metadata = path.stat()
+        cache_key = (str(path.resolve()), metadata.st_ino, metadata.st_mtime_ns, metadata.st_size)
+    except OSError:
+        return None
+    if cache_key != _MEMORY_READINESS_CACHE_KEY or _MEMORY_READINESS_CACHE_VALUE is None:
+        return None
+    cached = copy.deepcopy(_MEMORY_READINESS_CACHE_VALUE)
+    cached["backup_path_writable"] = backup_writable
+    return cached
+
+
+def _memory_integrity_status(path: Path, status: dict[str, Any], *, backup_writable: bool) -> dict[str, Any]:
+    global _MEMORY_READINESS_CACHE_KEY, _MEMORY_READINESS_CACHE_VALUE
+    try:
+        with ExperimentMemory(path, deep_on_open=False) as memory:
+            integrity = memory.integrity_check(deep=True)
+    except (ExperimentMemoryError, OSError, ValueError) as exc:
+        status.update(reason="integrity_failed", error=f"{type(exc).__name__}: {exc}")
+        return status
+    status.update(ok=True, reason="ready", path_writable=_path_writable(path), integrity=integrity)
+    try:
+        metadata = path.stat()
+        _MEMORY_READINESS_CACHE_KEY = (
+            str(path.resolve()),
+            metadata.st_ino,
+            metadata.st_mtime_ns,
+            metadata.st_size,
+        )
+        cached = copy.deepcopy(status)
+        cached["backup_path_writable"] = backup_writable
+        _MEMORY_READINESS_CACHE_VALUE = cached
+    except OSError:
+        _MEMORY_READINESS_CACHE_KEY = None
+        _MEMORY_READINESS_CACHE_VALUE = None
+    return status
+
+
+def _generated_batch_payload(path: Path, status: dict[str, Any]) -> dict[str, Any] | None:
+    if not path.exists():
+        status.update(
+            reason="missing; generated by the first research_factory job",
+            level="warning",
+            next_action="make research-generate",
+        )
+        return None
+    if path.is_symlink() or not path.is_file():
+        status.update(reason="batch_must_be_regular_file")
+        return None
+    if path.stat().st_size > MAX_READINESS_BATCH_BYTES:
+        status.update(reason="batch_too_large", size_bytes=path.stat().st_size)
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        status.update(reason="read_error", error=f"{type(exc).__name__}: {exc}")
+        return None
+    if not isinstance(payload, dict):
+        status.update(reason="payload_not_object")
+        return None
+    return payload
+
+
+def _generated_batch_inputs(
+    payload: dict[str, Any],
+    factory: ResearchFactoryConfig | None,
+    status: dict[str, Any],
+) -> tuple[list[Any], dict[str, dict[str, Any]]] | None:
+    safety = {key: payload.get(key) for key in GENERATED_BATCH_SAFETY}
+    if (
+        payload.get("ok") is not True
+        or payload.get("schema") != GENERATED_BATCH_SCHEMA
+        or safety != GENERATED_BATCH_SAFETY
+    ):
+        status.update(reason="failed_safety_contract", schema=payload.get("schema"), safety=safety)
+        return None
+    if factory is None:
+        status.update(reason="factory_config_unavailable")
+        return None
+    hypotheses = payload.get("hypotheses")
+    metadata_items = payload.get("generation_metadata")
+    if not isinstance(hypotheses, list) or not isinstance(metadata_items, list):
+        status.update(reason="hypotheses_or_metadata_not_list")
+        return None
+    if len(hypotheses) != len(metadata_items):
+        status.update(reason="hypothesis_metadata_count_mismatch")
+        return None
+    if len(hypotheses) > factory.budgets.max_candidates_per_cycle:
+        status.update(reason="candidate_budget_exceeded", hypotheses=len(hypotheses))
+        return None
+    metadata_by_id: dict[str, dict[str, Any]] = {}
+    for item in metadata_items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            status.update(reason="invalid_generation_metadata")
+            return None
+        strategy_id = item["id"]
+        if strategy_id in metadata_by_id:
+            status.update(reason="duplicate_metadata_id", strategy_id=strategy_id)
+            return None
+        metadata_by_id[strategy_id] = item
+    return hypotheses, metadata_by_id
+
+
+def _generated_hypothesis_identity(
+    raw_hypothesis: Any,
+    metadata_by_id: dict[str, dict[str, Any]],
+    factory: ResearchFactoryConfig,
+) -> tuple[str, str]:
+    if not isinstance(raw_hypothesis, dict):
+        raise ValueError("hypothesis must be an object")
+    hypothesis = Hypothesis.from_dict(raw_hypothesis)
+    metadata = metadata_by_id.pop(hypothesis.id)
+    space = resolve_search_space(factory, metadata)
+    expected_context = {
+        "product": space.product,
+        "market": space.market,
+        "pnl_unit": space.pnl_unit,
+        "opportunity_type": space.opportunity_type,
+        "base_timeframe": space.base_timeframe,
+    }
+    mismatches = [
+        key for key, expected in expected_context.items() if metadata.get(key) != expected
+    ]
+    if mismatches:
+        raise ValueError(f"metadata mismatch: {', '.join(mismatches)}")
+    problems = validate_hypothesis_against_space(hypothesis, space)
+    if problems:
+        raise ValueError(f"grammar contract failed: {', '.join(problems)}")
+    specification = strategy_behavior_spec(hypothesis, space)
+    expected_hash = canonical_strategy_hash(specification)
+    legacy_hash = canonical_strategy_hash(
+        {key: value for key, value in specification.items() if key != "_symbol"}
+    )
+    accepted_hashes = {expected_hash, legacy_hash} if space.symbol == "BTCUSDT" else {expected_hash}
+    observed_hash = metadata.get("strategy_hash")
+    if observed_hash not in accepted_hashes:
+        raise ValueError("strategy behavior hash mismatch")
+    return str(observed_hash), space.product
+
+
+def _generated_batch_identity_sets(
+    hypotheses: list[Any],
+    metadata_by_id: dict[str, dict[str, Any]],
+    factory: ResearchFactoryConfig,
+) -> tuple[set[str], set[str]]:
+    hashes: set[str] = set()
+    products: set[str] = set()
+    for raw_hypothesis in hypotheses:
+        observed_hash, product = _generated_hypothesis_identity(
+            raw_hypothesis, metadata_by_id, factory
+        )
+        if observed_hash in hashes:
+            raise ValueError("duplicate strategy behavior")
+        hashes.add(observed_hash)
+        products.add(product)
+    if metadata_by_id:
+        raise ValueError("orphan generation metadata")
+    return hashes, products
 
 
 def _disk_space_status(path: Path, min_free_bytes: int) -> dict[str, Any]:
@@ -464,42 +645,15 @@ def _experiment_memory_status(
     if not path.is_file():
         status.update(reason="memory_path_not_file")
         return status
+    cached = _memory_cache_status(path, backup_writable=backup_writable)
+    if cached is not None:
+        return cached
     try:
-        initial_stat = path.stat()
-        cache_key = (
-            str(path.resolve()),
-            initial_stat.st_ino,
-            initial_stat.st_mtime_ns,
-            initial_stat.st_size,
-        )
+        path.stat()
     except OSError as exc:
         status.update(reason="memory_stat_failed", error=f"{type(exc).__name__}: {exc}")
         return status
-    global _MEMORY_READINESS_CACHE_KEY, _MEMORY_READINESS_CACHE_VALUE
-    if cache_key == _MEMORY_READINESS_CACHE_KEY and _MEMORY_READINESS_CACHE_VALUE is not None:
-        cached = copy.deepcopy(_MEMORY_READINESS_CACHE_VALUE)
-        cached["backup_path_writable"] = backup_writable
-        return cached
-    try:
-        with ExperimentMemory(path, deep_on_open=False) as memory:
-            integrity = memory.integrity_check(deep=True)
-    except (ExperimentMemoryError, OSError, ValueError) as exc:
-        status.update(reason="integrity_failed", error=f"{type(exc).__name__}: {exc}")
-        return status
-    status.update(ok=True, reason="ready", path_writable=_path_writable(path), integrity=integrity)
-    try:
-        final_stat = path.stat()
-        _MEMORY_READINESS_CACHE_KEY = (
-            str(path.resolve()),
-            final_stat.st_ino,
-            final_stat.st_mtime_ns,
-            final_stat.st_size,
-        )
-        _MEMORY_READINESS_CACHE_VALUE = copy.deepcopy(status)
-    except OSError:
-        _MEMORY_READINESS_CACHE_KEY = None
-        _MEMORY_READINESS_CACHE_VALUE = None
-    return status
+    return _memory_integrity_status(path, status, backup_writable=backup_writable)
 
 
 def _generated_batch_status(
@@ -515,109 +669,18 @@ def _generated_batch_status(
         "ok": False,
         "level": "error",
     }
-    if not path.exists():
-        status.update(
-            reason="missing; generated by the first research_factory job",
-            level="warning",
-            next_action="make research-generate",
-        )
+    payload = _generated_batch_payload(path, status)
+    if payload is None:
         return status
-    if path.is_symlink() or not path.is_file():
-        status.update(reason="batch_must_be_regular_file")
+    prepared = _generated_batch_inputs(payload, factory, status)
+    if prepared is None:
         return status
-    if path.stat().st_size > MAX_READINESS_BATCH_BYTES:
-        status.update(reason="batch_too_large", size_bytes=path.stat().st_size)
-        return status
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        status.update(reason="read_error", error=f"{type(exc).__name__}: {exc}")
-        return status
-    if not isinstance(payload, dict):
-        status.update(reason="payload_not_object")
-        return status
-    safety = {key: payload.get(key) for key in GENERATED_BATCH_SAFETY}
-    if (
-        payload.get("ok") is not True
-        or payload.get("schema") != GENERATED_BATCH_SCHEMA
-        or safety != GENERATED_BATCH_SAFETY
-    ):
-        status.update(
-            reason="failed_safety_contract",
-            schema=payload.get("schema"),
-            safety=safety,
-        )
-        return status
-    if factory is None:
-        status.update(reason="factory_config_unavailable")
-        return status
-    hypotheses = payload.get("hypotheses")
-    metadata_items = payload.get("generation_metadata")
-    if not isinstance(hypotheses, list) or not isinstance(metadata_items, list):
-        status.update(reason="hypotheses_or_metadata_not_list")
-        return status
-    if len(hypotheses) != len(metadata_items):
-        status.update(reason="hypothesis_metadata_count_mismatch")
-        return status
-    if len(hypotheses) > factory.budgets.max_candidates_per_cycle:
-        status.update(reason="candidate_budget_exceeded", hypotheses=len(hypotheses))
-        return status
+    hypotheses, metadata_by_id = prepared
 
-    metadata_by_id: dict[str, dict[str, Any]] = {}
-    for item in metadata_items:
-        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
-            status.update(reason="invalid_generation_metadata")
-            return status
-        strategy_id = item["id"]
-        if strategy_id in metadata_by_id:
-            status.update(reason="duplicate_metadata_id", strategy_id=strategy_id)
-            return status
-        metadata_by_id[strategy_id] = item
-
-    hashes: set[str] = set()
-    products: set[str] = set()
     try:
-        for raw_hypothesis in hypotheses:
-            if not isinstance(raw_hypothesis, dict):
-                raise ValueError("hypothesis must be an object")
-            hypothesis = Hypothesis.from_dict(raw_hypothesis)
-            metadata = metadata_by_id.pop(hypothesis.id)
-            space = resolve_search_space(factory, metadata)
-            expected_context = {
-                "product": space.product,
-                "market": space.market,
-                "pnl_unit": space.pnl_unit,
-                "opportunity_type": space.opportunity_type,
-                "base_timeframe": space.base_timeframe,
-            }
-            mismatches = [
-                key for key, expected in expected_context.items() if metadata.get(key) != expected
-            ]
-            if mismatches:
-                raise ValueError(f"metadata mismatch: {', '.join(mismatches)}")
-            problems = validate_hypothesis_against_space(hypothesis, space)
-            if problems:
-                raise ValueError(f"grammar contract failed: {', '.join(problems)}")
-            expected_hash = canonical_strategy_hash(strategy_behavior_spec(hypothesis, space))
-            legacy_hash = canonical_strategy_hash(
-                {
-                    key: value
-                    for key, value in strategy_behavior_spec(hypothesis, space).items()
-                    if key != "_symbol"
-                }
-            )
-            accepted_hashes = {expected_hash}
-            if space.symbol == "BTCUSDT":
-                accepted_hashes.add(legacy_hash)
-            observed_hash = metadata.get("strategy_hash")
-            if observed_hash not in accepted_hashes:
-                raise ValueError("strategy behavior hash mismatch")
-            if observed_hash in hashes:
-                raise ValueError("duplicate strategy behavior")
-            hashes.add(str(observed_hash))
-            products.add(space.product)
-        if metadata_by_id:
-            raise ValueError("orphan generation metadata")
+        hashes, products = _generated_batch_identity_sets(
+            hypotheses, metadata_by_id, factory
+        )
     except (KeyError, TypeError, ValueError) as exc:
         status.update(reason="invalid_strategy_batch", error=f"{type(exc).__name__}: {exc}")
         return status
@@ -641,6 +704,50 @@ def _generated_batch_status(
         generated_at=payload.get("generated_at"),
     )
     return status
+
+
+def _offline_rehearsal_products(
+    products: Any,
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    product_status: dict[str, Any] = {}
+    missing_products: list[str] = []
+    invalid_products: list[str] = []
+    for name in ("active_income", "btc_accumulation"):
+        item = products.get(name) if isinstance(products, dict) else None
+        if not isinstance(item, dict):
+            missing_products.append(name)
+            continue
+        product_ok = (
+            item.get("before_recommendation") == "needs_approval"
+            and item.get("after_recommendation") == "already_approved"
+        )
+        product_status[name] = {
+            "ok": product_ok,
+            "artifact": item.get("artifact"),
+            "trade_log": item.get("trade_log"),
+            "promotion_review_json": item.get("promotion_review_json"),
+            "before_recommendation": item.get("before_recommendation"),
+            "after_recommendation": item.get("after_recommendation"),
+        }
+        if not product_ok:
+            invalid_products.append(name)
+    return product_status, missing_products, invalid_products
+
+
+def _offline_rehearsal_reasons(
+    payload: dict[str, Any],
+    missing_products: list[str],
+    invalid_products: list[str],
+    missing_preflight_products: list[str],
+) -> list[str]:
+    checks = (
+        (payload.get("ok") is not True, "summary_not_ok"),
+        (bool(missing_products), "missing_products"),
+        (bool(invalid_products), "invalid_product_recommendations"),
+        (payload.get("preflight_ok") is not True, "preflight_not_ok"),
+        (bool(missing_preflight_products), "missing_preflight_products"),
+    )
+    return [reason for failed, reason in checks if failed]
 
 
 def _offline_rehearsal_status(path: Path) -> dict[str, Any]:
@@ -667,46 +774,21 @@ def _offline_rehearsal_status(path: Path) -> dict[str, Any]:
             next_action="make rehearse",
         )
         return status
-    products = payload.get("products")
-    product_status: dict[str, Any] = {}
-    missing_products: list[str] = []
-    invalid_products: list[str] = []
-    for name in ("active_income", "btc_accumulation"):
-        item = products.get(name) if isinstance(products, dict) else None
-        if not isinstance(item, dict):
-            missing_products.append(name)
-            continue
-        product_ok = (
-            item.get("before_recommendation") == "needs_approval"
-            and item.get("after_recommendation") == "already_approved"
-        )
-        product_status[name] = {
-            "ok": product_ok,
-            "artifact": item.get("artifact"),
-            "trade_log": item.get("trade_log"),
-            "promotion_review_json": item.get("promotion_review_json"),
-            "before_recommendation": item.get("before_recommendation"),
-            "after_recommendation": item.get("after_recommendation"),
-        }
-        if not product_ok:
-            invalid_products.append(name)
+    product_status, missing_products, invalid_products = _offline_rehearsal_products(
+        payload.get("products")
+    )
     preflight_products = payload.get("preflight_products")
     if not isinstance(preflight_products, list):
         preflight_products = []
     missing_preflight_products = sorted(
         {"active_income", "btc_accumulation"} - {str(item) for item in preflight_products}
     )
-    reasons: list[str] = []
-    if payload.get("ok") is not True:
-        reasons.append("summary_not_ok")
-    if missing_products:
-        reasons.append("missing_products")
-    if invalid_products:
-        reasons.append("invalid_product_recommendations")
-    if payload.get("preflight_ok") is not True:
-        reasons.append("preflight_not_ok")
-    if missing_preflight_products:
-        reasons.append("missing_preflight_products")
+    reasons = _offline_rehearsal_reasons(
+        payload,
+        missing_products,
+        invalid_products,
+        missing_preflight_products,
+    )
     status.update(
         {
             "ok": not reasons,
@@ -727,6 +809,52 @@ def _offline_rehearsal_status(path: Path) -> dict[str, Any]:
     return status
 
 
+def _approval_entry_status(
+    fingerprint: str, raw_entry: Any
+) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    if not isinstance(raw_entry, dict):
+        return "malformed", None, None, None
+    entry_status = str(raw_entry.get("status") or "unknown")
+    actor_issue = None
+    revocation_issue = None
+    fingerprint_issue = None
+    if entry_status == "approved" and not is_valid_approval_actor(
+        raw_entry.get("approved_by")
+    ):
+        entry_status = "invalid_actor"
+        actor_issue = {
+            "fingerprint": str(fingerprint),
+            "strategy_id": raw_entry.get("strategy_id"),
+            "artifact_path": raw_entry.get("artifact_path"),
+            "product": raw_entry.get("product"),
+        }
+    elif entry_status == "revoked":
+        reasons = []
+        if not is_valid_approval_actor(raw_entry.get("revoked_by")):
+            reasons.append("invalid_revoked_by")
+        if not is_valid_revocation_reason(raw_entry.get("revocation_reason")):
+            reasons.append("missing_revocation_reason")
+        if reasons:
+            entry_status = "invalid_revocation_audit"
+            revocation_issue = {
+                "fingerprint": str(fingerprint),
+                "strategy_id": raw_entry.get("strategy_id"),
+                "artifact_path": raw_entry.get("artifact_path"),
+                "product": raw_entry.get("product"),
+                "reasons": reasons,
+            }
+    elif entry_status == "approved" and raw_entry.get("fingerprint") != str(fingerprint):
+        entry_status = "fingerprint_mismatch"
+        fingerprint_issue = {
+            "fingerprint": str(fingerprint),
+            "entry_fingerprint": raw_entry.get("fingerprint"),
+            "strategy_id": raw_entry.get("strategy_id"),
+            "artifact_path": raw_entry.get("artifact_path"),
+            "product": raw_entry.get("product"),
+        }
+    return entry_status, actor_issue, revocation_issue, fingerprint_issue
+
+
 def _approval_ledger_status(path: Path) -> dict[str, Any]:
     status: dict[str, Any] = {"path": str(path), "exists": path.exists(), "ok": True}
     if not path.exists():
@@ -743,48 +871,18 @@ def _approval_ledger_status(path: Path) -> dict[str, Any]:
     invalid_revocation_entries = []
     counts: dict[str, int] = {}
     for fingerprint, raw_entry in approvals.items():
-        if not isinstance(raw_entry, dict):
-            counts["malformed"] = counts.get("malformed", 0) + 1
-            continue
-        entry_status = str(raw_entry.get("status") or "unknown")
-        if entry_status == "approved" and not is_valid_approval_actor(raw_entry.get("approved_by")):
-            entry_status = "invalid_actor"
-            invalid_actor_entries.append(
-                {
-                    "fingerprint": str(fingerprint),
-                    "strategy_id": raw_entry.get("strategy_id"),
-                    "artifact_path": raw_entry.get("artifact_path"),
-                    "product": raw_entry.get("product"),
-                }
-            )
-        elif entry_status == "revoked":
-            reasons = []
-            if not is_valid_approval_actor(raw_entry.get("revoked_by")):
-                reasons.append("invalid_revoked_by")
-            if not is_valid_revocation_reason(raw_entry.get("revocation_reason")):
-                reasons.append("missing_revocation_reason")
-            if reasons:
-                entry_status = "invalid_revocation_audit"
-                invalid_revocation_entries.append(
-                    {
-                        "fingerprint": str(fingerprint),
-                        "strategy_id": raw_entry.get("strategy_id"),
-                        "artifact_path": raw_entry.get("artifact_path"),
-                        "product": raw_entry.get("product"),
-                        "reasons": reasons,
-                    }
-                )
-        elif entry_status == "approved" and raw_entry.get("fingerprint") != str(fingerprint):
-            entry_status = "fingerprint_mismatch"
-            fingerprint_mismatch_entries.append(
-                {
-                    "fingerprint": str(fingerprint),
-                    "entry_fingerprint": raw_entry.get("fingerprint"),
-                    "strategy_id": raw_entry.get("strategy_id"),
-                    "artifact_path": raw_entry.get("artifact_path"),
-                    "product": raw_entry.get("product"),
-                }
-            )
+        (
+            entry_status,
+            actor_issue,
+            revocation_issue,
+            fingerprint_issue,
+        ) = _approval_entry_status(fingerprint, raw_entry)
+        if actor_issue is not None:
+            invalid_actor_entries.append(actor_issue)
+        if revocation_issue is not None:
+            invalid_revocation_entries.append(revocation_issue)
+        if fingerprint_issue is not None:
+            fingerprint_mismatch_entries.append(fingerprint_issue)
         counts[entry_status] = counts.get(entry_status, 0) + 1
     status.update(
         reason="ready",
@@ -916,34 +1014,29 @@ def _readiness_env() -> dict[str, str]:
     return values
 
 
-def _product_readiness(
+def _product_artifact_checks(
     product: ProductConfig,
-    config: AutopilotConfig,
-    *,
-    env: Mapping[str, str],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     checks: list[dict[str, Any]] = []
     artifact_exists = product.strategies_path.exists()
-    if product.execution_mode == "live":
-        checks.append(
-            _check(
-                f"{product.name}: strategy artifact exists",
-                artifact_exists,
-                detail=str(product.strategies_path),
-            )
-        )
-    else:
-        checks.append(
-            _check(
-                f"{product.name}: paper strategy artifact",
-                artifact_exists,
-                level="info",
-                detail=str(product.strategies_path)
+    checks.append(
+        _check(
+            f"{product.name}: strategy artifact exists"
+            if product.execution_mode == "live"
+            else f"{product.name}: paper strategy artifact",
+            artifact_exists,
+            level="error" if product.execution_mode == "live" else "info",
+            detail=(
+                str(product.strategies_path)
                 if artifact_exists
-                else "missing; product will wait for research/export",
-            )
+                else (
+                    "missing; product will wait for research/export"
+                    if product.execution_mode != "live"
+                    else str(product.strategies_path)
+                )
+            ),
         )
-
+    )
     if artifact_exists:
         try:
             detail = assert_strategy_artifact_allowed(product)
@@ -957,25 +1050,30 @@ def _product_readiness(
                     detail=str(exc),
                 )
             )
-
-    checks.append(
-        _check(
-            f"{product.name}: state path writable",
-            _path_writable(product.state_file),
-            detail=str(product.state_file),
-        )
+    checks.extend(
+        [
+            _check(
+                f"{product.name}: state path writable",
+                _path_writable(product.state_file),
+                detail=str(product.state_file),
+            ),
+            _check(
+                f"{product.name}: trade-log path writable",
+                _path_writable(product.trade_log),
+                detail=str(product.trade_log),
+            ),
+        ]
     )
-    checks.append(
-        _check(
-            f"{product.name}: trade-log path writable",
-            _path_writable(product.trade_log),
-            detail=str(product.trade_log),
-        )
-    )
+    return checks, artifact_exists
 
-    if product.execution_mode != "live":
-        return checks
 
+def _product_live_evidence_checks(
+    product: ProductConfig,
+    config: AutopilotConfig,
+    *,
+    artifact_exists: bool,
+) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
     if artifact_exists:
         try:
             assert_artifact_live_approved(
@@ -984,55 +1082,60 @@ def _product_readiness(
             checks.append(_check(f"{product.name}: live approval", True))
         except (ApprovalError, FileNotFoundError, json.JSONDecodeError) as exc:
             checks.append(_check(f"{product.name}: live approval", False, detail=str(exc)))
-
     if product.require_preflight:
-        preflight_exists = bool(product.preflight_report and product.preflight_report.exists())
+        report = product.preflight_report
+        exists = bool(report and report.exists())
         checks.append(
             _check(
                 f"{product.name}: preflight report exists",
-                preflight_exists,
-                detail=str(product.preflight_report)
-                if product.preflight_report
-                else "not configured",
+                exists,
+                detail=str(report) if report else "not configured",
             )
         )
-        if preflight_exists:
+        if exists:
             try:
-                detail = assert_recent_preflight(product)
                 checks.append(
-                    _check(f"{product.name}: preflight report current", True, detail=detail)
+                    _check(
+                        f"{product.name}: preflight report current",
+                        True,
+                        detail=assert_recent_preflight(product),
+                    )
                 )
             except (RuntimeError, OSError, json.JSONDecodeError, ValueError) as exc:
                 checks.append(
                     _check(f"{product.name}: preflight report current", False, detail=str(exc))
                 )
-
     if product.require_testnet_rehearsal:
-        rehearsal_exists = bool(
-            product.testnet_rehearsal_report and product.testnet_rehearsal_report.exists()
-        )
+        report = product.testnet_rehearsal_report
+        exists = bool(report and report.exists())
         checks.append(
             _check(
                 f"{product.name}: testnet rehearsal report exists",
-                rehearsal_exists,
-                detail=str(product.testnet_rehearsal_report)
-                if product.testnet_rehearsal_report
-                else "not configured",
+                exists,
+                detail=str(report) if report else "not configured",
             )
         )
-        if rehearsal_exists:
+        if exists:
             try:
-                detail = assert_recent_testnet_rehearsal(product)
                 checks.append(
-                    _check(f"{product.name}: testnet rehearsal current", True, detail=detail)
+                    _check(
+                        f"{product.name}: testnet rehearsal current",
+                        True,
+                        detail=assert_recent_testnet_rehearsal(product),
+                    )
                 )
             except (RuntimeError, OSError, json.JSONDecodeError, ValueError) as exc:
                 checks.append(
                     _check(f"{product.name}: testnet rehearsal current", False, detail=str(exc))
                 )
+    return checks
 
+
+def _product_environment_checks(
+    product: ProductConfig, env: Mapping[str, str]
+) -> list[dict[str, Any]]:
     market_type = _market_type(product)
-    env_errors: list[str] = []
+    errors: list[str] = []
     exchange_name = "SPOT_EXCHANGE" if market_type == "spot" else "FUTURES_EXCHANGE"
     try:
         exchange = _env_exchange(
@@ -1042,24 +1145,25 @@ def _product_readiness(
         )
     except ValueError as exc:
         exchange = ""
-        env_errors.append(str(exc))
+        errors.append(str(exc))
     quote_asset = env.get("QUOTE_ASSET", "USDT").strip().upper()
     try:
         live_enabled = _env_bool(env, "TRADING_LIVE", False)
     except ValueError as exc:
         live_enabled = False
-        env_errors.append(str(exc))
+        errors.append(str(exc))
     try:
         testnet_enabled = _env_bool(env, "EXCHANGE_TESTNET", True)
     except ValueError as exc:
         testnet_enabled = False
-        env_errors.append(str(exc))
+        errors.append(str(exc))
     max_notional = _env_float(env, "MAX_NOTIONAL_USD", 100.0)
     max_futures_leverage = _env_float(env, "MAX_FUTURES_LEVERAGE", 1.0)
     futures_margin_mode = env.get("FUTURES_MARGIN_MODE", "isolated").strip().lower()
-    if env_errors:
+    checks: list[dict[str, Any]] = []
+    if errors:
         checks.append(
-            _check(f"{product.name}: exchange environment values", False, detail=env_errors)
+            _check(f"{product.name}: exchange environment values", False, detail=errors)
         )
     checks.extend(
         [
@@ -1076,11 +1180,7 @@ def _product_readiness(
                 ),
                 detail="EXCHANGE_API_KEY and EXCHANGE_API_SECRET",
             ),
-            _check(
-                f"{product.name}: max notional cap",
-                max_notional > 0,
-                detail=max_notional,
-            ),
+            _check(f"{product.name}: max notional cap", max_notional > 0, detail=max_notional),
             _check(
                 f"{product.name}: {market_type} exchange configured",
                 bool(exchange),
@@ -1090,6 +1190,11 @@ def _product_readiness(
         ]
     )
     if market_type == "futures":
+        leverage_ok = (
+            max_futures_leverage == ACTIVE_INCOME_MAX_FUTURES_LEVERAGE
+            if product.objective == "active_income"
+            else 1 <= max_futures_leverage <= 3
+        )
         checks.extend(
             [
                 _check(
@@ -1105,16 +1210,14 @@ def _product_readiness(
                 ),
                 _check(
                     f"{product.name}: max futures leverage",
-                    (
-                        max_futures_leverage == ACTIVE_INCOME_MAX_FUTURES_LEVERAGE
-                        if product.objective == "active_income"
-                        else 1 <= max_futures_leverage <= 3
-                    ),
+                    leverage_ok,
                     detail={
                         "value": max_futures_leverage,
-                        "required": ACTIVE_INCOME_MAX_FUTURES_LEVERAGE
-                        if product.objective == "active_income"
-                        else "1-3",
+                        "required": (
+                            ACTIVE_INCOME_MAX_FUTURES_LEVERAGE
+                            if product.objective == "active_income"
+                            else "1-3"
+                        ),
                     },
                 ),
             ]
@@ -1128,17 +1231,35 @@ def _product_readiness(
                 detail=exchange or "using execution default",
             )
         )
-    checks.append(_check(f"{product.name}: quote asset", quote_asset == "USDT", detail=quote_asset))
-    checks.append(
-        _check(
-            f"{product.name}: production exchange routing",
-            not testnet_enabled,
-            detail=(
-                "EXCHANGE_TESTNET=0 is required for a configured live product; "
-                "run the separate testnet rehearsal while the product remains paper/paused"
+    checks.extend(
+        [
+            _check(f"{product.name}: quote asset", quote_asset == "USDT", detail=quote_asset),
+            _check(
+                f"{product.name}: production exchange routing",
+                not testnet_enabled,
+                detail=(
+                    "EXCHANGE_TESTNET=0 is required for a configured live product; "
+                    "run the separate testnet rehearsal while the product remains paper/paused"
+                ),
             ),
-        )
+        ]
     )
+    return checks
+
+
+def _product_readiness(
+    product: ProductConfig,
+    config: AutopilotConfig,
+    *,
+    env: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    checks, artifact_exists = _product_artifact_checks(product)
+    if product.execution_mode != "live":
+        return checks
+    checks.extend(
+        _product_live_evidence_checks(product, config, artifact_exists=artifact_exists)
+    )
+    checks.extend(_product_environment_checks(product, env))
     return checks
 
 
