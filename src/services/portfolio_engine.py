@@ -118,6 +118,7 @@ class DatabasePortfolioTargetBuilder:
                 metadata={
                     "product_id": product_id,
                     "canonical_state_id": state_id,
+                    "assignment_id": seed.metadata.get("assignment_id"),
                     "core_btc_fraction": allocation.core_btc_fraction,
                     "tactical_btc_fraction": allocation.tactical_btc_fraction,
                     "stablecoin_fraction": allocation.stablecoin_fraction,
