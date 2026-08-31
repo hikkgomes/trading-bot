@@ -110,11 +110,29 @@ class ExecutionService:
         risk_decision: RiskDecision,
     ) -> tuple[DecisionTrace, ...]:
         return tuple(
-            self._accepted_trace(target.instrument_id, now, risk_decision).block(
+            self._portfolio_trace(target.instrument_id, now).block(
                 DecisionTraceStage.RISK_ACCEPTED,
                 reason_code=risk_decision.reason_code or "risk_rejected",
             )
             for target in targets
+        )
+
+    @staticmethod
+    def _portfolio_trace(
+        instrument_id: str, now: str
+    ) -> DecisionTrace:
+        return (
+            DecisionTrace.start(
+                event_id=f"target:{instrument_id}:{now}", instrument_id=instrument_id
+            )
+            .pass_stage(DecisionTraceStage.DATA_AVAILABLE)
+            .pass_stage(DecisionTraceStage.FEATURE_AVAILABLE)
+            .pass_stage(DecisionTraceStage.STRATEGY_EVALUATED)
+            .pass_stage(DecisionTraceStage.REGIME_PASSED)
+            .pass_stage(DecisionTraceStage.SETUP_PASSED)
+            .pass_stage(DecisionTraceStage.TRIGGER_PASSED)
+            .pass_stage(DecisionTraceStage.SIGNAL_PRODUCED)
+            .pass_stage(DecisionTraceStage.PORTFOLIO_ACCEPTED)
         )
 
     def _target_orders(
