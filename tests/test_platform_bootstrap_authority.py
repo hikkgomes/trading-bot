@@ -129,7 +129,7 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
     repeated = scheduler.run_once(now=NOW)
 
     assert scheduled["schedules"] == 12
-    assert scheduled["jobs_enqueued"] == 10
+    assert scheduled["jobs_enqueued"] == 8
     assert repeated["jobs_enqueued"] == 0
     assert scheduled["maintenance"]["reason_code"] == "platform_maintenance_completed"
     with database.engine.connect() as connection:
@@ -137,10 +137,11 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
             connection.execute(select(func.count()).select_from(platform_schedule)).scalar_one()
             == 12
         )
-        assert connection.execute(select(func.count()).select_from(job)).scalar_one() == 16
+        assert connection.execute(select(func.count()).select_from(job)).scalar_one() == 14
         assert "diagnostic_paper_open" in set(connection.execute(select(job.c.name)).scalars())
         assert "dataset_snapshot_validate" in set(connection.execute(select(job.c.name)).scalars())
         assert "universe_refresh" in set(connection.execute(select(job.c.name)).scalars())
+        assert "register_ml_candidate" not in set(connection.execute(select(job.c.name)).scalars())
 
     with database.engine.begin() as connection:
         connection.execute(

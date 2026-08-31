@@ -29,7 +29,6 @@ from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.research.datasets import SqlDatasetBundleRepository
 from src.research.store import SqlResearchStore
-from src.research.theses import StrategyThesisFactory
 from src.services.alerting import AlertSeverity, SqlAlertService, configured_alert_service
 from src.services.job_schemas import JobSchemaError, validate_job_payload
 
@@ -231,14 +230,6 @@ class PlatformScheduler:
                     catalogue,
                 ),
             ]
-            if catalogue["dataset_snapshot_hashes"]:
-                jobs.append(
-                    (
-                        f"scheduled:{schedule_name}:{product_id}:ml:{due_at}",
-                        "register_ml_candidate",
-                        self._ml_candidate_payload(product_id, product, catalogue),
-                    )
-                )
             jobs.append(
                 (
                     f"scheduled:{schedule_name}:{product_id}:hypotheses:{due_at}",
@@ -451,50 +442,6 @@ class PlatformScheduler:
                 )
             )
         return tuple(jobs)
-
-    def _ml_candidate_payload(
-        self,
-        product_id: str,
-        product: Mapping[str, Any],
-        catalogue: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        universe = tuple(str(item) for item in catalogue["instrument_universe"])
-        thesis = StrategyThesisFactory.default().build(
-            name="frozen_logistic_model",
-            family="machine_learning",
-            product=product_id,
-            instrument_universe=universe,
-        )
-        return {
-            "identity": f"platform-scheduler:{product_id}:ml-classifier",
-            "version": "diagnostic-v1",
-            "family": "machine_learning",
-            "product": product_id,
-            "thesis_id": thesis.thesis_id,
-            "lineage_id": canonical_hash(
-                {
-                    "thesis_id": thesis.thesis_id,
-                    "provider": "platform-scheduler",
-                    "product_id": product_id,
-                }
-            ),
-            "provider": "platform-scheduler",
-            "source_type": "machine_learning",
-            "source_payload": {
-                "kind": "ml_classifier",
-                "model_name": "logistic_regression",
-            },
-            "dataset_snapshot_hashes": list(catalogue["dataset_snapshot_hashes"]),
-            "submitted_at": str(catalogue["catalogue_submitted_at"]),
-            "universe": {"symbols": list(universe)},
-            "data_requirements": {"canonical_ml_rows": True},
-            "feature_graph": {"required_nodes": ["return_1", "range_fraction"]},
-            "position_model": {"kind": "volatility_scaled"},
-            "execution_preferences": {"policy": "paper_only"},
-            "risk_policy": {"id": str(product["risk_policy_id"])},
-            "validation_policy": {"promotable": False},
-            "metadata": {"diagnostic": True, "promotable": False},
-        }
 
     @staticmethod
     def _hypothesis_generation_payload(
