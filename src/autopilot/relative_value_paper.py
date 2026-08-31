@@ -144,6 +144,111 @@ def _position_return(
     return total - ROUND_TRIP_COST_FRACTION, leg_returns
 
 
+def _close_existing_positions(
+    sources: dict[str, Any],
+    active_ids: set[str],
+    *,
+    timeframe: str,
+    results: list[dict[str, Any]],
+) -> None:
+    for source_id, source_state in list(sources.items()):
+        if not isinstance(source_state, dict) or not isinstance(source_state.get("position"), dict):
+            continue
+        position = source_state["position"]
+        try:
+            prices, observed_at = _prices(position["legs"], timeframe)
+            matured = (
+                observed_at - pd.Timestamp(position["entry_observed_at"])
+            ).total_seconds() >= int(position["horizon_seconds"])
+            disappeared = source_id not in active_ids
+            if not (matured or disappeared):
+                continue
+            net_return, leg_returns = _position_return(position, prices, observed_at)
+            source_state["equity"] = float(source_state.get("equity", 1.0)) * (1 + net_return)
+            source_state["peak_equity"] = max(
+                float(source_state.get("peak_equity", 1.0)), float(source_state["equity"])
+            )
+            source_state.setdefault("trades", []).append(
+                {
+                    "source_report": position["source_report"],
+                    "entry_observed_at": position["entry_observed_at"],
+                    "exit_observed_at": observed_at.isoformat(),
+                    "net_return": net_return,
+                    "leg_returns": leg_returns,
+                    "reason": "horizon" if matured else "signal_disappeared",
+                }
+            )
+            source_state["trades"] = source_state["trades"][-200:]
+            source_state["position"] = None
+        except (FileNotFoundError, OSError, ValueError, KeyError) as exc:
+            results.append({"source_id": source_id, "status": "waiting", "detail": str(exc)})
+
+
+def _new_relative_value_state(sources: dict[str, Any], source_id: str) -> dict[str, Any]:
+    return sources.setdefault(
+        source_id,
+        {
+            "equity": 1.0,
+            "peak_equity": 1.0,
+            "position": None,
+            "trades": [],
+            "last_opened_report": None,
+        },
+    )
+
+
+def _open_forecast_position(
+    source: dict[str, Any],
+    source_state: dict[str, Any],
+    forecast: dict[str, Any],
+    *,
+    source_id: str,
+    timeframe: str,
+) -> None:
+    legs = _legs(forecast)
+    prices, observed_at = _prices(legs, timeframe)
+    source_state["position"] = {
+        "source_report": source["generated_at"],
+        "entry_observed_at": observed_at.isoformat(),
+        "entry_prices": prices,
+        "horizon_seconds": int(forecast["horizon_seconds"]),
+        "requires_borrow": bool(forecast.get("requires_borrow")),
+        "metadata": forecast.get("metadata") or {},
+        "legs": legs,
+    }
+    source_state["last_opened_report"] = source["generated_at"]
+
+
+def _open_relative_value_forecasts(
+    source: dict[str, Any],
+    forecasts: list[dict[str, Any]],
+    sources: dict[str, Any],
+    *,
+    timeframe: str,
+    results: list[dict[str, Any]],
+) -> None:
+    for forecast in forecasts:
+        source_id = str(forecast.get("source_id") or "")
+        source_state = _new_relative_value_state(sources, source_id)
+        if source_state.get("position") is not None:
+            results.append({"source_id": source_id, "status": "open"})
+            continue
+        if source_state.get("last_opened_report") == source["generated_at"]:
+            results.append({"source_id": source_id, "status": "observed"})
+            continue
+        try:
+            _open_forecast_position(
+                source,
+                source_state,
+                forecast,
+                source_id=source_id,
+                timeframe=timeframe,
+            )
+            results.append({"source_id": source_id, "status": "opened"})
+        except (FileNotFoundError, OSError, ValueError, KeyError) as exc:
+            results.append({"source_id": source_id, "status": "waiting", "detail": str(exc)})
+
+
 def run_cycle(
     *,
     input_path: Path = DEFAULT_INPUT,
@@ -182,72 +287,16 @@ def run_cycle(
     sources = state.get("sources")
     if not isinstance(sources, dict):
         raise ValueError("relative-value paper state sources must be an object")
-    active_ids = {str(forecast.get("source_id")) for forecast in forecasts}
     results = []
-    for source_id, source_state in list(sources.items()):
-        if not isinstance(source_state, dict) or not isinstance(source_state.get("position"), dict):
-            continue
-        position = source_state["position"]
-        try:
-            prices, observed_at = _prices(position["legs"], timeframe)
-            matured = (
-                observed_at - pd.Timestamp(position["entry_observed_at"])
-            ).total_seconds() >= int(position["horizon_seconds"])
-            disappeared = source_id not in active_ids
-            if matured or disappeared:
-                net_return, leg_returns = _position_return(position, prices, observed_at)
-                source_state["equity"] = float(source_state.get("equity", 1.0)) * (1 + net_return)
-                source_state["peak_equity"] = max(
-                    float(source_state.get("peak_equity", 1.0)), float(source_state["equity"])
-                )
-                source_state.setdefault("trades", []).append(
-                    {
-                        "source_report": position["source_report"],
-                        "entry_observed_at": position["entry_observed_at"],
-                        "exit_observed_at": observed_at.isoformat(),
-                        "net_return": net_return,
-                        "leg_returns": leg_returns,
-                        "reason": "horizon" if matured else "signal_disappeared",
-                    }
-                )
-                source_state["trades"] = source_state["trades"][-200:]
-                source_state["position"] = None
-        except (FileNotFoundError, OSError, ValueError, KeyError) as exc:
-            results.append({"source_id": source_id, "status": "waiting", "detail": str(exc)})
-    for forecast in forecasts:
-        source_id = str(forecast.get("source_id") or "")
-        source_state = sources.setdefault(
-            source_id,
-            {
-                "equity": 1.0,
-                "peak_equity": 1.0,
-                "position": None,
-                "trades": [],
-                "last_opened_report": None,
-            },
-        )
-        if source_state.get("position") is not None:
-            results.append({"source_id": source_id, "status": "open"})
-            continue
-        if source_state.get("last_opened_report") == source["generated_at"]:
-            results.append({"source_id": source_id, "status": "observed"})
-            continue
-        try:
-            legs = _legs(forecast)
-            prices, observed_at = _prices(legs, timeframe)
-            source_state["position"] = {
-                "source_report": source["generated_at"],
-                "entry_observed_at": observed_at.isoformat(),
-                "entry_prices": prices,
-                "horizon_seconds": int(forecast["horizon_seconds"]),
-                "requires_borrow": bool(forecast.get("requires_borrow")),
-                "metadata": forecast.get("metadata") or {},
-                "legs": legs,
-            }
-            source_state["last_opened_report"] = source["generated_at"]
-            results.append({"source_id": source_id, "status": "opened"})
-        except (FileNotFoundError, OSError, ValueError, KeyError) as exc:
-            results.append({"source_id": source_id, "status": "waiting", "detail": str(exc)})
+    active_ids = {str(forecast.get("source_id")) for forecast in forecasts}
+    _close_existing_positions(sources, active_ids, timeframe=timeframe, results=results)
+    _open_relative_value_forecasts(
+        source,
+        forecasts,
+        sources,
+        timeframe=timeframe,
+        results=results,
+    )
     state["updated_at"] = generated_at
     write_json_atomic(state_path, state)
     report = {
