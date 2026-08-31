@@ -227,7 +227,7 @@ def _environment_with_private_settings(environ: Mapping[str, str]) -> dict[str, 
     return values
 
 
-def _validate_env_value_syntax(raw: str, *, line_number: int) -> None:
+def _scan_env_value_syntax(raw: str) -> tuple[str | None, bool, int | None]:
     quote: str | None = None
     escaped = False
     comment_at: int | None = None
@@ -247,6 +247,11 @@ def _validate_env_value_syntax(raw: str, *, line_number: int) -> None:
         if char == "#" and quote is None and (index == 0 or raw[index - 1].isspace()):
             comment_at = index
             break
+    return quote, escaped, comment_at
+
+
+def _validate_env_value_syntax(raw: str, *, line_number: int) -> None:
+    quote, escaped, comment_at = _scan_env_value_syntax(raw)
     if quote is not None or escaped or "\x00" in raw:
         raise TelegramError(f"Telegram settings line {line_number} has malformed value syntax")
     syntax = raw[:comment_at].strip() if comment_at is not None else raw.strip()
@@ -256,6 +261,24 @@ def _validate_env_value_syntax(raw: str, *, line_number: int) -> None:
             raise TelegramError(f"Telegram settings line {line_number} has malformed value syntax")
     elif any(char in quote_chars for char in syntax):
         raise TelegramError(f"Telegram settings line {line_number} has malformed value syntax")
+
+
+def _parse_settings_line(raw: str, *, line_number: int) -> tuple[str, str] | None:
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        return None
+    if "=" not in line:
+        raise TelegramError(
+            f"Telegram settings line {line_number} must be a KEY=value assignment"
+        )
+    key, _, raw_value = line.partition("=")
+    key = key.strip()
+    if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key):
+        raise TelegramError(f"Telegram settings line {line_number} has malformed key")
+    if key not in TELEGRAM_SETTINGS_KEYS:
+        raise TelegramError(f"Telegram settings line {line_number} uses an unknown key")
+    _validate_env_value_syntax(raw_value, line_number=line_number)
+    return key, parse_env_value(raw_value)
 
 
 def load_settings_file(path: Path) -> dict[str, str]:
@@ -275,23 +298,13 @@ def load_settings_file(path: Path) -> dict[str, str]:
         raise TelegramError(f"cannot read Telegram settings file: {type(exc).__name__}") from exc
     values: dict[str, str] = {}
     for line_number, raw in enumerate(lines, start=1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
+        parsed = _parse_settings_line(raw, line_number=line_number)
+        if parsed is None:
             continue
-        if "=" not in line:
-            raise TelegramError(
-                f"Telegram settings line {line_number} must be a KEY=value assignment"
-            )
-        key, _, raw_value = line.partition("=")
-        key = key.strip()
-        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key):
-            raise TelegramError(f"Telegram settings line {line_number} has malformed key")
-        if key not in TELEGRAM_SETTINGS_KEYS:
-            raise TelegramError(f"Telegram settings line {line_number} uses an unknown key")
+        key, parsed_value = parsed
         if key in values:
             raise TelegramError(f"Telegram settings line {line_number} duplicates a key")
-        _validate_env_value_syntax(raw_value, line_number=line_number)
-        values[key] = parse_env_value(raw_value)
+        values[key] = parsed_value
     return values
 
 
@@ -367,34 +380,36 @@ def _redact_secret_patterns(value: str) -> str:
     return _TELEGRAM_BOT_TOKEN.sub("[redacted-telegram-token]", value)
 
 
-def _sanitize_telegram_value(value: Any, *, depth: int = 0) -> Any:
-    if depth > 8:
-        return "[truncated]"
-    if isinstance(value, dict):
-        result: dict[str, Any] = {}
-        for index, (key, item) in enumerate(value.items()):
-            if index >= 100:
-                result["_truncated"] = True
-                break
-            if _is_protected_research_key(key):
-                continue
-            if _is_sensitive_key(key):
-                result[str(key)] = "[redacted]"
-                continue
-            if _is_diagnostic_key(key):
-                result[str(key)] = "[redacted diagnostic]"
-                continue
-            sanitized = _sanitize_telegram_value(item, depth=depth + 1)
-            if sanitized is not _OMIT:
-                result[str(key)] = sanitized
-        return result
-    if isinstance(value, list):
-        result = []
-        for item in value[:100]:
-            sanitized = _sanitize_telegram_value(item, depth=depth + 1)
-            if sanitized is not _OMIT:
-                result.append(sanitized)
-        return result
+def _sanitize_telegram_mapping(value: dict[Any, Any], *, depth: int) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for index, (key, item) in enumerate(value.items()):
+        if index >= 100:
+            result["_truncated"] = True
+            break
+        if _is_protected_research_key(key):
+            continue
+        if _is_sensitive_key(key):
+            result[str(key)] = "[redacted]"
+            continue
+        if _is_diagnostic_key(key):
+            result[str(key)] = "[redacted diagnostic]"
+            continue
+        sanitized = _sanitize_telegram_value(item, depth=depth + 1)
+        if sanitized is not _OMIT:
+            result[str(key)] = sanitized
+    return result
+
+
+def _sanitize_telegram_list(value: list[Any], *, depth: int) -> list[Any]:
+    result = []
+    for item in value[:100]:
+        sanitized = _sanitize_telegram_value(item, depth=depth + 1)
+        if sanitized is not _OMIT:
+            result.append(sanitized)
+    return result
+
+
+def _sanitize_telegram_scalar(value: Any) -> Any:
     if isinstance(value, str):
         if _PROTECTED_RESEARCH_TEXT.search(value):
             return _OMIT
@@ -407,6 +422,16 @@ def _sanitize_telegram_value(value: Any, *, depth: int = 0) -> Any:
     if _PROTECTED_RESEARCH_TEXT.search(rendered):
         return _OMIT
     return _redact_secret_patterns(rendered)
+
+
+def _sanitize_telegram_value(value: Any, *, depth: int = 0) -> Any:
+    if depth > 8:
+        return "[truncated]"
+    if isinstance(value, dict):
+        return _sanitize_telegram_mapping(value, depth=depth)
+    if isinstance(value, list):
+        return _sanitize_telegram_list(value, depth=depth)
+    return _sanitize_telegram_scalar(value)
 
 
 def redact_sensitive(value: Any, *, depth: int = 0) -> Any:
@@ -612,6 +637,18 @@ def _append_readable_detail(
                 _append_readable_detail(lines, item, label=label, depth=depth + 1)
 
 
+def _format_generic_alert(safe: dict[str, Any]) -> str:
+    severity = str(safe.get("severity") or "info").upper()
+    title = str(safe.get("title") or "Autopilot notification")[:200]
+    detail = safe.get("detail") if isinstance(safe.get("detail"), dict) else {}
+    lines = [f"{severity.title()} · {title}"]
+    for key, value in detail.items():
+        if key in {"autonomous", "event_id", "operator_action_required", "schema"}:
+            continue
+        _append_readable_detail(lines, value, label=_friendly_name(key).capitalize())
+    return "\n".join(lines)
+
+
 def format_alert_message(payload: dict[str, Any]) -> str:
     safe = redact_sensitive(payload)
     title = str(safe.get("title") or "Autopilot notification")[:200]
@@ -661,22 +698,7 @@ def format_alert_message(payload: dict[str, Any]) -> str:
     if title == "autopilot cycle recovered":
         return "Trading supervision recovered\nNo action required."
 
-    severity = str(safe.get("severity") or "info").upper()
-    lines = [f"{severity.title()} · {title}"]
-    for key, value in detail.items():
-        if key in {
-            "autonomous",
-            "event_id",
-            "operator_action_required",
-            "schema",
-        }:
-            continue
-        _append_readable_detail(
-            lines,
-            value,
-            label=_friendly_name(key).capitalize(),
-        )
-    return "\n".join(lines)
+    return _format_generic_alert(safe)
 
 
 def _read_last_json_line(path: Path, *, max_bytes: int = 2 * 1024 * 1024) -> dict[str, Any]:
@@ -829,50 +851,32 @@ def build_status_snapshot(
     }
 
 
-def format_status_message(snapshot: dict[str, Any]) -> str:
-    supervisor = snapshot.get("supervisor") or {}
+def _status_attention_needed(snapshot: dict[str, Any]) -> bool:
     control = snapshot.get("control") or {}
-    worker = snapshot.get("job_worker") or {}
     research = snapshot.get("research") or {}
-    universe = snapshot.get("universe") or {}
-    review = snapshot.get("openclaw_review") or {}
-    ingest = snapshot.get("openclaw_ingest") or {}
-    paused = bool(control.get("paused") or control.get("pause_jobs"))
     summary = research.get("summary") or {}
-    research_blocked = any(
+    blocked = any(
         int(summary.get(key) or 0) > 0
-        for key in (
-            "coverage_failures",
-            "scenario_errors",
-            "unsupported_hypotheses",
-        )
+        for key in ("coverage_failures", "scenario_errors", "unsupported_hypotheses")
     )
-    attention = (
-        paused
-        or supervisor.get("ok") is False
-        or worker.get("ok") is False
+    return bool(
+        control.get("paused")
+        or control.get("pause_jobs")
+        or (snapshot.get("supervisor") or {}).get("ok") is False
+        or (snapshot.get("job_worker") or {}).get("ok") is False
         or research.get("ok") is False
-        or universe.get("ok") is False
-        or ingest.get("ok") is False
-        or bool(ingest.get("degraded"))
-        or research_blocked
+        or (snapshot.get("universe") or {}).get("ok") is False
+        or (snapshot.get("openclaw_ingest") or {}).get("ok") is False
+        or (snapshot.get("openclaw_ingest") or {}).get("degraded")
+        or blocked
     )
-    overall = "Attention needed" if attention else "Healthy"
-    lines = [
-        "Trading research update",
-        f"Overall: {overall}.",
-    ]
-    if paused:
-        lines.append(f"Automation is paused ({control.get('reason') or 'no reason recorded'}).")
-    lines.append("")
-    lines.append("Products")
-    for product in snapshot.get("products") or []:
-        lines.append(
-            f"- {str(product.get('name') or 'unknown').replace('_', ' ').title()}: "
-            f"{_status_word(product.get('ok'))}; {product.get('mode') or 'unknown'} mode; "
-            f"{product.get('open_positions') or 0} open positions."
-        )
-    lines.extend(["", "Research"])
+
+
+def _status_research_lines(
+    snapshot: dict[str, Any],
+    summary: dict[str, Any],
+) -> list[str]:
+    lines = ["", "Research"]
     generation = summary.get("generative_search") or {}
     if generation:
         lines.append(
@@ -881,10 +885,9 @@ def format_status_message(snapshot: dict[str, Any]) -> str:
             f"{generation.get('resumed_pending') or 0} resumed, "
             f"{generation.get('revalidation_pending') or 0} revalidations."
         )
-    verdicts = summary.get("verdicts") or {}
     verdict_text = ", ".join(
         f"{count} {str(verdict).replace('_', ' ')}"
-        for verdict, count in sorted(verdicts.items())
+        for verdict, count in sorted((summary.get("verdicts") or {}).items())
         if count
     )
     lines.append(
@@ -892,22 +895,30 @@ def format_status_message(snapshot: dict[str, Any]) -> str:
         f"{verdict_text or 'no completed verdicts'}; "
         f"{summary.get('keepers', 0)} keepers, {summary.get('staged', 0)} staged."
     )
-    top_reasons = summary.get("top_reasons") or {}
-    if top_reasons:
-        reason_text = ", ".join(
-            f"{str(reason).replace('_', ' ')} ({count})"
-            for reason, count in list(top_reasons.items())[:4]
-            if count
-        )
-        if reason_text:
-            lines.append(f"- Main outcomes: {reason_text}.")
+    reasons = ", ".join(
+        f"{str(reason).replace('_', ' ')} ({count})"
+        for reason, count in list((summary.get("top_reasons") or {}).items())[:4]
+        if count
+    )
+    if reasons:
+        lines.append(f"- Main outcomes: {reasons}.")
+    universe = snapshot.get("universe") or {}
     configured = universe.get("research_symbols") or []
-    eligible = universe.get("eligible_research_symbols") or []
     if configured:
         lines.append(
             f"- Futures universe: {', '.join(configured)}. "
-            f"Currently eligible: {', '.join(eligible) or 'none'}."
+            f"Currently eligible: {', '.join(universe.get('eligible_research_symbols') or []) or 'none'}."
         )
+    return lines
+
+
+def _status_bridge_lines(
+    snapshot: dict[str, Any], summary: dict[str, Any]
+) -> list[str]:
+    lines: list[str] = []
+    review = snapshot.get("openclaw_review") or {}
+    ingest = snapshot.get("openclaw_ingest") or {}
+    generation = summary.get("generative_search") or {}
     if review.get("recorded_at"):
         lines.append(
             f"- OpenClaw proposed {review.get('proposal_count') or 0} ideas in its latest review."
@@ -928,6 +939,33 @@ def format_status_message(snapshot: dict[str, Any]) -> str:
             f"- Strategy factory consumed "
             f"{generation.get('openclaw_proposals_seen') or 0} OpenClaw proposals."
         )
+    return lines
+
+
+def format_status_message(snapshot: dict[str, Any]) -> str:
+    supervisor = snapshot.get("supervisor") or {}
+    control = snapshot.get("control") or {}
+    worker = snapshot.get("job_worker") or {}
+    research = snapshot.get("research") or {}
+    summary = research.get("summary") or {}
+    paused = bool(control.get("paused") or control.get("pause_jobs"))
+    attention = _status_attention_needed(snapshot)
+    overall = "Attention needed" if attention else "Healthy"
+    lines = [
+        "Trading research update",
+        f"Overall: {overall}.",
+    ]
+    if paused:
+        lines.append(f"Automation is paused ({control.get('reason') or 'no reason recorded'}).")
+    lines.extend(["", "Products"])
+    lines.extend(
+        f"- {str(product.get('name') or 'unknown').replace('_', ' ').title()}: "
+        f"{_status_word(product.get('ok'))}; {product.get('mode') or 'unknown'} mode; "
+        f"{product.get('open_positions') or 0} open positions."
+        for product in snapshot.get("products") or []
+    )
+    lines.extend(_status_research_lines(snapshot, summary))
+    lines.extend(_status_bridge_lines(snapshot, summary))
     lines.extend(
         [
             "",
@@ -961,6 +999,84 @@ def _parse_command(text: str) -> tuple[str, list[str]] | None:
         return None
     command = parts[0].split("@", 1)[0].lower()
     return command, parts[1:]
+
+
+def _handle_pause_command(
+    command: str,
+    arguments: list[str],
+    *,
+    update: dict[str, Any],
+    sender_id: int,
+    settings: TelegramSettings,
+    control_path: Path,
+    control_audit_path: Path,
+    product_names: set[str],
+) -> dict[str, Any]:
+    pause_commands = {"/pause", "/pause_jobs", "/pause_product"}
+    refused = {
+        "handled": True,
+        "command": command,
+        "refused": True,
+    }
+    if command not in pause_commands:
+        return {
+            **refused,
+            "reply": "Command refused. This channel supports status and pause-only controls.",
+        }
+    if not settings.pause_commands_enabled:
+        return {
+            **refused,
+            "reply": "Pause commands are disabled; use /status or the local control CLI.",
+        }
+    if not isinstance(sender_id, int) or sender_id not in settings.allowed_user_ids:
+        return {
+            **refused,
+            "reply": "Pause command refused for this Telegram user.",
+        }
+    actor = f"telegram:{sender_id}"
+    reason = f"pause requested through Telegram update {update.get('update_id', 'unknown')}"
+    if command == "/pause" and not arguments:
+        control = update_control(
+            control_path, "pause", reason=reason, audit_path=control_audit_path, actor=actor
+        )
+        reply = "Global pause requested. Resuming requires the local control CLI."
+    elif command == "/pause_jobs" and not arguments:
+        control = update_control(
+            control_path,
+            "pause-jobs",
+            reason=reason,
+            audit_path=control_audit_path,
+            actor=actor,
+        )
+        reply = "Scheduled-job pause requested. Resuming requires the local control CLI."
+    elif command == "/pause_product" and len(arguments) == 1:
+        product_name = arguments[0]
+        if product_name not in product_names:
+            allowed = ", ".join(sorted(product_names)) or "none"
+            return {
+                **refused,
+                "reply": f"Unknown product. Configured products: {allowed}.",
+            }
+        control = update_control(
+            control_path,
+            "pause-product",
+            name=product_name,
+            reason=reason,
+            audit_path=control_audit_path,
+            actor=actor,
+        )
+        reply = f"Product {product_name} pause requested. Resuming requires the local control CLI."
+    else:
+        return {
+            **refused,
+            "reply": "Invalid pause command syntax. Use /help.",
+        }
+    return {
+        "handled": True,
+        "command": command,
+        "reply": reply,
+        "control": {key: control.get(key) for key in SAFE_CONTROL_KEYS},
+    }
 
 
 def handle_update(
@@ -1000,81 +1116,16 @@ def handle_update(
     if command == "/help" and not arguments:
         return {"handled": True, "command": command, "reply": _help_text(settings)}
 
-    pause_commands = {"/pause", "/pause_jobs", "/pause_product"}
-    if command not in pause_commands:
-        return {
-            "handled": True,
-            "command": command,
-            "refused": True,
-            "reply": "Command refused. This channel supports status and pause-only controls.",
-        }
-    if not settings.pause_commands_enabled:
-        return {
-            "handled": True,
-            "command": command,
-            "refused": True,
-            "reply": "Pause commands are disabled; use /status or the local control CLI.",
-        }
-    if not isinstance(sender_id, int) or sender_id not in settings.allowed_user_ids:
-        return {
-            "handled": True,
-            "command": command,
-            "refused": True,
-            "reply": "Pause command refused for this Telegram user.",
-        }
-
-    actor = f"telegram:{sender_id}"
-    reason = f"pause requested through Telegram update {update.get('update_id', 'unknown')}"
-    if command == "/pause" and not arguments:
-        control = update_control(
-            control_path,
-            "pause",
-            reason=reason,
-            audit_path=control_audit_path,
-            actor=actor,
-        )
-        reply = "Global pause requested. Resuming requires the local control CLI."
-    elif command == "/pause_jobs" and not arguments:
-        control = update_control(
-            control_path,
-            "pause-jobs",
-            reason=reason,
-            audit_path=control_audit_path,
-            actor=actor,
-        )
-        reply = "Scheduled-job pause requested. Resuming requires the local control CLI."
-    elif command == "/pause_product" and len(arguments) == 1:
-        product_name = arguments[0]
-        if product_name not in product_names:
-            allowed = ", ".join(sorted(product_names)) or "none"
-            return {
-                "handled": True,
-                "command": command,
-                "refused": True,
-                "reply": f"Unknown product. Configured products: {allowed}.",
-            }
-        control = update_control(
-            control_path,
-            "pause-product",
-            name=product_name,
-            reason=reason,
-            audit_path=control_audit_path,
-            actor=actor,
-        )
-        reply = f"Product {product_name} pause requested. Resuming requires the local control CLI."
-    else:
-        return {
-            "handled": True,
-            "command": command,
-            "refused": True,
-            "reply": "Invalid pause command syntax. Use /help.",
-        }
-    return {
-        "handled": True,
-        "command": command,
-        "reply": reply,
-        "control": {key: control.get(key) for key in SAFE_CONTROL_KEYS},
-    }
+    return _handle_pause_command(
+        command,
+        arguments,
+        update=update,
+        sender_id=sender_id,
+        settings=settings,
+        control_path=control_path,
+        control_audit_path=control_audit_path,
+        product_names=product_names,
+    )
 
 
 def _help_text(settings: TelegramSettings) -> str:
@@ -1218,6 +1269,111 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _validate_service_paths(
+    config: Any,
+    *,
+    expected_control_file: Path | None,
+    expected_control_audit: Path | None,
+    poll_state: Path,
+) -> None:
+    expected = {
+        "control_file": expected_control_file,
+        "control_audit_file": expected_control_audit,
+        "poll_state": poll_state,
+    }
+    actual = {
+        "control_file": config.control_file,
+        "control_audit_file": config.control_audit_file,
+        "poll_state": poll_state,
+    }
+    missing = [name for name, path in expected.items() if path is None]
+    mismatched = [
+        name
+        for name, expected_path in expected.items()
+        if expected_path is not None
+        and actual[name].resolve(strict=False) != expected_path.resolve(strict=False)
+    ]
+    if missing or mismatched:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "Telegram service writable paths do not match the dedicated boundary",
+                    "missing": missing,
+                    "mismatched": mismatched,
+                },
+                sort_keys=True,
+            )
+        )
+        raise SystemExit(1)
+    unsafe_paths = [
+        name
+        for name, path in actual.items()
+        if path.is_symlink() or path.parent.is_symlink() or not path.parent.is_dir()
+    ]
+    if unsafe_paths:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "Telegram service writable paths require safe existing parent directories",
+                    "unsafe": unsafe_paths,
+                },
+                sort_keys=True,
+            )
+        )
+        raise SystemExit(1)
+    writable_parents = {path.parent.resolve(strict=False) for path in actual.values()}
+    runtime_root = (PROJECT_ROOT / "runtime").resolve(strict=False)
+    if runtime_root in writable_parents:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "Telegram service paths must not require the runtime root to be writable",
+                },
+                sort_keys=True,
+            )
+        )
+        raise SystemExit(1)
+    print(
+        json.dumps(
+            {"ok": True, "writable_directories": sorted(map(str, writable_parents))},
+            sort_keys=True,
+        )
+    )
+
+
+def _run_telegram_loop(
+    settings: TelegramSettings,
+    config: Any,
+    args: argparse.Namespace,
+    product_names: set[str],
+) -> None:
+    while True:
+        try:
+            report = poll_once(
+                settings=settings,
+                status_path=config.status_file,
+                control_path=config.control_file,
+                control_audit_path=config.control_audit_file,
+                poll_state_path=args.poll_state,
+                product_names=product_names,
+                job_worker_status_path=args.job_worker_status,
+                research_cycle_path=args.research_cycle,
+                long_poll_seconds=args.long_poll_seconds,
+            )
+            print(json.dumps(report, sort_keys=True))
+        except TelegramError as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
+            if args.once:
+                raise SystemExit(str(exc)) from exc
+            time.sleep(args.retry_seconds)
+            continue
+        if args.once:
+            return
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if args.validate_settings:
@@ -1230,74 +1386,11 @@ def main(argv: list[str] | None = None) -> None:
         return
     config = load_config(args.config, strict_jobs=False)
     if args.validate_service_paths:
-        expected = {
-            "control_file": args.expected_control_file,
-            "control_audit_file": args.expected_control_audit,
-            "poll_state": args.poll_state,
-        }
-        actual = {
-            "control_file": config.control_file,
-            "control_audit_file": config.control_audit_file,
-            "poll_state": args.poll_state,
-        }
-        missing = [name for name, path in expected.items() if path is None]
-        mismatched = [
-            name
-            for name, expected_path in expected.items()
-            if expected_path is not None
-            and actual[name].resolve(strict=False) != expected_path.resolve(strict=False)
-        ]
-        if missing or mismatched:
-            print(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "error": "Telegram service writable paths do not match the dedicated boundary",
-                        "missing": missing,
-                        "mismatched": mismatched,
-                    },
-                    sort_keys=True,
-                )
-            )
-            raise SystemExit(1)
-        unsafe_paths = [
-            name
-            for name, path in actual.items()
-            if path.is_symlink() or path.parent.is_symlink() or not path.parent.is_dir()
-        ]
-        if unsafe_paths:
-            print(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "error": "Telegram service writable paths require safe existing parent directories",
-                        "unsafe": unsafe_paths,
-                    },
-                    sort_keys=True,
-                )
-            )
-            raise SystemExit(1)
-        writable_parents = {path.parent.resolve(strict=False) for path in actual.values()}
-        runtime_root = (PROJECT_ROOT / "runtime").resolve(strict=False)
-        if runtime_root in writable_parents:
-            print(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "error": "Telegram service paths must not require the runtime root to be writable",
-                    },
-                    sort_keys=True,
-                )
-            )
-            raise SystemExit(1)
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "writable_directories": sorted(map(str, writable_parents)),
-                },
-                sort_keys=True,
-            )
+        _validate_service_paths(
+            config,
+            expected_control_file=args.expected_control_file,
+            expected_control_audit=args.expected_control_audit,
+            poll_state=args.poll_state,
         )
         return
     snapshot = build_status_snapshot(
@@ -1322,28 +1415,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.retry_seconds <= 0:
         raise SystemExit("retry seconds must be positive")
     product_names = {product.name for product in config.products}
-    while True:
-        try:
-            report = poll_once(
-                settings=settings,
-                status_path=config.status_file,
-                control_path=config.control_file,
-                control_audit_path=config.control_audit_file,
-                poll_state_path=args.poll_state,
-                product_names=product_names,
-                job_worker_status_path=args.job_worker_status,
-                research_cycle_path=args.research_cycle,
-                long_poll_seconds=args.long_poll_seconds,
-            )
-            print(json.dumps(report, sort_keys=True))
-        except TelegramError as exc:
-            print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
-            if args.once:
-                raise SystemExit(str(exc)) from exc
-            time.sleep(args.retry_seconds)
-            continue
-        if args.once:
-            return
+    _run_telegram_loop(settings, config, args, product_names)
 
 
 if __name__ == "__main__":
