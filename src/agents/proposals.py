@@ -86,6 +86,74 @@ def _assert_safe_provenance(value: Any, *, path: str = "provenance") -> None:
             _assert_safe_provenance(item, path=f"{path}[{index}]")
 
 
+def _normalise_files(files: Mapping[str, str]) -> dict[str, str]:
+    normalised: dict[str, str] = {}
+    total_bytes = 0
+    for raw_path, content in files.items():
+        path = PurePosixPath(non_empty(raw_path, field="proposal file path"))
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("agent proposal file paths must stay in the worktree")
+        if not any(path == root or root in path.parents for root in ALLOWED_FILE_ROOTS):
+            raise ValueError(f"agent proposal file path is outside allowed roots: {path}")
+        if not isinstance(content, str):
+            raise ValueError("agent proposal file content must be text")
+        total_bytes += len(content.encode())
+        if any(marker in content for marker in FORBIDDEN_CODE_MARKERS):
+            raise ValueError(f"agent proposal contains forbidden execution marker: {path}")
+        normalised[str(path)] = content
+    if len(normalised) > 40 or total_bytes > 524_288:
+        raise ValueError("agent proposal exceeds the code resource budget")
+    return normalised
+
+
+def _normalise_research_job(
+    item: Mapping[str, Any], forbidden_result_fields: set[str]
+) -> dict[str, Any]:
+    if not isinstance(item, Mapping):
+        raise ValueError("agent research requests must be objects")
+    request_payload = item.get("request")
+    if isinstance(request_payload, Mapping):
+        if forbidden_result_fields & (set(item) | set(request_payload)):
+            raise ValueError("agent research requests cannot contain results")
+        try:
+            request = ResearchJobRequest.from_mapping(request_payload)
+        except JobSchemaError as exc:
+            raise ValueError(f"invalid agent research request: {exc}") from exc
+        name = non_empty(str(item.get("name") or "evaluate_candidate"), field="job name")
+        if name != "evaluate_candidate":
+            raise ValueError("agent research requests must use the typed evaluator command")
+        return {
+            "name": name,
+            "maximum_seconds": item.get("maximum_seconds", 60),
+            "request": request.to_payload(),
+        }
+    if forbidden_result_fields & set(item):
+        raise ValueError("agent research requests cannot contain results")
+    # An empty request is retained for proposal review compatibility, but the
+    # worker will not enqueue it as executable work.
+    return json_value(dict(item), field="research job")
+
+
+def _normalise_research_jobs(
+    research_jobs: tuple[Mapping[str, Any], ...],
+) -> tuple[dict[str, Any], ...]:
+    if len(research_jobs) > 10:
+        raise ValueError("agent proposal requests too many research jobs")
+    forbidden_result_fields = {
+        "accepted",
+        "evidence",
+        "holdout_result",
+        "forward_result",
+        "limits",
+        "metrics",
+        "risk_decision",
+        "returns",
+        "targets",
+        "validation",
+    }
+    return tuple(_normalise_research_job(item, forbidden_result_fields) for item in research_jobs)
+
+
 @dataclass(frozen=True)
 class AgentProposal:
     proposal_id: str
@@ -114,70 +182,8 @@ class AgentProposal:
             raise ValueError("agent economic thesis must be typed")
         if not isinstance(self.files, Mapping):
             raise ValueError("agent proposal files must be an object")
-        normalised_files: dict[str, str] = {}
-        total_bytes = 0
-        for raw_path, content in self.files.items():
-            path = PurePosixPath(non_empty(raw_path, field="proposal file path"))
-            if path.is_absolute() or ".." in path.parts:
-                raise ValueError("agent proposal file paths must stay in the worktree")
-            if not any(path == root or root in path.parents for root in ALLOWED_FILE_ROOTS):
-                raise ValueError(f"agent proposal file path is outside allowed roots: {path}")
-            if not isinstance(content, str):
-                raise ValueError("agent proposal file content must be text")
-            total_bytes += len(content.encode())
-            if any(marker in content for marker in FORBIDDEN_CODE_MARKERS):
-                raise ValueError(f"agent proposal contains forbidden execution marker: {path}")
-            normalised_files[str(path)] = content
-        if len(normalised_files) > 40 or total_bytes > 524_288:
-            raise ValueError("agent proposal exceeds the code resource budget")
-        object.__setattr__(self, "files", normalised_files)
-        if len(self.research_jobs) > 10:
-            raise ValueError("agent proposal requests too many research jobs")
-        normalised_jobs: list[dict[str, Any]] = []
-        forbidden_result_fields = {
-            "accepted",
-            "evidence",
-            "holdout_result",
-            "forward_result",
-            "limits",
-            "metrics",
-            "risk_decision",
-            "returns",
-            "targets",
-            "validation",
-        }
-        for item in self.research_jobs:
-            if not isinstance(item, Mapping):
-                raise ValueError("agent research requests must be objects")
-            request_payload = item.get("request")
-            if isinstance(request_payload, Mapping):
-                if forbidden_result_fields & (set(item) | set(request_payload)):
-                    raise ValueError("agent research requests cannot contain results")
-                try:
-                    request = ResearchJobRequest.from_mapping(request_payload)
-                except JobSchemaError as exc:
-                    raise ValueError(f"invalid agent research request: {exc}") from exc
-                name = non_empty(str(item.get("name") or "evaluate_candidate"), field="job name")
-                if name != "evaluate_candidate":
-                    raise ValueError("agent research requests must use the typed evaluator command")
-                normalised_jobs.append(
-                    {
-                        "name": name,
-                        "maximum_seconds": item.get("maximum_seconds", 60),
-                        "request": request.to_payload(),
-                    }
-                )
-                continue
-            if forbidden_result_fields & set(item):
-                raise ValueError("agent research requests cannot contain results")
-            # An empty request is retained for proposal review compatibility,
-            # but the worker will not enqueue it as executable work.
-            normalised_jobs.append(json_value(dict(item), field="research job"))
-        object.__setattr__(
-            self,
-            "research_jobs",
-            tuple(normalised_jobs),
-        )
+        object.__setattr__(self, "files", _normalise_files(self.files))
+        object.__setattr__(self, "research_jobs", _normalise_research_jobs(self.research_jobs))
         if not isinstance(self.provenance, Mapping):
             raise ValueError("agent proposal provenance must be an object")
         _assert_safe_provenance(self.provenance)

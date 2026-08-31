@@ -7,7 +7,7 @@ from collections.abc import Mapping
 
 from src.agents.proposals import AgentAction, AgentProposal
 from src.domain._codec import canonical_hash
-from src.domain.strategies import StrategyDefinition, StrategySourceType
+from src.domain.strategies import ResearchThesis, StrategyDefinition, StrategySourceType
 from src.research.datasets import CandidateDatasetPlan, DatasetBundle
 from src.research.providers import provider_candidate
 
@@ -33,11 +33,11 @@ _ALLOWED_FAMILIES = frozenset(
 _ALLOWED_DIRECTIONS = frozenset({"long", "short", "signed", "market_neutral", "hedged"})
 
 
-def compile_openclaw_candidate(
+def _validated_proposal(
     proposal: AgentProposal,
     *,
     bundle: DatasetBundle,
-) -> tuple[StrategyDefinition, CandidateDatasetPlan]:
+) -> tuple[ResearchThesis, str, Mapping[str, object]]:
     thesis = proposal.economic_thesis
     if thesis is None:
         raise AgentCompilationError("OpenClaw proposal has no typed economic thesis")
@@ -51,6 +51,15 @@ def compile_openclaw_candidate(
     rule = proposal.provenance.get("rule")
     if not isinstance(rule, Mapping):
         raise AgentCompilationError("OpenClaw DSL proposals require a typed rule")
+    return thesis, family, rule
+
+
+def _validated_rule(
+    proposal: AgentProposal,
+    *,
+    bundle: DatasetBundle,
+) -> tuple[ResearchThesis, str, str, str, float, str]:
+    thesis, family, rule = _validated_proposal(proposal, bundle=bundle)
     feature = str(rule.get("feature") or "")
     operator = str(rule.get("operator") or "")
     raw_threshold = rule.get("threshold")
@@ -66,6 +75,17 @@ def compile_openclaw_candidate(
         raise AgentCompilationError("OpenClaw rule threshold must be finite")
     if direction not in _ALLOWED_DIRECTIONS:
         raise AgentCompilationError("OpenClaw rule direction is unsupported")
+    return thesis, family, feature, operator, threshold, direction
+
+
+def compile_openclaw_candidate(
+    proposal: AgentProposal,
+    *,
+    bundle: DatasetBundle,
+) -> tuple[StrategyDefinition, CandidateDatasetPlan]:
+    thesis, family, feature, operator, threshold, direction = _validated_rule(
+        proposal, bundle=bundle
+    )
     plan = CandidateDatasetPlan.from_bundle(bundle)
     source_payload = {
         "kind": "typed_rule",
