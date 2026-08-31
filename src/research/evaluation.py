@@ -7,6 +7,7 @@ then appends a validation-stage record that points to that run.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -22,11 +23,16 @@ from src.research.datasets import CanonicalDatasetResolver
 from src.research.evidence import (
     EvidenceProfile,
     cross_symbol_stability_passes,
+    data_integrity_passes,
     drawdown_passes,
+    family_evidence_passes,
     monte_carlo_passes,
     parameter_stability_passes,
+    realistic_costs_passes,
+    regime_breakdown_passes,
     sample_evidence_passes,
     select_profile,
+    semantic_parity_passes,
 )
 from src.research.executors import ExecutorError, ProviderExecutorRegistry
 from src.research.objectives import objective_is_available, objective_passes
@@ -526,7 +532,7 @@ def _finite(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
     result = float(value)
-    return result if __import__("math").isfinite(result) else None
+    return result if math.isfinite(result) else None
 
 
 def _nonnegative(
@@ -618,6 +624,60 @@ def _mapping_passes(
         and value[key] not in (None, (), [], {})
         and not isinstance(value[key], bool)
         for key in value
+    )
+
+
+def _data_integrity_passes(
+    value: object, _policy: EvidencePolicy, _profile: EvidenceProfile | None = None
+) -> bool:
+    return data_integrity_passes(value)
+
+
+def _semantic_parity_passes(
+    value: object, _policy: EvidencePolicy, _profile: EvidenceProfile | None = None
+) -> bool:
+    return semantic_parity_passes(value)
+
+
+def _realistic_costs_passes(
+    value: object, _policy: EvidencePolicy, _profile: EvidenceProfile | None = None
+) -> bool:
+    return realistic_costs_passes(value)
+
+
+def _family_evidence_passes(
+    value: object, _policy: EvidencePolicy, _profile: EvidenceProfile | None = None
+) -> bool:
+    return family_evidence_passes(value)
+
+
+def _regime_breakdown_passes(
+    value: object, _policy: EvidencePolicy, _profile: EvidenceProfile | None = None
+) -> bool:
+    return regime_breakdown_passes(value)
+
+
+def _forward_duration_passes(
+    value: object, _policy: EvidencePolicy, profile: EvidenceProfile | None = None
+) -> bool:
+    if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    profile = profile or EvidenceProfile()
+    calendar_days = _finite(value.get("calendar_days"))
+    trading_days = value.get("trading_days")
+    cycles = value.get("cycles")
+    if calendar_days is None or calendar_days < profile.minimum_calendar_days:
+        return False
+    if (
+        not isinstance(trading_days, int)
+        or isinstance(trading_days, bool)
+        or trading_days < profile.minimum_trading_days
+    ):
+        return False
+    return (
+        isinstance(cycles, int)
+        and not isinstance(cycles, bool)
+        and cycles >= profile.minimum_cycles
     )
 
 
@@ -753,22 +813,34 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
         "compiled": _true,
         "features_valid": _true,
         "causality_valid": _true,
+        "data_integrity": _data_integrity_passes,
+        "semantic_parity": _semantic_parity_passes,
+        "realistic_costs": _realistic_costs_passes,
+        "family_evidence": _family_evidence_passes,
         "signal_frequency": _positive,
         "turnover": _nonnegative,
     },
     "development": {
         "chronological": _true,
+        "data_integrity": _data_integrity_passes,
+        "semantic_parity": _semantic_parity_passes,
+        "realistic_costs": _realistic_costs_passes,
+        "family_evidence": _family_evidence_passes,
         "cost_adjusted_return": _return_passes,
         "fees": _nonnegative,
         "slippage": _nonnegative,
         "funding": _nonnegative,
-        "regime_breakdown": _mapping_passes,
+        "regime_breakdown": _regime_breakdown_passes,
         "parameter_stability": _parameter_stability_passes,
         "sample_evidence": _sample_evidence_passes,
         "cross_symbol_stability": _cross_symbol_stability_passes,
         "universe_evidence": _mapping_passes,
     },
     "robustness": {
+        "data_integrity": _data_integrity_passes,
+        "semantic_parity": _semantic_parity_passes,
+        "realistic_costs": _realistic_costs_passes,
+        "family_evidence": _family_evidence_passes,
         "walk_forward": _walk_forward_passes,
         "purged": _true,
         "embargo": _positive,
@@ -787,6 +859,10 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
         "negative_control_results": _negative_control_results_pass,
     },
     "forward": {
+        "data_integrity": _data_integrity_passes,
+        "semantic_parity": _semantic_parity_passes,
+        "realistic_costs": _realistic_costs_passes,
+        "family_evidence": _family_evidence_passes,
         "production_equivalent": _mapping_passes,
         "exact_strategy_identity": _mapping_passes,
         "exact_artefact_hash": _mapping_passes,
@@ -795,6 +871,8 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
         "drift_checks": _mapping_passes,
         "duration": _positive,
         "evidence_units": _positive,
+        "sample_evidence": _sample_evidence_passes,
+        "forward_duration": _forward_duration_passes,
     },
 }
 
@@ -1306,6 +1384,10 @@ class CanonicalResearchEvaluator:
         required_fields: tuple[str, ...] = {
             "development": (
                 "chronological",
+                "data_integrity",
+                "semantic_parity",
+                "realistic_costs",
+                "family_evidence",
                 "cost_adjusted_return",
                 "funding",
                 "regime_breakdown",
@@ -1315,6 +1397,10 @@ class CanonicalResearchEvaluator:
                 "universe_evidence",
             ),
             "robustness": (
+                "data_integrity",
+                "semantic_parity",
+                "realistic_costs",
+                "family_evidence",
                 "walk_forward",
                 "purged",
                 "embargo",
@@ -1332,6 +1418,10 @@ class CanonicalResearchEvaluator:
                 "negative_control_results",
             ),
             "forward": (
+                "data_integrity",
+                "semantic_parity",
+                "realistic_costs",
+                "family_evidence",
                 "production_equivalent",
                 "exact_strategy_identity",
                 "exact_artefact_hash",
@@ -1340,6 +1430,8 @@ class CanonicalResearchEvaluator:
                 "drift_checks",
                 "duration",
                 "evidence_units",
+                "sample_evidence",
+                "forward_duration",
             ),
         }[stage]
         controls = self._negative_controls(candidate.thesis_id)

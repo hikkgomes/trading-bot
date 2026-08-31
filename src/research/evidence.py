@@ -366,6 +366,58 @@ def holdout_degradation_passes(
     return degradation <= profile.allowed_holdout_degradation + 1e-12
 
 
+def data_integrity_passes(value: object) -> bool:
+    if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    snapshots = value.get("dataset_snapshot_ids")
+    return (
+        isinstance(snapshots, list | tuple)
+        and bool(snapshots)
+        and all(_valid_hash(item) for item in snapshots)
+        and _valid_hash(value.get("input_hash"))
+    )
+
+
+def semantic_parity_passes(value: object) -> bool:
+    if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    source_identity = value.get("behaviour_hash") or value.get("semantic_identity")
+    return _valid_hash(source_identity) or bool(str(source_identity or "").strip())
+
+
+def realistic_costs_passes(value: object) -> bool:
+    if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    fee = _finite(value.get("fee_bps"))
+    slippage = _finite(value.get("slippage_bps"))
+    funding = _finite(value.get("funding_rate"))
+    return (
+        fee is not None
+        and fee >= 0.0
+        and slippage is not None
+        and slippage >= 0.0
+        and funding is not None
+    )
+
+
+def family_evidence_passes(value: object, family: str | None = None) -> bool:
+    if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    actual = str(value.get("family") or "")
+    return bool(actual) and (family is None or actual == family)
+
+
+def regime_breakdown_passes(value: object) -> bool:
+    if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    regimes = value.get("regimes")
+    return (
+        isinstance(regimes, Mapping)
+        and bool(regimes)
+        and all(_finite(measured) is not None for measured in regimes.values())
+    )
+
+
 def _objective_or_return(value: Mapping[str, Any]) -> float | None:
     for name in (
         "objective_excess_fraction",

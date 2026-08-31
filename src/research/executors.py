@@ -265,6 +265,47 @@ def _measured_result(
         context.get("feature_manifest_id") or context.get("feature_set_hash") or ""
     )
     observed_feature_manifest = str(context.get("runtime_feature_manifest_id") or "")
+    family = str(candidate.definition.family)
+    evidence_type = str(candidate.definition.validation_policy.get("evidence_type") or "")
+    data_integrity = {
+        "passed": bool(context.get("data_integrity_valid", True))
+        and all(value.startswith("sha256:") and len(value) == 71 for value in snapshots),
+        "dataset_snapshot_ids": list(snapshots),
+        "input_hash": canonical_hash(
+            {
+                "dataset_snapshot_ids": list(snapshots),
+                "feature_manifest_id": expected_feature_manifest,
+                "cost_model_id": expected_cost_model,
+                "parameter_set_id": context.get("parameter_set_id"),
+            }
+        ),
+    }
+    semantic_parity = {
+        "passed": bool(context.get("semantic_parity_valid", True)),
+        "behaviour_hash": str(
+            context.get("behaviour_hash") or candidate.definition.definition_hash
+        ),
+        "semantic_identity": candidate.definition.definition_hash,
+    }
+    realistic_costs = {
+        "passed": bool(context.get("cost_model_valid", True)),
+        "fee_bps": float(context.get("fee_bps", 0.0)),
+        "slippage_bps": float(context.get("slippage_bps", 0.0)),
+        "funding_rate": float(context.get("funding_rate", 0.0)),
+        "cost_model_id": expected_cost_model,
+    }
+    family_evidence = {
+        "passed": bool(context.get("family_evidence_valid", True)),
+        "family": family,
+        "evidence_type": evidence_type,
+        "instrument_scope": list(context.get("instrument_scope", ())),
+    }
+    cycles = int(
+        context.get(
+            "cycles",
+            accounting.get("cycles", 0) if accounting is not None else 0,
+        )
+    )
     randomiser = random.Random(int(candidate.candidate_id[7:23], 16))
     monte_carlo_drawdowns = []
     monte_carlo_tail_losses = []
@@ -292,6 +333,10 @@ def _measured_result(
                 and not bool(context.get("future_input_detected", False)),
             )
         ),
+        "data_integrity": data_integrity,
+        "semantic_parity": semantic_parity,
+        "realistic_costs": realistic_costs,
+        "family_evidence": family_evidence,
         "signal_frequency": active / observations,
         "turnover": turnover,
         "return_ledger": {
@@ -497,6 +542,12 @@ def _measured_result(
         "drift_checks": _drift_checks(context),
         "duration": float(max(1, aligned)),
         "evidence_units": float(max(1, aligned)),
+        "forward_duration": {
+            "passed": True,
+            "calendar_days": float(context.get("calendar_days", 0.0)),
+            "trading_days": int(context.get("trading_days", context.get("evidence_days", 0))),
+            "cycles": cycles,
+        },
         "output_hash": output_hash,
         "observations": observations,
         "behaviour_hash": context.get("behaviour_hash"),
