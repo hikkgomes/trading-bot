@@ -4071,30 +4071,12 @@ def _already_accounted_futures_flatten(
     last = _validated_accounted_futures_flatten(product, state)
     if last is None:
         return None
-    for marker in ("pending_order", "pending_entry_recovery", "risk_recovery_incident"):
-        if state.get(marker) is not None:
-            return None
+    if _futures_state_has_pending_markers(state):
+        return None
     current = broker.get_position(product.symbol)
-    if current.symbol != product.symbol or not current.is_flat:
+    if not _accounted_broker_is_flat(product, broker, current):
         return None
-    positions = broker.list_account_futures_positions()
-    regular = broker.list_account_open_orders(conditional=False)
-    conditional = broker.list_account_open_orders(conditional=True)
-    if not isinstance(positions, list | tuple) or positions:
-        return None
-    if not isinstance(regular, list | tuple) or regular:
-        return None
-    if not isinstance(conditional, list | tuple) or conditional:
-        return None
-    if product.trade_log.is_symlink() or not product.trade_log.exists():
-        return None
-    try:
-        with product.trade_log.open("r", encoding="utf-8", newline="") as handle:
-            rows = list(csv.DictReader(handle))
-    except (OSError, csv.Error):
-        return None
-    matches = [row for row in rows if row.get("exit_event_id") == last["exit_event_id"]]
-    if len(matches) != 1 or matches[0].get("exit_reason") != "emergency_flatten":
+    if not _accounted_trade_log_matches(product, last["exit_event_id"]):
         return None
     return {
         "exit_event_id": last["exit_event_id"],
@@ -4104,6 +4086,37 @@ def _already_accounted_futures_flatten(
         "whole_account_regular_orders": 0,
         "whole_account_conditional_orders": 0,
     }
+
+
+def _futures_state_has_pending_markers(state: dict[str, Any]) -> bool:
+    return any(
+        state.get(marker) is not None
+        for marker in ("pending_order", "pending_entry_recovery", "risk_recovery_incident")
+    )
+
+
+def _accounted_broker_is_flat(product: ProductConfig, broker: Any, current: Any) -> bool:
+    if current.symbol != product.symbol or not current.is_flat:
+        return False
+    positions = broker.list_account_futures_positions()
+    regular = broker.list_account_open_orders(conditional=False)
+    conditional = broker.list_account_open_orders(conditional=True)
+    return all(
+        isinstance(inventory, list | tuple) and not inventory
+        for inventory in (positions, regular, conditional)
+    )
+
+
+def _accounted_trade_log_matches(product: ProductConfig, exit_event_id: str) -> bool:
+    if product.trade_log.is_symlink() or not product.trade_log.exists():
+        return False
+    try:
+        with product.trade_log.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error):
+        return False
+    matches = [row for row in rows if row.get("exit_event_id") == exit_event_id]
+    return len(matches) == 1 and matches[0].get("exit_reason") == "emergency_flatten"
 
 
 def _finalize_proven_futures_flatten(
