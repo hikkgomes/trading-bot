@@ -348,18 +348,14 @@ def aggregate_forecasts(
     return payload
 
 
-def allocate_forecasts(
-    forecasts: Iterable[AlphaForecast],
-    *,
-    existing_positions: Iterable[PortfolioPosition] = (),
-    requested_fractions: Mapping[str, float] | None = None,
-    policy: PortfolioPolicy = PortfolioPolicy(),
-    risk_model: PortfolioRiskModel | None = None,
-    portfolio_drawdown_fraction: float = 0.0,
+def _allocation_context(
+    existing_positions: Iterable[PortfolioPosition],
+    requested_fractions: Mapping[str, float] | None,
+    policy: PortfolioPolicy,
+    risk_model: PortfolioRiskModel | None,
+    portfolio_drawdown_fraction: float,
 ) -> dict[str, Any]:
-    """Greedily allocate the strongest independent alpha under hard exposure caps."""
     positions = list(existing_positions)
-    decisions: list[dict[str, Any]] = []
     requested_fractions = requested_fractions or {}
     gross, net, symbols = _exposure(positions)
     if not math.isfinite(portfolio_drawdown_fraction) or portfolio_drawdown_fraction > 0:
@@ -388,74 +384,189 @@ def allocate_forecasts(
         if risk_model is not None
         else None
     )
-    occupied_symbols = {position.symbol.upper(): position.direction for position in positions}
+    return {
+        "positions": positions,
+        "requested_fractions": requested_fractions,
+        "gross": gross,
+        "net": net,
+        "symbols": symbols,
+        "beta_exposure": beta_exposure,
+        "occupied_symbols": {position.symbol.upper(): position.direction for position in positions},
+    }
+
+
+def _forecast_restriction_reason(
+    forecast: AlphaForecast,
+    *,
+    policy: PortfolioPolicy,
+    positions: list[PortfolioPosition],
+    occupied_symbols: Mapping[str, str],
+    portfolio_drawdown_fraction: float,
+) -> str | None:
+    checks = (
+        (forecast.expected_return <= 0, "non_positive_expected_return"),
+        (forecast.confidence < policy.min_confidence, "confidence_below_minimum"),
+        (forecast.score < policy.min_score, "score_below_minimum"),
+        (
+            portfolio_drawdown_fraction <= -policy.max_drawdown_fraction,
+            "portfolio_drawdown_limit_reached",
+        ),
+        (len(positions) >= policy.max_positions, "position_capacity_reached"),
+        (forecast.symbol.upper() in occupied_symbols, "symbol_already_allocated"),
+    )
+    for failed, reason in checks:
+        if failed:
+            return reason
+    return None
+
+
+def _forecast_risk_rooms(
+    forecast: AlphaForecast,
+    *,
+    policy: PortfolioPolicy,
+    positions: list[PortfolioPosition],
+    risk_model: PortfolioRiskModel | None,
+    gross: float,
+    net: float,
+    symbols: Mapping[str, float],
+    beta_exposure: float | None,
+    reason: str | None,
+) -> tuple[str | None, float, float, float, float | None]:
+    gross_room = max(0.0, policy.max_gross_fraction - gross)
+    symbol_room = max(
+        0.0,
+        policy.max_symbol_fraction - symbols.get(forecast.symbol.upper(), 0.0),
+    )
+    direction = 1.0 if forecast.direction == "long" else -1.0
+    net_room = (
+        max(0.0, policy.max_net_fraction - net)
+        if direction > 0
+        else max(0.0, policy.max_net_fraction + net)
+    )
+    correlation_room = policy.max_correlated_fraction
+    beta_room = policy.max_abs_beta_fraction
+    correlated_exposure = 0.0
+    candidate_beta = None
+    if risk_model is not None:
+        candidate_beta = risk_model.beta_by_symbol.get(forecast.symbol.upper())
+        if candidate_beta is None:
+            reason = reason or "portfolio_beta_missing"
+        for position in positions:
+            correlation = risk_model.correlation(forecast.symbol, position.symbol)
+            if correlation is None:
+                reason = reason or "portfolio_correlation_missing"
+                continue
+            same_direction = (
+                correlation * direction * (1.0 if position.direction == "long" else -1.0)
+            )
+            correlated_exposure += max(0.0, same_direction) * position.fraction
+        correlation_room = max(0.0, policy.max_correlated_fraction - correlated_exposure)
+        if candidate_beta is not None and beta_exposure is not None:
+            beta_per_fraction = direction * candidate_beta
+            if beta_per_fraction > 0:
+                beta_room = max(
+                    0.0,
+                    (policy.max_abs_beta_fraction - beta_exposure) / beta_per_fraction,
+                )
+            elif beta_per_fraction < 0:
+                beta_room = max(
+                    0.0,
+                    (policy.max_abs_beta_fraction + beta_exposure) / -beta_per_fraction,
+                )
+            else:
+                beta_room = policy.max_symbol_fraction
+    return (
+        reason,
+        correlated_exposure,
+        gross_room,
+        min(symbol_room, net_room, correlation_room, beta_room),
+        candidate_beta,
+    )
+
+
+def _forecast_allocation_decision(
+    forecast: AlphaForecast,
+    *,
+    context: dict[str, Any],
+    policy: PortfolioPolicy,
+    risk_model: PortfolioRiskModel | None,
+    portfolio_drawdown_fraction: float,
+) -> dict[str, Any]:
+    requested = min(
+        policy.max_symbol_fraction,
+        max(
+            0.0,
+            _finite(
+                context["requested_fractions"].get(forecast.source_id),
+                default=0.0,
+            ),
+        ),
+    )
+    reason = _forecast_restriction_reason(
+        forecast,
+        policy=policy,
+        positions=context["positions"],
+        occupied_symbols=context["occupied_symbols"],
+        portfolio_drawdown_fraction=portfolio_drawdown_fraction,
+    )
+    reason, correlated_exposure, gross_room, other_room, candidate_beta = _forecast_risk_rooms(
+        forecast,
+        policy=policy,
+        positions=context["positions"],
+        risk_model=risk_model,
+        gross=context["gross"],
+        net=context["net"],
+        symbols=context["symbols"],
+        beta_exposure=context["beta_exposure"],
+        reason=reason,
+    )
+    allocated = min(requested, gross_room, other_room) if reason is None else 0.0
+    if reason is None and allocated <= 0:
+        reason = "exposure_capacity_reached"
+    return {
+        "source_id": forecast.source_id,
+        "symbol": forecast.symbol,
+        "direction": forecast.direction,
+        "utility": forecast.utility,
+        "requested_fraction": requested,
+        "allocated_fraction": allocated,
+        "allowed": allocated > 0,
+        "reason": reason,
+        "correlated_existing_fraction": correlated_exposure,
+        "candidate_beta": candidate_beta,
+        "forecast": forecast.to_dict(),
+    }
+
+
+def allocate_forecasts(
+    forecasts: Iterable[AlphaForecast],
+    *,
+    existing_positions: Iterable[PortfolioPosition] = (),
+    requested_fractions: Mapping[str, float] | None = None,
+    policy: PortfolioPolicy = PortfolioPolicy(),
+    risk_model: PortfolioRiskModel | None = None,
+    portfolio_drawdown_fraction: float = 0.0,
+) -> dict[str, Any]:
+    """Greedily allocate the strongest independent alpha under hard exposure caps."""
+    context = _allocation_context(
+        existing_positions,
+        requested_fractions,
+        policy,
+        risk_model,
+        portfolio_drawdown_fraction,
+    )
+    positions = context["positions"]
+    decisions: list[dict[str, Any]] = []
     ranked = sorted(forecasts, key=lambda item: (item.utility, item.source_id), reverse=True)
     for forecast in ranked:
-        requested = min(
-            policy.max_symbol_fraction,
-            max(0.0, _finite(requested_fractions.get(forecast.source_id), default=0.0)),
+        decision = _forecast_allocation_decision(
+            forecast,
+            context=context,
+            policy=policy,
+            risk_model=risk_model,
+            portfolio_drawdown_fraction=portfolio_drawdown_fraction,
         )
-        reason = None
-        if forecast.expected_return <= 0:
-            reason = "non_positive_expected_return"
-        elif forecast.confidence < policy.min_confidence:
-            reason = "confidence_below_minimum"
-        elif forecast.score < policy.min_score:
-            reason = "score_below_minimum"
-        elif portfolio_drawdown_fraction <= -policy.max_drawdown_fraction:
-            reason = "portfolio_drawdown_limit_reached"
-        elif len(positions) >= policy.max_positions:
-            reason = "position_capacity_reached"
-        elif forecast.symbol.upper() in occupied_symbols:
-            reason = "symbol_already_allocated"
-        gross_room = max(0.0, policy.max_gross_fraction - gross)
-        symbol_room = max(
-            0.0,
-            policy.max_symbol_fraction - symbols.get(forecast.symbol.upper(), 0.0),
-        )
-        direction = 1.0 if forecast.direction == "long" else -1.0
-        net_room = (
-            max(0.0, policy.max_net_fraction - net)
-            if direction > 0
-            else max(0.0, policy.max_net_fraction + net)
-        )
-        correlation_room = policy.max_correlated_fraction
-        beta_room = policy.max_abs_beta_fraction
-        correlated_exposure = 0.0
-        candidate_beta = None
-        if risk_model is not None:
-            candidate_beta = risk_model.beta_by_symbol.get(forecast.symbol.upper())
-            if candidate_beta is None:
-                reason = reason or "portfolio_beta_missing"
-            for position in positions:
-                correlation = risk_model.correlation(forecast.symbol, position.symbol)
-                if correlation is None:
-                    reason = reason or "portfolio_correlation_missing"
-                    continue
-                same_risk_direction = (
-                    correlation * direction * (1.0 if position.direction == "long" else -1.0)
-                )
-                correlated_exposure += max(0.0, same_risk_direction) * position.fraction
-            correlation_room = max(0.0, policy.max_correlated_fraction - correlated_exposure)
-            if candidate_beta is not None and beta_exposure is not None:
-                beta_per_fraction = direction * candidate_beta
-                beta_room = (
-                    max(0.0, (policy.max_abs_beta_fraction - beta_exposure) / beta_per_fraction)
-                    if beta_per_fraction > 0
-                    else max(
-                        0.0,
-                        (policy.max_abs_beta_fraction + beta_exposure) / -beta_per_fraction,
-                    )
-                    if beta_per_fraction < 0
-                    else policy.max_symbol_fraction
-                )
-        allocated = (
-            min(requested, gross_room, symbol_room, net_room, correlation_room, beta_room)
-            if reason is None
-            else 0.0
-        )
-        if reason is None and allocated <= 0:
-            reason = "exposure_capacity_reached"
+        allocated = decision["allocated_fraction"]
         if allocated > 0:
             position = PortfolioPosition(
                 product=forecast.product,
@@ -464,38 +575,29 @@ def allocate_forecasts(
                 fraction=allocated,
             )
             positions.append(position)
-            gross += allocated
-            net += position.signed_fraction
-            if beta_exposure is not None and candidate_beta is not None:
-                beta_exposure += position.signed_fraction * candidate_beta
-            symbols[forecast.symbol.upper()] = symbols.get(forecast.symbol.upper(), 0.0) + allocated
-            occupied_symbols[forecast.symbol.upper()] = forecast.direction
-        decisions.append(
-            {
-                "source_id": forecast.source_id,
-                "symbol": forecast.symbol,
-                "direction": forecast.direction,
-                "utility": forecast.utility,
-                "requested_fraction": requested,
-                "allocated_fraction": allocated,
-                "allowed": allocated > 0,
-                "reason": reason,
-                "correlated_existing_fraction": correlated_exposure,
-                "candidate_beta": candidate_beta,
-                "forecast": forecast.to_dict(),
-            }
-        )
+            context["gross"] += allocated
+            context["net"] += position.signed_fraction
+            if context["beta_exposure"] is not None and decision["candidate_beta"] is not None:
+                context["beta_exposure"] += position.signed_fraction * decision["candidate_beta"]
+            symbol = forecast.symbol.upper()
+            context["symbols"][symbol] = context["symbols"].get(symbol, 0.0) + allocated
+            context["occupied_symbols"][symbol] = forecast.direction
+        decisions.append(decision)
     return {
         "schema": PORTFOLIO_DECISION_SCHEMA,
         "generated_at": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
         "policy": dataclasses.asdict(policy),
         "exposure": {
             "positions": len(positions),
-            "gross_fraction": round(gross, 12),
-            "net_fraction": round(net, 12),
-            "symbol_fractions": {key: round(value, 12) for key, value in sorted(symbols.items())},
+            "gross_fraction": round(context["gross"], 12),
+            "net_fraction": round(context["net"], 12),
+            "symbol_fractions": {
+                key: round(value, 12) for key, value in sorted(context["symbols"].items())
+            },
             "benchmark_beta_fraction": (
-                round(beta_exposure, 12) if beta_exposure is not None else None
+                round(context["beta_exposure"], 12)
+                if context["beta_exposure"] is not None
+                else None
             ),
             "portfolio_drawdown_fraction": portfolio_drawdown_fraction,
         },

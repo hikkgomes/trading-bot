@@ -166,7 +166,9 @@ def _close_series(config: PortfolioRiskConfig, symbol: str) -> tuple[pd.Series, 
     return close.pct_change().dropna().rename(symbol), path
 
 
-def build_risk_model(config: PortfolioRiskConfig) -> dict[str, Any]:
+def _load_risk_inputs(
+    config: PortfolioRiskConfig,
+) -> tuple[dict[str, pd.Series], list[dict[str, Any]], list[dict[str, str]]]:
     returns: dict[str, pd.Series] = {}
     inputs: list[dict[str, Any]] = []
     waiting: list[dict[str, str]] = []
@@ -186,17 +188,13 @@ def build_risk_model(config: PortfolioRiskConfig) -> dict[str, Any]:
                 "end": series.index[-1].isoformat(),
             }
         )
-    generated_at = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
-    if config.benchmark_symbol not in returns:
-        return {
-            "schema": PORTFOLIO_RISK_MODEL_SCHEMA,
-            "ok": False,
-            "generated_at": generated_at,
-            "reason": "benchmark_history_unavailable",
-            "benchmark_symbol": config.benchmark_symbol,
-            "inputs": inputs,
-            "waiting": waiting,
-        }
+    return returns, inputs, waiting
+
+
+def _risk_correlations_and_beta(
+    config: PortfolioRiskConfig,
+    returns: dict[str, pd.Series],
+) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
     matrix = pd.concat(returns.values(), axis=1, join="outer", sort=False).sort_index()
     correlations: dict[str, dict[str, float]] = {symbol: {} for symbol in returns}
     beta: dict[str, float] = {}
@@ -226,6 +224,23 @@ def build_risk_model(config: PortfolioRiskConfig) -> dict[str, Any]:
             value = covariance / float(aligned_benchmark[config.benchmark_symbol].var())
             if math.isfinite(value):
                 beta[first] = value
+    return correlations, beta
+
+
+def build_risk_model(config: PortfolioRiskConfig) -> dict[str, Any]:
+    returns, inputs, waiting = _load_risk_inputs(config)
+    generated_at = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+    if config.benchmark_symbol not in returns:
+        return {
+            "schema": PORTFOLIO_RISK_MODEL_SCHEMA,
+            "ok": False,
+            "generated_at": generated_at,
+            "reason": "benchmark_history_unavailable",
+            "benchmark_symbol": config.benchmark_symbol,
+            "inputs": inputs,
+            "waiting": waiting,
+        }
+    correlations, beta = _risk_correlations_and_beta(config, returns)
     return {
         "schema": PORTFOLIO_RISK_MODEL_SCHEMA,
         "ok": True,
