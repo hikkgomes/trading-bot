@@ -63,6 +63,18 @@ lint:  ## Lint with ruff
 	$(PY) -m ruff check .
 	$(PY) -m ruff format --check .
 
+.PHONY: lint-complexity
+lint-complexity:  ## Enforce the repository's maximum cyclomatic complexity
+	$(PY) -m ruff check . --select C901
+
+.PHONY: research-policy-check
+research-policy-check:  ## Run deterministic research-policy calibration checks
+	$(PY) -m pytest -q \
+		tests/test_research_evidence_integrity.py \
+		tests/test_research_job_authority.py \
+		tests/test_research_generation.py \
+		tests/test_strategy_evaluation_pipeline.py
+
 .PHONY: typecheck-platform
 typecheck-platform:  ## Type-check the PostgreSQL-authoritative platform boundary
 	$(PY) -m mypy --ignore-missing-imports --follow-imports=skip $(PLATFORM_TYPECHECK_FILES)
@@ -161,13 +173,17 @@ platform-permissions-test:  ## Verify installed service users, writable paths, a
 	REPO="$(CURDIR)" bash scripts/verify_platform_service_install.sh
 
 .PHONY: platform-ci
-platform-ci:  ## Run the platform configuration, lint, migration, smoke, and test checks
+platform-ci:  ## Run the complete platform quality and integration gate
 	$(MAKE) platform-validate
+	$(MAKE) lint-complexity
+	$(MAKE) typecheck-platform
 	$(MAKE) lint-autopilot
 	$(MAKE) lint
+	$(MAKE) research-policy-check
 	$(MAKE) db-alembic
 	$(MAKE) db-migration-check
 	$(MAKE) platform-smoke
+	$(MAKE) platform-testnet-rehearsal
 	$(MAKE) test
 
 .PHONY: db-migrate

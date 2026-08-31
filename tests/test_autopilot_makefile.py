@@ -54,3 +54,27 @@ def test_autonomous_research_targets_generate_then_validate_typed_batch():
     assert "--include-generated --include-mutations" in makefile
     assert "--generated-only" not in makefile
     assert "research-once: research-generate research-cycle" in makefile
+
+
+def test_platform_ci_contains_all_required_quality_gates():
+    makefile = (PROJECT_ROOT / "Makefile").read_text(encoding="utf-8")
+
+    assert ".PHONY: lint-complexity" in makefile
+    assert "$(PY) -m ruff check . --select C901" in makefile
+    assert ".PHONY: research-policy-check" in makefile
+    assert "$(MAKE) typecheck-platform" in makefile
+    assert "$(MAKE) db-alembic" in makefile
+    assert "$(MAKE) platform-smoke" in makefile
+    assert "$(MAKE) platform-testnet-rehearsal" in makefile
+    assert "$(MAKE) test" in makefile
+
+
+def test_platform_ci_workflow_provisions_postgresql_without_live_credentials():
+    workflow = (PROJECT_ROOT / ".github/workflows/platform.yml").read_text(encoding="utf-8")
+
+    assert "image: postgres:16" in workflow
+    assert "TRADING_PLATFORM_DATABASE_URL:" in workflow
+    assert "TRADING_PLATFORM_TESTNET_DATABASE_URL:" in workflow
+    assert "make platform-ci" in workflow
+    assert "BINANCE_API_KEY" not in workflow
+    assert "BINANCE_API_SECRET" not in workflow
