@@ -316,6 +316,202 @@ def canonical_product_config(product: ProductConfig) -> dict[str, Any]:
     return payload
 
 
+def _parse_strict_jobs(raw_jobs: Any) -> list[JobConfig]:
+    if not isinstance(raw_jobs, list):
+        raise ValueError("autopilot config jobs must be a list")
+    for index, job in enumerate(raw_jobs):
+        if not isinstance(job, dict):
+            raise ValueError(f"autopilot config jobs[{index}] must be a JSON object")
+    _reject_duplicate_names(raw_jobs, label="job")
+    return [JobConfig.from_dict(job) for job in raw_jobs]
+
+
+def _parse_tolerant_jobs(raw_jobs: list[Any]) -> tuple[list[JobConfig], list[str]]:
+    jobs: list[JobConfig] = []
+    errors: list[str] = []
+    seen_job_names: set[str] = set()
+    for index, raw_job in enumerate(raw_jobs):
+        if not isinstance(raw_job, dict):
+            errors.append(f"autopilot config jobs[{index}] must be a JSON object")
+            continue
+        try:
+            job = JobConfig.from_dict(raw_job)
+        except (TypeError, ValueError) as exc:
+            errors.append(f"jobs[{index}]: {exc}")
+            continue
+        if job.name in seen_job_names:
+            errors.append(f"duplicate job name: {job.name}")
+            continue
+        seen_job_names.add(job.name)
+        jobs.append(job)
+    return jobs, errors
+
+
+def _parse_jobs(payload: dict[str, Any], *, strict_jobs: bool) -> tuple[list[JobConfig], list[str]]:
+    raw_jobs = payload.get("jobs", [])
+    if strict_jobs:
+        return _parse_strict_jobs(raw_jobs), []
+    if isinstance(raw_jobs, list):
+        return _parse_tolerant_jobs(raw_jobs)
+    return [], ["autopilot config jobs must be a list"]
+
+
+def _parse_products(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    products_payload = payload.get("products", [])
+    if not isinstance(products_payload, list):
+        raise ValueError("autopilot config products must be a list")
+    for index, product in enumerate(products_payload):
+        if not isinstance(product, dict):
+            raise ValueError(f"autopilot config products[{index}] must be a JSON object")
+    _reject_duplicate_names(products_payload, label="product")
+    return products_payload
+
+
+def _validated_config_numbers(payload: dict[str, Any]) -> dict[str, Any]:
+    values = {
+        "alert_cooldown_seconds": _non_negative_int(
+            payload.get("alert_cooldown_seconds", 900), "alert_cooldown_seconds"
+        ),
+        "daily_digest_cadence_seconds": _positive_int(
+            payload.get("daily_digest_cadence_seconds", 86400),
+            "daily_digest_cadence_seconds",
+        ),
+        "min_runtime_free_bytes": _positive_int(
+            payload.get("min_runtime_free_bytes", DEFAULT_MIN_RUNTIME_FREE_BYTES),
+            "min_runtime_free_bytes",
+        ),
+        "loop_sleep_seconds": _positive_int(
+            payload.get("loop_sleep_seconds", 60), "loop_sleep_seconds"
+        ),
+        "candidate_paper_cadence_seconds": _positive_int(
+            payload.get("candidate_paper_cadence_seconds", 45),
+            "candidate_paper_cadence_seconds",
+        ),
+        "candidate_paper_max_unseen_bars": _positive_int(
+            payload.get("candidate_paper_max_unseen_bars", 240),
+            "candidate_paper_max_unseen_bars",
+        ),
+        "candidate_paper_timeout_seconds": _positive_int(
+            payload.get("candidate_paper_timeout_seconds", 240),
+            "candidate_paper_timeout_seconds",
+        ),
+        "event_capture_max_age_seconds": _positive_int(
+            payload.get("event_capture_max_age_seconds", 120),
+            "event_capture_max_age_seconds",
+        ),
+        "portfolio_risk_max_age_seconds": _positive_int(
+            payload.get("portfolio_risk_max_age_seconds", 86400),
+            "portfolio_risk_max_age_seconds",
+        ),
+        "trade_starvation_window_days": _positive_int(
+            payload.get("trade_starvation_window_days", 30),
+            "trade_starvation_window_days",
+        ),
+        "active_income_max_open_positions": _positive_int(
+            payload.get("active_income_max_open_positions", 3),
+            "active_income_max_open_positions",
+        ),
+        "active_income_max_gross_fraction": _unit_fraction(
+            payload.get("active_income_max_gross_fraction", 0.60),
+            "active_income_max_gross_fraction",
+            positive=True,
+        ),
+        "active_income_max_net_fraction": _unit_fraction(
+            payload.get("active_income_max_net_fraction", 0.40),
+            "active_income_max_net_fraction",
+            positive=True,
+        ),
+        "active_income_max_symbol_fraction": _unit_fraction(
+            payload.get("active_income_max_symbol_fraction", 0.25),
+            "active_income_max_symbol_fraction",
+            positive=True,
+        ),
+        "active_income_max_correlated_fraction": _unit_fraction(
+            payload.get("active_income_max_correlated_fraction", 0.40),
+            "active_income_max_correlated_fraction",
+            positive=True,
+        ),
+        "active_income_max_abs_beta_fraction": _unit_fraction(
+            payload.get("active_income_max_abs_beta_fraction", 0.40),
+            "active_income_max_abs_beta_fraction",
+            positive=True,
+        ),
+        "active_income_max_portfolio_drawdown_fraction": _unit_fraction(
+            payload.get("active_income_max_portfolio_drawdown_fraction", 0.10),
+            "active_income_max_portfolio_drawdown_fraction",
+            positive=True,
+        ),
+        "active_income_min_alpha_confidence": _unit_fraction(
+            payload.get("active_income_min_alpha_confidence", 0.50),
+            "active_income_min_alpha_confidence",
+        ),
+        "active_income_min_alpha_score": _unit_fraction(
+            payload.get("active_income_min_alpha_score", 0.55),
+            "active_income_min_alpha_score",
+        ),
+        "backup_cadence_seconds": _positive_int(
+            payload.get("backup_cadence_seconds", 86400), "backup_cadence_seconds"
+        ),
+        "backup_timeout_seconds": _positive_int(
+            payload.get("backup_timeout_seconds", 60), "backup_timeout_seconds"
+        ),
+    }
+    if values["trade_starvation_window_days"] > 365:
+        raise ValueError("trade_starvation_window_days must be at most 365")
+    if values["active_income_max_open_positions"] > 20:
+        raise ValueError("active_income_max_open_positions must be at most 20")
+    return values
+
+
+def _validated_job_runtime_values(
+    payload: dict[str, Any], *, strict_jobs: bool, errors: list[str]
+) -> dict[str, Any]:
+    try:
+        max_jobs_per_cycle = _positive_int(
+            payload.get("max_jobs_per_cycle", 1), "max_jobs_per_cycle"
+        )
+    except ValueError:
+        if strict_jobs:
+            raise
+        errors.append("max_jobs_per_cycle must be a positive JSON integer")
+        max_jobs_per_cycle = 1
+    try:
+        max_consecutive_job_deferrals = _positive_int(
+            payload.get("max_consecutive_job_deferrals", 16),
+            "max_consecutive_job_deferrals",
+        )
+    except ValueError:
+        if strict_jobs:
+            raise
+        errors.append("max_consecutive_job_deferrals must be a positive JSON integer")
+        max_consecutive_job_deferrals = 16
+    try:
+        run_data_update = _json_bool(
+            payload,
+            "run_data_update",
+            default=False,
+            field="run_data_update",
+        )
+    except ValueError:
+        if strict_jobs:
+            raise
+        errors.append("run_data_update must be a JSON boolean")
+        run_data_update = False
+    return {
+        "max_jobs_per_cycle": max_jobs_per_cycle,
+        "max_consecutive_job_deferrals": max_consecutive_job_deferrals,
+        "run_data_update": run_data_update,
+    }
+
+
+def _validated_config_values(
+    payload: dict[str, Any], *, strict_jobs: bool, errors: list[str]
+) -> dict[str, Any]:
+    values = _validated_config_numbers(payload)
+    values.update(_validated_job_runtime_values(payload, strict_jobs=strict_jobs, errors=errors))
+    return values
+
+
 @dataclass
 class AutopilotConfig:
     control_file: Path = DEFAULT_CONTROL_FILE
@@ -394,174 +590,39 @@ class AutopilotConfig:
         strict_jobs: bool = True,
     ) -> AutopilotConfig:
         _reject_unknown_keys(payload, allowed=AUTOPILOT_CONFIG_KEYS, label="autopilot config")
-        raw_jobs = payload.get("jobs", [])
-        jobs: list[JobConfig] = []
-        job_config_errors: list[str] = []
-        if strict_jobs:
-            if not isinstance(raw_jobs, list):
-                raise ValueError("autopilot config jobs must be a list")
-            for index, job in enumerate(raw_jobs):
-                if not isinstance(job, dict):
-                    raise ValueError(f"autopilot config jobs[{index}] must be a JSON object")
-            _reject_duplicate_names(raw_jobs, label="job")
-            jobs = [JobConfig.from_dict(job) for job in raw_jobs]
-        elif isinstance(raw_jobs, list):
-            # Supervision never executes jobs, but retaining every independently
-            # valid definition keeps normal status/report output complete. Bad
-            # entries and duplicates remain fatal in the dedicated job worker.
-            seen_job_names: set[str] = set()
-            for index, raw_job in enumerate(raw_jobs):
-                if not isinstance(raw_job, dict):
-                    job_config_errors.append(
-                        f"autopilot config jobs[{index}] must be a JSON object"
-                    )
-                    continue
-                try:
-                    job = JobConfig.from_dict(raw_job)
-                except (TypeError, ValueError) as exc:
-                    job_config_errors.append(f"jobs[{index}]: {exc}")
-                    continue
-                if job.name in seen_job_names:
-                    job_config_errors.append(f"duplicate job name: {job.name}")
-                    continue
-                seen_job_names.add(job.name)
-                jobs.append(job)
-        else:
-            job_config_errors.append("autopilot config jobs must be a list")
-        products_payload = payload.get("products", [])
-        if not isinstance(products_payload, list):
-            raise ValueError("autopilot config products must be a list")
-        for index, product in enumerate(products_payload):
-            if not isinstance(product, dict):
-                raise ValueError(f"autopilot config products[{index}] must be a JSON object")
-        _reject_duplicate_names(products_payload, label="product")
-        alert_cooldown_seconds = _non_negative_int(
-            payload.get("alert_cooldown_seconds", 900),
-            "alert_cooldown_seconds",
+        jobs, job_config_errors = _parse_jobs(payload, strict_jobs=strict_jobs)
+        products_payload = _parse_products(payload)
+        values = _validated_config_values(
+            payload,
+            strict_jobs=strict_jobs,
+            errors=job_config_errors,
         )
-        daily_digest_cadence_seconds = _positive_int(
-            payload.get("daily_digest_cadence_seconds", 86400),
-            "daily_digest_cadence_seconds",
-        )
-        min_runtime_free_bytes = _positive_int(
-            payload.get("min_runtime_free_bytes", DEFAULT_MIN_RUNTIME_FREE_BYTES),
-            "min_runtime_free_bytes",
-        )
-        loop_sleep_seconds = _positive_int(
-            payload.get("loop_sleep_seconds", 60), "loop_sleep_seconds"
-        )
-        candidate_paper_cadence_seconds = _positive_int(
-            payload.get("candidate_paper_cadence_seconds", 45),
-            "candidate_paper_cadence_seconds",
-        )
-        candidate_paper_max_unseen_bars = _positive_int(
-            payload.get("candidate_paper_max_unseen_bars", 240),
-            "candidate_paper_max_unseen_bars",
-        )
-        candidate_paper_timeout_seconds = _positive_int(
-            payload.get("candidate_paper_timeout_seconds", 240),
-            "candidate_paper_timeout_seconds",
-        )
-        event_capture_max_age_seconds = _positive_int(
-            payload.get("event_capture_max_age_seconds", 120),
-            "event_capture_max_age_seconds",
-        )
-        portfolio_risk_max_age_seconds = _positive_int(
-            payload.get("portfolio_risk_max_age_seconds", 86400),
-            "portfolio_risk_max_age_seconds",
-        )
-        trade_starvation_window_days = _positive_int(
-            payload.get("trade_starvation_window_days", 30),
-            "trade_starvation_window_days",
-        )
-        if trade_starvation_window_days > 365:
-            raise ValueError("trade_starvation_window_days must be at most 365")
-        active_income_max_open_positions = _positive_int(
-            payload.get("active_income_max_open_positions", 3),
-            "active_income_max_open_positions",
-        )
-        if active_income_max_open_positions > 20:
-            raise ValueError("active_income_max_open_positions must be at most 20")
-        active_income_max_gross_fraction = _unit_fraction(
-            payload.get("active_income_max_gross_fraction", 0.60),
-            "active_income_max_gross_fraction",
-            positive=True,
-        )
-        active_income_max_net_fraction = _unit_fraction(
-            payload.get("active_income_max_net_fraction", 0.40),
-            "active_income_max_net_fraction",
-            positive=True,
-        )
-        active_income_max_symbol_fraction = _unit_fraction(
-            payload.get("active_income_max_symbol_fraction", 0.25),
-            "active_income_max_symbol_fraction",
-            positive=True,
-        )
-        active_income_max_correlated_fraction = _unit_fraction(
-            payload.get("active_income_max_correlated_fraction", 0.40),
-            "active_income_max_correlated_fraction",
-            positive=True,
-        )
-        active_income_max_abs_beta_fraction = _unit_fraction(
-            payload.get("active_income_max_abs_beta_fraction", 0.40),
-            "active_income_max_abs_beta_fraction",
-            positive=True,
-        )
-        active_income_max_portfolio_drawdown_fraction = _unit_fraction(
-            payload.get("active_income_max_portfolio_drawdown_fraction", 0.10),
-            "active_income_max_portfolio_drawdown_fraction",
-            positive=True,
-        )
-        active_income_min_alpha_confidence = _unit_fraction(
-            payload.get("active_income_min_alpha_confidence", 0.50),
-            "active_income_min_alpha_confidence",
-        )
-        active_income_min_alpha_score = _unit_fraction(
-            payload.get("active_income_min_alpha_score", 0.55),
-            "active_income_min_alpha_score",
-        )
-        backup_cadence_seconds = _positive_int(
-            payload.get("backup_cadence_seconds", 86400),
-            "backup_cadence_seconds",
-        )
-        backup_timeout_seconds = _positive_int(
-            payload.get("backup_timeout_seconds", 60),
-            "backup_timeout_seconds",
-        )
-        try:
-            max_jobs_per_cycle = _positive_int(
-                payload.get("max_jobs_per_cycle", 1),
-                "max_jobs_per_cycle",
-            )
-        except ValueError:
-            if strict_jobs:
-                raise
-            job_config_errors.append("max_jobs_per_cycle must be a positive JSON integer")
-            max_jobs_per_cycle = 1
-        try:
-            max_consecutive_job_deferrals = _positive_int(
-                payload.get("max_consecutive_job_deferrals", 16),
-                "max_consecutive_job_deferrals",
-            )
-        except ValueError:
-            if strict_jobs:
-                raise
-            job_config_errors.append(
-                "max_consecutive_job_deferrals must be a positive JSON integer"
-            )
-            max_consecutive_job_deferrals = 16
-        try:
-            run_data_update = _json_bool(
-                payload,
-                "run_data_update",
-                default=False,
-                field="run_data_update",
-            )
-        except ValueError:
-            if strict_jobs:
-                raise
-            job_config_errors.append("run_data_update must be a JSON boolean")
-            run_data_update = False
+        alert_cooldown_seconds = values["alert_cooldown_seconds"]
+        daily_digest_cadence_seconds = values["daily_digest_cadence_seconds"]
+        min_runtime_free_bytes = values["min_runtime_free_bytes"]
+        loop_sleep_seconds = values["loop_sleep_seconds"]
+        candidate_paper_cadence_seconds = values["candidate_paper_cadence_seconds"]
+        candidate_paper_max_unseen_bars = values["candidate_paper_max_unseen_bars"]
+        candidate_paper_timeout_seconds = values["candidate_paper_timeout_seconds"]
+        event_capture_max_age_seconds = values["event_capture_max_age_seconds"]
+        portfolio_risk_max_age_seconds = values["portfolio_risk_max_age_seconds"]
+        trade_starvation_window_days = values["trade_starvation_window_days"]
+        active_income_max_open_positions = values["active_income_max_open_positions"]
+        active_income_max_gross_fraction = values["active_income_max_gross_fraction"]
+        active_income_max_net_fraction = values["active_income_max_net_fraction"]
+        active_income_max_symbol_fraction = values["active_income_max_symbol_fraction"]
+        active_income_max_correlated_fraction = values["active_income_max_correlated_fraction"]
+        active_income_max_abs_beta_fraction = values["active_income_max_abs_beta_fraction"]
+        active_income_max_portfolio_drawdown_fraction = values[
+            "active_income_max_portfolio_drawdown_fraction"
+        ]
+        active_income_min_alpha_confidence = values["active_income_min_alpha_confidence"]
+        active_income_min_alpha_score = values["active_income_min_alpha_score"]
+        backup_cadence_seconds = values["backup_cadence_seconds"]
+        backup_timeout_seconds = values["backup_timeout_seconds"]
+        max_jobs_per_cycle = values["max_jobs_per_cycle"]
+        max_consecutive_job_deferrals = values["max_consecutive_job_deferrals"]
+        run_data_update = values["run_data_update"]
         return cls(
             control_file=_optional_project_path(
                 payload, "control_file", default=DEFAULT_CONTROL_FILE, field="control_file"
