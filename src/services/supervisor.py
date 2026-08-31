@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -28,6 +29,8 @@ from src.execution.position_manager import PositionManager, SqlPositionStore
 from src.execution.recovery import SqlRecoveryStore
 from src.execution.stops import SqlStopStore, StopManager
 from src.observability.decision_trace import SqlDecisionTraceStore
+from src.observability.metrics import DatabaseMetricsProvider, build_metrics_server
+from src.observability.reports import DatabasePlatformReport
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.research.datasets import CanonicalDatasetResolver, SqlCanonicalDatasetRepository
 from src.research.evaluation import EvidencePolicy
@@ -1218,14 +1221,30 @@ def run(args: argparse.Namespace) -> int:
             ),
             bearer_token=token,
         )
+        metrics_provider = DatabaseMetricsProvider(
+            lambda: DatabasePlatformReport(database.engine).build()
+        )
+        metrics_server = build_metrics_server(
+            bind=_parse_bind(str(config.metrics.get("bind", "127.0.0.1:9108"))),
+            provider=metrics_provider.render,
+        )
+        metrics_thread = threading.Thread(
+            target=metrics_server.serve_forever,
+            kwargs={"poll_interval": 0.5},
+            daemon=True,
+        )
+        metrics_thread.start()
         runtime.heartbeat(payload={"reason_code": "control_api_started"})
 
         def stop_server(_signum: int, _frame: object) -> None:
+            metrics_server.shutdown()
             server.shutdown()
 
         signal.signal(signal.SIGTERM, stop_server)
         signal.signal(signal.SIGINT, stop_server)
         server.serve_forever(poll_interval=0.5)
+        metrics_server.shutdown()
+        metrics_thread.join(timeout=2.0)
         database.dispose()
         return 0
     if args.once:
