@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -30,6 +31,8 @@ class PortfolioRiskMeasurements:
     trades_today: int
     correlations: dict[str, dict[str, float]]
     beta: dict[str, float]
+    risk_data_available: bool
+    risk_data_missing: tuple[str, ...]
     clusters: dict[str, str]
     cluster_fraction_caps: dict[str, float]
     open_exposure_fraction: float
@@ -71,6 +74,11 @@ class PortfolioRiskCalculator:
         global_effects = tuple(item for values in effects.values() for item in values)
         clusters = self._clusters(tuple(str(key) for key in market))
         cluster_limit = _positive_number(product.get("maximum_cluster_fraction")) or 1.0
+        correlations, beta, risk_data_missing = self._factor_measurements(
+            product_id=product_id,
+            at=at,
+            instrument_ids=tuple(str(key) for key in market),
+        )
         return PortfolioRiskMeasurements(
             product_drawdown_fraction=_drawdown(product_effects, initial),
             daily_pnl_fraction=_daily_pnl_fraction(product_effects, initial, at),
@@ -92,8 +100,10 @@ class PortfolioRiskCalculator:
                 portfolio_id=str(product.get("portfolio_id") or ""),
                 at=at,
             ),
-            correlations=self._correlations(product_id=product_id, at=at),
-            beta=self._beta(product_id=product_id, at=at),
+            correlations=correlations,
+            beta=beta,
+            risk_data_available=not risk_data_missing,
+            risk_data_missing=risk_data_missing,
             clusters=clusters,
             cluster_fraction_caps={
                 cluster: cluster_limit for cluster in sorted(set(clusters.values()))
@@ -237,22 +247,47 @@ class PortfolioRiskCalculator:
     def _correlations(self, *, product_id: str, at: str) -> dict[str, dict[str, float]]:
         history = self._market_history(product_id=product_id, at=at)
         returns = {key: _returns(values) for key, values in history.items()}
-        result = {key: {key: 1.0} for key in returns}
+        return _correlations_from_returns(returns)
+
+    def _factor_measurements(
+        self,
+        *,
+        product_id: str,
+        at: str,
+        instrument_ids: tuple[str, ...],
+    ) -> tuple[dict[str, dict[str, float]], dict[str, float], tuple[str, ...]]:
+        history = self._market_history(product_id=product_id, at=at)
+        returns = {key: _returns(history.get(key, [])) for key in instrument_ids}
+        correlations = _correlations_from_returns(returns)
+        benchmark_key = next((key for key in returns if _is_btc_benchmark(key)), None)
+        benchmark = returns.get(benchmark_key, []) if benchmark_key is not None else []
+        beta = {
+            key: 1.0 if _is_btc_benchmark(key) else _beta(values, benchmark)
+            for key, values in sorted(returns.items())
+            if _is_btc_benchmark(key) or (len(values) >= 2 and len(benchmark) >= 2)
+        }
+        missing: set[str] = set()
+        for instrument_id, values in sorted(returns.items()):
+            if _is_btc_benchmark(instrument_id):
+                continue
+            if len(values) < 2 or len(benchmark) < 2:
+                missing.add(f"beta:{instrument_id}")
         keys = sorted(returns)
         for index, left in enumerate(keys):
             for right in keys[index + 1 :]:
-                value = _correlation(returns[left], returns[right])
-                result.setdefault(left, {})[right] = value
-                result.setdefault(right, {})[left] = value
-        return result
+                if len(returns[left]) < 2 or len(returns[right]) < 2:
+                    missing.add(f"correlation:{left}:{right}")
+        return correlations, beta, tuple(sorted(missing))
 
     def _beta(self, *, product_id: str, at: str) -> dict[str, float]:
         history = self._market_history(product_id=product_id, at=at)
         returns = {key: _returns(values) for key, values in history.items()}
-        benchmark = returns.get("BTCUSDT")
+        benchmark_key = next((key for key in returns if _is_btc_benchmark(key)), None)
+        benchmark = returns.get(benchmark_key, []) if benchmark_key is not None else []
         return {
-            key: 1.0 if key == "BTCUSDT" else _beta(values, benchmark)
+            key: 1.0 if _is_btc_benchmark(key) else _beta(values, benchmark)
             for key, values in sorted(returns.items())
+            if _is_btc_benchmark(key) or (len(values) >= 2 and len(benchmark) >= 2)
         }
 
     def _clusters(self, instrument_ids: tuple[str, ...]) -> dict[str, str]:
@@ -350,6 +385,29 @@ def _order_exposure_fraction(
 
 def _returns(values: list[float]) -> list[float]:
     return [values[index] / values[index - 1] - 1.0 for index in range(1, len(values))]
+
+
+def _correlations_from_returns(
+    returns: Mapping[str, list[float]],
+) -> dict[str, dict[str, float]]:
+    result = {
+        key: {key: 1.0}
+        for key, values in returns.items()
+        if len(values) >= 2
+    }
+    keys = sorted(returns)
+    for index, left in enumerate(keys):
+        for right in keys[index + 1 :]:
+            if len(returns[left]) < 2 or len(returns[right]) < 2:
+                continue
+            value = _correlation(returns[left], returns[right])
+            result.setdefault(left, {})[right] = value
+            result.setdefault(right, {})[left] = value
+    return result
+
+
+def _is_btc_benchmark(instrument_id: str) -> bool:
+    return bool(re.search(r"(?:^|[:/ -])BTC/?USDT(?:$|[:/ -])", instrument_id.upper()))
 
 
 def _correlation(left: list[float], right: list[float]) -> float:

@@ -83,6 +83,9 @@ class DatabasePortfolioTargetBuilder:
         balances = {str(key): float(value) for key, value in clean["balances"].items()}
         current_positions = {str(key): float(value) for key, value in clean["positions"].items()}
         market = {str(key): dict(value) for key, value in clean["market"].items()}
+        if product_id == "active_income" and clean["risk_data_available"] is not True:
+            missing = ", ".join(str(value) for value in clean["risk_data_missing"])
+            raise ValueError(f"risk measurements are unavailable: {missing or 'unknown'}")
         missing_market = sorted({item.instrument_id for item in forecasts} - set(market))
         if missing_market:
             raise ValueError("canonical market state is missing: " + ", ".join(missing_market))
@@ -333,6 +336,8 @@ _PORTFOLIO_STATE_FIELDS = frozenset(
         "market",
         "correlations",
         "beta",
+        "risk_data_available",
+        "risk_data_missing",
         "product_drawdown_fraction",
         "daily_pnl_fraction",
         "global_drawdown_fraction",
@@ -382,6 +387,12 @@ def _canonical_portfolio_state(state: Mapping[str, Any], *, product_id: str) -> 
             raise ValueError(f"canonical portfolio/risk state {field} must be an object")
     if not isinstance(clean["open_orders"], list | tuple):
         raise ValueError("canonical portfolio/risk state open_orders must be a list")
+    if not isinstance(clean["risk_data_available"], bool):
+        raise ValueError("canonical portfolio/risk state risk_data_available must be boolean")
+    if not isinstance(clean["risk_data_missing"], list | tuple):
+        raise ValueError("canonical portfolio/risk state risk_data_missing must be a list")
+    if any(not isinstance(value, str) or not value for value in clean["risk_data_missing"]):
+        raise ValueError("canonical portfolio/risk state risk_data_missing has invalid values")
     if not isinstance(clean["risk_policy_ids"], list | tuple) or not clean["risk_policy_ids"]:
         raise ValueError("canonical portfolio/risk state needs risk_policy_ids")
     required_sources = {

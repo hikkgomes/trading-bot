@@ -491,6 +491,8 @@ def test_portfolio_state_service_schedules_automatically_from_latest_sources(tmp
         },
         "correlations": {},
         "beta": {},
+        "risk_data_available": True,
+        "risk_data_missing": [],
         "product_drawdown_fraction": 0.0,
         "daily_pnl_fraction": 0.0,
         "global_drawdown_fraction": 0.0,

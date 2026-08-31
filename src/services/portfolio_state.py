@@ -189,6 +189,8 @@ class DatabasePortfolioSourceService:
                 "market": market,
                 "correlations": measurements.correlations,
                 "beta": measurements.beta,
+                "risk_data_available": measurements.risk_data_available,
+                "risk_data_missing": list(measurements.risk_data_missing),
             },
         )
         self.publish(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from src.accounting.ledger import Ledger, SqlLedgerStore
 from src.data.database import PlatformDatabase, account_snapshot
 from src.domain._codec import canonical_hash
@@ -96,4 +98,54 @@ def test_risk_measurements_use_ledger_marks_and_pending_orders(tmp_path) -> None
     assert measurements.correlations == {"BTCUSDT": {"BTCUSDT": 1.0}}
     assert measurements.beta == {"BTCUSDT": 1.0}
     assert measurements.clusters == {"BTCUSDT": "base:BTC"}
+    database.dispose()
+
+
+def test_risk_measurements_resolve_prefixed_btc_benchmark(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'risk-beta.sqlite3'}")
+    database.create_schema()
+    snapshots = SqlRiskSnapshotStore(database.engine)
+    for index, (btc, eth) in enumerate(((100.0, 10.0), (110.0, 11.0), (99.0, 9.9))):
+        observed_at = f"2026-08-30T00:00:0{index}+00:00"
+        for instrument_id, close in (
+            ("binance:futures:BTCUSDT:USDT", btc),
+            ("binance:futures:ETHUSDT:USDT", eth),
+        ):
+            snapshots.save(
+                {
+                    "kind": "market_data_input",
+                    "product_id": "active_income",
+                    "instrument_id": instrument_id,
+                    "values": {"close": close},
+                },
+                created_at=observed_at,
+            )
+
+    calculator = PortfolioRiskCalculator(database.engine)
+
+    beta = calculator._beta(product_id="active_income", at="2026-08-30T00:00:03+00:00")
+
+    assert beta["binance:futures:BTCUSDT:USDT"] == 1.0
+    assert beta["binance:futures:ETHUSDT:USDT"] == pytest.approx(1.0)
+    database.dispose()
+
+
+def test_risk_measurements_mark_missing_factor_history_unavailable(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'risk-missing.sqlite3'}")
+    database.create_schema()
+    calculator = PortfolioRiskCalculator(database.engine)
+
+    _correlations, _beta_values, missing = calculator._factor_measurements(
+        product_id="active_income",
+        at="2026-08-30T00:00:03+00:00",
+        instrument_ids=(
+            "binance:futures:BTCUSDT:USDT",
+            "binance:futures:ETHUSDT:USDT",
+        ),
+    )
+
+    assert missing == (
+        "beta:binance:futures:ETHUSDT:USDT",
+        "correlation:binance:futures:BTCUSDT:USDT:binance:futures:ETHUSDT:USDT",
+    )
     database.dispose()

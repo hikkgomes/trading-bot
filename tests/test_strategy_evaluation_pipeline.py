@@ -156,6 +156,8 @@ def test_target_builder_consumes_canonical_market_and_balance_snapshots(tmp_path
             },
             "correlations": {},
             "beta": {forecast.instrument_id: 0.0, eth_instrument: 0.0},
+            "risk_data_available": True,
+            "risk_data_missing": [],
             "product_drawdown_fraction": 0.0,
             "daily_pnl_fraction": 0.0,
             "global_drawdown_fraction": 0.0,

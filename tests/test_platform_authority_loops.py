@@ -75,6 +75,8 @@ def test_unchanged_portfolio_sources_remain_idle_for_10000_cycles(tmp_path) -> N
             },
             "correlations": {},
             "beta": {},
+            "risk_data_available": True,
+            "risk_data_missing": [],
         },
         "health": {
             "data_age_seconds": 0.0,
