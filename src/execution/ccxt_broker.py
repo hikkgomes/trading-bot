@@ -28,6 +28,8 @@ import logging
 import math
 import re
 import time
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from src.execution.broker import (
     Broker,
@@ -181,6 +183,37 @@ class CcxtBroker(Broker):
 
     def account_snapshot(self, *, expected_symbols: tuple[str, ...] = ()) -> dict:
         """Read the complete authenticated account state used by live gates."""
+        balance, balances, free_balances, info = self._account_balances()
+        used_margin, maintenance_margin, used_fraction, liquidation_buffer = self._account_margin(
+            balance, balances, info
+        )
+        positions, unknown_positions, regular_orders, conditional_orders = (
+            self._account_positions_and_orders(balances, expected_symbols)
+        )
+        unknown_orders = {
+            f"{item.symbol}:{item.order_id}": item.status
+            for item in [*regular_orders, *conditional_orders]
+            if not any(self._symbols_match(item.symbol, symbol) for symbol in expected_symbols)
+        }
+        position_mode = self._account_position_mode()
+        return {
+            "balances": balances,
+            "free_balances": free_balances,
+            "positions": positions,
+            "regular_orders": [item.__dict__ for item in regular_orders],
+            "conditional_orders": [item.__dict__ for item in conditional_orders],
+            "used_margin": used_margin,
+            "maintenance_margin": maintenance_margin,
+            "used_margin_fraction": used_fraction,
+            "liquidation_buffer_fraction": liquidation_buffer,
+            "account_mode": position_mode,
+            "unknown_exposure": {**unknown_positions, **unknown_orders},
+            "account_state_known": True,
+            "account_state_authority": "authenticated_rest",
+            "account_fingerprint": self.account_fingerprint,
+        }
+
+    def _account_balances(self) -> tuple[dict, dict[str, float], dict[str, float], dict]:
         balance = self._client.fetch_balance()
         if not isinstance(balance, dict):
             raise RuntimeError("authenticated balance response is not an object")
@@ -200,65 +233,69 @@ class CcxtBroker(Broker):
         }
         raw_info = balance.get("info")
         info = raw_info if isinstance(raw_info, dict) else {}
+        return balance, balances, free_balances, info
 
-        def number(*names: str, default: float | None = None) -> float:
-            for name in names:
-                value = info.get(name)
-                if value is None:
-                    value = balance.get(name)
-                if value is None:
-                    continue
+    def _account_number(
+        self, balance: dict, info: dict, *names: str, default: float | None = None
+    ) -> float:
+        for name in names:
+            value = info.get(name, balance.get(name))
+            if value is not None:
                 return self._finite_number(value, f"Account field {name}", non_negative=True)
-            if default is None:
-                raise RuntimeError(
-                    "authenticated account response is missing a required margin field"
-                )
-            return default
+        if default is None:
+            raise RuntimeError("authenticated account response is missing a required margin field")
+        return default
 
+    def _account_margin(
+        self, balance: dict, balances: Mapping[str, float], info: dict
+    ) -> tuple[float, float, float, float]:
         quote_total = self._finite_number(
             balances.get(self.config.quote_asset, 0.0),
             "Account quote balance",
             non_negative=True,
         )
         margin_default = 0.0 if self.config.market_type == "spot" else None
-        used_margin = number("totalInitialMargin", "initialMargin", default=margin_default)
-        maintenance_margin = number("totalMaintMargin", "maintMargin", default=margin_default)
-        margin_balance = number(
+        used = self._account_number(
+            balance, info, "totalInitialMargin", "initialMargin", default=margin_default
+        )
+        maintenance = self._account_number(
+            balance, info, "totalMaintMargin", "maintMargin", default=margin_default
+        )
+        margin_balance = self._account_number(
+            balance,
+            info,
             "totalMarginBalance",
             "marginBalance",
             "equity",
             default=quote_total if self.config.market_type == "spot" else None,
         )
-        if margin_balance <= 0 and (used_margin > 0 or maintenance_margin > 0):
+        if margin_balance <= 0 and (used > 0 or maintenance > 0):
             raise RuntimeError("authenticated account margin balance is not positive")
-        used_fraction = used_margin / margin_balance if margin_balance > 0 else 0.0
-        liquidation_buffer = (
-            max(0.0, 1.0 - maintenance_margin / margin_balance) if margin_balance > 0 else 0.0
-        )
+        used_fraction = used / margin_balance if margin_balance > 0 else 0.0
+        buffer = max(0.0, 1.0 - maintenance / margin_balance) if margin_balance > 0 else 0.0
+        return used, maintenance, used_fraction, buffer
+
+    def _account_positions_and_orders(
+        self, balances: Mapping[str, float], expected_symbols: tuple[str, ...]
+    ) -> tuple[dict[str, float], dict[str, float], list, list]:
         positions: dict[str, float] = {}
         unknown_positions: dict[str, float] = {}
         if self.config.market_type == "futures":
             position_rows = self.list_account_futures_positions()
-            positions = {}
             for item in position_rows:
-                if abs(float(item.qty)) <= 1e-12:
-                    continue
-                positions[self.platform_instrument_id(item.symbol)] = float(item.qty)
+                if abs(float(item.qty)) > 1e-12:
+                    positions[self.platform_instrument_id(item.symbol)] = float(item.qty)
             unknown_positions = {
                 f"position:{item.symbol}": float(item.qty)
                 for item in position_rows
                 if abs(float(item.qty)) > 1e-12
                 and not any(self._symbols_match(item.symbol, symbol) for symbol in expected_symbols)
             }
-            conditional_orders = list(self.list_account_open_orders(conditional=True))
-            regular_orders = list(self.list_account_open_orders(conditional=False))
         else:
-            regular_orders = list(self.list_account_open_orders(conditional=False))
             for symbol in expected_symbols:
                 position = self.get_position(symbol)
                 if abs(position.qty) > 1e-12:
                     positions[f"binance:spot:{symbol}"] = float(position.qty)
-            conditional_orders = list(self.list_account_open_orders(conditional=True))
             expected_assets = {
                 self.config.quote_asset.upper(),
                 *(self._base_asset(symbol) for symbol in expected_symbols),
@@ -268,43 +305,26 @@ class CcxtBroker(Broker):
                 for asset, quantity in balances.items()
                 if abs(quantity) > 1e-12 and asset.upper() not in expected_assets
             }
-        unknown_orders = {
-            f"{item.symbol}:{item.order_id}": item.status
-            for item in [*regular_orders, *conditional_orders]
-            if not any(self._symbols_match(item.symbol, symbol) for symbol in expected_symbols)
-        }
-        position_mode = "one_way"
+        regular_orders = list(self.list_account_open_orders(conditional=False))
+        conditional_orders = list(self.list_account_open_orders(conditional=True))
+        return positions, unknown_positions, regular_orders, conditional_orders
+
+    def _account_position_mode(self) -> str:
+        if self.config.market_type != "futures":
+            return "one_way"
         fetch_position_mode = getattr(self._client, "fetch_position_mode", None)
-        if self.config.market_type == "futures":
-            if not callable(fetch_position_mode):
-                raise RuntimeError(
-                    "authenticated futures account response lacks a position-mode reader"
-                )
-            mode_payload = fetch_position_mode()
-            if not isinstance(mode_payload, dict):
-                raise RuntimeError("authenticated futures account mode is not an object")
-            if mode_payload.get("hedged") is not None:
-                position_mode = "hedged" if bool(mode_payload["hedged"]) else "one_way"
-            elif str(mode_payload.get("mode") or "") in {"hedged", "one_way"}:
-                position_mode = str(mode_payload["mode"])
-            else:
-                raise RuntimeError("authenticated futures account mode is missing")
-        return {
-            "balances": balances,
-            "free_balances": free_balances,
-            "positions": positions,
-            "regular_orders": [item.__dict__ for item in regular_orders],
-            "conditional_orders": [item.__dict__ for item in conditional_orders],
-            "used_margin": used_margin,
-            "maintenance_margin": maintenance_margin,
-            "used_margin_fraction": used_fraction,
-            "liquidation_buffer_fraction": liquidation_buffer,
-            "account_mode": position_mode,
-            "unknown_exposure": {**unknown_positions, **unknown_orders},
-            "account_state_known": True,
-            "account_state_authority": "authenticated_rest",
-            "account_fingerprint": self.account_fingerprint,
-        }
+        if not callable(fetch_position_mode):
+            raise RuntimeError(
+                "authenticated futures account response lacks a position-mode reader"
+            )
+        mode_payload = fetch_position_mode()
+        if not isinstance(mode_payload, dict):
+            raise RuntimeError("authenticated futures account mode is not an object")
+        if mode_payload.get("hedged") is not None:
+            return "hedged" if bool(mode_payload["hedged"]) else "one_way"
+        if str(mode_payload.get("mode") or "") in {"hedged", "one_way"}:
+            return str(mode_payload["mode"])
+        raise RuntimeError("authenticated futures account mode is missing")
 
     def _build_client(self):
         try:
@@ -314,20 +334,28 @@ class CcxtBroker(Broker):
                 "ccxt is not installed. Run `pip install ccxt` to use CcxtBroker, "
                 "or use PaperBroker for simulated execution."
             ) from exc
+        self._assert_ccxt_version(ccxt)
+        client = self._new_client(ccxt)
+        self._configure_client(client)
+        self._assert_client_capabilities(client)
+        return client
 
-        if (
+    def _assert_ccxt_version(self, ccxt: Any) -> None:
+        if not (
             self.config.live
             and self.config.market_type == "futures"
             and str(self.config.exchange).lower() == "binanceusdm"
         ):
-            installed_version = str(getattr(ccxt, "__version__", ""))
-            if installed_version != NATIVE_STOP_CCXT_VERSION:
-                raise RuntimeError(
-                    "Live Binance USD-M execution requires "
-                    f"ccxt=={NATIVE_STOP_CCXT_VERSION} for the validated conditional Algo Order API path; "
-                    f"found {installed_version or 'unknown'}."
-                )
+            return
+        installed_version = str(getattr(ccxt, "__version__", ""))
+        if installed_version != NATIVE_STOP_CCXT_VERSION:
+            raise RuntimeError(
+                "Live Binance USD-M execution requires "
+                f"ccxt=={NATIVE_STOP_CCXT_VERSION} for the validated conditional Algo Order API path; "
+                f"found {installed_version or 'unknown'}."
+            )
 
+    def _new_client(self, ccxt: Any) -> Any:
         if not hasattr(ccxt, self.config.exchange):
             raise ValueError(f"ccxt has no exchange {self.config.exchange!r}.")
         klass = getattr(ccxt, self.config.exchange)
@@ -348,52 +376,47 @@ class CcxtBroker(Broker):
             f"{self.config.exchange}:{self.config.market_type}:{self.config.testnet}",
             minimum_interval_seconds=self.config.request_min_interval_seconds,
         )
-        client = RateLimitedExchangeClient(client, limiter)
-        if self.config.testnet:
-            if str(self.config.exchange).lower() == "binanceusdm":
-                enable_demo = getattr(client, "enable_demo_trading", None)
-                if not callable(enable_demo):
-                    raise RuntimeError("Binance USD-M testnet requires CCXT demo trading support")
-                enable_demo(True)
-            elif hasattr(client, "set_sandbox_mode"):
-                client.set_sandbox_mode(True)
+        return RateLimitedExchangeClient(client, limiter)
+
+    def _configure_client(self, client: Any) -> None:
+        if not self.config.testnet:
+            return
+        if str(self.config.exchange).lower() == "binanceusdm":
+            enable_demo = getattr(client, "enable_demo_trading", None)
+            if not callable(enable_demo):
+                raise RuntimeError("Binance USD-M testnet requires CCXT demo trading support")
+            enable_demo(True)
+        elif hasattr(client, "set_sandbox_mode"):
+            client.set_sandbox_mode(True)
+
+    def _assert_client_capabilities(self, client: Any) -> None:
         if self.config.live:
-            missing_precision_methods = [
-                name
-                for name in ("load_markets", "amount_to_precision", "price_to_precision")
-                if not callable(getattr(client, name, None))
-            ]
-            if missing_precision_methods:
-                raise RuntimeError(
-                    "Live ccxt client lacks required precision method(s): "
-                    f"{', '.join(missing_precision_methods)}."
-                )
+            self._assert_methods(
+                client,
+                ("load_markets", "amount_to_precision", "price_to_precision"),
+                "Live ccxt client lacks required precision method(s)",
+            )
         if (
             self.config.live
             and self.config.market_type == "futures"
             and str(self.config.exchange).lower() == "binanceusdm"
         ):
-            missing_position_mode_methods = [
-                name
-                for name in ("set_position_mode", "fetch_position_mode")
-                if not callable(getattr(client, name, None))
-            ]
-            if missing_position_mode_methods:
-                raise RuntimeError(
-                    "Live Binance USD-M client lacks required position-mode method(s): "
-                    f"{', '.join(missing_position_mode_methods)}."
-                )
-            missing_inventory_methods = [
-                name
-                for name in ("fetch_open_orders", "fetch_positions")
-                if not callable(getattr(client, name, None))
-            ]
-            if missing_inventory_methods:
-                raise RuntimeError(
-                    "Live Binance USD-M client lacks whole-account inventory method(s): "
-                    f"{', '.join(missing_inventory_methods)}."
-                )
-        return client
+            self._assert_methods(
+                client,
+                ("set_position_mode", "fetch_position_mode"),
+                "Live Binance USD-M client lacks required position-mode method(s)",
+            )
+            self._assert_methods(
+                client,
+                ("fetch_open_orders", "fetch_positions"),
+                "Live Binance USD-M client lacks whole-account inventory method(s)",
+            )
+
+    @staticmethod
+    def _assert_methods(client: Any, names: tuple[str, ...], message: str) -> None:
+        missing = [name for name in names if not callable(getattr(client, name, None))]
+        if missing:
+            raise RuntimeError(f"{message}: {', '.join(missing)}.")
 
     # -- market data --------------------------------------------------------
     def get_price(self, symbol: str) -> float:
@@ -733,12 +756,24 @@ class CcxtBroker(Broker):
             ) from exc
         if not isinstance(positions, list):
             raise RuntimeError("Refusing futures entry: position-settings response must be a list.")
+        position = self._matching_position_settings(
+            positions, client_symbol=client_symbol, symbol=symbol
+        )
+        raw_info = position.get("info")
+        info = raw_info if isinstance(raw_info, dict) else {}
+        self._assert_isolated_margin(position, info)
+        self._assert_leverage_readback(position, info)
+
+    @staticmethod
+    def _matching_position_settings(
+        positions: list[dict], *, client_symbol: str, symbol: str
+    ) -> dict:
         matches: list[dict] = []
         for position in positions:
             if not isinstance(position, dict):
                 continue
             raw_info = position.get("info")
-            info: dict = raw_info if isinstance(raw_info, dict) else {}
+            info = raw_info if isinstance(raw_info, dict) else {}
             reported_symbol = position.get("symbol") or info.get("symbol")
             if (
                 reported_symbol == client_symbol
@@ -750,14 +785,17 @@ class CcxtBroker(Broker):
                 "Refusing futures entry: exchange did not return exactly one matching "
                 f"position-settings record for {client_symbol}."
             )
-        position = matches[0]
-        raw_info = position.get("info")
-        info = raw_info if isinstance(raw_info, dict) else {}
+        return matches[0]
+
+    @staticmethod
+    def _assert_isolated_margin(position: dict, info: dict) -> None:
         margin_mode = str(position.get("marginMode") or info.get("marginType") or "").lower()
         if margin_mode != "isolated":
             raise RuntimeError(
                 "Refusing futures entry: exchange did not confirm isolated margin mode."
             )
+
+    def _assert_leverage_readback(self, position: dict, info: dict) -> None:
         raw_leverage = position.get("leverage")
         if raw_leverage is None:
             raw_leverage = info.get("leverage")
@@ -781,6 +819,31 @@ class CcxtBroker(Broker):
             )
 
     def place_order(self, order: Order) -> Fill:
+        normalized_order, ref_price, enforce_notional_cap = self._prepare_order(order)
+        client_symbol = self._ccxt_symbol(normalized_order.symbol)
+        params = self._order_params(normalized_order)
+        result = self._client.create_order(
+            symbol=client_symbol,
+            type=normalized_order.type.value,
+            side=normalized_order.side.value,
+            amount=normalized_order.qty,
+            price=normalized_order.price,
+            params=params,
+        )
+        self._assert_order_status_accepted(
+            result,
+            requested_quantity=normalized_order.qty,
+            acknowledgement_only=getattr(self, "_acknowledgement_only", False),
+        )
+        self._assert_order_response_matches(result, normalized_order)
+        return self._parse_order_result(
+            result,
+            normalized_order=normalized_order,
+            ref_price=ref_price,
+            enforce_notional_cap=enforce_notional_cap,
+        )
+
+    def _prepare_order(self, order: Order) -> tuple[Order, float, bool]:
         if not math.isfinite(float(order.qty)) or order.qty <= 0:
             raise ValueError(f"Order quantity must be positive, got {order.qty:g}. Refusing.")
         ref_price = self._reference_price(order)
@@ -806,32 +869,41 @@ class CcxtBroker(Broker):
             reduce_only=order.reduce_only,
             client_id=order.client_id,
         )
-        notional = ref_price * normalized_qty
         enforce_notional_cap = not self._is_futures_reduce_only(order)
         if enforce_notional_cap:
-            self._assert_notional_within_cap(notional)
+            self._assert_notional_within_cap(ref_price * normalized_qty)
+        self._assert_live_order_allowed()
+        self._assert_order_balance_and_position(normalized_order, ref_price)
+        if self.config.market_type == "futures" and not normalized_order.reduce_only:
+            self._prepare_futures_entry(normalized_order.symbol)
+        return normalized_order, ref_price, enforce_notional_cap
+
+    def _assert_live_order_allowed(self) -> None:
         if not self.config.live:
             raise RuntimeError(
                 "Refusing to place a real order: TRADING_LIVE is not enabled. "
                 "Set TRADING_LIVE=1 (and ideally EXCHANGE_TESTNET=1) to trade."
             )
-        if self.config.market_type == "spot" and normalized_order.side == OrderSide.BUY:
-            self._assert_spot_buy_within_balance(normalized_order, ref_price)
-        if self.config.market_type == "spot" and normalized_order.side == OrderSide.SELL:
-            self._assert_spot_sell_within_balance(normalized_order)
-        if self._is_futures_reduce_only(normalized_order):
-            self._assert_futures_reduce_only_within_position(normalized_order)
-        if self.config.market_type == "futures" and not normalized_order.reduce_only:
-            self._ensure_futures_margin_mode(normalized_order.symbol)
-            self._ensure_futures_leverage(normalized_order.symbol)
-            self._ensure_futures_position_mode(normalized_order.symbol)
-            self._verify_futures_risk_settings(normalized_order.symbol)
 
-        client_symbol = self._ccxt_symbol(normalized_order.symbol)
+    def _assert_order_balance_and_position(self, order: Order, ref_price: float) -> None:
+        if self.config.market_type == "spot" and order.side == OrderSide.BUY:
+            self._assert_spot_buy_within_balance(order, ref_price)
+        if self.config.market_type == "spot" and order.side == OrderSide.SELL:
+            self._assert_spot_sell_within_balance(order)
+        if self._is_futures_reduce_only(order):
+            self._assert_futures_reduce_only_within_position(order)
+
+    def _prepare_futures_entry(self, symbol: str) -> None:
+        self._ensure_futures_margin_mode(symbol)
+        self._ensure_futures_leverage(symbol)
+        self._ensure_futures_position_mode(symbol)
+        self._verify_futures_risk_settings(symbol)
+
+    def _order_params(self, order: Order) -> dict[str, object]:
         params: dict[str, object] = {}
-        if normalized_order.client_id is not None:
-            if not isinstance(normalized_order.client_id, str) or not CLIENT_ORDER_ID_RE.fullmatch(
-                normalized_order.client_id
+        if order.client_id is not None:
+            if not isinstance(order.client_id, str) or not CLIENT_ORDER_ID_RE.fullmatch(
+                order.client_id
             ):
                 raise ValueError(
                     "Order client_id must be 1-36 Binance-safe characters "
@@ -842,26 +914,22 @@ class CcxtBroker(Broker):
                 if str(self.config.exchange).lower().startswith("binance")
                 else "clientOrderId"
             )
-            params[client_id_param] = normalized_order.client_id
-        if normalized_order.reduce_only and self.config.market_type == "futures":
+            params[client_id_param] = order.client_id
+        if order.reduce_only and self.config.market_type == "futures":
             params["reduceOnly"] = True
-        if self.config.market_type == "futures" and not normalized_order.reduce_only:
-            self._assert_no_open_orders_before_entry(normalized_order.symbol)
-            self._assert_futures_position_compatible(normalized_order)
-        result = self._client.create_order(
-            symbol=client_symbol,
-            type=normalized_order.type.value,
-            side=normalized_order.side.value,
-            amount=normalized_order.qty,
-            price=normalized_order.price,
-            params=params,
-        )
-        self._assert_order_status_accepted(
-            result,
-            requested_quantity=normalized_order.qty,
-            acknowledgement_only=getattr(self, "_acknowledgement_only", False),
-        )
-        self._assert_order_response_matches(result, normalized_order)
+        if self.config.market_type == "futures" and not order.reduce_only:
+            self._assert_no_open_orders_before_entry(order.symbol)
+            self._assert_futures_position_compatible(order)
+        return params
+
+    def _parse_order_result(
+        self,
+        result: dict,
+        *,
+        normalized_order: Order,
+        ref_price: float,
+        enforce_notional_cap: bool,
+    ) -> Fill:
         exchange_order_id = str(
             result.get("id") or (result.get("info") or {}).get("orderId") or ""
         ).strip()
@@ -885,28 +953,16 @@ class CcxtBroker(Broker):
                 ).lower(),
                 submitted_at=float(result.get("timestamp") or time.time()),
             )
-        fill_price = float(
-            self._required_first_present(result, ("average", "price"), label="Filled order price")
+        fill_price, fee, filled = self._fill_values(result)
+        self._assert_fill_values(
+            result,
+            normalized_order=normalized_order,
+            ref_price=ref_price,
+            enforce_notional_cap=enforce_notional_cap,
+            fill_price=fill_price,
+            fee=fee,
+            filled=filled,
         )
-        fee = float((result.get("fee") or {}).get("cost") or 0.0)
-        filled = float(
-            self._required_first_present(result, ("filled",), label="Filled order quantity")
-        )
-        if not math.isfinite(fee) or fee < 0:
-            raise ValueError(
-                f"Filled order fee must be finite and non-negative, got {fee:g}. Refusing."
-            )
-        if not math.isfinite(fill_price) or fill_price <= 0:
-            raise ValueError(f"Filled order price must be positive, got {fill_price:g}. Refusing.")
-        if not math.isfinite(filled) or filled <= 0:
-            raise ValueError(f"Filled order quantity must be positive, got {filled:g}. Refusing.")
-        if filled < float(normalized_order.qty) and not (result.get("id") or result.get("status")):
-            raise ValueError("Refusing to accept a partial fill without an exchange order identity")
-        if filled > float(normalized_order.qty) + max(float(normalized_order.qty) * 1e-12, 1e-12):
-            raise ValueError("Exchange fill quantity exceeds requested quantity. Refusing.")
-        self._assert_fill_slippage_within_cap(ref_price, fill_price)
-        if enforce_notional_cap:
-            self._assert_notional_within_cap(fill_price * filled, label="Filled order")
         LOGGER.info(
             "Placed %s %s %s @ %s",
             normalized_order.side.value,
@@ -933,6 +989,43 @@ class CcxtBroker(Broker):
             or None,
             fee_asset=str((result.get("fee") or {}).get("currency") or "") or None,
         )
+
+    def _fill_values(self, result: dict) -> tuple[float, float, float]:
+        fill_price = float(
+            self._required_first_present(result, ("average", "price"), label="Filled order price")
+        )
+        fee = float((result.get("fee") or {}).get("cost") or 0.0)
+        filled = float(
+            self._required_first_present(result, ("filled",), label="Filled order quantity")
+        )
+        return fill_price, fee, filled
+
+    def _assert_fill_values(
+        self,
+        result: dict,
+        *,
+        normalized_order: Order,
+        ref_price: float,
+        enforce_notional_cap: bool,
+        fill_price: float,
+        fee: float,
+        filled: float,
+    ) -> None:
+        if not math.isfinite(fee) or fee < 0:
+            raise ValueError(
+                f"Filled order fee must be finite and non-negative, got {fee:g}. Refusing."
+            )
+        if not math.isfinite(fill_price) or fill_price <= 0:
+            raise ValueError(f"Filled order price must be positive, got {fill_price:g}. Refusing.")
+        if not math.isfinite(filled) or filled <= 0:
+            raise ValueError(f"Filled order quantity must be positive, got {filled:g}. Refusing.")
+        if filled < float(normalized_order.qty) and not (result.get("id") or result.get("status")):
+            raise ValueError("Refusing to accept a partial fill without an exchange order identity")
+        if filled > float(normalized_order.qty) + max(float(normalized_order.qty) * 1e-12, 1e-12):
+            raise ValueError("Exchange fill quantity exceeds requested quantity. Refusing.")
+        self._assert_fill_slippage_within_cap(ref_price, fill_price)
+        if enforce_notional_cap:
+            self._assert_notional_within_cap(fill_price * filled, label="Filled order")
 
     def supports_native_protective_stops(self) -> bool:
         return (
@@ -1051,7 +1144,33 @@ class CcxtBroker(Broker):
 
     def list_account_futures_positions(self) -> tuple[FuturesPositionIdentity, ...]:
         """Read and sanitize every non-flat Binance USD-M account position."""
+        self._assert_whole_account_positions_supported()
+        fetch_positions = getattr(self._client, "fetch_positions", None)
+        if not callable(fetch_positions):
+            raise RuntimeError(
+                "ccxt client cannot fetch account positions; refusing to assume the account is flat."
+            )
+        payload = self._fetch_whole_account_positions(fetch_positions)
+        if not isinstance(payload, list):
+            raise ValueError(
+                "ccxt fetch_positions response must be a list. Refusing to assume "
+                "the account is flat."
+            )
 
+        positions = [
+            position
+            for index, item in enumerate(payload)
+            if (position := self._parse_futures_position(item, index=index)) is not None
+        ]
+        symbols = [position.symbol for position in positions]
+        if len(symbols) != len(set(symbols)):
+            duplicate = next(symbol for symbol in symbols if symbols.count(symbol) > 1)
+            raise ValueError(
+                f"ccxt position response contains duplicate symbol {duplicate!r}. Refusing."
+            )
+        return tuple(sorted(positions, key=lambda position: position.symbol))
+
+    def _assert_whole_account_positions_supported(self) -> None:
         if (
             self.config.market_type != "futures"
             or str(self.config.exchange).lower() != "binanceusdm"
@@ -1059,89 +1178,64 @@ class CcxtBroker(Broker):
             raise RuntimeError(
                 "Whole-account position verification is only validated for Binance USD-M futures."
             )
-        fetch_positions = getattr(self._client, "fetch_positions", None)
-        if not callable(fetch_positions):
-            raise RuntimeError(
-                "ccxt client cannot fetch account positions; refusing to assume the account is flat."
-            )
+
+    @staticmethod
+    def _fetch_whole_account_positions(fetch_positions: Callable[..., Any]) -> Any:
         try:
-            # ``None`` is the CCXT sentinel for an unfiltered account read.
-            # Passing it explicitly also avoids adapters/test doubles silently
-            # interpreting an omitted argument as a configured-symbol query.
-            payload = fetch_positions(None)
+            return fetch_positions(None)
         except Exception as exc:
             raise RuntimeError(f"Could not query whole-account futures positions: {exc}") from exc
-        if not isinstance(payload, list):
-            raise ValueError(
-                "ccxt fetch_positions response must be a list. Refusing to assume "
-                "the account is flat."
-            )
 
-        positions: list[FuturesPositionIdentity] = []
-        seen_symbols: set[str] = set()
-        for index, item in enumerate(payload):
-            if not isinstance(item, dict):
+    def _parse_futures_position(self, item: Any, *, index: int) -> FuturesPositionIdentity | None:
+        if not isinstance(item, dict):
+            raise ValueError(f"ccxt position response item {index} must be an object. Refusing.")
+        info_value = item.get("info")
+        if info_value is not None and not isinstance(info_value, dict):
+            raise ValueError(
+                f"ccxt position response item {index} info must be an object. Refusing."
+            )
+        info = info_value or {}
+        symbol = self._canonical_inventory_symbol(
+            self._payload_value(item, info, "symbol"),
+            label=f"Position item {index} symbol",
+        )
+        contracts = self._finite_number(
+            self._payload_value(item, info, "contracts", "positionAmt"),
+            f"Position item {index} contracts",
+            non_negative=True,
+        )
+        if contracts == 0:
+            return None
+        qty = self._futures_position_quantity(item, info, contracts, index=index)
+        entry_price = self._finite_number(
+            self._payload_value(item, info, "entryPrice"),
+            f"Position item {index} entry price",
+            positive=True,
+        )
+        return FuturesPositionIdentity(symbol=symbol, qty=qty, avg_price=entry_price)
+
+    def _futures_position_quantity(
+        self, item: dict, info: dict, contracts: float, *, index: int
+    ) -> float:
+        raw_side = self._sanitized_open_order_field(
+            self._payload_value(item, info, "side", "positionSide"),
+            label=f"Position item {index} side",
+        ).lower()
+        if raw_side == "long":
+            return contracts
+        if raw_side == "short":
+            return -contracts
+        if raw_side == "both":
+            signed_amount = self._finite_number(
+                info.get("positionAmt"), f"Position item {index} signed amount"
+            )
+            quantity_tolerance = max(contracts * 1e-9, 1e-12)
+            if signed_amount == 0 or abs(abs(signed_amount) - contracts) > quantity_tolerance:
                 raise ValueError(
-                    f"ccxt position response item {index} must be an object. Refusing."
+                    f"Position item {index} one-way quantity evidence is inconsistent. Refusing."
                 )
-            info_value = item.get("info")
-            if info_value is not None and not isinstance(info_value, dict):
-                raise ValueError(
-                    f"ccxt position response item {index} info must be an object. Refusing."
-                )
-            info = info_value or {}
-            raw_symbol = self._payload_value(item, info, "symbol")
-            symbol = self._canonical_inventory_symbol(
-                raw_symbol,
-                label=f"Position item {index} symbol",
-            )
-            if symbol in seen_symbols:
-                raise ValueError(
-                    f"ccxt position response contains duplicate symbol {symbol!r}. Refusing."
-                )
-            seen_symbols.add(symbol)
-            raw_contracts = self._payload_value(item, info, "contracts", "positionAmt")
-            contracts = self._finite_number(
-                raw_contracts,
-                f"Position item {index} contracts",
-                non_negative=True,
-            )
-            if contracts == 0:
-                continue
-            raw_side = self._sanitized_open_order_field(
-                self._payload_value(item, info, "side", "positionSide"),
-                label=f"Position item {index} side",
-            ).lower()
-            if raw_side == "long":
-                qty = contracts
-            elif raw_side == "short":
-                qty = -contracts
-            elif raw_side == "both":
-                signed_amount = self._finite_number(
-                    info.get("positionAmt"),
-                    f"Position item {index} signed amount",
-                )
-                quantity_tolerance = max(contracts * 1e-9, 1e-12)
-                if signed_amount == 0 or abs(abs(signed_amount) - contracts) > quantity_tolerance:
-                    raise ValueError(
-                        f"Position item {index} one-way quantity evidence is inconsistent. Refusing."
-                    )
-                qty = signed_amount
-            else:
-                raise ValueError(f"Position item {index} side {raw_side!r} is invalid. Refusing.")
-            entry_price = self._finite_number(
-                self._payload_value(item, info, "entryPrice"),
-                f"Position item {index} entry price",
-                positive=True,
-            )
-            positions.append(
-                FuturesPositionIdentity(
-                    symbol=symbol,
-                    qty=qty,
-                    avg_price=entry_price,
-                )
-            )
-        return tuple(sorted(positions, key=lambda position: position.symbol))
+            return signed_amount
+        raise ValueError(f"Position item {index} side {raw_side!r} is invalid. Refusing.")
 
     @staticmethod
     def _sanitized_open_order_field(value, *, label: str) -> str:
@@ -1448,32 +1542,9 @@ class CcxtBroker(Broker):
             raise ValueError("Protective stop exchange response must be an object. Refusing.")
         info_value = payload.get("info")
         info = info_value if isinstance(info_value, dict) else {}
-
-        order_id_value = self._payload_value(payload, info, "id", "algoId", "orderId")
-        order_id = str(order_id_value or "").strip()
-        if not order_id:
-            raise ValueError("Protective stop order id missing from exchange response. Refusing.")
-        client_id_value = self._payload_value(
-            payload,
-            info,
-            "clientOrderId",
-            "clientAlgoId",
-            "origClientOrderId",
+        order_id, client_id, side = self._protective_identity(
+            payload, info, requested_symbol=requested_symbol
         )
-        client_id = str(client_id_value or "").strip()
-        self._assert_client_order_id(client_id, label="Protective stop response client_id")
-
-        symbol_value = self._payload_value(payload, info, "symbol")
-        if symbol_value is None or not self._symbols_match(str(symbol_value), requested_symbol):
-            raise ValueError(
-                f"Protective stop symbol {symbol_value!r} does not match {requested_symbol!r}. Refusing."
-            )
-        side_value = str(self._payload_value(payload, info, "side") or "").lower()
-        try:
-            side = OrderSide(side_value)
-        except ValueError as exc:
-            raise ValueError(f"Protective stop side {side_value!r} is invalid. Refusing.") from exc
-
         qty = self._finite_number(
             self._payload_value(payload, info, "amount", "quantity", "origQty"),
             "Protective stop response quantity",
@@ -1487,91 +1558,11 @@ class CcxtBroker(Broker):
         status = self._normalized_protective_status(
             self._payload_value(payload, info, "status", "algoStatus")
         )
-
-        reduce_only_value = self._payload_value(payload, info, "reduceOnly")
-        if reduce_only_value is None or not self._response_bool(
-            reduce_only_value,
-            label="Protective stop reduceOnly",
-        ):
-            raise ValueError("Protective stop response does not prove reduceOnly=true. Refusing.")
-        position_side = self._payload_value(payload, info, "positionSide")
-        if position_side is not None and str(position_side).upper() != "BOTH":
-            raise ValueError(
-                f"Protective stop positionSide {position_side!r} is not one-way BOTH. Refusing."
-            )
-
-        filled_value = self._payload_value(
-            payload,
-            info,
-            "filled",
-            "executedQty",
-            "actualQty",
-            "cumQty",
-            "aq",
+        self._assert_protective_constraints(payload, info, qty=qty, status=status)
+        filled_qty, average_price = self._protective_fill_values(
+            payload, info, qty=qty, status=status
         )
-        if filled_value is None:
-            if status == ProtectiveOrderStatus.TRIGGERED:
-                raise ValueError(
-                    "Triggered protective stop fill quantity is missing. Refusing adoption."
-                )
-            filled_qty = 0.0
-        else:
-            filled_qty = self._finite_number(
-                filled_value,
-                "Protective stop filled quantity",
-                non_negative=True,
-            )
-
-        average_value = self._payload_value(
-            payload,
-            info,
-            "average",
-            "avgPrice",
-            "averagePrice",
-            "actualPrice",
-            "ap",
-        )
-        average_price = None
-        if average_value is not None and str(average_value).strip() not in {
-            "",
-            "0",
-            "0.0",
-            "0.00000000",
-        }:
-            average_price = self._finite_number(
-                average_value,
-                "Protective stop average fill price",
-                positive=True,
-            )
-        if status == ProtectiveOrderStatus.TRIGGERED:
-            if filled_qty <= 0:
-                raise ValueError(
-                    "Triggered protective stop has no positive fill quantity. Refusing adoption."
-                )
-            if average_price is None:
-                raise ValueError(
-                    "Triggered protective stop average fill price is missing. Refusing adoption."
-                )
-            fill_tolerance = max(qty * 1e-9, 1e-12)
-            if abs(filled_qty - qty) > fill_tolerance:
-                raise ValueError(
-                    "Triggered protective stop is not fully filled. Refusing adoption."
-                )
-
-        fee_value = (
-            (payload.get("fee") or {}).get("cost") if isinstance(payload.get("fee"), dict) else None
-        )
-        if fee_value is None:
-            fee_value = self._payload_value({}, info, "commission", "fee")
-        fee = (
-            0.0
-            if fee_value is None
-            else self._finite_number(
-                fee_value,
-                "Protective stop fee",
-                non_negative=True,
-            )
-        )
+        fee = self._protective_fee(payload, info)
         return ProtectiveOrder(
             symbol=requested_symbol,
             side=side,
@@ -1583,6 +1574,103 @@ class CcxtBroker(Broker):
             filled_qty=filled_qty,
             average_price=average_price,
             fee=fee,
+        )
+
+    def _protective_identity(
+        self, payload: dict, info: dict, *, requested_symbol: str
+    ) -> tuple[str, str, OrderSide]:
+        order_id = str(self._payload_value(payload, info, "id", "algoId", "orderId") or "").strip()
+        if not order_id:
+            raise ValueError("Protective stop order id missing from exchange response. Refusing.")
+        client_id = str(
+            self._payload_value(payload, info, "clientOrderId", "clientAlgoId", "origClientOrderId")
+            or ""
+        ).strip()
+        self._assert_client_order_id(client_id, label="Protective stop response client_id")
+        symbol_value = self._payload_value(payload, info, "symbol")
+        if symbol_value is None or not self._symbols_match(str(symbol_value), requested_symbol):
+            raise ValueError(
+                f"Protective stop symbol {symbol_value!r} does not match {requested_symbol!r}. Refusing."
+            )
+        side_value = str(self._payload_value(payload, info, "side") or "").lower()
+        try:
+            side = OrderSide(side_value)
+        except ValueError as exc:
+            raise ValueError(f"Protective stop side {side_value!r} is invalid. Refusing.") from exc
+        return order_id, client_id, side
+
+    def _assert_protective_constraints(
+        self, payload: dict, info: dict, *, qty: float, status: ProtectiveOrderStatus
+    ) -> None:
+        reduce_only = self._payload_value(payload, info, "reduceOnly")
+        if reduce_only is None or not self._response_bool(
+            reduce_only, label="Protective stop reduceOnly"
+        ):
+            raise ValueError("Protective stop response does not prove reduceOnly=true. Refusing.")
+        position_side = self._payload_value(payload, info, "positionSide")
+        if position_side is not None and str(position_side).upper() != "BOTH":
+            raise ValueError(
+                f"Protective stop positionSide {position_side!r} is not one-way BOTH. Refusing."
+            )
+        filled_qty, average_price = self._protective_fill_values(
+            payload, info, qty=qty, status=status
+        )
+        if status is ProtectiveOrderStatus.TRIGGERED:
+            self._assert_triggered_protective_fill(qty, filled_qty, average_price)
+
+    def _protective_fill_values(
+        self, payload: dict, info: dict, *, qty: float, status: ProtectiveOrderStatus
+    ) -> tuple[float, float | None]:
+        filled_value = self._payload_value(
+            payload, info, "filled", "executedQty", "actualQty", "cumQty", "aq"
+        )
+        if filled_value is None:
+            if status is ProtectiveOrderStatus.TRIGGERED:
+                raise ValueError(
+                    "Triggered protective stop fill quantity is missing. Refusing adoption."
+                )
+            filled_qty = 0.0
+        else:
+            filled_qty = self._finite_number(
+                filled_value, "Protective stop filled quantity", non_negative=True
+            )
+        average_value = self._payload_value(
+            payload, info, "average", "avgPrice", "averagePrice", "actualPrice", "ap"
+        )
+        average_price = (
+            None
+            if average_value is None or str(average_value).strip() in {"", "0", "0.0", "0.00000000"}
+            else self._finite_number(
+                average_value, "Protective stop average fill price", positive=True
+            )
+        )
+        return filled_qty, average_price
+
+    @staticmethod
+    def _assert_triggered_protective_fill(
+        qty: float, filled_qty: float, average_price: float | None
+    ) -> None:
+        if filled_qty <= 0:
+            raise ValueError(
+                "Triggered protective stop has no positive fill quantity. Refusing adoption."
+            )
+        if average_price is None:
+            raise ValueError(
+                "Triggered protective stop average fill price is missing. Refusing adoption."
+            )
+        if abs(filled_qty - qty) > max(qty * 1e-9, 1e-12):
+            raise ValueError("Triggered protective stop is not fully filled. Refusing adoption.")
+
+    def _protective_fee(self, payload: dict, info: dict) -> float:
+        fee_value = (
+            (payload.get("fee") or {}).get("cost") if isinstance(payload.get("fee"), dict) else None
+        )
+        if fee_value is None:
+            fee_value = self._payload_value({}, info, "commission", "fee")
+        return (
+            0.0
+            if fee_value is None
+            else self._finite_number(fee_value, "Protective stop fee", non_negative=True)
         )
 
     def _assert_protective_identity(
