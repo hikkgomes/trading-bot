@@ -314,6 +314,54 @@ def _recent_failed_mutation_sources(
     return suppressed
 
 
+def _scenario_mutation_candidates(
+    scenario: dict[str, Any],
+    forward_feedback: dict[tuple[str, str], dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    candidates: list[dict[str, Any]] = []
+    retired_candidates: list[dict[str, Any]] = []
+    for raw_candidate in scenario.get("incubation_candidates") or []:
+        if not isinstance(raw_candidate, dict):
+            continue
+        retired_reason = _retired_reason(raw_candidate)
+        if retired_reason is not None:
+            retired_candidates.append(_retired_candidate(scenario, raw_candidate, retired_reason))
+            continue
+        candidate = dict(raw_candidate)
+        feedback = forward_feedback.get(
+            (str(scenario.get("product") or ""), str(candidate.get("id") or ""))
+        )
+        if feedback is not None:
+            candidate["adaptive_mutation_reason"] = feedback["diagnosis"]
+            candidate["adaptive_feedback"] = feedback
+        candidates.append(candidate)
+    return candidates, retired_candidates
+
+
+def _select_mutation_candidates(
+    scenario: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    suppressed_sources: dict[tuple[str, str, str], dict[str, Any]],
+    top_per_scenario: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    selected: list[dict[str, Any]] = []
+    suppressed: list[dict[str, Any]] = []
+    for candidate in sorted(
+        candidates,
+        key=lambda item: float(item.get("score") or 0.0),
+        reverse=True,
+    ):
+        reason = _primary_reason(candidate)
+        key = _source_key(scenario.get("name"), candidate.get("id"), reason)
+        if key is not None and key in suppressed_sources:
+            suppressed.append(suppressed_sources[key])
+            continue
+        selected.append(candidate)
+        if len(selected) >= top_per_scenario:
+            break
+    return selected, suppressed
+
+
 def build_mutation_plan(
     research_cycle: dict[str, Any],
     *,
@@ -343,37 +391,12 @@ def build_mutation_plan(
                 }
             )
             continue
-        candidates = []
-        for candidate in scenario.get("incubation_candidates") or []:
-            if not isinstance(candidate, dict):
-                continue
-            retired_reason = _retired_reason(candidate)
-            if retired_reason is not None:
-                retired_candidates.append(_retired_candidate(scenario, candidate, retired_reason))
-                continue
-            candidate = dict(candidate)
-            feedback = forward_feedback.get(
-                (str(scenario.get("product") or ""), str(candidate.get("id") or ""))
-            )
-            if feedback is not None:
-                candidate["adaptive_mutation_reason"] = feedback["diagnosis"]
-                candidate["adaptive_feedback"] = feedback
-            candidates.append(candidate)
-        candidates = sorted(
-            candidates,
-            key=lambda candidate: float(candidate.get("score") or 0.0),
-            reverse=True,
+        candidates, retired = _scenario_mutation_candidates(scenario, forward_feedback)
+        retired_candidates.extend(retired)
+        selected, suppressed = _select_mutation_candidates(
+            scenario, candidates, suppressed_sources, top_per_scenario
         )
-        selected = []
-        for candidate in candidates:
-            reason = _primary_reason(candidate)
-            key = _source_key(scenario.get("name"), candidate.get("id"), reason)
-            if key is not None and key in suppressed_sources:
-                suppressed_repeated_sources.append(suppressed_sources[key])
-                continue
-            selected.append(candidate)
-            if len(selected) >= top_per_scenario:
-                break
+        suppressed_repeated_sources.extend(suppressed)
         proposals.extend(
             _proposal(
                 scenario,
