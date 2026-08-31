@@ -748,7 +748,7 @@ class PlatformScheduler:
             ]
             if symbols:
                 return sorted(set(symbols))
-        return [str(product.get("exchange_symbol") or "BTCUSDT")]
+        return [str(product["exchange_symbol"])] if product.get("exchange_symbol") else []
 
 
 class DatabaseJobQueue:

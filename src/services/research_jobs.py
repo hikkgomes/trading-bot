@@ -196,6 +196,12 @@ class DatabaseResearchJobHandlers:
             if set(snapshot_ids) != set(plan.all_snapshot_ids):
                 raise JobSchemaError("catalogue datasets do not match the canonical bundle")
         universe = tuple(claimed.payload.get("instrument_universe", ("BTCUSDT",)))
+        if not universe:
+            return {
+                "product_id": str(claimed.payload["product_id"]),
+                "state": "waiting_for_universe",
+                "reason_code": "point_in_time_universe_unavailable",
+            }
         theses = registered_strategy_theses(
             product=str(claimed.payload["product_id"]), instrument_universe=universe
         )
@@ -262,7 +268,7 @@ class DatabaseResearchJobHandlers:
         universe = tuple(str(item) for item in payload["instrument_universe"])
         snapshot_ids = tuple(str(item) for item in payload["dataset_snapshot_hashes"])
         feedback_store = SqlGenerationFeedbackStore(self.store.engine)
-        if not snapshot_ids:
+        if not universe or not snapshot_ids:
             for campaign in CAMPAIGNS:
                 if campaign.product == product_id:
                     feedback_store.append(
@@ -270,10 +276,17 @@ class DatabaseResearchJobHandlers:
                             campaign=campaign.name,
                             outcome="data_unavailable",
                             observed_at=str(payload["submitted_at"]),
-                            reason_code="canonical_dataset_bundle_unavailable",
+                            reason_code=(
+                                "point_in_time_universe_unavailable"
+                                if not universe
+                                else "canonical_dataset_bundle_unavailable"
+                            ),
                         )
                     )
-            return {"product_id": product_id, "state": "waiting_for_dataset"}
+            return {
+                "product_id": product_id,
+                "state": "waiting_for_universe" if not universe else "waiting_for_dataset",
+            }
         generator = HypothesisGenerator(
             product=product_id,
             instrument_universe=universe,
