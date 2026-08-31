@@ -425,6 +425,8 @@ class PlatformLiveAuthority:
         ):
             raise PlatformLiveAuthorityError("artefact binding does not match the selected product")
         self._assert_reviewable(artefact)
+        if product_id == "btc_accumulation":
+            self._assert_btc_spot_only(artefact)
         supported = {str(value) for value in artefact.get("supported_instruments", [])}
         if instrument_id not in supported:
             raise PlatformLiveAuthorityError("instrument is not supported by the artefact")
@@ -464,6 +466,39 @@ class PlatformLiveAuthority:
         maximum = limits.get("maximum_position") if isinstance(limits, Mapping) else None
         if isinstance(maximum, bool) or not isinstance(maximum, int | float) or maximum <= 0:
             raise PlatformLiveAuthorityError("artefact has no positive maximum position")
+
+    @staticmethod
+    def _assert_btc_spot_only(artefact: Mapping[str, Any]) -> None:
+        supported = tuple(str(value) for value in artefact.get("supported_instruments", ()))
+        if supported != ("binance:spot:BTCUSDT",):
+            raise PlatformLiveAuthorityError(
+                "BTC accumulation artefacts must support BTCUSDT spot only"
+            )
+        definition = artefact.get("definition")
+        if not isinstance(definition, Mapping):
+            raise PlatformLiveAuthorityError("BTC accumulation artefact has no definition")
+        universe = definition.get("universe")
+        if isinstance(universe, Mapping):
+            instrument_ids = universe.get("instrument_ids")
+            if (
+                instrument_ids is not None
+                and tuple(str(value) for value in instrument_ids) != supported
+            ):
+                raise PlatformLiveAuthorityError(
+                    "BTC accumulation universe is not restricted to BTCUSDT spot"
+                )
+        forbidden = {"futures", "leverage", "borrow", "borrowing", "margin"}
+        containers = (
+            definition.get("position_model"),
+            definition.get("execution_preferences"),
+            definition.get("risk_policy"),
+            artefact.get("position_limits"),
+            artefact.get("risk_limits"),
+        )
+        if any(_contains_forbidden_btc_term(value, forbidden) for value in containers):
+            raise PlatformLiveAuthorityError(
+                "BTC accumulation artefacts cannot use futures, borrowing, leverage, or margin"
+            )
 
     def _broker(self, account: Mapping[str, Any]):
         market = _market(account)
@@ -654,6 +689,26 @@ def _records(
 
 def _market(account: Mapping[str, Any]) -> str:
     return "spot" if account.get("market") == "spot" else "futures"
+
+
+def _contains_forbidden_btc_term(value: object, forbidden: set[str]) -> bool:
+    if isinstance(value, Mapping):
+        return any(
+            bool(forbidden.intersection(_tokens(key)))
+            or _contains_forbidden_btc_term(item, forbidden)
+            for key, item in value.items()
+        )
+    if isinstance(value, list | tuple | set):
+        return any(_contains_forbidden_btc_term(item, forbidden) for item in value)
+    return bool(forbidden.intersection(_tokens(value)))
+
+
+def _tokens(value: object) -> set[str]:
+    return {
+        token
+        for token in str(value).casefold().replace("-", "_").replace("/", "_").split("_")
+        if token
+    }
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
