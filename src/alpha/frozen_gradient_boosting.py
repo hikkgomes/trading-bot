@@ -71,6 +71,81 @@ def export_sklearn_gradient_boosting(strategy: Any) -> dict[str, Any]:
     return payload
 
 
+def _frozen_header(payload: dict[str, Any]) -> tuple[str, list[str], list[Any]]:
+    if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
+        raise ValueError("frozen gradient-boosting schema is invalid")
+    kind = payload.get("kind")
+    if kind not in {"classifier", "regressor"}:
+        raise ValueError("frozen gradient-boosting kind is invalid")
+    names = payload.get("feature_names")
+    if (
+        not isinstance(names, list)
+        or not names
+        or len(names) > MAX_FEATURES
+        or any(not isinstance(name, str) or not name for name in names)
+        or len(names) != len(set(names))
+    ):
+        raise ValueError("frozen gradient-boosting features are invalid")
+    raw_trees = payload.get("trees")
+    if not isinstance(raw_trees, list) or not raw_trees or len(raw_trees) > MAX_TREES:
+        raise ValueError("frozen gradient-boosting tree count is invalid")
+    return str(kind), names, raw_trees
+
+
+def _frozen_tree(raw: Any, feature_count: int) -> tuple[dict[str, tuple[Any, ...]], int]:
+    fields = {"children_left", "children_right", "feature", "threshold", "value"}
+    if not isinstance(raw, dict) or set(raw) != fields:
+        raise ValueError("frozen gradient-boosting tree fields are invalid")
+    arrays = {key: raw[key] for key in raw}
+    if any(not isinstance(value, list) for value in arrays.values()):
+        raise ValueError("frozen gradient-boosting tree arrays are invalid")
+    lengths = {len(value) for value in arrays.values()}
+    if len(lengths) != 1:
+        raise ValueError("frozen gradient-boosting tree arrays are invalid")
+    nodes = next(iter(lengths), 0)
+    if nodes < 1:
+        raise ValueError("frozen gradient-boosting tree is empty")
+    left = tuple(int(value) for value in raw["children_left"])
+    right = tuple(int(value) for value in raw["children_right"])
+    features = tuple(int(value) for value in raw["feature"])
+    thresholds = tuple(_finite(value, "tree threshold") for value in raw["threshold"])
+    values = tuple(_finite(value, "tree value") for value in raw["value"])
+    for index, (child_left, child_right, feature) in enumerate(
+        zip(left, right, features, strict=True)
+    ):
+        if child_left == -1 and child_right == -1:
+            continue
+        if not (0 <= child_left < nodes and 0 <= child_right < nodes):
+            raise ValueError(f"tree node {index} has invalid children")
+        if not 0 <= feature < feature_count:
+            raise ValueError(f"tree node {index} has invalid feature")
+    return {
+        "children_left": left,
+        "children_right": right,
+        "feature": features,
+        "threshold": thresholds,
+        "value": values,
+    }, nodes
+
+
+def _frozen_thresholds(
+    payload: dict[str, Any], kind: str
+) -> tuple[float | None, float | None, float | None]:
+    long_threshold = payload.get("long_threshold")
+    short_threshold = payload.get("short_threshold")
+    min_edge = payload.get("min_edge")
+    if kind == "classifier":
+        long_threshold = _finite(long_threshold, "long_threshold")
+        short_threshold = _finite(short_threshold, "short_threshold")
+        if not 0 < short_threshold < long_threshold < 1:
+            raise ValueError("classifier thresholds are invalid")
+        return long_threshold, short_threshold, None
+    min_edge = _finite(min_edge, "min_edge")
+    if min_edge <= 0:
+        raise ValueError("regressor min_edge must be positive")
+    return None, None, min_edge
+
+
 @dataclass(frozen=True)
 class FrozenGradientBoostingModel:
     kind: str
@@ -84,84 +159,16 @@ class FrozenGradientBoostingModel:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> FrozenGradientBoostingModel:
-        if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
-            raise ValueError("frozen gradient-boosting schema is invalid")
-        kind = payload.get("kind")
-        if kind not in {"classifier", "regressor"}:
-            raise ValueError("frozen gradient-boosting kind is invalid")
-        names = payload.get("feature_names")
-        if (
-            not isinstance(names, list)
-            or not names
-            or len(names) > MAX_FEATURES
-            or any(not isinstance(name, str) or not name for name in names)
-            or len(names) != len(set(names))
-        ):
-            raise ValueError("frozen gradient-boosting features are invalid")
-        raw_trees = payload.get("trees")
-        if not isinstance(raw_trees, list) or not raw_trees or len(raw_trees) > MAX_TREES:
-            raise ValueError("frozen gradient-boosting tree count is invalid")
+        kind, names, raw_trees = _frozen_header(payload)
         trees = []
         total_nodes = 0
         for raw in raw_trees:
-            if not isinstance(raw, dict) or set(raw) != {
-                "children_left",
-                "children_right",
-                "feature",
-                "threshold",
-                "value",
-            }:
-                raise ValueError("frozen gradient-boosting tree fields are invalid")
-            arrays = {key: raw[key] for key in raw}
-            if any(not isinstance(value, list) for value in arrays.values()):
-                raise ValueError("frozen gradient-boosting tree arrays are invalid")
-            lengths = {len(value) for value in arrays.values()}
-            if len(lengths) != 1:
-                raise ValueError("frozen gradient-boosting tree arrays are invalid")
-            nodes = next(iter(lengths), 0)
-            if nodes < 1:
-                raise ValueError("frozen gradient-boosting tree is empty")
+            tree, nodes = _frozen_tree(raw, len(names))
             total_nodes += nodes
             if total_nodes > MAX_TOTAL_NODES:
                 raise ValueError("frozen gradient-boosting node budget exceeded")
-            left = tuple(int(value) for value in raw["children_left"])
-            right = tuple(int(value) for value in raw["children_right"])
-            features = tuple(int(value) for value in raw["feature"])
-            thresholds = tuple(_finite(value, "tree threshold") for value in raw["threshold"])
-            values = tuple(_finite(value, "tree value") for value in raw["value"])
-            for index, (child_left, child_right, feature) in enumerate(
-                zip(left, right, features, strict=True)
-            ):
-                leaf = child_left == -1 and child_right == -1
-                if leaf:
-                    continue
-                if not (0 <= child_left < nodes and 0 <= child_right < nodes):
-                    raise ValueError(f"tree node {index} has invalid children")
-                if not 0 <= feature < len(names):
-                    raise ValueError(f"tree node {index} has invalid feature")
-            trees.append(
-                {
-                    "children_left": left,
-                    "children_right": right,
-                    "feature": features,
-                    "threshold": thresholds,
-                    "value": values,
-                }
-            )
-        long_threshold = payload.get("long_threshold")
-        short_threshold = payload.get("short_threshold")
-        min_edge = payload.get("min_edge")
-        if kind == "classifier":
-            long_threshold = _finite(long_threshold, "long_threshold")
-            short_threshold = _finite(short_threshold, "short_threshold")
-            if not 0 < short_threshold < long_threshold < 1:
-                raise ValueError("classifier thresholds are invalid")
-            min_edge = None
-        else:
-            min_edge = _finite(min_edge, "min_edge")
-            if min_edge <= 0:
-                raise ValueError("regressor min_edge must be positive")
-            long_threshold = short_threshold = None
+            trees.append(tree)
+        long_threshold, short_threshold, min_edge = _frozen_thresholds(payload, kind)
         learning_rate = _finite(payload.get("learning_rate"), "learning_rate")
         if not 0 < learning_rate <= 10:
             raise ValueError("learning_rate must be in (0, 10]")
