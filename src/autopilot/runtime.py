@@ -2159,24 +2159,10 @@ def _local_state_requires_management(product: ProductConfig) -> bool:
     )
 
 
-def _frozen_management_artifact(product: ProductConfig) -> dict[str, Any]:
-    """Rebuild a non-entry artifact from durable local management state.
-
-    A deleted or malformed active artifact must block new entries, but it must
-    not disable exits for exposure that already exists. New positions persist
-    the exact executable strategy and its digest, so this fallback can recover
-    only that already-approved behaviour and cannot introduce a flat strategy.
-    """
-    state, state_error = _read_local_state_for_flatten(product)
-    if state_error or state is None:
-        raise RuntimeError(
-            f"{product.name}: cannot recover frozen strategy state: "
-            f"{state_error or 'state reader returned no payload'}"
-        )
-    positions = state.get("open_positions")
-    if not isinstance(positions, dict):
-        raise RuntimeError(f"{product.name}: state open_positions must be an object.")
-
+def _frozen_open_position_strategies(
+    product: ProductConfig,
+    positions: dict[str, Any],
+) -> list[dict[str, Any]]:
     strategies: list[dict[str, Any]] = []
     for strategy_id in sorted(positions):
         position = positions[strategy_id]
@@ -2206,59 +2192,81 @@ def _frozen_management_artifact(product: ProductConfig) -> dict[str, Any]:
                 f"{product.name}: open position {strategy_id!r} strategy snapshot failed integrity checks."
             )
         strategies.append(json.loads(canonical))
+    return strategies
+
+
+def _frozen_recovery_strategy(product: ProductConfig, state: dict[str, Any]) -> dict[str, Any]:
+    markers = (
+        state.get("pending_order"),
+        state.get("pending_entry_recovery"),
+        state.get("risk_recovery_incident"),
+    )
+    marker = next((item for item in markers if isinstance(item, dict)), None)
+    strategy_id = marker.get("strategy_id") if marker is not None else None
+    symbol = marker.get("symbol") if marker is not None else None
+    if not isinstance(strategy_id, str) or not strategy_id:
+        raise RuntimeError(
+            f"{product.name}: no frozen strategy or validated order-recovery strategy id is available."
+        )
+    if symbol not in {None, product.symbol}:
+        raise RuntimeError(
+            f"{product.name}: order-recovery symbol {symbol!r} does not match {product.symbol!r}."
+        )
+    pending_side = str(marker.get("side") or "").lower()
+    direction = "short" if pending_side == "sell" else "long"
+    if product.objective == "btc_accumulation":
+        direction = "short"
+    return {
+        "id": strategy_id,
+        "base_timeframe": "5m",
+        "direction": direction,
+        "horizon_bars": 1,
+        "take_profit": 0.01,
+        "stop_loss": 0.01,
+        "conditions": [
+            {
+                "feature": "tf_5m_close",
+                "kind": "value_ge",
+                "threshold": 0.0,
+                "description": "management-only placeholder; entries disabled",
+            }
+        ],
+        "risk": {
+            "risk_per_trade": 0.001,
+            "daily_stop_loss": -0.001,
+            "max_consecutive_losses": 1,
+            "cooldown_bars": 1,
+            "max_position_fraction": 0.001,
+            "max_trades_per_day": 1,
+        },
+        "fees": {"fee_bps": 0.0, "slippage_bps": 0.0},
+        "pnl_unit": "btc" if product.objective == "btc_accumulation" else "usdt",
+    }
+
+
+def _frozen_management_artifact(product: ProductConfig) -> dict[str, Any]:
+    """Rebuild a non-entry artifact from durable local management state.
+
+    A deleted or malformed active artifact must block new entries, but it must
+    not disable exits for exposure that already exists. New positions persist
+    the exact executable strategy and its digest, so this fallback can recover
+    only that already-approved behaviour and cannot introduce a flat strategy.
+    """
+    state, state_error = _read_local_state_for_flatten(product)
+    if state_error or state is None:
+        raise RuntimeError(
+            f"{product.name}: cannot recover frozen strategy state: "
+            f"{state_error or 'state reader returned no payload'}"
+        )
+    positions = state.get("open_positions")
+    if not isinstance(positions, dict):
+        raise RuntimeError(f"{product.name}: state open_positions must be an object.")
+
+    strategies = _frozen_open_position_strategies(product, positions)
 
     source = "frozen_open_position_state"
     if not strategies:
-        pending = state.get("pending_order")
-        recovery = state.get("pending_entry_recovery")
-        incident = state.get("risk_recovery_incident")
-        marker = pending if isinstance(pending, dict) else None
-        if marker is None and isinstance(recovery, dict):
-            marker = recovery
-        if marker is None and isinstance(incident, dict):
-            marker = incident
-        strategy_id = marker.get("strategy_id") if isinstance(marker, dict) else None
-        symbol = marker.get("symbol") if isinstance(marker, dict) else None
-        if not isinstance(strategy_id, str) or not strategy_id:
-            raise RuntimeError(
-                f"{product.name}: no frozen strategy or validated order-recovery strategy id is available."
-            )
-        if symbol not in {None, product.symbol}:
-            raise RuntimeError(
-                f"{product.name}: order-recovery symbol {symbol!r} does not match {product.symbol!r}."
-            )
-        pending_side = str(marker.get("side") or "").lower()
-        direction = "short" if pending_side == "sell" else "long"
-        if product.objective == "btc_accumulation":
-            direction = "short"
-        strategies.append(
-            {
-                "id": strategy_id,
-                "base_timeframe": "5m",
-                "direction": direction,
-                "horizon_bars": 1,
-                "take_profit": 0.01,
-                "stop_loss": 0.01,
-                "conditions": [
-                    {
-                        "feature": "tf_5m_close",
-                        "kind": "value_ge",
-                        "threshold": 0.0,
-                        "description": "management-only placeholder; entries disabled",
-                    }
-                ],
-                "risk": {
-                    "risk_per_trade": 0.001,
-                    "daily_stop_loss": -0.001,
-                    "max_consecutive_losses": 1,
-                    "cooldown_bars": 1,
-                    "max_position_fraction": 0.001,
-                    "max_trades_per_day": 1,
-                },
-                "fees": {"fee_bps": 0.0, "slippage_bps": 0.0},
-                "pnl_unit": "btc" if product.objective == "btc_accumulation" else "usdt",
-            }
-        )
+        strategies.append(_frozen_recovery_strategy(product, state))
         source = "durable_order_recovery_state"
 
     return {
