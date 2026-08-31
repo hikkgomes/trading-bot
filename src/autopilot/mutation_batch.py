@@ -90,6 +90,73 @@ def _with_note(pred: Predicate, suffix: str) -> Predicate:
     return dataclasses.replace(pred, note=note)
 
 
+def _mutate_low_predicate(pred: Predicate, suffix: str) -> Predicate:
+    if pred.op in {"ge", "gt"} and pred.reference is not None:
+        adjustments = {"volume_z_20": -0.25, "adx_14": -3.0, "rsi_14": -4.0}
+        if pred.feature in adjustments:
+            floor = {"volume_z_20": 0.0, "adx_14": 10.0, "rsi_14": 15.0}[pred.feature]
+            return _with_note(
+                dataclasses.replace(
+                    pred,
+                    reference=round(max(floor, pred.reference + adjustments[pred.feature]), 4),
+                ),
+                suffix,
+            )
+    if pred.op in {"le", "lt"} and pred.reference is not None and pred.feature == "rsi_14":
+        return _with_note(
+            dataclasses.replace(pred, reference=round(min(85.0, pred.reference + 4.0), 4)),
+            suffix,
+        )
+    if pred.op in {"q_ge", "q_le"} and pred.window is not None:
+        return _with_note(
+            dataclasses.replace(pred, window=max(30, round(pred.window * 0.75))), suffix
+        )
+    if pred.op == "between" and pred.low is not None and pred.high is not None:
+        return _with_note(
+            dataclasses.replace(
+                pred,
+                low=round(_clamp(pred.low - 3.0, 0.0, 100.0), 4),
+                high=round(_clamp(pred.high + 3.0, 0.0, 100.0), 4),
+            ),
+            suffix,
+        )
+    return pred
+
+
+def _mutate_high_predicate(pred: Predicate, suffix: str) -> Predicate:
+    if pred.op in {"ge", "gt"} and pred.reference is not None:
+        adjustments = {"volume_z_20": 0.25, "adx_14": 3.0}
+        if pred.feature in adjustments:
+            return _with_note(
+                dataclasses.replace(
+                    pred, reference=round(pred.reference + adjustments[pred.feature], 4)
+                ),
+                suffix,
+            )
+    quantile_adjustments = {"q_le": -0.05, "q_ge": 0.05}
+    if pred.op in quantile_adjustments and pred.quantile is not None:
+        return _with_note(
+            dataclasses.replace(
+                pred,
+                quantile=round(
+                    _clamp(pred.quantile + quantile_adjustments[pred.op], 0.05, 0.95), 4
+                ),
+            ),
+            suffix,
+        )
+    if (
+        pred.op == "between"
+        and pred.low is not None
+        and pred.high is not None
+        and pred.high - pred.low > 8.0
+    ):
+        return _with_note(
+            dataclasses.replace(pred, low=round(pred.low + 2.0, 4), high=round(pred.high - 2.0, 4)),
+            suffix,
+        )
+    return pred
+
+
 def _mutate_predicate(pred: Predicate, reason: str) -> Predicate:
     suffix = f"mutation:{reason}"
     if reason in {
@@ -98,79 +165,10 @@ def _mutate_predicate(pred: Predicate, reason: str) -> Predicate:
         "setup_never_fires",
         "trigger_never_fires",
     }:
-        if pred.op in {"ge", "gt"} and pred.reference is not None:
-            if pred.feature == "volume_z_20":
-                return _with_note(
-                    dataclasses.replace(pred, reference=round(max(0.0, pred.reference - 0.25), 4)),
-                    suffix,
-                )
-            if pred.feature == "adx_14":
-                return _with_note(
-                    dataclasses.replace(pred, reference=round(max(10.0, pred.reference - 3.0), 4)),
-                    suffix,
-                )
-        if pred.op in {"le", "lt"} and pred.reference is not None and pred.feature == "rsi_14":
-            return _with_note(
-                dataclasses.replace(pred, reference=round(min(85.0, pred.reference + 4.0), 4)),
-                suffix,
-            )
-        if pred.op in {"ge", "gt"} and pred.reference is not None and pred.feature == "rsi_14":
-            return _with_note(
-                dataclasses.replace(pred, reference=round(max(15.0, pred.reference - 4.0), 4)),
-                suffix,
-            )
-        if pred.op in {"q_ge", "q_le"} and pred.window is not None:
-            return _with_note(
-                dataclasses.replace(pred, window=max(30, round(pred.window * 0.75))), suffix
-            )
-        if pred.op == "between" and pred.low is not None and pred.high is not None:
-            return _with_note(
-                dataclasses.replace(
-                    pred,
-                    low=round(_clamp(pred.low - 3.0, 0.0, 100.0), 4),
-                    high=round(_clamp(pred.high + 3.0, 0.0, 100.0), 4),
-                ),
-                suffix,
-            )
-        return pred
+        return _mutate_low_predicate(pred, suffix)
 
     if reason == "no_train_edge":
-        if pred.op in {"ge", "gt"} and pred.reference is not None:
-            if pred.feature == "volume_z_20":
-                return _with_note(
-                    dataclasses.replace(pred, reference=round(pred.reference + 0.25, 4)), suffix
-                )
-            if pred.feature == "adx_14":
-                return _with_note(
-                    dataclasses.replace(pred, reference=round(pred.reference + 3.0, 4)), suffix
-                )
-        if pred.op == "q_le" and pred.quantile is not None:
-            return _with_note(
-                dataclasses.replace(
-                    pred, quantile=round(_clamp(pred.quantile - 0.05, 0.05, 0.95), 4)
-                ),
-                suffix,
-            )
-        if pred.op == "q_ge" and pred.quantile is not None:
-            return _with_note(
-                dataclasses.replace(
-                    pred, quantile=round(_clamp(pred.quantile + 0.05, 0.05, 0.95), 4)
-                ),
-                suffix,
-            )
-        if (
-            pred.op == "between"
-            and pred.low is not None
-            and pred.high is not None
-            and pred.high - pred.low > 8.0
-        ):
-            return _with_note(
-                dataclasses.replace(
-                    pred, low=round(pred.low + 2.0, 4), high=round(pred.high - 2.0, 4)
-                ),
-                suffix,
-            )
-        return pred
+        return _mutate_high_predicate(pred, suffix)
 
     return pred
 
