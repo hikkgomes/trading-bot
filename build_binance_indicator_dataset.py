@@ -310,46 +310,38 @@ def make_talib_inputs(df: pd.DataFrame) -> dict[str, np.ndarray]:
     }
 
 
-def normalise_output(result, output_names, prefix: str) -> dict[str, object]:
-    output = {}
+def _output_name(output_names, index: int) -> str:
+    if output_names and index < len(output_names):
+        return output_names[index]
+    return f"output_{index}"
 
-    if isinstance(result, pd.DataFrame):
-        for column in result.columns:
-            output[f"{prefix}_{column}"] = result[column].values
-        return output
 
-    if isinstance(result, pd.Series):
-        output[prefix] = result.values
-        return output
-
-    if isinstance(result, dict):
-        for key, values in result.items():
-            output[f"{prefix}_{key}"] = values
-        return output
-
-    if isinstance(result, tuple | list):
-        for index, values in enumerate(result):
-            name = (
-                output_names[index]
-                if output_names and index < len(output_names)
-                else f"output_{index}"
-            )
-            output[f"{prefix}_{name}"] = values
-        return output
-
-    values = np.asarray(result)
+def _normalise_array_output(values: np.ndarray, output_names, prefix: str) -> dict[str, object]:
+    output: dict[str, object] = {}
     if values.ndim == 1:
         output[prefix] = values
     elif values.ndim == 2:
         for index in range(values.shape[1]):
-            name = (
-                output_names[index]
-                if output_names and index < len(output_names)
-                else f"output_{index}"
-            )
-            output[f"{prefix}_{name}"] = values[:, index]
-
+            output[f"{prefix}_{_output_name(output_names, index)}"] = values[:, index]
     return output
+
+
+def _normalise_sequence_output(values, output_names, prefix: str) -> dict[str, object]:
+    return {
+        f"{prefix}_{_output_name(output_names, index)}": value for index, value in enumerate(values)
+    }
+
+
+def normalise_output(result, output_names, prefix: str) -> dict[str, object]:
+    if isinstance(result, pd.DataFrame):
+        return {f"{prefix}_{column}": result[column].values for column in result.columns}
+    if isinstance(result, pd.Series):
+        return {prefix: result.values}
+    if isinstance(result, dict):
+        return {f"{prefix}_{key}": values for key, values in result.items()}
+    if isinstance(result, tuple | list):
+        return _normalise_sequence_output(result, output_names, prefix)
+    return _normalise_array_output(np.asarray(result), output_names, prefix)
 
 
 def run_indicator(
@@ -496,59 +488,58 @@ def unsupported_required_features(required_features: set[str]) -> set[str]:
     return unsupported
 
 
-def build_indicator_features(
-    df: pd.DataFrame,
-    timeframe: str,
-    required_features: Iterable[str] | None = None,
-) -> pd.DataFrame:
-    inputs = make_talib_inputs(df)
-    features = {}
-    required = None if required_features is None else set(required_features)
-    if required is None or required & flow_feature_names():
-        flow_features = build_flow_features(df)
-        if required is None:
-            features.update(flow_features)
-        else:
-            features.update(
-                {name: values for name, values in flow_features.items() if name in required}
+def _merge_flow_features(
+    features: dict[str, object], df: pd.DataFrame, required: set[str] | None
+) -> None:
+    flow_features = build_flow_features(df)
+    if required is None:
+        features.update(flow_features)
+        return
+    features.update({name: values for name, values in flow_features.items() if name in required})
+
+
+def _build_required_indicator_features(
+    inputs: dict[str, np.ndarray], timeframe: str, required: set[str], features: dict[str, object]
+) -> None:
+    for function_name, period in sorted(
+        _required_indicator_specs(required),
+        key=lambda item: (item[0], -1 if item[1] is None else item[1]),
+    ):
+        try:
+            result = (
+                run_indicator(function_name, inputs)
+                if period is None
+                else run_indicator(
+                    function_name,
+                    inputs,
+                    params={"timeperiod": period},
+                    suffix=str(period),
+                )
             )
+            features.update(result)
+        except Exception as exc:
+            print(f"[{timeframe}] Skipped required {function_name}: {exc}", flush=True)
 
-    if required is not None:
-        for function_name, period in sorted(
-            _required_indicator_specs(required),
-            key=lambda item: (item[0], -1 if item[1] is None else item[1]),
-        ):
-            try:
-                if period is None:
-                    features.update(run_indicator(function_name, inputs))
-                else:
-                    features.update(
-                        run_indicator(
-                            function_name,
-                            inputs,
-                            params={"timeperiod": period},
-                            suffix=str(period),
-                        )
-                    )
-            except Exception as exc:
-                print(f"[{timeframe}] Skipped required {function_name}: {exc}", flush=True)
-        feature_df = pd.DataFrame(features, index=df.index)
-        final = pd.concat([df, feature_df], axis=1)
-        final = final.replace([np.inf, -np.inf], np.nan)
-        return final.loc[:, ~final.columns.duplicated()]
 
+def _build_default_indicator_features(
+    inputs: dict[str, np.ndarray], timeframe: str, features: dict[str, object]
+) -> list[str]:
     all_functions = talib.get_functions()
-    variant_candidates = get_variant_candidates()
     for index, function_name in enumerate(all_functions, start=1):
         print(f"[{timeframe}] Default {index}/{len(all_functions)}: {function_name}", flush=True)
         try:
             features.update(run_indicator(function_name, inputs))
         except Exception as exc:
             print(f"[{timeframe}] Skipped default {function_name}: {exc}", flush=True)
+    return get_variant_candidates()
 
-    variant_total = len(variant_candidates) * len(TIMEPERIOD_VARIANTS)
+
+def _build_variant_indicator_features(
+    inputs: dict[str, np.ndarray], timeframe: str, features: dict[str, object], variants: list[str]
+) -> None:
+    variant_total = len(variants) * len(TIMEPERIOD_VARIANTS)
     variant_count = 0
-    for function_name in variant_candidates:
+    for function_name in variants:
         for period in TIMEPERIOD_VARIANTS:
             variant_count += 1
             print(
@@ -567,10 +558,32 @@ def build_indicator_features(
             except Exception as exc:
                 print(f"[{timeframe}] Skipped variant {function_name}_{period}: {exc}", flush=True)
 
+
+def _finalise_indicator_features(df: pd.DataFrame, features: dict[str, object]) -> pd.DataFrame:
     feature_df = pd.DataFrame(features, index=df.index)
     final = pd.concat([df, feature_df], axis=1)
     final = final.replace([np.inf, -np.inf], np.nan)
     return final.loc[:, ~final.columns.duplicated()]
+
+
+def build_indicator_features(
+    df: pd.DataFrame,
+    timeframe: str,
+    required_features: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    inputs = make_talib_inputs(df)
+    features = {}
+    required = None if required_features is None else set(required_features)
+    if required is None or required & flow_feature_names():
+        _merge_flow_features(features, df, required)
+
+    if required is not None:
+        _build_required_indicator_features(inputs, timeframe, required, features)
+        return _finalise_indicator_features(df, features)
+
+    variant_candidates = _build_default_indicator_features(inputs, timeframe, features)
+    _build_variant_indicator_features(inputs, timeframe, features, variant_candidates)
+    return _finalise_indicator_features(df, features)
 
 
 def reduce_numeric_dtypes(df: pd.DataFrame) -> pd.DataFrame:

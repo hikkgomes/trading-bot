@@ -76,13 +76,7 @@ def _record_symbol(record: dict) -> str:
     return str(_eval_config(record).get("symbol") or "BTCUSDT")
 
 
-def _exportable(
-    record: dict,
-    min_dsr: float | None,
-    pnl_unit: str | None,
-    market: str | None,
-) -> tuple[bool, str]:
-    """Re-check the gates at export time. Returns (ok, reason_if_not)."""
+def _holdout_export_gate(record: dict) -> tuple[bool, str]:
     holdout = _seg_metrics(record, "holdout")
     if not holdout:
         return False, "no holdout metrics recorded"
@@ -90,13 +84,11 @@ def _exportable(
         return False, "holdout had no trades"
     if float(holdout.get("total_return") or 0.0) <= 0:
         return False, f"holdout not positive ({holdout.get('total_return')})"
-    metrics = record.get("metrics") or {}
-    if metrics.get("dsr_method") != DSR_METHOD:
-        return False, f"DSR evidence method is not current ({metrics.get('dsr_method')!r})"
-    n_trials = metrics.get("n_trials")
-    if isinstance(n_trials, bool) or not isinstance(n_trials, int) or n_trials < 1:
-        return False, "DSR evidence n_trials must be a positive integer"
-    numeric_evidence: dict[str, float] = {}
+    return True, ""
+
+
+def _numeric_dsr_evidence(metrics: dict) -> tuple[dict[str, float] | None, str]:
+    evidence: dict[str, float] = {}
     for field in (
         "sr_std_trials",
         "trial_sharpe_observed_std",
@@ -105,10 +97,23 @@ def _exportable(
         try:
             value = float(metrics.get(field))
         except (TypeError, ValueError):
-            return False, f"DSR evidence {field} must be numeric"
+            return None, f"DSR evidence {field} must be numeric"
         if not math.isfinite(value) or value < 0:
-            return False, f"DSR evidence {field} must be finite and non-negative"
-        numeric_evidence[field] = value
+            return None, f"DSR evidence {field} must be finite and non-negative"
+        evidence[field] = value
+    return evidence, ""
+
+
+def _dsr_export_gate(record: dict, min_dsr: float | None) -> tuple[bool, str]:
+    metrics = record.get("metrics") or {}
+    if metrics.get("dsr_method") != DSR_METHOD:
+        return False, f"DSR evidence method is not current ({metrics.get('dsr_method')!r})"
+    n_trials = metrics.get("n_trials")
+    if isinstance(n_trials, bool) or not isinstance(n_trials, int) or n_trials < 1:
+        return False, "DSR evidence n_trials must be a positive integer"
+    numeric_evidence, reason = _numeric_dsr_evidence(metrics)
+    if numeric_evidence is None:
+        return False, reason
     trial_sharpe_count = metrics.get("trial_sharpe_count")
     if (
         isinstance(trial_sharpe_count, bool)
@@ -130,6 +135,12 @@ def _exportable(
         return False, f"dsr_deflated {dsr!r} is not finite"
     if min_dsr is not None and dsr_value < min_dsr:
         return False, f"dsr_deflated {dsr} < --min-dsr {min_dsr}"
+    return True, ""
+
+
+def _provenance_export_gate(
+    record: dict, pnl_unit: str | None, market: str | None
+) -> tuple[bool, str]:
     if pnl_unit is not None:
         rec_unit = _eval_config(record).get("pnl_unit", "usdt")
         if rec_unit != pnl_unit:
@@ -139,6 +150,23 @@ def _exportable(
         return False, "validation record has no market provenance"
     if market is not None and rec_market != market:
         return False, f"validated on market={rec_market!r}, artifact wants {market!r}"
+    return True, ""
+
+
+def _exportable(
+    record: dict,
+    min_dsr: float | None,
+    pnl_unit: str | None,
+    market: str | None,
+) -> tuple[bool, str]:
+    """Re-check the gates at export time. Returns (ok, reason_if_not)."""
+    for passed, reason in (
+        _holdout_export_gate(record),
+        _dsr_export_gate(record, min_dsr),
+        _provenance_export_gate(record, pnl_unit, market),
+    ):
+        if not passed:
+            return False, reason
     return True, ""
 
 

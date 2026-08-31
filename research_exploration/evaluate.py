@@ -280,6 +280,111 @@ def _simulate_one_entry(
     return trade, entry_index, exit_index
 
 
+@dataclass
+class _RiskSimulationState:
+    next_allowed_entry: int = 0
+    cooldown_until_entry: int = 0
+    consecutive_losses: int = 0
+    current_session: object | None = None
+    daily_pnl: float = 0.0
+    daily_trades: int = 0
+
+
+def _sync_risk_session(state: _RiskSimulationState, session: object) -> None:
+    if session != state.current_session:
+        state.current_session = session
+        state.daily_pnl = 0.0
+        state.daily_trades = 0
+
+
+def _risk_entry_candidate(
+    *,
+    state: _RiskSimulationState,
+    signal_index: int,
+    raw_signal: object,
+    close: np.ndarray,
+    index: pd.Index,
+    hypothesis: Hypothesis,
+    eval_cfg: EvalConfig,
+    risk: EffectiveRisk,
+) -> tuple[int, int] | None:
+    signal = int(raw_signal)
+    if signal == 0:
+        return None
+    entry_index = signal_index + 1 + eval_cfg.entry_delay_bars
+    if entry_index >= len(close) or entry_index < state.next_allowed_entry:
+        return None
+    _sync_risk_session(state, _daily_session(index, entry_index, hypothesis.base_timeframe))
+    if entry_index < state.cooldown_until_entry:
+        return None
+    if state.daily_pnl <= risk.daily_stop_loss or state.daily_trades >= risk.max_trades_per_day:
+        return None
+    return signal, entry_index
+
+
+def _risk_trade_return(
+    trade: dict,
+    *,
+    hypothesis: Hypothesis,
+    eval_cfg: EvalConfig,
+    position_fraction: float,
+) -> tuple[float, float, float]:
+    raw_net_return = float(trade["net_return"])
+    funding_cost = 0.0
+    if eval_cfg.market == "futures" and eval_cfg.funding_bps_per_8h:
+        holding_hours = (
+            float(trade["holding_bars"]) * TIMEFRAME_SECONDS[hypothesis.base_timeframe] / 3_600.0
+        )
+        funding_cost = float(eval_cfg.funding_bps_per_8h) / 10_000.0 * holding_hours / 8.0
+        raw_net_return -= funding_cost
+    return raw_net_return, raw_net_return * position_fraction, funding_cost
+
+
+def _decorate_risk_trade(
+    trade: dict,
+    *,
+    eval_cfg: EvalConfig,
+    position_fraction: float,
+    raw_net_return: float,
+    sized_return: float,
+    funding_cost: float,
+) -> None:
+    trade.update(
+        unsized_net_return=raw_net_return,
+        position_size=position_fraction,
+        sized_return=sized_return,
+        net_return=sized_return,
+        entry_delay_bars=eval_cfg.entry_delay_bars,
+        adverse_fill_bps=float(eval_cfg.adverse_fill_bps),
+        exit_delay_bars=eval_cfg.exit_delay_bars,
+        adverse_exit_bps=float(eval_cfg.adverse_exit_bps),
+        funding_bps_per_8h=float(eval_cfg.funding_bps_per_8h),
+        funding_cost_fraction=funding_cost,
+    )
+
+
+def _advance_risk_state(
+    state: _RiskSimulationState,
+    *,
+    index: pd.Index,
+    hypothesis: Hypothesis,
+    exit_index: int,
+    sized_return: float,
+    risk: EffectiveRisk,
+) -> None:
+    state.daily_trades += 1
+    state.next_allowed_entry = exit_index + 1
+    _sync_risk_session(state, _daily_session(index, exit_index, hypothesis.base_timeframe))
+    state.daily_pnl = _accumulate_daily_return(state.daily_pnl, sized_return)
+    if sized_return < 0:
+        state.consecutive_losses += 1
+        if state.consecutive_losses >= risk.max_consecutive_losses:
+            state.cooldown_until_entry = exit_index + risk.cooldown_bars
+            state.consecutive_losses = 0
+        return
+    state.consecutive_losses = 0
+
+
 def _simulate_with_effective_risk(
     open_: np.ndarray,
     high: np.ndarray,
@@ -295,36 +400,24 @@ def _simulate_with_effective_risk(
     """Apply paper/live-equivalent sizing and stateful entry risk gates."""
 
     trades: list[dict] = []
-    next_allowed_entry = 0
-    cooldown_until_entry = 0
-    consecutive_losses = 0
-    current_session: object | None = None
-    daily_pnl = 0.0
-    daily_trades = 0
     position_fraction = risk.position_fraction(backtest_cfg.stop_loss)
     if position_fraction <= 0:
         return trades
-
-    def enter_session(session: object) -> None:
-        nonlocal current_session, daily_pnl, daily_trades
-        if session != current_session:
-            current_session = session
-            daily_pnl = 0.0
-            daily_trades = 0
-
+    state = _RiskSimulationState()
     for signal_index, raw_signal in enumerate(direction):
-        signal = int(raw_signal)
-        if signal == 0:
+        candidate = _risk_entry_candidate(
+            state=state,
+            signal_index=signal_index,
+            raw_signal=raw_signal,
+            close=close,
+            index=index,
+            hypothesis=hypothesis,
+            eval_cfg=eval_cfg,
+            risk=risk,
+        )
+        if candidate is None:
             continue
-        entry_index = signal_index + 1 + eval_cfg.entry_delay_bars
-        if entry_index >= len(close) or entry_index < next_allowed_entry:
-            continue
-        entry_session = _daily_session(index, entry_index, hypothesis.base_timeframe)
-        enter_session(entry_session)
-        if entry_index < cooldown_until_entry:
-            continue
-        if daily_pnl <= risk.daily_stop_loss or daily_trades >= risk.max_trades_per_day:
-            continue
+        signal, entry_index = candidate
         simulated = _simulate_one_entry(
             open_,
             high,
@@ -342,43 +435,29 @@ def _simulate_with_effective_risk(
         if simulated is None:
             continue
         trade, entry_index, exit_index = simulated
-        raw_net_return = float(trade["net_return"])
-        funding_cost = 0.0
-        if eval_cfg.market == "futures" and eval_cfg.funding_bps_per_8h:
-            holding_hours = (
-                float(trade["holding_bars"])
-                * TIMEFRAME_SECONDS[hypothesis.base_timeframe]
-                / 3_600.0
-            )
-            funding_cost = float(eval_cfg.funding_bps_per_8h) / 10_000.0 * holding_hours / 8.0
-            raw_net_return -= funding_cost
-        sized_return = raw_net_return * position_fraction
-        trade["unsized_net_return"] = raw_net_return
-        trade["position_size"] = position_fraction
-        trade["sized_return"] = sized_return
-        # All research metrics consume net_return, so make it the account-level
-        # return that paper/live accounting actually applies.
-        trade["net_return"] = sized_return
-        trade["entry_delay_bars"] = eval_cfg.entry_delay_bars
-        trade["adverse_fill_bps"] = float(eval_cfg.adverse_fill_bps)
-        trade["exit_delay_bars"] = eval_cfg.exit_delay_bars
-        trade["adverse_exit_bps"] = float(eval_cfg.adverse_exit_bps)
-        trade["funding_bps_per_8h"] = float(eval_cfg.funding_bps_per_8h)
-        trade["funding_cost_fraction"] = funding_cost
+        raw_net_return, sized_return, funding_cost = _risk_trade_return(
+            trade,
+            hypothesis=hypothesis,
+            eval_cfg=eval_cfg,
+            position_fraction=position_fraction,
+        )
+        _decorate_risk_trade(
+            trade,
+            eval_cfg=eval_cfg,
+            position_fraction=position_fraction,
+            raw_net_return=raw_net_return,
+            sized_return=sized_return,
+            funding_cost=funding_cost,
+        )
         trades.append(trade)
-        daily_trades += 1
-        next_allowed_entry = exit_index + 1
-
-        exit_session = _daily_session(index, exit_index, hypothesis.base_timeframe)
-        enter_session(exit_session)
-        daily_pnl = _accumulate_daily_return(daily_pnl, sized_return)
-        if sized_return < 0:
-            consecutive_losses += 1
-            if consecutive_losses >= risk.max_consecutive_losses:
-                cooldown_until_entry = exit_index + risk.cooldown_bars
-                consecutive_losses = 0
-        else:
-            consecutive_losses = 0
+        _advance_risk_state(
+            state,
+            index=index,
+            hypothesis=hypothesis,
+            exit_index=exit_index,
+            sized_return=sized_return,
+            risk=risk,
+        )
     return trades
 
 

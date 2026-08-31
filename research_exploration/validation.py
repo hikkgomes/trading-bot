@@ -78,6 +78,85 @@ REJECTION_REASONS = (
 )
 
 
+def _validate_split_config(cfg: ValidationConfig) -> None:
+    if not 0 < cfg.train_frac < 1 or not 0 < cfg.val_frac < 1:
+        raise ValueError("train_frac and val_frac must be in (0, 1)")
+    if cfg.train_frac + cfg.val_frac >= 1.0:
+        raise ValueError("train_frac + val_frac must leave room for a holdout")
+
+
+def _validate_stress_execution_config(cfg: ValidationConfig) -> None:
+    if not math.isfinite(cfg.stress_cost_multiplier) or cfg.stress_cost_multiplier <= 1.0:
+        raise ValueError("stress_cost_multiplier must be finite and greater than 1")
+    if not math.isfinite(cfg.stress_min_extra_cost_bps) or cfg.stress_min_extra_cost_bps <= 0:
+        raise ValueError("stress_min_extra_cost_bps must be finite and positive")
+    if (
+        not isinstance(cfg.stress_entry_delay_bars, int)
+        or isinstance(cfg.stress_entry_delay_bars, bool)
+        or cfg.stress_entry_delay_bars < 1
+    ):
+        raise ValueError("stress_entry_delay_bars must be a positive integer")
+    if (
+        not math.isfinite(cfg.stress_adverse_fill_bps)
+        or not 0 < cfg.stress_adverse_fill_bps < 10_000
+    ):
+        raise ValueError("stress_adverse_fill_bps must be finite and in (0, 10000)")
+    if (
+        not isinstance(cfg.stress_exit_delay_bars, int)
+        or isinstance(cfg.stress_exit_delay_bars, bool)
+        or cfg.stress_exit_delay_bars < 1
+    ):
+        raise ValueError("stress_exit_delay_bars must be a positive integer")
+    for label, value in (
+        ("stress_adverse_exit_bps", cfg.stress_adverse_exit_bps),
+        ("stress_funding_bps_per_8h", cfg.stress_funding_bps_per_8h),
+    ):
+        if not math.isfinite(value) or not 0 < value < 10_000:
+            raise ValueError(f"{label} must be finite and in (0, 10000)")
+
+
+def _validate_stress_gap_config(cfg: ValidationConfig) -> None:
+    if (
+        not isinstance(cfg.stress_missing_bar_stride, int)
+        or isinstance(cfg.stress_missing_bar_stride, bool)
+        or cfg.stress_missing_bar_stride < 3
+    ):
+        raise ValueError("stress_missing_bar_stride must be an integer of at least 3")
+    if (
+        not isinstance(cfg.stress_gap_bars, int)
+        or isinstance(cfg.stress_gap_bars, bool)
+        or not 1 <= cfg.stress_gap_bars < cfg.stress_missing_bar_stride
+    ):
+        raise ValueError("stress_gap_bars must be positive and below stress_missing_bar_stride")
+
+
+def _validate_stress_rates_config(cfg: ValidationConfig) -> None:
+    for label, value in (
+        ("min_stress_pass_rate", cfg.min_stress_pass_rate),
+        ("min_stress_trade_fraction", cfg.min_stress_trade_fraction),
+    ):
+        if not math.isfinite(value) or not 0 < value <= 1:
+            raise ValueError(f"{label} must be finite and in (0, 1]")
+
+
+def _validate_evidence_config(cfg: ValidationConfig) -> None:
+    if not isinstance(cfg.n_trials, int) or isinstance(cfg.n_trials, bool) or cfg.n_trials < 1:
+        raise ValueError("n_trials must be a positive integer")
+    if (
+        not isinstance(cfg.trial_sharpe_count, int)
+        or isinstance(cfg.trial_sharpe_count, bool)
+        or cfg.trial_sharpe_count < 0
+    ):
+        raise ValueError("trial_sharpe_count must be a non-negative integer")
+    for label, value in (
+        ("sr_std_trials", cfg.sr_std_trials),
+        ("trial_sharpe_observed_std", cfg.trial_sharpe_observed_std),
+        ("trial_sharpe_conservative_floor", cfg.trial_sharpe_conservative_floor),
+    ):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{label} must be finite and non-negative")
+
+
 @dataclass
 class ValidationConfig:
     """Split sizes, stage gates and perturbation sizes."""
@@ -114,74 +193,11 @@ class ValidationConfig:
     min_stress_trade_fraction: float = 0.5
 
     def __post_init__(self) -> None:
-        if not 0 < self.train_frac < 1 or not 0 < self.val_frac < 1:
-            raise ValueError("train_frac and val_frac must be in (0, 1)")
-        if self.train_frac + self.val_frac >= 1.0:
-            raise ValueError("train_frac + val_frac must leave room for a holdout")
-        if not math.isfinite(self.stress_cost_multiplier) or self.stress_cost_multiplier <= 1.0:
-            raise ValueError("stress_cost_multiplier must be finite and greater than 1")
-        if not math.isfinite(self.stress_min_extra_cost_bps) or self.stress_min_extra_cost_bps <= 0:
-            raise ValueError("stress_min_extra_cost_bps must be finite and positive")
-        if (
-            not isinstance(self.stress_entry_delay_bars, int)
-            or isinstance(self.stress_entry_delay_bars, bool)
-            or self.stress_entry_delay_bars < 1
-        ):
-            raise ValueError("stress_entry_delay_bars must be a positive integer")
-        if (
-            not math.isfinite(self.stress_adverse_fill_bps)
-            or not 0 < self.stress_adverse_fill_bps < 10_000
-        ):
-            raise ValueError("stress_adverse_fill_bps must be finite and in (0, 10000)")
-        if (
-            not isinstance(self.stress_exit_delay_bars, int)
-            or isinstance(self.stress_exit_delay_bars, bool)
-            or self.stress_exit_delay_bars < 1
-        ):
-            raise ValueError("stress_exit_delay_bars must be a positive integer")
-        for label, value in (
-            ("stress_adverse_exit_bps", self.stress_adverse_exit_bps),
-            ("stress_funding_bps_per_8h", self.stress_funding_bps_per_8h),
-        ):
-            if not math.isfinite(value) or not 0 < value < 10_000:
-                raise ValueError(f"{label} must be finite and in (0, 10000)")
-        if (
-            not isinstance(self.stress_missing_bar_stride, int)
-            or isinstance(self.stress_missing_bar_stride, bool)
-            or self.stress_missing_bar_stride < 3
-        ):
-            raise ValueError("stress_missing_bar_stride must be an integer of at least 3")
-        if (
-            not isinstance(self.stress_gap_bars, int)
-            or isinstance(self.stress_gap_bars, bool)
-            or not 1 <= self.stress_gap_bars < self.stress_missing_bar_stride
-        ):
-            raise ValueError("stress_gap_bars must be positive and below stress_missing_bar_stride")
-        for label, value in (
-            ("min_stress_pass_rate", self.min_stress_pass_rate),
-            ("min_stress_trade_fraction", self.min_stress_trade_fraction),
-        ):
-            if not math.isfinite(value) or not 0 < value <= 1:
-                raise ValueError(f"{label} must be finite and in (0, 1]")
-        if (
-            not isinstance(self.n_trials, int)
-            or isinstance(self.n_trials, bool)
-            or self.n_trials < 1
-        ):
-            raise ValueError("n_trials must be a positive integer")
-        if (
-            not isinstance(self.trial_sharpe_count, int)
-            or isinstance(self.trial_sharpe_count, bool)
-            or self.trial_sharpe_count < 0
-        ):
-            raise ValueError("trial_sharpe_count must be a non-negative integer")
-        for label, value in (
-            ("sr_std_trials", self.sr_std_trials),
-            ("trial_sharpe_observed_std", self.trial_sharpe_observed_std),
-            ("trial_sharpe_conservative_floor", self.trial_sharpe_conservative_floor),
-        ):
-            if not math.isfinite(value) or value < 0:
-                raise ValueError(f"{label} must be finite and non-negative")
+        _validate_split_config(self)
+        _validate_stress_execution_config(self)
+        _validate_stress_gap_config(self)
+        _validate_stress_rates_config(self)
+        _validate_evidence_config(self)
 
 
 # --------------------------------------------------------------------------- #
@@ -617,19 +633,10 @@ def _deflated_sharpe_evidence(
 # --------------------------------------------------------------------------- #
 # Staged validation of one hypothesis
 # --------------------------------------------------------------------------- #
-def validate_hypothesis(
-    frame: pd.DataFrame,
-    hyp: Hypothesis,
-    cfg: ValidationConfig | None = None,
-    eval_cfg: EvalConfig | None = None,
-    before_holdout: Callable[[Hypothesis, dict], bool | str | None] | None = None,
+def _initial_validation_result(
+    hyp: Hypothesis, segs: dict[str, pd.DataFrame], cfg: ValidationConfig
 ) -> dict:
-    """Run the full staged pipeline. The holdout is only ever *touched* after
-    every earlier stage passes, and a negative holdout rejects — it gates."""
-    cfg = cfg or ValidationConfig()
-    eval_cfg = eval_cfg or EvalConfig()
-    segs = split_frame(frame, cfg)
-    result: dict = {
+    return {
         "hypothesis_id": hyp.id,
         "family": hyp.family,
         "direction": hyp.direction,
@@ -652,74 +659,134 @@ def validate_hypothesis(
         "reasons": [],
     }
 
-    def finish(verdict: str, reason: str | None = None) -> dict:
-        result["verdict"] = verdict
-        if reason:
-            result["reasons"].append(reason)
-        return result
 
-    # 1. TRAIN — is there an edge at all?
-    train = evaluate_hypothesis(segs["train"], hyp, eval_cfg)
+def _finish_validation(result: dict, verdict: str, reason: str | None = None) -> dict:
+    result["verdict"] = verdict
+    if reason:
+        result["reasons"].append(reason)
+    return result
+
+
+def _train_gate(
+    result: dict,
+    segment: pd.DataFrame,
+    hyp: Hypothesis,
+    cfg: ValidationConfig,
+    eval_cfg: EvalConfig,
+) -> str | None:
+    train = evaluate_hypothesis(segment, hyp, eval_cfg)
     result["train"] = train
     if train["trades"] < cfg.min_trades_train:
-        return finish("inconclusive", "insufficient_train_trades")
+        return "insufficient_train_trades"
     if train["total_return"] <= 0 or train["sharpe"] <= cfg.min_train_sharpe:
-        return finish("reject", "no_train_edge")
+        return "no_train_edge"
+    return None
 
-    # 2. VALIDATION — does it repeat out-of-sample?
-    val = evaluate_hypothesis(segs["validation"], hyp, eval_cfg)
-    result["validation"] = val
-    if val["trades"] < cfg.min_trades_val:
-        return finish("inconclusive", "insufficient_validation_trades")
-    if val["total_return"] <= 0:
-        return finish("reject", "failed_validation")
 
-    # Pre-holdout region (train+val) for stability / sensitivity / regimes / DSR.
-    pre_holdout = frame.iloc[: len(segs["train"]) + len(segs["validation"])]
+def _validation_gate(
+    result: dict,
+    segment: pd.DataFrame,
+    hyp: Hypothesis,
+    cfg: ValidationConfig,
+    eval_cfg: EvalConfig,
+) -> str | None:
+    validation = evaluate_hypothesis(segment, hyp, eval_cfg)
+    result["validation"] = validation
+    if validation["trades"] < cfg.min_trades_val:
+        return "insufficient_validation_trades"
+    if validation["total_return"] <= 0:
+        return "failed_validation"
+    return None
+
+
+def _pre_holdout_evidence(
+    result: dict,
+    pre_holdout: pd.DataFrame,
+    hyp: Hypothesis,
+    cfg: ValidationConfig,
+    eval_cfg: EvalConfig,
+) -> None:
     result["regimes"] = regime_breakdown(pre_holdout, hyp, eval_cfg, cfg)
-
     trades, _, _ = hypothesis_trades(pre_holdout, hyp, eval_cfg)
-    r = trades["net_return"].to_numpy()
-    result.update(_deflated_sharpe_evidence(r, cfg))
+    result.update(_deflated_sharpe_evidence(trades["net_return"].to_numpy(), cfg))
 
-    # 3. OOS WINDOWS — is the edge spread across time?
+
+def _stability_gates(
+    result: dict,
+    pre_holdout: pd.DataFrame,
+    hyp: Hypothesis,
+    cfg: ValidationConfig,
+    eval_cfg: EvalConfig,
+) -> str | None:
     oos = oos_window_stats(pre_holdout, hyp, eval_cfg, cfg.oos_windows)
     result["oos"] = oos
     if oos["pass_rate"] < cfg.min_window_pass_rate:
-        return finish("reject", "unstable_across_windows")
-
-    # 4. SENSITIVITY — does it survive neighbouring parameters?
-    sens = sensitivity_check(pre_holdout, hyp, eval_cfg, cfg)
-    result["sensitivity"] = sens
-    if not sens["passed"]:
-        return finish("reject", "parameter_fragile")
-
-    # 5. EXECUTION/DATA STRESS — still pre-holdout, so its full evidence may
-    # safely guide later generations without exposing final evaluation data.
+        return "unstable_across_windows"
+    sensitivity = sensitivity_check(pre_holdout, hyp, eval_cfg, cfg)
+    result["sensitivity"] = sensitivity
+    if not sensitivity["passed"]:
+        return "parameter_fragile"
     stress = execution_data_stress_check(pre_holdout, hyp, eval_cfg, cfg)
     result["stress"] = stress
     if not stress["passed"]:
-        return finish("reject", "failed_execution_stress")
+        return "failed_execution_stress"
+    return None
 
-    # 6. HOLDOUT — untouched until now, and it GATES.  Autonomous callers use
-    # this hook to durably claim the canonical behavior+snapshot before a read.
-    # Returning False means an earlier attempt (including a killed process)
-    # already consumed this holdout; fail closed rather than looking again.
-    # Returning a string defers with that reason (e.g. a seal-budget gate)
-    # without reading a single protected row.
+
+def _holdout_gate(
+    result: dict,
+    holdout: pd.DataFrame,
+    hyp: Hypothesis,
+    cfg: ValidationConfig,
+    eval_cfg: EvalConfig,
+    before_holdout: Callable[[Hypothesis, dict], bool | str | None] | None,
+) -> str | None:
     if before_holdout is not None:
         gate = before_holdout(hyp, result)
         if gate is False:
-            return finish("inconclusive", "holdout_already_consumed")
+            return "holdout_already_consumed"
         if isinstance(gate, str):
-            return finish("inconclusive", gate)
-    holdout = evaluate_hypothesis(segs["holdout"], hyp, eval_cfg)
-    result["holdout"] = holdout
-    if holdout["trades"] < cfg.min_trades_holdout:
-        return finish("inconclusive", "insufficient_holdout_trades")
-    if holdout["total_return"] <= 0:
-        return finish("reject", "failed_holdout")
-    return finish("keep")
+            return gate
+    evaluated = evaluate_hypothesis(holdout, hyp, eval_cfg)
+    result["holdout"] = evaluated
+    if evaluated["trades"] < cfg.min_trades_holdout:
+        return "insufficient_holdout_trades"
+    if evaluated["total_return"] <= 0:
+        return "failed_holdout"
+    return None
+
+
+def validate_hypothesis(
+    frame: pd.DataFrame,
+    hyp: Hypothesis,
+    cfg: ValidationConfig | None = None,
+    eval_cfg: EvalConfig | None = None,
+    before_holdout: Callable[[Hypothesis, dict], bool | str | None] | None = None,
+) -> dict:
+    """Run the full staged pipeline. The holdout is only ever *touched* after
+    every earlier stage passes, and a negative holdout rejects — it gates."""
+    cfg = cfg or ValidationConfig()
+    eval_cfg = eval_cfg or EvalConfig()
+    segs = split_frame(frame, cfg)
+    result = _initial_validation_result(hyp, segs, cfg)
+    reason = _train_gate(result, segs["train"], hyp, cfg, eval_cfg)
+    if reason is not None:
+        verdict = "inconclusive" if reason == "insufficient_train_trades" else "reject"
+        return _finish_validation(result, verdict, reason)
+    reason = _validation_gate(result, segs["validation"], hyp, cfg, eval_cfg)
+    if reason is not None:
+        verdict = "inconclusive" if reason == "insufficient_validation_trades" else "reject"
+        return _finish_validation(result, verdict, reason)
+    pre_holdout = frame.iloc[: len(segs["train"]) + len(segs["validation"])]
+    _pre_holdout_evidence(result, pre_holdout, hyp, cfg, eval_cfg)
+    reason = _stability_gates(result, pre_holdout, hyp, cfg, eval_cfg)
+    if reason is not None:
+        return _finish_validation(result, "reject", reason)
+    reason = _holdout_gate(result, segs["holdout"], hyp, cfg, eval_cfg, before_holdout)
+    if reason is not None:
+        inconclusive = reason in {"holdout_already_consumed", "insufficient_holdout_trades"}
+        return _finish_validation(result, "inconclusive" if inconclusive else "reject", reason)
+    return _finish_validation(result, "keep")
 
 
 # --------------------------------------------------------------------------- #

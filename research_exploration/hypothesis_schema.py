@@ -65,6 +65,81 @@ OPS = {
 }
 
 
+def _validate_predicate_identity(predicate: Predicate) -> None:
+    if predicate.timeframe not in TF_RANK:
+        raise ValueError(f"Unknown timeframe {predicate.timeframe!r}")
+    if predicate.op not in OPS:
+        raise ValueError(f"Unknown op {predicate.op!r}. Allowed: {sorted(OPS)}")
+    if not isinstance(predicate.feature, str) or not predicate.feature.strip():
+        raise ValueError("predicate feature must be a non-empty string")
+
+
+def _validate_predicate_limits(predicate: Predicate) -> None:
+    if predicate.shift_b < 0:
+        raise ValueError("predicate shift_b must be non-negative")
+    if predicate.lookback is not None and predicate.lookback <= 0:
+        raise ValueError("predicate lookback must be positive")
+    if predicate.window is not None and predicate.window <= 1:
+        raise ValueError("predicate rolling window must be greater than one")
+    if predicate.quantile is not None and not 0 < predicate.quantile < 1:
+        raise ValueError("predicate quantile must be in (0, 1)")
+
+
+def _validate_predicate_requirements(predicate: Predicate) -> None:
+    if (
+        predicate.op in {"gt", "ge", "lt", "le", "pct_above", "pct_below"}
+        and predicate.reference is None
+    ):
+        raise ValueError(f"predicate op {predicate.op!r} requires reference")
+    if (
+        predicate.op
+        in {
+            "gt_feature",
+            "lt_feature",
+            "cross_above",
+            "cross_below",
+            "pct_above",
+            "pct_below",
+        }
+        and not predicate.feature_b
+    ):
+        raise ValueError(f"predicate op {predicate.op!r} requires feature_b")
+    if (
+        predicate.op in {"rising", "falling", "slope_up", "slope_down"}
+        and predicate.lookback is None
+    ):
+        raise ValueError(f"predicate op {predicate.op!r} requires lookback")
+    if predicate.op in {"q_ge", "q_le"} and (
+        predicate.window is None or predicate.quantile is None
+    ):
+        raise ValueError(f"predicate op {predicate.op!r} requires window and quantile")
+    if predicate.op == "between":
+        if predicate.low is None or predicate.high is None:
+            raise ValueError("predicate op 'between' requires low and high")
+        if predicate.low > predicate.high:
+            raise ValueError("predicate between low cannot exceed high")
+
+
+def _describe_feature_comparison(
+    column: str, column_b: str | None, prior: str, operation: str
+) -> str:
+    if operation in ("gt_feature", "lt_feature"):
+        symbol = ">" if operation == "gt_feature" else "<"
+        return f"{column} {symbol} {column_b}{prior}"
+    return f"{column} {operation.replace('_', ' ')} {column_b}{prior}"
+
+
+def _describe_movement(column: str, column_b: str | None, predicate: Predicate) -> str:
+    operation = predicate.op
+    if operation in ("rising", "falling"):
+        return f"{column} {operation} over {predicate.lookback} bars"
+    if operation in ("slope_up", "slope_down"):
+        symbol = ">" if operation == "slope_up" else "<"
+        return f"{column} slope({predicate.lookback}) {symbol} {predicate.reference or 0}"
+    symbol = ">" if operation == "pct_above" else "<"
+    return f"{column} {symbol} {column_b} by {predicate.reference:.2%}"
+
+
 @dataclass(frozen=True)
 class Predicate:
     """A single causal condition on one feature of one timeframe."""
@@ -83,44 +158,9 @@ class Predicate:
     note: str = ""
 
     def __post_init__(self) -> None:
-        if self.timeframe not in TF_RANK:
-            raise ValueError(f"Unknown timeframe {self.timeframe!r}")
-        if self.op not in OPS:
-            raise ValueError(f"Unknown op {self.op!r}. Allowed: {sorted(OPS)}")
-        if not isinstance(self.feature, str) or not self.feature.strip():
-            raise ValueError("predicate feature must be a non-empty string")
-        if self.shift_b < 0:
-            raise ValueError("predicate shift_b must be non-negative")
-        if self.lookback is not None and self.lookback <= 0:
-            raise ValueError("predicate lookback must be positive")
-        if self.window is not None and self.window <= 1:
-            raise ValueError("predicate rolling window must be greater than one")
-        if self.quantile is not None and not 0 < self.quantile < 1:
-            raise ValueError("predicate quantile must be in (0, 1)")
-        if self.op in {"gt", "ge", "lt", "le", "pct_above", "pct_below"} and self.reference is None:
-            raise ValueError(f"predicate op {self.op!r} requires reference")
-        if (
-            self.op
-            in {
-                "gt_feature",
-                "lt_feature",
-                "cross_above",
-                "cross_below",
-                "pct_above",
-                "pct_below",
-            }
-            and not self.feature_b
-        ):
-            raise ValueError(f"predicate op {self.op!r} requires feature_b")
-        if self.op in {"rising", "falling", "slope_up", "slope_down"} and self.lookback is None:
-            raise ValueError(f"predicate op {self.op!r} requires lookback")
-        if self.op in {"q_ge", "q_le"} and (self.window is None or self.quantile is None):
-            raise ValueError(f"predicate op {self.op!r} requires window and quantile")
-        if self.op == "between":
-            if self.low is None or self.high is None:
-                raise ValueError("predicate op 'between' requires low and high")
-            if self.low > self.high:
-                raise ValueError("predicate between low cannot exceed high")
+        _validate_predicate_identity(self)
+        _validate_predicate_limits(self)
+        _validate_predicate_requirements(self)
 
     def column(self) -> str:
         return f"tf_{self.timeframe}_{self.feature}"
@@ -137,17 +177,10 @@ class Predicate:
             sym = {"gt": ">", "ge": ">=", "lt": "<", "le": "<="}[self.op]
             return f"{c} {sym} {self.reference}"
         prior = f" (prior {self.shift_b}-bar)" if self.shift_b else ""
-        if self.op in ("gt_feature", "lt_feature"):
-            sym = ">" if self.op == "gt_feature" else "<"
-            return f"{c} {sym} {cb}{prior}"
-        if self.op in ("cross_above", "cross_below"):
-            return f"{c} {self.op.replace('_', ' ')} {cb}{prior}"
-        if self.op in ("rising", "falling"):
-            return f"{c} {self.op} over {self.lookback} bars"
-        if self.op in ("slope_up", "slope_down"):
-            return f"{c} slope({self.lookback}) {'>' if self.op == 'slope_up' else '<'} {self.reference or 0}"
-        if self.op in ("pct_above", "pct_below"):
-            return f"{c} {'>' if self.op == 'pct_above' else '<'} {cb} by {self.reference:.2%}"
+        if self.op in {"gt_feature", "lt_feature", "cross_above", "cross_below"}:
+            return _describe_feature_comparison(c, cb, prior, self.op)
+        if self.op in {"rising", "falling", "slope_up", "slope_down", "pct_above", "pct_below"}:
+            return _describe_movement(c, cb, self)
         if self.op == "between":
             return f"{self.low} <= {c} <= {self.high}"
         if self.op in ("q_ge", "q_le"):
