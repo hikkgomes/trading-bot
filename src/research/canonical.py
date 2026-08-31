@@ -555,6 +555,241 @@ class ForwardPaperSummary:
         }
 
 
+def _validated_observation_facts(row: object) -> tuple[str, ...]:
+    if not isinstance(row, Mapping):
+        raise CanonicalEvidenceError("forward observation facts are missing")
+    observation = row.get("observation")
+    facts = observation.get("facts") if isinstance(observation, Mapping) else None
+    if (
+        not isinstance(facts, Mapping)
+        or facts.get("schema") != "platform.forward_evidence_facts/v1"
+    ):
+        raise CanonicalEvidenceError("forward observations need immutable evidence facts")
+    saved_hash = facts.get("facts_hash")
+    content = dict(facts)
+    content.pop("facts_hash", None)
+    if saved_hash != canonical_hash(content):
+        raise CanonicalEvidenceError("forward evidence facts hash is invalid")
+    source_ids = facts.get("source_event_ids")
+    metrics = facts.get("metrics")
+    if not isinstance(source_ids, list | tuple) or not source_ids:
+        raise CanonicalEvidenceError("forward evidence facts need source identities")
+    if not isinstance(metrics, Mapping):
+        raise CanonicalEvidenceError("forward evidence facts need metrics")
+    required_metrics = {
+        "net_pnl",
+        "benchmark_pnl",
+        "drawdown",
+        "execution_drift",
+        "model_drift",
+        "portfolio_capacity",
+        "risk_budget_available",
+        "data_gaps",
+        "effective_trades",
+        "fill_rate",
+        "slippage",
+        "data_uptime",
+        "rejected_orders",
+    }
+    if not required_metrics.issubset(metrics):
+        raise CanonicalEvidenceError("forward evidence facts metrics are incomplete")
+    return tuple(str(source_id) for source_id in source_ids)
+
+
+def _has_known_observation_source(connection, source_ids: tuple[str, ...], tables) -> bool:
+    for source_id in source_ids:
+        if any(
+            connection.execute(select(table.c.id).where(table.c.id == source_id)).first()
+            for table in tables
+        ):
+            return True
+    return False
+
+
+_SUMMARY_OBJECTIVE_FIELDS = (
+    "objective_value",
+    "benchmark_value",
+    "objective_excess",
+    "objective_excess_fraction",
+)
+_SUMMARY_NONNEGATIVE_FIELDS = (
+    "drawdown",
+    "execution_drift",
+    "model_drift",
+    "portfolio_capacity",
+    "risk_budget_available",
+    "strategy_decay",
+    "slippage",
+    "tail_loss",
+)
+_SUMMARY_FRACTION_FIELDS = ("fill_rate", "data_uptime")
+_SUMMARY_INTEGER_FIELDS = (
+    "effective_trades",
+    "rejected_orders",
+    "trading_days",
+    "cycles",
+    "effective_independent_episodes",
+)
+
+
+def _normalise_summary_objective(payload: dict[str, Any], product_id: str) -> None:
+    has_objective = payload.get("objective_unit") is not None or any(
+        payload.get(field) is not None for field in _SUMMARY_OBJECTIVE_FIELDS
+    )
+    if not has_objective:
+        return
+    expected_unit = objective_unit(product_id)
+    if expected_unit is None or payload.get("objective_unit") != expected_unit:
+        raise CanonicalEvidenceError("forward summary objective unit is invalid")
+    for field_name in _SUMMARY_OBJECTIVE_FIELDS:
+        payload[field_name] = _finite_number(payload.get(field_name), field=f"summary {field_name}")
+    payload["objective_unit"] = expected_unit
+
+
+def _normalise_summary_metrics(payload: dict[str, Any]) -> None:
+    for field_name in _SUMMARY_NONNEGATIVE_FIELDS:
+        payload[field_name] = _finite_nonnegative(
+            payload.get(field_name, 0.0), field=f"summary {field_name}"
+        )
+    for field_name in _SUMMARY_FRACTION_FIELDS:
+        value = _finite_nonnegative(payload.get(field_name, 0.0), field=f"summary {field_name}")
+        if value > 1:
+            raise CanonicalEvidenceError(f"summary {field_name} must be at most one")
+        payload[field_name] = value
+    for field_name in _SUMMARY_INTEGER_FIELDS:
+        payload[field_name] = int(
+            _finite_nonnegative(payload.get(field_name, 0), field=f"summary {field_name}")
+        )
+    payload["data_gaps"] = int(
+        _finite_nonnegative(payload.get("data_gaps", 0), field="summary data gaps")
+    )
+
+
+def _summary_observation_ids(payload: dict[str, Any]) -> tuple[str, ...]:
+    observation_ids = payload.get("observation_ids", ())
+    if (
+        not isinstance(observation_ids, list | tuple)
+        or not observation_ids
+        or any(not str(value).strip() for value in observation_ids)
+    ):
+        raise CanonicalEvidenceError("forward summary needs observation identities")
+    normalised = tuple(
+        _identity(str(value), field="summary observation identity") for value in observation_ids
+    )
+    if len(set(normalised)) != len(normalised):
+        raise CanonicalEvidenceError("forward summary observation identities must be unique")
+    payload["observation_ids"] = list(normalised)
+    return normalised
+
+
+def _prepare_summary_payload(
+    *,
+    strategy_version_id: str,
+    product_id: str,
+    observed_at: str,
+    artefact_hash: str | None,
+    evidence: Mapping[str, Any],
+) -> tuple[str, str, str, dict[str, Any], tuple[str, ...], str]:
+    strategy_version_id = str(strategy_version_id).strip()
+    product_id = str(product_id).strip()
+    if not strategy_version_id or not product_id:
+        raise CanonicalEvidenceError("forward summaries require strategy and product identities")
+    observed_at = timestamp(observed_at, field="summary.observed_at")
+    payload = _object(evidence, field="forward summary")
+    if "accepted" in payload:
+        raise CanonicalEvidenceError(
+            "artefact-bound forward summary cannot contain a raw acceptance flag"
+        )
+    artefact = _identity(
+        artefact_hash or str(payload.get("artefact_hash") or ""), field="artefact_hash"
+    )
+    payload.update(
+        {
+            "strategy_version_id": strategy_version_id,
+            "product_id": product_id,
+            "artefact_hash": artefact,
+            "observed_from": timestamp(
+                str(payload.get("observed_from") or observed_at), field="summary.observed_from"
+            ),
+            "observed_until": timestamp(
+                str(payload.get("observed_until") or observed_at), field="summary.observed_until"
+            ),
+            "elapsed_days": _finite_nonnegative(
+                payload.get("elapsed_days", 0.0), field="summary elapsed days"
+            ),
+            "independent_decisions": int(
+                _finite_nonnegative(
+                    payload.get("independent_decisions", 0),
+                    field="summary independent decisions",
+                )
+            ),
+            "net_pnl": _finite_number(payload.get("net_pnl", 0.0), field="summary net_pnl"),
+        }
+    )
+    if payload["observed_until"] < payload["observed_from"]:
+        raise CanonicalEvidenceError("forward summary interval is not chronological")
+    _normalise_summary_objective(payload, product_id)
+    _normalise_summary_metrics(payload)
+    observation_ids = _summary_observation_ids(payload)
+    identity = _hash(payload, field="forward summary")
+    return strategy_version_id, product_id, observed_at, payload, observation_ids, identity
+
+
+def _assert_summary_bindings(
+    connection,
+    *,
+    strategy_version_id: str,
+    product_id: str,
+    artefact: str,
+    payload: Mapping[str, Any],
+    observation_ids: tuple[str, ...],
+) -> None:
+    if (
+        connection.execute(
+            select(strategy_version.c.id).where(strategy_version.c.id == strategy_version_id)
+        ).first()
+        is None
+    ):
+        raise CanonicalEvidenceError(f"strategy version does not exist: {strategy_version_id}")
+    artefact_payload = _assert_canonical_artifact(connection, artefact)
+    _assert_artefact_binding(
+        artefact_payload,
+        strategy_version_id=strategy_version_id,
+        product_id=product_id,
+    )
+    if payload["observed_from"] <= timestamp(
+        str(artefact_payload["created_at"]), field="artefact.created_at"
+    ):
+        raise CanonicalEvidenceError("forward summary must follow artefact creation")
+    observations = (
+        connection.execute(
+            select(
+                forward_paper_observation.c.id,
+                forward_paper_observation.c.strategy_version_id,
+                forward_paper_observation.c.product_id,
+                forward_paper_observation.c.artefact_hash,
+                forward_paper_observation.c.observed_at,
+            ).where(forward_paper_observation.c.id.in_(observation_ids))
+        )
+        .mappings()
+        .all()
+    )
+    if len(observations) != len(observation_ids):
+        raise CanonicalEvidenceError("forward summary references an unknown observation identity")
+    for observation_row in observations:
+        if (
+            str(observation_row["strategy_version_id"]) != strategy_version_id
+            or str(observation_row["product_id"]) != product_id
+            or str(observation_row["artefact_hash"]) != artefact
+            or not payload["observed_from"]
+            <= str(observation_row["observed_at"])
+            <= payload["observed_until"]
+        ):
+            raise CanonicalEvidenceError(
+                "forward summary observation binding or interval is invalid"
+            )
+
+
 class SqlForwardEvidenceRepository:
     def __init__(self, engine: Engine):
         self.engine = engine
@@ -657,156 +892,30 @@ class SqlForwardEvidenceRepository:
         artefact_hash: str | None = None,
         evidence: Mapping[str, Any],
     ) -> str:
-        strategy_version_id = str(strategy_version_id).strip()
-        product_id = str(product_id).strip()
-        if not strategy_version_id or not product_id:
-            raise CanonicalEvidenceError(
-                "forward summaries require strategy and product identities"
-            )
-        observed_at = timestamp(observed_at, field="summary.observed_at")
-        payload = _object(evidence, field="forward summary")
-        if "accepted" in payload:
-            raise CanonicalEvidenceError(
-                "artefact-bound forward summary cannot contain a raw acceptance flag"
-            )
-        artefact = _identity(
-            artefact_hash or str(payload.get("artefact_hash") or ""),
-            field="artefact_hash",
+        (
+            strategy_version_id,
+            product_id,
+            observed_at,
+            payload,
+            normalised_observation_ids,
+            identity,
+        ) = _prepare_summary_payload(
+            strategy_version_id=strategy_version_id,
+            product_id=product_id,
+            observed_at=observed_at,
+            artefact_hash=artefact_hash,
+            evidence=evidence,
         )
-        payload["strategy_version_id"] = strategy_version_id
-        payload["product_id"] = product_id
-        payload["artefact_hash"] = artefact
-        payload["observed_from"] = timestamp(
-            str(payload.get("observed_from") or observed_at), field="summary.observed_from"
-        )
-        payload["observed_until"] = timestamp(
-            str(payload.get("observed_until") or observed_at), field="summary.observed_until"
-        )
-        if payload["observed_until"] < payload["observed_from"]:
-            raise CanonicalEvidenceError("forward summary interval is not chronological")
-        payload["elapsed_days"] = _finite_nonnegative(
-            payload.get("elapsed_days", 0.0), field="summary elapsed days"
-        )
-        payload["independent_decisions"] = int(
-            _finite_nonnegative(
-                payload.get("independent_decisions", 0), field="summary independent decisions"
-            )
-        )
-        payload["net_pnl"] = _finite_number(payload.get("net_pnl", 0.0), field="summary net_pnl")
-        objective_fields = (
-            "objective_value",
-            "benchmark_value",
-            "objective_excess",
-            "objective_excess_fraction",
-        )
-        has_objective = payload.get("objective_unit") is not None or any(
-            payload.get(field) is not None for field in objective_fields
-        )
-        if has_objective:
-            expected_unit = objective_unit(product_id)
-            if expected_unit is None or payload.get("objective_unit") != expected_unit:
-                raise CanonicalEvidenceError("forward summary objective unit is invalid")
-            for field_name in objective_fields:
-                payload[field_name] = _finite_number(
-                    payload.get(field_name), field=f"summary {field_name}"
-                )
-            payload["objective_unit"] = expected_unit
-        for field_name in (
-            "drawdown",
-            "execution_drift",
-            "model_drift",
-            "portfolio_capacity",
-            "risk_budget_available",
-            "strategy_decay",
-            "slippage",
-            "tail_loss",
-        ):
-            payload[field_name] = _finite_nonnegative(
-                payload.get(field_name, 0.0), field=f"summary {field_name}"
-            )
-        for field_name in ("fill_rate", "data_uptime"):
-            value = _finite_nonnegative(payload.get(field_name, 0.0), field=f"summary {field_name}")
-            if value > 1:
-                raise CanonicalEvidenceError(f"summary {field_name} must be at most one")
-            payload[field_name] = value
-        for field_name in ("effective_trades", "rejected_orders"):
-            payload[field_name] = int(
-                _finite_nonnegative(payload.get(field_name, 0), field=f"summary {field_name}")
-            )
-        for field_name in ("trading_days", "cycles", "effective_independent_episodes"):
-            payload[field_name] = int(
-                _finite_nonnegative(payload.get(field_name, 0), field=f"summary {field_name}")
-            )
-        payload["data_gaps"] = int(
-            _finite_nonnegative(payload.get("data_gaps", 0), field="summary data gaps")
-        )
-        observation_ids = payload.get("observation_ids", ())
-        if (
-            not isinstance(observation_ids, list | tuple)
-            or not observation_ids
-            or any(not str(value).strip() for value in observation_ids)
-        ):
-            raise CanonicalEvidenceError("forward summary needs observation identities")
-        normalised_observation_ids = tuple(
-            _identity(str(value), field="summary observation identity") for value in observation_ids
-        )
-        if len(set(normalised_observation_ids)) != len(normalised_observation_ids):
-            raise CanonicalEvidenceError("forward summary observation identities must be unique")
-        payload["observation_ids"] = list(normalised_observation_ids)
-        identity = _hash(payload, field="forward summary")
+        artefact = str(payload["artefact_hash"])
         with self.engine.begin() as connection:
-            if (
-                connection.execute(
-                    select(strategy_version.c.id).where(
-                        strategy_version.c.id == strategy_version_id
-                    )
-                ).first()
-                is None
-            ):
-                raise CanonicalEvidenceError(
-                    f"strategy version does not exist: {strategy_version_id}"
-                )
-            artefact_payload = _assert_canonical_artifact(connection, artefact)
-            _assert_artefact_binding(
-                artefact_payload,
+            _assert_summary_bindings(
+                connection,
                 strategy_version_id=strategy_version_id,
                 product_id=product_id,
+                artefact=artefact,
+                payload=payload,
+                observation_ids=normalised_observation_ids,
             )
-            if payload["observed_from"] <= timestamp(
-                str(artefact_payload["created_at"]), field="artefact.created_at"
-            ):
-                raise CanonicalEvidenceError("forward summary must follow artefact creation")
-            observations = (
-                connection.execute(
-                    select(
-                        forward_paper_observation.c.id,
-                        forward_paper_observation.c.strategy_version_id,
-                        forward_paper_observation.c.product_id,
-                        forward_paper_observation.c.artefact_hash,
-                        forward_paper_observation.c.observed_at,
-                    ).where(forward_paper_observation.c.id.in_(normalised_observation_ids))
-                )
-                .mappings()
-                .all()
-            )
-            if len(observations) != len(normalised_observation_ids):
-                raise CanonicalEvidenceError(
-                    "forward summary references an unknown observation identity"
-                )
-            for observation_row in observations:
-                if (
-                    str(observation_row["strategy_version_id"]) != strategy_version_id
-                    or str(observation_row["product_id"]) != product_id
-                    or str(observation_row["artefact_hash"]) != artefact
-                    or not (
-                        payload["observed_from"]
-                        <= str(observation_row["observed_at"])
-                        <= payload["observed_until"]
-                    )
-                ):
-                    raise CanonicalEvidenceError(
-                        "forward summary observation binding or interval is invalid"
-                    )
             self._assert_observation_facts(connection, normalised_observation_ids)
             return _immutable_insert(
                 connection,
@@ -1001,54 +1110,8 @@ class SqlForwardEvidenceRepository:
                     forward_paper_observation.c.id == observation_id
                 )
             ).scalar_one_or_none()
-            if not isinstance(row, Mapping):
-                raise CanonicalEvidenceError("forward observation facts are missing")
-            observation = row.get("observation")
-            facts = observation.get("facts") if isinstance(observation, Mapping) else None
-            if (
-                not isinstance(facts, Mapping)
-                or facts.get("schema") != "platform.forward_evidence_facts/v1"
-            ):
-                raise CanonicalEvidenceError("forward observations need immutable evidence facts")
-            saved_hash = facts.get("facts_hash")
-            content = dict(facts)
-            content.pop("facts_hash", None)
-            if saved_hash != canonical_hash(content):
-                raise CanonicalEvidenceError("forward evidence facts hash is invalid")
-            source_ids = facts.get("source_event_ids")
-            metrics = facts.get("metrics")
-            if not isinstance(source_ids, list | tuple) or not source_ids:
-                raise CanonicalEvidenceError("forward evidence facts need source identities")
-            if not isinstance(metrics, Mapping):
-                raise CanonicalEvidenceError("forward evidence facts need metrics")
-            required_metrics = {
-                "net_pnl",
-                "benchmark_pnl",
-                "drawdown",
-                "execution_drift",
-                "model_drift",
-                "portfolio_capacity",
-                "risk_budget_available",
-                "data_gaps",
-                "effective_trades",
-                "fill_rate",
-                "slippage",
-                "data_uptime",
-                "rejected_orders",
-            }
-            if not required_metrics.issubset(metrics):
-                raise CanonicalEvidenceError("forward evidence facts metrics are incomplete")
-            known = False
-            for source_id in source_ids:
-                for table in known_tables:
-                    if connection.execute(
-                        select(table.c.id).where(table.c.id == str(source_id))
-                    ).first():
-                        known = True
-                        break
-                if known:
-                    break
-            if not known:
+            source_ids = _validated_observation_facts(row)
+            if not _has_known_observation_source(connection, source_ids, known_tables):
                 raise CanonicalEvidenceError("forward evidence facts reference no canonical source")
 
     def append_decision(
