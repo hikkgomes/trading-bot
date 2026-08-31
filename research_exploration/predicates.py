@@ -66,47 +66,72 @@ def predicate_history_bars(p: Predicate, base_tf: str | None) -> int:
     return ratio
 
 
+def _comparison_mask(a: pd.Series, p: Predicate) -> pd.Series:
+    ref = float(p.reference)
+    return {"gt": a > ref, "ge": a >= ref, "lt": a < ref, "le": a <= ref}[p.op]
+
+
+def _feature_comparison_mask(frame: pd.DataFrame, a: pd.Series, p: Predicate) -> pd.Series:
+    b = _col(frame, p.column_b())  # type: ignore[arg-type]
+    if p.shift_b:
+        b = b.shift(p.shift_b)
+    if p.op in ("gt_feature", "lt_feature"):
+        return a > b if p.op == "gt_feature" else a < b
+    if p.op == "cross_above":
+        return (a > b) & (a.shift(1) <= b.shift(1))
+    return (a < b) & (a.shift(1) >= b.shift(1))
+
+
+def _trend_mask(a: pd.Series, p: Predicate) -> pd.Series:
+    lb = int(p.lookback or 1)
+    if p.op in ("rising", "falling"):
+        return a > a.shift(lb) if p.op == "rising" else a < a.shift(lb)
+    slope = (a - a.shift(lb)) / lb
+    ref = float(p.reference or 0.0)
+    return slope > ref if p.op == "slope_up" else slope < ref
+
+
+def _percentage_mask(frame: pd.DataFrame, a: pd.Series, p: Predicate) -> pd.Series:
+    b = _col(frame, p.column_b())  # type: ignore[arg-type]
+    if p.shift_b:
+        b = b.shift(p.shift_b)
+    pct = a / b.replace(0, np.nan) - 1.0
+    ref = float(p.reference)
+    return pct > ref if p.op == "pct_above" else pct < ref
+
+
+def _range_mask(a: pd.Series, p: Predicate) -> pd.Series:
+    return (a >= float(p.low)) & (a <= float(p.high))
+
+
+def _quantile_mask(a: pd.Series, p: Predicate, base_tf: str | None) -> pd.Series:
+    win = effective_rolling_window(p, base_tf)
+    q = float(p.quantile)
+    thresh = a.rolling(win, min_periods=max(10, win // 4)).quantile(q)
+    return a >= thresh if p.op == "q_ge" else a <= thresh
+
+
+def _pattern_mask(a: pd.Series, p: Predicate) -> pd.Series:
+    return {"bullish": a > 0, "bearish": a < 0, "nonzero": a != 0}[p.op]
+
+
 def predicate_mask(frame: pd.DataFrame, p: Predicate, base_tf: str | None = None) -> pd.Series:
     a = _col(frame, p.column())
     op = p.op
-
-    def _b() -> pd.Series:
-        b = _col(frame, p.column_b())  # type: ignore[arg-type]
-        return b.shift(p.shift_b) if p.shift_b else b
-
     if op in ("gt", "ge", "lt", "le"):
-        ref = float(p.reference)
-        return {"gt": a > ref, "ge": a >= ref, "lt": a < ref, "le": a <= ref}[op]
-    if op in ("gt_feature", "lt_feature"):
-        b = _b()
-        return a > b if op == "gt_feature" else a < b
-    if op in ("cross_above", "cross_below"):
-        b = _b()
-        if op == "cross_above":
-            return (a > b) & (a.shift(1) <= b.shift(1))
-        return (a < b) & (a.shift(1) >= b.shift(1))
-    if op in ("rising", "falling"):
-        lb = int(p.lookback or 1)
-        return a > a.shift(lb) if op == "rising" else a < a.shift(lb)
-    if op in ("slope_up", "slope_down"):
-        lb = int(p.lookback or 1)
-        slope = (a - a.shift(lb)) / lb
-        ref = float(p.reference or 0.0)
-        return slope > ref if op == "slope_up" else slope < ref
+        return _comparison_mask(a, p)
+    if op in ("gt_feature", "lt_feature", "cross_above", "cross_below"):
+        return _feature_comparison_mask(frame, a, p)
+    if op in ("rising", "falling", "slope_up", "slope_down"):
+        return _trend_mask(a, p)
     if op in ("pct_above", "pct_below"):
-        b = _b()
-        pct = a / b.replace(0, np.nan) - 1.0
-        ref = float(p.reference)
-        return pct > ref if op == "pct_above" else pct < ref
+        return _percentage_mask(frame, a, p)
     if op == "between":
-        return (a >= float(p.low)) & (a <= float(p.high))
+        return _range_mask(a, p)
     if op in ("q_ge", "q_le"):
-        win = effective_rolling_window(p, base_tf)
-        q = float(p.quantile)
-        thresh = a.rolling(win, min_periods=max(10, win // 4)).quantile(q)
-        return a >= thresh if op == "q_ge" else a <= thresh
+        return _quantile_mask(a, p, base_tf)
     if op in ("bullish", "bearish", "nonzero"):
-        return {"bullish": a > 0, "bearish": a < 0, "nonzero": a != 0}[op]
+        return _pattern_mask(a, p)
     raise ValueError(f"Unhandled op {op!r}")
 
 

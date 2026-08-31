@@ -23,6 +23,7 @@ Run:  python -m research_exploration.predicate_funnel \
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -360,225 +361,286 @@ def _pct(n: int, total: int) -> str:
     return f"{(100.0 * n / total):.1f}%" if total else "—"
 
 
-def build_report(funnels: list[HypothesisFunnel], meta: dict) -> str:
-    L: list[str] = []
-    L.append("# Predicate Funnel Report")
-    L.append("")
-    bases = ", ".join(f"{b} ({r:,} rows)" for b, r in meta["bases"])
-    L.append(
-        f"_Read-only diagnostic. Sample: **{meta['start']} → {meta['end']}**, "
-        f"base timeframes {bases}. Fees {meta['fee_bps']}+{meta['slippage_bps']}bps, "
-        f"min_trades={meta['min_trades']}. {len(funnels)} hypotheses._"
-    )
-    L.append("")
-    L.append(
-        "No optimisation, no new features, no walk-forward — this only explains "
-        "*why* each hypothesis from the bounded smoke was rejected. Coverage %s are "
-        "relative to each hypothesis's own base-timeframe row count."
-    )
-    L.append("")
+def _report_header(funnels: list[HypothesisFunnel], meta: dict) -> list[str]:
+    bases = ", ".join(f"{base} ({rows:,} rows)" for base, rows in meta["bases"])
+    return [
+        "# Predicate Funnel Report",
+        "",
+        (
+            f"_Read-only diagnostic. Sample: **{meta['start']} → {meta['end']}**, "
+            f"base timeframes {bases}. Fees {meta['fee_bps']}+{meta['slippage_bps']}bps, "
+            f"min_trades={meta['min_trades']}. {len(funnels)} hypotheses._"
+        ),
+        "",
+        (
+            "No optimisation, no new features, no walk-forward — this only explains "
+            "*why* each hypothesis from the bounded smoke was rejected. Coverage %s are "
+            "relative to each hypothesis's own base-timeframe row count."
+        ),
+        "",
+    ]
 
-    # ---- summary table ----
-    L.append("## Summary")
-    L.append("")
-    L.append(
-        "| hypothesis | family | dir | base | regime | setup | trigger | entry | trades | ret% | reason |"
-    )
-    L.append("|---|---|---|---|--:|--:|--:|--:|--:|--:|---|")
-    for f in funnels:
-        reg = _pct(f.stage_combined.get("regime", 0), f.total_rows)
-        setp = _pct(f.stage_combined.get("setup", 0), f.total_rows)
-        trg = _pct(f.stage_combined.get("trigger", 0), f.total_rows)
-        ret = f"{f.total_return * 100:+.2f}" if f.trades else "—"
-        L.append(
-            f"| {f.hypothesis_id} | {f.family} | {f.direction} | {f.base_tf} | {reg} | {setp} | "
-            f"{trg} | {f.risk_filtered_rows} | {f.trades} | {ret} | **{f.rejection_reason}** |"
-        )
-    L.append("")
 
-    # ---- buckets ----
-    impossible = [f for f in funnels if f.rejection_reason in _IMPOSSIBLE]
-    too_strict = [f for f in funnels if f.rejection_reason in _TOO_STRICT]
-    bad_trades = [f for f in funnels if f.rejection_reason in _BAD_TRADES]
-    positive = [f for f in funnels if f.rejection_reason == "candidate_positive"]
+def _report_summary(funnels: list[HypothesisFunnel]) -> list[str]:
+    lines = [
+        "## Summary",
+        "",
+        "| hypothesis | family | dir | base | regime | setup | trigger | entry | trades | ret% | reason |",
+        "|---|---|---|---|--:|--:|--:|--:|--:|--:|---|",
+    ]
+    for funnel in funnels:
+        reg = _pct(funnel.stage_combined.get("regime", 0), funnel.total_rows)
+        setup = _pct(funnel.stage_combined.get("setup", 0), funnel.total_rows)
+        trigger = _pct(funnel.stage_combined.get("trigger", 0), funnel.total_rows)
+        ret = f"{funnel.total_return * 100:+.2f}" if funnel.trades else "—"
+        lines.append(
+            f"| {funnel.hypothesis_id} | {funnel.family} | {funnel.direction} | {funnel.base_tf} | "
+            f"{reg} | {setup} | {trigger} | {funnel.risk_filtered_rows} | {funnel.trades} | "
+            f"{ret} | **{funnel.rejection_reason}** |"
+        )
+    lines.append("")
+    return lines
 
-    L.append("## Verdict buckets")
-    L.append("")
-    L.append(
-        f"- **Impossible with current data** ({len(impossible)}): a required predicate "
-        "never fires in this sample (or a column is missing)."
-    )
-    for f in impossible:
-        L.append(
-            f"  - `{f.hypothesis_id}` — {f.rejection_reason}; killer: **{f.killer_predicate}** "
-            f"({f.killer_stage}, {f.killer_kind})"
+
+def _bucket_lines(label: str, description: str, funnels: list[HypothesisFunnel]) -> list[str]:
+    lines = [f"- **{label}** ({len(funnels)}): {description}"]
+    for funnel in funnels:
+        lines.append(
+            f"  - `{funnel.hypothesis_id}` — {funnel.rejection_reason}; killer: "
+            f"**{funnel.killer_predicate}** ({funnel.killer_stage}, {funnel.killer_kind})"
         )
-    L.append(
-        f"- **Too strict** ({len(too_strict)}): every stage fires alone, but the combination "
-        "(or risk filter) leaves no usable entries."
-    )
-    for f in too_strict:
-        L.append(
-            f"  - `{f.hypothesis_id}` — {f.rejection_reason}; killer: **{f.killer_predicate}** "
-            f"({f.killer_stage}, {f.killer_kind})"
+    return lines
+
+
+def _report_buckets(funnels: list[HypothesisFunnel]) -> list[str]:
+    impossible = [funnel for funnel in funnels if funnel.rejection_reason in _IMPOSSIBLE]
+    too_strict = [funnel for funnel in funnels if funnel.rejection_reason in _TOO_STRICT]
+    bad_trades = [funnel for funnel in funnels if funnel.rejection_reason in _BAD_TRADES]
+    positive = [funnel for funnel in funnels if funnel.rejection_reason == "candidate_positive"]
+    lines = ["## Verdict buckets", ""]
+    lines.extend(
+        _bucket_lines(
+            "Impossible with current data",
+            "a required predicate never fires in this sample (or a column is missing).",
+            impossible,
         )
-    L.append(
+    )
+    lines.extend(
+        _bucket_lines(
+            "Too strict",
+            "every stage fires alone, but the combination (or risk filter) leaves no usable entries.",
+            too_strict,
+        )
+    )
+    lines.append(
         f"- **Signals but bad trade outcomes** ({len(bad_trades)}): entries exist, the trades "
         "lose or are too few to judge."
     )
-    for f in bad_trades:
-        L.append(
-            f"  - `{f.hypothesis_id}` — {f.rejection_reason}; {f.trades} trades, "
-            f"ret {f.total_return * 100:+.2f}%, win {f.win_rate * 100:.0f}%, PF {f.profit_factor}"
+    for funnel in bad_trades:
+        lines.append(
+            f"  - `{funnel.hypothesis_id}` — {funnel.rejection_reason}; {funnel.trades} trades, "
+            f"ret {funnel.total_return * 100:+.2f}%, win {funnel.win_rate * 100:.0f}%, PF {funnel.profit_factor}"
         )
     if positive:
-        L.append(
+        lines.append(
             f"- **Positive candidates** ({len(positive)}): survived this single window — "
             "still needs walk-forward + holdout before any belief."
         )
-        for f in positive:
-            L.append(
-                f"  - `{f.hypothesis_id}` — {f.trades} trades, ret {f.total_return * 100:+.2f}%, "
-                f"PSR {f.psr}"
+        for funnel in positive:
+            lines.append(
+                f"  - `{funnel.hypothesis_id}` — {funnel.trades} trades, "
+                f"ret {funnel.total_return * 100:+.2f}%, PSR {funnel.psr}"
             )
-    L.append("")
+    lines.append("")
+    return lines
 
-    # ---- readiness for entry-edge diagnostic ----
-    ready = [f for f in funnels if f.trades >= meta["min_trades"]]
-    L.append("## Ready for an entry-edge diagnostic")
-    L.append("")
-    L.append(
-        f"A hypothesis is *ready* when it produces enough trades ({meta['min_trades']}+) to "
-        "study its entry edge — independent of whether this single window was profitable. "
-        "Impossible / too-strict / too-few-trade candidates are **not** ready (no sample)."
-    )
-    L.append("")
+
+def _report_ready(funnels: list[HypothesisFunnel], meta: dict) -> list[str]:
+    ready = [funnel for funnel in funnels if funnel.trades >= meta["min_trades"]]
+    lines = [
+        "## Ready for an entry-edge diagnostic",
+        "",
+        (
+            f"A hypothesis is *ready* when it produces enough trades ({meta['min_trades']}+) to "
+            "study its entry edge — independent of whether this single window was profitable. "
+            "Impossible / too-strict / too-few-trade candidates are **not** ready (no sample)."
+        ),
+        "",
+    ]
     if ready:
-        for f in sorted(ready, key=lambda x: -x.trades):
-            L.append(
-                f"- `{f.hypothesis_id}` ({f.family}/{f.direction}, base {f.base_tf}) — "
-                f"{f.trades} trades, win {f.win_rate * 100:.0f}%, ret {f.total_return * 100:+.2f}%, "
-                f"PF {f.profit_factor}, exits {f.exit_reasons}"
+        for funnel in sorted(ready, key=lambda item: -item.trades):
+            lines.append(
+                f"- `{funnel.hypothesis_id}` ({funnel.family}/{funnel.direction}, base {funnel.base_tf}) — "
+                f"{funnel.trades} trades, win {funnel.win_rate * 100:.0f}%, "
+                f"ret {funnel.total_return * 100:+.2f}%, PF {funnel.profit_factor}, "
+                f"exits {funnel.exit_reasons}"
             )
     else:
-        L.append("- _none in this sample._")
-    L.append("")
+        lines.append("- _none in this sample._")
+    lines.append("")
+    return lines
 
-    # ---- family refinement summary ----
-    L.append("## Which families deserve refinement")
-    L.append("")
-    fams: dict[str, list[HypothesisFunnel]] = {}
-    for f in funnels:
-        fams.setdefault(f.family, []).append(f)
-    L.append("| family | n | dominant reason | typical bottleneck |")
-    L.append("|---|--:|---|---|")
-    for fam, fs in fams.items():
-        from collections import Counter
 
-        reasons = Counter(f.rejection_reason for f in fs)
-        dom = reasons.most_common(1)[0][0]
-        necks = Counter(bottleneck(f) for f in fs if bottleneck(f) != "—")
-        typ = necks.most_common(1)[0][0] if necks else "—"
-        L.append(f"| {fam} | {len(fs)} | {dom} | {typ} |")
-    L.append("")
-
-    # ---- per-hypothesis detail ----
-    L.append("## Per-hypothesis funnels")
-    L.append("")
-    for f in funnels:
-        L.append(f"### `{f.hypothesis_id}` — {f.family} / {f.direction}  (base {f.base_tf})")
-        L.append("")
-        if f.missing_columns:
-            L.append(f"- **missing columns:** {', '.join(f.missing_columns)}")
-            L.append("")
-            continue
-        # stage coverage
-        L.append(f"TFs: regime={f.regime_tf} · setup={f.setup_tf} · trigger={f.trigger_tf}")
-        L.append("")
-        L.append("```")
-        L.append(f"stage coverage (rows firing / {f.total_rows:,})")
-        for stage in ("regime", "setup", "trigger"):
-            sc = f.stage_combined.get(stage, 0)
-            L.append(f"  {stage:7} AND : {sc:>8,} ({_pct(sc, f.total_rows)})")
-            for c in [c for c in f.per_predicate if c.stage == stage]:
-                warm = "" if c.valid_rows == f.total_rows else f"  [valid {c.valid_rows:,}]"
-                L.append(
-                    f"      - {c.description:55} {c.true_rows:>8,} ({c.true_pct * 100:4.1f}%){warm}"
-                )
-        L.append("")
-        L.append("cumulative funnel (regime -> setup -> trigger -> risk):")
-        L.append(f"  {'start':55} {f.total_rows:>8,}")
-        for step in f.cumulative:
-            L.append(f"  + {step.description:53} {step.cum_after:>8,}  (-{step.dropped:,})")
-        L.append(f"  => entry signals {' ' * 39} {f.risk_filtered_rows:>8,}")
-        if f.trades:
-            exits = " / ".join(f"{k} {v}" for k, v in f.exit_reasons.items())
-            L.append(f"  => trades {' ' * 46} {f.trades:>8,}")
-            L.append(f"     exits: {exits}")
-            L.append(
-                f"     win {f.win_rate * 100:.0f}% | ret {f.total_return * 100:+.2f}% | "
-                f"avg {f.avg_net_return * 100:+.3f}% | PF {f.profit_factor} | "
-                f"PSR {f.psr} | maxDD {f.max_drawdown * 100:.1f}%"
-            )
-        L.append("```")
-        L.append(
-            f"**Reason:** `{f.rejection_reason}` — killer: **{f.killer_predicate}** "
-            f"(stage={f.killer_stage}, kind={f.killer_kind})"
+def _report_families(funnels: list[HypothesisFunnel]) -> list[str]:
+    families: dict[str, list[HypothesisFunnel]] = {}
+    for funnel in funnels:
+        families.setdefault(funnel.family, []).append(funnel)
+    lines = [
+        "## Which families deserve refinement",
+        "",
+        "| family | n | dominant reason | typical bottleneck |",
+        "|---|--:|---|---|",
+    ]
+    for family, family_funnels in families.items():
+        reasons = Counter(funnel.rejection_reason for funnel in family_funnels)
+        dominant = reasons.most_common(1)[0][0]
+        bottlenecks = Counter(
+            bottleneck(funnel) for funnel in family_funnels if bottleneck(funnel) != "—"
         )
-        if f.killer_kind == "trade_level" and f.tightest_filter:
-            L.append(f"  - tightest predicate (most rows removed): {f.tightest_filter}")
-        if f.notes:
-            for n in f.notes:
-                L.append(f"  - note: {n}")
-        L.append("")
+        typical = bottlenecks.most_common(1)[0][0] if bottlenecks else "—"
+        lines.append(f"| {family} | {len(family_funnels)} | {dominant} | {typical} |")
+    lines.append("")
+    return lines
 
-    # ---- cross-cutting notes ----
-    L.append("## Cross-cutting observations")
-    L.append("")
-    # surface the max_/min_ breakout self-reference if any trigger never fired on it
+
+def _report_detail_coverage(funnel: HypothesisFunnel, lines: list[str]) -> None:
+    lines.append(f"stage coverage (rows firing / {funnel.total_rows:,})")
+    for stage in ("regime", "setup", "trigger"):
+        combined = funnel.stage_combined.get(stage, 0)
+        lines.append(f"  {stage:7} AND : {combined:>8,} ({_pct(combined, funnel.total_rows)})")
+        for coverage in [item for item in funnel.per_predicate if item.stage == stage]:
+            warm = (
+                ""
+                if coverage.valid_rows == funnel.total_rows
+                else f"  [valid {coverage.valid_rows:,}]"
+            )
+            lines.append(
+                f"      - {coverage.description:55} {coverage.true_rows:>8,} "
+                f"({coverage.true_pct * 100:4.1f}%){warm}"
+            )
+
+
+def _report_detail_trades(funnel: HypothesisFunnel, lines: list[str]) -> None:
+    lines.append("")
+    lines.append("cumulative funnel (regime -> setup -> trigger -> risk):")
+    lines.append(f"  {'start':55} {funnel.total_rows:>8,}")
+    for step in funnel.cumulative:
+        lines.append(f"  + {step.description:53} {step.cum_after:>8,}  (-{step.dropped:,})")
+    lines.append(f"  => entry signals {' ' * 39} {funnel.risk_filtered_rows:>8,}")
+    if funnel.trades:
+        exits = " / ".join(f"{key} {value}" for key, value in funnel.exit_reasons.items())
+        lines.append(f"  => trades {' ' * 46} {funnel.trades:>8,}")
+        lines.append(f"     exits: {exits}")
+        lines.append(
+            f"     win {funnel.win_rate * 100:.0f}% | ret {funnel.total_return * 100:+.2f}% | "
+            f"avg {funnel.avg_net_return * 100:+.3f}% | PF {funnel.profit_factor} | "
+            f"PSR {funnel.psr} | maxDD {funnel.max_drawdown * 100:.1f}%"
+        )
+
+
+def _report_detail(funnel: HypothesisFunnel) -> list[str]:
+    lines = [
+        f"### `{funnel.hypothesis_id}` — {funnel.family} / {funnel.direction}  (base {funnel.base_tf})",
+        "",
+    ]
+    if funnel.missing_columns:
+        lines.extend([f"- **missing columns:** {', '.join(funnel.missing_columns)}", ""])
+        return lines
+    lines.extend(
+        [
+            f"TFs: regime={funnel.regime_tf} · setup={funnel.setup_tf} · trigger={funnel.trigger_tf}",
+            "",
+            "```",
+        ]
+    )
+    _report_detail_coverage(funnel, lines)
+    _report_detail_trades(funnel, lines)
+    lines.extend(
+        [
+            "```",
+            (
+                f"**Reason:** `{funnel.rejection_reason}` — killer: **{funnel.killer_predicate}** "
+                f"(stage={funnel.killer_stage}, kind={funnel.killer_kind})"
+            ),
+        ]
+    )
+    if funnel.killer_kind == "trade_level" and funnel.tightest_filter:
+        lines.append(f"  - tightest predicate (most rows removed): {funnel.tightest_filter}")
+    if funnel.notes:
+        lines.extend(f"  - note: {note}" for note in funnel.notes)
+    lines.append("")
+    return lines
+
+
+def _report_details(funnels: list[HypothesisFunnel]) -> list[str]:
+    lines = ["## Per-hypothesis funnels", ""]
+    for funnel in funnels:
+        lines.extend(_report_detail(funnel))
+    return lines
+
+
+def _report_observations(funnels: list[HypothesisFunnel]) -> list[str]:
     breakout_zero = [
-        f
-        for f in funnels
-        if f.rejection_reason == "trigger_never_fires"
+        funnel
+        for funnel in funnels
+        if funnel.rejection_reason == "trigger_never_fires"
         and (
-            "max_" in f.killer_predicate
-            or "20-bar high" in f.killer_predicate
-            or "20-bar low" in f.killer_predicate
+            "max_" in funnel.killer_predicate
+            or "20-bar high" in funnel.killer_predicate
+            or "20-bar low" in funnel.killer_predicate
         )
     ]
+    lines = ["## Cross-cutting observations", ""]
     if breakout_zero:
-        L.append(
+        lines.append(
             "- **STILL BROKEN: a breakout trigger references a current-bar-inclusive rolling "
             f"extreme and never fires** ({len(breakout_zero)} candidate(s)). Expected 0 after "
             "the `shift_b` fix — investigate."
         )
     else:
-        L.append(
+        lines.append(
             "- **FIXED — breakout/sweep now compare against the *prior* range.** Predicates "
             "comparing `close`/`high`/`low` to `max_N`/`min_N` carry `shift_b=1`, i.e. "
             "`close > max_20.shift(1)` (the prior 20-bar max-close, since TA-Lib `MAX`/`MIN` "
             "run on close). This removes the old tautology (`close > max_20` was impossible; "
             "`close > min_20` was always-true)."
         )
-    L.append(
-        "- **FIXED — rolling-quantile windows are now scaled to native HTF bars.** A "
-        "`q_le(window=180)` on a 4h column is evaluated over `180 × (4h/base)` base rows, so "
-        "it means 180 *4h* candles, not 180 base rows. Because the HTF column is forward-filled "
-        "uniformly, the quantile over the scaled window equals the quantile over the 180 native "
-        "values. If the scaled window can't fit the bounded sample, the hypothesis is rejected "
-        "with `invalid_timeframe_window` instead of silently using the wrong length."
+    lines.extend(
+        [
+            (
+                "- **FIXED — rolling-quantile windows are now scaled to native HTF bars.** A "
+                "`q_le(window=180)` on a 4h column is evaluated over `180 × (4h/base)` base rows, "
+                "so it means 180 *4h* candles, not 180 base rows. Because the HTF column is "
+                "forward-filled uniformly, the quantile over the scaled window equals the "
+                "quantile over the 180 native values. If the scaled window can't fit the bounded "
+                "sample, the hypothesis is rejected with `invalid_timeframe_window` instead of "
+                "silently using the wrong length."
+            ),
+            (
+                "- **Risk NATR filters silently cut entries.** `trend_continuation` (min_atr_pct) and "
+                "`mean_reversion` (max_atr_pct) drop signals after the predicate conjunction; the "
+                "funnel's `risk` step shows how many."
+            ),
+            (
+                "- A single bounded window cannot tell *too strict* from *rare-but-real*. Treat "
+                "`combination_too_strict` as 'revisit the conjunction', not 'delete the idea'."
+            ),
+            "",
+        ]
     )
-    L.append(
-        "- **Risk NATR filters silently cut entries.** `trend_continuation` (min_atr_pct) and "
-        "`mean_reversion` (max_atr_pct) drop signals after the predicate conjunction; the "
-        "funnel's `risk` step shows how many."
-    )
-    L.append(
-        "- A single bounded window cannot tell *too strict* from *rare-but-real*. Treat "
-        "`combination_too_strict` as 'revisit the conjunction', not 'delete the idea'."
-    )
-    L.append("")
-    return "\n".join(L) + "\n"
+    return lines
+
+
+def build_report(funnels: list[HypothesisFunnel], meta: dict) -> str:
+    lines: list[str] = []
+    lines.extend(_report_header(funnels, meta))
+    lines.extend(_report_summary(funnels))
+    lines.extend(_report_buckets(funnels))
+    lines.extend(_report_ready(funnels, meta))
+    lines.extend(_report_families(funnels))
+    lines.extend(_report_details(funnels))
+    lines.extend(_report_observations(funnels))
+    return "\n".join(lines) + "\n"
 
 
 def run_funnel(
