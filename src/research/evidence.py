@@ -39,6 +39,7 @@ _PROFILE_FINITE_FIELDS = (
     "minimum_cross_symbol_pooled_return",
     "minimum_cross_symbol_lower_quantile_return",
     "allowed_holdout_degradation",
+    "minimum_evidence_score",
 )
 _PROFILE_INTEGER_FIELDS = (
     "minimum_walk_forward_windows",
@@ -54,6 +55,7 @@ _PROFILE_UNIT_FIELDS = (
     "minimum_positive_symbol_fraction",
     "maximum_parameter_degradation",
     "allowed_holdout_degradation",
+    "minimum_evidence_score",
 )
 
 
@@ -145,6 +147,7 @@ class EvidenceProfile:
     minimum_cross_symbol_pooled_return: float = 0.0
     minimum_cross_symbol_lower_quantile_return: float | None = None
     allowed_holdout_degradation: float = 0.5
+    minimum_evidence_score: float = 0.5
 
     def __post_init__(self) -> None:
         _normalise_profile_dimensions(self)

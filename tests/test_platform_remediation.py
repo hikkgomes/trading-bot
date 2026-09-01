@@ -469,6 +469,14 @@ def test_robustness_uses_one_primary_confidence_gate() -> None:
     assert "deflated_sharpe" not in decision.fatal_failures
     assert "deflated_sharpe:fail" in decision.diagnostics
 
+    degraded = dict(evidence)
+    degraded["delay_stress"] = {"passed": False, "return": -0.2}
+    degraded_decision = policy.decide("robustness", degraded, ())
+
+    assert degraded_decision.accepted is True
+    assert degraded_decision.fatal_failures == ()
+    assert "delay_stress:fail" in degraded_decision.diagnostics
+
 
 def test_single_symbol_and_empty_portfolio_overlap_are_not_applicable() -> None:
     cross_symbol = _cross_symbol_stability(

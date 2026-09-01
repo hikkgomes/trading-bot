@@ -613,37 +613,55 @@ class EvidencePolicy:
             horizon=horizon,
             evidence_type=evidence_type,
         )
+        optional = self._optional_evidence_names(stage)
         required_statuses = {
-            name: status
-            for name, status in statuses.items()
-            if name not in self._optional_evidence_names(stage)
+            name: status for name, status in statuses.items() if name not in optional
         }
+        fatal_fields = _FATAL_EVIDENCE_FIELDS.get(stage, frozenset())
+        unavailable = [
+            name
+            for name, status in required_statuses.items()
+            if status is EvidenceStatus.UNAVAILABLE
+        ]
         failures = [
             name
             for name, status in required_statuses.items()
-            if status not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
+            if status is EvidenceStatus.FAIL and name in fatal_fields
         ]
+        failures.extend(unavailable)
         if evidence.get("evidence_policy_hash") != self.policy_hash:
             failures.insert(0, "evidence_policy_hash")
-        denominator = len(required_statuses) + int(
-            evidence.get("evidence_policy_hash") == self.policy_hash
-        )
+        scoreable = {
+            name: status
+            for name, status in required_statuses.items()
+            if name not in fatal_fields and status is not EvidenceStatus.UNAVAILABLE
+        }
         passed = sum(
             status in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
-            for status in required_statuses.values()
+            for status in scoreable.values()
         )
-        score = passed / denominator if denominator else 0.0
+        score = passed / len(scoreable) if scoreable else (1.0 if not unavailable else 0.0)
+        profile = self.profile_for(
+            stage,
+            product_id=product_id,
+            family=family,
+            horizon=horizon,
+            evidence_type=evidence_type,
+        )
+        if not failures and scoreable and score < profile.minimum_evidence_score:
+            failures.append("evidence_score_below_threshold")
         diagnostics = [
             f"{name}:{status.value}"
             for name, status in statuses.items()
-            if name in self._optional_evidence_names(stage)
+            if (name in optional or name in scoreable)
             and status not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
         ]
         accepted = bool(required_statuses) and not failures
         deferred = (
             bool(failures)
             and "evidence_policy_hash" not in failures
-            and all(statuses.get(name) is EvidenceStatus.UNAVAILABLE for name in failures)
+            and bool(unavailable)
+            and all(name in unavailable for name in failures)
         )
         return EvaluationDecision(
             accepted=accepted,
@@ -1180,6 +1198,64 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
 
 _OPTIONAL_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
     "development": {"portfolio_overlap": _portfolio_overlap_passes},
+}
+
+
+_FATAL_EVIDENCE_FIELDS: dict[str, frozenset[str]] = {
+    "screening": frozenset(_STAGE_EVIDENCE_VALIDATORS["screening"]),
+    "development": frozenset(
+        {
+            "chronological",
+            "data_integrity",
+            "semantic_parity",
+            "realistic_costs",
+            "family_evidence",
+            "cost_adjusted_return",
+            "fees",
+            "slippage",
+            "funding",
+            "sample_evidence",
+            "universe_evidence",
+        }
+    ),
+    "robustness": frozenset(
+        {
+            "data_integrity",
+            "semantic_parity",
+            "realistic_costs",
+            "family_evidence",
+            "purged",
+            "embargo",
+            "drawdown_stability",
+            "negative_control_results",
+        }
+    ),
+    "forward": frozenset(
+        {
+            "data_integrity",
+            "semantic_parity",
+            "realistic_costs",
+            "family_evidence",
+            "production_equivalent",
+            "exact_strategy_identity",
+            "exact_artefact_hash",
+            "exact_engine_hash",
+            "exact_cost_model",
+            "drift_checks",
+        }
+    ),
+    "protected": frozenset(
+        {
+            "chronological",
+            "data_integrity",
+            "semantic_parity",
+            "realistic_costs",
+            "family_evidence",
+            "cost_adjusted_return",
+            "sample_evidence",
+            "drawdown_stability",
+        }
+    ),
 }
 
 
@@ -1837,10 +1913,8 @@ class CanonicalResearchEvaluator:
         missing = [
             field
             for field in required_fields
-            if field not in policy_fields
-            and field != "objective_excess_fraction"
-            or evidence_status.get(field)
-            not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
+            if field not in evidence_status
+            or field not in policy_fields and field != "objective_excess_fraction"
         ]
         decision = self.evidence_policy.decide(
             stage,
