@@ -42,6 +42,7 @@ from src.services.account_reconciliation import AccountReconciliationService
 from src.services.accounting_service import AccountingService, DatabaseAccountingWorker
 from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.config import load_platform_config, load_split_configuration
+from src.services.health import DatabaseHeartbeatStore
 from src.services.live_execution import ApprovedLiveExecution, execution_engine_identity
 from src.services.market_gateway import DatabaseMarketGateway, UserStreamAccount
 from src.services.order_execution import DatabaseLiveExecutionWorker, DatabaseUserStreamWorker
@@ -70,6 +71,7 @@ _RISK_JOB_NAME = "connected_testnet_risk_assessment"
 _LIVE_JOB_NAME = "connected_testnet_live_order_submit"
 _USER_STREAM_JOB_NAME = "connected_testnet_user_stream_event"
 _ACCOUNTING_JOB_NAME = "connected_testnet_accounting_event"
+_HEALTH_NODE_ID = "connected-testnet"
 
 
 def validate_connected_testnet_configuration(configuration: Mapping[str, Any]) -> dict[str, Any]:
@@ -728,11 +730,19 @@ def _refresh_reconciled_state(
     account_fingerprint: str,
 ) -> dict[str, Any]:
     store = SqlRiskSnapshotStore(database.engine)
+    DatabaseHeartbeatStore(database.engine).record(
+        service_name="connected-testnet",
+        node_id=_HEALTH_NODE_ID,
+        observed_at=reconciled_at,
+        healthy=True,
+        payload={"data_age_seconds": 0.0, "clock_skew_seconds": 0.0},
+    )
     source = DatabasePortfolioSourceService(
         engine=database.engine,
         store=store,
         products={product_id: product},
         accounts=accounts,
+        health_node_id=_HEALTH_NODE_ID,
     )
     worker_id = "connected-testnet:portfolio-state"
     queue.register_worker(
