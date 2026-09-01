@@ -77,6 +77,28 @@ def aggregate_forecasts(forecasts: Iterable[AlphaForecast]) -> tuple[AlphaForeca
                 }
             ),
         }
+        group_keys = tuple(
+            sorted(
+                {
+                    str(item.metadata["order_group_key"])
+                    for item in items
+                    if item.metadata.get("order_group_key")
+                }
+            )
+        )
+        if len(group_keys) == 1:
+            metadata["order_group_key"] = group_keys[0]
+        semantic_groups = tuple(
+            sorted(
+                {
+                    str(item.metadata["semantic_group_id"])
+                    for item in items
+                    if item.metadata.get("semantic_group_id")
+                }
+            )
+        )
+        if len(semantic_groups) == 1:
+            metadata["semantic_group_id"] = semantic_groups[0]
         assignment_ids = metadata["assignment_ids"]
         if len(assignment_ids) == 1:
             metadata["assignment_id"] = assignment_ids[0]
