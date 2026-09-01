@@ -212,6 +212,28 @@ def test_bootstrap_is_idempotent_after_initial_job_completion(tmp_path: Path) ->
         )
 
 
+def test_bootstrap_ignores_completed_diagnostic_from_an_older_payload(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    configuration = load_split_configuration(ROOT / "config")
+    bootstrap = PlatformBootstrap(engine=database.engine, configuration=configuration)
+    bootstrap.ensure(now=NOW)
+    job_id = "diagnostic-paper:open:active_income"
+    with database.engine.begin() as connection:
+        payload = connection.execute(select(job.c.payload).where(job.c.id == job_id)).scalar_one()
+        older_payload = {**dict(payload), "artefact_hash": "sha256:" + "f" * 64}
+        connection.execute(
+            update(job)
+            .where(job.c.id == job_id)
+            .values(
+                payload=older_payload,
+                content_hash=canonical_hash(older_payload),
+                state="completed",
+            )
+        )
+
+    bootstrap.ensure(now="2026-08-27T11:00:00+00:00")
+
+
 def test_fresh_platform_state_policies_leave_measured_risk_to_runtime() -> None:
     configuration = load_split_configuration(ROOT / "config")
     products = {

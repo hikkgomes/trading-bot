@@ -15,6 +15,7 @@ from src.data.database import (
     cost_model_manifest,
     feature_manifest,
     feature_set,
+    job,
     platform_bootstrap,
     strategy_definition,
     strategy_version,
@@ -600,13 +601,44 @@ class PlatformBootstrap:
             "quantity": 0.0001,
             "price": 100_000.0,
         }
-        DatabaseJobQueue(self.engine).enqueue_if_absent(
-            job_id=f"diagnostic-paper:open:{product_id}",
-            name="diagnostic_paper_open",
-            payload=payload,
-            available_at=observed_at,
-            priority=100,
-            producer_identity="platform-bootstrap:diagnostic-paper",
+        queue = DatabaseJobQueue(self.engine)
+        job_id = f"diagnostic-paper:open:{product_id}"
+        try:
+            queue.enqueue_if_absent(
+                job_id=job_id,
+                name="diagnostic_paper_open",
+                payload=payload,
+                available_at=observed_at,
+                priority=100,
+                producer_identity="platform-bootstrap:diagnostic-paper",
+            )
+        except ValueError as exc:
+            if not str(
+                exc
+            ) == f"job identity collision: {job_id}" or not self._historical_diagnostic_job(
+                job_id,
+                product_id=product_id,
+            ):
+                raise
+
+    def _historical_diagnostic_job(self, job_id: str, *, product_id: str) -> bool:
+        with self.engine.connect() as connection:
+            row = (
+                connection.execute(
+                    select(job.c.name, job.c.state, job.c.payload).where(job.c.id == job_id)
+                )
+                .mappings()
+                .first()
+            )
+        if row is None or str(row["name"]) != "diagnostic_paper_open":
+            return False
+        payload = row["payload"]
+        return (
+            str(row["state"]) in {"pending", "running", "completed"}
+            and isinstance(payload, Mapping)
+            and payload.get("schema") == "platform.diagnostic_paper/v1"
+            and payload.get("diagnostic") is True
+            and payload.get("product_id") == product_id
         )
 
     def _save_account_snapshot(
