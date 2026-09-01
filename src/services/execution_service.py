@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from decimal import Decimal
 from typing import Protocol
 
-from src.accounting.fees import FeeConversionError, convert_fee
+from src.accounting.fees import FeeConversionError, convert_fee, instrument_asset
 from src.accounting.ledger import Ledger
 from src.domain._codec import timestamp
 from src.domain.orders import Fill, OrderIntent
@@ -327,8 +327,4 @@ class ExecutionService:
 
 
 def _instrument_asset(instrument_id: str, asset: str) -> str | None:
-    symbol = str(instrument_id).rsplit(":", 1)[-1].upper()
-    for quote in ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH"):
-        if symbol.endswith(quote) and len(symbol) > len(quote):
-            return symbol[: -len(quote)] if asset == "base" else quote
-    return None
+    return instrument_asset(instrument_id, asset)

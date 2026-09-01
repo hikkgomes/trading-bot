@@ -12,6 +12,32 @@ class FeeConversionError(ValueError):
     """A fee cannot be valued in the configured accounting asset."""
 
 
+_KNOWN_QUOTES = ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH")
+
+
+def instrument_asset(instrument_id: str, asset: str) -> str | None:
+    """Extract the base or quote asset from exchange and canonical symbols."""
+
+    symbol = str(instrument_id).strip().upper()
+    if ":" in symbol and "/" in symbol:
+        symbol = symbol.split(":", 1)[0]
+    if "/" in symbol:
+        base, quote = symbol.split("/", 1)
+        return base if asset == "base" else quote if asset == "quote" else None
+    parts = symbol.split(":")
+    symbol = parts[-2] if len(parts) >= 2 and parts[-1] in _KNOWN_QUOTES else parts[-1]
+    for quote in _KNOWN_QUOTES:
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            return (
+                symbol[: -len(quote)]
+                if asset == "base"
+                else quote
+                if asset == "quote"
+                else None
+            )
+    return None
+
+
 @dataclass(frozen=True)
 class FeeConversion:
     fee_asset: str

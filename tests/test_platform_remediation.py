@@ -7,7 +7,7 @@ import pyarrow.parquet as pq
 import pytest
 from sqlalchemy import select, update
 
-from src.accounting.fees import FeeConversionError, convert_fee
+from src.accounting.fees import FeeConversionError, convert_fee, instrument_asset
 from src.data.database import (
     PlatformDatabase,
     cost_model_manifest,
@@ -614,6 +614,15 @@ def test_runtime_fee_conversion_is_explicit_and_accounting_asset_bound() -> None
             accounting_asset="USDT",
             trade_price=100.0,
         )
+
+
+def test_instrument_asset_parsing_handles_canonical_futures_symbols() -> None:
+    instrument = "binance:futures:BTCUSDT:USDT"
+
+    assert instrument_asset(instrument, "base") == "BTC"
+    assert instrument_asset(instrument, "quote") == "USDT"
+    assert instrument_asset("BTC/USDT:USDT", "base") == "BTC"
+    assert instrument_asset("BTC/USDT:USDT", "quote") == "USDT"
 
 
 def test_btc_accounting_allows_initial_stablecoin_deployment_with_reserve() -> None:

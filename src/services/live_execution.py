@@ -14,7 +14,7 @@ from typing import Any, cast
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
-from src.accounting.fees import FeeConversion, FeeConversionError, convert_fee
+from src.accounting.fees import FeeConversion, FeeConversionError, convert_fee, instrument_asset
 from src.data.database import account_snapshot
 from src.data.database import instrument as instrument_table
 from src.domain._codec import canonical_hash, timestamp, to_primitive
@@ -342,8 +342,11 @@ class ApprovedLiveExecution:
         self, product_id: str, order: OrderIntent, fills: tuple[BrokerFill, ...]
     ) -> int:
         existing = {item.fill_id for item in self.order_manager.fills_for(order.order_id)}
+        existing_fills = self.order_manager.fills_for(order.order_id)
         recovered = 0
         for broker_fill in fills:
+            if _matches_existing_recovered_fill(existing_fills, broker_fill):
+                continue
             conversion = self.fee_conversion_metadata(
                 product_id,
                 order.instrument_id,
@@ -353,9 +356,7 @@ class ApprovedLiveExecution:
             )
             fill = _domain_fill(order, broker_fill, metadata=conversion)
             current = self.order_manager.get(order.order_id)
-            if fill.fill_id in existing or _matches_existing_recovered_fill(
-                self.order_manager.fills_for(order.order_id), broker_fill
-            ):
+            if fill.fill_id in existing:
                 continue
             if current.status is OrderStatus.RECOVERY_REQUIRED:
                 pass
@@ -390,6 +391,7 @@ class ApprovedLiveExecution:
                     ledger=ledger,
                 ).record_execution_costs(current, fill, previous_position=previous)
             existing.add(fill.fill_id)
+            existing_fills = (*existing_fills, fill)
             recovered += 1
         return recovered
 
@@ -1250,11 +1252,7 @@ def _load_instruments(engine: Engine) -> dict[str, Instrument]:
 
 
 def _instrument_asset(instrument_id: str, asset: str) -> str | None:
-    symbol = str(instrument_id).rsplit(":", 1)[-1].upper()
-    for quote in ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH"):
-        if symbol.endswith(quote) and len(symbol) > len(quote):
-            return symbol[: -len(quote)] if asset == "base" else quote
-    return None
+    return instrument_asset(instrument_id, asset)
 
 
 def _exchange_config(account: Mapping[str, Any], *, market: str) -> ExchangeConfig:
