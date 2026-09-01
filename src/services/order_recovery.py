@@ -49,6 +49,8 @@ class DatabaseLiveRecoveryWorker:
             product_id = str(claimed.payload.get("product_id") or "")
             if not product_id:
                 product_id = self.account_products[str(claimed.payload["account_id"])]
+            if claimed.name == "live_account_backfill" and self.backfill_account is None:
+                raise RuntimeError("periodic live backfill has no account backfill handler")
             backfill = (
                 self.backfill_account(product_id, now)
                 if self.backfill_account is not None
