@@ -792,6 +792,23 @@ def test_registered_strategy_behaviour_is_shared_by_research_and_dispatch() -> N
     assert dispatched["execution_receipt"]["behaviour_hash"] == artefact.behaviour_hash
 
 
+def test_registered_strategy_behaviour_rejects_stale_source_identity() -> None:
+    candidates = registered_strategy_candidates(
+        product="active_income",
+        dataset_snapshot_hashes=("sha256:" + "b" * 64,),
+        instrument_universe=("BTCUSDT",),
+    )
+    candidate = next(item for item in candidates if item.definition.identity == "sma_cross")
+    behaviour = RegisteredStrategyBehaviour(
+        name="sma_cross",
+        parameters=candidate.definition.signal_model["parameters"],
+        source_hash="sha256:" + "f" * 64,
+    )
+
+    with pytest.raises(ValueError, match="source identity is stale"):
+        behaviour.generate_signals([{"close": 1.0}])
+
+
 def test_btc_accounting_measures_sell_rebuy_in_btc_and_counts_costs() -> None:
     report = BtcAccumulationAccounting().evaluate(
         initial_btc=1.0,

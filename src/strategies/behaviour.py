@@ -194,6 +194,16 @@ class RegisteredStrategyBehaviour:
 
         if frame is None or not hasattr(frame, "__len__"):
             raise StrategyBehaviourError("registered strategy requires an immutable market frame")
+        try:
+            from src.research.catalogue import registered_strategy_source_hash
+
+            current_source_hash = registered_strategy_source_hash(self.name)
+        except (ImportError, KeyError, TypeError, ValueError) as exc:
+            raise StrategyBehaviourError(
+                "registered strategy source identity is unavailable"
+            ) from exc
+        if current_source_hash != self.source_hash:
+            raise StrategyBehaviourError("registered strategy source identity is stale")
         if isinstance(frame, list | tuple):
             if not frame or not all(isinstance(row, Mapping) for row in frame):
                 raise StrategyBehaviourError("market frame rows must be objects")
