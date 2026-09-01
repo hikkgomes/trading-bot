@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1961,6 +1962,52 @@ def test_ccxt_futures_entry_rechecks_flatness_immediately_before_create_order(
         broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=0.1))
 
     assert broker._client.created == []
+
+
+def test_ccxt_futures_entry_reads_raw_position_risk_when_flat_position_is_filtered():
+    from src.execution.ccxt_broker import CcxtBroker
+
+    raw_calls = []
+    fake_client = SimpleNamespace(
+        fetch_ticker=lambda _symbol: {"last": 100.0},
+        set_margin_mode=lambda _margin_mode, _symbol: None,
+        set_leverage=lambda _leverage, _symbol: None,
+        set_position_mode=lambda _hedged, _symbol: None,
+        fetch_position_mode=lambda _symbol: {"hedged": False},
+        fetch_open_orders=lambda _symbol, **_kwargs: [],
+        fetch_positions=lambda _symbols: [],
+        fapiPrivateV3GetPositionRisk=lambda params: (
+            raw_calls.append(params)
+            or [
+                {
+                    "symbol": "BTCUSDT",
+                    "marginType": "isolated",
+                    "leverage": "1",
+                    "positionAmt": "0.0000",
+                    "entryPrice": "0.00000",
+                }
+            ]
+        ),
+        create_order=lambda **kwargs: {
+            "average": 100.0,
+            "filled": kwargs["amount"],
+            "fee": {"cost": 0.1},
+        },
+    )
+
+    broker = CcxtBroker.__new__(CcxtBroker)
+    broker.config = ExchangeConfig(
+        exchange="binanceusdm",
+        market_type="futures",
+        live=True,
+        max_notional_usd=1000,
+        max_futures_leverage=1,
+    )
+    broker.name = "fake"
+    broker._client = fake_client
+    broker.place_order(Order("BTCUSDT", OrderSide.BUY, qty=0.1))
+
+    assert raw_calls == [{"symbol": "BTCUSDT"}]
 
 
 def test_ccxt_futures_open_order_refuses_when_leverage_cannot_be_set():

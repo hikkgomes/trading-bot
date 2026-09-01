@@ -942,13 +942,55 @@ class CcxtBroker(Broker):
             ) from exc
         if not isinstance(positions, list):
             raise RuntimeError("Refusing futures entry: position-settings response must be a list.")
-        position = self._matching_position_settings(
-            positions, client_symbol=client_symbol, symbol=symbol
+        position = (
+            self._matching_position_settings(positions, client_symbol=client_symbol, symbol=symbol)
+            if positions
+            else self._raw_futures_position_settings(client_symbol=client_symbol, symbol=symbol)
         )
         raw_info = position.get("info")
-        info = raw_info if isinstance(raw_info, dict) else {}
+        info = raw_info if isinstance(raw_info, dict) else position
         self._assert_isolated_margin(position, info)
         self._assert_leverage_readback(position, info)
+
+    def _raw_futures_position_settings(self, *, client_symbol: str, symbol: str) -> dict:
+        """Read zero-size position settings omitted by CCXT's unified response."""
+
+        readers = (
+            getattr(self._client, "fapiPrivateV3GetPositionRisk", None),
+            getattr(self._client, "fapiPrivateV2GetPositionRisk", None),
+        )
+        reader = next((item for item in readers if callable(item)), None)
+        if reader is None:
+            raise RuntimeError(
+                "Refusing futures entry: exchange did not return exactly one matching "
+                "position-settings record"
+            )
+        market = getattr(self, "_precision_markets", {}).get(client_symbol)
+        exchange_symbol = (
+            str(market.get("id") or "") if isinstance(market, dict) else ""
+        ) or symbol.replace("/", "").split(":", 1)[0].upper()
+        try:
+            payload = reader({"symbol": exchange_symbol})
+        except Exception as exc:
+            raise RuntimeError(
+                f"Refusing futures entry: could not read raw position settings: {exc}"
+            ) from exc
+        if not isinstance(payload, list):
+            raise RuntimeError(
+                "Refusing futures entry: raw position-settings response must be a list."
+            )
+        matches = tuple(
+            item
+            for item in payload
+            if isinstance(item, dict)
+            and str(item.get("symbol") or "").upper() == exchange_symbol.upper()
+        )
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Refusing futures entry: exchange did not return exactly one matching "
+                "position-settings record"
+            )
+        return matches[0]
 
     @staticmethod
     def _matching_position_settings(
