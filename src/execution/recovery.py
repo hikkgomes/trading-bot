@@ -130,6 +130,45 @@ class SqlRecoveryStore:
                 plans.append(RecoveryPlan(**values))
             return tuple(plans)
 
+    def resolve(self, plan_id: str, *, resolved_at: str, verification_hash: str) -> str:
+        plan_id = str(plan_id).strip()
+        if not plan_id:
+            raise ValueError("recovery plan identity cannot be empty")
+        resolved_at = timestamp(resolved_at, field="recovery resolution time")
+        verification_hash = str(verification_hash).strip()
+        if not verification_hash.startswith("sha256:") or len(verification_hash) != 71:
+            raise ValueError("recovery verification hash must be a sha256 identity")
+        with self.engine.begin() as connection:
+            if (
+                connection.execute(
+                    select(reconciliation_event.c.id).where(reconciliation_event.c.id == plan_id)
+                ).first()
+                is None
+            ):
+                raise KeyError(f"recovery plan does not exist: {plan_id}")
+            payload = {
+                "record_type": "recovery_resolution",
+                "recovery_plan_id": plan_id,
+                "resolved_at": resolved_at,
+                "verification_hash": verification_hash,
+            }
+            identity = canonical_hash(payload)
+            existing = connection.execute(
+                select(reconciliation_event.c.payload).where(reconciliation_event.c.id == identity)
+            ).scalar_one_or_none()
+            if existing is not None:
+                if dict(existing) != payload:
+                    raise ValueError("recovery resolution identity collision")
+                return identity
+            connection.execute(
+                insert(reconciliation_event).values(
+                    id=identity,
+                    created_at=resolved_at,
+                    payload=payload,
+                )
+            )
+            return identity
+
 
 def plan_recovery(
     result: ReconciliationResult,

@@ -486,10 +486,21 @@ class DatabasePlatformReport:
 
     def _unresolved_recovery(self) -> dict[str, Any]:
         plans = []
+        resolved_plan_ids: set[str] = set()
         for row in self._rows(reconciliation_event):
             payload = row.get("payload")
-            if isinstance(payload, dict) and payload.get("record_type") == "recovery_plan":
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("record_type") == "recovery_resolution":
+                plan_id = str(payload.get("recovery_plan_id") or "")
+                if plan_id:
+                    resolved_plan_ids.add(plan_id)
+            elif (
+                payload.get("record_type") == "recovery_plan"
+                and str(row["id"]) not in resolved_plan_ids
+            ):
                 plans.append({"plan_id": row["id"], **dict(payload.get("plan") or {})})
+        plans = [plan for plan in plans if plan["plan_id"] not in resolved_plan_ids]
         recovery_orders = _latest_statuses(
             self._rows(exchange_order), key="order_id", status="recovery_required"
         )

@@ -570,16 +570,23 @@ def test_live_recovery_worker_reconciles_missing_exchange_order(tmp_path: Path):
         available_at=NOW,
     )
     actions = []
+    reconciliation_calls = 0
+
+    def reconcile_product(_product_id):
+        nonlocal reconciliation_calls
+        reconciliation_calls += 1
+        return reconcile_account(
+            local_positions={},
+            exchange_positions={},
+            local_open_order_ids={"missing-order"} if reconciliation_calls == 1 else set(),
+            exchange_open_order_ids=set(),
+        )
+
     worker = DatabaseLiveRecoveryWorker(
         queue=queue,
         worker_id="linux-optiplex:execution-engine",
         store=SqlRecoveryStore(database.engine),
-        reconcile_product=lambda _product_id: reconcile_account(
-            local_positions={},
-            exchange_positions={},
-            local_open_order_ids={"missing-order"},
-            exchange_open_order_ids=set(),
-        ),
+        reconcile_product=reconcile_product,
         account_products={"binance-futures-main": "active_income"},
         execute_action=lambda product_id, action: actions.append(
             (product_id, action.action_type.value, action.target)
@@ -595,6 +602,8 @@ def test_live_recovery_worker_reconciles_missing_exchange_order(tmp_path: Path):
     assert plans[0].actions[0].action_type is RecoveryActionType.RECONCILE_ORDER
     assert plans[0].actions[0].target == "missing-order"
     assert actions == [("active_income", "reconcile_order", "missing-order")]
+    assert result["resolution_id"].startswith("sha256:")
+    assert DatabasePlatformReport(database.engine)._unresolved_recovery()["count"] == 0
 
 
 def test_live_recovery_worker_verifies_a_user_stream_reconnect_without_difference(

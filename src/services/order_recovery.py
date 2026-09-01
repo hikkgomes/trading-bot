@@ -6,7 +6,7 @@ import datetime as dt
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from src.domain._codec import timestamp
+from src.domain._codec import canonical_hash, timestamp
 from src.execution.reconciler import ReconciliationResult
 from src.execution.recovery import RecoveryAction, SqlRecoveryStore, plan_recovery
 from src.services.scheduler import DatabaseJobQueue
@@ -72,6 +72,23 @@ class DatabaseLiveRecoveryWorker:
                 action_results = tuple(
                     dict(self.execute_action(product_id, action)) for action in plan.actions
                 )
+                verification = self.reconcile_product(product_id)
+                if not verification.recovery_required:
+                    resolution_id = self.store.resolve(
+                        plan.plan_id,
+                        resolved_at=now,
+                        verification_hash=canonical_hash(
+                            {
+                                "product_id": product_id,
+                                "recovery_plan_id": plan.plan_id,
+                                "matched": verification.matched,
+                            }
+                        ),
+                    )
+                else:
+                    resolution_id = None
+            else:
+                resolution_id = None
         except Exception as exc:
             self.queue.fail(
                 claimed,
@@ -98,6 +115,7 @@ class DatabaseLiveRecoveryWorker:
             "actions": len(plan.actions),
             "operator_review_required": plan.requires_operator_review,
             "action_results": list(action_results),
+            "resolution_id": resolution_id,
             **({"backfill": dict(backfill)} if backfill is not None else {}),
         }
 
