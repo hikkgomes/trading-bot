@@ -240,6 +240,12 @@ class DatabaseResearchJobHandlers:
         thesis_registry = SqlThesisRegistry(self.store.engine)
         for thesis in theses.values():
             thesis_registry.register(thesis)
+        if product_id == "active_income" and len(universe) > 1:
+            for symbol in universe:
+                for thesis in registered_strategy_theses(
+                    product=product_id, instrument_universe=(symbol,)
+                ).values():
+                    thesis_registry.register(thesis)
         candidates = registered_strategy_candidates(
             product=product_id,
             dataset_snapshot_hashes=snapshot_ids,

@@ -579,6 +579,7 @@ class CanonicalResearchDatasetBuilder:
     def _bar_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
         market_frame = [dict(row) for row in rows]
         aligned_returns: list[float] = []
+        funding_rates: list[float] = []
         previous_by_instrument: dict[str, float] = {}
         history_by_instrument: dict[str, list[float]] = {}
         feature_rows: list[dict[str, Any]] = []
@@ -589,6 +590,9 @@ class CanonicalResearchDatasetBuilder:
             previous = previous_by_instrument.get(instrument)
             row_return = close_value / previous - 1.0 if previous and close_value else 0.0
             aligned_returns.append(row_return)
+            funding_rates.append(
+                _signed_numeric(row.get("funding_rate", row.get("funding")), default=0.0)
+            )
             feature_rows.append(_bar_feature_row(row, close_value, row_return, history))
             if close_value > 0.0:
                 history.append(close_value)
@@ -597,6 +601,7 @@ class CanonicalResearchDatasetBuilder:
             "bars": market_frame,
             "market_frame": market_frame,
             "returns": aligned_returns[1:],
+            "funding_rates": funding_rates,
             "feature_rows": feature_rows,
             "independent_units": len(market_frame),
             "data_quality": {
