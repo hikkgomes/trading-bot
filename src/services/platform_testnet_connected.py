@@ -355,6 +355,12 @@ def _prepare_rehearsal_runtime(
     now: str,
     notional_usd: float,
 ) -> dict[str, Any]:
+    market = "spot" if account.get("market") == "spot" else "futures"
+    market_symbol = str((product.get("live_exchange_symbols") or ["BTCUSDT"])[0])
+    market_price = CcxtBroker(_exchange_config(account, market=market)).get_price(market_symbol)
+    if market_price <= 0:
+        raise ConnectedTestnetError("testnet market price is not positive")
+    now = utc_now()
     initial_account = AccountReconciliationService(
         engine=database.engine,
         products={product_id: product},
@@ -363,12 +369,6 @@ def _prepare_rehearsal_runtime(
     _assert_initial_account_clean(initial_account, account=account)
     account_detail = initial_account["accounts"][0]
     initial_positions = dict(account_detail.get("positions") or {})
-    market = "spot" if account.get("market") == "spot" else "futures"
-    market_symbol = str((product.get("live_exchange_symbols") or ["BTCUSDT"])[0])
-    market_price = CcxtBroker(_exchange_config(account, market=market)).get_price(market_symbol)
-    if market_price <= 0:
-        raise ConnectedTestnetError("testnet market price is not positive")
-    now = utc_now()
     state = _refresh_reconciled_state(
         database=database,
         queue=queue,
