@@ -35,7 +35,7 @@ from src.research.accounting import (
 from src.research.artefacts import StrategyArtefact
 from src.research.catalogue import registered_strategy_candidates
 from src.research.coordinator import ResearchCoordinator
-from src.research.dataset_service import DatabaseDatasetBundleService
+from src.research.dataset_service import DatabaseDatasetBundleService, _bounded_instrument_rows
 from src.research.datasets import (
     CORE_RESEARCH_BUNDLE_ROLES,
     CanonicalResearchDatasetBuilder,
@@ -1391,6 +1391,7 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(tmp_path) 
     assert pending.state == "waiting_for_dataset"
     assert pending.reason_code == "historical_history_insufficient"
 
+
     claimed = ClaimedJob(
         job_id="catalogue-service",
         name="register_strategy_catalogue",
@@ -1417,3 +1418,33 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(tmp_path) 
         lambda: claimed,
     )
     assert catalogue["registered_candidates"] > 0
+
+
+def test_dataset_row_budget_preserves_each_instrument_and_history_endpoints() -> None:
+    def rows(instrument_id: str) -> list[dict[str, object]]:
+        return [
+            {
+                "instrument_id": instrument_id,
+                "close_timestamp": f"2026-08-{20 + index:02d}T00:00:00+00:00",
+            }
+            for index in range(10)
+        ]
+
+    sampled = _bounded_instrument_rows(
+        {"instrument-a": rows("instrument-a"), "instrument-b": rows("instrument-b")},
+        maximum_rows=8,
+    )
+
+    assert len(sampled) == 8
+    assert {str(row["instrument_id"]) for row in sampled} == {
+        "instrument-a",
+        "instrument-b",
+    }
+    for instrument_id in ("instrument-a", "instrument-b"):
+        timestamps = [
+            str(row["close_timestamp"])
+            for row in sampled
+            if row["instrument_id"] == instrument_id
+        ]
+        assert timestamps[0] == "2026-08-20T00:00:00+00:00"
+        assert timestamps[-1] == "2026-08-29T00:00:00+00:00"

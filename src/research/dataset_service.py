@@ -102,24 +102,16 @@ class DatabaseDatasetBundleService:
         if feature_id is None or cost_id is None:
             return self._waiting(product_id, "dataset_manifests_unavailable")
         instrument_scope = tuple(item[0] for item in instruments)
-        try:
-            bars, source_hashes = self._load_bars(
-                instruments,
-                market_type=market_type,
-                timeframe=timeframe or self.timeframe,
-                created=created,
-            )
-        except DatasetBundleBuildError as exc:
-            return DatasetBundleBuildResult(
-                state="blocked_dataset",
-                reason_code="bar_partition_invalid",
-                product_id=product_id,
-                detail=str(exc),
-            )
-        if not bars:
-            return self._waiting(product_id, "historical_bars_unavailable")
-        if not _history_span_satisfies(bars, self.minimum_history_days):
-            return self._waiting(product_id, "historical_history_insufficient")
+        prepared = self._prepare_historical_bars(
+            instruments,
+            market_type=market_type,
+            timeframe=timeframe or self.timeframe,
+            created=created,
+            product_id=product_id,
+        )
+        if isinstance(prepared, DatasetBundleBuildResult):
+            return prepared
+        bars, source_hashes = prepared
         try:
             if market_type.lower() == "futures":
                 bars = self._attach_funding_rates(
@@ -130,6 +122,8 @@ class DatabaseDatasetBundleService:
                 )
             _validate_market_bars(bars, market_type=market_type)
         except DatasetBundleBuildError as exc:
+            if str(exc).startswith("historical bars are missing"):
+                return self._waiting(product_id, "historical_bars_incomplete")
             return DatasetBundleBuildResult(
                 state="blocked_dataset",
                 reason_code="bar_quality_invalid",
@@ -270,6 +264,37 @@ class DatabaseDatasetBundleService:
             product_id=product_id,
         )
 
+    def _prepare_historical_bars(
+        self,
+        instruments: tuple[tuple[str, str, str], ...],
+        *,
+        market_type: str,
+        timeframe: str,
+        created: str,
+        product_id: str,
+    ) -> tuple[tuple[dict[str, Any], ...], tuple[str, ...]] | DatasetBundleBuildResult:
+        try:
+            bars, source_hashes = self._load_bars(
+                instruments,
+                market_type=market_type,
+                timeframe=timeframe,
+                created=created,
+            )
+        except DatasetBundleBuildError as exc:
+            if str(exc).startswith("historical bars are missing"):
+                return self._waiting(product_id, "historical_bars_incomplete")
+            return DatasetBundleBuildResult(
+                state="blocked_dataset",
+                reason_code="bar_partition_invalid",
+                product_id=product_id,
+                detail=str(exc),
+            )
+        if not bars:
+            return self._waiting(product_id, "historical_bars_unavailable")
+        if not _history_span_satisfies(bars, self.minimum_history_days):
+            return self._waiting(product_id, "historical_history_insufficient")
+        return bars, source_hashes
+
     def _universe(
         self, universe_id: str, observed_at: str, *, product_id: str
     ) -> tuple[str, tuple[tuple[str, str, str], ...]] | None:
@@ -323,7 +348,7 @@ class DatabaseDatasetBundleService:
         timeframe: str,
         created: str,
     ) -> tuple[tuple[dict[str, Any], ...], tuple[str, ...]]:
-        rows: list[dict[str, Any]] = []
+        rows_by_instrument: dict[str, list[dict[str, Any]]] = {}
         source_hashes: set[str] = set()
         for instrument_id, symbol, venue in instruments:
             root = self.parquet_root / "bars" / venue.lower() / market_type.lower() / symbol.upper()
@@ -342,11 +367,14 @@ class DatabaseDatasetBundleService:
                     and (normalised := _normalise_bar(raw, instrument_id, created)) is not None
                 ]
                 if accepted:
-                    rows.extend(accepted)
+                    rows_by_instrument.setdefault(instrument_id, []).extend(accepted)
                     source_hashes.add(_file_identity(path))
-        rows.sort(key=lambda row: (str(row["close_timestamp"]), str(row["instrument_id"])))
-        if len(rows) > self.maximum_rows:
-            rows = rows[-self.maximum_rows :]
+        missing = sorted({item[0] for item in instruments} - set(rows_by_instrument))
+        if missing:
+            raise DatasetBundleBuildError(
+                "historical bars are missing for instrument scope: " + ", ".join(missing)
+            )
+        rows = _bounded_instrument_rows(rows_by_instrument, maximum_rows=self.maximum_rows)
         return tuple(rows), tuple(sorted(source_hashes))
 
     def _attach_funding_rates(
@@ -433,6 +461,57 @@ def _history_span_satisfies(rows: tuple[dict[str, Any], ...], minimum_days: int)
         max(times) - min(times) >= dt.timedelta(days=minimum_days)
         for times in by_instrument.values()
     )
+
+
+def _bounded_instrument_rows(
+    rows_by_instrument: Mapping[str, list[dict[str, Any]]], *, maximum_rows: int
+) -> list[dict[str, Any]]:
+    """Keep a deterministic, time-spanning sample for every instrument."""
+
+    total = sum(len(rows) for rows in rows_by_instrument.values())
+    if total <= maximum_rows:
+        rows = [row for values in rows_by_instrument.values() for row in values]
+        return sorted(rows, key=lambda row: (str(row["close_timestamp"]), str(row["instrument_id"])))
+    instrument_ids = tuple(sorted(rows_by_instrument))
+    if len(instrument_ids) > maximum_rows:
+        raise DatasetBundleBuildError(
+            "maximum_rows cannot represent every instrument in the scope"
+        )
+    base, remainder = divmod(maximum_rows, len(instrument_ids))
+    quotas = {
+        instrument_id: min(len(rows_by_instrument[instrument_id]), base + (index < remainder))
+        for index, instrument_id in enumerate(instrument_ids)
+    }
+    unused = maximum_rows - sum(quotas.values())
+    while unused:
+        expanded = False
+        for instrument_id in instrument_ids:
+            if quotas[instrument_id] < len(rows_by_instrument[instrument_id]):
+                quotas[instrument_id] += 1
+                unused -= 1
+                expanded = True
+                if not unused:
+                    break
+        if not expanded:
+            break
+    selected = [
+        row
+        for instrument_id in instrument_ids
+        for row in _evenly_sample(rows_by_instrument[instrument_id], quotas[instrument_id])
+    ]
+    return sorted(selected, key=lambda row: (str(row["close_timestamp"]), str(row["instrument_id"])))
+
+
+def _evenly_sample(rows: list[dict[str, Any]], quota: int) -> tuple[dict[str, Any], ...]:
+    ordered = sorted(rows, key=lambda row: str(row["close_timestamp"]))
+    if quota >= len(ordered):
+        return tuple(ordered)
+    if quota < 1:
+        return ()
+    if quota == 1:
+        return (ordered[-1],)
+    indexes = tuple(index * (len(ordered) - 1) // (quota - 1) for index in range(quota))
+    return tuple(ordered[index] for index in indexes)
 
 
 def _validate_market_bars(rows: tuple[dict[str, Any], ...], *, market_type: str) -> None:

@@ -561,6 +561,12 @@ class CanonicalResearchDatasetBuilder:
                 raise DatasetResolutionError(
                     f"dataset data_pending: no available bars for role {role}"
                 )
+            selected_scope = {str(row.get("instrument_id") or row.get("symbol") or "") for row in selected}
+            missing = sorted(scope - selected_scope)
+            if missing:
+                raise DatasetResolutionError(
+                    f"dataset data_pending: missing instruments for role {role}: {', '.join(missing)}"
+                )
             payload_by_role[role] = self._bar_payload(selected)
             availability[role] = created
         return self.build(
