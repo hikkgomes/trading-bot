@@ -40,6 +40,7 @@ from src.data.database import (
 from src.domain._codec import canonical_hash, timestamp
 from src.execution.config import ACCOUNT_FINGERPRINT_PREFIX
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
+from src.research.datasets import dataset_payload_is_non_promotable
 from src.risk.engine import SqlRiskSnapshotStore
 from src.services.config import load_platform_config, load_split_configuration
 from src.services.live_execution import (
@@ -954,26 +955,11 @@ def _ready_dataset_roles(
             continue
         stage_payloads = [snapshots.get(str(snapshot_id)) for snapshot_id in stages.values()]
         if len(stage_payloads) != len(stages) or any(
-            _dataset_snapshot_is_non_production(payload) for payload in stage_payloads
+            dataset_payload_is_non_promotable(payload) for payload in stage_payloads
         ):
             continue
         result.setdefault(product_key, set()).update(str(role) for role in stages)
     return result
-
-
-def _dataset_snapshot_is_non_production(payload: Any) -> bool:
-    if not isinstance(payload, Mapping):
-        return True
-    data = payload.get("payload")
-    return any(
-        isinstance(source, Mapping)
-        and (
-            source.get("synthetic") is True
-            or source.get("diagnostic") is True
-            or source.get("promotable") is False
-        )
-        for source in (payload, data)
-    )
 
 
 def _scheduler_readiness(

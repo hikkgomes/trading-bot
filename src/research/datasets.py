@@ -30,6 +30,24 @@ DATASET_ROLES = frozenset(
     }
 )
 
+
+def dataset_payload_is_non_promotable(payload: Any) -> bool:
+    """Identify diagnostic or synthetic data that cannot support authority."""
+
+    if not isinstance(payload, Mapping):
+        return True
+    data = payload.get("payload")
+    return any(
+        isinstance(source, Mapping)
+        and (
+            source.get("synthetic") is True
+            or source.get("diagnostic") is True
+            or source.get("promotable") is False
+        )
+        for source in (payload, data)
+    )
+
+
 CORE_RESEARCH_BUNDLE_ROLES = (
     "screening",
     "development",
@@ -684,9 +702,26 @@ class SqlDatasetBundleRepository:
                     bundle = self.get(str(bundle_id))
                 except (DatasetResolutionError, KeyError):
                     continue
-                if bundle.lifecycle_state is DatasetLifecycleState.READY:
+                if (
+                    bundle.lifecycle_state is DatasetLifecycleState.READY
+                    and self._bundle_is_promotable(bundle)
+                ):
                     return bundle
         return None
+
+    def _bundle_is_promotable(self, bundle: DatasetBundle) -> bool:
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(dataset_snapshot.c.payload).where(
+                    dataset_snapshot.c.id.in_(tuple(bundle.stage_snapshot_ids.values()))
+                )
+            ).scalars()
+            payloads = tuple(rows)
+        return (
+            bool(payloads)
+            and len(payloads) == len(bundle.stage_snapshot_ids)
+            and all(not dataset_payload_is_non_promotable(payload) for payload in payloads)
+        )
 
     def get(self, bundle_id: str) -> DatasetBundle:
         bundle_id = _identity(bundle_id, field="bundle_id")

@@ -20,6 +20,7 @@ from src.research.accounting import (
 from src.research.artefacts import StrategyArtefact
 from src.research.catalogue import registered_strategy_candidates
 from src.research.datasets import (
+    CORE_RESEARCH_BUNDLE_ROLES,
     CanonicalResearchDatasetBuilder,
     DatasetLifecycleState,
     DatasetResolutionError,
@@ -959,3 +960,35 @@ def test_readiness_excludes_synthetic_bundles_and_does_not_require_forward_data(
     ]
     assert _ready_dataset_roles([bundle], synthetic) == {}
     assert identity.startswith("sha256:")
+
+
+def test_latest_ready_bundle_excludes_synthetic_diagnostic_data(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'diagnostic.sqlite3'}")
+    database.create_schema()
+    identity = "sha256:" + "e" * 64
+    intervals = {
+        role: {
+            "start": f"2026-08-{26 + index:02d}T00:00:00+00:00",
+            "end": f"2026-08-{27 + index:02d}T00:00:00+00:00",
+        }
+        for index, role in enumerate(CORE_RESEARCH_BUNDLE_ROLES)
+    }
+    builder = CanonicalResearchDatasetBuilder(database.engine)
+    bundle = builder.build(
+        "active_income",
+        intervals=intervals,
+        payload_by_role={
+            role: {"bars": [1], "diagnostic": True, "synthetic": True}
+            for role in CORE_RESEARCH_BUNDLE_ROLES
+        },
+        universe_snapshot_id=identity,
+        feature_manifest_id=identity,
+        cost_model_id=identity,
+        parameter_set_id=identity,
+        instrument_scope=("BTCUSDT",),
+        availability_timestamp=NOW,
+        created_at=NOW,
+    )
+
+    assert SqlDatasetBundleRepository(database.engine).get(bundle.bundle_id) == bundle
+    assert SqlDatasetBundleRepository(database.engine).latest_ready("active_income", at=NOW) is None
