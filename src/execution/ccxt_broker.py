@@ -89,20 +89,28 @@ class CcxtBroker(Broker):
     ) -> BrokerOrderState:
         if not exchange_order_id and not client_order_id:
             raise RuntimeError("exchange order lookup requires an exchange or client order ID")
+        payload = self._fetch_order_state(
+            symbol=symbol,
+            exchange_order_id=exchange_order_id,
+            client_order_id=client_order_id,
+        )
+        return self._parse_order_state(
+            payload,
+            exchange_order_id=exchange_order_id,
+            client_order_id=client_order_id,
+        )
+
+    def _fetch_order_state(
+        self, *, symbol: str, exchange_order_id: str, client_order_id: str
+    ) -> dict | None:
         responses = getattr(self, "_submission_responses", {})
         cached = responses.get(exchange_order_id)
         if cached is None and client_order_id:
-
-            def response_client_id(response: dict) -> str:
-                raw_info = response.get("info")
-                info = raw_info if isinstance(raw_info, dict) else {}
-                return str(response.get("clientOrderId") or info.get("clientOrderId") or "")
-
             cached = next(
                 (
                     response
                     for response in responses.values()
-                    if response_client_id(response) == client_order_id
+                    if self._response_client_id(response) == client_order_id
                 ),
                 None,
             )
@@ -112,24 +120,51 @@ class CcxtBroker(Broker):
             payload = fetch(exchange_order_id, self._ccxt_symbol(symbol), params)
         else:
             payload = cached
-        if not isinstance(payload, dict):
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _response_client_id(response: dict) -> str:
+        raw_info = response.get("info")
+        info = raw_info if isinstance(raw_info, dict) else {}
+        return str(response.get("clientOrderId") or info.get("clientOrderId") or "")
+
+    @staticmethod
+    def _parse_order_state(
+        payload: dict | None, *, exchange_order_id: str, client_order_id: str
+    ) -> BrokerOrderState:
+        if payload is None:
             raise RuntimeError("exchange order state is unavailable")
         raw_info = payload.get("info")
         info = raw_info if isinstance(raw_info, dict) else {}
         status = str(payload.get("status") or info.get("status") or "unknown").lower()
-        filled = float(payload.get("filled") or info.get("executedQty") or 0.0)
+        try:
+            filled = float(payload.get("filled") or info.get("executedQty") or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("exchange order state has an invalid filled quantity") from exc
+        if not math.isfinite(filled) or filled < 0:
+            raise RuntimeError("exchange order state has an invalid filled quantity")
         average_raw = payload.get("average") or payload.get("price")
-        average = float(average_raw) if average_raw not in {None, ""} and filled > 0 else None
+        try:
+            average = float(average_raw) if average_raw not in {None, ""} and filled > 0 else None
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("exchange order state has an invalid average price") from exc
+        if average is not None and (not math.isfinite(average) or average <= 0):
+            raise RuntimeError("exchange order state has an invalid average price")
         resolved_exchange_order_id = str(
             payload.get("id") or info.get("orderId") or exchange_order_id
-        )
+        ).strip()
+        resolved_client_order_id = str(
+            payload.get("clientOrderId") or info.get("clientOrderId") or client_order_id
+        ).strip()
         if not resolved_exchange_order_id:
             raise RuntimeError("exchange order state has no exchange order ID")
+        if client_order_id and resolved_client_order_id != client_order_id:
+            raise RuntimeError("exchange order state changed the client order ID")
+        if exchange_order_id and resolved_exchange_order_id != exchange_order_id:
+            raise RuntimeError("exchange order state changed the exchange order ID")
         return BrokerOrderState(
             exchange_order_id=resolved_exchange_order_id,
-            client_order_id=str(
-                payload.get("clientOrderId") or info.get("clientOrderId") or client_order_id
-            ),
+            client_order_id=resolved_client_order_id,
             status=status,
             filled_quantity=filled,
             average_price=average,
@@ -151,6 +186,11 @@ class CcxtBroker(Broker):
                 raise RuntimeError("exchange trade history contains a non-object")
             info_value = item.get("info")
             info = info_value if isinstance(info_value, dict) else {}
+            reported_symbol = item.get("symbol") or info.get("symbol")
+            if reported_symbol is not None and not self._symbols_match(
+                str(reported_symbol), symbol
+            ):
+                raise RuntimeError("exchange trade history returned a different symbol")
             raw_order_id = str(item.get("order") or info.get("orderId") or "").strip()
             raw_client_id = str(
                 item.get("clientOrderId") or info.get("clientOrderId") or ""
@@ -546,6 +586,16 @@ class CcxtBroker(Broker):
                 client,
                 ("fetch_open_orders", "fetch_positions"),
                 "Live Binance USD-M client lacks whole-account inventory method(s)",
+            )
+            self._assert_methods(
+                client,
+                (
+                    "fapiPrivatePostAlgoOrder",
+                    "fapiPrivateGetAlgoOrder",
+                    "fapiPrivateGetOpenAlgoOrders",
+                    "fapiPrivateDeleteAlgoOrder",
+                ),
+                "Live Binance USD-M client lacks the Algo Order API method(s)",
             )
 
     @staticmethod

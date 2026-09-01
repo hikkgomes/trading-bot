@@ -17,9 +17,9 @@ from typing import Any
 
 import aiohttp
 
-from src.autopilot.event_capture import EventCaptureConfig, capture
 from src.data.binance_market import normalise_public_event
 from src.data.binance_user_stream import normalise_user_event
+from src.data.event_capture import EventCaptureConfig, capture
 from src.data.parquet_store import DurableMarketBatchSpool, MarketEventBatchSegment
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.market_events import MarketEvent, MarketEventType

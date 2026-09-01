@@ -36,6 +36,7 @@ from src.domain.market_events import MarketEventType
 from src.domain.orders import OrderIntent, OrderSide, OrderType
 from src.execution.broker import (
     BrokerFill,
+    BrokerIncome,
     BrokerOrderState,
     FuturesPositionIdentity,
     OpenOrderIdentity,
@@ -1464,6 +1465,18 @@ def test_approved_live_recovery_applies_rest_trade_fills_to_position_and_ledger(
                 ),
             )
 
+        def query_income(self, **_kwargs):
+            return (
+                BrokerIncome(
+                    income_id="funding-1",
+                    symbol="BTCUSDT",
+                    income_type="FUNDING_FEE",
+                    amount=-0.25,
+                    asset="USDT",
+                    occurred_at=dt.datetime.fromisoformat(NOW).timestamp(),
+                ),
+            )
+
     venue = SimpleNamespace(
         broker=Broker(),
         instruments={"binance:futures:BTCUSDT:USDT": SimpleNamespace(exchange_symbol="BTCUSDT")},
@@ -1489,6 +1502,11 @@ def test_approved_live_recovery_applies_rest_trade_fills_to_position_and_ledger(
         "active-income-portfolio", "binance:futures:BTCUSDT:USDT"
     ).quantity == pytest.approx(-0.01)
     assert len(approved.ledgers["active_income"].entries) == 1
+    first_backfill = approved.backfill_account("active_income", NOW)
+    second_backfill = approved.backfill_account("active_income", NOW)
+    assert first_backfill["recorded"] == 1
+    assert second_backfill["recorded"] == 0
+    assert len(approved.ledgers["active_income"].entries) == 2
 
 
 def test_ccxt_futures_testnet_uses_binance_demo_routing(monkeypatch) -> None:

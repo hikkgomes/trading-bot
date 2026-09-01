@@ -17,8 +17,8 @@ from src.accounting.ledger import Ledger, SqlLedgerStore
 from src.agents.code_worker import AgentCodeWorkflow
 from src.agents.sandbox import SandboxPolicy
 from src.agents.store import SqlAgentStore
-from src.autopilot.event_capture import load_event_capture_config
 from src.data.database import PlatformDatabase, active_strategy_assignment, strategy_artefact
+from src.data.event_capture import load_event_capture_config
 from src.data.feature_store import SqlFeatureStore
 from src.data.parquet_store import PartitionedBacktestStore
 from src.data.universe import SqlUniverseStore

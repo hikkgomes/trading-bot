@@ -395,7 +395,20 @@ class ApprovedLiveExecution:
             raise RuntimeError("account backfill requires a broker income reader and ledger")
         incomes = tuple(query(since=_backfill_since(at)))
         recorded = 0
+        existing_ids = {entry.entry_id for entry in ledger.entries}
         for income in incomes:
+            income_type = income.income_type.casefold()
+            if income_type not in {
+                "funding_fee",
+                "commission",
+                "commission_fee",
+                "realized_pnl",
+                "realised_pnl",
+            }:
+                continue
+            entry_id = f"rest:{income.income_id}"
+            if entry_id in existing_ids:
+                continue
             if income.asset != ledger.accounting_asset:
                 raise RuntimeError("account income requires deterministic asset conversion")
             attribution = {
@@ -404,29 +417,30 @@ class ApprovedLiveExecution:
                 "income_id": income.income_id,
                 "recovered_from_rest": True,
             }
-            if income.income_type.casefold() == "funding_fee":
+            if income_type == "funding_fee":
                 ledger.record_funding(
-                    entry_id=f"rest:{income.income_id}",
+                    entry_id=entry_id,
                     amount=Decimal(str(income.amount)),
                     occurred_at=_epoch_time(income.occurred_at),
                     attribution=attribution,
                 )
-            elif income.income_type.casefold() in {"commission", "commission_fee"}:
+            elif income_type in {"commission", "commission_fee"}:
                 ledger.record_fee(
-                    entry_id=f"rest:{income.income_id}",
+                    entry_id=entry_id,
                     amount=Decimal(str(abs(income.amount))),
                     occurred_at=_epoch_time(income.occurred_at),
                     attribution=attribution,
                 )
-            elif income.income_type.casefold() in {"realized_pnl", "realised_pnl"}:
+            elif income_type in {"realized_pnl", "realised_pnl"}:
                 ledger.record_realised_pnl(
-                    entry_id=f"rest:{income.income_id}",
+                    entry_id=entry_id,
                     amount=Decimal(str(income.amount)),
                     occurred_at=_epoch_time(income.occurred_at),
                     attribution=attribution,
                 )
             else:
                 continue
+            existing_ids.add(entry_id)
             recorded += 1
         return {"product_id": product_id, "income_records": len(incomes), "recorded": recorded}
 

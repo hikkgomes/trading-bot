@@ -16,13 +16,13 @@ from typing import Any
 from sqlalchemy import func, insert, select
 
 from src.accounting.ledger import Ledger, SqlLedgerStore
-from src.autopilot.event_capture import load_event_capture_config
 from src.data.database import (
     PlatformDatabase,
     accounting_entry,
     job,
     platform_rehearsal_report,
 )
+from src.data.event_capture import load_event_capture_config
 from src.data.feature_store import SqlFeatureStore
 from src.domain._codec import canonical_hash
 from src.domain.forecasts import AlphaForecast, ForecastDirection

@@ -167,6 +167,11 @@ class LiveProtectiveStopService:
                     order_id=stop.native_order_id,
                     client_id=stop.native_client_id,
                 )
+                _validate_native(
+                    native,
+                    stop,
+                    symbol=_exchange_symbol(venue, stop.instrument_id),
+                )
                 results.append(self._apply_native_status(product_id, stop, native, at))
             except Exception as exc:
                 self.stop_manager.mark_failure(

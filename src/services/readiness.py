@@ -731,6 +731,21 @@ def _readiness_configuration(
             },
         ),
     ]
+    if live:
+        alerting = config.alerting
+        sink = str(alerting.get("sink") or "").strip().lower()
+        webhook_configured = bool(os.environ.get("TRADING_PLATFORM_ALERT_WEBHOOK_URL", "").strip())
+        checks.append(
+            _check(
+                "external_alert_delivery_configured",
+                not bool(alerting.get("enabled", True)) or sink != "webhook" or webhook_configured,
+                detail={
+                    "enabled": bool(alerting.get("enabled", True)),
+                    "sink": sink,
+                    "webhook_configured": webhook_configured,
+                },
+            )
+        )
     return config, split, checks
 
 
