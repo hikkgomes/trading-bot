@@ -7,6 +7,7 @@ from src.data.database import PlatformDatabase, job
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.domain.orders import OrderSide
 from src.domain.portfolios import TargetPosition
+from src.execution.order_planner import plan_orders
 from src.portfolio.optimiser import PortfolioConstraints, optimise_targets
 from src.products.btc_accumulation import BtcAllocationPolicy, target_btc_allocation
 from src.research.accounting import (
@@ -37,9 +38,8 @@ from src.research.executors import _cross_symbol_stability, _portfolio_overlap, 
 from src.research.objectives import objective_passes
 from src.research.returns import PositionReturnLedger
 from src.services.artefact_dispatcher import ArtefactDispatcher
-from src.services.scheduler import DatabaseJobQueue
 from src.services.order_execution import _validate_btc_spot_orders
-from src.execution.order_planner import plan_orders
+from src.services.scheduler import DatabaseJobQueue
 from src.strategies.behaviour import RegisteredStrategyBehaviour
 
 NOW = "2026-08-30T10:00:00+00:00"

@@ -118,9 +118,7 @@ class ExecutionService:
         )
 
     @staticmethod
-    def _portfolio_trace(
-        instrument_id: str, now: str
-    ) -> DecisionTrace:
+    def _portfolio_trace(instrument_id: str, now: str) -> DecisionTrace:
         return (
             DecisionTrace.start(
                 event_id=f"target:{instrument_id}:{now}", instrument_id=instrument_id

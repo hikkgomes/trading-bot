@@ -106,9 +106,7 @@ class DatabaseMetricsProvider:
         operations = operations if isinstance(operations, Mapping) else {}
         slis = operations.get("slis")
         slis = slis if isinstance(slis, Mapping) else {}
-        for name in (
-            "unresolved_recovery_count",
-        ):
+        for name in ("unresolved_recovery_count",):
             registry.set_gauge(f"platform_{name}", _numeric(slis.get(name)))
         for group, metric in (
             ("stale_account_authority", "platform_stale_account_authority"),

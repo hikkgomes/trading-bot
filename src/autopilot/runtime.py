@@ -675,9 +675,7 @@ def _product_path_errors(
 def _product_identity_errors(product: ProductConfig) -> list[str]:
     errors: list[str] = []
     if product.objective not in {"btc_accumulation", "active_income"}:
-        errors.append(
-            f"{product.name}: objective must be 'btc_accumulation' or 'active_income'"
-        )
+        errors.append(f"{product.name}: objective must be 'btc_accumulation' or 'active_income'")
     if product.market not in {"spot", "futures"}:
         errors.append(f"{product.name}: market must be 'spot' or 'futures'")
     if product.execution_mode not in {"paper", "live"}:
@@ -807,9 +805,7 @@ def _validate_jobs(config: AutopilotConfig) -> list[str]:
             errors.append(f"duplicate job name: {job.name}")
         job_names.add(job.name)
         errors.extend(_job_validation_errors(job))
-        errors.extend(
-            _job_output_collision_errors(job, protected_output_paths, job_output_paths)
-        )
+        errors.extend(_job_output_collision_errors(job, protected_output_paths, job_output_paths))
     return errors
 
 
@@ -1256,9 +1252,7 @@ def _assert_preflight_exchange_limits(
         )
     margin_mode = str(detail.get("futures_margin_mode") or "").lower()
     if margin_mode != "isolated":
-        raise RuntimeError(
-            f"{product.name}: {label} futures margin mode evidence is not isolated."
-        )
+        raise RuntimeError(f"{product.name}: {label} futures margin mode evidence is not isolated.")
 
 
 def _assert_preflight_exchange_evidence(
@@ -1530,9 +1524,7 @@ def _match_preflight_product(
             raise RuntimeError(f"{product.name}: {label} products must contain JSON objects.")
         item_product = item.get("product", {})
         if not isinstance(item_product, dict):
-            raise RuntimeError(
-                f"{product.name}: {label} product payload must be a JSON object."
-            )
+            raise RuntimeError(f"{product.name}: {label} product payload must be a JSON object.")
         if item_product.get("name") == product.name:
             matched = item
             break
@@ -2065,8 +2057,8 @@ def _active_income_portfolio_status(config: AutopilotConfig) -> dict[str, Any]:
     for product in config.products:
         if not product.enabled or product.objective != "active_income":
             continue
-        item, item_positions, item_total, item_equity, item_peak = (
-            _active_income_product_snapshot(product)
+        item, item_positions, item_total, item_equity, item_peak = _active_income_product_snapshot(
+            product
         )
         products[product.name] = item
         positions.extend(item_positions)
@@ -5988,9 +5980,7 @@ def _emit_report_advisory_alerts(
             config.readiness_report_json_file,
         )
     ):
-        readiness_report = json.loads(
-            config.readiness_report_json_file.read_text(encoding="utf-8")
-        )
+        readiness_report = json.loads(config.readiness_report_json_file.read_text(encoding="utf-8"))
         readiness_detail = readiness_warning_detail(readiness_report)
         if readiness_detail["warnings"]:
             report["readiness_alert"] = _emit_runtime_alert(
@@ -6006,9 +5996,7 @@ def _emit_report_advisory_alerts(
         config.operator_report_json_file,
     ):
         return reports_need_refresh
-    operator_report = json.loads(
-        config.operator_report_json_file.read_text(encoding="utf-8")
-    )
+    operator_report = json.loads(config.operator_report_json_file.read_text(encoding="utf-8"))
     for detail_factory, title, report_key in (
         (
             research_handoff_warning_detail,

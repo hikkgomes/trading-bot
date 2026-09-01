@@ -268,9 +268,7 @@ def _parse_settings_line(raw: str, *, line_number: int) -> tuple[str, str] | Non
     if not line or line.startswith("#"):
         return None
     if "=" not in line:
-        raise TelegramError(
-            f"Telegram settings line {line_number} must be a KEY=value assignment"
-        )
+        raise TelegramError(f"Telegram settings line {line_number} must be a KEY=value assignment")
     key, _, raw_value = line.partition("=")
     key = key.strip()
     if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key):
@@ -912,9 +910,7 @@ def _status_research_lines(
     return lines
 
 
-def _status_bridge_lines(
-    snapshot: dict[str, Any], summary: dict[str, Any]
-) -> list[str]:
+def _status_bridge_lines(snapshot: dict[str, Any], summary: dict[str, Any]) -> list[str]:
     lines: list[str] = []
     review = snapshot.get("openclaw_review") or {}
     ingest = snapshot.get("openclaw_ingest") or {}

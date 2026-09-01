@@ -26,7 +26,7 @@ class BtcAllocationPolicy:
         if not 0 <= self.max_tactical_fraction <= 1:
             raise ValueError("max_tactical_fraction must be in [0, 1]")
         if self.core_btc_fraction == 0 and self.max_tactical_fraction > 0:
-                raise ValueError("a tactical BTC sleeve needs a positive neutral allocation")
+            raise ValueError("a tactical BTC sleeve needs a positive neutral allocation")
 
     @property
     def minimum_btc_fraction(self) -> float:

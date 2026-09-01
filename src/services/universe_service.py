@@ -86,9 +86,7 @@ class DatabaseUniverseService:
             )
             if str(payload.get("product_id") or "") == "btc_accumulation":
                 observations = tuple(
-                    item
-                    for item in observations
-                    if item.instrument.exchange_symbol == "BTCUSDT"
+                    item for item in observations if item.instrument.exchange_symbol == "BTCUSDT"
                 )
                 if not observations:
                     raise RuntimeError("BTC accumulation universe has no BTCUSDT observation")

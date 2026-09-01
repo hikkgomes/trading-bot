@@ -1081,12 +1081,15 @@ def _derived_futures_accounting_inputs(
 
 def _futures_frame_inputs(
     context: Mapping[str, Any],
-) -> tuple[
-    tuple[dict[str, Any], ...],
-    list[float],
-    tuple[str, ...],
-    tuple[float, ...],
-] | None:
+) -> (
+    tuple[
+        tuple[dict[str, Any], ...],
+        list[float],
+        tuple[str, ...],
+        tuple[float, ...],
+    ]
+    | None
+):
     rows = _frame_rows(context)
     signals = _numeric_series(context.get("signals"))
     if rows is None or len(rows) != len(signals):
@@ -1155,9 +1158,7 @@ def _futures_fill_event(
     }
 
 
-def _futures_mark_event(
-    observed_at: str, row: Mapping[str, Any], price: float
-) -> dict[str, Any]:
+def _futures_mark_event(observed_at: str, row: Mapping[str, Any], price: float) -> dict[str, Any]:
     return {
         "type": "mark",
         "timestamp": observed_at,

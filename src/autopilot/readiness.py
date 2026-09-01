@@ -115,16 +115,12 @@ def _dynamic_snapshot_valid(
     )
 
 
-def _dynamic_symbol_statuses(
-    config: AutopilotConfig, symbols: list[str]
-) -> dict[str, Any]:
+def _dynamic_symbol_statuses(config: AutopilotConfig, symbols: list[str]) -> dict[str, Any]:
     required = required_indicator_features_by_market(["futures"], jobs=config.jobs)["futures"]
     statuses: dict[str, Any] = {}
     for symbol in symbols:
         market_data = build_market_data_status(market="futures", symbol=symbol)
-        indicators = build_indicator_feature_status(
-            required, market="futures", symbol=symbol
-        )
+        indicators = build_indicator_feature_status(required, market="futures", symbol=symbol)
         statuses[symbol] = {
             "ok": bool(market_data.get("ok") and indicators.get("ok")),
             "market_data": market_data,
@@ -270,7 +266,9 @@ def _memory_cache_status(path: Path, *, backup_writable: bool) -> dict[str, Any]
     return cached
 
 
-def _memory_integrity_status(path: Path, status: dict[str, Any], *, backup_writable: bool) -> dict[str, Any]:
+def _memory_integrity_status(
+    path: Path, status: dict[str, Any], *, backup_writable: bool
+) -> dict[str, Any]:
     global _MEMORY_READINESS_CACHE_KEY, _MEMORY_READINESS_CACHE_VALUE
     try:
         with ExperimentMemory(path, deep_on_open=False) as memory:
@@ -673,9 +671,7 @@ def _generated_batch_status(
     hypotheses, metadata_by_id = prepared
 
     try:
-        hashes, products = _generated_batch_identity_sets(
-            hypotheses, metadata_by_id, factory
-        )
+        hashes, products = _generated_batch_identity_sets(hypotheses, metadata_by_id, factory)
     except (KeyError, TypeError, ValueError) as exc:
         status.update(reason="invalid_strategy_batch", error=f"{type(exc).__name__}: {exc}")
         return status
@@ -813,9 +809,7 @@ def _approval_entry_status(
     actor_issue = None
     revocation_issue = None
     fingerprint_issue = None
-    if entry_status == "approved" and not is_valid_approval_actor(
-        raw_entry.get("approved_by")
-    ):
+    if entry_status == "approved" and not is_valid_approval_actor(raw_entry.get("approved_by")):
         entry_status = "invalid_actor"
         actor_issue = {
             "fingerprint": str(fingerprint),
@@ -1157,9 +1151,7 @@ def _product_environment_checks(
     futures_margin_mode = env.get("FUTURES_MARGIN_MODE", "isolated").strip().lower()
     checks: list[dict[str, Any]] = []
     if errors:
-        checks.append(
-            _check(f"{product.name}: exchange environment values", False, detail=errors)
-        )
+        checks.append(_check(f"{product.name}: exchange environment values", False, detail=errors))
     checks.extend(
         [
             _check(
@@ -1251,9 +1243,7 @@ def _product_readiness(
     checks, artifact_exists = _product_artifact_checks(product)
     if product.execution_mode != "live":
         return checks
-    checks.extend(
-        _product_live_evidence_checks(product, config, artifact_exists=artifact_exists)
-    )
+    checks.extend(_product_live_evidence_checks(product, config, artifact_exists=artifact_exists))
     checks.extend(_product_environment_checks(product, env))
     return checks
 

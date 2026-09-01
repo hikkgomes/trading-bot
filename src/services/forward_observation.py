@@ -200,15 +200,13 @@ class DatabaseForwardObservationWorker:
                 payload = row["payload"]
                 candidate = (
                     payload.get("target")
-                    if isinstance(payload, Mapping)
-                    and isinstance(payload.get("target"), Mapping)
+                    if isinstance(payload, Mapping) and isinstance(payload.get("target"), Mapping)
                     else payload
                 )
                 if not isinstance(candidate, Mapping) or candidate.get("product_id") != product_id:
                     continue
-                if (
-                    strategy_version_id is not None
-                    and not _target_belongs_to_strategy(candidate, strategy_version_id)
+                if strategy_version_id is not None and not _target_belongs_to_strategy(
+                    candidate, strategy_version_id
                 ):
                     continue
                 if instrument_id is not None and candidate.get("instrument_id") not in {

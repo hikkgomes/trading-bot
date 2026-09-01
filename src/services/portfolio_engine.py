@@ -423,7 +423,10 @@ def _target_risk_scopes(
     )
     maximum_position = max(abs(item.target_fraction) for item in targets)
     maximum_funding = max(abs(float(market[item.instrument_id]["funding"])) for item in targets)
-    identity = lambda scope: canonical_hash({"scope": scope, "target_ids": target_ids})
+
+    def identity(scope: str) -> str:
+        return canonical_hash({"scope": scope, "target_ids": target_ids})
+
     return {
         "strategy": {
             "inputs": {

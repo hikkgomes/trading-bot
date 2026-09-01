@@ -728,11 +728,7 @@ def _embedded_preflight_check(
     name: str,
 ) -> dict[str, Any] | None:
     return next(
-        (
-            check
-            for check in checks
-            if isinstance(check, dict) and check.get("name") == name
-        ),
+        (check for check in checks if isinstance(check, dict) and check.get("name") == name),
         None,
     )
 
@@ -965,13 +961,17 @@ def _rehearsal_fill_invalid_reasons(
     elif measurements["entry_side"] != "buy":
         reasons.append("entry_fill_side_not_buy")
     if entry_fill:
-        reasons.extend(_fill_invalid_reasons(entry_fill, label="entry", expected_product=expected_product))
+        reasons.extend(
+            _fill_invalid_reasons(entry_fill, label="entry", expected_product=expected_product)
+        )
     if not close_fill:
         reasons.append("missing_close_fill")
     elif measurements["close_side"] != "sell":
         reasons.append("close_fill_side_not_sell")
     if close_fill:
-        reasons.extend(_fill_invalid_reasons(close_fill, label="close", expected_product=expected_product))
+        reasons.extend(
+            _fill_invalid_reasons(close_fill, label="close", expected_product=expected_product)
+        )
     reasons.extend(
         _fill_qty_mismatch_reasons(
             entry_fill,
@@ -1047,9 +1047,7 @@ def _rehearsal_report_status(
         "clock_skew_seconds": TESTNET_REHEARSAL_CLOCK_SKEW_SECONDS,
         "generated_at": payload.get("generated_at"),
         "product": (
-            measurements["report_product"].get("name")
-            if measurements["report_product"]
-            else None
+            measurements["report_product"].get("name") if measurements["report_product"] else None
         ),
         "report_product": measurements["report_product"],
         "expected_product": measurements["expected_product_payload"],
@@ -1357,11 +1355,7 @@ def _rehearsal_order_parameters(
     stop_trigger_price = _finite_float(
         broker.normalize_order_price(live_product.symbol, raw_stop_trigger_price)
     )
-    if (
-        stop_trigger_price is None
-        or stop_trigger_price <= 0
-        or stop_trigger_price >= float(price)
-    ):
+    if stop_trigger_price is None or stop_trigger_price <= 0 or stop_trigger_price >= float(price):
         raise RuntimeError("broker returned an invalid normalized protective-stop trigger price")
     raw_qty = _order_qty(notional_usd, price)
     normalized_qty = _finite_float(
@@ -1472,7 +1466,9 @@ def _close_rehearsal_position(
     final_position = broker.get_position(live_product.symbol)
     state["final_position"] = final_position
     if not final_position.is_flat:
-        raise RuntimeError(f"position is not flat after reduce-only close: qty {final_position.qty:g}")
+        raise RuntimeError(
+            f"position is not flat after reduce-only close: qty {final_position.qty:g}"
+        )
     placed_stop = state["placed_stop"]
     stop_client_id = state["stop_client_id"]
     cancel_result = broker.cancel_protective_stop(
@@ -1611,9 +1607,7 @@ def _recover_rehearsal_stop(
                     order_id=recovery_cancel.order_id,
                     client_id=stop_client_id,
                 )
-                evidence["recovery_fetched_terminal"] = _protective_order_payload(
-                    recovery_fetched
-                )
+                evidence["recovery_fetched_terminal"] = _protective_order_payload(recovery_fetched)
                 _assert_rehearsal_protective_order_valid(
                     live_product,
                     recovery_fetched,
