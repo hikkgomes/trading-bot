@@ -204,6 +204,11 @@ class DatabaseStrategyEvaluator:
                 "execution_receipt": forecast_values.get("execution_receipt", {}),
                 "parity_receipt": forecast_values.get("parity_receipt"),
                 "semantic_strategy": forecast_values.get("semantic_strategy"),
+                **{
+                    key: forecast_values[key]
+                    for key in ("semantic_group_id", "order_group_key")
+                    if forecast_values.get(key) is not None
+                },
             },
         )
 

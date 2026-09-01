@@ -303,6 +303,8 @@ def _target_metadata(
     }
     if forecast.metadata.get("order_group_key"):
         metadata["order_group_key"] = str(forecast.metadata["order_group_key"])
+    if forecast.metadata.get("semantic_group_id"):
+        metadata["semantic_group_id"] = str(forecast.metadata["semantic_group_id"])
     if forecast.metadata.get("recovery_policy"):
         metadata["recovery_policy"] = str(forecast.metadata["recovery_policy"])
     if forecast.metadata.get("assignment_id"):

@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from src.domain._codec import canonical_hash
+from src.domain.forecasts import AlphaForecast
 from src.strategies.behaviour import (
     RegisteredStrategyBehaviour,
     StrategyBehaviourError,
@@ -15,6 +16,8 @@ from src.strategies.behaviour import (
 )
 from src.strategies.semantic import (
     SEMANTIC_STRATEGIES,
+    HedgedTargets,
+    RankedTargets,
     SemanticEvaluationError,
     semantic_forecast_from_output,
     semantic_input_from_features,
@@ -312,6 +315,13 @@ def _semantic(features: Mapping[str, Any], artefact: Mapping[str, Any]) -> Mappi
     result["behaviour_hash"] = artefact.get("behaviour_hash") or behaviour_hash_for_definition(
         definition
     )
+    if isinstance(output, RankedTargets | HedgedTargets) or (
+        isinstance(output, tuple) and all(isinstance(item, AlphaForecast) for item in output)
+    ):
+        result["semantic_group_id"] = canonical_hash(
+            {"strategy": name, "input_hash": input_hash, "output_hash": output_hash}
+        )
+        result["order_group_key"] = "semantic:" + result["semantic_group_id"]
     parity_payload = {
         "schema": "semantic_parity/v1",
         "behaviour_hash": result["behaviour_hash"],

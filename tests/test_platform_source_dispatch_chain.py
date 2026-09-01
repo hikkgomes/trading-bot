@@ -399,3 +399,8 @@ def test_every_promotable_source_type_runs_a_complete_paper_service_chain(
     assert forecast.direction.value in {"long", "short"}
     assert forecast.metadata["assignment_id"] == assignment_id
     assert forecast.metadata["execution_receipt"]["source_type"] == source_type.value
+    if source_type in {
+        StrategySourceType.CROSS_SECTIONAL,
+        StrategySourceType.RELATIVE_VALUE,
+    }:
+        assert str(forecast.metadata["order_group_key"]).startswith("semantic:sha256:")
