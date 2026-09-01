@@ -9,6 +9,41 @@ from typing import Any
 
 from src.domain._codec import canonical_hash, json_value, non_empty
 
+_UNIVERSE_FIELDS = frozenset(
+    {"type", "symbols", "instrument_ids", "universe_snapshot_id", "snapshot_id", "dynamic"}
+)
+
+
+def _validate_universe(value: Mapping[str, Any], *, product: str) -> None:
+    unknown = sorted(set(value) - _UNIVERSE_FIELDS)
+    if unknown:
+        raise ValueError("universe contains unsupported fields: " + ", ".join(unknown))
+    universe_type = value.get("type")
+    if universe_type is not None and str(universe_type) not in {"fixed", "point_in_time", "dynamic"}:
+        raise ValueError("universe type is unsupported")
+    for field_name in ("symbols", "instrument_ids"):
+        declared = value.get(field_name)
+        if declared is None:
+            continue
+        if (
+            not isinstance(declared, list | tuple)
+            or not declared
+            or any(not str(item).strip() for item in declared)
+            or len({str(item) for item in declared}) != len(declared)
+        ):
+            raise ValueError(f"universe {field_name} must contain unique non-empty values")
+    if universe_type == "point_in_time" and not value.get("universe_snapshot_id"):
+        raise ValueError("point-in-time universes need a universe_snapshot_id")
+    if universe_type == "fixed" and not value.get("symbols") and not value.get("instrument_ids"):
+        raise ValueError("fixed universes need symbols or instrument_ids")
+    if product == "btc_accumulation":
+        symbols = tuple(str(item).upper() for item in value.get("symbols", ()))
+        instrument_ids = tuple(str(item) for item in value.get("instrument_ids", ()))
+        if symbols != ("BTCUSDT",) or (
+            instrument_ids and instrument_ids != ("binance:spot:BTCUSDT",)
+        ):
+            raise ValueError("BTC accumulation definitions require BTCUSDT spot only")
+
 
 class StrategySourceType(StrEnum):
     REGISTERED_PYTHON = "registered_python"
@@ -148,6 +183,7 @@ class StrategyDefinition:
             if not isinstance(value, Mapping):
                 raise ValueError(f"{attribute} must be an object")
             object.__setattr__(self, attribute, json_value(dict(value), field=attribute))
+        _validate_universe(self.universe, product=self.product)
 
     @property
     def strategy_version_id(self) -> str:

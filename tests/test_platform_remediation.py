@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import replace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -314,6 +315,18 @@ def test_active_income_registered_time_series_candidates_are_symbol_isolated() -
     assert all(
         candidate.definition.metadata["research_scope"] == "symbol" for candidate in sma_candidates
     )
+
+
+def test_strategy_universe_rejects_legacy_and_wrong_btc_scope() -> None:
+    definition = registered_strategy_candidates(
+        product="btc_accumulation",
+        dataset_snapshot_hashes=("sha256:" + "1" * 64,),
+    )[0].definition
+
+    with pytest.raises(ValueError, match="unsupported fields"):
+        replace(definition, universe={"symbols": ["BTCUSDT"], "predeclared": True})
+    with pytest.raises(ValueError, match="BTCUSDT spot only"):
+        replace(definition, universe={"symbols": ["ETHUSDT"]})
 
 
 def test_typed_rule_behaviour_has_one_research_and_production_signal_contract() -> None:
