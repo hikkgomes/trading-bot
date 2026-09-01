@@ -40,6 +40,7 @@
     "bootstrap_method": "moving_block_bootstrap_v1",
     "multiple_testing_method": "bailey_lopez_de_prado_dsr_v1",
     "pbo_method": "combinatorial_purged_pbo_v1",
+    "confidence_method": "bootstrap",
     "profiles": [
       {
         "stage": "forward",

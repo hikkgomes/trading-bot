@@ -416,7 +416,9 @@ class EvaluationDecision:
         object.__setattr__(self, "fatal_failures", failures)
         object.__setattr__(self, "diagnostics", diagnostics)
         if self.accepted and failures:
-            raise EvaluationContractError("accepted evaluation decisions cannot have fatal failures")
+            raise EvaluationContractError(
+                "accepted evaluation decisions cannot have fatal failures"
+            )
         if not self.accepted and not failures:
             raise EvaluationContractError("rejected evaluation decisions need a fatal failure")
         if self.next_stage is not None and self.next_stage not in STAGES:
@@ -473,7 +475,12 @@ class EvidencePolicy:
     bootstrap_method: str = "moving_block_bootstrap_v1"
     multiple_testing_method: str = "bailey_lopez_de_prado_dsr_v1"
     pbo_method: str = "combinatorial_purged_pbo_v1"
+    confidence_method: str = "bootstrap"
     profiles: tuple[EvidenceProfile, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.confidence_method not in {"bootstrap", "deflated_sharpe"}:
+            raise EvaluationContractError("confidence_method must be bootstrap or deflated_sharpe")
 
     @classmethod
     def from_configuration(cls, configuration: Mapping[str, Any]) -> EvidencePolicy:
@@ -504,6 +511,7 @@ class EvidencePolicy:
             raise EvaluationContractError(f"invalid research evidence profile: {exc}") from exc
         return cls(
             **{str(key): configuration[key] for key in required},
+            confidence_method=str(configuration.get("confidence_method", "bootstrap")),
             profiles=profiles,
         )
 
@@ -522,6 +530,7 @@ class EvidencePolicy:
                 "bootstrap_method": self.bootstrap_method,
                 "multiple_testing_method": self.multiple_testing_method,
                 "pbo_method": self.pbo_method,
+                "confidence_method": self.confidence_method,
                 "profiles": [profile.to_payload() for profile in self.profiles],
             }
         )
@@ -598,7 +607,7 @@ class EvidencePolicy:
         required_statuses = {
             name: status
             for name, status in statuses.items()
-            if name not in _OPTIONAL_EVIDENCE_VALIDATORS.get(stage, {})
+            if name not in self._optional_evidence_names(stage)
         }
         failures = [
             name
@@ -618,7 +627,7 @@ class EvidencePolicy:
         diagnostics = [
             f"{name}:{status.value}"
             for name, status in statuses.items()
-            if name in _OPTIONAL_EVIDENCE_VALIDATORS.get(stage, {})
+            if name in self._optional_evidence_names(stage)
             and status not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
         ]
         accepted = bool(required_statuses) and not failures
@@ -636,6 +645,16 @@ class EvidencePolicy:
             if accepted
             else None,
         )
+
+    def _optional_evidence_names(self, stage: str) -> frozenset[str]:
+        optional = set(_OPTIONAL_EVIDENCE_VALIDATORS.get(stage, {}))
+        if stage == "robustness":
+            optional.add(
+                "deflated_sharpe"
+                if self.confidence_method == "bootstrap"
+                else "bootstrap_confidence"
+            )
+        return frozenset(optional)
 
     def statuses(
         self,
@@ -1162,12 +1181,20 @@ class ProtectedHoldoutWorker:
         if existing_outcome is not None:
             outcome_payload = existing_outcome.get("payload")
             accepted = bool(existing_outcome.get("accepted"))
-            if not isinstance(outcome_payload, Mapping) or outcome_payload.get("passed") is not accepted:
+            if (
+                not isinstance(outcome_payload, Mapping)
+                or outcome_payload.get("passed") is not accepted
+            ):
                 raise EvaluationContractError("persisted protected outcome is inconsistent")
-            return claim_id, str(existing_outcome["id"]), accepted, {
-                "passed": accepted,
-                "outcome_id": str(existing_outcome["id"]),
-            }
+            return (
+                claim_id,
+                str(existing_outcome["id"]),
+                accepted,
+                {
+                    "passed": accepted,
+                    "outcome_id": str(existing_outcome["id"]),
+                },
+            )
         protected_context: Mapping[str, Any] | None = None
         if self.dataset_resolver is not None:
             if any(value is None for value in self.dataset_identities.values()):
@@ -1386,6 +1413,7 @@ class CanonicalResearchEvaluator:
             "bootstrap_method": self.evidence_policy.bootstrap_method,
             "multiple_testing_method": self.evidence_policy.multiple_testing_method,
             "pbo_method": self.evidence_policy.pbo_method,
+            "confidence_method": self.evidence_policy.confidence_method,
             "negative_controls": list(self._negative_controls(thesis_id)),
             "requested_stage": request.requested_stage,
             "evaluated_at": request.evaluated_at,
@@ -1688,6 +1716,11 @@ class CanonicalResearchEvaluator:
         run_measured, metrics, receipt = self._merge_authoritative_runs(authoritative_runs)
         evidence.update(run_measured)
         required_fields = _REQUIRED_STAGE_FIELDS[stage]
+        required_fields = tuple(
+            field
+            for field in required_fields
+            if field not in self.evidence_policy._optional_evidence_names(stage)
+        )
         requires_objective = _requires_product_objective(candidate)
         if requires_objective and stage in {"development", "robustness", "forward"}:
             required_fields = (*required_fields, "objective_excess_fraction")

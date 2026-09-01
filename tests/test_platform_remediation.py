@@ -305,6 +305,80 @@ def test_evidence_policy_returns_a_structured_next_stage_decision() -> None:
     assert decision.to_payload()["next_stage"] == "development"
 
 
+def test_robustness_uses_one_primary_confidence_gate() -> None:
+    policy = EvidencePolicy(
+        minimum_deflated_sharpe=0.95,
+        minimum_bootstrap_observations=30,
+        confidence_method="bootstrap",
+    )
+    identity = "sha256:" + "b" * 64
+    parity = {
+        "schema": "typed_rule_parity/v1",
+        "behaviour_hash": identity,
+        "input_hash": identity,
+        "signals": [1],
+    }
+    evidence = {
+        "evidence_policy_hash": policy.policy_hash,
+        "data_integrity": {
+            "passed": True,
+            "dataset_snapshot_ids": [identity],
+            "input_hash": identity,
+        },
+        "semantic_parity": {
+            "passed": True,
+            "behaviour_hash": identity,
+            "parity_receipt": {**parity, "receipt_hash": canonical_hash(parity)},
+        },
+        "realistic_costs": {
+            "passed": True,
+            "fee_bps": 1.0,
+            "slippage_bps": 1.0,
+            "funding_rate": 0.0,
+        },
+        "family_evidence": {"passed": True, "family": "time_series"},
+        "walk_forward": {"passed": True, "window_count": 5, "pass_fraction": 0.8},
+        "purged": True,
+        "embargo": 1,
+        "cost_stress": {"passed": True, "return": 0.1},
+        "delay_stress": {"passed": True, "return": 0.1},
+        "adverse_fill_stress": {"passed": True, "return": 0.1},
+        "missing_data_stress": {"passed": True, "return": 0.1},
+        "funding_stress": {"passed": True, "return": 0.1},
+        "monte_carlo_trade_order": {
+            "passed": True,
+            "iterations": 250,
+            "maximum_drawdown": 0.1,
+            "tail_loss": 0.01,
+        },
+        "bootstrap_confidence": {
+            "passed": True,
+            "observations": 30,
+            "lower_bound": 0.1,
+        },
+        "probability_backtest_overfitting": 0.1,
+        "deflated_sharpe": 0.0,
+        "statistical_procedures": {
+            "bootstrap": policy.bootstrap_method,
+            "multiple_testing": policy.multiple_testing_method,
+            "pbo": policy.pbo_method,
+        },
+        "drawdown_stability": {
+            "passed": True,
+            "maximum_drawdown": 0.1,
+            "tail_loss": 0.01,
+        },
+        "null_results": {"passed": True, "tests": 1},
+        "negative_control_results": {},
+    }
+
+    decision = policy.decide("robustness", evidence, ())
+
+    assert decision.accepted is True
+    assert "deflated_sharpe" not in decision.fatal_failures
+    assert "deflated_sharpe:fail" in decision.diagnostics
+
+
 def test_single_symbol_and_empty_portfolio_overlap_are_not_applicable() -> None:
     cross_symbol = _cross_symbol_stability(
         {"instrument_scope": ("BTCUSDT",)},
@@ -414,9 +488,7 @@ def test_typed_rule_behaviour_supports_multi_condition_entries_and_exits() -> No
                 {"feature": "volatility", "operator": "lt", "threshold": 0.5},
             ],
             "condition_mode": "all",
-            "exit_conditions": [
-                {"feature": "volatility", "operator": "ge", "threshold": 0.9}
-            ],
+            "exit_conditions": [{"feature": "volatility", "operator": "ge", "threshold": 0.9}],
             "direction": "long",
         }
     )
@@ -972,6 +1044,7 @@ def test_btc_step_aside_metadata_binds_lot_and_quote_budget() -> None:
     assert metadata["btc_step_aside_quote_proceeds"] == pytest.approx(29.964006)
     assert metadata["btc_quote_reinvest_budget"] == pytest.approx(39.964006)
 
+
 def test_product_objective_rejects_positive_usdt_result_that_loses_btc() -> None:
     assert not objective_passes(
         {
@@ -1509,7 +1582,6 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(tmp_path) 
     assert pending.state == "waiting_for_dataset"
     assert pending.reason_code == "historical_history_insufficient"
 
-
     claimed = ClaimedJob(
         job_id="catalogue-service",
         name="register_strategy_catalogue",
@@ -1560,9 +1632,7 @@ def test_dataset_row_budget_preserves_each_instrument_and_history_endpoints() ->
     }
     for instrument_id in ("instrument-a", "instrument-b"):
         timestamps = [
-            str(row["close_timestamp"])
-            for row in sampled
-            if row["instrument_id"] == instrument_id
+            str(row["close_timestamp"]) for row in sampled if row["instrument_id"] == instrument_id
         ]
         assert timestamps[0] == "2026-08-20T00:00:00+00:00"
         assert timestamps[-1] == "2026-08-29T00:00:00+00:00"
