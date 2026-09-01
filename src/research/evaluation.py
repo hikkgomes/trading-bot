@@ -1063,6 +1063,7 @@ class ProtectedHoldoutWorker:
         evaluator: Callable[[Mapping[str, Any]], tuple[bool, Mapping[str, Any]]],
         *,
         dataset_resolver: CanonicalDatasetResolver | None = None,
+        product_id: str | None = None,
         feature_manifest_id: str | None = None,
         cost_model_id: str | None = None,
         parameter_set_id: str | None = None,
@@ -1070,6 +1071,7 @@ class ProtectedHoldoutWorker:
         self.repository = SqlHoldoutRepository(engine)
         self.evaluator = evaluator
         self.dataset_resolver = dataset_resolver
+        self.product_id = product_id
         self.dataset_identities = {
             "feature_manifest_hash": feature_manifest_id,
             "cost_model_hash": cost_model_id,
@@ -1110,6 +1112,7 @@ class ProtectedHoldoutWorker:
                 )
             protected_context = self.dataset_resolver.resolve_context(
                 snapshot_ids=(dataset_snapshot_id,),
+                product_id=self.product_id,
                 feature_manifest_id=str(self.dataset_identities["feature_manifest_hash"]),
                 cost_model_id=str(self.dataset_identities["cost_model_hash"]),
                 parameter_set_id=str(self.dataset_identities["parameter_set_hash"]),

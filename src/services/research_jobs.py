@@ -812,6 +812,7 @@ class DatabaseResearchJobHandlers:
                 self.store.engine,
                 evaluate_protected,
                 dataset_resolver=resolver,
+                product_id=candidate.definition.product,
                 feature_manifest_id=str(request.feature_manifest_id),
                 cost_model_id=str(request.cost_model_id),
                 parameter_set_id=str(request.parameter_set_id),

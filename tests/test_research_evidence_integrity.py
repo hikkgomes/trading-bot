@@ -87,6 +87,20 @@ def test_development_resolution_cannot_load_protected_data() -> None:
         resolver.resolve_context(snapshot_ids=(protected.snapshot_id,), **kwargs)
 
 
+def test_dataset_resolution_requires_the_requested_product() -> None:
+    development = _dataset("development", "2026-08-22T00:00:00+00:00")
+    resolver = CanonicalDatasetResolver(_DatasetRepository(development))
+    with pytest.raises(DatasetResolutionError, match="product_id does not match"):
+        resolver.resolve_context(
+            snapshot_ids=(development.snapshot_id,),
+            product_id="btc_accumulation",
+            feature_manifest_id=development.feature_manifest_hash,
+            cost_model_id=development.cost_model_hash,
+            parameter_set_id=development.parameter_set_hash,
+            allowed_roles=frozenset({"development"}),
+        )
+
+
 def test_research_stages_select_distinct_dataset_roles() -> None:
     development = canonical_hash({"snapshot": "development"})
     protected = canonical_hash({"snapshot": "protected"})

@@ -1030,6 +1030,7 @@ class CanonicalDatasetResolver:
         self,
         *,
         snapshot_ids: tuple[str, ...],
+        product_id: str | None = None,
         feature_manifest_id: str,
         cost_model_id: str,
         parameter_set_id: str,
@@ -1046,6 +1047,7 @@ class CanonicalDatasetResolver:
             self.resolve(
                 snapshot_id,
                 expected={
+                    **({"product_id": product_id} if product_id is not None else {}),
                     "feature_manifest_hash": feature_manifest_id,
                     "cost_model_hash": cost_model_id,
                     "parameter_set_hash": parameter_set_id,

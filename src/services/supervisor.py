@@ -1077,6 +1077,7 @@ def _research_cycle(
                 allowed_roles = frozenset({role})
         context = dataset_resolver.resolve_context(
             snapshot_ids=snapshot_ids,
+            product_id=str(payload.get("product_id") or "") or None,
             feature_manifest_id=str(payload["feature_manifest_id"]),
             cost_model_id=str(payload["cost_model_id"]),
             parameter_set_id=str(payload["parameter_set_id"]),
