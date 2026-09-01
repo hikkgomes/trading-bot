@@ -41,7 +41,7 @@ class DatabaseLiveRecoveryWorker:
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.lease_seconds,
-            names=("live_order_recovery",),
+            names=("live_order_recovery", "live_account_backfill"),
         )
         if claimed is None:
             return {"reason_code": "live_recovery_queue_empty"}
@@ -64,6 +64,14 @@ class DatabaseLiveRecoveryWorker:
                         "job_id": claimed.job_id,
                         "product_id": product_id,
                         "recovery_kind": "user_stream_reconnect",
+                        **({"backfill": dict(backfill)} if backfill is not None else {}),
+                    }
+                if claimed.name == "live_account_backfill":
+                    self.queue.complete(claimed, completed_at=now)
+                    return {
+                        "reason_code": "live_account_backfill_completed",
+                        "job_id": claimed.job_id,
+                        "product_id": product_id,
                         **({"backfill": dict(backfill)} if backfill is not None else {}),
                     }
                 raise ValueError("recovery job found no exchange-state difference")

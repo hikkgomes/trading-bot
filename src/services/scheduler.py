@@ -75,6 +75,7 @@ AUTONOMOUS_SCHEDULES = (
     ScheduleSpec("forward_paper_observation", 300),
     ScheduleSpec("forward_paper_summary", 900),
     ScheduleSpec("promotion_evaluation", 900),
+    ScheduleSpec("live_account_backfill", 300),
     ScheduleSpec("reporting", 900),
     ScheduleSpec("agent_review", 3600),
     ScheduleSpec("maintenance", 3600),
@@ -200,6 +201,7 @@ class PlatformScheduler:
             "forward_paper_observation": "forward_paper_observation",
             "forward_paper_summary": "forward_paper_summary",
             "promotion_evaluation": "promotion_evaluation",
+            "live_account_backfill": "live_account_backfill",
             "reporting": "reporting",
             "agent_review": "agent_review",
             "maintenance": "maintenance",
@@ -215,6 +217,8 @@ class PlatformScheduler:
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
         if schedule_name in {"reporting", "agent_review", "maintenance"}:
             return self._single_job(schedule_name, product_id, product, now, due_at)
+        if schedule_name == "live_account_backfill" and product.get("execution_mode") != "live":
+            return ()
         if schedule_name == "candidate_generation":
             return self._candidate_generation_jobs(product_id, product, due_at, now)
         if schedule_name in {"bounded_backtest", "event_replay", "ml_research"}:

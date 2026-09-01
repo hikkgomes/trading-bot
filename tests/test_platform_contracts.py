@@ -650,6 +650,44 @@ def test_live_recovery_worker_verifies_a_user_stream_reconnect_without_differenc
     database.dispose()
 
 
+def test_live_recovery_worker_runs_periodic_account_backfill_without_difference(tmp_path: Path):
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'account-backfill.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="linux-optiplex:execution-engine",
+        node_id="linux-optiplex",
+        role="execution-engine",
+        capabilities=("live_account_backfill",),
+        observed_at=NOW,
+    )
+    queue.enqueue(
+        job_id="live-account-backfill-1",
+        name="live_account_backfill",
+        payload={"product_id": "active_income"},
+        available_at=NOW,
+    )
+    worker = DatabaseLiveRecoveryWorker(
+        queue=queue,
+        worker_id="linux-optiplex:execution-engine",
+        store=SqlRecoveryStore(database.engine),
+        reconcile_product=lambda _product_id: reconcile_account(
+            local_positions={},
+            exchange_positions={},
+            local_open_order_ids=set(),
+            exchange_open_order_ids=set(),
+        ),
+        account_products={},
+        backfill_account=lambda _product_id, _at: {"recorded": 2},
+    )
+
+    result = worker.run_once(now=NOW)
+
+    assert result["reason_code"] == "live_account_backfill_completed"
+    assert result["backfill"] == {"recorded": 2}
+    database.dispose()
+
+
 def test_rejected_risk_stops_before_order_planning(tmp_path: Path):
     diagnostic = ExecutionDiagnostic()
     manager = OrderManager(JsonlOrderStore(tmp_path / "orders.jsonl"))

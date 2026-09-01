@@ -270,6 +270,7 @@ def _execution_cycle(
             "execute_targets",
             "live_order_submit",
             "live_order_recovery",
+            "live_account_backfill",
             "user_stream_event",
         ),
         observed_at=utc_now(),

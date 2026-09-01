@@ -137,14 +137,14 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
     scheduled = scheduler.run_once(now=NOW)
     repeated = scheduler.run_once(now=NOW)
 
-    assert scheduled["schedules"] == 13
+    assert scheduled["schedules"] == 14
     assert scheduled["jobs_enqueued"] == 7
     assert repeated["jobs_enqueued"] == 0
     assert scheduled["maintenance"]["reason_code"] == "platform_maintenance_completed"
     with database.engine.connect() as connection:
         assert (
             connection.execute(select(func.count()).select_from(platform_schedule)).scalar_one()
-            == 13
+            == 14
         )
         assert connection.execute(select(func.count()).select_from(job)).scalar_one() == 13
         assert "diagnostic_paper_open" in set(connection.execute(select(job.c.name)).scalars())
