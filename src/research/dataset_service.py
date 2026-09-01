@@ -19,6 +19,7 @@ from src.domain._codec import canonical_hash, timestamp
 from src.research.datasets import (
     CORE_RESEARCH_BUNDLE_ROLES,
     CanonicalResearchDatasetBuilder,
+    DatasetLifecycleState,
     DatasetResolutionError,
 )
 
@@ -232,7 +233,7 @@ class DatabaseDatasetBundleService:
                 created_at=created,
                 engine_version="dataset-service/forward-v1",
                 source_partition_hashes=source_hashes,
-                lifecycle_state="data_pending",
+                lifecycle_state=DatasetLifecycleState.DATA_PENDING,
             )
         except DatasetBundleBuildError as exc:
             return DatasetBundleBuildResult(
