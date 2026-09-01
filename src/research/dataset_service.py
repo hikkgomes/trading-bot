@@ -13,7 +13,13 @@ from typing import Any
 import pyarrow.parquet as pq
 from sqlalchemy import select
 
-from src.data.database import cost_model_manifest, feature_manifest, risk_snapshot
+from src.data.database import (
+    cost_model_manifest,
+    feature_manifest,
+    risk_snapshot,
+    universe_member,
+    universe_snapshot,
+)
 from src.data.universe import SqlUniverseStore
 from src.domain._codec import canonical_hash, timestamp
 from src.products.btc_accumulation import BTC_SPOT_INSTRUMENT_ID
@@ -53,6 +59,14 @@ class DatasetBundleBuildResult:
         }
 
 
+@dataclass(frozen=True)
+class _ResolvedUniverse:
+    latest_snapshot_id: str
+    instruments: tuple[tuple[str, str, str], ...]
+    memberships: tuple[tuple[str, frozenset[str]], ...]
+    snapshot_ids: tuple[str, ...]
+
+
 class DatabaseDatasetBundleService:
     """Resolve point-in-time inputs and publish one immutable stage bundle."""
 
@@ -85,10 +99,13 @@ class DatabaseDatasetBundleService:
         timeframe: str | None = None,
     ) -> DatasetBundleBuildResult:
         created = timestamp(created_at, field="created_at")
-        resolved_universe = self._universe(universe_id, created, product_id=product_id)
+        resolved_universe = self._universe(
+            universe_id, created, product_id=product_id, include_history=True
+        )
         if resolved_universe is None:
             return self._waiting(product_id, "point_in_time_universe_unavailable")
-        universe_snapshot_id, instruments = resolved_universe
+        universe_snapshot_id = resolved_universe.latest_snapshot_id
+        instruments = resolved_universe.instruments
         feature_id = self._latest_manifest(
             feature_manifest,
             created=created,
@@ -132,16 +149,23 @@ class DatabaseDatasetBundleService:
             )
         try:
             intervals = _stage_intervals(bars)
-            bundle = CanonicalResearchDatasetBuilder(self.engine).build_from_bars(
-                product_id,
-                bars=bars,
+            payload_by_role = self._role_payloads(
+                bars,
                 intervals=intervals,
+                memberships=resolved_universe.memberships,
+                snapshot_ids=resolved_universe.snapshot_ids,
+            )
+            bundle = CanonicalResearchDatasetBuilder(self.engine).build(
+                product_id,
+                intervals=intervals,
+                payload_by_role=payload_by_role,
                 universe_snapshot_id=universe_snapshot_id,
                 feature_manifest_id=feature_id,
                 cost_model_id=cost_id,
                 parameter_set_id=_parameter_set_id(product_id),
                 instrument_scope=instrument_scope,
                 created_at=created,
+                availability_timestamp=created,
                 source_partition_hashes=source_hashes,
                 engine_version="dataset-service/v1",
             )
@@ -173,10 +197,13 @@ class DatabaseDatasetBundleService:
         artefact_created = timestamp(artefact_created_at, field="artefact_created_at")
         if artefact_created >= created:
             return self._waiting(product_id, "forward_data_not_available_after_artefact")
-        resolved_universe = self._universe(universe_id, created, product_id=product_id)
+        resolved_universe = self._universe(
+            universe_id, created, product_id=product_id, include_history=False
+        )
         if resolved_universe is None:
             return self._waiting(product_id, "point_in_time_universe_unavailable")
-        universe_snapshot_id, instruments = resolved_universe
+        universe_snapshot_id = resolved_universe.latest_snapshot_id
+        instruments = resolved_universe.instruments
         feature_id = self._latest_manifest(
             feature_manifest,
             created=created,
@@ -294,8 +321,13 @@ class DatabaseDatasetBundleService:
         return bars, source_hashes
 
     def _universe(
-        self, universe_id: str, observed_at: str, *, product_id: str
-    ) -> tuple[str, tuple[tuple[str, str, str], ...]] | None:
+        self,
+        universe_id: str,
+        observed_at: str,
+        *,
+        product_id: str,
+        include_history: bool,
+    ) -> _ResolvedUniverse | None:
         memberships = SqlUniverseStore(self.engine).members_at(
             universe_id=universe_id,
             observed_at=observed_at,
@@ -303,21 +335,157 @@ class DatabaseDatasetBundleService:
         )
         if not memberships:
             return None
-        instruments = tuple(
-            sorted(
-                {
+        current_instruments = {
+            item.instrument.instrument_id: (
+                item.instrument.instrument_id,
+                item.instrument.exchange_symbol,
+                item.instrument.venue,
+            )
+            for item in memberships
+            if product_id != "btc_accumulation"
+            or item.instrument.instrument_id == BTC_SPOT_INSTRUMENT_ID
+        }
+        if not current_instruments:
+            return None
+        if not include_history:
+            return _ResolvedUniverse(
+                latest_snapshot_id=memberships[0].snapshot_id,
+                instruments=tuple(sorted(current_instruments.values())),
+                memberships=(
                     (
-                        item.instrument.instrument_id,
-                        item.instrument.exchange_symbol,
-                        item.instrument.venue,
+                        timestamp(observed_at, field="universe observed_at"),
+                        frozenset(current_instruments),
+                    ),
+                ),
+                snapshot_ids=(memberships[0].snapshot_id,),
+            )
+        history, historical_instruments, snapshot_ids = self._universe_history(
+            universe_id=universe_id,
+            observed_at=observed_at,
+            product_id=product_id,
+        )
+        current_instruments.update(historical_instruments)
+        return _ResolvedUniverse(
+            latest_snapshot_id=memberships[0].snapshot_id,
+            instruments=tuple(sorted(current_instruments.values())),
+            memberships=history,
+            snapshot_ids=snapshot_ids,
+        )
+
+    def _universe_history(
+        self, *, universe_id: str, observed_at: str, product_id: str
+    ) -> tuple[
+        tuple[tuple[str, frozenset[str]], ...],
+        dict[str, tuple[str, str, str]],
+        tuple[str, ...],
+    ]:
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(
+                    universe_snapshot.c.id,
+                    universe_snapshot.c.observed_at,
+                    universe_member.c.instrument_id,
+                    universe_member.c.eligible,
+                    universe_member.c.payload,
+                )
+                .select_from(
+                    universe_snapshot.join(
+                        universe_member,
+                        universe_snapshot.c.id == universe_member.c.snapshot_id,
                     )
-                    for item in memberships
-                    if product_id != "btc_accumulation"
-                    or item.instrument.instrument_id == BTC_SPOT_INSTRUMENT_ID
-                }
+                )
+                .where(
+                    universe_snapshot.c.universe_id == universe_id,
+                    universe_snapshot.c.observed_at <= observed_at,
+                )
+                .order_by(
+                    universe_snapshot.c.observed_at,
+                    universe_snapshot.c.id,
+                    universe_member.c.instrument_id,
+                )
+            ).mappings()
+        memberships: dict[str, set[str]] = {}
+        observed_at_by_snapshot: dict[str, str] = {}
+        instruments: dict[str, tuple[str, str, str]] = {}
+        for row in rows:
+            instrument_id = str(row["instrument_id"])
+            if product_id == "btc_accumulation" and instrument_id != BTC_SPOT_INSTRUMENT_ID:
+                continue
+            snapshot_id = str(row["id"])
+            observed = timestamp(str(row["observed_at"]), field="universe observed_at")
+            observed_at_by_snapshot[snapshot_id] = observed
+            raw_payload = row["payload"]
+            instrument_payload = (
+                raw_payload.get("instrument") if isinstance(raw_payload, Mapping) else None
+            )
+            if isinstance(instrument_payload, Mapping):
+                symbol = str(instrument_payload.get("exchange_symbol") or "")
+                venue = str(instrument_payload.get("venue") or "")
+                if symbol and venue:
+                    instruments[instrument_id] = (instrument_id, symbol, venue)
+            if row["eligible"] is True:
+                memberships.setdefault(snapshot_id, set()).add(instrument_id)
+        history = tuple(
+            (
+                observed_at_by_snapshot[snapshot_id],
+                frozenset(memberships.get(snapshot_id, set())),
+            )
+            for snapshot_id in sorted(
+                observed_at_by_snapshot,
+                key=lambda value: (observed_at_by_snapshot[value], value),
             )
         )
-        return memberships[0].snapshot_id, instruments
+        return (
+            history,
+            instruments,
+            tuple(
+                snapshot_id
+                for snapshot_id, _observed in sorted(
+                    observed_at_by_snapshot.items(), key=lambda item: (item[1], item[0])
+                )
+            ),
+        )
+
+    @staticmethod
+    def _role_payloads(
+        bars: tuple[dict[str, Any], ...],
+        *,
+        intervals: Mapping[str, Mapping[str, str]],
+        memberships: tuple[tuple[str, frozenset[str]], ...],
+        snapshot_ids: tuple[str, ...],
+    ) -> dict[str, dict[str, Any]]:
+        payloads: dict[str, dict[str, Any]] = {}
+        for role, interval in intervals.items():
+            selected = [
+                row
+                for row in bars
+                if interval["start"] <= str(row["close_timestamp"]) < interval["end"]
+                and DatabaseDatasetBundleService._eligible_at(
+                    str(row["instrument_id"]), str(row["close_timestamp"]), memberships
+                )
+            ]
+            if not selected:
+                raise DatasetResolutionError(
+                    f"dataset data_pending: no available bars for role {role}"
+                )
+            payload = CanonicalResearchDatasetBuilder._bar_payload(selected)
+            payload["point_in_time_universe"] = True
+            payload["universe_snapshot_ids"] = list(snapshot_ids)
+            payloads[role] = payload
+        return payloads
+
+    @staticmethod
+    def _eligible_at(
+        instrument_id: str,
+        observed_at: str,
+        memberships: tuple[tuple[str, frozenset[str]], ...],
+    ) -> bool:
+        eligible: frozenset[str] = memberships[0][1] if memberships else frozenset()
+        for snapshot_at, snapshot_members in memberships:
+            if snapshot_at > observed_at:
+                break
+            eligible = snapshot_members
+        return instrument_id in eligible
 
     def _latest_manifest(
         self,

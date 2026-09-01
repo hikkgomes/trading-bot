@@ -1717,6 +1717,131 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(tmp_path) 
     assert catalogue["registered_candidates"] > 0
 
 
+def test_dataset_service_keeps_delisted_symbols_in_their_historical_roles(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'historical-universe.sqlite3'}")
+    database.create_schema()
+    btc = Instrument(
+        venue="binance",
+        market_type=MarketType.SPOT,
+        base_asset="BTC",
+        quote_asset="USDT",
+        settlement_asset=None,
+        exchange_symbol="BTCUSDT",
+        price_precision=2,
+        quantity_precision=6,
+        minimum_quantity=0.000001,
+        minimum_notional=5.0,
+    )
+    eth = Instrument(
+        venue="binance",
+        market_type=MarketType.SPOT,
+        base_asset="ETH",
+        quote_asset="USDT",
+        settlement_asset=None,
+        exchange_symbol="ETHUSDT",
+        price_precision=2,
+        quantity_precision=5,
+        minimum_quantity=0.00001,
+        minimum_notional=5.0,
+    )
+    universe_id = "historical-spot-universe"
+    policy = UniverseEligibilityPolicy()
+
+    def observation(instrument: Instrument) -> InstrumentObservation:
+        return InstrumentObservation(
+            instrument=instrument,
+            listing_age_days=365.0,
+            quote_volume=1_000_000_000.0,
+            trade_count=1_000_000,
+            spread_bps=1.0,
+            open_interest=0.0,
+            funding_rate=0.0,
+            realised_volatility=0.2,
+            depth_notional=10_000_000.0,
+            data_completeness=1.0,
+        )
+
+    store = SqlUniverseStore(database.engine)
+    store.record_snapshot(
+        universe_id=universe_id,
+        observed_at="2026-08-01T00:00:00+00:00",
+        observations=(observation(btc), observation(eth)),
+        policy=policy,
+    )
+    store.record_snapshot(
+        universe_id=universe_id,
+        observed_at="2026-08-03T00:00:00+00:00",
+        observations=(observation(btc),),
+        policy=policy,
+    )
+    feature_id = canonical_hash({"schema": "platform.feature_manifest/v1", "market_type": "spot"})
+    cost_id = canonical_hash({"schema": "platform.cost_model/v1", "product_id": "active_income"})
+    with database.engine.begin() as connection:
+        connection.execute(
+            feature_manifest.insert().values(
+                id=feature_id,
+                created_at=NOW,
+                payload={"schema": "platform.feature_manifest/v1", "market_type": "spot"},
+            )
+        )
+        connection.execute(
+            cost_model_manifest.insert().values(
+                id=cost_id,
+                created_at=NOW,
+                payload={"schema": "platform.cost_model/v1", "product_id": "active_income"},
+            )
+        )
+    root = tmp_path / "data"
+    rows_by_instrument = {
+        btc.instrument_id: (100.0, 101.0, 102.0, 103.0),
+        eth.instrument_id: (10.0, 10.1, 10.2, 10.3),
+    }
+    for item, prices in rows_by_instrument.items():
+        symbol = "BTCUSDT" if item == btc.instrument_id else "ETHUSDT"
+        partition = root / "bars" / "binance" / "spot" / symbol / "1m" / "history"
+        partition.mkdir(parents=True)
+        times = [
+            int(dt.datetime(2026, 8, 1 + index, tzinfo=dt.UTC).timestamp() * 1_000)
+            for index in range(4)
+        ]
+        pq.write_table(
+            pa.table(
+                {
+                    "instrument_id": [item] * 4,
+                    "close_time_ms": times,
+                    "availability_time": [NOW] * 4,
+                    "open": list(prices),
+                    "high": [price + 1.0 for price in prices],
+                    "low": [price - 1.0 for price in prices],
+                    "close": list(prices),
+                    "volume": [10.0] * 4,
+                }
+            ),
+            partition / "bars.parquet",
+        )
+
+    result = DatabaseDatasetBundleService(database.engine, root).run(
+        product_id="active_income",
+        universe_id=universe_id,
+        market_type="spot",
+        created_at=NOW,
+    )
+
+    assert result.state == "ready"
+    bundle = SqlDatasetBundleRepository(database.engine).get(str(result.bundle_id))
+    with database.engine.connect() as connection:
+        payloads = {
+            role: connection.execute(
+                select(dataset_snapshot.c.payload).where(dataset_snapshot.c.id == snapshot_id)
+            ).scalar_one()
+            for role, snapshot_id in bundle.stage_snapshot_ids.items()
+        }
+    screening_rows = payloads["screening"]["payload"]["market_frame"]
+    robustness_rows = payloads["robustness"]["payload"]["market_frame"]
+    assert any(row["instrument_id"] == eth.instrument_id for row in screening_rows)
+    assert all(row["instrument_id"] != eth.instrument_id for row in robustness_rows)
+
+
 def test_dataset_row_budget_preserves_each_instrument_and_history_endpoints() -> None:
     def rows(instrument_id: str) -> list[dict[str, object]]:
         return [
