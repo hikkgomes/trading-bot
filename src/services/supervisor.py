@@ -32,6 +32,7 @@ from src.observability.decision_trace import SqlDecisionTraceStore
 from src.observability.metrics import DatabaseMetricsProvider, build_metrics_server
 from src.observability.reports import DatabasePlatformReport
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
+from src.research.dataset_service import DatabaseDatasetBundleService
 from src.research.datasets import CanonicalDatasetResolver, SqlCanonicalDatasetRepository
 from src.research.evaluation import EvidencePolicy
 from src.research.ml import MlExperimentRunner, ModelArtefactStore, SqlModelArtefactStore
@@ -1069,6 +1070,7 @@ def _research_cycle(
             metadata_store=SqlModelArtefactStore(database.engine),
         ),
         dataset_resolver=dataset_resolver,
+        dataset_bundle_service=DatabaseDatasetBundleService(database.engine, parquet_root),
         dataset_loader=load_research_dataset,
         evidence_policy=evidence_policy,
         configuration=configuration,

@@ -120,7 +120,7 @@ class ResearchWorker:
         self.queue.complete(current, completed_at=utc_now())
         if compute_lease is not None and heavy_compute is not None:
             heavy_compute.release(compute_lease)
-        return {"reason_code": "research_job_completed", "job_id": current.job_id, **result}
+        return _completed_outcome(current.job_id, result)
 
 
 def _add_seconds(value: str, seconds: int) -> str:
@@ -128,3 +128,13 @@ def _add_seconds(value: str, seconds: int) -> str:
 
     parsed = dt.datetime.fromisoformat(value)
     return (parsed + dt.timedelta(seconds=seconds)).replace(microsecond=0).isoformat()
+
+
+def _completed_outcome(job_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    handler_reason = result.pop("reason_code", None)
+    return {
+        "reason_code": "research_job_completed",
+        "job_id": job_id,
+        **result,
+        **({"handler_reason_code": handler_reason} if handler_reason is not None else {}),
+    }

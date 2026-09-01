@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import datetime as dt
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from sqlalchemy import select
 
-from src.data.database import PlatformDatabase, job
+from src.data.database import (
+    PlatformDatabase,
+    cost_model_manifest,
+    dataset_snapshot,
+    feature_manifest,
+    job,
+)
+from src.data.universe import InstrumentObservation, SqlUniverseStore, UniverseEligibilityPolicy
+from src.domain._codec import canonical_hash
 from src.domain.forecasts import AlphaForecast, ForecastDirection
+from src.domain.instruments import Instrument, MarketType
 from src.domain.orders import OrderSide
 from src.domain.portfolios import TargetPosition
 from src.execution.order_planner import plan_orders
@@ -19,6 +32,7 @@ from src.research.accounting import (
 )
 from src.research.artefacts import StrategyArtefact
 from src.research.catalogue import registered_strategy_candidates
+from src.research.dataset_service import DatabaseDatasetBundleService
 from src.research.datasets import (
     CORE_RESEARCH_BUNDLE_ROLES,
     CanonicalResearchDatasetBuilder,
@@ -38,10 +52,12 @@ from src.research.evidence import (
 from src.research.executors import _cross_symbol_stability, _portfolio_overlap, _product_accounting
 from src.research.objectives import objective_passes
 from src.research.returns import PositionReturnLedger
+from src.research.store import SqlResearchStore
 from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.order_execution import _validate_btc_spot_orders
 from src.services.readiness import _dataset_readiness, _ready_dataset_roles
-from src.services.scheduler import DatabaseJobQueue
+from src.services.research_jobs import DatabaseResearchJobHandlers
+from src.services.scheduler import ClaimedJob, DatabaseJobQueue
 from src.strategies.behaviour import RegisteredStrategyBehaviour
 
 NOW = "2026-08-30T10:00:00+00:00"
@@ -992,3 +1008,127 @@ def test_latest_ready_bundle_excludes_synthetic_diagnostic_data(tmp_path) -> Non
 
     assert SqlDatasetBundleRepository(database.engine).get(bundle.bundle_id) == bundle
     assert SqlDatasetBundleRepository(database.engine).latest_ready("active_income", at=NOW) is None
+
+
+def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'dataset-service.sqlite3'}")
+    database.create_schema()
+    instrument = Instrument(
+        venue="binance",
+        market_type=MarketType.SPOT,
+        base_asset="BTC",
+        quote_asset="USDT",
+        settlement_asset=None,
+        exchange_symbol="BTCUSDT",
+        price_precision=2,
+        quantity_precision=6,
+        minimum_quantity=0.000001,
+        minimum_notional=5.0,
+    )
+    universe_id = "service-btc-universe"
+    SqlUniverseStore(database.engine).record_snapshot(
+        universe_id=universe_id,
+        observed_at=NOW,
+        observations=(
+            InstrumentObservation(
+                instrument=instrument,
+                listing_age_days=365.0,
+                quote_volume=1_000_000_000.0,
+                trade_count=1_000_000,
+                spread_bps=1.0,
+                open_interest=0.0,
+                funding_rate=0.0,
+                realised_volatility=0.2,
+                depth_notional=10_000_000.0,
+                data_completeness=1.0,
+            ),
+        ),
+        policy=UniverseEligibilityPolicy(),
+    )
+    feature_id = canonical_hash({"schema": "platform.feature_manifest/v1", "market_type": "spot"})
+    cost_id = canonical_hash({"schema": "platform.cost_model/v1", "product_id": "btc_accumulation"})
+    with database.engine.begin() as connection:
+        connection.execute(
+            feature_manifest.insert().values(
+                id=feature_id,
+                created_at=NOW,
+                payload={"schema": "platform.feature_manifest/v1", "market_type": "spot"},
+            )
+        )
+        connection.execute(
+            cost_model_manifest.insert().values(
+                id=cost_id,
+                created_at=NOW,
+                payload={"schema": "platform.cost_model/v1", "product_id": "btc_accumulation"},
+            )
+        )
+    root = tmp_path / "data"
+    partition = root / "bars" / "binance" / "spot" / "BTCUSDT" / "1m" / "date=2026-08-20"
+    partition.mkdir(parents=True)
+    timestamps = [
+        int(dt.datetime(2026, 8, 20 + index, tzinfo=dt.UTC).timestamp() * 1_000)
+        for index in range(8)
+    ]
+    pq.write_table(
+        pa.table(
+            {
+                "event_id": [f"event-{index}" for index in range(8)],
+                "instrument_id": [instrument.instrument_id] * 8,
+                "close_time_ms": timestamps,
+                "availability_time": [NOW] * 8,
+                "open": [100.0 + index for index in range(8)],
+                "high": [101.0 + index for index in range(8)],
+                "low": [99.0 + index for index in range(8)],
+                "close": [100.0 + index for index in range(8)],
+                "volume": [10.0] * 8,
+            }
+        ),
+        partition / "bars.parquet",
+    )
+
+    result = DatabaseDatasetBundleService(database.engine, root).run(
+        product_id="btc_accumulation",
+        universe_id=universe_id,
+        market_type="spot",
+        created_at=NOW,
+    )
+
+    assert result.state == "ready"
+    assert result.bundle_id is not None
+    assert len(result.source_partition_hashes) == 1
+    bundle = SqlDatasetBundleRepository(database.engine).get(str(result.bundle_id))
+    assert set(bundle.stage_snapshot_ids) == set(CORE_RESEARCH_BUNDLE_ROLES)
+    with database.engine.connect() as connection:
+        snapshot_payload = connection.execute(
+            select(dataset_snapshot.c.payload).where(
+                dataset_snapshot.c.id == bundle.stage_snapshot_ids["screening"]
+            )
+        ).scalar_one()
+    assert snapshot_payload["payload"]["market_frame"]
+
+    claimed = ClaimedJob(
+        job_id="catalogue-service",
+        name="register_strategy_catalogue",
+        payload={
+            "product_id": "btc_accumulation",
+            "instrument_universe": ["BTCUSDT"],
+            "dataset_snapshot_hashes": [],
+            "dataset_bundle_id": None,
+            "universe_id": universe_id,
+            "market_type": "spot",
+            "dataset_timeframe": "1m",
+            "available_at": NOW,
+            "catalogue_submitted_at": NOW,
+        },
+        worker_id="catalogue-worker",
+        attempt=1,
+        lease_expires_at="2026-08-30T10:01:00+00:00",
+    )
+    catalogue = DatabaseResearchJobHandlers(
+        SqlResearchStore(database.engine),
+        dataset_bundle_service=DatabaseDatasetBundleService(database.engine, root),
+    ).register_strategy_catalogue(
+        claimed,
+        lambda: claimed,
+    )
+    assert catalogue["registered_candidates"] > 0

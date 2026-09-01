@@ -23,6 +23,7 @@ from src.research.backtest.event_engine import (
 from src.research.canonical import SqlStrategyArtefactRepository, SqlValidationRepository
 from src.research.catalogue import registered_strategy_candidates, registered_strategy_theses
 from src.research.coordinator import Candidate, CandidateEvaluationView, ResearchCoordinator
+from src.research.dataset_service import DatabaseDatasetBundleService
 from src.research.datasets import (
     CandidateDatasetPlan,
     CanonicalDatasetResolver,
@@ -116,6 +117,7 @@ class DatabaseResearchJobHandlers:
         context_builders: ProviderContextBuilderRegistry | None = None,
         evidence_policy: EvidencePolicy | None = None,
         configuration: Mapping[str, Mapping[str, Any]] | None = None,
+        dataset_bundle_service: DatabaseDatasetBundleService | None = None,
     ):
         self.store = store
         self.artefact_store = artefact_store
@@ -126,6 +128,7 @@ class DatabaseResearchJobHandlers:
         self.context_builders = context_builders or ProviderContextBuilderRegistry.default()
         self.evidence_policy = evidence_policy or EvidencePolicy()
         self.configuration = configuration
+        self.dataset_bundle_service = dataset_bundle_service
 
     def handlers(self) -> dict[str, Callable]:
         return {
@@ -174,13 +177,37 @@ class DatabaseResearchJobHandlers:
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
     ) -> dict[str, Any]:
         renew()
+        product_id = str(claimed.payload["product_id"])
         snapshot_ids = tuple(str(item) for item in claimed.payload["dataset_snapshot_hashes"])
         bundle_id = claimed.payload.get("dataset_bundle_id")
+        if self.dataset_bundle_service is not None and not bundle_id:
+            built = self.dataset_bundle_service.run(
+                product_id=product_id,
+                universe_id=str(claimed.payload.get("universe_id") or ""),
+                market_type=str(claimed.payload.get("market_type") or "futures"),
+                created_at=str(
+                    claimed.payload.get("catalogue_submitted_at")
+                    or claimed.payload.get("available_at")
+                ),
+                timeframe=(
+                    str(claimed.payload["dataset_timeframe"])
+                    if claimed.payload.get("dataset_timeframe") is not None
+                    else None
+                ),
+            )
+            if built.state != "ready" or built.bundle_id is None:
+                return {
+                    "product_id": product_id,
+                    "state": built.state,
+                    "reason_code": built.reason_code,
+                }
+            bundle_id = built.bundle_id
+            snapshot_ids = built.snapshot_ids
         plan = None
         bundle = None
         if not snapshot_ids:
             return {
-                "product_id": str(claimed.payload["product_id"]),
+                "product_id": product_id,
                 "state": "waiting_for_dataset",
                 "reason_code": "canonical_dataset_bundle_unavailable",
             }
@@ -199,28 +226,26 @@ class DatabaseResearchJobHandlers:
         universe = tuple(claimed.payload.get("instrument_universe", ("BTCUSDT",)))
         if not universe:
             return {
-                "product_id": str(claimed.payload["product_id"]),
+                "product_id": product_id,
                 "state": "waiting_for_universe",
                 "reason_code": "point_in_time_universe_unavailable",
             }
-        theses = registered_strategy_theses(
-            product=str(claimed.payload["product_id"]), instrument_universe=universe
-        )
+        theses = registered_strategy_theses(product=product_id, instrument_universe=universe)
         thesis_registry = SqlThesisRegistry(self.store.engine)
         for thesis in theses.values():
             thesis_registry.register(thesis)
         candidates = registered_strategy_candidates(
-            product=str(claimed.payload["product_id"]),
+            product=product_id,
             dataset_snapshot_hashes=snapshot_ids,
-            dataset_bundle_id=(
-                str(claimed.payload["dataset_bundle_id"])
-                if claimed.payload.get("dataset_bundle_id")
-                else None
-            ),
+            dataset_bundle_id=(str(bundle_id) if bundle_id else None),
             universe_snapshot_id=(
-                str(claimed.payload["universe_snapshot_id"])
-                if claimed.payload.get("universe_snapshot_id")
-                else None
+                plan.universe_snapshot_id
+                if plan is not None
+                else (
+                    str(claimed.payload["universe_snapshot_id"])
+                    if claimed.payload.get("universe_snapshot_id")
+                    else None
+                )
             ),
             instrument_universe=universe,
             submitted_at=(

@@ -253,10 +253,10 @@ def test_scheduler_research_jobs_are_processed_automatically(
     results = [research() for _ in range(6)]
 
     assert all(result["reason_code"] == "research_job_completed" for result in results)
-    assert {
-        candidate.definition.product
-        for candidate in SqlResearchStore(database.engine).load_candidates()
-    } == {"btc_accumulation", "active_income"}
+    assert any(
+        result.get("handler_reason_code") == "historical_bars_unavailable" for result in results
+    )
+    assert SqlResearchStore(database.engine).load_candidates() == ()
 
 
 def test_platform_smoke_runs_after_bootstrap(tmp_path: Path) -> None:

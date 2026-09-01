@@ -735,6 +735,7 @@ class PlatformScheduler:
                 "instrument_universe": self._universe_symbols(product_id, product, now),
                 "dataset_snapshot_hashes": snapshot_ids,
                 "dataset_bundle_id": bundle.bundle_id if bundle is not None else None,
+                "dataset_timeframe": str(product.get("dataset_timeframe") or "1m"),
                 "universe_snapshot_id": (
                     bundle.universe_snapshot_id if bundle is not None else None
                 ),
