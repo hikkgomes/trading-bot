@@ -305,7 +305,7 @@ def _prepare_connected_context(
         raise ConnectedTestnetError("connected rehearsal requires PostgreSQL")
     database.assert_migrated()
     now = utc_now()
-    queue = DatabaseJobQueue(database.engine)
+    queue = DatabaseJobQueue(database.engine, claim_scope="connected-testnet-rehearsal")
     order_manager = OrderManager(SqlOrderStore(database.engine))
     positions = PositionManager(SqlPositionStore(database.engine))
     assignment = SqlActiveStrategyAssignmentRepository(database.engine).active(
@@ -413,6 +413,7 @@ def _prepare_rehearsal_runtime(
     accounting_before = _accounting_count(database, product_id=product_id)
     gateway = _connected_gateway(
         database=database,
+        queue=queue,
         config_path=config_path,
         account_payload=account,
     )
@@ -1114,7 +1115,11 @@ def _rehearsal_target_result(
 
 
 def _connected_gateway(
-    *, database: PlatformDatabase, config_path: Path, account_payload: Mapping[str, Any]
+    *,
+    database: PlatformDatabase,
+    queue: DatabaseJobQueue | None = None,
+    config_path: Path,
+    account_payload: Mapping[str, Any],
 ):
     account = UserStreamAccount.from_config(account_payload)
     if account is None:
@@ -1130,8 +1135,11 @@ def _connected_gateway(
             replace(source, url=testnet_urls[source.market]) for source in capture_config.sources
         ),
     )
+    gateway_queue = queue or DatabaseJobQueue(
+        database.engine, claim_scope="connected-testnet-rehearsal"
+    )
     return DatabaseMarketGateway(
-        queue=DatabaseJobQueue(database.engine),
+        queue=gateway_queue,
         capture_config=capture_config,
         accounts=(account,),
         testnet=True,
