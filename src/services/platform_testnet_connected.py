@@ -35,6 +35,7 @@ from src.execution.broker import OrderType as BrokerOrderType
 from src.execution.ccxt_broker import CcxtBroker
 from src.execution.order_manager import OrderManager, SqlOrderStore
 from src.execution.position_manager import PositionManager, SqlPositionStore
+from src.execution.recovery import RecoveryAction, RecoveryActionType
 from src.observability.decision_trace import SqlDecisionTraceStore
 from src.research.canonical import (
     SqlActiveStrategyAssignmentRepository,
@@ -234,7 +235,14 @@ def run_connected_testnet_rehearsal(
             "close_exchange_order_id": closed["exchange_order_id"],
             "open_acknowledged": True,
             "close_acknowledged": True,
-            "user_stream_fill": True,
+            "user_stream_fill": (
+                opened.get("fill_source") == "user_stream"
+                and closed.get("fill_source") == "user_stream"
+            ),
+            "fill_sources": {
+                "open": opened.get("fill_source"),
+                "close": closed.get("fill_source"),
+            },
             "accounting_reconciled": accounting_after > accounting_before,
             "recovery_identifiers": {
                 "open": open_recovery,
@@ -628,6 +636,7 @@ def _open_connected_order(
         artefact_hash=str(assignment["artefact_hash"]),
         reference_price=reference_price,
         rehearsal_id=rehearsal_id,
+        approved_live=approved_live,
     )
     open_quantity = float(order_manager.get(opened["order_id"]).filled_quantity)
     if open_quantity <= 0:
@@ -668,6 +677,7 @@ def _close_connected_order(
     opening_side: OrderSide,
     reference_price: float,
     rehearsal_id: str,
+    approved_live: ApprovedLiveExecution,
 ) -> tuple[dict[str, Any], Mapping[str, Any]]:
     closed = _submit_and_wait(
         order_manager=order_manager,
@@ -686,8 +696,12 @@ def _close_connected_order(
         artefact_hash=str(assignment["artefact_hash"]),
         reference_price=reference_price,
         rehearsal_id=rehearsal_id,
+        approved_live=approved_live,
     )
-    if order_manager.get(closed["order_id"]).status is not OrderStatus.FILLED:
+    closed_order = order_manager.get(closed["order_id"])
+    if closed_order.status not in {OrderStatus.FILLED, OrderStatus.RECONCILED}:
+        raise ConnectedTestnetError("testnet close order was not filled")
+    if closed_order.filled_quantity <= 0:
         raise ConnectedTestnetError("testnet close order was not filled")
     close_recovery = _verify_recovery_lookup(
         venue=live_worker.venues[str(product["product_id"])],
@@ -1189,6 +1203,7 @@ def _submit_and_wait(
     artefact_hash: str,
     reference_price: float,
     rehearsal_id: str,
+    approved_live: ApprovedLiveExecution,
 ) -> dict[str, Any]:
     order = OrderIntent(
         order_id=canonical_hash(
@@ -1237,21 +1252,85 @@ def _submit_and_wait(
         raise ConnectedTestnetError(
             f"durable live submission failed: {submission.get('reason_code')}{detail}"
         )
-    deadline = time.monotonic() + float(os.environ.get("PLATFORM_TESTNET_TIMEOUT_SECONDS", "120"))
+    timeout = float(os.environ.get("PLATFORM_TESTNET_TIMEOUT_SECONDS", "120"))
+    deadline = time.monotonic() + timeout
+    recovery_at = time.monotonic() + min(30.0, timeout)
+    recovery_attempted = False
     while time.monotonic() < deadline:
         user_stream_worker.run_once(now=utc_now())
         accounting_worker.run_once(now=utc_now())
         order_manager.reload()
         current = order_manager.get(order.order_id)
-        if current.status is OrderStatus.FILLED:
+        if current.status in {OrderStatus.FILLED, OrderStatus.RECONCILED}:
             return {
                 "order_id": order.order_id,
                 "exchange_order_id": submission["exchange_order_id"],
                 "client_order_id": submission["client_order_id"],
                 "status": current.status.value,
+                "fill_source": "user_stream",
             }
+        if not recovery_attempted and time.monotonic() >= recovery_at:
+            recovered = _recover_order_from_rest(
+                approved_live=approved_live,
+                product_id=str(product["product_id"]),
+                order_manager=order_manager,
+                order_id=order.order_id,
+            )
+            recovery_attempted = True
+            if recovered is not None:
+                return recovered
         time.sleep(1.0)
+    if not recovery_attempted:
+        recovered = _recover_order_from_rest(
+            approved_live=approved_live,
+            product_id=str(product["product_id"]),
+            order_manager=order_manager,
+            order_id=order.order_id,
+        )
+        if recovered is not None:
+            return recovered
     raise ConnectedTestnetError("no user-stream fill was received before timeout")
+
+
+def _recover_order_from_rest(
+    *,
+    approved_live: ApprovedLiveExecution,
+    product_id: str,
+    order_manager: OrderManager,
+    order_id: str,
+) -> dict[str, Any] | None:
+    order_manager.reload()
+    order = order_manager.get(order_id)
+    if order.status not in {
+        OrderStatus.ACKNOWLEDGED,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.RECOVERY_REQUIRED,
+    }:
+        return None
+    if order.status is not OrderStatus.RECOVERY_REQUIRED:
+        order_manager.recovery_required(order_id)
+    try:
+        recovery = approved_live.recover_action(
+            product_id,
+            RecoveryAction(RecoveryActionType.RECONCILE_ORDER, target=order_id),
+        )
+    except Exception:
+        return None
+    order_manager.reload()
+    recovered = order_manager.get(order_id)
+    if recovered.filled_quantity <= 0 or recovered.status not in {
+        OrderStatus.FILLED,
+        OrderStatus.RECONCILED,
+    }:
+        return None
+    return {
+        "order_id": order_id,
+        "exchange_order_id": str(recovered.metadata.get("exchange_order_id") or ""),
+        "client_order_id": str(recovered.metadata.get("client_order_id") or ""),
+        "status": recovered.status.value,
+        "fill_source": "rest_recovery",
+        "recovery": dict(recovery),
+    }
 
 
 def _verify_recovery_lookup(*, venue, symbol: str, submission: Mapping[str, Any]) -> dict[str, str]:
