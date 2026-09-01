@@ -437,6 +437,11 @@ def _target_value(values: Mapping[str, float], instrument_id: str) -> float:
     if key not in values:
         market_key = "perpetual" if ":futures:" in instrument_id.casefold() else "spot"
         matches = tuple(name for name in values if market_key in str(name).casefold())
+        if not matches:
+            symbol = _instrument_symbol(instrument_id)
+            matches = tuple(
+                name for name in values if _compact_identifier(name) == _compact_identifier(symbol)
+            )
         if len(matches) == 1:
             key = matches[0]
     if key not in values:
@@ -445,6 +450,17 @@ def _target_value(values: Mapping[str, float], instrument_id: str) -> float:
     if not math.isfinite(value):
         raise SemanticEvaluationError("semantic target is not finite")
     return max(-1.0, min(1.0, value))
+
+
+def _instrument_symbol(instrument_id: str) -> str:
+    parts = instrument_id.split(":")
+    if len(parts) >= 3:
+        return parts[2]
+    return instrument_id.split("/", 1)[0]
+
+
+def _compact_identifier(value: object) -> str:
+    return "".join(character for character in str(value).upper() if character.isalnum())
 
 
 def _finite_float(value: Any, *, field: str) -> float:

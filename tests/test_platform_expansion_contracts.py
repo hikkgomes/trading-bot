@@ -88,6 +88,7 @@ from src.strategies.semantic import (
     PointInTimePanel,
     RankedTargets,
     SemanticFamily,
+    semantic_signal,
 )
 
 NOW = dt.datetime(2026, 8, 23, tzinfo=dt.UTC).isoformat()
@@ -956,6 +957,17 @@ def test_every_semantic_alpha_registration_is_typed_deterministic_and_family_spe
             assert output.hedge_error == pytest.approx(0.0)
         else:
             assert output.expected_direction in {-1, 0, 1}
+
+
+def test_semantic_targets_resolve_exchange_symbol_aliases() -> None:
+    assert semantic_signal(
+        RankedTargets(
+            NOW,
+            {"BTCUSDT": 1.0, "ETHUSDT": 0.0},
+            {"BTCUSDT": 0.5, "ETHUSDT": -0.5},
+        ),
+        instrument_id="binance:futures:BTCUSDT:USDT",
+    ) == pytest.approx(0.5)
 
 
 def test_frozen_model_requires_exact_artefact_and_ordered_feature_manifest(tmp_path) -> None:
