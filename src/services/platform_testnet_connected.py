@@ -1232,8 +1232,10 @@ def _submit_and_wait(
     )
     submission = live_worker.run_once(now=now)
     if submission.get("reason_code") != "live_order_acknowledged":
+        detail = str(submission.get("error") or "").strip()
+        detail = f": {detail}" if detail else ""
         raise ConnectedTestnetError(
-            f"durable live submission failed: {submission.get('reason_code')}"
+            f"durable live submission failed: {submission.get('reason_code')}{detail}"
         )
     deadline = time.monotonic() + float(os.environ.get("PLATFORM_TESTNET_TIMEOUT_SECONDS", "120"))
     while time.monotonic() < deadline:
