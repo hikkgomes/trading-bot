@@ -1414,6 +1414,7 @@ class DatabasePromotionWorker:
                     evidence.product_id,
                     at=decision.evaluated_at,
                     assignment_reason=f"canonical promotion: {decision.reason_code}",
+                    portfolio_id=evidence.portfolio_id,
                     strategy_version_id=decision.strategy_version_id,
                     artefact_hash=evidence.strategy_artefact_hash,
                 )
@@ -1441,6 +1442,9 @@ class DatabasePromotionWorker:
                 evidence.product_id,
                 at=decision.evaluated_at,
                 assignment_reason="promotion transition to live",
+                portfolio_id=evidence.portfolio_id,
+                strategy_version_id=decision.strategy_version_id,
+                artefact_hash=evidence.strategy_artefact_hash,
             )
         for instrument_id in evidence.supported_instruments or (None,):
             assignments.assign(
