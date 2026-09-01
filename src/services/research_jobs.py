@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from sqlalchemy import select
@@ -27,6 +27,7 @@ from src.research.dataset_service import DatabaseDatasetBundleService
 from src.research.datasets import (
     CandidateDatasetPlan,
     CanonicalDatasetResolver,
+    DatasetBundle,
     DatasetLifecycleState,
     SqlDatasetBundleRepository,
 )
@@ -104,6 +105,21 @@ _EVIDENCE_UNITS: dict[str, frozenset[str]] = {
 }
 
 
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+@dataclass(frozen=True)
+class _CatalogueDataset:
+    snapshot_ids: tuple[str, ...]
+    bundle: DatasetBundle | None
+    plan: CandidateDatasetPlan | None
+    bundle_id: str | None
+
+
 class DatabaseResearchJobHandlers:
     def __init__(
         self,
@@ -178,51 +194,15 @@ class DatabaseResearchJobHandlers:
     ) -> dict[str, Any]:
         renew()
         product_id = str(claimed.payload["product_id"])
-        snapshot_ids = tuple(str(item) for item in claimed.payload["dataset_snapshot_hashes"])
-        bundle_id = claimed.payload.get("dataset_bundle_id")
-        if self.dataset_bundle_service is not None and not bundle_id:
-            built = self.dataset_bundle_service.run(
-                product_id=product_id,
-                universe_id=str(claimed.payload.get("universe_id") or ""),
-                market_type=str(claimed.payload.get("market_type") or "futures"),
-                created_at=str(
-                    claimed.payload.get("catalogue_submitted_at")
-                    or claimed.payload.get("available_at")
-                ),
-                timeframe=(
-                    str(claimed.payload["dataset_timeframe"])
-                    if claimed.payload.get("dataset_timeframe") is not None
-                    else None
-                ),
-            )
-            if built.state != "ready" or built.bundle_id is None:
-                return {
-                    "product_id": product_id,
-                    "state": built.state,
-                    "reason_code": built.reason_code,
-                }
-            bundle_id = built.bundle_id
-            snapshot_ids = built.snapshot_ids
-        plan = None
-        bundle = None
-        if not snapshot_ids:
-            return {
-                "product_id": product_id,
-                "state": "waiting_for_dataset",
-                "reason_code": "canonical_dataset_bundle_unavailable",
-            }
-        if bundle_id:
-            bundle = SqlDatasetBundleRepository(self.store.engine).get(str(bundle_id))
-            if bundle.lifecycle_state is not DatasetLifecycleState.READY:
-                return {
-                    "product_id": str(claimed.payload["product_id"]),
-                    "state": "waiting_for_dataset",
-                    "reason_code": "canonical_dataset_bundle_not_ready",
-                    "dataset_bundle_id": str(bundle_id),
-                }
-            plan = CandidateDatasetPlan.from_bundle(bundle)
-            if set(snapshot_ids) != set(plan.all_snapshot_ids):
-                raise JobSchemaError("catalogue datasets do not match the canonical bundle")
+        dataset, waiting = self._catalogue_dataset(claimed.payload, product_id=product_id)
+        if waiting is not None:
+            return waiting
+        if dataset is None:
+            raise JobSchemaError("catalogue dataset resolution returned no result")
+        snapshot_ids = dataset.snapshot_ids
+        bundle_id = dataset.bundle_id
+        bundle = dataset.bundle
+        plan = dataset.plan
         universe = tuple(claimed.payload.get("instrument_universe", ("BTCUSDT",)))
         if not universe:
             return {
@@ -241,11 +221,7 @@ class DatabaseResearchJobHandlers:
             universe_snapshot_id=(
                 plan.universe_snapshot_id
                 if plan is not None
-                else (
-                    str(claimed.payload["universe_snapshot_id"])
-                    if claimed.payload.get("universe_snapshot_id")
-                    else None
-                )
+                else _optional_text(claimed.payload.get("universe_snapshot_id"))
             ),
             instrument_universe=universe,
             submitted_at=(
@@ -255,6 +231,8 @@ class DatabaseResearchJobHandlers:
             ),
         )
         if plan is not None:
+            if bundle is None:
+                raise JobSchemaError("catalogue dataset plan has no bundle")
             candidates = tuple(
                 replace(
                     candidate,
@@ -266,6 +244,51 @@ class DatabaseResearchJobHandlers:
             )
         identities = ResearchCoordinator(self.store).register(candidates)
         return {"registered_candidates": len(identities), "candidate_ids": list(identities)}
+
+    def _catalogue_dataset(
+        self, payload: Mapping[str, Any], *, product_id: str
+    ) -> tuple[_CatalogueDataset | None, dict[str, Any] | None]:
+        snapshot_ids = tuple(str(item) for item in payload["dataset_snapshot_hashes"])
+        bundle_id = _optional_text(payload.get("dataset_bundle_id"))
+        if self.dataset_bundle_service is not None and bundle_id is None:
+            built = self.dataset_bundle_service.run(
+                product_id=product_id,
+                universe_id=str(payload.get("universe_id") or ""),
+                market_type=str(payload.get("market_type") or "futures"),
+                created_at=str(
+                    payload.get("catalogue_submitted_at") or payload.get("available_at")
+                ),
+                timeframe=_optional_text(payload.get("dataset_timeframe")),
+            )
+            if built.state != "ready" or built.bundle_id is None:
+                return None, {
+                    "product_id": product_id,
+                    "state": built.state,
+                    "reason_code": built.reason_code,
+                }
+            bundle_id = built.bundle_id
+            snapshot_ids = built.snapshot_ids
+        if not snapshot_ids:
+            return None, {
+                "product_id": product_id,
+                "state": "waiting_for_dataset",
+                "reason_code": "canonical_dataset_bundle_unavailable",
+            }
+        bundle = None
+        plan = None
+        if bundle_id is not None:
+            bundle = SqlDatasetBundleRepository(self.store.engine).get(bundle_id)
+            if bundle.lifecycle_state is not DatasetLifecycleState.READY:
+                return None, {
+                    "product_id": product_id,
+                    "state": "waiting_for_dataset",
+                    "reason_code": "canonical_dataset_bundle_not_ready",
+                    "dataset_bundle_id": bundle_id,
+                }
+            plan = CandidateDatasetPlan.from_bundle(bundle)
+            if set(snapshot_ids) != set(plan.all_snapshot_ids):
+                raise JobSchemaError("catalogue datasets do not match the canonical bundle")
+        return _CatalogueDataset(snapshot_ids, bundle, plan, bundle_id), None
 
     def register_candidate(
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
@@ -445,6 +468,8 @@ class DatabaseResearchJobHandlers:
         candidate = hypothesis.candidate
         if plan.product_id != candidate.definition.product:
             raise JobSchemaError("generated candidate and dataset bundle products differ")
+        if bundle is None:
+            raise JobSchemaError("generated dataset plan has no bundle")
         return replace(
             hypothesis,
             candidate=replace(
@@ -643,10 +668,10 @@ class DatabaseResearchJobHandlers:
                 ),
             )
             try:
-                context = self.context_builders.build(
-                    CandidateEvaluationView.from_candidate(candidate, adaptive_snapshot_ids),
-                    resolved_context,
+                evaluation_view = CandidateEvaluationView.from_candidate(
+                    candidate, adaptive_snapshot_ids
                 )
+                context = self.context_builders.build(evaluation_view, resolved_context)
             except (ExecutorError, KeyError, TypeError, ValueError) as exc:
                 context = {
                     **dict(resolved_context),
