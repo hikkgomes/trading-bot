@@ -23,6 +23,7 @@ from src.data.event_capture import EventCaptureConfig, capture
 from src.data.parquet_store import DurableMarketBatchSpool, MarketEventBatchSegment
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.market_events import MarketEvent, MarketEventType
+from src.execution.rate_limit import ExchangeRateLimiter, shared_exchange_rate_limiter
 from src.services.scheduler import DatabaseJobQueue
 
 _CLOCK_ENDPOINTS = {
@@ -223,11 +224,14 @@ class DatabaseGatewaySink:
 class BinanceUserStreams:
     """Create, keep alive, and reconnect authenticated Binance user streams."""
 
-    def __init__(self) -> None:
+    def __init__(self, rate_limiter: ExchangeRateLimiter | None = None) -> None:
         self._listen_keys: dict[str, str] = {}
         self._refreshed_at: dict[str, float] = {}
         self._connected_accounts: set[str] = set()
         self._connection_lock = threading.Lock()
+        self.rate_limiter = rate_limiter or shared_exchange_rate_limiter(
+            "binance:authenticated-rest"
+        )
 
     def connected(self, account_id: str) -> bool:
         with self._connection_lock:
@@ -259,6 +263,7 @@ class BinanceUserStreams:
         _, websocket_root = _stream_endpoints(account)
         deadline = time.monotonic() + maximum_seconds
         events = 0
+        await asyncio.to_thread(self.rate_limiter.acquire)
         async with session.ws_connect(
             f"{websocket_root}/{listen_key}", heartbeat=30, receive_timeout=90
         ) as websocket:
@@ -313,6 +318,7 @@ class BinanceUserStreams:
         deadline = time.monotonic() + maximum_seconds
         events = 0
         endpoint = _SPOT_TESTNET_USER_STREAM if account.testnet else _SPOT_USER_STREAM
+        await asyncio.to_thread(self.rate_limiter.acquire)
         async with session.ws_connect(endpoint, heartbeat=20, receive_timeout=60) as websocket:
             await websocket.send_json(
                 {
@@ -364,6 +370,7 @@ class BinanceUserStreams:
         refreshed_at = self._refreshed_at.get(account.account_id, 0.0)
         if current and time.monotonic() - refreshed_at < 1_500:
             return current
+        await asyncio.to_thread(self.rate_limiter.acquire)
         method = session.put if current else session.post
         parameters = {"listenKey": current} if current else None
         async with method(endpoint, headers=headers, params=parameters) as response:
@@ -469,7 +476,10 @@ class DatabaseMarketGateway:
         self.testnet = testnet
         self.user_stream_job_name = user_stream_job_name
         self.user_stream_job_prefix = user_stream_job_prefix
-        self.user_streams = BinanceUserStreams()
+        self.rate_limiter = shared_exchange_rate_limiter(
+            f"binance:authenticated-rest:{self.testnet}"
+        )
+        self.user_streams = BinanceUserStreams(self.rate_limiter)
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[dict[str, Any]] | None = None
@@ -705,6 +715,7 @@ class DatabaseMarketGateway:
         status: dict[str, Any] = {}
         endpoints = _TESTNET_CLOCK_ENDPOINTS if self.testnet else _CLOCK_ENDPOINTS
         for market, endpoint in endpoints.items():
+            await asyncio.to_thread(self.rate_limiter.acquire)
             started_ms = time.time_ns() / 1_000_000
             async with session.get(endpoint) as response:
                 response.raise_for_status()

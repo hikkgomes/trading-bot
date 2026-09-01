@@ -263,7 +263,7 @@ def test_scheduler_research_jobs_are_processed_automatically(
 
     assert all(result["reason_code"] == "research_job_completed" for result in results)
     assert any(
-        result.get("handler_reason_code") == "historical_bars_unavailable" for result in results
+        result.get("handler_reason_code") == "historical_bars_incomplete" for result in results
     )
     assert SqlResearchStore(database.engine).load_candidates() == ()
 

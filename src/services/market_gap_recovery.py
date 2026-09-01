@@ -59,9 +59,7 @@ class BinanceMarketGapRepair:
         self.base_urls = {market: str(url).rstrip("/") for market, url in urls.items()}
         self.timeout_seconds = timeout_seconds
         self.clock_ms = clock_ms or (lambda: int(time.time_ns() / 1_000_000))
-        self.rate_limiter = rate_limiter or shared_exchange_rate_limiter(
-            "binance-public-market-repair"
-        )
+        self.rate_limiter = rate_limiter or shared_exchange_rate_limiter("binance:public-rest")
 
     def __call__(self, request: Mapping[str, Any]) -> tuple[MarketEvent, ...]:
         market = str(request.get("market") or "")

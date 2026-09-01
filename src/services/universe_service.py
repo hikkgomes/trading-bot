@@ -15,6 +15,7 @@ import requests
 
 from src.data.universe import InstrumentObservation, SqlUniverseStore, UniverseEligibilityPolicy
 from src.domain.instruments import Instrument, MarketType
+from src.execution.rate_limit import ExchangeRateLimiter, shared_exchange_rate_limiter
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -141,6 +142,7 @@ class BinanceUniverseClient:
         request_weight_budget: int = 1_000,
         maximum_retries: int = 3,
         maximum_concurrency: int = 4,
+        rate_limiter: ExchangeRateLimiter | None = None,
     ) -> None:
         if request_weight_budget < 1 or maximum_retries < 1 or maximum_concurrency < 1:
             raise ValueError("universe client budgets must be positive")
@@ -149,6 +151,7 @@ class BinanceUniverseClient:
         self.request_weight_budget = request_weight_budget
         self.maximum_retries = maximum_retries
         self.maximum_concurrency = maximum_concurrency
+        self.rate_limiter = rate_limiter or shared_exchange_rate_limiter("binance:public-rest")
         self._weight_used = 0
         self._weight_lock = threading.Lock()
         self.last_status: dict[str, Any] = {}
@@ -161,6 +164,7 @@ class BinanceUniverseClient:
             self._weight_used += weight
         for attempt in range(self.maximum_retries):
             try:
+                self.rate_limiter.acquire()
                 base_url = self.base_url
                 if path.startswith("/api/") and base_url == "https://fapi.binance.com":
                     base_url = "https://api.binance.com"
