@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,89 @@ from src.domain._codec import canonical_hash, json_value, non_empty
 
 class StrategyBehaviourError(ValueError):
     """A registered strategy behaviour cannot be evaluated safely."""
+
+
+@dataclass(frozen=True)
+class TypedRuleBehaviour:
+    """Immutable typed-rule behaviour shared by research and production."""
+
+    rule: Mapping[str, Any]
+    contract_version: str = "typed_rule/v1"
+
+    def __post_init__(self) -> None:
+        if self.contract_version != "typed_rule/v1":
+            raise StrategyBehaviourError("unsupported typed-rule behaviour contract")
+        if not isinstance(self.rule, Mapping):
+            raise StrategyBehaviourError("typed strategy rule must be an object")
+        object.__setattr__(self, "rule", json_value(dict(self.rule), field="typed strategy rule"))
+        feature = str(self.rule.get("feature") or "")
+        operator = str(self.rule.get("operator") or "")
+        threshold = self.rule.get("threshold")
+        if not feature or operator not in {"gt", "ge", "lt", "le"}:
+            raise StrategyBehaviourError("typed strategy rule feature or operator is invalid")
+        if isinstance(threshold, bool) or not isinstance(threshold, int | float):
+            raise StrategyBehaviourError("typed strategy rule threshold is invalid")
+        if not math.isfinite(float(threshold)):
+            raise StrategyBehaviourError("typed strategy rule threshold is not finite")
+        direction = str(self.rule.get("direction") or "long")
+        if direction not in {"long", "short", "signed", "market_neutral", "hedged"}:
+            raise StrategyBehaviourError("typed strategy rule direction is invalid")
+
+    @classmethod
+    def from_definition(cls, definition: Any) -> TypedRuleBehaviour:
+        signal_model = (
+            definition.get("signal_model")
+            if isinstance(definition, Mapping)
+            else getattr(definition, "signal_model", None)
+        )
+        rule = signal_model.get("rule") if isinstance(signal_model, Mapping) else None
+        if not isinstance(rule, Mapping):
+            raise StrategyBehaviourError("strategy definition has no typed rule")
+        return cls(rule)
+
+    @property
+    def behaviour_hash(self) -> str:
+        return canonical_hash({"contract_version": self.contract_version, "rule": self.rule})
+
+    def signal(self, features: Mapping[str, Any]) -> int:
+        feature = str(self.rule["feature"])
+        if feature not in features:
+            raise StrategyBehaviourError(f"typed strategy feature is unavailable: {feature}")
+        try:
+            value = float(features[feature])
+        except (TypeError, ValueError) as exc:
+            raise StrategyBehaviourError("typed strategy feature value is invalid") from exc
+        if not math.isfinite(value):
+            raise StrategyBehaviourError("typed strategy feature value is not finite")
+        threshold = float(self.rule["threshold"])
+        passed = {
+            "gt": value > threshold,
+            "ge": value >= threshold,
+            "lt": value < threshold,
+            "le": value <= threshold,
+        }[str(self.rule["operator"])]
+        direction = str(self.rule.get("direction") or "long")
+        return -1 if passed and direction == "short" else 1 if passed else 0
+
+    def generate_signals(self, rows: Any) -> tuple[int, ...]:
+        if hasattr(rows, "to_dict"):
+            rows = rows.to_dict(orient="records")
+        if not isinstance(rows, list | tuple) or not rows:
+            raise StrategyBehaviourError("typed strategy rows must be a non-empty sequence")
+        if not all(isinstance(row, Mapping) for row in rows):
+            raise StrategyBehaviourError("typed strategy rows must be objects")
+        return tuple(self.signal(row) for row in rows)
+
+    def parity_receipt(self, rows: Any) -> Mapping[str, Any]:
+        signals = self.generate_signals(rows)
+        input_payload = rows.to_dict(orient="records") if hasattr(rows, "to_dict") else rows
+        payload = {
+            "schema": "typed_rule_parity/v1",
+            "behaviour_hash": self.behaviour_hash,
+            "input_hash": canonical_hash(input_payload),
+            "signals": list(signals),
+        }
+        return {**payload, "receipt_hash": canonical_hash(payload)}
 
 
 def _hash_identity(value: str, *, field: str) -> str:
@@ -167,6 +251,8 @@ def behaviour_hash_for_definition(definition: Any) -> str:
     )
     if isinstance(signal_model, Mapping) and signal_model.get("registered_strategy"):
         return RegisteredStrategyBehaviour.from_definition(definition).behaviour_hash
+    if isinstance(signal_model, Mapping) and isinstance(signal_model.get("rule"), Mapping):
+        return TypedRuleBehaviour.from_definition(definition).behaviour_hash
     definition_hash = (
         definition.definition_hash
         if hasattr(definition, "definition_hash")

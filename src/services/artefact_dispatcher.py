@@ -10,6 +10,7 @@ from src.domain._codec import canonical_hash
 from src.strategies.behaviour import (
     RegisteredStrategyBehaviour,
     StrategyBehaviourError,
+    TypedRuleBehaviour,
     behaviour_hash_for_definition,
 )
 
@@ -245,28 +246,17 @@ def _agent_registered_python(
 
 
 def _generated_dsl(features: Mapping[str, float], artefact: Mapping[str, Any]) -> Mapping[str, Any]:
-    model = _definition(artefact).get("signal_model")
-    rule = model.get("rule") if isinstance(model, Mapping) else None
-    if not isinstance(rule, Mapping):
-        raise ArtefactDispatchError("generated DSL artefact has no typed rule")
-    value = _feature(features, str(rule.get("feature") or ""))
-    threshold = float(rule.get("threshold", 0.0))
-    operator = str(rule.get("operator") or "")
-    passed = {
-        "gt": value > threshold,
-        "ge": value >= threshold,
-        "lt": value < threshold,
-        "le": value <= threshold,
-    }.get(operator)
-    if passed is None:
-        raise ArtefactDispatchError("generated DSL operator is unsupported")
-    direction = str(rule.get("direction") or "long")
-    if direction not in {"long", "short", "signed", "market_neutral", "hedged"}:
-        raise ArtefactDispatchError("generated DSL direction is unsupported")
-    score = 1.0 if passed else 0.0
-    if direction == "short":
-        score = -score
-    return _forecast(score, artefact)
+    try:
+        behaviour = TypedRuleBehaviour.from_definition(_definition(artefact))
+        signal = behaviour.signal(features)
+    except StrategyBehaviourError as exc:
+        raise ArtefactDispatchError(str(exc)) from exc
+    result = dict(_forecast(float(signal), artefact))
+    result["behaviour_hash"] = behaviour.behaviour_hash
+    result["behaviour_input_hash"] = canonical_hash(
+        {"behaviour_hash": behaviour.behaviour_hash, "features": dict(features)}
+    )
+    return result
 
 
 def _machine_learning(

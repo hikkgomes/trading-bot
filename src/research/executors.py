@@ -20,7 +20,11 @@ from typing import Any, cast
 from src.domain._codec import canonical_hash, json_value
 from src.domain.strategies import StrategySourceType
 from src.research.coordinator import Candidate, CandidateEvaluationView
-from src.strategies.behaviour import RegisteredStrategyBehaviour, StrategyBehaviourError
+from src.strategies.behaviour import (
+    RegisteredStrategyBehaviour,
+    StrategyBehaviourError,
+    TypedRuleBehaviour,
+)
 from src.strategies.semantic import SEMANTIC_STRATEGIES
 
 
@@ -2037,33 +2041,24 @@ def execute_generated_dsl(candidate: Candidate, context: Mapping[str, Any]) -> E
     rule = candidate.definition.signal_model.get("rule")
     if not isinstance(rows, list | tuple) or not isinstance(rule, Mapping):
         raise ExecutorError("DSL execution requires canonical feature_rows and a typed rule")
-    signals = _dsl_signals(rows, rule)
-    return _measured_result(candidate, context, signals)
+    try:
+        behaviour = TypedRuleBehaviour(rule)
+        signals = behaviour.generate_signals(rows)
+        parity = behaviour.parity_receipt(rows)
+    except StrategyBehaviourError as exc:
+        raise ExecutorError(str(exc)) from exc
+    return _measured_result(
+        candidate,
+        {**context, "behaviour_hash": behaviour.behaviour_hash, "parity_receipt": parity},
+        signals,
+    )
 
 
 def _dsl_signals(rows: list[Any] | tuple[Any, ...], rule: Mapping[str, Any]) -> tuple[int, ...]:
-    feature = str(rule.get("feature", ""))
-    operator = str(rule.get("operator", ""))
-    raw_threshold = rule.get("threshold")
-    if isinstance(raw_threshold, bool) or not isinstance(raw_threshold, int | float):
-        raise ExecutorError("DSL rule threshold must be numeric")
-    threshold = float(raw_threshold)
-    operations = {
-        "gt": lambda value: value > threshold,
-        "ge": lambda value: value >= threshold,
-        "lt": lambda value: value < threshold,
-        "le": lambda value: value <= threshold,
-    }
-    if operator not in operations:
-        raise ExecutorError("DSL rule operator is unsupported")
-    direction = str(rule.get("direction") or "long")
-    if direction not in {"long", "short", "signed", "market_neutral", "hedged"}:
-        raise ExecutorError("DSL rule direction is unsupported")
-    sign = -1 if direction == "short" else 1
     try:
-        return tuple(sign if operations[operator](float(row[feature])) else 0 for row in rows)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ExecutorError("DSL rule feature values are invalid") from exc
+        return TypedRuleBehaviour(rule).generate_signals(rows)
+    except StrategyBehaviourError as exc:
+        raise ExecutorError(str(exc)) from exc
 
 
 def execute_machine_learning(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:

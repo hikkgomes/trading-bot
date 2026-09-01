@@ -1420,14 +1420,6 @@ def _forward_decision_checks(
             float(payload.get("risk_budget_available", 0.0)) <= 0.0,
             "risk_budget_unavailable",
         ),
-        (
-            float(payload.get("portfolio_capacity", 0.0)) <= 0.0,
-            "portfolio_capacity_unavailable",
-        ),
-        (
-            float(payload.get("risk_budget_available", 0.0)) <= 0.0,
-            "risk_budget_unavailable",
-        ),
     )
 
 

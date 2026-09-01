@@ -67,7 +67,7 @@ from src.services.order_execution import _validate_btc_spot_orders
 from src.services.readiness import _dataset_readiness, _ready_dataset_roles
 from src.services.research_jobs import DatabaseResearchJobHandlers
 from src.services.scheduler import ClaimedJob, DatabaseJobQueue, PlatformScheduler
-from src.strategies.behaviour import RegisteredStrategyBehaviour
+from src.strategies.behaviour import RegisteredStrategyBehaviour, TypedRuleBehaviour
 
 NOW = "2026-08-30T10:00:00+00:00"
 
@@ -291,6 +291,16 @@ def test_active_income_registered_time_series_candidates_are_symbol_isolated() -
     assert all(
         candidate.definition.metadata["research_scope"] == "symbol" for candidate in sma_candidates
     )
+
+
+def test_typed_rule_behaviour_has_one_research_and_production_signal_contract() -> None:
+    behaviour = TypedRuleBehaviour(
+        {"feature": "bar_return", "operator": "gt", "threshold": 0.0, "direction": "short"}
+    )
+    rows = [{"bar_return": -0.01}, {"bar_return": 0.01}, {"bar_return": 0.0}]
+
+    assert behaviour.generate_signals(rows) == tuple(behaviour.signal(row) for row in rows)
+    assert behaviour.parity_receipt(rows)["behaviour_hash"] == behaviour.behaviour_hash
 
 
 def _evidence_hashes(index: int) -> dict[str, str]:
