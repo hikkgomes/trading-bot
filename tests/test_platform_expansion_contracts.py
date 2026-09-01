@@ -450,6 +450,52 @@ def test_product_promotion_uses_the_declared_objective_instead_of_generic_pnl() 
     assert accepted.next_state is LifecycleState.LIVE_READY
 
 
+def test_disabled_automatic_live_canary_cannot_be_requested_from_promotion_worker() -> None:
+    policy = PromotionPolicy(
+        automatic_paper_promotion=True,
+        automatic_live_canary_promotion=False,
+        canary_capital_limit=0.01,
+        required_forward_evidence_days=30,
+        maximum_drawdown=0.1,
+        maximum_execution_drift=0.1,
+        maximum_model_drift=0.1,
+    )
+    evidence = PromotionEvidence(
+        strategy_artefact_hash="sha256:" + "5" * 64,
+        source_commit_hash="sha256:" + "6" * 64,
+        validation_accepted=True,
+        protected_holdout_accepted=True,
+        forward_evidence_days=30,
+        forward_evidence_accepted=True,
+        drawdown=0.01,
+        execution_drift=0.0,
+        model_drift=0.0,
+        portfolio_capacity=1.0,
+        requested_capital=0.1,
+        risk_budget_available=1.0,
+        live_approval=True,
+        fresh_preflight=True,
+        forward_summary_id="summary-disabled-canary",
+        forward_decision_id="decision-disabled-canary",
+        forward_independent_decisions=1,
+        forward_net_pnl=1.0,
+        forward_data_uptime=1.0,
+    )
+
+    decision = decide_promotion(
+        strategy_version_id="disabled-canary:v1",
+        current_state=LifecycleState.FORWARD_PAPER,
+        evidence=evidence,
+        policy=policy,
+        evaluated_at=NOW,
+        requested_transition="live_canary",
+    )
+
+    assert decision.accepted is False
+    assert decision.next_state is LifecycleState.FORWARD_PAPER
+    assert decision.reason_code == "automatic_live_canary_promotion_disabled"
+
+
 def test_thesis_registry_shares_budget_across_lineage_variants() -> None:
     registry = ThesisRegistry()
     thesis_id = registry.register(_thesis(budget=2))

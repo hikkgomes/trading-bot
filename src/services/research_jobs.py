@@ -105,6 +105,96 @@ _EVIDENCE_UNITS: dict[str, frozenset[str]] = {
 }
 
 
+def _configured_product(
+    configuration: Mapping[str, Any], product_id: str
+) -> Mapping[str, Any] | None:
+    products = configuration.get("products")
+    if not isinstance(products, Mapping):
+        return None
+    return next(
+        (
+            item
+            for item in products.get("products", ())
+            if isinstance(item, Mapping) and str(item.get("product_id")) == product_id
+        ),
+        None,
+    )
+
+
+def _configured_account(
+    configuration: Mapping[str, Any], account_id: str
+) -> Mapping[str, Any] | None:
+    accounts = configuration.get("accounts")
+    if not isinstance(accounts, Mapping):
+        return None
+    return next(
+        (
+            item
+            for item in accounts.get("accounts", ())
+            if isinstance(item, Mapping) and str(item.get("account_id")) == account_id
+        ),
+        None,
+    )
+
+
+def _cost_context(product: Mapping[str, Any]) -> dict[str, Any]:
+    costs = product.get("execution_costs")
+    if not isinstance(costs, Mapping):
+        return {}
+    return {"fee_bps": costs.get("fee_bps"), "slippage_bps": costs.get("slippage_bps")}
+
+
+def _btc_accounting_context(product: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "btc_core_fraction": product.get("btc_core_fraction"),
+        "btc_minimum_fraction": product.get("btc_minimum_fraction"),
+        "btc_max_tactical_fraction": product.get("btc_max_tactical_fraction"),
+    }
+
+
+def _active_income_accounting_context(
+    configuration: Mapping[str, Any], account: Mapping[str, Any]
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "leverage": account.get("maximum_leverage"),
+        "margin_mode": account.get("margin_mode"),
+        "maintenance_margin_fraction": 0.05,
+    }
+    risk = configuration.get("risk")
+    if not isinstance(risk, Mapping):
+        return result
+    account_limits = risk.get("accounts")
+    limits = (
+        account_limits.get(str(account.get("account_id") or ""))
+        if isinstance(account_limits, Mapping)
+        else None
+    )
+    if isinstance(limits, Mapping):
+        result.update(
+            {
+                "max_margin_fraction": limits.get("maximum_margin_fraction"),
+                "liquidation_buffer_fraction": limits.get("minimum_liquidation_buffer"),
+            }
+        )
+    instrument_limits = risk.get("instrument")
+    if isinstance(instrument_limits, Mapping):
+        result["max_participation_fraction"] = instrument_limits.get(
+            "maximum_visible_depth_fraction"
+        )
+    return result
+
+
+def _balance_context(account: Mapping[str, Any] | None) -> dict[str, Any]:
+    balances = account.get("paper_starting_balances") if isinstance(account, Mapping) else {}
+    if not isinstance(balances, Mapping):
+        return {}
+    return {
+        "initial_btc": balances.get("BTC"),
+        "initial_stablecoin": balances.get("USDT"),
+        "initial_cash": balances.get("USDT"),
+    }
+
+
 def _optional_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -136,6 +226,51 @@ def _candidate_supported_instruments(
     if not selected or not set(selected).issubset(set(available)):
         raise JobSchemaError("candidate instrument scope is outside its dataset scope")
     return tuple(sorted(selected))
+
+
+def _candidate_scope_context(candidate: Candidate, context: Mapping[str, Any]) -> dict[str, Any]:
+    declared = candidate.definition.universe.get("instrument_ids")
+    if not isinstance(declared, list | tuple) or not declared:
+        return dict(context)
+    scope = tuple(dict.fromkeys(str(value) for value in declared if str(value).strip()))
+    selected = {item.upper() for item in scope}
+    result = dict(context)
+    for field in ("market_frame", "feature_rows", "bars"):
+        rows = result.get(field)
+        if isinstance(rows, list | tuple):
+            result[field] = tuple(
+                row for row in rows if isinstance(row, Mapping) and _row_in_scope(row, selected)
+            )
+    symbol_returns = result.get("symbol_returns")
+    if isinstance(symbol_returns, Mapping):
+        scoped_returns = {
+            str(key): value
+            for key, value in symbol_returns.items()
+            if _value_in_scope(str(key), selected)
+        }
+        result["symbol_returns"] = scoped_returns
+        if len(scoped_returns) == 1:
+            result["returns"] = next(iter(scoped_returns.values()))
+    result["instrument_scope"] = scope
+    return result
+
+
+def _row_in_scope(row: Mapping[str, Any], scope: set[str]) -> bool:
+    return _value_in_scope(
+        str(row.get("instrument_id") or row.get("symbol") or ""),
+        scope,
+    )
+
+
+def _value_in_scope(value: str, scope: set[str]) -> bool:
+    upper = value.upper()
+    return upper in scope or any(
+        upper.endswith(f":{item}")
+        or upper.endswith(f":{item}:USDT")
+        or item.endswith(f":{upper}")
+        or item.endswith(f":{upper}:USDT")
+        for item in scope
+    )
 
 
 @dataclass(frozen=True)
@@ -731,7 +866,10 @@ class DatabaseResearchJobHandlers:
                 evaluation_view = CandidateEvaluationView.from_candidate(
                     candidate, adaptive_snapshot_ids
                 )
-                context = self.context_builders.build(evaluation_view, resolved_context)
+                context = self.context_builders.build(
+                    evaluation_view,
+                    _candidate_scope_context(candidate, resolved_context),
+                )
             except (ExecutorError, KeyError, TypeError, ValueError) as exc:
                 context = {
                     **dict(resolved_context),
@@ -761,59 +899,16 @@ class DatabaseResearchJobHandlers:
     def _product_accounting_context(self, product_id: str) -> dict[str, Any]:
         if self.configuration is None:
             return {}
-        products = self.configuration.get("products")
-        if not isinstance(products, Mapping):
-            return {}
-        product = next(
-            (
-                item
-                for item in products.get("products", ())
-                if isinstance(item, Mapping) and str(item.get("product_id")) == product_id
-            ),
-            None,
-        )
+        product = _configured_product(self.configuration, product_id)
         if not isinstance(product, Mapping):
             return {}
-        costs = product.get("execution_costs")
-        account_id = str(product.get("account_id") or "")
-        accounts = self.configuration.get("accounts")
-        account = (
-            next(
-                (
-                    item
-                    for item in accounts.get("accounts", ())
-                    if isinstance(item, Mapping) and str(item.get("account_id")) == account_id
-                ),
-                None,
-            )
-            if isinstance(accounts, Mapping)
-            else None
-        )
-        balances = account.get("paper_starting_balances") if isinstance(account, Mapping) else {}
-        result: dict[str, Any] = {}
-        if isinstance(costs, Mapping):
-            result.update(
-                {
-                    "fee_bps": costs.get("fee_bps"),
-                    "slippage_bps": costs.get("slippage_bps"),
-                }
-            )
+        account = _configured_account(self.configuration, str(product.get("account_id") or ""))
+        result = _cost_context(product)
         if product_id == "btc_accumulation":
-            result.update(
-                {
-                    "btc_core_fraction": product.get("btc_core_fraction"),
-                    "btc_minimum_fraction": product.get("btc_minimum_fraction"),
-                    "btc_max_tactical_fraction": product.get("btc_max_tactical_fraction"),
-                }
-            )
-        if isinstance(balances, Mapping):
-            result.update(
-                {
-                    "initial_btc": balances.get("BTC"),
-                    "initial_stablecoin": balances.get("USDT"),
-                    "initial_cash": balances.get("USDT"),
-                }
-            )
+            result.update(_btc_accounting_context(product))
+        elif product_id == "active_income" and isinstance(account, Mapping):
+            result.update(_active_income_accounting_context(self.configuration, account))
+        result.update(_balance_context(account))
         return {key: value for key, value in result.items() if value is not None}
 
     def _finalise_evaluation(

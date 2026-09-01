@@ -201,7 +201,10 @@ class PortfolioRiskCalculator:
         balances: Mapping[str, object],
         market: Mapping[str, Mapping[str, object]],
     ) -> float:
-        return max(_equity(product_id, balances, market), 1.0)
+        equity = _equity(product_id, balances, market)
+        if equity <= 0.0:
+            raise ValueError("risk measurement requires positive current equity")
+        return equity
 
     def _trades_today(self, *, product_id: str, portfolio_id: str, at: str) -> int:
         current = dt.datetime.fromisoformat(at)
@@ -359,6 +362,14 @@ def _exposure_fraction(
     market: Mapping[str, Mapping[str, object]],
     equity: float,
 ) -> float:
+    missing = sorted(
+        str(instrument_id)
+        for instrument_id, quantity in positions.items()
+        if abs(_finite_number(quantity, "position quantity")) > 1e-12
+        and _positive_number(market.get(str(instrument_id), {}).get("price")) <= 0.0
+    )
+    if missing:
+        raise ValueError("risk measurement has no price for: " + ", ".join(missing))
     return (
         sum(
             abs(_finite_number(quantity, "position quantity"))
@@ -374,11 +385,20 @@ def _order_exposure_fraction(
     market: Mapping[str, Mapping[str, object]],
     equity: float,
 ) -> float:
+    missing = sorted(
+        str(order.get("instrument_id"))
+        for order in orders
+        if not bool(order.get("reduce_only"))
+        and _positive_number(market.get(str(order.get("instrument_id")), {}).get("price")) <= 0.0
+    )
+    if missing:
+        raise ValueError("risk measurement has no pending-order price for: " + ", ".join(missing))
     return (
         sum(
-            abs(_positive_number(order.get("quantity")))
+            abs(_positive_number(order.get("remaining_quantity", order.get("quantity"))))
             * _positive_number(market.get(str(order.get("instrument_id")), {}).get("price"))
             for order in orders
+            if not bool(order.get("reduce_only"))
         )
         / equity
     )

@@ -273,6 +273,23 @@ def test_missing_declared_negative_control_is_unavailable_not_a_fake_null() -> N
     assert evidence["block_permutation"]["passed"] is False
 
 
+def test_negative_controls_are_deterministic_when_immutable_market_inputs_are_available() -> None:
+    kwargs = {
+        "signals": [1.0, -1.0, 1.0, 0.0, -1.0, 1.0],
+        "returns": [0.01, -0.02, 0.03, 0.0, -0.01, 0.02],
+        "candidate_return": 0.01,
+        "controls": ("block_permutation", "feature_ablation", "parameter_neighbourhood"),
+        "seed_material": {"candidate": "candidate-1", "dataset": "dataset-1"},
+    }
+    first = _negative_control_evidence(**kwargs)
+    second = _negative_control_evidence(**kwargs)
+
+    assert first == second
+    assert first["feature_ablation"]["control_return"] == 0.0
+    assert first["block_permutation"]["source"] == "derived_immutable_inputs"
+    assert first["parameter_neighbourhood"]["method"] == "parameter_neighbourhood_shift_v1"
+
+
 def test_active_income_registered_time_series_candidates_are_symbol_isolated() -> None:
     candidates = registered_strategy_candidates(
         product="active_income",
@@ -1251,6 +1268,19 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(tmp_path) 
             )
         ).scalar_one()
     assert snapshot_payload["payload"]["market_frame"]
+
+    forward = DatabaseDatasetBundleService(database.engine, root).run_forward(
+        product_id="btc_accumulation",
+        universe_id=universe_id,
+        market_type="spot",
+        artefact_created_at="2026-08-19T00:00:00+00:00",
+        created_at=NOW,
+    )
+    assert forward.state == "ready"
+    assert forward.reason_code == "forward_dataset_ready"
+    assert len(forward.snapshot_ids) == 1
+    forward_bundle = SqlDatasetBundleRepository(database.engine).get(str(forward.bundle_id))
+    assert set(forward_bundle.stage_snapshot_ids) == {"forward_observation"}
 
     pending = DatabaseDatasetBundleService(database.engine, root, minimum_history_days=365).run(
         product_id="btc_accumulation",

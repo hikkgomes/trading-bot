@@ -96,6 +96,32 @@ def test_risk_measurements_use_ledger_marks_and_pending_orders(tmp_path) -> None
     assert measurements.correlations == {"BTCUSDT": {"BTCUSDT": 1.0}}
     assert measurements.beta == {"BTCUSDT": 1.0}
     assert measurements.clusters == {"BTCUSDT": "base:BTC"}
+    reduced = PortfolioRiskCalculator(database.engine).calculate(
+        product_id="active_income",
+        account_id="account-usdt",
+        product={"portfolio_id": "portfolio-active-income"},
+        account={"paper_starting_balances": {"USDT": 10_000.0}},
+        balances={"USDT": 9_800.0},
+        positions={"BTCUSDT": 1.0},
+        open_orders=(
+            {
+                "instrument_id": "BTCUSDT",
+                "quantity": 100.0,
+                "reduce_only": True,
+            },
+        ),
+        market={
+            "BTCUSDT": {
+                "price": 99.0,
+                "spread_bps": 1.0,
+                "visible_depth": 100_000.0,
+                "volatility": 0.1,
+                "funding": 0.0,
+            }
+        },
+        at="2026-08-30T00:00:03+00:00",
+    )
+    assert reduced.pending_exposure_fraction == 0.0
     database.dispose()
 
 

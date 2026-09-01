@@ -121,9 +121,7 @@ class DatabasePlatformReport:
         experiments = self._rows(experiment, order_by=experiment.c.submitted_at.desc())
         results = self._rows(validation_result)
         report = {
-            "candidate_queue": [
-                item for item in experiments if item.get("state", "queued") == "queued"
-            ],
+            "candidate_queue": [item for item in experiments if _candidate_is_active(item)],
             "experiments": experiments,
             "validation_results": results,
             "validation_stages": self._rows(validation_stage),
@@ -642,10 +640,21 @@ def _candidates_without_job_or_reason(
                 "completed",
                 "rejected",
                 "retired",
+                "forward_paper",
+                "live_ready",
+                "live_canary",
+                "live",
+                "suspended",
             }
+            and not state.startswith(("waiting_", "blocked_"))
         ):
             missing.append(candidate_id)
     return sorted(missing)
+
+
+def _candidate_is_active(row: Mapping[str, Any]) -> bool:
+    state = str(row.get("state") or "queued")
+    return state not in {"completed", "rejected", "retired"} and not state.startswith("blocked_")
 
 
 def _latest_statuses(rows: list[dict[str, Any]], *, key: str, status: str) -> list[dict[str, Any]]:

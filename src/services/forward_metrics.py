@@ -163,7 +163,12 @@ class ForwardEvidenceCollector:
         )
         net_pnl = self._ledger_pnl(ledger_rows)
         benchmark_pnl = self._benchmark_pnl(product_id, market_rows, assignment)
-        drawdown = self._drawdown(product_id, all_ledger_rows, assignment)
+        drawdown = self._drawdown(
+            product_id,
+            all_ledger_rows,
+            assignment,
+            at=created_at,
+        )
         slippage = self._slippage(fills)
         execution_drift = self._execution_drift(fills)
         model_drift = self._model_drift(net_pnl, forecast, bool(fills))
@@ -204,6 +209,11 @@ class ForwardEvidenceCollector:
         )
         cycles = self._cycles(fills)
         ledger_returns = self._ledger_returns(ledger_rows)
+        independent_episodes = cycles if cycles > 0 else completed
+        data_uptime = self._data_uptime(
+            market_rows,
+            data_gaps=data_gaps,
+        )
         return ForwardEvidenceMetrics(
             net_pnl=net_pnl,
             benchmark_pnl=benchmark_pnl,
@@ -216,7 +226,7 @@ class ForwardEvidenceCollector:
             effective_trades=len(fills),
             fill_rate=(completed / attempted if attempted else 1.0),
             slippage=slippage,
-            data_uptime=(1.0 if market_rows else 0.0),
+            data_uptime=data_uptime,
             rejected_orders=rejected,
             source_event_ids=source_ids,
             window_start=window_start,
@@ -227,7 +237,7 @@ class ForwardEvidenceCollector:
             objective_excess_fraction=objective[4],
             trading_days=trading_days,
             cycles=cycles,
-            effective_independent_episodes=len(ledger_returns) or len(fills),
+            effective_independent_episodes=independent_episodes,
             tail_loss=self._tail_loss(ledger_returns),
         )
 
@@ -480,10 +490,12 @@ class ForwardEvidenceCollector:
         product_id: str,
         rows: tuple[Mapping[str, Any], ...],
         assignment: Mapping[str, Any],
+        *,
+        at: str,
     ) -> float:
         if not rows:
             return 0.0
-        base = self._starting_equity(product_id, assignment)
+        base = self._starting_equity(product_id, assignment, at=at)
         running = 0.0
         peak = 0.0
         worst = 0.0
@@ -496,6 +508,13 @@ class ForwardEvidenceCollector:
             peak = max(peak, running)
             worst = max(worst, (peak - running) / base)
         return max(0.0, worst)
+
+    @staticmethod
+    def _data_uptime(market_rows: tuple[Mapping[str, Any], ...], *, data_gaps: int) -> float:
+        observed = len(market_rows)
+        if observed == 0:
+            return 0.0
+        return max(0.0, min(1.0, observed / max(1, observed + data_gaps)))
 
     def _starting_equity(
         self,

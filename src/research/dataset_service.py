@@ -161,6 +161,103 @@ class DatabaseDatasetBundleService:
             source_partition_hashes=source_hashes,
         )
 
+    def run_forward(
+        self,
+        *,
+        product_id: str,
+        universe_id: str,
+        market_type: str,
+        artefact_created_at: str,
+        created_at: str,
+        timeframe: str | None = None,
+    ) -> DatasetBundleBuildResult:
+        """Publish one immutable forward-observation snapshot after an artefact."""
+
+        created = timestamp(created_at, field="created_at")
+        artefact_created = timestamp(artefact_created_at, field="artefact_created_at")
+        if artefact_created >= created:
+            return self._waiting(product_id, "forward_data_not_available_after_artefact")
+        resolved_universe = self._universe(universe_id, created)
+        if resolved_universe is None:
+            return self._waiting(product_id, "point_in_time_universe_unavailable")
+        universe_snapshot_id, instruments = resolved_universe
+        feature_id = self._latest_manifest(
+            feature_manifest,
+            created=created,
+            matches=lambda payload: _matches_feature(payload, market_type),
+        )
+        cost_id = self._latest_manifest(
+            cost_model_manifest,
+            created=created,
+            matches=lambda payload: str(payload.get("product_id") or "") == product_id,
+        )
+        if feature_id is None or cost_id is None:
+            return self._waiting(product_id, "dataset_manifests_unavailable")
+        scope = tuple(item[0] for item in instruments)
+        try:
+            bars, source_hashes = self._load_bars(
+                instruments,
+                market_type=market_type,
+                timeframe=timeframe or self.timeframe,
+                created=created,
+            )
+            bars = tuple(
+                row
+                for row in bars
+                if str(row["close_timestamp"]) > artefact_created
+                and str(row["availability_time"]) > artefact_created
+            )
+            if not bars:
+                return self._waiting(product_id, "forward_bars_unavailable")
+            if market_type.lower() == "futures":
+                bars = self._attach_funding_rates(
+                    product_id=product_id,
+                    bars=bars,
+                    instrument_scope=scope,
+                    created=created,
+                )
+            _validate_market_bars(bars, market_type=market_type)
+            interval = _single_interval(bars)
+            payload = CanonicalResearchDatasetBuilder._bar_payload(list(bars))
+            bundle = CanonicalResearchDatasetBuilder(self.engine).build(
+                product_id,
+                intervals={"forward_observation": interval},
+                payload_by_role={"forward_observation": payload},
+                universe_snapshot_id=universe_snapshot_id,
+                feature_manifest_id=feature_id,
+                cost_model_id=cost_id,
+                parameter_set_id=_parameter_set_id(product_id),
+                instrument_scope=scope,
+                availability_timestamp={"forward_observation": created},
+                created_at=created,
+                engine_version="dataset-service/forward-v1",
+                source_partition_hashes=source_hashes,
+                lifecycle_state="data_pending",
+            )
+        except DatasetBundleBuildError as exc:
+            return DatasetBundleBuildResult(
+                state="blocked_dataset",
+                reason_code="bar_quality_invalid",
+                product_id=product_id,
+                detail=str(exc),
+            )
+        except DatasetResolutionError as exc:
+            return DatasetBundleBuildResult(
+                state="blocked_dataset",
+                reason_code=_reason_code(str(exc)),
+                product_id=product_id,
+                detail=str(exc),
+            )
+        return DatasetBundleBuildResult(
+            state="ready",
+            reason_code="forward_dataset_ready",
+            product_id=product_id,
+            bundle_id=bundle.bundle_id,
+            snapshot_ids=tuple(bundle.stage_snapshot_ids.values()),
+            instrument_scope=scope,
+            source_partition_hashes=source_hashes,
+        )
+
     @staticmethod
     def _waiting(product_id: str, reason_code: str) -> DatasetBundleBuildResult:
         return DatasetBundleBuildResult(
@@ -266,6 +363,7 @@ class DatabaseDatasetBundleService:
             close = str(row["close_timestamp"])
             values = dict(row)
             values["funding_rate"] = funding[instrument_id].get(close, 0.0)
+            values["funding_event"] = close in funding[instrument_id]
             enriched.append(values)
         return tuple(enriched)
 
@@ -320,8 +418,15 @@ def _normalise_bar(
 def _history_span_satisfies(rows: tuple[dict[str, Any], ...], minimum_days: int) -> bool:
     if minimum_days == 0:
         return True
-    times = [dt.datetime.fromisoformat(str(row["close_timestamp"])) for row in rows]
-    return max(times) - min(times) >= dt.timedelta(days=minimum_days)
+    by_instrument: dict[str, list[dt.datetime]] = {}
+    for row in rows:
+        by_instrument.setdefault(str(row["instrument_id"]), []).append(
+            dt.datetime.fromisoformat(str(row["close_timestamp"]))
+        )
+    return bool(by_instrument) and all(
+        max(times) - min(times) >= dt.timedelta(days=minimum_days)
+        for times in by_instrument.values()
+    )
 
 
 def _validate_market_bars(rows: tuple[dict[str, Any], ...], *, market_type: str) -> None:
@@ -406,6 +511,18 @@ def _stage_intervals(rows: tuple[dict[str, Any], ...]) -> dict[str, dict[str, st
         role: {"start": start, "end": end}
         for role, start, end in zip(CORE_RESEARCH_BUNDLE_ROLES, starts, ends, strict=True)
     }
+
+
+def _single_interval(rows: tuple[dict[str, Any], ...]) -> dict[str, str]:
+    times = sorted(str(row["close_timestamp"]) for row in rows)
+    if not times:
+        raise DatasetResolutionError("dataset data_pending: no forward bars are available")
+    end = (
+        (dt.datetime.fromisoformat(times[-1]) + dt.timedelta(seconds=1))
+        .replace(microsecond=0)
+        .isoformat()
+    )
+    return {"start": times[0], "end": end}
 
 
 def _matches_feature(payload: Mapping[str, Any], market_type: str) -> bool:

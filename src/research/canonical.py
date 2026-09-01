@@ -1062,7 +1062,7 @@ class SqlForwardEvidenceRepository:
                 if payloads
                 else 0.0
             ),
-            slippage=sum(value(payload, "slippage") for payload in payloads),
+            slippage=max(value(payload, "slippage") for payload in payloads),
             data_uptime=(
                 sum(value(payload, "data_uptime") for payload in payloads) / len(payloads)
                 if payloads

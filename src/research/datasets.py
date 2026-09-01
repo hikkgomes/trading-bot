@@ -580,8 +580,10 @@ class CanonicalResearchDatasetBuilder:
         market_frame = [dict(row) for row in rows]
         aligned_returns: list[float] = []
         funding_rates: list[float] = []
+        funding_timestamps: list[str] = []
         previous_by_instrument: dict[str, float] = {}
         history_by_instrument: dict[str, list[float]] = {}
+        returns_by_instrument: dict[str, list[float]] = {}
         feature_rows: list[dict[str, Any]] = []
         for row in market_frame:
             close_value = _numeric_close(row.get("close"))
@@ -590,9 +592,13 @@ class CanonicalResearchDatasetBuilder:
             previous = previous_by_instrument.get(instrument)
             row_return = close_value / previous - 1.0 if previous and close_value else 0.0
             aligned_returns.append(row_return)
+            if previous is not None:
+                returns_by_instrument.setdefault(instrument, []).append(row_return)
             funding_rates.append(
                 _signed_numeric(row.get("funding_rate", row.get("funding")), default=0.0)
             )
+            if row.get("funding_event") is True:
+                funding_timestamps.append(str(row.get("close_timestamp", row.get("timestamp"))))
             feature_rows.append(_bar_feature_row(row, close_value, row_return, history))
             if close_value > 0.0:
                 history.append(close_value)
@@ -602,6 +608,9 @@ class CanonicalResearchDatasetBuilder:
             "market_frame": market_frame,
             "returns": aligned_returns[1:],
             "funding_rates": funding_rates,
+            "funding_period_rates": [0.0, *funding_rates[1:]],
+            "funding_timestamps": funding_timestamps,
+            "symbol_returns": returns_by_instrument,
             "feature_rows": feature_rows,
             "independent_units": len(market_frame),
             "data_quality": {

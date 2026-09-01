@@ -19,6 +19,7 @@ from typing import Any, cast
 
 from src.domain._codec import canonical_hash, json_value
 from src.domain.strategies import StrategySourceType
+from src.research.controls import control_identity, derive_control_returns
 from src.research.coordinator import Candidate, CandidateEvaluationView
 from src.strategies.behaviour import (
     RegisteredStrategyBehaviour,
@@ -239,7 +240,7 @@ def _measured_result(
             _nonnegative_rate(context.get("slippage_bps", 1.0), field="slippage_bps") / 10_000.0
         )
         funding_rate = _finite_rate(context.get("funding_rate", 0.0), field="funding_rate")
-        funding_rates = context.get("funding_rates")
+        funding_rates = context.get("funding_period_rates", context.get("funding_rates"))
         return_ledger = PositionReturnLedger(
             fee_rate=fee_rate,
             slippage_rate=slippage_rate,
@@ -270,6 +271,10 @@ def _measured_result(
         control_returns=context.get("negative_control_returns"),
         controls=_negative_control_names(candidate, context),
         instrument_scope=tuple(str(item) for item in context.get("instrument_scope", ())),
+        seed_material={
+            "candidate_id": candidate.candidate_id,
+            "dataset_snapshot_ids": snapshots,
+        },
     )
     delayed_report = (
         return_ledger.measure([0.0, *signals[:-1]], returns, funding_rates=funding_rates)
@@ -1176,6 +1181,8 @@ def _futures_mark_event(observed_at: str, row: Mapping[str, Any], price: float) 
 def _futures_funding_event(
     observed_at: str, row: Mapping[str, Any], price: float
 ) -> dict[str, Any] | None:
+    if row.get("funding_event") is False:
+        return None
     if row.get("funding_rate") is None and row.get("funding") is None:
         return None
     return {
@@ -1525,6 +1532,19 @@ def _parameter_stability(
 def _cross_symbol_stability(
     context: Mapping[str, Any], base_returns: list[float]
 ) -> dict[str, Any]:
+    scope = tuple(
+        str(item)
+        for item in context.get("instrument_scope", context.get("expected_symbols", ()))
+        if item
+    )
+    if len(scope) <= 1:
+        return {
+            "status": "not_applicable",
+            "passed": True,
+            "symbols": 0,
+            "per_symbol": {},
+            "reason": "single_instrument",
+        }
     raw = context.get("symbol_returns", context.get("cross_symbol_returns", {}))
     per_symbol: dict[str, dict[str, Any]] = {}
     if isinstance(raw, Mapping):
@@ -1552,19 +1572,6 @@ def _cross_symbol_stability(
                     ),
                 }
     if not per_symbol:
-        scope = tuple(
-            str(item)
-            for item in context.get("instrument_scope", context.get("expected_symbols", ()))
-            if item
-        )
-        if len(scope) == 1:
-            return {
-                "status": "not_applicable",
-                "passed": True,
-                "symbols": 0,
-                "per_symbol": {},
-                "reason": "single_instrument",
-            }
         return {
             "status": "unavailable",
             "passed": False,
@@ -1572,11 +1579,6 @@ def _cross_symbol_stability(
             "per_symbol": {},
             "reason": "missing_symbol_returns",
         }
-    scope = tuple(
-        str(item)
-        for item in context.get("instrument_scope", context.get("expected_symbols", ()))
-        if item
-    )
     missing_symbols = sorted(set(scope) - set(per_symbol)) if len(scope) > 1 else []
     returns = [float(item["return"]) for item in per_symbol.values()]
     positive_fraction = sum(value >= 0.0 for value in returns) / len(returns)
@@ -1824,6 +1826,7 @@ def _negative_control_evidence(
     control_returns: Any = None,
     controls: tuple[str, ...] = (),
     instrument_scope: tuple[str, ...] = (),
+    seed_material: object = "negative-control",
 ) -> dict[str, dict[str, float | int | bool | str | None]]:
     aligned = min(len(signals), len(returns))
     signals, returns = signals[:aligned], returns[:aligned]
@@ -1832,7 +1835,10 @@ def _negative_control_evidence(
     for name in controls:
         numeric = _numeric_series(supplied.get(name))
         comparable = numeric[:aligned]
-        if name == "cross_instrument" and len(set(instrument_scope)) < 2:
+        if (
+            name in {"cross_instrument", "predeclared_universe_holdout"}
+            and len(set(instrument_scope)) < 2
+        ):
             results[name] = {
                 "status": "not_applicable",
                 "passed": True,
@@ -1841,6 +1847,18 @@ def _negative_control_evidence(
                 "reason": "single_instrument_scope",
             }
             continue
+        method = "dataset"
+        if not comparable:
+            derived = derive_control_returns(
+                name,
+                signals,
+                returns,
+                seed_material=seed_material,
+                instrument_scope=instrument_scope,
+            )
+            if derived is not None:
+                comparable, method = derived
+                comparable = comparable[:aligned]
         if not comparable:
             results[name] = {
                 "status": "unavailable",
@@ -1859,10 +1877,14 @@ def _negative_control_evidence(
             and candidate_return >= control_return,
             "observations": len(comparable),
             "control_return": control_return,
-            "source": "dataset",
-            "input_hash": canonical_hash({"control": name, "returns": comparable})
-            if comparable
-            else None,
+            "source": "dataset" if method == "dataset" else "derived_immutable_inputs",
+            "method": method,
+            "input_hash": control_identity(
+                name,
+                comparable,
+                seed_material=seed_material,
+                method=method,
+            ),
         }
     return results
 
