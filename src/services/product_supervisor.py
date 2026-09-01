@@ -13,6 +13,7 @@ from src.products.active_income import ActiveIncomePortfolio
 from src.products.btc_accumulation import (
     BtcAllocationPolicy,
     BtcAllocationTarget,
+    assert_btc_spot_instrument,
     target_btc_allocation,
 )
 from src.risk.engine import REQUIRED_RISK_SCOPES, HierarchicalRiskAssessment
@@ -198,6 +199,7 @@ class BtcAccumulationProductSupervisor:
         valid_until: str,
         risk_assessment: HierarchicalRiskAssessment,
     ) -> BtcProductCycleResult:
+        instrument_id = assert_btc_spot_instrument(instrument_id)
         if tuple(item.scope for item in risk_assessment.decisions) != REQUIRED_RISK_SCOPES:
             raise ValueError("product execution requires all six risk scopes")
         if risk_assessment.aggregate.input_snapshot.get("product_id") != "btc_accumulation":

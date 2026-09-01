@@ -7,6 +7,17 @@ from dataclasses import dataclass
 
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 
+BTC_SPOT_INSTRUMENT_ID = "binance:spot:BTCUSDT"
+
+
+def assert_btc_spot_instrument(instrument_id: str) -> str:
+    """Validate the sole instrument allowed by the BTC accumulation product."""
+
+    value = str(instrument_id).strip()
+    if value != BTC_SPOT_INSTRUMENT_ID:
+        raise ValueError("BTC accumulation requires binance:spot:BTCUSDT")
+    return value
+
 
 @dataclass(frozen=True)
 class BtcAllocationPolicy:

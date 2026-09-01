@@ -35,6 +35,7 @@ from src.data.database import (
     validation_stage,
 )
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
+from src.products.btc_accumulation import BTC_SPOT_INSTRUMENT_ID
 from src.research.objectives import objective_unit
 
 
@@ -1842,6 +1843,13 @@ class SqlActiveStrategyAssignmentRepository:
             product_id=product_id,
             portfolio_id=portfolio_id,
         )
+        if product_id == "btc_accumulation" and (
+            record.get("instrument_id") != BTC_SPOT_INSTRUMENT_ID
+            or record.get("universe_id") is not None
+        ):
+            raise CanonicalEvidenceError(
+                "BTC accumulation assignments require the BTCUSDT spot instrument"
+            )
         assigned_at = str(record["assigned_at"])
         if assigned_at < timestamp(str(artefact["created_at"]), field="artefact.created_at"):
             raise CanonicalEvidenceError(

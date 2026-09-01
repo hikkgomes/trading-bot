@@ -602,6 +602,7 @@ def _validate_btc_product(
     account = accounts[str(product["account_id"])]
     if account.get("market") != "spot":
         raise ValueError("BTC accumulation must use a spot account")
+    _validate_btc_symbol_scope(product_id, product)
     for field in ("btc_core_fraction", "btc_max_tactical_fraction", "btc_minimum_fraction"):
         value = product.get(field)
         if not _is_number(value) or not 0 <= float(value) <= 1:
@@ -612,6 +613,22 @@ def _validate_btc_product(
         )
     if float(product["btc_minimum_fraction"]) > float(product["btc_core_fraction"]):
         raise ValueError("BTC minimum fraction cannot exceed the neutral BTC fraction")
+
+
+def _validate_btc_symbol_scope(product_id: str, product: Mapping[str, Any]) -> None:
+    if str(product.get("universe_id") or "") != "btc-spot":
+        raise ValueError("BTC accumulation must use the btc-spot universe")
+    for field in ("exchange_symbol", "live_exchange_symbol"):
+        declared = product.get(field)
+        if declared is not None and str(declared).upper() != "BTCUSDT":
+            raise ValueError(f"product {product_id}.{field} must be BTCUSDT")
+    for field in ("exchange_symbols", "live_exchange_symbols"):
+        declared = product.get(field)
+        if declared is not None and (
+            not isinstance(declared, list | tuple)
+            or tuple(str(value).upper() for value in declared) != ("BTCUSDT",)
+        ):
+            raise ValueError(f"product {product_id}.{field} must contain BTCUSDT only")
 
 
 def _validate_active_income_product(product_id: str, product: Mapping[str, Any]) -> None:

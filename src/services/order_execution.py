@@ -30,6 +30,7 @@ from src.observability.decision_trace import (
     DecisionTraceStage,
     SqlDecisionTraceStore,
 )
+from src.products.btc_accumulation import assert_btc_spot_instrument
 from src.risk.engine import SqlRiskDecisionStore, SqlRiskSnapshotStore
 from src.services.execution_service import ExecutionService
 from src.services.scheduler import DatabaseJobQueue
@@ -1414,11 +1415,11 @@ def _validate_btc_spot_identity(
 ) -> None:
     if not isinstance(balances, Mapping):
         raise ValueError("BTC spot execution requires canonical account balances")
-    if any(
-        ":spot:" not in order.instrument_id or not order.instrument_id.upper().endswith("BTCUSDT")
-        for order in orders
-    ):
-        raise ValueError("BTC accumulation orders must use BTCUSDT spot")
+    for order in orders:
+        try:
+            assert_btc_spot_instrument(order.instrument_id)
+        except ValueError as exc:
+            raise ValueError("BTC accumulation orders must use BTCUSDT spot") from exc
 
 
 def _validate_owned_btc(value: float) -> None:

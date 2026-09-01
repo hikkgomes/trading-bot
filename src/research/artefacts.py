@@ -12,6 +12,7 @@ from typing import Any
 
 from src.domain._codec import canonical_hash, json_value, timestamp, to_primitive
 from src.domain.strategies import StrategyDefinition
+from src.products.btc_accumulation import BTC_SPOT_INSTRUMENT_ID
 from src.strategies.behaviour import behaviour_hash_for_definition
 
 
@@ -25,6 +26,43 @@ def _hashes(values: tuple[str, ...], *, field_name: str, allow_empty: bool = Fal
         for item in values
     ):
         raise ValueError(f"{field_name} must contain SHA-256 hashes")
+
+
+def _assert_btc_definition_scope(
+    definition: StrategyDefinition,
+    supported_products: tuple[str, ...],
+    supported_instruments: tuple[str, ...],
+) -> None:
+    if tuple(supported_products) != ("btc_accumulation",):
+        raise ValueError("BTC accumulation artefacts must support that product only")
+    if tuple(supported_instruments) != (BTC_SPOT_INSTRUMENT_ID,):
+        raise ValueError("BTC accumulation artefacts must support BTCUSDT spot only")
+    universe = definition.universe
+    if not isinstance(universe, Mapping):
+        raise ValueError("BTC accumulation artefacts need a canonical universe")
+    for field_name, expected in (
+        ("symbols", ("BTCUSDT",)),
+        ("instrument_ids", (BTC_SPOT_INSTRUMENT_ID,)),
+    ):
+        declared = universe.get(field_name)
+        if declared is not None and tuple(str(value) for value in declared) != expected:
+            raise ValueError("BTC accumulation universe is restricted to BTCUSDT spot")
+    forbidden = {"futures", "leverage", "borrow", "borrowing", "margin"}
+    if any(
+        _contains_forbidden_term(getattr(definition, field_name), forbidden)
+        for field_name in ("position_model", "execution_preferences", "risk_policy")
+    ):
+        raise ValueError(
+            "BTC accumulation artefacts cannot use futures, borrowing, leverage, or margin"
+        )
+
+
+def _contains_forbidden_term(value: object, forbidden: set[str]) -> bool:
+    if isinstance(value, Mapping):
+        return any(_contains_forbidden_term(item, forbidden) for item in value.values())
+    if isinstance(value, list | tuple | set):
+        return any(_contains_forbidden_term(item, forbidden) for item in value)
+    return isinstance(value, str) and any(term in value.casefold() for term in forbidden)
 
 
 @dataclass(frozen=True)
@@ -63,6 +101,10 @@ class StrategyArtefact:
         _hashes(self.model_hashes, field_name="model_hashes", allow_empty=True)
         if not self.supported_products or not self.supported_instruments:
             raise ValueError("artefacts need supported products and instruments")
+        if self.definition.product == "btc_accumulation":
+            _assert_btc_definition_scope(
+                self.definition, self.supported_products, self.supported_instruments
+            )
         object.__setattr__(self, "created_at", timestamp(self.created_at, field="created_at"))
         for field_name in (
             "validation_evidence",

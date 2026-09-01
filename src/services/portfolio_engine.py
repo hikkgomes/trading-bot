@@ -18,7 +18,11 @@ from src.observability.decision_trace import (
 from src.portfolio.aggregation import aggregate_forecasts
 from src.portfolio.optimiser import PortfolioConstraints, optimise_targets
 from src.products.active_income import ActiveIncomePortfolio
-from src.products.btc_accumulation import BtcAllocationPolicy, target_btc_allocation
+from src.products.btc_accumulation import (
+    BtcAllocationPolicy,
+    assert_btc_spot_instrument,
+    target_btc_allocation,
+)
 from src.risk.engine import SqlRiskDecisionStore, SqlRiskSnapshotStore
 from src.services.job_schemas import build_content_hash, validate_job_payload
 from src.services.portfolio_service import SqlPortfolioRepository
@@ -202,7 +206,7 @@ class DatabasePortfolioTargetBuilder:
         prices: Mapping[str, float],
         state_id: str,
     ) -> tuple[tuple[TargetPosition, ...], float, dict[str, float]]:
-        instrument_id = seed.instrument_id
+        instrument_id = assert_btc_spot_instrument(seed.instrument_id)
         price = prices[instrument_id]
         current_positions[instrument_id] = float(balances.get("BTC", 0.0))
         equity_btc = balances.get("BTC", 0.0) + balances.get("USDT", 0.0) / price
@@ -928,7 +932,7 @@ class DatabasePortfolioWorker:
                 available_margin_fraction=float(payload.get("available_margin_fraction", 1.0)),
             )
             return targets, prices, {}
-        instrument_id = str(payload["instrument_id"])
+        instrument_id = assert_btc_spot_instrument(str(payload["instrument_id"]))
         price = float(payload["stablecoin_per_btc"])
         btc_balance = float(payload["btc_balance"])
         stablecoin_balance = float(payload["stablecoin_balance"])

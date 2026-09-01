@@ -14,6 +14,7 @@ from sqlalchemy.engine import Engine
 
 from src.data.database import dataset_bundle, dataset_snapshot, universe_snapshot
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
+from src.products.btc_accumulation import BTC_SPOT_INSTRUMENT_ID
 
 
 class DatasetResolutionError(RuntimeError):
@@ -436,6 +437,7 @@ class CanonicalResearchDatasetBuilder:
         scope = tuple(non_empty(item, field="instrument_scope") for item in instrument_scope)
         if not scope:
             raise DatasetResolutionError("instrument_scope cannot be empty")
+        _validate_product_scope(product_id, scope)
         snapshots: dict[str, str] = {}
         snapshot_payloads: dict[str, dict[str, Any]] = {}
         for role in sorted(roles):
@@ -543,6 +545,7 @@ class CanonicalResearchDatasetBuilder:
         materialised = self._materialise_bars(bars)
         created = timestamp(created_at, field="created_at")
         scope = {str(item) for item in instrument_scope}
+        _validate_product_scope(product_id, tuple(scope))
         payload_by_role: dict[str, Any] = {}
         availability: dict[str, str] = {}
         for role, raw_interval in intervals.items():
@@ -725,6 +728,11 @@ class CanonicalResearchDatasetBuilder:
             return
         if any(existing[key] != value for key, value in values.items()):
             raise DatasetResolutionError(f"immutable dataset identity collision: {values['id']}")
+
+
+def _validate_product_scope(product_id: str, scope: tuple[str, ...]) -> None:
+    if product_id == "btc_accumulation" and scope != (BTC_SPOT_INSTRUMENT_ID,):
+        raise DatasetResolutionError("BTC accumulation datasets require BTCUSDT spot only")
 
 
 def _numeric_close(value: Any) -> float:

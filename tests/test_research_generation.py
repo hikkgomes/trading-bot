@@ -228,7 +228,7 @@ def test_generation_worker_persists_a_typed_dataset_plan(tmp_path) -> None:
         feature_manifest_id=identity["feature"],
         cost_model_id=identity["cost"],
         parameter_set_id=identity["parameters"],
-        instrument_scope=("BTCUSDT",),
+        instrument_scope=("binance:spot:BTCUSDT",),
         availability_timestamp="2026-08-30T00:00:00+00:00",
         created_at=NOW,
     )

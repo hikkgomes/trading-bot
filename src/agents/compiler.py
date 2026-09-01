@@ -7,7 +7,9 @@ from collections.abc import Mapping
 
 from src.agents.proposals import AgentAction, AgentProposal
 from src.domain._codec import canonical_hash
+from src.domain.instruments import MarketType, canonical_instrument_id
 from src.domain.strategies import ResearchThesis, StrategyDefinition, StrategySourceType
+from src.products.btc_accumulation import BTC_SPOT_INSTRUMENT_ID
 from src.research.datasets import CandidateDatasetPlan, DatasetBundle
 from src.research.providers import provider_candidate
 
@@ -45,6 +47,10 @@ def _validated_proposal(
         raise AgentCompilationError("only typed DSL proposals can enter the candidate funnel")
     if bundle.product_id != proposal.product_id:
         raise AgentCompilationError("proposal and dataset bundle products differ")
+    if proposal.product_id == "btc_accumulation" and tuple(thesis.instrument_universe) != (
+        "BTCUSDT",
+    ):
+        raise AgentCompilationError("BTC accumulation proposals are restricted to BTCUSDT spot")
     family = str(thesis.generalisation_scope.get("family") or "")
     if family not in _ALLOWED_FAMILIES:
         raise AgentCompilationError("OpenClaw thesis family is not allowlisted")
@@ -108,6 +114,18 @@ def compile_openclaw_candidate(
         universe={
             "type": "point_in_time",
             "symbols": list(thesis.instrument_universe),
+            "instrument_ids": [
+                (
+                    BTC_SPOT_INSTRUMENT_ID
+                    if proposal.product_id == "btc_accumulation"
+                    else canonical_instrument_id(
+                        symbol,
+                        market_type=MarketType.FUTURES,
+                        settlement_asset="USDT",
+                    )
+                )
+                for symbol in thesis.instrument_universe
+            ],
             "universe_snapshot_id": bundle.universe_snapshot_id,
         },
         data_requirements={"required": list(thesis.required_data)},

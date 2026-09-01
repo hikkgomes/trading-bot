@@ -16,6 +16,7 @@ from sqlalchemy import select
 from src.data.database import cost_model_manifest, feature_manifest, risk_snapshot
 from src.data.universe import SqlUniverseStore
 from src.domain._codec import canonical_hash, timestamp
+from src.products.btc_accumulation import BTC_SPOT_INSTRUMENT_ID
 from src.research.datasets import (
     CORE_RESEARCH_BUNDLE_ROLES,
     CanonicalResearchDatasetBuilder,
@@ -84,7 +85,7 @@ class DatabaseDatasetBundleService:
         timeframe: str | None = None,
     ) -> DatasetBundleBuildResult:
         created = timestamp(created_at, field="created_at")
-        resolved_universe = self._universe(universe_id, created)
+        resolved_universe = self._universe(universe_id, created, product_id=product_id)
         if resolved_universe is None:
             return self._waiting(product_id, "point_in_time_universe_unavailable")
         universe_snapshot_id, instruments = resolved_universe
@@ -178,7 +179,7 @@ class DatabaseDatasetBundleService:
         artefact_created = timestamp(artefact_created_at, field="artefact_created_at")
         if artefact_created >= created:
             return self._waiting(product_id, "forward_data_not_available_after_artefact")
-        resolved_universe = self._universe(universe_id, created)
+        resolved_universe = self._universe(universe_id, created, product_id=product_id)
         if resolved_universe is None:
             return self._waiting(product_id, "point_in_time_universe_unavailable")
         universe_snapshot_id, instruments = resolved_universe
@@ -229,7 +230,9 @@ class DatabaseDatasetBundleService:
                 cost_model_id=cost_id,
                 parameter_set_id=_parameter_set_id(product_id),
                 instrument_scope=scope,
-                availability_timestamp={"forward_observation": created},
+                availability_timestamp={
+                    "forward_observation": max(created, interval["end"])
+                },
                 created_at=created,
                 engine_version="dataset-service/forward-v1",
                 source_partition_hashes=source_hashes,
@@ -268,7 +271,7 @@ class DatabaseDatasetBundleService:
         )
 
     def _universe(
-        self, universe_id: str, observed_at: str
+        self, universe_id: str, observed_at: str, *, product_id: str
     ) -> tuple[str, tuple[tuple[str, str, str], ...]] | None:
         memberships = SqlUniverseStore(self.engine).members_at(
             universe_id=universe_id,
@@ -286,6 +289,8 @@ class DatabaseDatasetBundleService:
                         item.instrument.venue,
                     )
                     for item in memberships
+                    if product_id != "btc_accumulation"
+                    or item.instrument.instrument_id == BTC_SPOT_INSTRUMENT_ID
                 }
             )
         )
