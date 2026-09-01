@@ -3,7 +3,6 @@
 VENV ?= .venv
 PY ?= $(VENV)/bin/python
 PLATFORM_CONFIG ?= config/platform.json
-PREFLIGHT_OUTPUT ?= runtime/preflight_report.json
 BACKUP_ID ?=
 DESTINATION ?=
 PROCESS ?= trading-runtime

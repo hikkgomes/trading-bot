@@ -1,392 +1,70 @@
-# Telegram and OpenClaw boundaries
+# Control, alerts, and research agents
 
-These integrations are optional. The trading and research system does not depend
-on either service and continues operating when they are offline.
+Communication is an optional edge around the PostgreSQL platform. Trading,
+research, accounting, reconciliation, and recovery continue without Telegram,
+webhooks, or OpenClaw.
 
-## Telegram
+## Control API
 
-Telegram is a deterministic notification and restricted operator edge. It is
-not an approval or execution channel.
+`control-api` listens on the configured local bind and requires the bearer
+token from the private service environment. It reads and writes control state
+through PostgreSQL.
 
-Available inbound commands are:
+Read-only routes:
 
-- `/status` — sanitized supervisor, product, worker, and research status.
-- `/help` — show the commands enabled for this bot.
-- `/pause` — pause all products and scheduled jobs, when explicitly enabled.
-- `/pause_jobs` — pause scheduled data/research jobs, when explicitly enabled.
-- `/pause_product NAME` — pause one configured product, when explicitly enabled.
+- `GET /health` or `GET /status`
+- `GET /configuration`
+- `GET /reports`
+- `GET /agent/reviews`
 
-There are deliberately no Telegram commands for strategy approval, candidate
-activation, live enablement, resume, flattening, risk changes, configuration,
-credentials, or order placement. Resuming always requires the local control CLI
-on the server. A broadcast channel works for outbound alerts; pause commands
-require a private chat or group message with a real user ID.
+Audited routes:
 
-### Configure
+- `POST /pause`, `/resume`, `/block-new-risk`, or `/management-only`
+- `POST /suspend-strategy`
+- `POST /cancel-all-entry-orders`
+- `POST /emergency-flatten`
+- `POST /agent/proposals`
 
-Create a bot with BotFather, add it only to the private chat/group/channel you
-control, and create `runtime/telegram.env`:
+Requests must include the target, reason, requesting actor, and timestamp when
+the route requires them. Live approval, live assignment, credential changes,
+and discretionary orders are not API operations.
 
-```bash
-cp config/telegram.env.example runtime/telegram.env
-```
+Control modes are ordered from least to most restrictive: `run`,
+`block_new_risk`, `management_only`, `suspended`, and `emergency_flatten`.
+Risk-reducing actions, account reconciliation, and recovery remain available
+when new entries are blocked.
 
-```dotenv
-AUTOPILOT_TELEGRAM_BOT_TOKEN=replace-with-botfather-token
-AUTOPILOT_TELEGRAM_CHAT_ID=-1001234567890
-# Pause commands stay off unless both settings below are present.
-AUTOPILOT_TELEGRAM_PAUSE_COMMANDS=0
-AUTOPILOT_TELEGRAM_ALLOWED_USER_IDS=123456789
-```
+## Alerts
 
-Protect the file and never put exchange credentials in it:
-
-```bash
-chmod 600 runtime/telegram.env
-```
-
-Only one process may poll `getUpdates` for a Telegram bot token. If OpenClaw (or
-another service) already receives inbound messages for this bot, install the
-trading integration in outbound-only mode. Alerts and daily status reports will
-still be sent, while OpenClaw remains the sole inbound poller:
-
-```bash
-REPO="$PWD" TELEGRAM_POLLING_ENABLED=0 \
-  bash scripts/install_communications_service.sh
-```
-
-To use this edge's `/status` and restricted pause commands, create a separate
-BotFather bot/token and explicitly install it with
-`TELEGRAM_POLLING_ENABLED=1`. Never run the trading edge and OpenClaw as pollers
-for the same token; Telegram will continuously terminate one of them with an
-HTTP 409 conflict.
-
-Create the separate alert-routing settings file as well. It contains no
-exchange credentials and is the only operations settings file read by the
-watchdog:
-
-```bash
-cp config/alerts.env.example runtime/alerts.env
-chmod 600 runtime/alerts.env
-```
-
-```dotenv
-AUTOPILOT_WEBHOOK_URL=
-AUTOPILOT_TELEGRAM_SETTINGS_FILE=runtime/telegram.env
-```
-
-`runtime/telegram.env` accepts exactly the four `AUTOPILOT_TELEGRAM_*` keys in
-the first example. `runtime/alerts.env` accepts exactly the two alert-routing
-keys in the second example. Unknown, duplicate, malformed, symlinked,
-oversized, or group/world-readable settings in either file fail closed without
-printing any setting value. The dedicated systemd units do not load either file
-as an `EnvironmentFile`; each consumer reads its settings file directly, so an
-accidental assignment cannot enter the network-facing process environment. The
-token does not need to be duplicated in the trading `.env`.
-
-Telegram payloads are a second allowlisted boundary. Secret-bearing keys and
-string patterns (bearer/JWT/Telegram tokens, credential query parameters,
-signed URLs, and embedded credential assignments) are redacted. Raw diagnostic
-fields are replaced with a marker, and protected holdout/final-test keys or
-content are recursively omitted. Detailed errors and protected research results
-remain in the private local reports and logs. The outbound path is added
-alongside the existing local JSONL and webhook alert destinations. Local alerts
-and cooldown state are committed before outbound delivery is queued; webhook
-and Telegram outcomes are appended later under the same fingerprint. A slow or
-unavailable remote endpoint therefore cannot stop supervision or erase local
-alerts. The long-running supervisor delivers asynchronously. The systemd
-healthcheck is a short-lived oneshot, so it performs a bounded drain of its
-queued remote alert before exiting; delivery success or failure is appended to
-the local alert log. Its unit passes only the path to `runtime/alerts.env`; the
-application opens a non-symlink owner-matched `0600` file and accepts exactly
-the webhook URL and Telegram-settings path keys. Systemd never imports its
-assignments into the process environment. The unit explicitly removes inherited
-exchange and direct operations variables, cannot read `.env`, and runs
-readiness-free watchdog checks. Full credential-aware readiness remains an
-install/preflight operation. Generic research, candidate-paper, and backup units
-both unset inherited operations variables and cannot read either private
-operations settings file.
-
-Check the sanitized view without using the network, send a one-off status, then
-install the isolated polling service:
-
-```bash
-.venv/bin/python -m src.autopilot.telegram_edge \
-  --settings-file runtime/telegram.env --validate-settings
-.venv/bin/python -m src.autopilot.telegram_edge --status
-.venv/bin/python -m src.autopilot.telegram_edge --send-status
-
-REPO="$PWD" DRY_RUN=1 UNIT_DIR="$PWD/runtime/systemd-communications-dry-run" \
-  bash scripts/install_communications_service.sh
-REPO="$PWD" bash scripts/install_communications_service.sh
-```
-
-Inspect it with:
-
-```bash
-systemctl --user status \
-  trading-bot-telegram.service \
-  trading-bot-telegram-report.timer --no-pager
-journalctl --user -u trading-bot-telegram.service -n 100 --no-pager
-```
-
-The installer also creates a deterministic sanitized status report timer. It
-runs every 24 hours by default; set `REPORT_INTERVAL=12h` (or another systemd
-duration) while running the installer to change the cadence.
-
-The polling unit mounts the repository read-only. It can write only the two
-dedicated state directories required for crash-safe atomic replacement:
-`runtime/operator-control/` for `control.json`, `control_audit.jsonl`, their
-sibling locks and temporary replacements, and `runtime/telegram/` for
-`telegram_poll_state.json`. The settings file `runtime/telegram.env` is an
-explicit read-only path; `.env`, approvals, outputs, and market data are
-inaccessible. File-only write mounts are intentionally not used because atomic
-`os.replace` updates require write permission on the target parent directory.
-
-For upgrades from the older flat layout, a real installer run copies existing
-`runtime/control.json`, `runtime/control_audit.jsonl`, and
-`runtime/telegram_poll_state.json` into the dedicated directories with mode
-`0600`, while retaining the originals for review. Until the first narrowed
-control or poll-state write, the readers can fall back to the legacy file. Pause
-or stop the core services during the upgrade, verify the new copies, and remove
-legacy files only after all installed units use the new config.
-
-Start with `AUTOPILOT_TELEGRAM_PAUSE_COMMANDS=0`. After status and alerts have
-been verified, set it to `1` only if the numeric user allowlist is correct, then
-restart the service. Both the exact chat ID and the sender user ID must match.
+Every alert is written to PostgreSQL before remote delivery. Dedupe, cooldown,
+acknowledgement, and delivery-failure records are durable. An optional
+`TRADING_PLATFORM_ALERT_WEBHOOK_URL` adds outbound webhook delivery; the URL
+is never persisted or printed. The report worker alerts on stalled research,
+missing datasets, unstarted jobs, stale account or market authority, missing
+risk inputs, unresolved recovery, conflicting execution authority, backup
+failure, and remote delivery failure.
 
 ## OpenClaw
 
-Alfred/OpenClaw has two roles: an on-demand natural-language operator acting
-only on Henrique's explicit requests, and an autonomous research supervisor.
-It is not part of the deterministic trading process, which continues when
-OpenClaw or its model is unavailable. Do not run OpenClaw from the autopilot job
-worker: the trusted worker is not an agent sandbox.
+OpenClaw has no order, approval, credential, or live-risk access. Scheduled
+reviews receive only a sanitised PostgreSQL research context. Proposals enter
+an untrusted proposal record, pass schema and security validation, and are
+compiled into the normal typed research queue. Protected holdout results are
+not exposed before final disposition.
 
-The recurring research loop uses a narrow credential-free workspace with:
+Agents may request bounded research, revise a thesis, or retire a lineage.
+They cannot grant `live_ready`, create a live assignment, or alter execution
+controls.
 
-- read: `runtime/openclaw/research_context.json`, containing allowlisted
-  operational state and non-protected research evidence
-- write: `runtime/research_inbox/openclaw/incoming/`
-
-The autonomous loop must not receive `.env`, approvals, credentials, raw market
-data, or protected/final-holdout evidence. The on-demand operator is a separate
-explicit-authority path: it may inspect status and use audited control/service
-commands when Henrique asks, but cannot autonomously promote, order, approve,
-or increase live risk. If OpenClaw runs as the same Unix user as the trader,
-these limits are policy rather than filesystem isolation; a dedicated account
-or container remains the stronger production boundary.
-
-### Sanitized research workspace
-
-Export context for OpenClaw:
+## Verification
 
 ```bash
-.venv/bin/python -m src.autopilot.openclaw_bridge export
+curl --fail http://127.0.0.1:8088/status
+curl --fail http://127.0.0.1:9108/metrics
+make platform-report
+make platform-readiness
 ```
 
-The output contains allowlisted paper-product health/performance, scheduled-job
-health, aggregate development/train/validation progress, every active
-non-protected hypothesis with stable identity/spec summary/lineage/evaluation
-history, prior Alfred action dispositions, and review receipts. The exporter
-reads experiment memory through a read-only SQLite connection. OpenClaw receives
-neither direct SQLite access nor protected evaluation rows.
-
-The context excludes credentials, approvals, exchange account information, raw
-market data, live-control mutation capability, and locked/final holdout outcomes.
-Final holdout decisions are deliberately one-way: they may gate export, stage a
-candidate, or retire a lineage inside the trusted core but never become
-feedback that OpenClaw can optimize against. Forward-paper evidence is also
-excluded from the adaptive research context.
-
-### Research action contract
-
-OpenClaw may write one JSON file per action to
-`runtime/research_inbox/openclaw/incoming/`. It should write a non-`.json`
-temporary file completely and then atomically rename it to `.json`, so the
-ingester never sees a partial record. Example:
-
-```json
-{
-  "schema": "research_action/v1",
-  "source": "openclaw",
-  "created_at": "2026-07-10T12:00:00Z",
-  "action": "revise",
-  "parent_hypothesis_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "objective": "active_income",
-  "opportunity_type": "day",
-  "base_timeframe": "5m",
-  "thesis": "A volatility expansion after a quiet regime may carry short-term continuation.",
-  "reasoning": "The parent had enough trades but weak validation edge, so simplify the entry.",
-  "changes": ["remove one setup predicate"],
-  "expected_outcome": "Higher validation trade count without worse drawdown.",
-  "falsification_criteria": "Reject if validation edge remains non-positive.",
-  "suggested_primitives": ["volatility percentile", "range expansion"],
-  "constraints": ["avoid unusually high funding windows"],
-  "provenance": {
-    "agent": "openclaw-researcher",
-    "model": "local-model"
-  },
-  "source_proposal_id": "session-42:idea-7"
-}
-```
-
-Actions are `new`, `revise`, `retry`, `request_test`, and `retire`. Every action
-except `new` references a stable parent behavior hash. Valid objectives are
-`btc_accumulation` and `active_income`; opportunity types are `scalp`, `day`,
-`swing`, and `position`.
-
-Ingest proposals with:
-
-```bash
-.venv/bin/python -m src.autopilot.openclaw_bridge ingest
-```
-
-The bridge bounds and validates input, rejects duplicate/unsafe records, assigns
-a canonical digest and proposal ID, archives the raw file, and writes accepted
-records to `runtime/research_inbox/openclaw/accepted/`. Rejection metadata goes
-to `rejected/`; it does not echo the untrusted thesis.
-
-Incoming files may be owned by the separate OpenClaw account. The bridge never
-moves such a file into its private archive and then assumes it can change the
-owner's permissions. It reads at most 64 KiB plus one detection byte through a
-non-following descriptor, copies the exact bounded bytes into a newly created
-bridge-owned `0600` archive file, fsyncs it, and only then unlinks the unchanged
-source. Oversized inputs are fingerprinted from bounded metadata/prefix bytes,
-rejected, and removed without copying their unbounded body into the archive.
-
-`accepted/` is a transient hand-off spool, not an archive. After the factory
-commits an accepted/rejected disposition to its atomic proposal-state receipt,
-it removes the corresponding spool file. A crash between those steps is repaired
-on the next cycle without reprocessing the proposal. The bridge's private
-`index.json` retains canonical IDs and content digests independently of the
-spool, so removing a file cannot make the same semantic proposal new again. The
-index is bounded at 50,000 identities; at capacity the optional bridge rejects
-new submissions fail closed rather than evicting old duplicate memory or
-starving native generation. The ingest report sets `degraded: true`, includes
-`dedup_index_capacity`, and explicitly reports that native generation is
-unaffected.
-
-Raw and rejection audit files use deterministic rolling retention after the
-dedup index has been durably updated. `archive/` keeps at most 2,000 files and
-128 MiB; `rejected/` keeps at most 5,000 files and 32 MiB. The oldest records by
-modification time and name are removed first, with at most 5,000 removals per
-bridge cycle. Both directories and every retained/pruned record must be owned by
-the bridge user, non-symlink, regular, and inaccessible to group/other users. An
-unsafe path stops the bridge visibly instead of being followed or silently
-skipped. The ingest report exposes initial, pruned, and retained file/byte counts
-under `retention`.
-
-The shared `incoming/` spool is also best-effort bounded to 2,000 observed files
-and 128 MiB. Each bridge cycle scans at most 20,000 entries, removes temporary
-non-JSON files stale for at least one hour, and can remove at most 5,000 oldest
-inert entries to reduce a producer backlog. A truncated scan or remaining
-backlog is reported as degraded, while trusted native generation continues.
-This cleanup is not a security quota: for a separate user or container, apply a
-filesystem/project quota to `incoming/`. A malicious or much faster writer can
-otherwise outpace any periodic userspace cleanup.
-
-Every accepted action is stamped as research-only, non-executable, not eligible
-for paper trading, promotion, or live trading, and requiring trusted compilation
-and full validation. The optional `suggested_spec` is renamed
-`untrusted_suggested_spec`; it is never passed directly to an executor. On the
-next factory cycle, the trusted compiler either maps the thesis to a native
-grammar motif or accepts a complete suggestion only after strict field, typed
-schema, search-space, feature-inventory, and risk-limit validation. The compiled
-behavior is then canonicalized, deduplicated, recorded in experiment memory,
-and subjected to the same real-data and protected-holdout gates as a native
-idea. Invalid suggestions are rejected and the native generator continues to
-fill its bounded batch.
-
-For a separate Unix account, use a dedicated trading checkout. The checkout and
-the immediate entries on each ACL boundary (`REPO`, `runtime`,
-`runtime/research_inbox`, and the private OpenClaw inbox root) must be owned by
-the trading-service user and must not be symlinks. Create a dedicated group once
-and add both the trading-service user and OpenClaw user to it (replace the names
-to match the server). Log out and back in, and restart the existing OpenClaw
-service, after changing group membership:
-
-```bash
-sudo groupadd --force trading-research-bridge
-sudo usermod -aG trading-research-bridge trader
-sudo usermod -aG trading-research-bridge openclaw
-id -nG trader
-id -nG openclaw
-# Restart the existing OpenClaw service/process so it receives the new group.
-```
-
-The installer enforces this boundary with narrow named-user ACLs while
-preserving unrelated checkout modes and ACLs. It grants the exact OpenClaw user
-execute-only traversal on the minimum trading-user-owned ancestors, explicitly
-denies that user on every other existing immediate child at each boundary, and
-adds a default named-user denial for future children. An exact named-user ACL is
-evaluated before group/world mode bits, so even an existing `0644` data file is
-unreachable below its denied directory. Only the sanitized context directory
-is readable, and only the incoming spool is setgid/group-writable. Accepted,
-rejected, archive, approval, control, trade-log, data, output, config, source,
-and credential paths remain private to the OpenClaw identity. OpenClaw should
-use `umask 0007` when atomically writing proposal files so the bridge user can
-read them.
-
-This mode requires the Linux `setfacl` and `getfacl` commands (usually provided
-by the `acl` package), both `OPENCLAW_USER` and `OPENCLAW_GROUP`, and a real non-symlink
-checkout. The installer never tries to edit root-owned ancestors such as
-`/home` or `/`; it verifies that those foreign-owned parents already permit the
-OpenClaw account to traverse them. If a hardened parent does not, have an
-administrator grant execute-only traversal to that one account before rerunning.
-Because execute-only access to a service home permits access to any independently
-world/group-readable path whose exact name is known, keep other contents of the
-trading-service home owner-private as well. Prefer a dedicated service home.
-
-Install the credential-free five-minute export/ingest timer:
-
-```bash
-REPO="$PWD" DRY_RUN=1 UNIT_DIR="$PWD/runtime/systemd-openclaw-dry-run" \
-  bash scripts/install_openclaw_bridge_timer.sh
-REPO="$PWD" OPENCLAW_GROUP=trading-research-bridge OPENCLAW_USER=openclaw \
-  bash scripts/install_openclaw_bridge_timer.sh
-```
-
-The dry run writes units only; it deliberately does not change checkout modes,
-ownership, or ACLs. The real shared-user install is the step that validates the
-accounts and applies the narrow named-user ACL boundary. Inspect `git status`
-first and back up intentional local state before that one-time ACL operation.
-
-If OpenClaw runs in a container, mount only
-`runtime/openclaw/research_context.json` read-only plus
-`runtime/research_inbox/openclaw/incoming/` read-write. Do not mount the repo or
-the trading `.env`. A different container UID cannot read the default `0600` /
-`0700` non-shared files: either map a dedicated host OpenClaw identity into the
-container and run the shared-user install above, or use an administrator-managed
-idmapped/bind-mount boundary that grants equivalent read/write access only to
-those two paths. Do not solve container permissions by making the repo or
-runtime tree world-readable.
-
-Inspect it with:
-
-```bash
-systemctl --user status \
-  trading-bot-openclaw-bridge.service \
-  trading-bot-openclaw-bridge.timer --no-pager
-journalctl --user -u trading-bot-openclaw-bridge.service -n 100 --no-pager
-```
-
-Install Alfred's managed natural-language operator instructions, four daily
-research reviews, and the 15-minute material-event watcher:
-
-```bash
-REPO="$PWD" bash scripts/install_alfred_integration.sh
-```
-
-The scheduled reviews run at 00:45, 06:45, 12:45, and 18:45 Europe/Madrid. The
-bridge records material operational/research changes; the event watcher wakes
-the same review job with a cooldown and leaves a failed event pending for retry.
-Accepted actions make `research_factory` immediately due, and the changed batch
-makes `research_cycle` immediately due, closing the action-to-result loop.
-Meaningful findings are announced to Henrique's Telegram mapping from
-`USER_IDS.md` (or `TELEGRAM_TO`); audited no-op reviews finish with `NO_REPLY`
-and remain quiet.
-
-OpenClaw being unavailable, returning invalid JSON, or proposing unsafe content
-cannot stop the trading supervisor. Its action remains inert or is rejected;
-there is no direct OpenClaw-to-execution path.
+Use [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for service installation and
+incident recovery. The old file-based Telegram and autopilot bridges are
+offline migration or research code only.

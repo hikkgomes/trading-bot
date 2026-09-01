@@ -103,7 +103,7 @@
   },
   "alerting": {
     "enabled": true,
-    "sink": "existing_autopilot_alerts",
+    "sink": "webhook",
     "minimum_valid_screenings_before_progress": 10
   },
   "backup": {

@@ -1,65 +1,54 @@
-## Trading bot ownership
+# Trading platform operator instructions
 
-The trading bot at `/home/alfred/trading-bot` is a system you own and supervise.
-Henrique talks to you in natural language; do not require Telegram slash
-commands.
+Use `/home/alfred/trading-bot` on the Linux authority host. PostgreSQL is the
+only source of lifecycle, assignment, approval, order, position, risk,
+accounting, control, and report state.
 
-### On-demand operator role
-
-For questions about current state, refresh the authoritative report first:
+## Inspect
 
 ```bash
 cd /home/alfred/trading-bot
-.venv/bin/python -m src.autopilot.reporting \
-  --config config/autopilot.json \
-  --output runtime/operator_report.md \
-  --json-output runtime/operator_report.json
+make platform-report
+make platform-readiness
+curl --fail http://127.0.0.1:8088/status
 ```
 
-Read `runtime/operator_report.md` and inspect relevant user-systemd state or
-journals before answering. Never infer that a service restarted or recovered;
-verify it.
+Inspect the resulting PostgreSQL report and system-level service state before
+claiming that a process recovered, a strategy progressed, or an account is
+safe. Never infer state from a stale file.
 
-When Henrique explicitly asks:
+## Controls
 
-- stop/pause trading: use the audited `pause` control so new entries and jobs
-  stop while deterministic position management can remain available; do not
-  stop systemd units merely because Henrique says “stop the bot”;
-- pause/resume: use `.venv/bin/python -m src.autopilot.control --config
-  config/autopilot.json --operator alfred <command> --reason <reason>`;
-- hard service stop/start: only when Henrique explicitly distinguishes this
-  from pausing; inspect open positions first and keep risk management available
-  unless he confirms otherwise;
-- restart: use `systemctl --user restart trading-bot-autopilot.service
-  trading-bot-autopilot-jobs.service`, then verify both units and the refreshed
-  operator report;
-- logs/diagnosis: inspect the relevant `systemctl --user status` and
-  `journalctl --user` output;
-- test: run the narrow relevant tests first, then broader tests in proportion
-  to the change;
-- modify/deploy: inspect git status, preserve unrelated work, change the
-  repository, test, commit, push, deploy, and verify the live revision.
+Use the authenticated local control API for explicit operator actions:
 
-Pause, resume, restart, code changes, and deployment require a direct user
-request. Emergency risk-reduction is allowed when explicitly requested.
-Destructive recovery, flattening, live promotion, discretionary orders, risk
-increases, credentials, and approvals require explicit confirmation; never
-infer it from a general request to “fix” or “manage” the bot.
+- block new risk or set management-only mode during an incident;
+- cancel all entry orders;
+- suspend one strategy;
+- reduce or flatten selected exposure;
+- resume only after reconciliation and an explicit confirmation.
 
-### Autonomous research-supervisor role
+Keep the bearer token private. Do not use chat messages as live approval.
+Emergency actions must be idempotent and must be followed by account and
+stop reconciliation.
 
-Four times daily and after material events, follow
-`/home/alfred/trading-bot/config/openclaw_daily_review_prompt.md`. You may
-autonomously create, revise, retry, test, or retire research hypotheses through
-the research-action inbox. You may not autonomously promote to live, place
-orders, alter live risk, approve a strategy, or edit active strategy artifacts.
+## Research
 
-Once weekly, follow
-`/home/alfred/trading-bot/config/openclaw_weekly_deep_review_prompt.md` for a
-Sol quality-first audit across the complete active research portfolio. The same
-research-only authority and live-trading prohibitions apply.
+Review candidates, stage states, waiting reasons, forward summaries, and
+generation feedback from PostgreSQL. Synthetic diagnostics are not production
+evidence. Agents may submit bounded research proposals, but cannot approve,
+promote, place orders, or change risk.
+Agents must not autonomously promote or approve any strategy.
 
-The trading process is deterministic and must continue if you or the model are
-offline. OpenClaw is the sole inbound Telegram poller. The trading bot may send
-outbound alerts through the same bot token but its inbound poller must remain
-disabled.
+If optional Telegram is deployed, OpenClaw is the sole inbound Telegram poller.
+Use `config/openclaw_daily_review_prompt.md` and
+`config/openclaw_weekly_deep_review_prompt.md` for research reviews.
+
+## Deployment and recovery
+
+Follow [`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md) for installation,
+backups, restores, testnet rehearsal, and incident recovery. Use the grouped
+system-level `trading-platform-*` units only.
+
+Legacy autopilot services, SQLite memory, JSON approvals, and active-strategy
+files are migration or archive inputs. Do not start them or use them as
+runtime authority.
