@@ -40,23 +40,18 @@ class TypedRuleBehaviour:
         ):
             _validate_condition(self.rule, field="rule")
         else:
-            condition_groups = tuple(
-                key
-                for key in (
-                    "conditions",
-                    "positive_conditions",
-                    "negative_conditions",
-                    "long_conditions",
-                    "short_conditions",
-                    "exit_conditions",
-                )
-                if key in self.rule
+            entry_groups = (
+                "conditions",
+                "positive_conditions",
+                "negative_conditions",
+                "long_conditions",
+                "short_conditions",
             )
-            if not any(
-                _conditions(self.rule, key, required=key != "exit_conditions")
-                for key in condition_groups
-            ):
+            if not any(key in self.rule for key in entry_groups):
                 raise StrategyBehaviourError("typed strategy rule has no entry conditions")
+            for key in (*entry_groups, "exit_conditions"):
+                if key in self.rule:
+                    _conditions(self.rule, key, required=key in entry_groups)
         direction = str(self.rule.get("direction") or "long")
         if direction not in {"long", "short", "signed", "market_neutral", "hedged"}:
             raise StrategyBehaviourError("typed strategy rule direction is invalid")

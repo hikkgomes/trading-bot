@@ -575,6 +575,25 @@ def test_typed_rule_behaviour_supports_multi_condition_entries_and_exits() -> No
     ) == (1, 0, 0)
 
 
+def test_typed_rule_behaviour_validates_directional_groups() -> None:
+    behaviour = TypedRuleBehaviour(
+        {
+            "positive_conditions": [{"feature": "momentum", "operator": "gt", "threshold": 0.1}],
+            "negative_conditions": [{"feature": "momentum", "operator": "lt", "threshold": -0.1}],
+            "condition_mode": "any",
+            "direction": "signed",
+        }
+    )
+
+    assert behaviour.generate_signals(
+        [{"momentum": 0.2}, {"momentum": -0.2}, {"momentum": 0.0}]
+    ) == (1, -1, 0)
+    with pytest.raises(ValueError, match="no entry conditions"):
+        TypedRuleBehaviour(
+            {"exit_conditions": [{"feature": "volatility", "operator": "gt", "threshold": 0.9}]}
+        )
+
+
 def _evidence_hashes(index: int) -> dict[str, str]:
     return {
         "run_id": "sha256:" + str(index) * 64,
