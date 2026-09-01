@@ -712,7 +712,7 @@ class PlatformDatabase:
         if self.is_postgresql:
             with self.engine.connect() as connection:
                 revision = connection.execute(text("SELECT version_num FROM alembic_version"))
-                if revision.scalar_one_or_none() != "platform_v2_0011":
+                if revision.scalar_one_or_none() != "platform_v2_0012":
                     raise RuntimeError("database is not at the current Alembic revision")
 
     def dispose(self) -> None:
