@@ -768,6 +768,20 @@ def _requested_transition_decision(
         )
     if requested_transition == "resume":
         return _resume_decision(strategy_version_id, current_state, evidence, policy, evaluated_at)
+    if requested_transition == "live_ready" and current_state in {
+        LifecycleState.REGISTERED,
+        LifecycleState.DEVELOPMENT,
+    }:
+        return _decision(
+            strategy_version_id,
+            current_state,
+            current_state,
+            False,
+            "forward_paper_required",
+            evaluated_at,
+            0.0,
+            evidence,
+        )
     if requested_transition == "live_canary" and not policy.automatic_live_canary_promotion:
         return _decision(
             strategy_version_id,

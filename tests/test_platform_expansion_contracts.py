@@ -383,6 +383,39 @@ def test_market_making_live_promotion_requires_capability_and_replay() -> None:
     assert accepted.next_state is LifecycleState.LIVE_CANARY
 
 
+def test_requested_live_ready_cannot_skip_forward_paper() -> None:
+    policy = PromotionPolicy(True, False, 0.01, 30, 0.1, 0.1, 0.1)
+    evidence = PromotionEvidence(
+        strategy_artefact_hash="sha256:" + "1" * 64,
+        source_commit_hash="sha256:" + "2" * 64,
+        validation_accepted=True,
+        protected_holdout_accepted=True,
+        forward_evidence_days=0,
+        forward_evidence_accepted=False,
+        drawdown=0.0,
+        execution_drift=0.0,
+        model_drift=0.0,
+        portfolio_capacity=0.1,
+        requested_capital=0.01,
+        risk_budget_available=0.1,
+        live_approval=False,
+        fresh_preflight=False,
+    )
+
+    decision = decide_promotion(
+        strategy_version_id="strategy:v1",
+        current_state=LifecycleState.REGISTERED,
+        evidence=evidence,
+        policy=policy,
+        evaluated_at=NOW,
+        requested_transition="live_ready",
+    )
+
+    assert decision.accepted is False
+    assert decision.next_state is LifecycleState.REGISTERED
+    assert decision.reason_code == "forward_paper_required"
+
+
 def test_product_promotion_uses_the_declared_objective_instead_of_generic_pnl() -> None:
     policy = PromotionPolicy(
         automatic_paper_promotion=True,
