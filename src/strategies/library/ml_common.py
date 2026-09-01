@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -75,7 +76,7 @@ def triple_barrier_direction_target(
     take_profit: float,
     stop_loss: float,
 ) -> pd.Series:
-    values = np.full(len(index), np.nan, dtype=float)
+    values: Any = np.full(len(index), np.nan, dtype=float)
     for i, entry_idx, end_idx, entry in _barrier_windows(ohlcv, horizon):
         upper = entry * (1.0 + take_profit)
         lower = entry * (1.0 - stop_loss)
@@ -105,7 +106,7 @@ def triple_barrier_return_target(
     take_profit: float,
     stop_loss: float,
 ) -> pd.Series:
-    values = np.full(len(index), np.nan, dtype=float)
+    values: Any = np.full(len(index), np.nan, dtype=float)
     for i, entry_idx, end_idx, entry in _barrier_windows(ohlcv, horizon):
         upper = entry * (1.0 + take_profit)
         lower = entry * (1.0 - stop_loss)

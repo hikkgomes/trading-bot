@@ -81,7 +81,7 @@ class Candidate:
 
     @property
     def candidate_id(self) -> str:
-        payload = {
+        payload: dict[str, Any] = {
             "definition_hash": self.definition.definition_hash,
             "thesis_id": self.thesis_id,
             "lineage_id": self.lineage_id,

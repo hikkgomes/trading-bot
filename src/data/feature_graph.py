@@ -7,7 +7,7 @@ import statistics
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 
@@ -314,6 +314,7 @@ class FeatureGraphRegistry:
             parameters,
             minimum_history,
         ) in specifications.items():
+            parameters = cast(Mapping[str, Any], parameters)
             registry.register(
                 FeatureNode(
                     name,
@@ -490,12 +491,14 @@ def _evaluate_default_node(
         for index in range(1, length):
             final_upper.append(
                 upper[index]
-                if upper[index] < final_upper[index - 1] or closes[index - 1] > final_upper[index - 1]
+                if upper[index] < final_upper[index - 1]
+                or closes[index - 1] > final_upper[index - 1]
                 else final_upper[index - 1]
             )
             final_lower.append(
                 lower[index]
-                if lower[index] > final_lower[index - 1] or closes[index - 1] < final_lower[index - 1]
+                if lower[index] > final_lower[index - 1]
+                or closes[index - 1] < final_lower[index - 1]
                 else final_lower[index - 1]
             )
             if closes[index] > final_upper[index - 1]:

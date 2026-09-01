@@ -10,7 +10,7 @@ import subprocess
 import sys
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from src.domain._codec import canonical_hash
 from src.domain.instruments import MarketType, canonical_instrument_id
@@ -222,7 +222,7 @@ def registered_strategy_candidates(
         if entry is None:
             raise ValueError(f"registered strategy is missing from the manifest: {name}")
         feature_nodes, _ = registered_feature_contract(name)
-        strategy_class = get(name)
+        strategy_class = cast(Any, get(name))
         parameters = strategy_class.default_params()
         market_type = MarketType.SPOT if product == "btc_accumulation" else MarketType.FUTURES
         universe_definition = {

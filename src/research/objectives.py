@@ -43,7 +43,10 @@ def objective_passes(
 
     if not objective_is_available(evidence, product_id=product_id):
         return False
-    excess_fraction = float(evidence["objective_excess_fraction"])
+    raw_excess_fraction = evidence["objective_excess_fraction"]
+    if not isinstance(raw_excess_fraction, int | float) or isinstance(raw_excess_fraction, bool):
+        return False
+    excess_fraction = float(raw_excess_fraction)
     return excess_fraction >= minimum_excess_fraction
 
 

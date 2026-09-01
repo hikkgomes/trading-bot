@@ -15,11 +15,11 @@ import statistics
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from src.domain._codec import canonical_hash, json_value
 from src.domain.strategies import StrategySourceType
-from src.research.coordinator import Candidate
+from src.research.coordinator import Candidate, CandidateEvaluationView
 from src.strategies.behaviour import RegisteredStrategyBehaviour, StrategyBehaviourError
 from src.strategies.semantic import SEMANTIC_STRATEGIES
 
@@ -51,7 +51,8 @@ class ExecutionResult:
 
 
 Executor = Callable[[Candidate, Mapping[str, Any]], ExecutionResult]
-ContextBuilder = Callable[[Candidate, Mapping[str, Any]], Mapping[str, Any]]
+ContextCandidate = Candidate | CandidateEvaluationView
+ContextBuilder = Callable[[ContextCandidate, Mapping[str, Any]], Mapping[str, Any]]
 
 
 class ProviderContextBuilderRegistry:
@@ -71,7 +72,7 @@ class ProviderContextBuilderRegistry:
         except KeyError as exc:
             raise ExecutorError(f"no context builder registered for {source_type.value}") from exc
 
-    def build(self, candidate: Candidate, context: Mapping[str, Any]) -> Mapping[str, Any]:
+    def build(self, candidate: ContextCandidate, context: Mapping[str, Any]) -> Mapping[str, Any]:
         builder = self.builder_for(candidate.definition.source_type)
         source_hash = canonical_hash(context)
         built = dict(builder(candidate, context))
@@ -763,10 +764,10 @@ def _btc_fraction_inputs(
     if derived and tactical_fraction is None:
         tactical_fraction = 0.3
     if derived and reserve_fraction is None:
-        reserve_fraction = 1.0 - float(tactical_fraction)
+        reserve_fraction = 1.0 - float(cast(Any, tactical_fraction))
     return (
-        float(reserve_fraction) if reserve_fraction is not None else None,
-        float(tactical_fraction) if tactical_fraction is not None else None,
+        float(cast(Any, reserve_fraction)) if reserve_fraction is not None else None,
+        float(cast(Any, tactical_fraction)) if tactical_fraction is not None else None,
     )
 
 
@@ -989,10 +990,10 @@ def _derived_btc_accounting_inputs(
     times = _frame_times(context, rows)
     if times is None:
         return None, None
-    prices = tuple(_row_price(row) for row in rows)
-    if any(price is None for price in prices):
+    raw_prices = tuple(_row_price(row) for row in rows)
+    if any(price is None for price in raw_prices):
         return None, None
-    prices = tuple(float(price) for price in prices)
+    prices: tuple[float, ...] = tuple(float(cast(Any, price)) for price in raw_prices)
     tactical = float(
         context.get("max_tactical_fraction", context.get("btc_max_tactical_fraction", 0.3))
     )
@@ -1097,10 +1098,11 @@ def _futures_frame_inputs(
     times = _frame_times(context, rows)
     if times is None:
         return None
-    prices = tuple(_row_price(row) for row in rows)
-    if any(price is None for price in prices):
+    raw_prices = tuple(_row_price(row) for row in rows)
+    if any(price is None for price in raw_prices):
         return None
-    return rows, signals, times, tuple(float(price) for price in prices)
+    prices: tuple[float, ...] = tuple(float(cast(Any, price)) for price in raw_prices)
+    return rows, signals, times, prices
 
 
 def _derived_futures_target_notional(context: Mapping[str, Any]) -> float:
@@ -1904,7 +1906,7 @@ def _negative_control_names(candidate: Candidate, context: Mapping[str, Any]) ->
 
 
 def _build_registered_context(
-    _candidate: Candidate, context: Mapping[str, Any]
+    _candidate: ContextCandidate, context: Mapping[str, Any]
 ) -> Mapping[str, Any]:
     raw = context.get("market_frame")
     if raw is None:
@@ -1923,7 +1925,9 @@ def _build_registered_context(
     return {**dict(context), "market_frame": frame}
 
 
-def _build_dsl_context(_candidate: Candidate, context: Mapping[str, Any]) -> Mapping[str, Any]:
+def _build_dsl_context(
+    _candidate: ContextCandidate, context: Mapping[str, Any]
+) -> Mapping[str, Any]:
     rows = context.get("feature_rows")
     if (
         not isinstance(rows, list | tuple)
@@ -1934,7 +1938,7 @@ def _build_dsl_context(_candidate: Candidate, context: Mapping[str, Any]) -> Map
     return {**dict(context), "feature_rows": tuple(dict(item) for item in rows)}
 
 
-def _build_ml_context(candidate: Candidate, context: Mapping[str, Any]) -> Mapping[str, Any]:
+def _build_ml_context(candidate: ContextCandidate, context: Mapping[str, Any]) -> Mapping[str, Any]:
     from src.strategies.frozen_model import FrozenSafeModel
 
     model = context.get("frozen_model")
@@ -1969,7 +1973,9 @@ def _build_ml_context(candidate: Candidate, context: Mapping[str, Any]) -> Mappi
     return {**dict(context), "frozen_model": model, "feature_vector": dict(vector)}
 
 
-def _build_semantic_context(candidate: Candidate, context: Mapping[str, Any]) -> Mapping[str, Any]:
+def _build_semantic_context(
+    candidate: ContextCandidate, context: Mapping[str, Any]
+) -> Mapping[str, Any]:
     name = str(
         candidate.definition.signal_model.get("semantic_strategy") or candidate.definition.identity
     )

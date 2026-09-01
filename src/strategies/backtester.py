@@ -41,7 +41,7 @@ class BacktestResult:
             return np.array([], dtype=float)
         return self.trades["net_return"].to_numpy(dtype=float)
 
-    def summary(self) -> dict[str, float]:
+    def summary(self) -> dict[str, float | str]:
         r = self.returns
         n = int(r.size)
         if n == 0:

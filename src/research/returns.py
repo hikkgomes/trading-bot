@@ -160,6 +160,8 @@ class PositionReturnLedger:
             if not math.isfinite(rate):
                 raise ReturnLedgerError("funding_rate must be finite")
             return (rate,) * count
+        if isinstance(funding_rates, bool):
+            raise ReturnLedgerError("funding_rates must be numeric or iterable")
         values = _series(funding_rates, field="funding_rates")
         if len(values) < count:
             raise ReturnLedgerError("funding_rates must cover every return observation")

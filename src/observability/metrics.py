@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, cast
 
 
 def _label_value(value: str) -> str:
@@ -146,7 +147,7 @@ def build_metrics_server(
 
 def _numeric(value: object) -> float:
     try:
-        result = float(value or 0.0)
+        result = float(cast(Any, value or 0.0))
     except (TypeError, ValueError):
         return 0.0
     return result if math.isfinite(result) else 0.0

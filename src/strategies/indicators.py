@@ -7,6 +7,8 @@ TA-Lib; these are for strategies that compute their own features on the fly.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
 
@@ -166,7 +168,7 @@ def supertrend(
     lower_basic = (hl2 - mult * atr_s).to_numpy()
     close_a = close.to_numpy()
     n = len(close_a)
-    direction = np.ones(n, dtype=int)
+    direction: Any = np.ones(n, dtype=int)
     final_upper = np.full(n, np.nan)
     final_lower = np.full(n, np.nan)
 

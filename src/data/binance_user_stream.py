@@ -19,8 +19,10 @@ def normalise_user_event(
     if market not in {"spot", "futures"}:
         raise ValueError("Binance user-stream market must be spot or futures")
     event_name = str(payload.get("e") or "")
-    order = payload.get("o") if isinstance(payload.get("o"), Mapping) else {}
-    algo = payload.get("a") if isinstance(payload.get("a"), Mapping) else {}
+    raw_order = payload.get("o")
+    raw_algo = payload.get("a")
+    order: Mapping[str, Any] = raw_order if isinstance(raw_order, Mapping) else {}
+    algo: Mapping[str, Any] = raw_algo if isinstance(raw_algo, Mapping) else {}
     symbol = str(payload.get("s") or order.get("s") or algo.get("s") or "").upper()
     if event_name in {"executionReport", "ORDER_TRADE_UPDATE"}:
         execution_type = str(payload.get("x") or order.get("x") or "")

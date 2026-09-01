@@ -47,7 +47,8 @@ def normalise_public_event(
     """Convert one combined-stream event without changing its raw payload."""
     if market not in {"spot", "futures"}:
         raise ValueError("Binance market must be spot or futures")
-    liquidation = payload.get("o") if isinstance(payload.get("o"), Mapping) else {}
+    raw_liquidation = payload.get("o")
+    liquidation: Mapping[str, Any] = raw_liquidation if isinstance(raw_liquidation, Mapping) else {}
     symbol = str(payload.get("s") or liquidation.get("s") or "").upper()
     if not symbol or not symbol.isalnum():
         raise ValueError("Binance public event has no valid symbol")

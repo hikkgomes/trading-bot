@@ -8,6 +8,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 from src.domain._codec import canonical_hash
 
@@ -170,14 +171,14 @@ def _safe_model_raw(
     trees = payload.get("trees")
     if isinstance(trees, list):
         feature_values = dict(zip(feature_names, values, strict=True))
-        learning_rate = float(payload.get("learning_rate", 1.0))
-        return float(payload.get("base_score", 0.0)) + learning_rate * sum(
+        learning_rate = float(cast(Any, payload.get("learning_rate", 1.0)))
+        return float(cast(Any, payload.get("base_score", 0.0))) + learning_rate * sum(
             _tree_value(tree, feature_values) for tree in trees
         )
     weights = payload.get("weights")
     if not isinstance(weights, list) or len(weights) != len(values):
         raise ValueError("safe frozen model has no validated numeric weights or trees")
-    raw = float(payload.get("intercept", 0.0)) + sum(
+    raw = float(cast(Any, payload.get("intercept", 0.0))) + sum(
         float(weight) * value for weight, value in zip(weights, values, strict=True)
     )
     calibration = payload.get("calibration")
