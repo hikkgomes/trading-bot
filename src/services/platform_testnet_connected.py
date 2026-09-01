@@ -164,6 +164,7 @@ def run_connected_testnet_rehearsal(
         opening_side = runtime["opening_side"]
         accounting_before = runtime["accounting_before"]
         now = runtime["now"]
+        reference_price = runtime["reference_price"]
         gateway = runtime["gateway"]
         user_stream_worker = runtime["user_stream_worker"]
         accounting_worker = runtime["accounting_worker"]
@@ -188,6 +189,7 @@ def run_connected_testnet_rehearsal(
             quantity=quantity,
             opening_side=opening_side,
             now=now,
+            reference_price=reference_price,
         )
         opened = cycle["opened"]
         closed = cycle["closed"]
@@ -448,6 +450,7 @@ def _prepare_rehearsal_runtime(
         "opening_side": opening_side,
         "accounting_before": accounting_before,
         "now": now,
+        "reference_price": price,
         "gateway": gateway,
         "user_stream_worker": user_stream_worker,
         "accounting_worker": accounting_worker,
@@ -511,6 +514,7 @@ def _perform_connected_round_trip(
     quantity: float,
     opening_side: OrderSide,
     now: str,
+    reference_price: float,
 ) -> dict[str, Any]:
     gateway.start()
     open_quantity = 0.0
@@ -533,6 +537,7 @@ def _perform_connected_round_trip(
             quantity=quantity,
             opening_side=opening_side,
             now=now,
+            reference_price=reference_price,
         )
         closed, close_recovery = _close_connected_order(
             account=account,
@@ -547,6 +552,7 @@ def _perform_connected_round_trip(
             accounting_worker=accounting_worker,
             open_quantity=open_quantity,
             opening_side=opening_side,
+            reference_price=reference_price,
         )
         return {
             "opened": opened,
@@ -589,6 +595,7 @@ def _open_connected_order(
     quantity: float,
     opening_side: OrderSide,
     now: str,
+    reference_price: float,
 ) -> tuple[dict[str, Any], float, Mapping[str, Any], Any]:
     timeout = min(30.0, float(os.environ.get("PLATFORM_TESTNET_TIMEOUT_SECONDS", "120")))
     if not gateway.wait_for_user_stream(str(account["account_id"]), timeout_seconds=timeout):
@@ -609,6 +616,7 @@ def _open_connected_order(
         accounting_worker=accounting_worker,
         strategy_version_id=str(assignment["strategy_version_id"]),
         artefact_hash=str(assignment["artefact_hash"]),
+        reference_price=reference_price,
     )
     open_quantity = float(order_manager.get(opened["order_id"]).filled_quantity)
     if open_quantity <= 0:
@@ -647,6 +655,7 @@ def _close_connected_order(
     accounting_worker: Any,
     open_quantity: float,
     opening_side: OrderSide,
+    reference_price: float,
 ) -> tuple[dict[str, Any], Mapping[str, Any]]:
     closed = _submit_and_wait(
         order_manager=order_manager,
@@ -663,6 +672,7 @@ def _close_connected_order(
         accounting_worker=accounting_worker,
         strategy_version_id=str(assignment["strategy_version_id"]),
         artefact_hash=str(assignment["artefact_hash"]),
+        reference_price=reference_price,
     )
     if order_manager.get(closed["order_id"]).status is not OrderStatus.FILLED:
         raise ConnectedTestnetError("testnet close order was not filled")
@@ -1164,6 +1174,7 @@ def _submit_and_wait(
     accounting_worker,
     strategy_version_id: str,
     artefact_hash: str,
+    reference_price: float,
 ) -> dict[str, Any]:
     order = OrderIntent(
         order_id=canonical_hash(
@@ -1182,7 +1193,11 @@ def _submit_and_wait(
         created_at=now,
         reduce_only=reduce_only,
         strategy_contributions={strategy_version_id: 1.0},
-        metadata={"connected_testnet_rehearsal": True, "account_id": account_id},
+        metadata={
+            "connected_testnet_rehearsal": True,
+            "account_id": account_id,
+            "reference_price": reference_price,
+        },
     )
     order_manager.create(order)
     order_manager.persist_for_submission(order.order_id)
