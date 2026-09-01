@@ -1199,6 +1199,7 @@ def test_live_readiness_accepts_exact_connected_authority(tmp_path: Path, monkey
     assert [
         item["id"] for item in _active_assignments(database.engine)(instrument_value.instrument_id)
     ] == [assignment_id]
+    assert _active_assignments(database.engine)("binance:futures:ETHUSDT:USDT") == ()
 
     drifted_product = copy.deepcopy(product)
     drifted_product["account_snapshot_max_age_seconds"] = 30

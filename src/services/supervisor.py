@@ -717,6 +717,8 @@ def _active_assignments(engine) -> Callable[[str], tuple[Mapping[str, Any], ...]
         assignments: list[Mapping[str, Any]] = []
         for product_id in product_ids:
             for row in repository.active_assignments(product_id, at=utc_now()):
+                if str(row.get("instrument_id") or "") != instrument_id:
+                    continue
                 payload = row["payload"]
                 if isinstance(payload, Mapping):
                     if payload.get("diagnostic") is True:
