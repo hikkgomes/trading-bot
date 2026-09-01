@@ -158,8 +158,50 @@ class LiveProtectiveStopService:
         for stop in self.stop_manager.active():
             if stop.portfolio_id != _portfolio_id(self.products[product_id]):
                 continue
+            position_quantity = self._position_quantity(stop)
+            if abs(position_quantity) <= 1e-12:
+                if stop.native_order_id:
+                    try:
+                        cancelled = venue.broker.cancel_protective_stop(
+                            symbol=_exchange_symbol(venue, stop.instrument_id),
+                            order_id=stop.native_order_id,
+                            client_id=str(stop.native_client_id or ""),
+                        )
+                        if ProtectiveOrderStatus(cancelled.status) is ProtectiveOrderStatus.OPEN:
+                            raise ProtectiveStopError(
+                                "native protective stop remained open after flat reconciliation"
+                            )
+                    except Exception as exc:
+                        self.stop_manager.mark_failure(
+                            stop.stop_id, reason=f"flat stop cancellation failed: {exc}"
+                        )
+                        self._emit_alert(
+                            event_type="protective_stop_orphaned",
+                            dedupe_key=f"protective-stop:{product_id}:{stop.stop_id}:flat",
+                            target=product_id,
+                            message="a flat position still has an active protective stop",
+                            emitted_at=at,
+                            payload={"stop_id": stop.stop_id},
+                        )
+                        results.append(
+                            {"stop_id": stop.stop_id, "status": "orphan_cancellation_failed"}
+                        )
+                        continue
+                self.stop_manager.cancel(stop.stop_id)
+                results.append({"stop_id": stop.stop_id, "status": "cancelled_flat"})
+                continue
             if not stop.native_order_id or not stop.native_client_id:
-                results.append({"stop_id": stop.stop_id, "status": stop.status.value})
+                self.stop_manager.mark_failure(
+                    stop.stop_id, reason="live position has no confirmed native protective stop"
+                )
+                self._enqueue_reduction(
+                    product_id=product_id,
+                    stop=stop,
+                    position_quantity=position_quantity,
+                    at=at,
+                    reason_code="protective_stop_missing_after_reconciliation",
+                )
+                results.append({"stop_id": stop.stop_id, "status": "recovery_required"})
                 continue
             try:
                 native = venue.broker.get_protective_stop(

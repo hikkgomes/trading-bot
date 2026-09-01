@@ -195,3 +195,30 @@ def test_unknown_algo_update_is_not_silently_ignored() -> None:
     )
     result = service.on_algo_update("active_income", event)
     assert result["reason_code"] == "unknown_protective_algo_update"
+
+
+def test_reconcile_cancels_orphaned_native_stop_after_position_is_flat() -> None:
+    class Positions:
+        @staticmethod
+        def get(_portfolio_id, _instrument_id):
+            return type("Position", (), {"quantity": 0.0})()
+
+    broker = _Broker()
+    manager = StopManager(_StopStore())
+    service = LiveProtectiveStopService(
+        stop_manager=manager,
+        venues={"active_income": _Venue(broker)},
+        products={"active_income": {"portfolio_id": "active-income-portfolio"}},
+        accounts={"futures-account": {"market": "usdt_futures"}},
+        positions=Positions(),
+    )
+    order = _order()
+    service.prepare_entry("active_income", order, NOW)
+    service.on_fill("active_income", order, 1.0, NOW)
+    stop_id = manager.for_entry_order(order.order_id)[0].stop_id
+
+    result = service.reconcile("active_income", NOW)
+
+    assert result == ({"stop_id": stop_id, "status": "cancelled_flat"},)
+    assert broker.cancelled == ["native-1"]
+    assert manager.active() == ()
