@@ -261,11 +261,6 @@ class PlatformScheduler:
         catalogue = self._payload("register_strategy_catalogue", product_id, product, now)
         return (
             (
-                f"scheduled:candidate_generation:{product_id}:catalogue:{due_at}",
-                "register_strategy_catalogue",
-                catalogue,
-            ),
-            (
                 f"scheduled:candidate_generation:{product_id}:hypotheses:{due_at}",
                 "generate_hypotheses",
                 self._hypothesis_generation_payload(product_id, product, catalogue),

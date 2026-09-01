@@ -1410,7 +1410,13 @@ class DatabasePromotionWorker:
             )
         elif decision.next_state in {LifecycleState.SUSPENDED, LifecycleState.RETIRED}:
             if evidence.product_id:
-                assignments.deactivate(evidence.product_id)
+                assignments.deactivate(
+                    evidence.product_id,
+                    at=decision.evaluated_at,
+                    assignment_reason=f"canonical promotion: {decision.reason_code}",
+                    strategy_version_id=decision.strategy_version_id,
+                    artefact_hash=evidence.strategy_artefact_hash,
+                )
 
     def _assign_promoted_state(
         self,

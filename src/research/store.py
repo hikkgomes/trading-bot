@@ -22,6 +22,7 @@ from src.domain._codec import canonical_hash, json_value, timestamp, to_primitiv
 from src.domain.strategies import StrategyDefinition, StrategySourceType
 from src.research.coordinator import Candidate, CandidateState, ResearchResult
 from src.research.datasets import CandidateDatasetPlan
+from src.strategies.behaviour import behaviour_hash_for_definition
 
 
 def _mapping(value: object, *, field: str) -> Mapping[str, Any]:
@@ -204,15 +205,16 @@ class SqlResearchStore:
         definition_payload: dict[str, Any],
         metadata_payload: dict[str, Any],
     ) -> None:
+        behaviour_hash = behaviour_hash_for_definition(candidate.definition)
         identity_rows = connection.execute(
             select(strategy_identity.c.id).where(
-                strategy_identity.c.behavior_hash == definition_id,
+                strategy_identity.c.behavior_hash == behaviour_hash,
                 strategy_identity.c.id != candidate.candidate_id,
             )
         ).all()
         identity_values = {
             "id": candidate.candidate_id,
-            "behavior_hash": definition_id,
+            "behavior_hash": behaviour_hash,
             "submitted_spec": definition_payload,
             "generation_method": candidate.definition.source_type.value,
             "metadata": metadata_payload,

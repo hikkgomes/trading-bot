@@ -2182,6 +2182,8 @@ class SqlActiveStrategyAssignmentRepository:
         *,
         at: str | None = None,
         assignment_reason: str = "deactivated",
+        strategy_version_id: str | None = None,
+        artefact_hash: str | None = None,
         sleeve_id: str | None = None,
         instrument_id: str | None = None,
         universe_id: str | None = None,
@@ -2193,6 +2195,14 @@ class SqlActiveStrategyAssignmentRepository:
             else dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
         )
         active = self.active_assignments(product_id, at=deactivated_at)
+        if strategy_version_id is not None:
+            active = tuple(
+                row
+                for row in active
+                if row["strategy_version_id"] == strategy_version_id
+            )
+        if artefact_hash is not None:
+            active = tuple(row for row in active if row["artefact_hash"] == artefact_hash)
         if sleeve_id is not None:
             active = tuple(row for row in active if row["sleeve_id"] == sleeve_id)
         if instrument_id is not None:

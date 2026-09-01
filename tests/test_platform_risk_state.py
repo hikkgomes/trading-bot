@@ -6,7 +6,23 @@ from src.accounting.ledger import Ledger, SqlLedgerStore
 from src.data.database import PlatformDatabase, account_snapshot
 from src.domain._codec import canonical_hash
 from src.risk.engine import SqlRiskSnapshotStore
+from src.services.portfolio_engine import _validate_state_health
 from src.services.risk_state import PortfolioRiskCalculator
+
+
+def test_unavailable_factor_measurements_block_new_targets() -> None:
+    with pytest.raises(ValueError, match="unavailable factor measurements"):
+        _validate_state_health(
+            {
+                "risk_data_available": False,
+                "risk_data_missing": ["beta:binance:futures:ETHUSDT:USDT"],
+                "unknown_exposure": {},
+                "exchange_connected": True,
+                "database_healthy": True,
+                "execution_drift": False,
+                "model_drift": False,
+            }
+        )
 
 
 def test_risk_measurements_use_ledger_marks_and_pending_orders(tmp_path) -> None:

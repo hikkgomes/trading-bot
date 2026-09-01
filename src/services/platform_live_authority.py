@@ -345,6 +345,8 @@ class PlatformLiveAuthority:
             product_id,
             at=assigned_at,
             assignment_reason="paper authority replaced by live canary",
+            strategy_version_id=str(artefact["strategy_version_id"]),
+            artefact_hash=artefact_hash,
             sleeve_id=sleeve_id,
             instrument_id=instrument_id,
         )

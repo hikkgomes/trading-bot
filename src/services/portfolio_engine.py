@@ -597,6 +597,12 @@ def _validate_state_market(clean: Mapping[str, Any]) -> None:
 
 
 def _validate_state_health(clean: Mapping[str, Any]) -> None:
+    if clean["risk_data_available"] is not True:
+        missing = ", ".join(str(value) for value in clean["risk_data_missing"])
+        raise ValueError(
+            "canonical portfolio/risk state has unavailable factor measurements"
+            + (f": {missing}" if missing else "")
+        )
     if clean["unknown_exposure"]:
         raise ValueError("unknown exposure rejects new portfolio targets")
     if clean.get("account_state_known") is False:

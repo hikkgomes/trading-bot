@@ -22,6 +22,7 @@ from src.domain.strategies import (
 )
 from src.research.coordinator import Candidate
 from src.research.theses import FAMILY_NEGATIVE_CONTROLS
+from src.strategies.behaviour import behaviour_hash_for_definition
 
 
 class GenerationError(ValueError):
@@ -539,7 +540,7 @@ class SqlHypothesisMemory:
                 ).order_by(strategy_identity.c.created_at, strategy_identity.c.id)
             ).mappings()
             for row in rows:
-                if str(row["behavior_hash"]) == candidate.definition.definition_hash:
+                if str(row["behavior_hash"]) == behaviour_hash_for_definition(candidate.definition):
                     return DuplicateMatch(str(row["id"]), "exact", 0.0, signature)
                 distance = semantic_distance(candidate.definition, row["submitted_spec"])
                 if distance <= maximum_distance:
