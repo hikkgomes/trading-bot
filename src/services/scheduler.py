@@ -282,8 +282,11 @@ class PlatformScheduler:
             requested_stage = {
                 "queued": "screening",
                 "screening": "development",
+                "screening_deferred": "screening",
                 "development": "robustness",
+                "development_deferred": "development",
                 "robustness": "protected",
+                "robustness_deferred": "robustness",
             }.get(state_value)
             if requested_stage is None and state_value.startswith("waiting_for_dataset:"):
                 requested_stage = state_value.removeprefix("waiting_for_dataset:")

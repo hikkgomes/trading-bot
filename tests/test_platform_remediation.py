@@ -305,6 +305,79 @@ def test_evidence_policy_returns_a_structured_next_stage_decision() -> None:
     assert decision.to_payload()["next_stage"] == "development"
 
 
+def test_forward_evidence_is_deferred_until_sample_is_sufficient() -> None:
+    identity = "sha256:" + "c" * 64
+    policy = EvidencePolicy(
+        profiles=(
+            EvidenceProfile(
+                stage="forward",
+                family="swing",
+                minimum_calendar_days=60.0,
+                minimum_closed_trades=20,
+                minimum_effective_episodes=20,
+            ),
+        )
+    )
+    parity = {
+        "schema": "typed_rule_parity/v1",
+        "behaviour_hash": identity,
+        "input_hash": identity,
+        "signals": [1],
+    }
+    parity["receipt_hash"] = canonical_hash(parity)
+    evidence = {
+        "evidence_policy_hash": policy.policy_hash,
+        "data_integrity": {
+            "passed": True,
+            "dataset_snapshot_ids": [identity],
+            "input_hash": identity,
+        },
+        "semantic_parity": {
+            "passed": True,
+            "behaviour_hash": identity,
+            "parity_receipt": parity,
+        },
+        "realistic_costs": {
+            "passed": True,
+            "fee_bps": 1.0,
+            "slippage_bps": 1.0,
+            "funding_rate": 0.0,
+        },
+        "family_evidence": {"passed": True, "family": "swing"},
+        "production_equivalent": {"passed": True, "mode": "production"},
+        "exact_strategy_identity": {"passed": True, "expected": identity},
+        "exact_artefact_hash": {"passed": True, "expected": identity},
+        "exact_engine_hash": {"passed": True, "expected": identity},
+        "exact_cost_model": {"passed": True, "expected": identity},
+        "drift_checks": {"passed": True, "execution": 0.0},
+        "duration": 1.0,
+        "evidence_units": 1.0,
+        "sample_evidence": {
+            "passed": False,
+            "observations": 1,
+            "closed_trades": 0,
+            "effective_independent_episodes": 0,
+            "trading_days": 0,
+        },
+        "forward_duration": {
+            "passed": False,
+            "calendar_days": 1.0,
+            "trading_days": 0,
+            "cycles": 0,
+        },
+    }
+
+    statuses = policy.statuses("forward", evidence, (), family="swing")
+    decision = policy.decide("forward", evidence, (), family="swing")
+
+    assert statuses["sample_evidence"] is EvidenceStatus.UNAVAILABLE
+    assert statuses["forward_duration"] is EvidenceStatus.UNAVAILABLE
+    assert decision.accepted is False
+    assert decision.deferred is True
+    assert decision.fatal_failures == ("sample_evidence", "forward_duration")
+    assert decision.to_payload()["deferred"] is True
+
+
 def test_robustness_uses_one_primary_confidence_gate() -> None:
     policy = EvidencePolicy(
         minimum_deflated_sharpe=0.95,

@@ -195,6 +195,7 @@ class DatabasePlatformReport:
                 key = str(blocked["stage"])
                 first_blocked[key] = first_blocked.get(key, 0) + 1
         candidate_ages = _candidate_age_by_state(experiments, now=now)
+        deferred_by_stage = _deferred_candidates_by_stage(experiments)
         missing_stage_datasets = _missing_stage_datasets(
             experiments,
             bundles=research["dataset_bundles"],
@@ -247,6 +248,7 @@ class DatabasePlatformReport:
             ),
             "candidates_evaluated": len(evaluated_ids),
             "candidates_rejected_by_stage": rejection_by_stage,
+            "candidates_deferred_by_stage": deferred_by_stage,
             "top_rejection_reasons": dict(
                 sorted(rejection_reasons.items(), key=lambda item: (-item[1], item[0]))[:10]
             ),
@@ -559,6 +561,16 @@ def _candidate_age_by_state(
         }
         for state, ages in sorted(values.items())
     }
+
+
+def _deferred_candidates_by_stage(experiments: list[dict[str, Any]]) -> dict[str, int]:
+    deferred: dict[str, int] = {}
+    for row in experiments:
+        state = str(row.get("state") or "")
+        if state.endswith("_deferred"):
+            stage = state.removesuffix("_deferred")
+            deferred[stage] = deferred.get(stage, 0) + 1
+    return dict(sorted(deferred.items()))
 
 
 def _missing_stage_datasets(

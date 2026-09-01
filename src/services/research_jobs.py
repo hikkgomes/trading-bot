@@ -920,6 +920,7 @@ class DatabaseResearchJobHandlers:
             "candidate_id": result.candidate_id,
             "stage": result.stage,
             "accepted": result.accepted,
+            "deferred": result.deferred,
             "reason_code": result.reason_code,
             "run_id": result.run_id,
             "evidence_hash": result.evidence_hash,
@@ -943,6 +944,8 @@ class DatabaseResearchJobHandlers:
         *,
         campaign: str,
     ) -> None:
+        if result.deferred:
+            return
         if result.accepted and result.stage != "protected":
             return
         SqlGenerationFeedbackStore(self.store.engine).append(

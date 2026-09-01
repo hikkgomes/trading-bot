@@ -171,7 +171,9 @@ class DatabaseReportWorker:
         progressed = sum(
             int(values.get("count", 0))
             for state, values in age_by_state.items()
-            if state not in blocking_states and isinstance(values, dict)
+            if state not in blocking_states
+            and not state.endswith("_deferred")
+            and isinstance(values, dict)
         )
         if (
             int(funnel.get("candidates_generated", 0)) > 0

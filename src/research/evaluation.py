@@ -394,6 +394,7 @@ class StageEvaluation:
     run_id: str
     evidence_hash: str
     evidence: Mapping[str, Any]
+    deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -405,8 +406,11 @@ class EvaluationDecision:
     evidence_score: float = 0.0
     diagnostics: tuple[str, ...] = ()
     next_stage: str | None = None
+    deferred: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.accepted, bool) or not isinstance(self.deferred, bool):
+            raise EvaluationContractError("evaluation decision flags must be boolean")
         score = float(self.evidence_score)
         if not math.isfinite(score) or not 0.0 <= score <= 1.0:
             raise EvaluationContractError("evaluation evidence_score must be between zero and one")
@@ -421,6 +425,10 @@ class EvaluationDecision:
             )
         if not self.accepted and not failures:
             raise EvaluationContractError("rejected evaluation decisions need a fatal failure")
+        if self.deferred and self.accepted:
+            raise EvaluationContractError("deferred evaluation decisions cannot be accepted")
+        if self.deferred and self.next_stage is not None:
+            raise EvaluationContractError("deferred evaluation decisions cannot advance stages")
         if self.next_stage is not None and self.next_stage not in STAGES:
             raise EvaluationContractError("evaluation decision next_stage is unsupported")
 
@@ -431,6 +439,7 @@ class EvaluationDecision:
             "evidence_score": self.evidence_score,
             "diagnostics": list(self.diagnostics),
             "next_stage": self.next_stage,
+            "deferred": self.deferred,
         }
 
 
@@ -631,6 +640,11 @@ class EvidencePolicy:
             and status not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
         ]
         accepted = bool(required_statuses) and not failures
+        deferred = (
+            bool(failures)
+            and "evidence_policy_hash" not in failures
+            and all(statuses.get(name) is EvidenceStatus.UNAVAILABLE for name in failures)
+        )
         return EvaluationDecision(
             accepted=accepted,
             fatal_failures=tuple(failures),
@@ -642,8 +656,9 @@ class EvidencePolicy:
                 "robustness": "protected",
                 "protected": "forward",
             }.get(stage)
-            if accepted
+            if accepted and not deferred
             else None,
+            deferred=deferred,
         )
 
     def _optional_evidence_names(self, stage: str) -> frozenset[str]:
@@ -685,6 +700,8 @@ class EvidencePolicy:
                 statuses[name] = EvidenceStatus.NOT_APPLICABLE
             elif _is_unavailable(value):
                 statuses[name] = EvidenceStatus.UNAVAILABLE
+            elif stage == "forward" and _forward_evidence_pending(name, value, profile):
+                statuses[name] = EvidenceStatus.UNAVAILABLE
             else:
                 statuses[name] = (
                     EvidenceStatus.PASS if validator(value, self, profile) else EvidenceStatus.FAIL
@@ -725,6 +742,52 @@ def _is_not_applicable(value: object) -> bool:
 def _is_unavailable(value: object) -> bool:
     return value is None or (
         isinstance(value, Mapping) and value.get("status") == EvidenceStatus.UNAVAILABLE
+    )
+
+
+def _forward_evidence_pending(name: str, value: object, profile: EvidenceProfile) -> bool:
+    """Classify valid-but-incomplete forward samples as retryable evidence."""
+
+    if not isinstance(value, Mapping) or value.get("passed") is True:
+        return False
+    if name == "forward_duration":
+        calendar_days = _finite(value.get("calendar_days"))
+        trading_days = value.get("trading_days")
+        cycles = value.get("cycles")
+        return (
+            (
+                calendar_days is not None
+                and calendar_days >= 0.0
+                and calendar_days < profile.minimum_calendar_days
+            )
+            or (
+                isinstance(trading_days, int)
+                and not isinstance(trading_days, bool)
+                and trading_days >= 0
+                and trading_days < profile.minimum_trading_days
+            )
+            or (
+                isinstance(cycles, int)
+                and not isinstance(cycles, bool)
+                and cycles >= 0
+                and cycles < profile.minimum_cycles
+            )
+        )
+    if name != "sample_evidence":
+        return False
+    closed_trades = value.get("closed_trades", value.get("trades"))
+    episodes = value.get("effective_independent_episodes", value.get("episodes"))
+    trading_days = value.get("trading_days", value.get("evidence_days"))
+    return any(
+        isinstance(measured, int)
+        and not isinstance(measured, bool)
+        and measured >= 0
+        and measured < minimum
+        for measured, minimum in (
+            (closed_trades, profile.minimum_closed_trades),
+            (episodes, profile.minimum_effective_episodes),
+            (trading_days, profile.minimum_trading_days),
+        )
     )
 
 
@@ -1304,23 +1367,44 @@ class CanonicalResearchEvaluator:
             },
             receipt=receipt,
         )
-        stage_id = self.validation.append_stage(
-            experiment_id=request.candidate_id,
-            stage=request.requested_stage,
-            source_run_id=run_id,
-            evaluated_at=request.evaluated_at,
-            accepted=accepted,
-            reason_code=reason_code,
-            evidence=evidence,
-        )
+        deferred = _evaluation_is_deferred(evidence)
+        stage_id = None
+        if not deferred:
+            stage_id = self.validation.append_stage(
+                experiment_id=request.candidate_id,
+                stage=request.requested_stage,
+                source_run_id=run_id,
+                evaluated_at=request.evaluated_at,
+                accepted=accepted,
+                reason_code=reason_code,
+                evidence=evidence,
+            )
         with self.store.engine.begin() as connection:
+            metadata_row = connection.execute(
+                select(experiment.c.metadata).where(experiment.c.id == request.candidate_id)
+            ).scalar_one()
+            metadata = dict(metadata_row) if isinstance(metadata_row, Mapping) else {}
+            if deferred:
+                metadata["evaluation_deferred"] = {
+                    "stage": request.requested_stage,
+                    "reason_code": reason_code,
+                    "run_id": run_id,
+                    "observed_at": request.evaluated_at,
+                }
+            else:
+                metadata.pop("evaluation_deferred", None)
             connection.execute(
                 update(experiment)
                 .where(experiment.c.id == request.candidate_id)
                 .values(
-                    state=request.requested_stage
-                    if accepted
-                    else f"{request.requested_stage}_rejected"
+                    state=(
+                        request.requested_stage
+                        if accepted
+                        else f"{request.requested_stage}_deferred"
+                        if deferred
+                        else f"{request.requested_stage}_rejected"
+                    ),
+                    metadata=json_value(metadata, field="metadata"),
                 )
             )
         return StageEvaluation(
@@ -1331,6 +1415,7 @@ class CanonicalResearchEvaluator:
             run_id=run_id,
             evidence_hash=canonical_hash(evidence),
             evidence={**dict(evidence), "validation_stage_id": stage_id},
+            deferred=deferred,
         )
 
     def _validate_request_scope(self, request: EvaluationRequest) -> None:
@@ -1515,7 +1600,7 @@ class CanonicalResearchEvaluator:
         return (
             evidence,
             accepted,
-            None if accepted else "screening_measured_evidence_missing",
+            _decision_reason(decision, "screening_measured_evidence_missing"),
             execution.receipt,
             execution.metrics,
         )
@@ -1712,7 +1797,20 @@ class CanonicalResearchEvaluator:
             "context": dict(context),
         }
         if missing_runs:
-            return evidence, False, "missing_authoritative_run", None, {}
+            decision = EvaluationDecision(
+                accepted=False,
+                fatal_failures=("missing_authoritative_run",),
+                diagnostics=tuple(f"missing_run:{name}" for name in missing_runs),
+                deferred=True,
+            )
+            evidence.update(
+                {
+                    "missing_authoritative_runs": missing_runs,
+                    "missing_evidence": ["missing_authoritative_run"],
+                    "evaluation_decision": decision.to_payload(),
+                }
+            )
+            return evidence, False, "evidence_insufficient_defer", None, {}
         run_measured, metrics, receipt = self._merge_authoritative_runs(authoritative_runs)
         evidence.update(run_measured)
         required_fields = _REQUIRED_STAGE_FIELDS[stage]
@@ -1766,7 +1864,7 @@ class CanonicalResearchEvaluator:
         return (
             evidence,
             accepted,
-            None if accepted else "measured_evidence_missing",
+            _decision_reason(decision, "measured_evidence_missing"),
             receipt,
             metrics,
         )
@@ -1845,7 +1943,19 @@ def _with_fatal_failures(
         evidence_score=decision.evidence_score,
         diagnostics=decision.diagnostics,
         next_stage=decision.next_stage if not failures else None,
+        deferred=decision.deferred and not additional,
     )
+
+
+def _decision_reason(decision: EvaluationDecision, rejected_reason: str) -> str | None:
+    if decision.accepted:
+        return None
+    return "evidence_insufficient_defer" if decision.deferred else rejected_reason
+
+
+def _evaluation_is_deferred(evidence: Mapping[str, Any]) -> bool:
+    decision = evidence.get("evaluation_decision")
+    return isinstance(decision, Mapping) and decision.get("deferred") is True
 
 
 def _requires_product_objective(candidate: Any) -> bool:
