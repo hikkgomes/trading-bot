@@ -754,12 +754,10 @@ def _readiness_paths(config: Any, checks: list[dict[str, Any]]) -> dict[str, dic
     for name, raw_path in config.paths.items():
         path = Path(raw_path)
         ok, reason = _regular_directory(path)
-        parquet_count = sum(1 for item in path.rglob("*.parquet") if item.is_file()) if ok else 0
         paths[name] = {
             "path": str(path),
             "ok": ok,
             "reason": reason,
-            "parquet_files": parquet_count,
         }
         checks.append(_check(f"path:{name}", ok, detail=paths[name]))
     return paths
