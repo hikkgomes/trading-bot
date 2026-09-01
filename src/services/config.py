@@ -677,6 +677,11 @@ def _validate_evidence_policy(policy: Mapping[str, Any]) -> None:
     }
     if any(not isinstance(value, str) or not value.strip() for value in procedures.values()):
         raise ValueError("research.evidence_policy statistical procedures must be named")
+    confidence_method = policy.get("confidence_method", "bootstrap")
+    if confidence_method not in {"bootstrap", "deflated_sharpe"}:
+        raise ValueError(
+            "research.evidence_policy.confidence_method must be bootstrap or deflated_sharpe"
+        )
     profiles = policy.get("profiles", [])
     if not isinstance(profiles, list):
         raise ValueError("research.evidence_policy.profiles must be a list")
