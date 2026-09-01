@@ -396,6 +396,42 @@ class StageEvaluation:
     evidence: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class EvaluationDecision:
+    """Structured, immutable decision produced by one evidence policy."""
+
+    accepted: bool
+    fatal_failures: tuple[str, ...] = ()
+    evidence_score: float = 0.0
+    diagnostics: tuple[str, ...] = ()
+    next_stage: str | None = None
+
+    def __post_init__(self) -> None:
+        score = float(self.evidence_score)
+        if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+            raise EvaluationContractError("evaluation evidence_score must be between zero and one")
+        object.__setattr__(self, "evidence_score", score)
+        failures = tuple(dict.fromkeys(str(value) for value in self.fatal_failures if str(value)))
+        diagnostics = tuple(dict.fromkeys(str(value) for value in self.diagnostics if str(value)))
+        object.__setattr__(self, "fatal_failures", failures)
+        object.__setattr__(self, "diagnostics", diagnostics)
+        if self.accepted and failures:
+            raise EvaluationContractError("accepted evaluation decisions cannot have fatal failures")
+        if not self.accepted and not failures:
+            raise EvaluationContractError("rejected evaluation decisions need a fatal failure")
+        if self.next_stage is not None and self.next_stage not in STAGES:
+            raise EvaluationContractError("evaluation decision next_stage is unsupported")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "accepted": self.accepted,
+            "fatal_failures": list(self.fatal_failures),
+            "evidence_score": self.evidence_score,
+            "diagnostics": list(self.diagnostics),
+            "next_stage": self.next_stage,
+        }
+
+
 class EvidenceStatus(StrEnum):
     PASS = "pass"
     FAIL = "fail"
@@ -527,8 +563,29 @@ class EvidencePolicy:
         horizon: str | None = None,
         evidence_type: str | None = None,
     ) -> bool:
-        if evidence.get("evidence_policy_hash") != self.policy_hash:
-            return False
+        return self.decide(
+            stage,
+            evidence,
+            controls,
+            product_id=product_id,
+            family=family,
+            horizon=horizon,
+            evidence_type=evidence_type,
+        ).accepted
+
+    def decide(
+        self,
+        stage: str,
+        evidence: Mapping[str, Any],
+        controls: tuple[str, ...],
+        *,
+        product_id: str | None = None,
+        family: str | None = None,
+        horizon: str | None = None,
+        evidence_type: str | None = None,
+    ) -> EvaluationDecision:
+        if stage not in STAGES:
+            raise EvaluationContractError(f"unsupported evidence stage: {stage}")
         statuses = self.statuses(
             stage,
             evidence,
@@ -543,35 +600,42 @@ class EvidencePolicy:
             for name, status in statuses.items()
             if name not in _OPTIONAL_EVIDENCE_VALIDATORS.get(stage, {})
         }
-        if not required_statuses or any(
-            status not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
+        failures = [
+            name
+            for name, status in required_statuses.items()
+            if status not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
+        ]
+        if evidence.get("evidence_policy_hash") != self.policy_hash:
+            failures.insert(0, "evidence_policy_hash")
+        denominator = len(required_statuses) + int(
+            evidence.get("evidence_policy_hash") == self.policy_hash
+        )
+        passed = sum(
+            status in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
             for status in required_statuses.values()
-        ):
-            return False
-        if product_id is not None and stage in {
-            "development",
-            "robustness",
-            "protected",
-            "forward",
-        }:
-            profile = self.profile_for(
-                stage,
-                product_id=product_id,
-                family=family,
-                horizon=horizon,
-                evidence_type=evidence_type,
-            )
-            if not objective_passes(
-                evidence,
-                product_id=product_id,
-                minimum_excess_fraction=(
-                    profile.minimum_cost_adjusted_return
-                    if profile.minimum_cost_adjusted_return is not None
-                    else self.minimum_cost_adjusted_return
-                ),
-            ):
-                return False
-        return True
+        )
+        score = passed / denominator if denominator else 0.0
+        diagnostics = [
+            f"{name}:{status.value}"
+            for name, status in statuses.items()
+            if name in _OPTIONAL_EVIDENCE_VALIDATORS.get(stage, {})
+            and status not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
+        ]
+        accepted = bool(required_statuses) and not failures
+        return EvaluationDecision(
+            accepted=accepted,
+            fatal_failures=tuple(failures),
+            evidence_score=score,
+            diagnostics=tuple(diagnostics),
+            next_stage={
+                "screening": "development",
+                "development": "robustness",
+                "robustness": "protected",
+                "protected": "forward",
+            }.get(stage)
+            if accepted
+            else None,
+        )
 
     def statuses(
         self,
@@ -1400,19 +1464,26 @@ class CanonicalResearchEvaluator:
             "context": dict(context),
             "execution_receipt": dict(execution.receipt),
         }
-        accepted = (
-            fields_valid
-            and causality_valid
-            and self.evidence_policy.accepts(
-                "screening",
-                measured,
-                self._negative_controls(candidate.thesis_id),
-                product_id=definition.product,
-                family=family,
-                horizon=horizon,
-                evidence_type=evidence_type,
-            )
+        decision = self.evidence_policy.decide(
+            "screening",
+            measured,
+            self._negative_controls(candidate.thesis_id),
+            product_id=definition.product,
+            family=family,
+            horizon=horizon,
+            evidence_type=evidence_type,
         )
+        additional_failures = tuple(
+            name
+            for failed, name in (
+                (not fields_valid, "definition_contract"),
+                (not causality_valid, "causality_contract"),
+            )
+            if failed
+        )
+        decision = _with_fatal_failures(decision, additional_failures)
+        accepted = decision.accepted
+        evidence["evaluation_decision"] = decision.to_payload()
         return (
             evidence,
             accepted,
@@ -1640,7 +1711,7 @@ class CanonicalResearchEvaluator:
             or evidence_status.get(field)
             not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
         ]
-        accepted = not missing and self.evidence_policy.accepts(
+        decision = self.evidence_policy.decide(
             stage,
             evidence,
             controls,
@@ -1649,10 +1720,13 @@ class CanonicalResearchEvaluator:
             horizon=horizon,
             evidence_type=evidence_type,
         )
+        decision = _with_fatal_failures(decision, tuple(missing))
+        accepted = decision.accepted
         evidence["missing_evidence"] = missing
         evidence["evidence_status"] = {
             field: status.value for field, status in evidence_status.items()
         }
+        evidence["evaluation_decision"] = decision.to_payload()
         if execution is not None:
             receipt = execution.receipt
             metrics.update(execution.metrics)
@@ -1726,6 +1800,19 @@ class CanonicalResearchEvaluator:
             evidence_type=evidence_type,
             execution=execution,
         )
+
+
+def _with_fatal_failures(
+    decision: EvaluationDecision, additional: tuple[str, ...]
+) -> EvaluationDecision:
+    failures = tuple(dict.fromkeys((*decision.fatal_failures, *additional)))
+    return EvaluationDecision(
+        accepted=not failures,
+        fatal_failures=failures,
+        evidence_score=decision.evidence_score,
+        diagnostics=decision.diagnostics,
+        next_stage=decision.next_stage if not failures else None,
+    )
 
 
 def _requires_product_objective(candidate: Any) -> bool:

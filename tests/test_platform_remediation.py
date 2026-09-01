@@ -48,7 +48,12 @@ from src.research.datasets import (
     DatasetResolutionError,
     SqlDatasetBundleRepository,
 )
-from src.research.evaluation import EvidencePolicy, EvidenceProfile, EvidenceStatus
+from src.research.evaluation import (
+    EvaluationDecision,
+    EvidencePolicy,
+    EvidenceProfile,
+    EvidenceStatus,
+)
 from src.research.evidence import (
     cross_symbol_stability_passes,
     drawdown_passes,
@@ -253,6 +258,51 @@ def test_evidence_policy_preserves_applicability_and_thesis_scoped_controls() ->
         ("placebo_event_times",),
     )
     assert robustness_statuses["negative_control_results"] is EvidenceStatus.PASS
+
+
+def test_evidence_policy_returns_a_structured_next_stage_decision() -> None:
+    policy = EvidencePolicy()
+    identity = "sha256:" + "a" * 64
+    parity = {
+        "schema": "typed_rule_parity/v1",
+        "behaviour_hash": identity,
+        "input_hash": identity,
+        "signals": [1],
+    }
+    evidence = {
+        "evidence_policy_hash": policy.policy_hash,
+        "compiled": True,
+        "features_valid": True,
+        "causality_valid": True,
+        "data_integrity": {
+            "passed": True,
+            "dataset_snapshot_ids": [identity],
+            "input_hash": identity,
+        },
+        "semantic_parity": {
+            "passed": True,
+            "behaviour_hash": identity,
+            "parity_receipt": {**parity, "receipt_hash": canonical_hash(parity)},
+        },
+        "realistic_costs": {
+            "passed": True,
+            "fee_bps": 1.0,
+            "slippage_bps": 1.0,
+            "funding_rate": 0.0,
+        },
+        "family_evidence": {"passed": True, "family": "time_series"},
+        "signal_frequency": 0.2,
+        "turnover": 0.1,
+    }
+
+    decision = policy.decide("screening", evidence, ())
+
+    assert isinstance(decision, EvaluationDecision)
+    assert decision.accepted is True
+    assert decision.fatal_failures == ()
+    assert decision.next_stage == "development"
+    assert 0.0 < decision.evidence_score <= 1.0
+    assert decision.to_payload()["next_stage"] == "development"
 
 
 def test_single_symbol_and_empty_portfolio_overlap_are_not_applicable() -> None:
