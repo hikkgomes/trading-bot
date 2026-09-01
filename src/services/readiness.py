@@ -869,6 +869,11 @@ def _readiness_inventory(
             for name, table in count_tables
         }
         bundle_rows = connection.execute(select(dataset_bundle.c.payload)).scalars().all()
+        snapshot_rows = (
+            connection.execute(select(dataset_snapshot.c.id, dataset_snapshot.c.payload))
+            .mappings()
+            .all()
+        )
         schedule_rows = connection.execute(select(platform_schedule)).mappings().all()
         activity_rows = connection.execute(
             select(strategy_definition.c.product_id, experiment.c.submitted_at).select_from(
@@ -914,7 +919,7 @@ def _readiness_inventory(
             .mappings()
             .all()
         )
-    ready_roles = _ready_dataset_roles(bundle_rows)
+    ready_roles = _ready_dataset_roles(bundle_rows, snapshot_rows)
     return {
         "tables": {"count": len(table_names), "rows": counts},
         "counts": counts,
@@ -931,16 +936,44 @@ def _readiness_inventory(
     }
 
 
-def _ready_dataset_roles(rows: list[Any]) -> dict[str, set[str]]:
+def _ready_dataset_roles(
+    rows: list[Any], snapshot_rows: list[Mapping[str, Any]]
+) -> dict[str, set[str]]:
+    snapshots = {
+        str(row["id"]): row["payload"]
+        for row in snapshot_rows
+        if isinstance(row, Mapping) and isinstance(row.get("payload"), Mapping)
+    }
     result: dict[str, set[str]] = {}
     for raw in rows:
         if not isinstance(raw, Mapping) or raw.get("lifecycle_state") != "ready":
             continue
         product_key = str(raw.get("product_id") or "")
         stages = raw.get("stage_snapshot_ids")
-        if product_key and isinstance(stages, Mapping):
-            result.setdefault(product_key, set()).update(str(role) for role in stages)
+        if not product_key or not isinstance(stages, Mapping):
+            continue
+        stage_payloads = [snapshots.get(str(snapshot_id)) for snapshot_id in stages.values()]
+        if len(stage_payloads) != len(stages) or any(
+            _dataset_snapshot_is_non_production(payload) for payload in stage_payloads
+        ):
+            continue
+        result.setdefault(product_key, set()).update(str(role) for role in stages)
     return result
+
+
+def _dataset_snapshot_is_non_production(payload: Any) -> bool:
+    if not isinstance(payload, Mapping):
+        return True
+    data = payload.get("payload")
+    return any(
+        isinstance(source, Mapping)
+        and (
+            source.get("synthetic") is True
+            or source.get("diagnostic") is True
+            or source.get("promotable") is False
+        )
+        for source in (payload, data)
+    )
 
 
 def _scheduler_readiness(
@@ -981,7 +1014,6 @@ def _dataset_readiness(
         "development",
         "robustness",
         "protected_holdout",
-        "forward_observation",
     }
     details = {
         product: {

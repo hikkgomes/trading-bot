@@ -39,6 +39,7 @@ from src.research.objectives import objective_passes
 from src.research.returns import PositionReturnLedger
 from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.order_execution import _validate_btc_spot_orders
+from src.services.readiness import _dataset_readiness, _ready_dataset_roles
 from src.services.scheduler import DatabaseJobQueue
 from src.strategies.behaviour import RegisteredStrategyBehaviour
 
@@ -918,3 +919,43 @@ def test_dataset_builder_selects_only_available_bars_for_every_stage(tmp_path) -
             instrument_scope=("binance:futures:BTCUSDT:USDT",),
             created_at=NOW,
         )
+
+
+def test_readiness_excludes_synthetic_bundles_and_does_not_require_forward_data() -> None:
+    identity = "sha256:" + "d" * 64
+    stages = {
+        role: f"sha256:{chr(100 + index) * 64}"
+        for index, role in enumerate(
+            ("screening", "development", "robustness", "protected_holdout")
+        )
+    }
+    bundle = {
+        "product_id": "active_income",
+        "lifecycle_state": "ready",
+        "stage_snapshot_ids": stages,
+    }
+    snapshots = [
+        {"id": snapshot_id, "payload": {"role": role, "payload": {"bars": [1]}}}
+        for role, snapshot_id in stages.items()
+    ]
+
+    assert _ready_dataset_roles([bundle], snapshots) == {"active_income": set(stages)}
+    assert (
+        _dataset_readiness(
+            {"active_income": set(stages)}, {"dataset_bundles": 1}, {"active_income"}
+        )["ok"]
+        is True
+    )
+
+    synthetic = [
+        {
+            "id": snapshot_id,
+            "payload": {
+                "role": role,
+                "payload": {"bars": [1], "synthetic": role == "screening"},
+            },
+        }
+        for role, snapshot_id in stages.items()
+    ]
+    assert _ready_dataset_roles([bundle], synthetic) == {}
+    assert identity.startswith("sha256:")
