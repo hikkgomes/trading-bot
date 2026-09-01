@@ -1,5 +1,5 @@
 [Unit]
-Description=Trading platform research and reporting services
+Description=Trading platform research services
 
 [Slice]
 CPUWeight=100

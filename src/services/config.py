@@ -36,7 +36,6 @@ LINUX_SERVICES = frozenset(
         "event-replay-worker",
         "agent-sandbox",
         "feature-build-worker",
-        "report-worker",
         "migration-service",
     }
 )
@@ -66,7 +65,6 @@ PLATFORM_PROCESS_SERVICES: dict[str, tuple[str, ...]] = {
         "ml-worker",
         "event-replay-worker",
         "feature-build-worker",
-        "report-worker",
     ),
     "agent-runtime": ("agent-sandbox",),
     "control-api": ("control-api",),
@@ -125,7 +123,7 @@ def _platform_paths(data: Mapping[str, Any]) -> dict[str, str]:
         key: _string(item, field=f"platform.paths.{key}")
         for key, item in _mapping(data.get("paths"), field="platform.paths").items()
     }
-    required = {"parquet", "artefacts", "reports", "backups"}
+    required = {"parquet", "artefacts", "backups"}
     if set(paths) != required:
         raise ValueError(f"platform.paths must contain {sorted(required)}")
     return paths

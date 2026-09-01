@@ -14,7 +14,6 @@ def test_readiness_path_check_does_not_walk_data_tree(tmp_path, monkeypatch) -> 
         paths={
             "parquet": str(tmp_path / "data"),
             "artefacts": str(tmp_path / "artefacts"),
-            "reports": str(tmp_path / "reports"),
             "backups": str(tmp_path / "backups"),
         }
     )

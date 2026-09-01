@@ -44,7 +44,7 @@ set +a
 cd "$repository"
 python_root="$repository/.venv-runtime"
 case "$service_name" in
-  research-worker|ml-worker|event-replay-worker|feature-build-worker|report-worker)
+  research-worker|ml-worker|event-replay-worker|feature-build-worker)
     python_root="$repository/.venv-research"
     ;;
   agent-sandbox)

@@ -1518,7 +1518,6 @@ def test_platform_configuration_rejects_execution_on_non_linux_authority():
         "paths": {
             "parquet": "data",
             "artefacts": "data/artefacts",
-            "reports": "data/reports",
             "backups": "backups",
         },
         "worker_limits": {"research-worker": 1},

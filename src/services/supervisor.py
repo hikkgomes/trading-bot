@@ -84,7 +84,6 @@ from src.services.promotion import (
     SqlPromotionStore,
 )
 from src.services.protective_stops import LiveProtectiveStopService
-from src.services.report_worker import DatabaseReportWorker
 from src.services.research_jobs import DatabaseResearchJobHandlers
 from src.services.research_worker import ResearchWorker
 from src.services.risk_service import DatabaseRiskWorker
@@ -954,49 +953,6 @@ def _account_reconciliation_cycle(
     return run_once
 
 
-def _report_cycle(
-    *,
-    database: PlatformDatabase,
-    root: Path,
-    node_id: str,
-    risk_configuration: Mapping[str, Any] | None = None,
-    alerts: SqlAlertService | None = None,
-    alerting_configuration: Mapping[str, Any] | None = None,
-    backup_root: Path | None = None,
-    backup_max_age_seconds: int = 172_800,
-    minimum_free_bytes: int = 536_870_912,
-) -> Callable[[], dict[str, Any]]:
-    queue = DatabaseJobQueue(database.engine)
-    worker_id = f"{node_id}:report-worker"
-    queue.register_worker(
-        worker_id=worker_id,
-        node_id=node_id,
-        role="report-worker",
-        capabilities=("reporting",),
-        observed_at=utc_now(),
-    )
-    worker = DatabaseReportWorker(
-        engine=database.engine,
-        root=root,
-        queue=queue,
-        worker_id=worker_id,
-        account_stale_after_seconds=int(
-            (risk_configuration or {}).get("maximum_database_staleness_seconds", 60)
-        ),
-        market_data_stale_after_seconds=int(
-            (risk_configuration or {}).get("maximum_market_data_staleness_seconds", 5)
-        ),
-        alerts=alerts,
-        minimum_valid_screenings_before_progress=int(
-            (alerting_configuration or {}).get("minimum_valid_screenings_before_progress", 10)
-        ),
-        backup_root=backup_root,
-        backup_max_age_seconds=backup_max_age_seconds,
-        minimum_free_bytes=minimum_free_bytes,
-    )
-    return lambda: worker.run_once(now=utc_now())
-
-
 def _research_cycle(
     *,
     database: PlatformDatabase,
@@ -1270,17 +1226,6 @@ def _service_work(args: argparse.Namespace, context: Mapping[str, Any]) -> Calla
         "account-reconciliation": lambda: _account_reconciliation_cycle(
             database=database, configuration=split, alerts=alerts
         ),
-        "report-worker": lambda: _report_cycle(
-            database=database,
-            root=Path(config.paths["reports"]),
-            node_id=args.node,
-            risk_configuration=split["risk"],
-            alerts=alerts,
-            alerting_configuration=config.alerting,
-            backup_root=Path(config.paths["backups"]),
-            backup_max_age_seconds=int(config.backup.get("maximum_age_seconds", 172_800)),
-            minimum_free_bytes=int(config.backup.get("minimum_free_bytes", 536_870_912)),
-        ),
     }
     if args.service in {"feature-service", "feature-build-worker"}:
         return _feature_cycle(
@@ -1429,8 +1374,7 @@ def _serve_loop(
 def _should_sleep(service: str, cycle: Any) -> bool:
     reason_code = str(cycle.detail.get("reason_code") or "")
     return (
-        service == "report-worker"
-        or reason_code == "market_gateway_running"
+        reason_code == "market_gateway_running"
         or reason_code.endswith("queue_empty")
         or reason_code.endswith("paused")
         or reason_code

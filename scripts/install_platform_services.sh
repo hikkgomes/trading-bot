@@ -95,7 +95,7 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     install -d -m 2770 -o trading-runtime -g trading-runtime "$REPO/data/$directory"
   done
   install -d -m 2770 -o trading-runtime -g trading-platform "$REPO/runtime/backups"
-  for directory in research artefacts reports; do
+  for directory in research artefacts; do
     install -d -m 2770 -o trading-research -g trading-research "$REPO/data/$directory"
   done
   install -d -m 2770 -o trading-research -g trading-research "$REPO/runtime/research"
@@ -115,8 +115,8 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     # an installation upgrade does not leave historical Parquet unreadable.
     setfacl -R -m u:trading-research:r-X "$REPO/data/$directory"
   done
-  setfacl -m u:trading-runtime:rx "$REPO/data/research" "$REPO/data/artefacts" "$REPO/data/reports"
-  setfacl -m d:u:trading-runtime:rx "$REPO/data/research" "$REPO/data/artefacts" "$REPO/data/reports"
+  setfacl -m u:trading-runtime:rx "$REPO/data/research" "$REPO/data/artefacts"
+  setfacl -m d:u:trading-runtime:rx "$REPO/data/research" "$REPO/data/artefacts"
   setfacl -m u:trading-runtime:rx "$REPO/runtime/research"
   setfacl -m d:u:trading-runtime:rx "$REPO/runtime/research"
   setfacl -m u:trading-agent:rwx "$REPO/runtime/agent-worktrees"

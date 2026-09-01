@@ -63,13 +63,11 @@ probe_json trading-runtime "$REPO/runtime"
 for path in \
   "$REPO/data/research" \
   "$REPO/data/artefacts" \
-  "$REPO/data/reports" \
   "$REPO/runtime/research"; do
   probe_write trading-research "$path"
 done
 probe_parquet trading-research "$REPO/.venv-research/bin/python" "$REPO/data/research"
 probe_json trading-research "$REPO/data/artefacts"
-probe_json trading-research "$REPO/data/reports"
 probe_json trading-research "$REPO/runtime/research"
 probe_write trading-agent "$REPO/runtime/agent-worktrees"
 probe_json trading-agent "$REPO/runtime/agent-worktrees"

@@ -1,5 +1,5 @@
 [Unit]
-Description=Trading platform research and reporting process
+Description=Trading platform research process
 After=network-online.target postgresql.service trading-platform-migration.service
 Wants=network-online.target
 Requires=postgresql.service trading-platform-migration.service
@@ -24,7 +24,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/trading-bot/data/research /opt/trading-bot/data/artefacts /opt/trading-bot/data/reports /opt/trading-bot/runtime/research
+ReadWritePaths=/opt/trading-bot/data/research /opt/trading-bot/data/artefacts /opt/trading-bot/runtime/research
 ReadOnlyPaths=/opt/trading-bot/data/raw /opt/trading-bot/data/bars /opt/trading-bot/data/features
 Slice=trading-platform-background.slice
 

@@ -35,7 +35,6 @@ from src.services.supervisor import (
     _portfolio_state_cycle,
     _product_coordination_cycle,
     _promotion_cycle,
-    _report_cycle,
     _research_cycle,
     _risk_cycle,
     _strategy_evaluator_cycle,
@@ -180,16 +179,6 @@ def _build_research_work(
             node_id=node_id,
             service_name="feature-build-worker",
             parquet_root=Path(config.paths["parquet"]),
-        ),
-        "report-worker": _report_cycle(
-            database=database,
-            root=Path(config.paths["reports"]),
-            node_id=node_id,
-            risk_configuration=configuration["risk"],
-            alerting_configuration=config.alerting,
-            backup_root=Path(config.paths["backups"]),
-            backup_max_age_seconds=int(config.backup.get("maximum_age_seconds", 172_800)),
-            minimum_free_bytes=int(config.backup.get("minimum_free_bytes", 536_870_912)),
         ),
     }
     return work

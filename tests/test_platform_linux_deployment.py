@@ -48,7 +48,7 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
         in installer
     )
     assert "/opt/trading-bot/data/artefacts" in research
-    assert "/opt/trading-bot/data/reports" in research
+    assert "/opt/trading-bot/data/reports" not in research
     assert "/opt/trading-bot/runtime/research" in research
     assert "NUMBA_CACHE_DIR=/opt/trading-bot/runtime/research/numba-cache" in research
     assert (
@@ -129,7 +129,6 @@ def test_installed_service_users_can_traverse_and_write_their_real_paths() -> No
         "trading-research": (
             str(INSTALLED_ROOT / "data/research"),
             str(INSTALLED_ROOT / "data/artefacts"),
-            str(INSTALLED_ROOT / "data/reports"),
             str(INSTALLED_ROOT / "runtime/research"),
         ),
         "trading-agent": (str(INSTALLED_ROOT / "runtime/agent-worktrees"),),
