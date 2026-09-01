@@ -92,6 +92,9 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
     )
     assert "systemctl enable trading-platform-runtime.service" in installer
     assert "systemctl enable trading-platform-research.service" in installer
+    assert "trading-bot-candidate-paper.timer" in installer
+    assert "trading-bot-openclaw-bridge.timer" in installer
+    assert "trading-bot-telegram-report.timer" in installer
     assert "systemctl disable --now" in installer
 
 

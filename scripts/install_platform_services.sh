@@ -151,11 +151,17 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     trading-bot-autopilot.service
     trading-bot-autopilot-jobs.service
     trading-bot-candidate-paper.service
+    trading-bot-candidate-paper.timer
     trading-bot-event-capture.service
+    trading-bot-autopilot-backup.service
     trading-bot-autopilot-backup.timer
+    trading-bot-autopilot-healthcheck.service
     trading-bot-autopilot-healthcheck.timer
     trading-bot-openclaw-bridge.service
+    trading-bot-openclaw-bridge.timer
     trading-bot-telegram.service
+    trading-bot-telegram-report.service
+    trading-bot-telegram-report.timer
   )
   for unit in "${legacy_units[@]}"; do
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
