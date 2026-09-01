@@ -1372,6 +1372,26 @@ def test_position_return_ledger_keeps_funding_signed_per_period() -> None:
     assert report.net_pnl == pytest.approx(-0.08)
 
 
+def test_futures_return_ledger_scales_fractional_costs_into_usdt() -> None:
+    report = PositionReturnLedger(fee_rate=0.01, slippage_rate=0.005).measure(
+        positions=(0.0, 1.0, 1.0),
+        market_returns=(0.10, -0.10),
+        funding_rates=(0.02, -0.03),
+    )
+
+    accounting = _product_accounting(
+        {"product_id": "active_income", "initial_cash": 1_000.0},
+        fallback_return=report,
+    )
+
+    assert accounting is not None
+    assert accounting["fees"] == pytest.approx(10.0)
+    assert accounting["slippage_cost"] == pytest.approx(5.0)
+    assert accounting["funding_pnl"] == pytest.approx(30.0)
+    assert accounting["turnover_notional"] == pytest.approx(1_000.0)
+    assert accounting["implementation_shortfall"] == pytest.approx(15.0)
+
+
 def test_pbo_uses_the_configured_window_count_and_parameter_cohort() -> None:
     pbo, matrix = _pbo_measurements(
         {"walk_forward_windows": 5},

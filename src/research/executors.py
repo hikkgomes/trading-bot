@@ -868,6 +868,10 @@ def _futures_return_ledger(
         )
     net_pnl = float(fallback_return.net_pnl) * initial_equity
     observations = int(fallback_return.effective_observations)
+    fees = float(fallback_return.fees) * initial_equity
+    funding_pnl = float(fallback_return.funding_pnl) * initial_equity
+    slippage = float(fallback_return.slippage) * initial_equity
+    turnover_notional = float(fallback_return.turnover) * initial_equity
     return {
         "schema": "platform.futures_accounting/return_ledger_v1",
         "objective_unit": "USDT",
@@ -879,10 +883,10 @@ def _futures_return_ledger(
         "return_fraction": net_pnl / initial_equity,
         "realised_pnl": net_pnl,
         "unrealised_pnl": 0.0,
-        "fees": float(fallback_return.fees),
-        "funding_pnl": float(fallback_return.funding_pnl),
+        "fees": fees,
+        "funding_pnl": funding_pnl,
         "spread_cost": 0.0,
-        "slippage_cost": float(fallback_return.slippage),
+        "slippage_cost": slippage,
         "fills": observations,
         "partial_fills": 0,
         "capacity_violations": 0,
@@ -891,9 +895,11 @@ def _futures_return_ledger(
         "max_margin_fraction": 0.0,
         "liquidation": False,
         "effective_observations": observations,
-        "turnover_notional": 0.0,
-        "implementation_shortfall": float(fallback_return.fees + fallback_return.slippage),
-        "capital_efficiency": 0.0,
+        "turnover_notional": turnover_notional,
+        "implementation_shortfall": fees + slippage,
+        "capital_efficiency": (
+            net_pnl / turnover_notional if turnover_notional > 0.0 else 0.0
+        ),
         "funding_adjusted_expectancy": net_pnl / observations if observations > 0 else 0.0,
         "margin_mode": "isolated",
         "target_notional": None,
