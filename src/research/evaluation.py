@@ -1092,6 +1092,16 @@ class ProtectedHoldoutWorker:
             source_hashes=source_hashes,
             claimed_at=evaluated_at,
         )
+        existing_outcome = self.repository.outcome_for(claim_id)
+        if existing_outcome is not None:
+            outcome_payload = existing_outcome.get("payload")
+            accepted = bool(existing_outcome.get("accepted"))
+            if not isinstance(outcome_payload, Mapping) or outcome_payload.get("passed") is not accepted:
+                raise EvaluationContractError("persisted protected outcome is inconsistent")
+            return claim_id, str(existing_outcome["id"]), accepted, {
+                "passed": accepted,
+                "outcome_id": str(existing_outcome["id"]),
+            }
         protected_context: Mapping[str, Any] | None = None
         if self.dataset_resolver is not None:
             if any(value is None for value in self.dataset_identities.values()):

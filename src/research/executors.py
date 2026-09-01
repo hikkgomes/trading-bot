@@ -157,12 +157,7 @@ def _pbo_measurements(
     else:
         pbo_matrix = []
     if len(pbo_matrix) < 2:
-        pbo_matrix = [
-            _numeric_series(item.get("window_returns"))
-            for item in parameter_stability["results"]
-            if isinstance(item, Mapping) and _numeric_series(item.get("window_returns"))
-        ]
-        pbo_matrix.insert(0, window_returns)
+        pbo_matrix = []
     width = min((len(row) for row in pbo_matrix), default=0)
     pbo_matrix = [row[:width] for row in pbo_matrix if width >= 2]
     if len(pbo_matrix) < 2:

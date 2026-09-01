@@ -481,6 +481,17 @@ class SqlHoldoutRepository:
                 },
             )
 
+    def outcome_for(self, claim_id: str) -> dict[str, Any] | None:
+        with self.engine.connect() as connection:
+            row = (
+                connection.execute(
+                    select(holdout_outcome).where(holdout_outcome.c.holdout_claim_id == claim_id)
+                )
+                .mappings()
+                .first()
+            )
+        return None if row is None else dict(row)
+
 
 @dataclass(frozen=True)
 class ForwardPaperSummary:
