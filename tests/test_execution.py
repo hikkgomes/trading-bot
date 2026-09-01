@@ -2419,6 +2419,83 @@ def test_ccxt_places_binance_usdm_reduce_only_stop_market_and_validates_ack():
     }
 
 
+def test_ccxt_uses_binance_algo_order_api_when_available():
+    client_id = "tb-sl-0123456789abcdef0123456789ab"
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+            self.status = "NEW"
+
+        def fetch_positions(self, symbols):
+            return [{"contracts": 1.0, "side": "long", "entryPrice": 100.0}]
+
+        def fapiPrivatePostAlgoOrder(self, params):
+            self.calls.append(("post", params))
+            return {
+                "algoId": "987654321",
+                "clientAlgoId": client_id,
+                "symbol": "BTCUSDT",
+                "side": "SELL",
+                "quantity": 1.0,
+                "triggerPrice": 95.0,
+                "algoStatus": self.status,
+                "reduceOnly": True,
+                "positionSide": "BOTH",
+            }
+
+        def fapiPrivateGetAlgoOrder(self, params):
+            self.calls.append(("get", params))
+            return self.fapiPrivatePostAlgoOrder(
+                {
+                    **params,
+                    "algoStatus": self.status,
+                }
+            )
+
+        def fapiPrivateDeleteAlgoOrder(self, params):
+            self.calls.append(("delete", params))
+            self.status = "CANCELED"
+            return {"algoId": "987654321", "clientAlgoId": client_id}
+
+    client = FakeClient()
+    broker = _ccxt_protective_broker(client)
+
+    placed = broker.place_protective_stop(
+        symbol="BTCUSDT",
+        side=OrderSide.SELL,
+        qty=1.0,
+        trigger_price=95.0,
+        client_id=client_id,
+    )
+    assert placed.status is ProtectiveOrderStatus.OPEN
+    assert client.calls[0] == (
+        "post",
+        {
+            "symbol": "BTC/USDT:USDT",
+            "side": "SELL",
+            "positionSide": "BOTH",
+            "type": "STOP_MARKET",
+            "quantity": 1.0,
+            "triggerPrice": 95.0,
+            "reduceOnly": True,
+            "clientAlgoId": client_id,
+        },
+    )
+
+    cancelled = broker.cancel_protective_stop(
+        symbol="BTCUSDT",
+        order_id="987654321",
+        client_id=client_id,
+    )
+    assert cancelled.status is ProtectiveOrderStatus.CANCELED
+    assert client.calls[1] == (
+        "delete",
+        {"symbol": "BTC/USDT:USDT", "algoId": "987654321"},
+    )
+    assert client.calls[2][0] == "get"
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [

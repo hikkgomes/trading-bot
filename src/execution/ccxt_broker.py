@@ -1260,6 +1260,20 @@ class CcxtBroker(Broker):
                 "Open-order inventory verification is only validated for Binance spot regular "
                 "orders and Binance USD-M futures."
             )
+        if futures_supported and conditional:
+            algo_orders = getattr(self._client, "fapiPrivateGetOpenAlgoOrders", None)
+            if callable(algo_orders):
+                params = {"symbol": self._ccxt_symbol(symbol)} if symbol is not None else {}
+                try:
+                    payload = algo_orders(params)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Could not query conditional open orders for "
+                        f"{symbol or 'the whole account'}: {exc}"
+                    ) from exc
+                return self._parse_open_order_payload(
+                    payload, requested_symbol=symbol, conditional=True
+                )
         fetch_open_orders = getattr(self._client, "fetch_open_orders", None)
         if not callable(fetch_open_orders):
             raise RuntimeError(
@@ -1281,6 +1295,22 @@ class CcxtBroker(Broker):
                 "the open-order inventory is empty."
             )
 
+        return self._parse_open_order_payload(
+            payload, requested_symbol=symbol, conditional=conditional
+        )
+
+    def _parse_open_order_payload(
+        self,
+        payload: Any,
+        *,
+        requested_symbol: str | None,
+        conditional: bool,
+    ) -> tuple[OpenOrderIdentity, ...]:
+        if not isinstance(payload, list):
+            raise ValueError(
+                "ccxt open-order response must be a list. Refusing to assume "
+                "the open-order inventory is empty."
+            )
         orders: list[OpenOrderIdentity] = []
         seen: set[tuple[str, str, str]] = set()
         for index, item in enumerate(payload):
@@ -1291,7 +1321,7 @@ class CcxtBroker(Broker):
                     continue
             order = self._parse_open_order_identity(
                 item,
-                requested_symbol=symbol,
+                requested_symbol=requested_symbol,
                 conditional=is_conditional,
                 index=index,
             )
@@ -1568,18 +1598,12 @@ class CcxtBroker(Broker):
         self._assert_futures_reduce_only_within_position(
             Order(symbol=symbol, side=side, qty=qty, reduce_only=True)
         )
-        result = self._client.create_order(
-            symbol=self._ccxt_symbol(symbol),
-            type=OrderType.MARKET.value,
-            side=side.value,
-            amount=qty,
-            price=None,
-            params={
-                "stopLossPrice": trigger_price,
-                "reduceOnly": True,
-                "positionSide": "BOTH",
-                "newClientOrderId": client_id,
-            },
+        result = self._place_algo_stop(
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            trigger_price=trigger_price,
+            client_id=client_id,
         )
         protective = self._parse_protective_order(result, requested_symbol=symbol)
         self._assert_protective_order_matches(
@@ -1618,12 +1642,21 @@ class CcxtBroker(Broker):
         client_id: str,
     ) -> ProtectiveOrder:
         self._assert_protective_stop_supported()
-        lookup_id, params = self._protective_lookup(order_id=order_id, client_id=client_id)
-        result = self._client.fetch_order(
-            lookup_id,
-            self._ccxt_symbol(symbol),
-            params,
-        )
+        algo_get = getattr(self._client, "fapiPrivateGetAlgoOrder", None)
+        if callable(algo_get):
+            params = {"symbol": self._ccxt_symbol(symbol)}
+            if order_id is not None:
+                params["algoId"] = str(order_id)
+            else:
+                params["clientAlgoId"] = client_id
+            result = algo_get(params)
+        else:
+            lookup_id, params = self._protective_lookup(order_id=order_id, client_id=client_id)
+            result = self._client.fetch_order(
+                lookup_id,
+                self._ccxt_symbol(symbol),
+                params,
+            )
         protective = self._parse_protective_order(result, requested_symbol=symbol)
         self._assert_protective_identity(
             protective,
@@ -1641,12 +1674,21 @@ class CcxtBroker(Broker):
         client_id: str,
     ) -> ProtectiveOrder:
         self._assert_protective_stop_supported()
-        lookup_id, params = self._protective_lookup(order_id=order_id, client_id=client_id)
-        self._client.cancel_order(
-            lookup_id,
-            self._ccxt_symbol(symbol),
-            params,
-        )
+        algo_delete = getattr(self._client, "fapiPrivateDeleteAlgoOrder", None)
+        if callable(algo_delete):
+            params = {"symbol": self._ccxt_symbol(symbol)}
+            if order_id is not None:
+                params["algoId"] = str(order_id)
+            else:
+                params["clientAlgoId"] = client_id
+            algo_delete(params)
+        else:
+            lookup_id, params = self._protective_lookup(order_id=order_id, client_id=client_id)
+            self._client.cancel_order(
+                lookup_id,
+                self._ccxt_symbol(symbol),
+                params,
+            )
         # Binance's cancel response may omit status and execution details.  A
         # separate trigger-order query is the acknowledgement we trust.
         protective = self.get_protective_stop(
@@ -1659,6 +1701,43 @@ class CcxtBroker(Broker):
                 f"Protective stop {protective.order_id} is still open after cancellation. Refusing."
             )
         return protective
+
+    def _place_algo_stop(
+        self,
+        *,
+        symbol: str,
+        side: OrderSide,
+        qty: float,
+        trigger_price: float,
+        client_id: str,
+    ) -> dict:
+        algo_post = getattr(self._client, "fapiPrivatePostAlgoOrder", None)
+        if callable(algo_post):
+            return algo_post(
+                {
+                    "symbol": self._ccxt_symbol(symbol),
+                    "side": side.value.upper(),
+                    "positionSide": "BOTH",
+                    "type": "STOP_MARKET",
+                    "quantity": qty,
+                    "triggerPrice": trigger_price,
+                    "reduceOnly": True,
+                    "clientAlgoId": client_id,
+                }
+            )
+        return self._client.create_order(
+            symbol=self._ccxt_symbol(symbol),
+            type=OrderType.MARKET.value,
+            side=side.value,
+            amount=qty,
+            price=None,
+            params={
+                "stopLossPrice": trigger_price,
+                "reduceOnly": True,
+                "positionSide": "BOTH",
+                "newClientOrderId": client_id,
+            },
+        )
 
     def _assert_protective_stop_supported(self) -> None:
         if not self.config.live:
