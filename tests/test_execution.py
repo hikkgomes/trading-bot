@@ -1976,7 +1976,8 @@ def test_ccxt_futures_entry_reads_raw_position_risk_when_flat_position_is_filter
         fetch_position_mode=lambda _symbol: {"hedged": False},
         fetch_open_orders=lambda _symbol, **_kwargs: [],
         fetch_positions=lambda _symbols: [],
-        fapiPrivateV3GetPositionRisk=lambda params: (
+        fapiPrivateV3GetPositionRisk=lambda _params: [],
+        fapiPrivateV2GetPositionRisk=lambda params: (
             raw_calls.append(params)
             or [
                 {

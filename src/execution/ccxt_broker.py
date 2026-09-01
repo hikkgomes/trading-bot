@@ -959,8 +959,7 @@ class CcxtBroker(Broker):
             getattr(self._client, "fapiPrivateV3GetPositionRisk", None),
             getattr(self._client, "fapiPrivateV2GetPositionRisk", None),
         )
-        reader = next((item for item in readers if callable(item)), None)
-        if reader is None:
+        if not any(callable(item) for item in readers):
             raise RuntimeError(
                 "Refusing futures entry: exchange did not return exactly one matching "
                 "position-settings record"
@@ -969,28 +968,33 @@ class CcxtBroker(Broker):
         exchange_symbol = (
             str(market.get("id") or "") if isinstance(market, dict) else ""
         ) or symbol.replace("/", "").split(":", 1)[0].upper()
-        try:
-            payload = reader({"symbol": exchange_symbol})
-        except Exception as exc:
-            raise RuntimeError(
-                f"Refusing futures entry: could not read raw position settings: {exc}"
-            ) from exc
-        if not isinstance(payload, list):
-            raise RuntimeError(
-                "Refusing futures entry: raw position-settings response must be a list."
+        for reader in readers:
+            if not callable(reader):
+                continue
+            try:
+                payload = reader({"symbol": exchange_symbol})
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Refusing futures entry: could not read raw position settings: {exc}"
+                ) from exc
+            if not isinstance(payload, list):
+                raise RuntimeError(
+                    "Refusing futures entry: raw position-settings response must be a list."
+                )
+            matches = tuple(
+                item
+                for item in payload
+                if isinstance(item, dict)
+                and str(item.get("symbol") or "").upper() == exchange_symbol.upper()
             )
-        matches = tuple(
-            item
-            for item in payload
-            if isinstance(item, dict)
-            and str(item.get("symbol") or "").upper() == exchange_symbol.upper()
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                break
+        raise RuntimeError(
+            "Refusing futures entry: exchange did not return exactly one matching "
+            "position-settings record"
         )
-        if len(matches) != 1:
-            raise RuntimeError(
-                "Refusing futures entry: exchange did not return exactly one matching "
-                "position-settings record"
-            )
-        return matches[0]
 
     @staticmethod
     def _matching_position_settings(
