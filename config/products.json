@@ -10,7 +10,7 @@
       "portfolio_id": "btc-accumulation-portfolio",
       "sleeves": ["tactical-allocation"],
       "strategy_eligibility": ["named", "generated_dsl", "python", "ml"],
-      "promotion_policy_id": "btc-accumulation",
+      "promotion_policy_id": "btc-accumulation-v2",
       "preflight_max_age_seconds": 3600,
       "account_snapshot_max_age_seconds": 60,
       "connected_testnet_max_age_seconds": 86400,
@@ -39,7 +39,7 @@
         "relative_value",
         "agent"
       ],
-      "promotion_policy_id": "active-income",
+      "promotion_policy_id": "active-income-v2",
       "preflight_max_age_seconds": 3600,
       "account_snapshot_max_age_seconds": 60,
       "connected_testnet_max_age_seconds": 86400,

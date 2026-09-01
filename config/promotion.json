@@ -2,7 +2,7 @@
   "schema": "promotion/v1",
   "policies": [
     {
-      "policy_id": "btc-accumulation",
+      "policy_id": "btc-accumulation-v2",
       "automatic_paper_promotion": true,
       "automatic_live_canary_promotion": false,
       "canary_capital_limit": 0.02,
@@ -29,7 +29,7 @@
       "capital_increase_policy": "manual_approval_required"
     },
     {
-      "policy_id": "active-income",
+      "policy_id": "active-income-v2",
       "automatic_paper_promotion": true,
       "automatic_live_canary_promotion": false,
       "canary_capital_limit": 0.01,
