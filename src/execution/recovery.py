@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -138,12 +139,17 @@ class SqlRecoveryStore:
         verification_hash = str(verification_hash).strip()
         if not verification_hash.startswith("sha256:") or len(verification_hash) != 71:
             raise ValueError("recovery verification hash must be a sha256 identity")
+        try:
+            int(verification_hash[7:], 16)
+        except ValueError as exc:
+            raise ValueError("recovery verification hash must be a sha256 identity") from exc
         with self.engine.begin() as connection:
+            plan_payload = connection.execute(
+                select(reconciliation_event.c.payload).where(reconciliation_event.c.id == plan_id)
+            ).scalar_one_or_none()
             if (
-                connection.execute(
-                    select(reconciliation_event.c.id).where(reconciliation_event.c.id == plan_id)
-                ).first()
-                is None
+                not isinstance(plan_payload, Mapping)
+                or plan_payload.get("record_type") != "recovery_plan"
             ):
                 raise KeyError(f"recovery plan does not exist: {plan_id}")
             payload = {
