@@ -844,6 +844,7 @@ class DatabaseResearchJobHandlers:
         if adaptive_snapshot_ids:
             resolved_context = resolver.resolve_context(
                 snapshot_ids=adaptive_snapshot_ids,
+                product_id=candidate.definition.product,
                 feature_manifest_id=str(request.feature_manifest_id),
                 cost_model_id=str(request.cost_model_id),
                 parameter_set_id=str(request.parameter_set_id),
