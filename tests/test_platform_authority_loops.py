@@ -174,6 +174,40 @@ def test_portfolio_source_readers_fail_closed_without_complete_market_or_health(
     assert health_at is None
 
 
+def test_portfolio_health_source_can_scope_diagnostic_heartbeats(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'scoped-health.sqlite3'}")
+    database.create_schema()
+    heartbeat = DatabaseHeartbeatStore(database.engine)
+    heartbeat.record(
+        service_name="feature-service",
+        node_id="linux-optiplex",
+        observed_at=NOW,
+        healthy=False,
+        payload={"reason_code": "service_cycle_failed"},
+    )
+    heartbeat.record(
+        service_name="data-writer",
+        node_id="diagnostic-node",
+        observed_at=NOW,
+        healthy=True,
+        payload={"reason_code": "market_event_written"},
+    )
+
+    source = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=SqlRiskSnapshotStore(database.engine),
+        products={},
+        accounts={},
+        health_node_id="diagnostic-node",
+    )
+
+    health, observed_at = source._health(NOW)
+
+    assert observed_at == NOW
+    assert health["exchange_connected"] is True
+    assert health["services"] == {"data-writer@diagnostic-node": True}
+
+
 def test_portfolio_market_source_derives_realised_volatility_from_closes(tmp_path) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'market-volatility.sqlite3'}")
     database.create_schema()

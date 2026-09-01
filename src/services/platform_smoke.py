@@ -214,6 +214,7 @@ def _product_fixture(
     assignments = SqlActiveStrategyAssignmentRepository(database.engine)
     snapshots = SqlRiskSnapshotStore(database.engine)
     _install_risk_policy(database, str(product["risk_policy_id"]))
+    health_node_id = f"platform-smoke:{run_id}"
 
     close_ms = int(observed.timestamp() * 1_000) - 1
     event = normalise_public_event(
@@ -426,7 +427,7 @@ def _product_fixture(
     feature_result = feature_worker.run_once(now=now)
     DatabaseHeartbeatStore(database.engine).record(
         service_name="data-writer",
-        node_id="linux-optiplex",
+        node_id=health_node_id,
         observed_at=now,
         healthy=data_result["reason_code"] == "market_event_written",
         payload=data_result,
@@ -436,6 +437,7 @@ def _product_fixture(
         store=snapshots,
         products={product_id: product},
         accounts=accounts,
+        health_node_id=health_node_id,
     )
     state_worker = DatabasePortfolioStateWorker(
         queue=queue,

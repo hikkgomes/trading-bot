@@ -61,11 +61,13 @@ class DatabasePortfolioSourceService:
         store: SqlRiskSnapshotStore,
         products: Mapping[str, Mapping[str, Any]],
         accounts: Mapping[str, Mapping[str, Any]],
+        health_node_id: str | None = None,
     ) -> None:
         self.engine = engine
         self.store = store
         self.products = {str(key): dict(value) for key, value in products.items()}
         self.accounts = {str(key): dict(value) for key, value in accounts.items()}
+        self.health_node_id = health_node_id
         self.risk_calculator = PortfolioRiskCalculator(engine)
         self.accounting = AccountingService(engine=engine)
 
@@ -554,18 +556,20 @@ class DatabasePortfolioSourceService:
         return market, latest_at
 
     def _health(self, at: str) -> tuple[dict[str, Any], str | None]:
+        statement = select(
+            service_heartbeat.c.service_name,
+            service_heartbeat.c.node_id,
+            service_heartbeat.c.observed_at,
+            service_heartbeat.c.healthy,
+            service_heartbeat.c.payload,
+        ).where(service_heartbeat.c.observed_at <= at)
+        if self.health_node_id is not None:
+            statement = statement.where(service_heartbeat.c.node_id == self.health_node_id)
+        statement = statement.order_by(
+            service_heartbeat.c.observed_at.desc(), service_heartbeat.c.id.desc()
+        )
         with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(
-                    service_heartbeat.c.service_name,
-                    service_heartbeat.c.node_id,
-                    service_heartbeat.c.observed_at,
-                    service_heartbeat.c.healthy,
-                    service_heartbeat.c.payload,
-                )
-                .where(service_heartbeat.c.observed_at <= at)
-                .order_by(service_heartbeat.c.observed_at.desc(), service_heartbeat.c.id.desc())
-            ).mappings()
+            rows = connection.execute(statement).mappings()
         latest: dict[tuple[str, str], tuple[bool, Mapping[str, Any]]] = {}
         latest_observed_at: str | None = None
         for row in rows:
