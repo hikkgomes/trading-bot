@@ -6,7 +6,7 @@ import datetime as dt
 import math
 import statistics
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import select
 
@@ -948,7 +948,7 @@ def portfolio_state_policies(
 
 def _number(value: object) -> float:
     try:
-        result = float(value)
+        result = float(cast(Any, value))
     except (TypeError, ValueError):
         return 0.0
     return result if math.isfinite(result) else 0.0
@@ -957,7 +957,7 @@ def _number(value: object) -> float:
 def _fill_market_volatility(values: dict[str, Any], history: Iterable[float]) -> None:
     if "volatility" in values:
         return
-    closes = list(reversed(history))
+    closes = list(reversed(tuple(history)))
     returns = [
         closes[index] / closes[index - 1] - 1.0
         for index in range(1, len(closes))

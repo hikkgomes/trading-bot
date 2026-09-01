@@ -287,6 +287,8 @@ class DatabaseExecutionWorker:
         prices: Mapping[str, float],
     ) -> None:
         target_metadata = order.metadata.get("target_metadata")
+        if order.valid_until is None:
+            raise ValueError("control rejection requires an order expiry")
         target = TargetPosition(
             portfolio_id=order.portfolio_id,
             instrument_id=order.instrument_id,
@@ -579,6 +581,8 @@ class DatabaseLiveExecutionWorker:
             raise ValueError(
                 f"live order is not in the durable pre-submission state: {order.status.value}"
             )
+        if order.valid_until is None:
+            raise ValueError("live order has no expiry")
         if now < order.valid_until:
             return None
         self.order_manager.transition(order.order_id, OrderStatus.EXPIRED, event_at=now)
@@ -1071,6 +1075,8 @@ class DatabaseUserStreamWorker:
         product_id: str | None,
         received_at: str,
     ) -> dict[str, Any]:
+        if self.positions is None:
+            raise RuntimeError("user-stream worker requires a durable position store")
         position = self.positions.get(order.portfolio_id, order.instrument_id)
         if self.on_live_fill is not None and product_id is not None:
             self.on_live_fill(product_id, order, position.quantity, received_at)
@@ -1092,6 +1098,8 @@ class DatabaseUserStreamWorker:
         fee_asset: str | None,
         accounting_asset: str,
     ) -> dict[str, Any]:
+        if self.order_manager is None:
+            raise RuntimeError("user-stream worker requires a durable order store")
         if order.status is not OrderStatus.RECOVERY_REQUIRED:
             order = self.order_manager.recovery_required(order.order_id)
         recovery_payload = {
@@ -1248,7 +1256,7 @@ def _mark_account_authority_unknown(
 ) -> None:
     """Invalidate the last REST snapshot until a fresh reconciliation completes."""
 
-    payload = {
+    payload: dict[str, Any] = {
         "account_id": account_id,
         "product_id": product_id,
         "balances": {},

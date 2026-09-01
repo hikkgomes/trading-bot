@@ -356,6 +356,8 @@ class DatabaseReportWorker:
         now: str,
         payload: dict[str, Any],
     ) -> str:
+        if self.alerts is None:
+            raise RuntimeError("alert emission requires an alert service")
         return self.alerts.emit(
             event_type=event_type,
             severity=severity,

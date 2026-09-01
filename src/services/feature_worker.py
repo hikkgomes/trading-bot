@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -490,7 +490,9 @@ class DatabaseFeatureWorker:
         return latest
 
     @staticmethod
-    def _bar_values(latest: Mapping[str, Any], ordered: list[Mapping[str, Any]]) -> dict[str, Any]:
+    def _bar_values(
+        latest: Mapping[str, Any], ordered: Sequence[Mapping[str, Any]]
+    ) -> dict[str, Any]:
         result: dict[str, Any] = {
             name: float(latest[name]) for name in ("open", "high", "low", "close", "volume")
         }

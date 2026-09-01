@@ -8,7 +8,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from src.research.evidence import EvidenceProfile
@@ -489,7 +489,7 @@ def _validate_promotion_counts(policy_id: str, policy: Mapping[str, Any]) -> Non
         )
 
 
-def _is_number(value: object) -> bool:
+def _is_number(value: object) -> TypeGuard[int | float]:
     return (
         isinstance(value, int | float)
         and not isinstance(value, bool)

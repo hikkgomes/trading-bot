@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from src.domain.orders import OrderIntent, OrderSide
 from src.domain.positions import Position
@@ -351,7 +351,7 @@ def _finite(value: object, *, field: str, positive: bool = False) -> float:
     if isinstance(value, bool):
         raise ExposureBudgetError(f"{field} must be numeric")
     try:
-        result = float(value)
+        result = float(cast(Any, value))
     except (TypeError, ValueError) as exc:
         raise ExposureBudgetError(f"{field} must be numeric") from exc
     if not math.isfinite(result) or (result <= 0 if positive else result < 0):

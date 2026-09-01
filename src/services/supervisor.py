@@ -258,7 +258,7 @@ def _execution_cycle(
     control_plane = control_plane or DatabaseControlPlane(
         database.engine,
         DatabaseHeartbeatStore(database.engine),
-        configuration=dict(configuration),
+        configuration={str(key): dict(value) for key, value in configuration.items()},
         alerts=alerts,
     )
     worker_id = f"{node_id}:execution-engine"
@@ -381,7 +381,7 @@ def _live_execution_components(
     alerts: SqlAlertService | None,
     control_plane: DatabaseControlPlane,
 ) -> dict[str, Any]:
-    empty = {
+    empty: dict[str, Any] = {
         "live_worker": None,
         "recovery_worker": None,
         "emergency_worker": None,
@@ -1158,7 +1158,7 @@ def _initialise_service(
     control_plane = DatabaseControlPlane(
         database.engine,
         heartbeat_store,
-        configuration=split,
+        configuration={str(key): dict(value) for key, value in split.items()},
         alerts=alerts,
     )
     runtime = ServiceRuntime(

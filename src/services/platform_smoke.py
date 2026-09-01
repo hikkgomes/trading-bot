@@ -9,7 +9,7 @@ import tempfile
 import uuid
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import func, insert, select
 
@@ -555,7 +555,7 @@ def _seed_strategy(
 ) -> str:
     product_id = str(product["product_id"])
     feature_nodes, _ = registered_feature_contract(strategy_name)
-    strategy_parameters = get_registered_strategy(strategy_name).default_params()
+    strategy_parameters = cast(Any, get_registered_strategy(strategy_name)).default_params()
     if strategy_name == "condition_grid":
         strategy_parameters = {
             **strategy_parameters,

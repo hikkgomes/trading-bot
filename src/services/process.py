@@ -68,7 +68,7 @@ def _build_trading_work(
     control_plane = DatabaseControlPlane(
         database.engine,
         heartbeat_store,
-        configuration=configuration,
+        configuration={str(key): dict(value) for key, value in configuration.items()},
     )
     return {
         "market-gateway": _market_gateway_cycle(

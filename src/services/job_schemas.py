@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from src.domain._codec import canonical_hash, json_value, timestamp
 
@@ -592,7 +592,7 @@ def _validate_emergency_reduction(payload: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(position_quantity, bool):
         raise JobSchemaError("position_quantity must be numeric")
     try:
-        numeric_quantity = float(position_quantity)
+        numeric_quantity = float(cast(Any, position_quantity))
     except (TypeError, ValueError) as exc:
         raise JobSchemaError("position_quantity must be numeric") from exc
     if not math.isfinite(numeric_quantity) or abs(numeric_quantity) <= 0:

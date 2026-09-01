@@ -589,7 +589,7 @@ def _validate_state_market(clean: Mapping[str, Any]) -> None:
         if not market_type:
             market_type = "spot" if ":spot:" in str(instrument_id) else "futures"
         if market_type == "spot":
-            values.setdefault("funding", 0.0)
+            continue
         elif market_type == "futures" and "funding" not in values:
             raise ValueError(f"canonical futures market state has no funding for {instrument_id}")
         elif market_type not in {"spot", "futures"}:

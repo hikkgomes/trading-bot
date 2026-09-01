@@ -1028,16 +1028,15 @@ def _progress_readiness(
         observed_at = timestamp(str(observed), field="research_activity.observed_at")
         if observed_at > latest.get(product, ""):
             latest[product] = observed_at
-    details = {
-        product: {
+    details: dict[str, dict[str, Any]] = {}
+    for product in sorted(required_products):
+        observed = latest.get(product)
+        details[product] = {
             "latest_activity_at": observed,
-            "age_seconds": _record_age(current, observed),
+            "age_seconds": _record_age(current, observed) if observed is not None else None,
             "maximum_age_seconds": 86_400.0,
             "progressed": True,
         }
-        for product in sorted(required_products)
-        for observed in (latest.get(product),)
-    }
     for detail in details.values():
         detail["progressed"] = (
             detail["age_seconds"] is not None and 0 <= detail["age_seconds"] <= 86_400
@@ -1057,13 +1056,13 @@ def _heartbeat_readiness(
     details: dict[str, Any] = {}
     ok = True
     for name in ("platform-scheduler", "account-reconciliation"):
-        row = latest.get(name)
-        if row is None:
+        candidate = latest.get(name)
+        if candidate is None:
             ok = False
             details[name] = "missing"
             continue
-        age = _record_age(current, str(row["observed_at"]))
-        healthy = bool(row["healthy"]) and age is not None and 0 <= age <= maximum_age
+        age = _record_age(current, str(candidate["observed_at"]))
+        healthy = bool(candidate["healthy"]) and age is not None and 0 <= age <= maximum_age
         ok = ok and healthy
         details[name] = {"age_seconds": age, "healthy": healthy}
     return {"ok": ok, "details": details}

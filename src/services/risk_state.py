@@ -7,6 +7,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any, cast
 
 from sqlalchemy import select
 
@@ -450,7 +451,7 @@ def _base_asset(payload: object, instrument_id: str) -> str:
 
 def _positive_number(value: object) -> float:
     try:
-        result = float(value)
+        result = float(cast(Any, value))
     except (TypeError, ValueError):
         return 0.0
     return result if math.isfinite(result) and result > 0 else 0.0
@@ -458,7 +459,7 @@ def _positive_number(value: object) -> float:
 
 def _finite_number(value: object, field_name: str) -> float:
     try:
-        result = float(value)
+        result = float(cast(Any, value))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must be numeric") from exc
     if not math.isfinite(result):

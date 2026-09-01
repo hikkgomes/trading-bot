@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import Any, cast
 
 import requests
 
@@ -336,4 +336,5 @@ def _precision(value: object) -> int:
     increment = decimal.Decimal(str(value))
     if not increment.is_finite() or increment <= 0:
         raise ValueError("Binance instrument precision is invalid")
-    return max(0, -increment.normalize().as_tuple().exponent)
+    exponent = cast(int, increment.normalize().as_tuple().exponent)
+    return max(0, -exponent)

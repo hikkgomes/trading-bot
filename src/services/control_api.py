@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import insert, select
 from sqlalchemy.engine import Engine
@@ -336,11 +336,17 @@ def _control_target(target: str) -> str:
     return clean
 
 
+class ControlHTTPServer(ThreadingHTTPServer):
+    control_plane: DatabaseControlPlane
+    bearer_token: str
+
+
 class ControlRequestHandler(BaseHTTPRequestHandler):
     """Authenticated HTTP adapter around one database control plane."""
 
     def _authorised(self) -> bool:
-        return self.headers.get("Authorization") == f"Bearer {self.server.bearer_token}"
+        server = cast(ControlHTTPServer, self.server)
+        return self.headers.get("Authorization") == f"Bearer {server.bearer_token}"
 
     def _reply(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, sort_keys=True).encode()
@@ -354,7 +360,7 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         if not self._authorised():
             self._reply(HTTPStatus.UNAUTHORIZED, {"reason_code": "unauthorised"})
             return
-        response = _get_route(self.server.control_plane, self.path)
+        response = _get_route(cast(ControlHTTPServer, self.server).control_plane, self.path)
         if response is None:
             self._reply(HTTPStatus.NOT_FOUND, {"reason_code": "not_found"})
             return
@@ -368,7 +374,11 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             self._reply(HTTPStatus.NOT_FOUND, {"reason_code": "not_found"})
             return
         try:
-            response = _post_route(self.server.control_plane, self.path, _request_payload(self))
+            response = _post_route(
+                cast(ControlHTTPServer, self.server).control_plane,
+                self.path,
+                _request_payload(self),
+            )
         except (UnicodeDecodeError, PermissionError, ValueError, json.JSONDecodeError) as exc:
             self._reply(
                 HTTPStatus.BAD_REQUEST,
@@ -386,10 +396,10 @@ def build_control_server(
     bind: tuple[str, int],
     control_plane: DatabaseControlPlane,
     bearer_token: str,
-) -> ThreadingHTTPServer:
+) -> ControlHTTPServer:
     if not bearer_token:
         raise ValueError("control API bearer token cannot be empty")
-    server = ThreadingHTTPServer(bind, ControlRequestHandler)
+    server = ControlHTTPServer(bind, ControlRequestHandler)
     server.control_plane = control_plane
     server.bearer_token = bearer_token
     return server

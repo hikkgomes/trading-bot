@@ -594,12 +594,19 @@ class ForwardEvidenceCollector:
         )
         first_snapshot = before_creation[-1] if before_creation else snapshots[0]
         last_snapshot = snapshots[-1]
-        initial = self._btc_nav(first_snapshot["payload"], prices[0])
-        final = self._btc_nav(last_snapshot["payload"], prices[-1])
-        if initial is None or final is None or initial <= 0.0:
+        initial_btc_nav = self._btc_nav(first_snapshot["payload"], prices[0])
+        final_btc_nav = self._btc_nav(last_snapshot["payload"], prices[-1])
+        if initial_btc_nav is None or final_btc_nav is None or initial_btc_nav <= 0.0:
             return ("BTC", None, None, None, None, source_ids)
-        excess = final - initial
-        return ("BTC", final, initial, excess, excess / initial, source_ids)
+        excess = final_btc_nav - initial_btc_nav
+        return (
+            "BTC",
+            final_btc_nav,
+            initial_btc_nav,
+            excess,
+            excess / initial_btc_nav,
+            source_ids,
+        )
 
     @staticmethod
     def _btc_nav(payload: Mapping[str, Any], price: float) -> float | None:

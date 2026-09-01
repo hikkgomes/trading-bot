@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from src.domain._codec import canonical_hash, timestamp
 from src.domain.orders import OrderIntent, OrderSide, OrderStatus, OrderType
@@ -295,7 +295,7 @@ def _reference_price(venue: Any, instrument_id: str) -> float:
 
 
 def _bounded_fraction(value: object) -> float:
-    result = float(value)
+    result = float(cast(Any, value))
     if not math.isfinite(result) or not 0 <= result <= 1:
         raise ValueError("btc_core_fraction must be in [0, 1]")
     return result

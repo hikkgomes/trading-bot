@@ -426,6 +426,8 @@ class ApprovedLiveExecution:
         order_created_at = timestamp(order.created_at, field="order.created_at")
         if authority_at < order_created_at:
             raise PermissionError("live order cannot be authorised before it was created")
+        if order.valid_until is None:
+            raise PermissionError("live order intent has no expiry")
         if authority_at >= order.valid_until:
             raise PermissionError("live order intent has expired")
         return product_id, product, account_id, authority_at
@@ -465,6 +467,8 @@ class ApprovedLiveExecution:
             account_age=account_age,
             maximum_age=int(product.get("account_snapshot_max_age_seconds", 60)),
         )
+        if not isinstance(account_payload, Mapping):
+            raise PermissionError("live order requires a complete account snapshot")
         expected_fingerprint = str(account_payload.get("account_fingerprint") or "")
         venue = self.venues[product_id]
         actual_fingerprint = str(getattr(venue.broker, "account_fingerprint", ""))

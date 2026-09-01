@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from src.domain._codec import canonical_hash, timestamp
 from src.domain.market_events import MarketEvent
@@ -516,7 +516,7 @@ def _reference_price(order: OrderIntent) -> float:
     if raw is None:
         raw = order.limit_price
     try:
-        value = float(raw)
+        value = float(cast(Any, raw))
     except (TypeError, ValueError) as exc:
         raise ProtectiveStopError("live entry has no positive reference price") from exc
     if not math.isfinite(value) or value <= 0:
@@ -530,7 +530,7 @@ def _trigger_price(order: OrderIntent) -> float:
     if raw is None and isinstance(target_metadata, Mapping):
         raw = target_metadata.get("protective_stop_price")
     try:
-        value = float(raw)
+        value = float(cast(Any, raw))
     except (TypeError, ValueError) as exc:
         raise ProtectiveStopError("live futures entry has no protective_stop_price") from exc
     if not math.isfinite(value) or value <= 0:

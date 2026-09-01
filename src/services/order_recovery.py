@@ -59,7 +59,7 @@ class DatabaseLiveRecoveryWorker:
                         "recovery_kind": "user_stream_reconnect",
                     }
                 raise ValueError("recovery job found no exchange-state difference")
-            action_results = ()
+            action_results: tuple[dict[str, Any], ...] = ()
             if self.execute_action is not None:
                 action_results = tuple(
                     dict(self.execute_action(product_id, action)) for action in plan.actions
