@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from src.accounting.ledger import Ledger, SqlLedgerStore
-from src.data.database import PlatformDatabase, account_snapshot
+from src.data.database import PlatformDatabase, account_snapshot, nav_snapshot
 from src.domain._codec import canonical_hash
 from src.risk.engine import SqlRiskSnapshotStore
 from src.services.portfolio_engine import _validate_state_health
@@ -188,4 +188,52 @@ def test_risk_measurements_mark_missing_factor_history_unavailable(tmp_path) -> 
         "beta:binance:futures:ETHUSDT:USDT",
         "correlation:binance:futures:BTCUSDT:USDT:binance:futures:ETHUSDT:USDT",
     )
+    database.dispose()
+
+
+def test_risk_measurements_use_canonical_nav_for_open_position_loss(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'risk-nav.sqlite3'}")
+    database.create_schema()
+    for observed_at, value in (
+        ("2026-08-30T00:00:00+00:00", 1_000.0),
+        ("2026-08-30T01:00:00+00:00", 950.0),
+    ):
+        payload = {
+            "product_id": "active_income",
+            "accounting_asset": "USDT",
+            "nav": value,
+            "observed_at": observed_at,
+            "components": {},
+        }
+        with database.engine.begin() as connection:
+            connection.execute(
+                nav_snapshot.insert().values(
+                    id=canonical_hash(payload),
+                    created_at=observed_at,
+                    payload=payload,
+                )
+            )
+
+    measurements = PortfolioRiskCalculator(database.engine).calculate(
+        product_id="active_income",
+        account_id="account-usdt",
+        product={"portfolio_id": "portfolio-active-income"},
+        account={"paper_starting_balances": {"USDT": 1_000.0}},
+        balances={"USDT": 950.0},
+        positions={},
+        open_orders=(),
+        market={
+            "BTCUSDT": {
+                "price": 100.0,
+                "spread_bps": 1.0,
+                "visible_depth": 100_000.0,
+                "volatility": 0.1,
+                "funding": 0.0,
+            }
+        },
+        at="2026-08-30T01:00:00+00:00",
+    )
+
+    assert measurements.product_drawdown_fraction == pytest.approx(0.05)
+    assert measurements.daily_pnl_fraction == pytest.approx(-0.05)
     database.dispose()
