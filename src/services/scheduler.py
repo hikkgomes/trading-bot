@@ -528,6 +528,10 @@ class PlatformScheduler:
             "universe_snapshot_id": catalogue.get("universe_snapshot_id"),
             "submitted_at": str(catalogue["catalogue_submitted_at"]),
             "generation_budget": int(product.get("generation_budget", 6)),
+            "universe_id": str(product.get("universe_id") or ""),
+            "market_type": "spot" if product_id == "btc_accumulation" else "futures",
+            "dataset_timeframe": str(product.get("dataset_timeframe") or "1m"),
+            "available_at": str(catalogue["catalogue_submitted_at"]),
         }
         return {key: value for key, value in payload.items() if value is not None}
 

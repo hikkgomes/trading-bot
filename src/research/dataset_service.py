@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import Any
 import pyarrow.parquet as pq
 from sqlalchemy import select
 
-from src.data.database import cost_model_manifest, feature_manifest
+from src.data.database import cost_model_manifest, feature_manifest, risk_snapshot
 from src.data.universe import SqlUniverseStore
 from src.domain._codec import canonical_hash, timestamp
 from src.research.datasets import (
@@ -60,13 +61,17 @@ class DatabaseDatasetBundleService:
         *,
         maximum_rows: int = 250_000,
         timeframe: str = "1m",
+        minimum_history_days: int = 0,
     ) -> None:
         if maximum_rows <= 0:
             raise ValueError("maximum_rows must be positive")
+        if minimum_history_days < 0:
+            raise ValueError("minimum_history_days must be non-negative")
         self.engine = engine
         self.parquet_root = parquet_root.resolve()
         self.maximum_rows = maximum_rows
         self.timeframe = _text(timeframe, field="timeframe")
+        self.minimum_history_days = minimum_history_days
 
     def run(
         self,
@@ -111,6 +116,24 @@ class DatabaseDatasetBundleService:
             )
         if not bars:
             return self._waiting(product_id, "historical_bars_unavailable")
+        if not _history_span_satisfies(bars, self.minimum_history_days):
+            return self._waiting(product_id, "historical_history_insufficient")
+        try:
+            if market_type.lower() == "futures":
+                bars = self._attach_funding_rates(
+                    product_id=product_id,
+                    bars=bars,
+                    instrument_scope=instrument_scope,
+                    created=created,
+                )
+            _validate_market_bars(bars, market_type=market_type)
+        except DatasetBundleBuildError as exc:
+            return DatasetBundleBuildResult(
+                state="blocked_dataset",
+                reason_code="bar_quality_invalid",
+                product_id=product_id,
+                detail=str(exc),
+            )
         try:
             intervals = _stage_intervals(bars)
             bundle = CanonicalResearchDatasetBuilder(self.engine).build_from_bars(
@@ -223,6 +246,58 @@ class DatabaseDatasetBundleService:
             rows = rows[-self.maximum_rows :]
         return tuple(rows), tuple(sorted(source_hashes))
 
+    def _attach_funding_rates(
+        self,
+        *,
+        product_id: str,
+        bars: tuple[dict[str, Any], ...],
+        instrument_scope: tuple[str, ...],
+        created: str,
+    ) -> tuple[dict[str, Any], ...]:
+        funding = self._funding_events(product_id, created)
+        missing = sorted(set(instrument_scope) - set(funding))
+        if missing:
+            raise DatasetBundleBuildError(
+                "futures funding history is missing for: " + ", ".join(missing)
+            )
+        enriched: list[dict[str, Any]] = []
+        for row in bars:
+            instrument_id = str(row["instrument_id"])
+            close = str(row["close_timestamp"])
+            values = dict(row)
+            values["funding_rate"] = funding[instrument_id].get(close, 0.0)
+            enriched.append(values)
+        return tuple(enriched)
+
+    def _funding_events(self, product_id: str, created: str) -> dict[str, dict[str, float]]:
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(risk_snapshot.c.payload, risk_snapshot.c.created_at)
+                .where(risk_snapshot.c.created_at <= created)
+                .order_by(risk_snapshot.c.created_at, risk_snapshot.c.id)
+            ).mappings()
+        result: dict[str, dict[str, float]] = {}
+        for row in rows:
+            payload = row["payload"]
+            if not isinstance(payload, Mapping):
+                continue
+            if (
+                payload.get("kind") != "market_data_input"
+                or payload.get("product_id") != product_id
+            ):
+                continue
+            values = payload.get("values")
+            if not isinstance(values, Mapping) or values.get("funding") is None:
+                continue
+            instrument_id = str(payload.get("instrument_id") or "")
+            source_time = payload.get("source_event_time", row["created_at"])
+            if not instrument_id or source_time is None:
+                continue
+            result.setdefault(instrument_id, {})[_bar_time(source_time, field="funding_time")] = (
+                _signed_number(values["funding"], field="funding")
+            )
+        return result
+
 
 def _normalise_bar(
     raw: Mapping[str, Any], instrument_id: str, created: str
@@ -240,6 +315,64 @@ def _normalise_bar(
     row["close_timestamp"] = close
     row["availability_time"] = available
     return row
+
+
+def _history_span_satisfies(rows: tuple[dict[str, Any], ...], minimum_days: int) -> bool:
+    if minimum_days == 0:
+        return True
+    times = [dt.datetime.fromisoformat(str(row["close_timestamp"])) for row in rows]
+    return max(times) - min(times) >= dt.timedelta(days=minimum_days)
+
+
+def _validate_market_bars(rows: tuple[dict[str, Any], ...], *, market_type: str) -> None:
+    previous: dict[str, str] = {}
+    for index, row in enumerate(rows):
+        instrument_id = str(row.get("instrument_id") or "")
+        observed = str(row.get("close_timestamp") or "")
+        if previous.get(instrument_id, "") >= observed:
+            raise DatasetBundleBuildError(
+                f"bar timestamps are not strictly increasing at row {index}"
+            )
+        previous[instrument_id] = observed
+        values = {
+            name: _positive_number(row.get(name), field=f"bar[{index}].{name}")
+            for name in ("open", "high", "low", "close")
+        }
+        volume = _nonnegative_number(row.get("volume"), field=f"bar[{index}].volume")
+        if values["high"] < max(values["open"], values["close"]) or values["low"] > min(
+            values["open"], values["close"]
+        ):
+            raise DatasetBundleBuildError(f"bar[{index}] has inconsistent OHLC values")
+        if volume < 0.0:
+            raise DatasetBundleBuildError(f"bar[{index}].volume is negative")
+        if market_type.lower() == "futures" and "funding_rate" not in row:
+            raise DatasetBundleBuildError(f"bar[{index}] has no signed funding rate")
+
+
+def _positive_number(value: Any, *, field: str) -> float:
+    result = _signed_number(value, field=field)
+    if result <= 0.0:
+        raise DatasetBundleBuildError(f"{field} must be positive")
+    return result
+
+
+def _nonnegative_number(value: Any, *, field: str) -> float:
+    result = _signed_number(value, field=field)
+    if result < 0.0:
+        raise DatasetBundleBuildError(f"{field} must be non-negative")
+    return result
+
+
+def _signed_number(value: Any, *, field: str) -> float:
+    if isinstance(value, bool):
+        raise DatasetBundleBuildError(f"{field} must be numeric")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise DatasetBundleBuildError(f"{field} must be numeric") from exc
+    if not math.isfinite(result):
+        raise DatasetBundleBuildError(f"{field} must be finite")
+    return result
 
 
 def _bar_time(value: Any, *, field: str) -> str:

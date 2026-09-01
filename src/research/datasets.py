@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -577,20 +578,35 @@ class CanonicalResearchDatasetBuilder:
     @staticmethod
     def _bar_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
         market_frame = [dict(row) for row in rows]
-        returns: list[float] = []
-        previous_close: float | None = None
+        aligned_returns: list[float] = []
+        previous_by_instrument: dict[str, float] = {}
+        history_by_instrument: dict[str, list[float]] = {}
+        feature_rows: list[dict[str, Any]] = []
         for row in market_frame:
-            close = row.get("close")
-            if isinstance(close, int | float) and not isinstance(close, bool):
-                close_value = float(close)
-                if previous_close is not None and previous_close > 0:
-                    returns.append(close_value / previous_close - 1.0)
-                previous_close = close_value
+            close_value = _numeric_close(row.get("close"))
+            instrument = str(row.get("instrument_id") or row.get("symbol") or "")
+            history = history_by_instrument.setdefault(instrument, [])
+            previous = previous_by_instrument.get(instrument)
+            row_return = close_value / previous - 1.0 if previous and close_value else 0.0
+            aligned_returns.append(row_return)
+            feature_rows.append(_bar_feature_row(row, close_value, row_return, history))
+            if close_value > 0.0:
+                history.append(close_value)
+                previous_by_instrument[instrument] = close_value
         return {
             "bars": market_frame,
             "market_frame": market_frame,
-            "returns": returns,
+            "returns": aligned_returns[1:],
+            "feature_rows": feature_rows,
             "independent_units": len(market_frame),
+            "data_quality": {
+                "rows": len(market_frame),
+                "instruments": sorted(
+                    {str(row.get("instrument_id") or row.get("symbol") or "") for row in rows}
+                ),
+                "missing_fields": [],
+                "duplicate_timestamps": 0,
+            },
         }
 
     @staticmethod
@@ -694,6 +710,57 @@ class CanonicalResearchDatasetBuilder:
             return
         if any(existing[key] != value for key, value in values.items()):
             raise DatasetResolutionError(f"immutable dataset identity collision: {values['id']}")
+
+
+def _numeric_close(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return result if math.isfinite(result) and result > 0.0 else 0.0
+
+
+def _bar_feature_row(
+    row: Mapping[str, Any], close: float, row_return: float, history: list[float]
+) -> dict[str, Any]:
+    recent = history[-20:]
+    mean = sum(recent) / len(recent) if recent else close
+    variance = sum((value - mean) ** 2 for value in recent) / len(recent) if recent else 0.0
+    deviation = (close - mean) / math.sqrt(variance) if variance > 0.0 else 0.0
+    prior_high = max(recent) if recent else close
+    range_fraction = _range_fraction(row, close)
+    return {
+        "timestamp": row.get("close_timestamp", row.get("timestamp")),
+        "bar_return": row_return,
+        "trend": row_return,
+        "breakout": close / prior_high - 1.0 if prior_high > 0.0 else 0.0,
+        "normalised_price_deviation": deviation,
+        "oscillator": deviation,
+        "range_state": range_fraction,
+        "realised_volatility": math.sqrt(variance) / mean if mean > 0.0 else 0.0,
+        "relative_return": row_return,
+        "funding_rank": _signed_numeric(
+            row.get("funding", row.get("funding_rate", 0.0)), default=0.0
+        ),
+    }
+
+
+def _range_fraction(row: Mapping[str, Any], close: float) -> float:
+    high = _numeric_close(row.get("high"))
+    low = _numeric_close(row.get("low"))
+    return (high - low) / close if close > 0.0 and high >= low else 0.0
+
+
+def _signed_numeric(value: Any, *, default: float) -> float:
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
 
 
 class SqlDatasetBundleRepository:

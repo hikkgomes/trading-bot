@@ -273,6 +273,26 @@ def test_missing_declared_negative_control_is_unavailable_not_a_fake_null() -> N
     assert evidence["block_permutation"]["passed"] is False
 
 
+def test_active_income_registered_time_series_candidates_are_symbol_isolated() -> None:
+    candidates = registered_strategy_candidates(
+        product="active_income",
+        dataset_snapshot_hashes=("sha256:" + "1" * 64,),
+        instrument_universe=("BTCUSDT", "ETHUSDT"),
+    )
+
+    sma_candidates = [
+        candidate for candidate in candidates if candidate.definition.identity == "sma_cross"
+    ]
+    assert len(sma_candidates) == 2
+    assert {tuple(candidate.definition.universe["symbols"]) for candidate in sma_candidates} == {
+        ("BTCUSDT",),
+        ("ETHUSDT",),
+    }
+    assert all(
+        candidate.definition.metadata["research_scope"] == "symbol" for candidate in sma_candidates
+    )
+
+
 def _evidence_hashes(index: int) -> dict[str, str]:
     return {
         "run_id": "sha256:" + str(index) * 64,
@@ -1221,6 +1241,15 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(tmp_path) 
             )
         ).scalar_one()
     assert snapshot_payload["payload"]["market_frame"]
+
+    pending = DatabaseDatasetBundleService(database.engine, root, minimum_history_days=365).run(
+        product_id="btc_accumulation",
+        universe_id=universe_id,
+        market_type="spot",
+        created_at=NOW,
+    )
+    assert pending.state == "waiting_for_dataset"
+    assert pending.reason_code == "historical_history_insufficient"
 
     claimed = ClaimedJob(
         job_id="catalogue-service",

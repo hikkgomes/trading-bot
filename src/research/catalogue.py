@@ -211,7 +211,6 @@ def registered_strategy_candidates(
     universe = tuple(sorted(set(instrument_universe)))
     if product == "btc_accumulation" and universe != ("BTCUSDT",):
         raise ValueError("BTC accumulation research is restricted to BTCUSDT spot")
-    theses = registered_strategy_theses(product=product, instrument_universe=universe)
     candidates: list[Candidate] = []
     # Only executable registry entries enter research. The manifest is
     # descriptive and cannot manufacture a candidate for missing code.
@@ -225,68 +224,80 @@ def registered_strategy_candidates(
         strategy_class = cast(Any, get(name))
         parameters = strategy_class.default_params()
         market_type = MarketType.SPOT if product == "btc_accumulation" else MarketType.FUTURES
-        universe_definition = {
-            "type": "fixed",
-            "symbols": list(universe),
-            "instrument_ids": [
-                canonical_instrument_id(
-                    symbol,
-                    market_type=market_type,
-                    settlement_asset="USDT" if market_type is MarketType.FUTURES else None,
-                )
-                for symbol in universe
-            ],
-        }
-        if universe_snapshot_id is not None:
-            universe_definition["type"] = "point_in_time"
-            universe_definition["universe_snapshot_id"] = universe_snapshot_id
         evidence_type = (
             "btc_allocation"
             if product == "btc_accumulation"
             else (entry.evidence_type if entry is not None else "swing")
         )
-        definition = StrategyDefinition(
-            identity=name,
-            version="registered-v1",
-            family=entry.family,
-            product=product,
-            universe=universe_definition,
-            data_requirements={"closed_ohlcv_bars": True},
-            feature_graph={"version": "canonical-features/v2", "required_nodes": feature_nodes},
-            signal_model={
-                "registered_strategy": name,
-                "parameters": parameters,
-                "behaviour_contract": "registered_strategy/v1",
-            },
-            position_model={"kind": "volatility_scaled"},
-            execution_preferences={"policy": "market"},
-            risk_policy={"product_policy": product},
-            validation_policy={"evidence_type": evidence_type},
-            # The common queue owns execution of these catalogue entries. The
-            # family-specific source type remains explicit metadata until a
-            # concrete evaluator is registered for that family.
-            source_type=StrategySourceType.REGISTERED_PYTHON,
-            source_hash=source_hash,
-            metadata={
-                "description": descriptions.get(name) or manifest_description(name),
-                "manifest_family": entry.family,
-                "canonical_source_type": manifest_source_type(name),
-                "executable_registry_entry": True,
-                "promotable": True,
-                "source_provenance": registered_strategy_provenance(name),
-            },
+        candidate_universes = (
+            tuple((symbol,) for symbol in universe)
+            if product == "active_income"
+            and entry.input_contract == "single_instrument_time_series"
+            else (universe,)
         )
-        candidates.append(
-            Candidate(
-                definition=definition,
-                thesis_id=theses[name].thesis_id,
-                lineage_id=canonical_hash({"thesis_id": theses[name].thesis_id, "root": name}),
-                provider="registered_strategy_catalogue",
-                dataset_snapshot_hashes=tuple(dataset_snapshot_hashes),
-                submitted_at=now,
-                dataset_bundle_id=dataset_bundle_id,
+        for candidate_universe in candidate_universes:
+            theses = registered_strategy_theses(
+                product=product, instrument_universe=candidate_universe
             )
-        )
+            universe_definition: dict[str, object] = {
+                "type": "fixed",
+                "symbols": list(candidate_universe),
+                "instrument_ids": [
+                    canonical_instrument_id(
+                        symbol,
+                        market_type=market_type,
+                        settlement_asset="USDT" if market_type is MarketType.FUTURES else None,
+                    )
+                    for symbol in candidate_universe
+                ],
+            }
+            if universe_snapshot_id is not None:
+                universe_definition["type"] = "point_in_time"
+                universe_definition["universe_snapshot_id"] = universe_snapshot_id
+            thesis = theses[name]
+            definition = StrategyDefinition(
+                identity=name,
+                version="registered-v1",
+                family=entry.family,
+                product=product,
+                universe=universe_definition,
+                data_requirements={"closed_ohlcv_bars": True},
+                feature_graph={
+                    "version": "canonical-features/v2",
+                    "required_nodes": feature_nodes,
+                },
+                signal_model={
+                    "registered_strategy": name,
+                    "parameters": parameters,
+                    "behaviour_contract": "registered_strategy/v1",
+                },
+                position_model={"kind": "volatility_scaled"},
+                execution_preferences={"policy": "market"},
+                risk_policy={"product_policy": product},
+                validation_policy={"evidence_type": evidence_type},
+                source_type=StrategySourceType.REGISTERED_PYTHON,
+                source_hash=source_hash,
+                metadata={
+                    "description": descriptions.get(name) or manifest_description(name),
+                    "manifest_family": entry.family,
+                    "canonical_source_type": manifest_source_type(name),
+                    "executable_registry_entry": True,
+                    "promotable": True,
+                    "research_scope": "symbol" if len(candidate_universe) == 1 else "panel",
+                    "source_provenance": registered_strategy_provenance(name),
+                },
+            )
+            candidates.append(
+                Candidate(
+                    definition=definition,
+                    thesis_id=thesis.thesis_id,
+                    lineage_id=canonical_hash({"thesis_id": thesis.thesis_id, "root": name}),
+                    provider="registered_strategy_catalogue",
+                    dataset_snapshot_hashes=tuple(dataset_snapshot_hashes),
+                    submitted_at=now,
+                    dataset_bundle_id=dataset_bundle_id,
+                )
+            )
     return tuple(candidates)
 
 

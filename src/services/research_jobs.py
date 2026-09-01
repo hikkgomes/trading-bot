@@ -112,6 +112,32 @@ def _optional_text(value: Any) -> str | None:
     return text or None
 
 
+def _candidate_supported_instruments(
+    candidate: Candidate, resolved: tuple[Any, ...]
+) -> tuple[str, ...]:
+    available = tuple(
+        dict.fromkeys(str(symbol) for item in resolved for symbol in item.instrument_scope)
+    )
+    declared = candidate.definition.universe.get("instrument_ids")
+    if isinstance(declared, list | tuple) and declared:
+        selected = tuple(dict.fromkeys(str(value) for value in declared if str(value).strip()))
+    else:
+        symbols = candidate.definition.universe.get("symbols")
+        selected = tuple(
+            instrument
+            for instrument in available
+            if not isinstance(symbols, list | tuple)
+            or any(
+                instrument.endswith(f":{str(symbol)}")
+                or instrument.endswith(f":{str(symbol)}:USDT")
+                for symbol in symbols
+            )
+        )
+    if not selected or not set(selected).issubset(set(available)):
+        raise JobSchemaError("candidate instrument scope is outside its dataset scope")
+    return tuple(sorted(selected))
+
+
 @dataclass(frozen=True)
 class _CatalogueDataset:
     snapshot_ids: tuple[str, ...]
@@ -303,7 +329,7 @@ class DatabaseResearchJobHandlers:
     ) -> dict[str, Any]:
         """Compile safe campaigns into the same candidate queue as all providers."""
 
-        payload = claimed.payload
+        payload = self._resolve_generation_dataset(claimed.payload)
         product_id, universe, snapshot_ids = self._generation_inputs(payload)
         feedback_store = SqlGenerationFeedbackStore(self.store.engine)
         if not universe or not snapshot_ids:
@@ -350,6 +376,32 @@ class DatabaseResearchJobHandlers:
             "candidate_ids": registered,
             "candidate_count": len(registered),
         }
+
+    def _resolve_generation_dataset(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        resolved = dict(payload)
+        snapshot_ids = tuple(str(item) for item in payload.get("dataset_snapshot_hashes", ()))
+        bundle_id = _optional_text(payload.get("dataset_bundle_id"))
+        if snapshot_ids or self.dataset_bundle_service is None or bundle_id is not None:
+            return resolved
+        built = self.dataset_bundle_service.run(
+            product_id=str(payload["product_id"]),
+            universe_id=str(payload.get("universe_id") or ""),
+            market_type=str(payload.get("market_type") or "futures"),
+            created_at=str(payload.get("submitted_at") or payload.get("available_at")),
+            timeframe=_optional_text(payload.get("dataset_timeframe")),
+        )
+        if built.state != "ready" or built.bundle_id is None:
+            return resolved
+        return {
+            **resolved,
+            "dataset_snapshot_hashes": list(built.snapshot_ids),
+            "dataset_bundle_id": built.bundle_id,
+            "universe_snapshot_id": self._bundle_universe_snapshot(built.bundle_id),
+        }
+
+    def _bundle_universe_snapshot(self, bundle_id: str) -> str:
+        bundle = SqlDatasetBundleRepository(self.store.engine).get(bundle_id)
+        return bundle.universe_snapshot_id
 
     @staticmethod
     def _generation_inputs(
@@ -805,6 +857,7 @@ class DatabaseResearchJobHandlers:
             )
             for snapshot_id in dataset_snapshot_hashes
         )
+        supported_instruments = _candidate_supported_instruments(candidate, resolved)
         raw_claims = evidence.get("holdout_claim")
         if not isinstance(raw_claims, list) or len(raw_claims) != 1:
             raise JobSchemaError("promotable artefact requires one protected holdout claim")
@@ -847,9 +900,7 @@ class DatabaseResearchJobHandlers:
                 )
             ),
             supported_products=(candidate.definition.product,),
-            supported_instruments=tuple(
-                dict.fromkeys(symbol for item in resolved for symbol in item.instrument_scope)
-            ),
+            supported_instruments=supported_instruments,
             created_at=request.evaluated_at,
             validation_evidence={
                 "stage_ids": [stages_by_name[name] for name in required_stages],
@@ -865,6 +916,7 @@ class DatabaseResearchJobHandlers:
                 "lineage_id": candidate.lineage_id,
                 "diagnostic": False,
                 "promotable": True,
+                "assignment_scope": list(supported_instruments),
             },
             product_id=candidate.definition.product,
             portfolio_id=str(product["portfolio_id"]),

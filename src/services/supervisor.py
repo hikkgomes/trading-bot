@@ -1070,7 +1070,13 @@ def _research_cycle(
             metadata_store=SqlModelArtefactStore(database.engine),
         ),
         dataset_resolver=dataset_resolver,
-        dataset_bundle_service=DatabaseDatasetBundleService(database.engine, parquet_root),
+        dataset_bundle_service=DatabaseDatasetBundleService(
+            database.engine,
+            parquet_root,
+            minimum_history_days=int(
+                research_configuration.get("data_requirements", {}).get("minimum_history_days", 0)
+            ),
+        ),
         dataset_loader=load_research_dataset,
         evidence_policy=evidence_policy,
         configuration=configuration,
