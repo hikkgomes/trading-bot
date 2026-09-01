@@ -473,6 +473,39 @@ def test_binance_spot_universe_uses_filter_precision_and_listing_history() -> No
     assert eligibility_reason(observation, UniverseEligibilityPolicy()) == "eligible"
 
 
+def test_binance_universe_rest_requests_use_the_shared_limiter() -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {"serverTime": 1}
+
+    class Session:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get(self, *_args, **_kwargs) -> Response:
+            self.calls += 1
+            return Response()
+
+    class Limiter:
+        def __init__(self) -> None:
+            self.acquires = 0
+
+        def acquire(self) -> None:
+            self.acquires += 1
+
+    session = Session()
+    limiter = Limiter()
+    client = BinanceUniverseClient(session=session, rate_limiter=limiter)
+
+    assert client._get("/api/v3/exchangeInfo") == {"serverTime": 1}
+    assert session.calls == 1
+    assert limiter.acquires == 1
+
+
 def test_spot_market_source_defaults_funding_but_futures_rejects_missing_or_stale_funding(
     tmp_path: Path,
 ) -> None:
