@@ -799,6 +799,7 @@ class DatabaseUserStreamWorker:
         accounting_job_prefix: str = "accounting",
         on_live_fill: Callable[[str, OrderIntent, float, str], object] | None = None,
         on_algo_update: Callable[[str, MarketEvent], object] | None = None,
+        on_order_status: Callable[[str, OrderIntent, str, str], object] | None = None,
     ) -> None:
         self.engine = engine
         self.queue = queue
@@ -815,6 +816,7 @@ class DatabaseUserStreamWorker:
         self.accounting_job_prefix = accounting_job_prefix
         self.on_live_fill = on_live_fill
         self.on_algo_update = on_algo_update
+        self.on_order_status = on_order_status
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
@@ -966,7 +968,15 @@ class DatabaseUserStreamWorker:
             )
         if order.status is OrderStatus.FILLED:
             return {"reason_code": "exchange_order_already_filled", "order_id": order.order_id}
-        return self._apply_status_event(order=order, values=values, event=event)
+        result = self._apply_status_event(order=order, values=values, event=event)
+        self._notify_order_status(product_id, order.order_id, event.receive_timestamp)
+        return result
+
+    def _notify_order_status(self, product_id: str | None, order_id: str, at: str) -> None:
+        if self.on_order_status is None or product_id is None or self.order_manager is None:
+            return
+        current = self.order_manager.get(order_id)
+        self.on_order_status(product_id, current, current.status.value, at)
 
     def _apply_fill_event(
         self,

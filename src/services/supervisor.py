@@ -337,6 +337,11 @@ def _execution_cycle(
             return {"reason_code": "protective_algo_handler_not_configured"}
         return protective_service.on_algo_update(product_id, event)
 
+    def on_order_status(product_id: str, order, status: str, at: str) -> object:
+        if protective_service is None or product_id not in live_product_ids:
+            return None
+        return protective_service.on_order_status(product_id, order, status, at)
+
     user_stream_worker = DatabaseUserStreamWorker(
         engine=database.engine,
         queue=queue,
@@ -349,6 +354,7 @@ def _execution_cycle(
         order_groups=order_groups,
         on_live_fill=on_live_fill if protective_service is not None else None,
         on_algo_update=on_algo_update if protective_service is not None else None,
+        on_order_status=on_order_status if protective_service is not None else None,
     )
 
     def run_once() -> dict[str, Any]:

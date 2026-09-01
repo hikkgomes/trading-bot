@@ -337,6 +337,51 @@ class LiveProtectiveStopService:
                 )
         return stops[0]
 
+    def on_order_status(
+        self, product_id: str, order: OrderIntent, status: str, at: str
+    ) -> ProtectiveStop | None:
+        """Clean up or resize protection when an entry ends without a fill."""
+
+        if order.reduce_only or status not in {
+            "cancelled",
+            "rejected",
+            "expired",
+            "reconciled",
+        }:
+            return None
+        stops = self.stop_manager.for_entry_order(order.order_id)
+        if len(stops) > 1:
+            raise ProtectiveStopError("entry order has multiple durable protective stops")
+        if not stops:
+            return None
+        stop = stops[0]
+        position_quantity = self._position_quantity(stop)
+        if abs(position_quantity) > 1e-12:
+            return self.on_fill(product_id, order, position_quantity, at)
+        if stop.native_order_id:
+            try:
+                native = self.venues[product_id].broker.cancel_protective_stop(
+                    symbol=_exchange_symbol(self.venues[product_id], stop.instrument_id),
+                    order_id=stop.native_order_id,
+                    client_id=str(stop.native_client_id or ""),
+                )
+                if ProtectiveOrderStatus(native.status) is ProtectiveOrderStatus.OPEN:
+                    raise ProtectiveStopError("protective stop remained open after entry ended")
+            except Exception as exc:
+                self.stop_manager.mark_failure(
+                    stop.stop_id, reason=f"orphan protective stop cancellation failed: {exc}"
+                )
+                self._emit_alert(
+                    event_type="protective_stop_orphaned",
+                    dedupe_key=f"protective-stop:{product_id}:{stop.stop_id}:orphaned",
+                    target=product_id,
+                    message="entry ended but its protective stop could not be cancelled",
+                    emitted_at=at,
+                    payload={"stop_id": stop.stop_id, "order_id": order.order_id},
+                )
+                raise ProtectiveStopError(str(exc)) from exc
+        return self.stop_manager.cancel(stop.stop_id)
+
     def _fail_unprotected(
         self,
         product_id: str,

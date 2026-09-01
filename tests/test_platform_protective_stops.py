@@ -162,6 +162,24 @@ def test_stop_failure_is_durable_and_latches_unprotected_state() -> None:
     )
 
 
+def test_rejected_entry_cancels_its_unsubmitted_protective_stop() -> None:
+    service, broker, manager = _service()
+    order = _order()
+    service.prepare_entry("active_income", order, NOW)
+
+    cancelled = service.on_order_status(
+        "active_income",
+        replace(order, status=OrderStatus.REJECTED),
+        OrderStatus.REJECTED.value,
+        NOW,
+    )
+
+    assert cancelled is not None
+    assert cancelled.status is StopStatus.CANCELLED
+    assert manager.active() == ()
+    assert broker.placed == []
+
+
 def test_unknown_algo_update_is_not_silently_ignored() -> None:
     service, _broker, _manager = _service()
     event = MarketEvent(
