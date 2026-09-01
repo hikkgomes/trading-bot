@@ -66,7 +66,11 @@ from src.services.market_gateway import UserStreamAccount, _stream_endpoints
 from src.services.order_execution import DatabasePaperExecutionWorker
 from src.services.paper_diagnostic import DatabaseDiagnosticPaperWorker
 from src.services.platform_bootstrap import PlatformBootstrap
-from src.services.platform_smoke import _product_fixture, _seed_strategy
+from src.services.platform_smoke import (
+    _cleanup_smoke_assignments,
+    _product_fixture,
+    _seed_strategy,
+)
 from src.services.platform_testnet_connected import (
     ConnectedTestnetError,
     _connected_gateway,
@@ -353,6 +357,22 @@ def test_platform_smoke_runs_after_bootstrap(tmp_path: Path) -> None:
 
     assert all(result["ok"] for result in results), results
     assert all(result["ok"] for result in repeated_results), repeated_results
+
+    smoke_assignments = SqlActiveStrategyAssignmentRepository(database.engine)
+    assert smoke_assignments.active_assignments("btc_accumulation:smoke:first")
+    assert smoke_assignments.active_assignments("active_income:smoke:second")
+    _cleanup_smoke_assignments(
+        database,
+        (
+            "btc_accumulation:smoke:first",
+            "active_income:smoke:first",
+            "btc_accumulation:smoke:second",
+            "active_income:smoke:second",
+        ),
+        at="2026-08-25T00:00:00+00:00",
+    )
+    assert not smoke_assignments.active_assignments("btc_accumulation:smoke:first")
+    assert not smoke_assignments.active_assignments("active_income:smoke:second")
 
 
 def test_bootstrap_diagnostic_paper_round_trip_is_automatic(tmp_path: Path) -> None:

@@ -90,6 +90,9 @@ def run_smoke(
     accounts = {str(item["account_id"]): dict(item) for item in split["accounts"]["accounts"]}
     results: list[dict[str, Any]] = []
     run_id = uuid.uuid4().hex
+    smoke_product_ids = tuple(
+        f"{product['product_id']}:smoke:{run_id}" for product in split["products"]["products"]
+    )
     try:
         with tempfile.TemporaryDirectory(prefix="platform-smoke-") as directory:
             observed = dt.datetime.now(dt.UTC).replace(microsecond=0)
@@ -113,6 +116,7 @@ def run_smoke(
                     )
                 )
     finally:
+        _cleanup_smoke_assignments(database, smoke_product_ids)
         database.dispose()
     return {
         "schema": "platform.smoke/v2",
@@ -120,6 +124,21 @@ def run_smoke(
         "postgresql_service_chain": True,
         "products": results,
     }
+
+
+def _cleanup_smoke_assignments(
+    database: PlatformDatabase,
+    product_ids: tuple[str, ...],
+    *,
+    at: str | None = None,
+) -> None:
+    assignments = SqlActiveStrategyAssignmentRepository(database.engine)
+    for product_id in product_ids:
+        assignments.deactivate(
+            product_id,
+            at=at,
+            assignment_reason="platform-smoke-cleanup",
+        )
 
 
 def _product_fixture(
