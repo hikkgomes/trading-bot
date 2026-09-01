@@ -151,7 +151,7 @@ strategy_identity = Table(
     "strategy_identity",
     metadata,
     Column("id", String(160), primary_key=True),
-    Column("behavior_hash", ForeignKey("strategy_definition.id"), nullable=False, index=True),
+    Column("behavior_hash", String(80), nullable=False, index=True),
     Column("submitted_spec", JSON, nullable=False),
     Column("generation_method", String(120), nullable=False),
     Column("metadata", JSON, nullable=False),
@@ -662,6 +662,7 @@ class PlatformDatabase:
                 "008_forward_paper_summaries.py",
                 "009_generation_feedback.py",
                 "010_live_ready_lifecycle.py",
+                "011_behavior_hash_identity.py",
             )
             applied: list[str] = []
             with self.engine.begin() as connection:
@@ -711,7 +712,7 @@ class PlatformDatabase:
         if self.is_postgresql:
             with self.engine.connect() as connection:
                 revision = connection.execute(text("SELECT version_num FROM alembic_version"))
-                if revision.scalar_one_or_none() != "platform_v2_0010":
+                if revision.scalar_one_or_none() != "platform_v2_0011":
                     raise RuntimeError("database is not at the current Alembic revision")
 
     def dispose(self) -> None:
