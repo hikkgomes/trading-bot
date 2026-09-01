@@ -584,7 +584,9 @@ class DatabaseResearchJobHandlers:
                     "requested_stage": "protected",
                     "evaluated_at": request.evaluated_at,
                     "evidence_policy_hash": self.evidence_policy.policy_hash,
-                    "minimum_bootstrap_observations": self.evidence_policy.minimum_bootstrap_observations,
+                    "minimum_bootstrap_observations": (
+                        self.evidence_policy.minimum_bootstrap_observations
+                    ),
                     "bootstrap_method": self.evidence_policy.bootstrap_method,
                     "multiple_testing_method": self.evidence_policy.multiple_testing_method,
                     "pbo_method": self.evidence_policy.pbo_method,
@@ -737,6 +739,10 @@ class DatabaseResearchJobHandlers:
                 "cost_model_id": str(request.cost_model_id),
                 "parameter_set_id": str(request.parameter_set_id),
             }
+        context = {
+            **dict(context),
+            **self._product_accounting_context(candidate.definition.product),
+        }
         return {
             **dict(context),
             "artefact_hash": request.artefact_hash,
@@ -745,6 +751,64 @@ class DatabaseResearchJobHandlers:
                 candidate.thesis_id
             ),
         }
+
+    def _product_accounting_context(self, product_id: str) -> dict[str, Any]:
+        if self.configuration is None:
+            return {}
+        products = self.configuration.get("products")
+        if not isinstance(products, Mapping):
+            return {}
+        product = next(
+            (
+                item
+                for item in products.get("products", ())
+                if isinstance(item, Mapping) and str(item.get("product_id")) == product_id
+            ),
+            None,
+        )
+        if not isinstance(product, Mapping):
+            return {}
+        costs = product.get("execution_costs")
+        account_id = str(product.get("account_id") or "")
+        accounts = self.configuration.get("accounts")
+        account = (
+            next(
+                (
+                    item
+                    for item in accounts.get("accounts", ())
+                    if isinstance(item, Mapping) and str(item.get("account_id")) == account_id
+                ),
+                None,
+            )
+            if isinstance(accounts, Mapping)
+            else None
+        )
+        balances = account.get("paper_starting_balances") if isinstance(account, Mapping) else {}
+        result: dict[str, Any] = {}
+        if isinstance(costs, Mapping):
+            result.update(
+                {
+                    "fee_bps": costs.get("fee_bps"),
+                    "slippage_bps": costs.get("slippage_bps"),
+                }
+            )
+        if product_id == "btc_accumulation":
+            result.update(
+                {
+                    "btc_core_fraction": product.get("btc_core_fraction"),
+                    "btc_minimum_fraction": product.get("btc_minimum_fraction"),
+                    "btc_max_tactical_fraction": product.get("btc_max_tactical_fraction"),
+                }
+            )
+        if isinstance(balances, Mapping):
+            result.update(
+                {
+                    "initial_btc": balances.get("BTC"),
+                    "initial_stablecoin": balances.get("USDT"),
+                    "initial_cash": balances.get("USDT"),
+                }
+            )
+        return {key: value for key, value in result.items() if value is not None}
 
     def _finalise_evaluation(
         self, candidate: Candidate, request: EvaluationRequest, result: Any
@@ -1112,7 +1176,8 @@ class DatabaseResearchJobHandlers:
     def _load_dataset(self, kind: str, request: ResearchJobRequest) -> Any:
         if self.dataset_loader is None:
             raise JobSchemaError(
-                f"{kind} requires a canonical dataset loader; queue payloads cannot contain raw data"
+                f"{kind} requires a canonical dataset loader; queue payloads cannot contain "
+                "raw data"
             )
         return self.dataset_loader(kind, request.to_payload())
 

@@ -765,9 +765,9 @@ def _btc_fraction_inputs(
     tactical_fraction = context.get("max_tactical_fraction")
     if tactical_fraction is None:
         tactical_fraction = context.get("btc_max_tactical_fraction")
-    if derived and tactical_fraction is None:
+    if tactical_fraction is None:
         tactical_fraction = 0.3
-    if derived and reserve_fraction is None:
+    if reserve_fraction is None:
         reserve_fraction = 1.0 - float(cast(Any, tactical_fraction))
     return (
         float(cast(Any, reserve_fraction)) if reserve_fraction is not None else None,
