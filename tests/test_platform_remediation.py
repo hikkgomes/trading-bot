@@ -11,6 +11,7 @@ from sqlalchemy import select, update
 from src.accounting.fees import FeeConversionError, convert_fee, instrument_asset
 from src.data.database import (
     PlatformDatabase,
+    account_snapshot,
     cost_model_manifest,
     dataset_snapshot,
     experiment,
@@ -1455,6 +1456,31 @@ def test_futures_return_ledger_scales_fractional_costs_into_usdt() -> None:
     assert accounting["funding_pnl"] == pytest.approx(30.0)
     assert accounting["turnover_notional"] == pytest.approx(1_000.0)
     assert accounting["implementation_shortfall"] == pytest.approx(15.0)
+
+
+def test_forward_drawdown_includes_a_loss_in_the_first_interval(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'forward-drawdown.sqlite3'}")
+    database.create_schema()
+    with database.engine.begin() as connection:
+        connection.execute(
+            account_snapshot.insert().values(
+                id="account-forward",
+                account_id="account-forward",
+                observed_at=NOW,
+                source="paper_config",
+                content_hash="sha256:" + "a" * 64,
+                payload={"balances": {"USDT": 1_000.0}},
+            )
+        )
+
+    drawdown = ForwardEvidenceCollector(database.engine)._drawdown(
+        "active_income",
+        ({"payload": {"metadata": {"pnl_effect": -100.0}}},),
+        {"account_id": "account-forward", "capital_limit": 1_000.0},
+        at=NOW,
+    )
+
+    assert drawdown == pytest.approx(0.1)
 
 
 def test_pbo_uses_the_configured_window_count_and_parameter_cohort() -> None:

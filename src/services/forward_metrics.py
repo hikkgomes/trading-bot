@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -54,6 +55,7 @@ class ForwardEvidenceMetrics:
     cycles: int = 0
     effective_independent_episodes: int = 0
     tail_loss: float = 0.0
+    evidence_days: float = 0.0
 
     def to_payload(
         self, *, forecast: Mapping[str, Any], target: Mapping[str, Any] | None
@@ -85,6 +87,7 @@ class ForwardEvidenceMetrics:
                 "cycles": self.cycles,
                 "effective_independent_episodes": self.effective_independent_episodes,
                 "tail_loss": self.tail_loss,
+                "evidence_days": self.evidence_days,
             },
             "forecast_hash": canonical_hash(dict(forecast)),
             "target_hash": canonical_hash(dict(target)) if target is not None else None,
@@ -251,6 +254,14 @@ class ForwardEvidenceCollector:
             cycles=cycles,
             effective_independent_episodes=independent_episodes,
             tail_loss=self._tail_loss(ledger_returns),
+            evidence_days=max(
+                0.0,
+                (
+                    dt.datetime.fromisoformat(evaluated_at)
+                    - dt.datetime.fromisoformat(created)
+                ).total_seconds()
+                / 86_400,
+            ),
         )
 
     def latest_observed_at(
@@ -525,8 +536,8 @@ class ForwardEvidenceCollector:
         if not rows:
             return 0.0
         base = self._starting_equity(product_id, assignment, at=at)
-        running = 0.0
-        peak = 0.0
+        running = base
+        peak = base
         worst = 0.0
         for row in rows:
             payload = row["payload"]
