@@ -143,6 +143,7 @@ class RegisteredStrategyBehaviour:
     parameters: Mapping[str, Any]
     source_hash: str
     contract_version: str = "registered_strategy/v1"
+    verify_source_identity: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", non_empty(self.name, field="strategy_name"))
@@ -175,7 +176,19 @@ class RegisteredStrategyBehaviour:
         parameters = signal_model.get("parameters", {})
         if not isinstance(parameters, Mapping):
             raise StrategyBehaviourError("registered strategy parameters must be an object")
-        return cls(name=name, parameters=parameters, source_hash=source_hash)
+        metadata = (
+            definition.get("metadata")
+            if isinstance(definition, Mapping)
+            else getattr(definition, "metadata", None)
+        )
+        return cls(
+            name=name,
+            parameters=parameters,
+            source_hash=source_hash,
+            verify_source_identity=(
+                isinstance(metadata, Mapping) and metadata.get("executable_registry_entry") is True
+            ),
+        )
 
     @property
     def behaviour_hash(self) -> str:
@@ -194,16 +207,17 @@ class RegisteredStrategyBehaviour:
 
         if frame is None or not hasattr(frame, "__len__"):
             raise StrategyBehaviourError("registered strategy requires an immutable market frame")
-        try:
-            from src.research.catalogue import registered_strategy_source_hash
+        if self.verify_source_identity:
+            try:
+                from src.research.catalogue import registered_strategy_source_hash
 
-            current_source_hash = registered_strategy_source_hash(self.name)
-        except (ImportError, KeyError, TypeError, ValueError) as exc:
-            raise StrategyBehaviourError(
-                "registered strategy source identity is unavailable"
-            ) from exc
-        if current_source_hash != self.source_hash:
-            raise StrategyBehaviourError("registered strategy source identity is stale")
+                current_source_hash = registered_strategy_source_hash(self.name)
+            except (ImportError, KeyError, TypeError, ValueError) as exc:
+                raise StrategyBehaviourError(
+                    "registered strategy source identity is unavailable"
+                ) from exc
+            if current_source_hash != self.source_hash:
+                raise StrategyBehaviourError("registered strategy source identity is stale")
         if isinstance(frame, list | tuple):
             if not frame or not all(isinstance(row, Mapping) for row in frame):
                 raise StrategyBehaviourError("market frame rows must be objects")

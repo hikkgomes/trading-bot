@@ -800,11 +800,11 @@ def test_registered_strategy_behaviour_rejects_stale_source_identity() -> None:
         instrument_universe=("BTCUSDT",),
     )
     candidate = next(item for item in candidates if item.definition.identity == "sma_cross")
-    behaviour = RegisteredStrategyBehaviour(
-        name="sma_cross",
-        parameters=candidate.definition.signal_model["parameters"],
+    stale_definition = replace(
+        candidate.definition,
         source_hash="sha256:" + "f" * 64,
     )
+    behaviour = RegisteredStrategyBehaviour.from_definition(stale_definition)
 
     with pytest.raises(ValueError, match="source identity is stale"):
         behaviour.generate_signals([{"close": 1.0}])
