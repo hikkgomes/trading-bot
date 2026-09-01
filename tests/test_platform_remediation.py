@@ -49,7 +49,12 @@ from src.research.evidence import (
     parameter_stability_passes,
     sample_evidence_passes,
 )
-from src.research.executors import _cross_symbol_stability, _portfolio_overlap, _product_accounting
+from src.research.executors import (
+    _cross_symbol_stability,
+    _negative_control_evidence,
+    _portfolio_overlap,
+    _product_accounting,
+)
 from src.research.objectives import objective_passes
 from src.research.returns import PositionReturnLedger
 from src.research.store import SqlResearchStore
@@ -155,6 +160,18 @@ def test_single_symbol_and_empty_portfolio_overlap_are_not_applicable() -> None:
     assert cross_symbol["passed"] is True
     assert overlap["status"] == "not_applicable"
     assert overlap["passed"] is True
+
+
+def test_missing_declared_negative_control_is_unavailable_not_a_fake_null() -> None:
+    evidence = _negative_control_evidence(
+        signals=[1.0, 1.0],
+        returns=[0.01, 0.01],
+        candidate_return=0.02,
+        controls=("block_permutation",),
+    )
+
+    assert evidence["block_permutation"]["status"] == "unavailable"
+    assert evidence["block_permutation"]["passed"] is False
 
 
 def _evidence_hashes(index: int) -> dict[str, str]:

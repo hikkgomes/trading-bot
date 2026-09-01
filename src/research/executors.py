@@ -1837,14 +1837,17 @@ def _negative_control_evidence(
                 "reason": "single_instrument_scope",
             }
             continue
-        generated = False
-        if not comparable and aligned:
-            # A missing precomputed control is not a reason to fail a
-            # candidate.  These deterministic nulls are deliberately weak
-            # controls and are retained as evidence so stronger family
-            # controls can be added without changing the command contract.
-            comparable = [0.0] * aligned
-            generated = True
+        if not comparable:
+            results[name] = {
+                "status": "unavailable",
+                "passed": False,
+                "observations": 0,
+                "control_return": None,
+                "source": "dataset",
+                "input_hash": None,
+                "reason": "control_dataset_unavailable",
+            }
+            continue
         control_return = sum(comparable) if comparable else None
         results[name] = {
             "passed": bool(comparable)
@@ -1852,7 +1855,7 @@ def _negative_control_evidence(
             and candidate_return >= control_return,
             "observations": len(comparable),
             "control_return": control_return,
-            "source": "evaluator_generated_null" if generated else "dataset",
+            "source": "dataset",
             "input_hash": canonical_hash({"control": name, "returns": comparable})
             if comparable
             else None,
