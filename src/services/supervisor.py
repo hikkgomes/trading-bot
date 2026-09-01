@@ -337,6 +337,23 @@ def _execution_cycle(
             return {"reason_code": "protective_algo_handler_not_configured"}
         return protective_service.on_algo_update(product_id, event)
 
+    def fee_converter(
+        product_id: str,
+        instrument_id: str,
+        fee_asset: str,
+        fee: float,
+        price: float,
+    ) -> Mapping[str, Any]:
+        if approved_live is None or product_id not in live_product_ids:
+            raise ValueError("live fee conversion is not configured")
+        return approved_live.fee_conversion_metadata(
+            product_id,
+            instrument_id,
+            fee_asset,
+            fee,
+            price,
+        )
+
     def on_order_status(product_id: str, order, status: str, at: str) -> object:
         if protective_service is None or product_id not in live_product_ids:
             return None
@@ -355,6 +372,7 @@ def _execution_cycle(
         on_live_fill=on_live_fill if protective_service is not None else None,
         on_algo_update=on_algo_update if protective_service is not None else None,
         on_order_status=on_order_status if protective_service is not None else None,
+        fee_converter=fee_converter if approved_live is not None else None,
     )
 
     def run_once() -> dict[str, Any]:

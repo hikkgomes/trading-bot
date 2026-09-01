@@ -799,6 +799,7 @@ class DatabaseUserStreamWorker:
         accounting_job_prefix: str = "accounting",
         on_live_fill: Callable[[str, OrderIntent, float, str], object] | None = None,
         on_algo_update: Callable[[str, MarketEvent], object] | None = None,
+        fee_converter: Callable[[str, str, str, float, float], Mapping[str, Any]] | None = None,
         on_order_status: Callable[[str, OrderIntent, str, str], object] | None = None,
     ) -> None:
         self.engine = engine
@@ -816,6 +817,7 @@ class DatabaseUserStreamWorker:
         self.accounting_job_prefix = accounting_job_prefix
         self.on_live_fill = on_live_fill
         self.on_algo_update = on_algo_update
+        self.fee_converter = fee_converter
         self.on_order_status = on_order_status
 
     def run_once(self, *, now: str) -> dict[str, Any]:
@@ -1010,16 +1012,27 @@ class DatabaseUserStreamWorker:
         product_id = self.account_products.get(account_id)
         ledger = self.ledgers.get(product_id) if product_id is not None else None
         if fee and ledger is not None and fee_asset != ledger.accounting_asset:
-            return self._fee_conversion_recovery(
-                order=order,
-                account_id=account_id,
-                product_id=product_id,
-                event=event,
-                fill_id=fill_id,
-                fee=fee,
-                fee_asset=fee_asset,
-                accounting_asset=ledger.accounting_asset,
-            )
+            try:
+                conversion = self._fee_conversion_metadata(
+                    product_id=product_id,
+                    instrument_id=order.instrument_id,
+                    fee_asset=fee_asset,
+                    fee=fee,
+                    price=price,
+                )
+            except Exception:
+                return self._fee_conversion_recovery(
+                    order=order,
+                    account_id=account_id,
+                    product_id=product_id,
+                    event=event,
+                    fill_id=fill_id,
+                    fee=fee,
+                    fee_asset=fee_asset,
+                    accounting_asset=ledger.accounting_asset,
+                )
+        else:
+            conversion = {}
         if order.status is OrderStatus.PERSISTED:
             order_manager.submitted(order.order_id)
             order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
@@ -1042,6 +1055,7 @@ class DatabaseUserStreamWorker:
                 "user_stream": True,
                 "exchange_order_id": str(values.get("i") or "") or None,
                 "trade_id": trade_id,
+                **conversion,
             },
         )
         updated = order_manager.apply_fill(fill)
@@ -1082,6 +1096,28 @@ class DatabaseUserStreamWorker:
             "position_quantity": position.quantity,
             "remaining_quantity": updated.remaining_quantity,
         }
+
+    def _fee_conversion_metadata(
+        self,
+        *,
+        product_id: str | None,
+        instrument_id: str,
+        fee_asset: str | None,
+        fee: float,
+        price: float,
+    ) -> Mapping[str, Any]:
+        if self.fee_converter is None or product_id is None:
+            raise ValueError("fee conversion callback is unavailable")
+        result = self.fee_converter(
+            product_id,
+            instrument_id,
+            str(fee_asset or ""),
+            fee,
+            price,
+        )
+        if not isinstance(result, Mapping):
+            raise ValueError("fee converter returned an invalid conversion record")
+        return dict(result)
 
     def _duplicate_fill_result(
         self,

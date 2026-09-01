@@ -14,12 +14,13 @@ from typing import Any, cast
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
+from src.accounting.fees import FeeConversion, FeeConversionError, convert_fee
 from src.data.database import account_snapshot
 from src.data.database import instrument as instrument_table
 from src.domain._codec import canonical_hash, timestamp, to_primitive
 from src.domain.instruments import Instrument, MarketType
 from src.domain.orders import Fill, OrderIntent, OrderSide, OrderStatus, OrderType
-from src.execution.broker import BrokerFill
+from src.execution.broker import BrokerFill, BrokerIncome
 from src.execution.ccxt_broker import CcxtBroker
 from src.execution.config import ExchangeConfig
 from src.execution.live_exchange import BrokerExecutionVenue
@@ -343,7 +344,14 @@ class ApprovedLiveExecution:
         existing = {item.fill_id for item in self.order_manager.fills_for(order.order_id)}
         recovered = 0
         for broker_fill in fills:
-            fill = _domain_fill(order, broker_fill)
+            conversion = self.fee_conversion_metadata(
+                product_id,
+                order.instrument_id,
+                broker_fill.fee_asset,
+                broker_fill.fee,
+                broker_fill.price,
+            )
+            fill = _domain_fill(order, broker_fill, metadata=conversion)
             current = self.order_manager.get(order.order_id)
             if fill.fill_id in existing or _matches_existing_recovered_fill(
                 self.order_manager.fills_for(order.order_id), broker_fill
@@ -409,8 +417,6 @@ class ApprovedLiveExecution:
             entry_id = f"rest:{income.income_id}"
             if entry_id in existing_ids:
                 continue
-            if income.asset != ledger.accounting_asset:
-                raise RuntimeError("account income requires deterministic asset conversion")
             attribution = {
                 "product": product_id,
                 "symbol": income.symbol,
@@ -418,6 +424,8 @@ class ApprovedLiveExecution:
                 "recovered_from_rest": True,
             }
             if income_type == "funding_fee":
+                if income.asset != ledger.accounting_asset:
+                    raise RuntimeError("funding income must use the accounting asset")
                 ledger.record_funding(
                     entry_id=entry_id,
                     amount=Decimal(str(income.amount)),
@@ -425,13 +433,16 @@ class ApprovedLiveExecution:
                     attribution=attribution,
                 )
             elif income_type in {"commission", "commission_fee"}:
+                conversion = self._income_fee_conversion(product_id, income)
                 ledger.record_fee(
                     entry_id=entry_id,
-                    amount=Decimal(str(abs(income.amount))),
+                    amount=Decimal(str(conversion.accounting_amount)),
                     occurred_at=_epoch_time(income.occurred_at),
-                    attribution=attribution,
+                    attribution={**attribution, **conversion.to_payload()},
                 )
             elif income_type in {"realized_pnl", "realised_pnl"}:
+                if income.asset != ledger.accounting_asset:
+                    raise RuntimeError("realised PnL income must use the accounting asset")
                 ledger.record_realised_pnl(
                     entry_id=entry_id,
                     amount=Decimal(str(income.amount)),
@@ -443,6 +454,80 @@ class ApprovedLiveExecution:
             existing_ids.add(entry_id)
             recorded += 1
         return {"product_id": product_id, "income_records": len(incomes), "recorded": recorded}
+
+    def _income_fee_conversion(self, product_id: str, income: BrokerIncome) -> FeeConversion:
+        ledger = self.ledgers[product_id]
+        asset = str(income.asset or "").upper()
+        symbol = str(income.symbol or "").strip()
+        if asset in {"USDT", "USDC", "BUSD"} and ledger.accounting_asset in {
+            "USDT",
+            "USDC",
+            "BUSD",
+        }:
+            price = 1.0
+            metadata: Mapping[str, Any] = {}
+        elif asset in {"USDT", "USDC", "BUSD", "BTC", "ETH"} and symbol:
+            price = float(self.venues[product_id].broker.get_price(symbol))
+            metadata = {}
+        else:
+            price = float(
+                self.venues[product_id].broker.get_price(f"{asset}{ledger.accounting_asset}")
+            )
+            metadata = {"fee_conversion_rate": price}
+        try:
+            return convert_fee(
+                amount=abs(income.amount),
+                fee_asset=asset,
+                accounting_asset=ledger.accounting_asset,
+                trade_price=price,
+                base_asset=_instrument_asset(symbol, "base"),
+                quote_asset=_instrument_asset(symbol, "quote"),
+                metadata=metadata,
+            )
+        except FeeConversionError as exc:
+            raise RuntimeError(f"income fee conversion failed: {exc}") from exc
+
+    def fee_conversion_metadata(
+        self,
+        product_id: str,
+        instrument_id: str,
+        fee_asset: str | None,
+        fee: float,
+        price: float,
+    ) -> Mapping[str, Any]:
+        ledger = self.ledgers.get(product_id)
+        if ledger is None:
+            raise RuntimeError(f"no accounting ledger is configured for {product_id}")
+        base_asset = _instrument_asset(instrument_id, "base")
+        quote_asset = _instrument_asset(instrument_id, "quote")
+        try:
+            conversion = convert_fee(
+                amount=fee,
+                fee_asset=fee_asset,
+                accounting_asset=ledger.accounting_asset,
+                trade_price=price,
+                base_asset=base_asset,
+                quote_asset=quote_asset,
+            )
+        except FeeConversionError:
+            asset = str(fee_asset or "").upper()
+            conversion_price = float(
+                self.venues[product_id].broker.get_price(f"{asset}{ledger.accounting_asset}")
+            )
+            conversion = convert_fee(
+                amount=fee,
+                fee_asset=asset,
+                accounting_asset=ledger.accounting_asset,
+                trade_price=price,
+                base_asset=base_asset,
+                quote_asset=quote_asset,
+                metadata={"fee_conversion_rate": conversion_price},
+            )
+        return {
+            "fee_in_accounting_asset": conversion.accounting_amount,
+            "fee_conversion_rate": conversion.conversion_rate,
+            "fee_conversion_source": conversion.source,
+        }
 
     def _reconcile_position(
         self, product_id: str, instrument_id: str, quantity: float | None
@@ -995,7 +1080,12 @@ class _RecoveryVenue:
         raise RuntimeError("recovery accounting cannot submit orders")
 
 
-def _domain_fill(order: OrderIntent, recovered: BrokerFill) -> Fill:
+def _domain_fill(
+    order: OrderIntent,
+    recovered: BrokerFill,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> Fill:
     if not _instrument_matches_symbol(order.instrument_id, recovered.symbol):
         raise RuntimeError("recovered fill symbol does not match the local order")
     if recovered.side.value != order.side.value:
@@ -1022,6 +1112,7 @@ def _domain_fill(order: OrderIntent, recovered: BrokerFill) -> Fill:
             "rest_recovery": True,
             "exchange_order_id": recovered.exchange_order_id,
             "trade_id": recovered.trade_id,
+            **dict(metadata or {}),
         },
     )
 
@@ -1155,7 +1246,15 @@ def _load_instruments(engine: Engine) -> dict[str, Instrument]:
             if item.instrument_id != identity:
                 raise ValueError(f"persisted instrument identity mismatch: {identity}")
             result[identity] = item
-        return result
+    return result
+
+
+def _instrument_asset(instrument_id: str, asset: str) -> str | None:
+    symbol = str(instrument_id).rsplit(":", 1)[-1].upper()
+    for quote in ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH"):
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            return symbol[: -len(quote)] if asset == "base" else quote
+    return None
 
 
 def _exchange_config(account: Mapping[str, Any], *, market: str) -> ExchangeConfig:

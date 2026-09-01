@@ -7,6 +7,7 @@ import pyarrow.parquet as pq
 import pytest
 from sqlalchemy import select, update
 
+from src.accounting.fees import FeeConversionError, convert_fee
 from src.data.database import (
     PlatformDatabase,
     cost_model_manifest,
@@ -581,6 +582,36 @@ def test_btc_accounting_converts_bnb_fee_and_enforces_core_reserve() -> None:
                     "fee_asset": "BNB",
                 },
             ),
+        )
+
+
+def test_runtime_fee_conversion_is_explicit_and_accounting_asset_bound() -> None:
+    quote_to_btc = convert_fee(
+        amount=1.0,
+        fee_asset="USDT",
+        accounting_asset="BTC",
+        trade_price=100.0,
+        base_asset="BTC",
+        quote_asset="USDT",
+    )
+    assert quote_to_btc.accounting_amount == pytest.approx(0.01)
+    assert quote_to_btc.source == "quote_to_base"
+
+    bnb_to_usdt = convert_fee(
+        amount=0.01,
+        fee_asset="BNB",
+        accounting_asset="USDT",
+        trade_price=100.0,
+        metadata={"fee_conversion_rate": 200.0},
+    )
+    assert bnb_to_usdt.accounting_amount == pytest.approx(2.0)
+    assert bnb_to_usdt.source == "explicit_rate"
+    with pytest.raises(FeeConversionError, match="deterministic conversion"):
+        convert_fee(
+            amount=0.01,
+            fee_asset="BNB",
+            accounting_asset="USDT",
+            trade_price=100.0,
         )
 
 

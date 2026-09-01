@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from decimal import Decimal
 from typing import Protocol
 
+from src.accounting.fees import FeeConversionError, convert_fee
 from src.accounting.ledger import Ledger
 from src.domain._codec import timestamp
 from src.domain.orders import Fill, OrderIntent
@@ -226,12 +227,25 @@ class ExecutionService:
     ) -> None:
         if self.ledger is None:
             return
-        if fill.fee_asset not in {None, self.ledger.accounting_asset}:
-            raise ValueError(
-                f"fee conversion to {self.ledger.accounting_asset} is required for {fill.fee_asset}"
-            )
         target_metadata = order.metadata.get("target_metadata")
         target_metadata = target_metadata if isinstance(target_metadata, dict) else {}
+        fee_metadata = {
+            **dict(target_metadata),
+            **dict(order.metadata),
+            **dict(fill.metadata),
+        }
+        try:
+            fee_conversion = convert_fee(
+                amount=fill.fee,
+                fee_asset=fill.fee_asset,
+                accounting_asset=self.ledger.accounting_asset,
+                trade_price=fill.price,
+                base_asset=_instrument_asset(order.instrument_id, "base"),
+                quote_asset=_instrument_asset(order.instrument_id, "quote"),
+                metadata=fee_metadata,
+            )
+        except FeeConversionError as exc:
+            raise ValueError(str(exc)) from exc
         contributions = sorted(order.strategy_contributions)
         attribution = {
             "product": self.ledger.product_id,
@@ -242,10 +256,11 @@ class ExecutionService:
             "strategy_version_id": contributions[0] if len(contributions) == 1 else None,
             "sleeve": target_metadata.get("sleeve") or "unassigned",
             "assignment_id": target_metadata.get("assignment_id"),
+            **fee_conversion.to_payload(),
         }
         self.ledger.record_fee(
             entry_id=f"{fill.fill_id}:fee",
-            amount=Decimal(str(fill.fee)),
+            amount=Decimal(str(fee_conversion.accounting_amount)),
             occurred_at=fill.occurred_at,
             attribution=attribution,
         )
@@ -309,3 +324,11 @@ class ExecutionService:
             .pass_stage(DecisionTraceStage.PORTFOLIO_ACCEPTED)
             .pass_stage(DecisionTraceStage.RISK_ACCEPTED, decision_id=risk_decision.decision_id)
         )
+
+
+def _instrument_asset(instrument_id: str, asset: str) -> str | None:
+    symbol = str(instrument_id).rsplit(":", 1)[-1].upper()
+    for quote in ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH"):
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            return symbol[: -len(quote)] if asset == "base" else quote
+    return None
