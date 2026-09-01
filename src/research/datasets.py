@@ -557,10 +557,7 @@ class CanonicalResearchDatasetBuilder:
                 raise DatasetResolutionError(
                     f"dataset data_pending: no available bars for role {role}"
                 )
-            payload_by_role[role] = {
-                "bars": selected,
-                "independent_units": len(selected),
-            }
+            payload_by_role[role] = self._bar_payload(selected)
             availability[role] = created
         return self.build(
             product_id,
@@ -576,6 +573,25 @@ class CanonicalResearchDatasetBuilder:
             engine_version=engine_version,
             source_partition_hashes=source_partition_hashes,
         )
+
+    @staticmethod
+    def _bar_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        market_frame = [dict(row) for row in rows]
+        returns: list[float] = []
+        previous_close: float | None = None
+        for row in market_frame:
+            close = row.get("close")
+            if isinstance(close, int | float) and not isinstance(close, bool):
+                close_value = float(close)
+                if previous_close is not None and previous_close > 0:
+                    returns.append(close_value / previous_close - 1.0)
+                previous_close = close_value
+        return {
+            "bars": market_frame,
+            "market_frame": market_frame,
+            "returns": returns,
+            "independent_units": len(market_frame),
+        }
 
     @staticmethod
     def _materialise_bars(bars: Any) -> tuple[dict[str, Any], ...]:
