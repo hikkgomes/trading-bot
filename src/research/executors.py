@@ -355,11 +355,14 @@ def _measured_result(
         ),
     }
     semantic_parity = {
-        "passed": bool(context.get("semantic_parity_valid", True)),
+        "passed": bool(
+            context.get("semantic_parity_valid", context.get("parity_receipt") is not None)
+        ),
         "behaviour_hash": str(
-            context.get("behaviour_hash") or candidate.definition.definition_hash
+            context.get("behaviour_hash") or behaviour_hash_for_definition(candidate.definition)
         ),
         "semantic_identity": candidate.definition.definition_hash,
+        "parity_receipt": context.get("parity_receipt"),
     }
     realistic_costs = {
         "passed": bool(context.get("cost_model_valid", True)),
@@ -2084,7 +2087,27 @@ def execute_machine_learning(candidate: Candidate, context: Mapping[str, Any]) -
         or not isinstance(features, Mapping)
     ):
         raise ExecutorError("machine-learning execution needs loaded frozen model inputs")
-    return _measured_result(candidate, context, model.evaluate(features))
+    output = model.evaluate(features)
+    behaviour_hash = behaviour_hash_for_definition(candidate.definition)
+    parity_payload = {
+        "schema": "machine_learning_parity/v1",
+        "behaviour_hash": behaviour_hash,
+        "input_hash": output.feature_vector_hash,
+        "output_hash": canonical_hash(output),
+        "signal": output.score,
+    }
+    return _measured_result(
+        candidate,
+        {
+            **context,
+            "behaviour_hash": behaviour_hash,
+            "parity_receipt": {
+                **parity_payload,
+                "receipt_hash": canonical_hash(parity_payload),
+            },
+        },
+        output,
+    )
 
 
 def execute_cross_sectional(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
@@ -2135,6 +2158,7 @@ def _execute_semantic(candidate: Candidate, context: Mapping[str, Any]) -> Execu
         raise ExecutorError(str(exc)) from exc
     parity_payload = {
         "schema": "semantic_parity/v1",
+        "behaviour_hash": behaviour_hash_for_definition(candidate.definition),
         "strategy": name,
         "input_hash": canonical_hash(semantic_input),
         "output_hash": canonical_hash(output),

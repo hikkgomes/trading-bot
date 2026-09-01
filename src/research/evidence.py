@@ -8,6 +8,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from src.domain._codec import canonical_hash
+
 
 def _finite(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -428,8 +430,21 @@ def data_integrity_passes(value: object) -> bool:
 def semantic_parity_passes(value: object) -> bool:
     if not isinstance(value, Mapping) or value.get("passed") is not True:
         return False
-    source_identity = value.get("behaviour_hash") or value.get("semantic_identity")
-    return _valid_hash(source_identity) or bool(str(source_identity or "").strip())
+    source_identity = value.get("behaviour_hash")
+    receipt = value.get("parity_receipt")
+    if not _valid_hash(source_identity) or not isinstance(receipt, Mapping):
+        return False
+    saved_hash = receipt.get("receipt_hash")
+    content = dict(receipt)
+    content.pop("receipt_hash", None)
+    input_hash = receipt.get("input_hash")
+    receipt_behaviour = receipt.get("behaviour_hash")
+    return (
+        _valid_hash(saved_hash)
+        and canonical_hash(content) == saved_hash
+        and _valid_hash(input_hash)
+        and (receipt_behaviour is None or receipt_behaviour == source_identity)
+    )
 
 
 def realistic_costs_passes(value: object) -> bool:

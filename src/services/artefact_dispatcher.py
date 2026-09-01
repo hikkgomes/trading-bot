@@ -317,6 +317,7 @@ def _semantic(
     )
     parity_payload = {
         "schema": "semantic_parity/v1",
+        "behaviour_hash": result["behaviour_hash"],
         "strategy": name,
         "input_hash": input_hash,
         "output_hash": output_hash,
