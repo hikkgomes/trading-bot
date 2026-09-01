@@ -827,9 +827,7 @@ def _assert_summary_bindings(
             raise CanonicalEvidenceError(
                 "forward summary observation binding or interval is invalid"
             )
-    declared_instruments = {
-        str(value) for value in payload.get("instrument_ids", ())
-    }
+    declared_instruments = {str(value) for value in payload.get("instrument_ids", ())}
     declared_assignments = {str(value) for value in payload.get("assignment_ids", ())}
     observed_instruments = {str(row["instrument_id"]) for row in observations}
     observed_assignments = {
@@ -1099,9 +1097,7 @@ class SqlForwardEvidenceRepository:
                 }
             )
         )
-        instrument_ids = tuple(
-            sorted({str(row["instrument_id"]) for row in materialised})
-        )
+        instrument_ids = tuple(sorted({str(row["instrument_id"]) for row in materialised}))
         first_return = returns[0] if returns else 0.0
         last_return = returns[-1] if returns else 0.0
         summary = ForwardPaperSummary(
@@ -1418,7 +1414,7 @@ def _objective_decision_failed(payload: Mapping[str, Any], threshold: float | No
                 "objective_excess_fraction",
             )
         )
-        or float(payload.get("objective_excess_fraction", 0.0)) <= threshold
+        or float(payload.get("objective_excess_fraction", 0.0)) < threshold
     )
 
 
@@ -2281,9 +2277,7 @@ class SqlActiveStrategyAssignmentRepository:
         active = self.active_assignments(product_id, at=deactivated_at)
         if strategy_version_id is not None:
             active = tuple(
-                row
-                for row in active
-                if row["strategy_version_id"] == strategy_version_id
+                row for row in active if row["strategy_version_id"] == strategy_version_id
             )
         if portfolio_id is not None:
             active = tuple(row for row in active if row["portfolio_id"] == portfolio_id)

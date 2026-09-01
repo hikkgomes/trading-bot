@@ -444,10 +444,25 @@ def test_product_promotion_uses_the_declared_objective_instead_of_generic_pnl() 
         policy=policy,
         evaluated_at=NOW,
     )
+    at_threshold = decide_promotion(
+        strategy_version_id="btc-objective:v3",
+        current_state=LifecycleState.FORWARD_PAPER,
+        evidence=PromotionEvidence(
+            **{
+                **evidence.__dict__,
+                "forward_objective_value": 1.001,
+                "forward_objective_excess": 0.001,
+                "forward_objective_excess_fraction": 0.001,
+            }
+        ),
+        policy=policy,
+        evaluated_at=NOW,
+    )
 
     assert rejected.accepted is False
     assert rejected.reason_code == "forward_objective_excess_threshold"
     assert accepted.next_state is LifecycleState.LIVE_READY
+    assert at_threshold.next_state is LifecycleState.LIVE_READY
 
 
 def test_disabled_automatic_live_canary_cannot_be_requested_from_promotion_worker() -> None:

@@ -1112,7 +1112,7 @@ def _forward_evidence_failures(
         requires_objective
         and evidence.forward_objective_excess_fraction is not None
         and evidence.forward_objective_excess_fraction
-        <= policy.minimum_forward_objective_excess_fraction
+        < policy.minimum_forward_objective_excess_fraction
     )
     checks = (
         (evidence.forward_summary_id is None, "forward_summary_missing"),
@@ -1139,7 +1139,7 @@ def _forward_evidence_failures(
         (
             objective_failure
             if requires_objective
-            else evidence.forward_net_pnl <= policy.minimum_forward_net_pnl,
+            else evidence.forward_net_pnl < policy.minimum_forward_net_pnl,
             "forward_objective_evidence_missing"
             if objective_missing
             else (
