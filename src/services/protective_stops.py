@@ -160,6 +160,9 @@ class LiveProtectiveStopService:
                 continue
             position_quantity = self._position_quantity(stop)
             if abs(position_quantity) <= 1e-12:
+                if stop.status is StopStatus.ACTIVE and not stop.native_order_id:
+                    results.append({"stop_id": stop.stop_id, "status": "awaiting_entry_fill"})
+                    continue
                 if stop.native_order_id:
                     try:
                         cancelled = venue.broker.cancel_protective_stop(
