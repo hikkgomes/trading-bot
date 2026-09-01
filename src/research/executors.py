@@ -260,7 +260,12 @@ def _measured_result(
             slippage_rate=slippage_rate,
             funding_rate=funding_rate,
         )
-        return_report = return_ledger.measure(signals, returns, funding_rates=funding_rates)
+        return_report = return_ledger.measure(
+            signals,
+            returns,
+            funding_rates=funding_rates,
+            initial_position=0.0,
+        )
     except (ReturnLedgerError, TypeError, ValueError) as exc:
         raise ExecutorError(f"position return ledger input is invalid: {exc}") from exc
     aligned = return_report.effective_observations
@@ -1261,7 +1266,12 @@ def _stress_report(
         fee_rate=fee_rate,
         slippage_rate=slippage_rate,
         funding_rate=funding_rate,
-    ).measure(signals, returns, funding_rates=funding_rates)
+    ).measure(
+        signals,
+        returns,
+        funding_rates=funding_rates,
+        initial_position=0.0,
+    )
 
 
 def _stress_passes(stressed: float, base: float, context: Mapping[str, Any]) -> bool:

@@ -1401,6 +1401,17 @@ def test_position_return_ledger_keeps_funding_signed_per_period() -> None:
     assert report.net_pnl == pytest.approx(-0.08)
 
 
+def test_position_return_ledger_can_charge_initial_flat_to_position_transition() -> None:
+    report = PositionReturnLedger(fee_rate=0.01).measure(
+        positions=(1.0, 1.0),
+        market_returns=(0.0,),
+        initial_position=0.0,
+    )
+
+    assert report.turnover == pytest.approx(1.0)
+    assert report.fees == pytest.approx(0.01)
+
+
 def test_futures_return_ledger_scales_fractional_costs_into_usdt() -> None:
     report = PositionReturnLedger(fee_rate=0.01, slippage_rate=0.005).measure(
         positions=(0.0, 1.0, 1.0),
