@@ -423,7 +423,25 @@ def _prepare_rehearsal_runtime(
         now=now,
     )
     target_quantity = float(pipeline["target_quantity"])
-    quantity = min(abs(target_quantity), notional_usd / price)
+    requested_quantity = min(abs(target_quantity), notional_usd / price)
+    normalise_quantity = getattr(broker, "normalize_order_qty", None)
+    if not callable(normalise_quantity):
+        raise ConnectedTestnetError("testnet broker cannot normalise exchange order quantity")
+    try:
+        quantity = float(
+            normalise_quantity(
+                instrument.exchange_symbol,
+                requested_quantity,
+                price=price,
+                reduce_only=False,
+            )
+        )
+    except Exception as exc:
+        raise ConnectedTestnetError(
+            f"testnet quantity cannot satisfy exchange precision and minimums: {exc}"
+        ) from exc
+    if quantity <= 0 or quantity * price > notional_usd + max(1e-9, notional_usd * 1e-12):
+        raise ConnectedTestnetError("testnet order quantity exceeds its requested notional cap")
     opening_side = _opening_side(account, target_quantity, quantity)
     accounting_before = _accounting_count(database, product_id=product_id)
     gateway = _connected_gateway(
