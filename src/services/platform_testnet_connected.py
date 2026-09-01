@@ -398,11 +398,17 @@ def _prepare_rehearsal_runtime(
     )
     if not state:
         raise ConnectedTestnetError("no reconciled canonical portfolio/risk state is available")
+    rehearsal_ledger = Ledger(
+        product_id=product_id,
+        accounting_asset=str(product["base_accounting_asset"]),
+        store=SqlLedgerStore(database.engine, product_id=product_id),
+    )
     approved_live = ApprovedLiveExecution(
         engine=database.engine,
         configuration=split,
         order_manager=order_manager,
         positions=positions,
+        ledgers={product_id: rehearsal_ledger},
     )
     venue = approved_live.venues[product_id]
     instrument_id = str(assignment.get("instrument_id") or "")
