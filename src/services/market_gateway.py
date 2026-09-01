@@ -476,6 +476,9 @@ class DatabaseMarketGateway:
         self.testnet = testnet
         self.user_stream_job_name = user_stream_job_name
         self.user_stream_job_prefix = user_stream_job_prefix
+        self.public_rate_limiter = shared_exchange_rate_limiter(
+            f"binance:public-stream:{self.testnet}"
+        )
         self.rate_limiter = shared_exchange_rate_limiter(
             f"binance:authenticated-rest:{self.testnet}"
         )
@@ -562,6 +565,7 @@ class DatabaseMarketGateway:
         )
         async with aiohttp.ClientSession(timeout=timeout) as session:
             clocks = await self._clock_status(session)
+            await asyncio.to_thread(self.public_rate_limiter.acquire)
             public = asyncio.create_task(
                 capture(
                     self.capture_config,
@@ -671,6 +675,7 @@ class DatabaseMarketGateway:
         )
         async with aiohttp.ClientSession(timeout=timeout) as session:
             clocks = await self._clock_status(session)
+            await asyncio.to_thread(self.public_rate_limiter.acquire)
             public_task = asyncio.create_task(
                 capture(
                     self.capture_config,
@@ -715,7 +720,7 @@ class DatabaseMarketGateway:
         status: dict[str, Any] = {}
         endpoints = _TESTNET_CLOCK_ENDPOINTS if self.testnet else _CLOCK_ENDPOINTS
         for market, endpoint in endpoints.items():
-            await asyncio.to_thread(self.rate_limiter.acquire)
+            await asyncio.to_thread(self.public_rate_limiter.acquire)
             started_ms = time.time_ns() / 1_000_000
             async with session.get(endpoint) as response:
                 response.raise_for_status()
