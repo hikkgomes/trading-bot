@@ -678,12 +678,10 @@ def _normalise_summary_metrics(payload: dict[str, Any]) -> None:
             raise CanonicalEvidenceError(f"summary {field_name} must be at most one")
         payload[field_name] = value
     for field_name in _SUMMARY_INTEGER_FIELDS:
-        payload[field_name] = int(
-            _finite_nonnegative(payload.get(field_name, 0), field=f"summary {field_name}")
+        payload[field_name] = _summary_integer(
+            payload.get(field_name, 0), field=f"summary {field_name}"
         )
-    payload["data_gaps"] = int(
-        _finite_nonnegative(payload.get("data_gaps", 0), field="summary data gaps")
-    )
+    payload["data_gaps"] = _summary_integer(payload.get("data_gaps", 0), field="summary data gaps")
 
 
 def _normalise_summary_scope(payload: dict[str, Any]) -> None:
@@ -699,6 +697,13 @@ def _normalise_summary_scope(payload: dict[str, Any]) -> None:
         ):
             raise CanonicalEvidenceError(f"summary {field_name} must contain unique identities")
         payload[field_name] = [str(value) for value in raw]
+
+
+def _summary_integer(value: object, *, field: str) -> int:
+    measured = _finite_nonnegative(value, field=field)
+    if not measured.is_integer():
+        raise CanonicalEvidenceError(f"{field} must be an integer")
+    return int(measured)
 
 
 def _summary_observation_ids(payload: dict[str, Any]) -> tuple[str, ...]:
