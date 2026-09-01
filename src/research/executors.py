@@ -1181,7 +1181,7 @@ def _futures_mark_event(observed_at: str, row: Mapping[str, Any], price: float) 
 def _futures_funding_event(
     observed_at: str, row: Mapping[str, Any], price: float
 ) -> dict[str, Any] | None:
-    if row.get("funding_event") is False:
+    if row.get("funding_event") is not True:
         return None
     if row.get("funding_rate") is None and row.get("funding") is None:
         return None

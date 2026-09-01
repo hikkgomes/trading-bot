@@ -320,6 +320,23 @@ def test_typed_rule_behaviour_has_one_research_and_production_signal_contract() 
     assert behaviour.parity_receipt(rows)["behaviour_hash"] == behaviour.behaviour_hash
 
 
+def test_typed_rule_behaviour_supports_signed_long_and_short_outputs() -> None:
+    behaviour = TypedRuleBehaviour(
+        {
+            "feature": "trend",
+            "operator": "gt",
+            "threshold": 0.25,
+            "direction": "signed",
+        }
+    )
+
+    assert behaviour.generate_signals([{"trend": 0.5}, {"trend": -0.5}, {"trend": 0.1}]) == (
+        1,
+        -1,
+        0,
+    )
+
+
 def _evidence_hashes(index: int) -> dict[str, str]:
     return {
         "run_id": "sha256:" + str(index) * 64,
@@ -680,7 +697,12 @@ def test_executor_derives_btc_objective_from_canonical_bar_frame() -> None:
 def test_executor_derives_signed_futures_events_with_mark_to_market() -> None:
     frame = [
         {"timestamp": NOW, "close": 100.0, "funding_rate": 0.0},
-        {"timestamp": "2026-08-30T10:01:00+00:00", "close": 90.0, "funding_rate": 0.01},
+        {
+            "timestamp": "2026-08-30T10:01:00+00:00",
+            "close": 90.0,
+            "funding_rate": 0.01,
+            "funding_event": True,
+        },
     ]
 
     accounting = _product_accounting(
@@ -701,6 +723,27 @@ def test_executor_derives_signed_futures_events_with_mark_to_market() -> None:
     assert accounting["unrealised_pnl"] == pytest.approx(20.0)
     assert accounting["funding_pnl"] == pytest.approx(2.0)
     assert accounting["max_leverage"] == pytest.approx(0.2)
+
+
+def test_executor_does_not_charge_non_event_funding_quotes() -> None:
+    accounting = _product_accounting(
+        {
+            "product_id": "active_income",
+            "market_frame": [
+                {"timestamp": NOW, "close": 100.0, "funding_rate": 0.01},
+                {"timestamp": "2026-08-30T10:01:00+00:00", "close": 100.0, "funding_rate": 0.01},
+            ],
+            "signals": [1.0, 1.0],
+            "initial_cash": 1_000.0,
+            "maximum_position": 0.1,
+            "leverage": 2.0,
+            "fee_bps": 0.0,
+            "slippage_bps": 0.0,
+        }
+    )
+
+    assert accounting is not None
+    assert accounting["funding_pnl"] == pytest.approx(0.0)
 
 
 def test_btc_spot_execution_is_limited_to_owned_inventory_and_quote_proceeds() -> None:

@@ -67,13 +67,23 @@ class TypedRuleBehaviour:
         if not math.isfinite(value):
             raise StrategyBehaviourError("typed strategy feature value is not finite")
         threshold = float(self.rule["threshold"])
-        passed = {
-            "gt": value > threshold,
-            "ge": value >= threshold,
-            "lt": value < threshold,
-            "le": value <= threshold,
-        }[str(self.rule["operator"])]
         direction = str(self.rule.get("direction") or "long")
+        if direction in {"signed", "market_neutral", "hedged"}:
+            magnitude = abs(threshold)
+            long_operator = str(self.rule.get("positive_operator") or "gt")
+            short_operator = str(self.rule.get("negative_operator") or "lt")
+            long_threshold = float(self.rule.get("positive_threshold", magnitude))
+            short_threshold = float(self.rule.get("negative_threshold", -magnitude))
+            _validate_operator(long_operator, field="positive_operator")
+            _validate_operator(short_operator, field="negative_operator")
+            if not math.isfinite(long_threshold) or not math.isfinite(short_threshold):
+                raise StrategyBehaviourError("typed strategy directional thresholds are invalid")
+            if _compare(value, long_operator, long_threshold):
+                return 1
+            if _compare(value, short_operator, short_threshold):
+                return -1
+            return 0
+        passed = _compare(value, str(self.rule["operator"]), threshold)
         return -1 if passed and direction == "short" else 1 if passed else 0
 
     def generate_signals(self, rows: Any) -> tuple[int, ...]:
@@ -239,6 +249,21 @@ class RegisteredStrategyBehaviour:
         if number not in {-1, 0, 1} or float(value) != number:
             raise StrategyBehaviourError("strategy signal must be -1, 0, or 1")
         return number
+
+
+def _validate_operator(value: str, *, field: str) -> None:
+    if value not in {"gt", "ge", "lt", "le"}:
+        raise StrategyBehaviourError(f"typed strategy {field} is invalid")
+
+
+def _compare(value: float, operator: str, threshold: float) -> bool:
+    _validate_operator(operator, field="operator")
+    return {
+        "gt": value > threshold,
+        "ge": value >= threshold,
+        "lt": value < threshold,
+        "le": value <= threshold,
+    }[operator]
 
 
 def behaviour_hash_for_definition(definition: Any) -> str:
