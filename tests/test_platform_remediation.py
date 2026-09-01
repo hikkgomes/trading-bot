@@ -65,6 +65,7 @@ from src.research.evidence import (
 from src.research.executors import (
     _cross_symbol_stability,
     _negative_control_evidence,
+    _pbo_measurements,
     _portfolio_overlap,
     _product_accounting,
 )
@@ -1352,6 +1353,20 @@ def test_position_return_ledger_keeps_funding_signed_per_period() -> None:
     assert report.period_funding_pnl == pytest.approx((0.0, 0.03))
     assert report.net_returns == pytest.approx((-0.01, -0.07))
     assert report.net_pnl == pytest.approx(-0.08)
+
+
+def test_pbo_uses_the_configured_window_count_and_parameter_cohort() -> None:
+    pbo, matrix = _pbo_measurements(
+        {"walk_forward_windows": 5},
+        {"results": [{"window_returns": [0.1, 0.2, 0.1, 0.2, 0.1]}]},
+        [0.05, 0.05, 0.05, 0.05, 0.05],
+    )
+
+    assert isinstance(pbo, float)
+    assert matrix == [
+        [0.05, 0.05, 0.05, 0.05, 0.05],
+        [0.1, 0.2, 0.1, 0.2, 0.1],
+    ]
 
 
 def test_dataset_bundle_supports_explicit_pending_lifecycle_and_verifies_stages(tmp_path) -> None:

@@ -163,7 +163,18 @@ def _pbo_measurements(
             _numeric_series(row) for row in strategy_window_returns if _numeric_series(row)
         ]
     else:
-        pbo_matrix = []
+        pbo_matrix = [window_returns]
+        results = parameter_stability.get("results", ())
+        if isinstance(results, list | tuple):
+            pbo_matrix.extend(
+                window
+                for item in results
+                if isinstance(item, Mapping)
+                and (window := _numeric_series(item.get("window_returns")))
+            )
+        trial_returns = context.get("trial_returns")
+        if isinstance(trial_returns, list | tuple):
+            pbo_matrix.extend(window for item in trial_returns if (window := _numeric_series(item)))
     if len(pbo_matrix) < 2:
         pbo_matrix = []
     width = min((len(row) for row in pbo_matrix), default=0)
@@ -266,7 +277,7 @@ def _measured_result(
     accounting = _product_accounting(context, fallback_return=return_report)
     if accounting is not None:
         net_return = float(accounting["return_fraction"])
-    window_returns = _window_sums(analysis_returns, 3)
+    window_returns = _window_sums(analysis_returns, _evaluation_window_count(context))
     negative_controls = _negative_control_evidence(
         signals=signals[:aligned],
         returns=returns[:aligned],
@@ -1325,6 +1336,14 @@ def _window_sums(values: list[float], windows: int) -> list[float]:
     return [sum(values[index * size : (index + 1) * size]) for index in range(windows)]
 
 
+def _evaluation_window_count(context: Mapping[str, Any]) -> int:
+    try:
+        configured = int(context.get("walk_forward_windows", 3))
+    except (TypeError, ValueError):
+        configured = 3
+    return max(3, configured)
+
+
 def _trial_sharpes(
     context: Mapping[str, Any], parameter_stability: Mapping[str, Any], base_returns: list[float]
 ) -> list[float]:
@@ -1471,7 +1490,7 @@ def _parameter_stability_results(
                 "observations": len(comparable),
                 "return": sum(comparable),
                 "passed": bool(comparable) and sum(comparable) >= base_total * 0.5,
-                "window_returns": _window_sums(comparable, 3),
+                "window_returns": _window_sums(comparable, _evaluation_window_count(context)),
                 "input_hash": canonical_hash(
                     {
                         "candidate_id": candidate.candidate_id,
@@ -1496,7 +1515,7 @@ def _parameter_stability(
             "reason": "no_tunable_parameters",
             "neighbours_tested": 0,
             "results": [],
-            "base_window_returns": _window_sums(base_returns, 3),
+            "base_window_returns": _window_sums(base_returns, _evaluation_window_count(context)),
         }
     neighbours = _parameter_neighbours(candidate, context)
     results = _parameter_stability_results(candidate, context, base_returns, neighbours)
@@ -1531,7 +1550,7 @@ def _parameter_stability(
         "degradation_fraction": degradation,
         "degradation_shape": "cliff" if cliff_detected else "smooth",
         "cliff_detected": cliff_detected,
-        "base_window_returns": _window_sums(base_returns, 3),
+        "base_window_returns": _window_sums(base_returns, _evaluation_window_count(context)),
     }
 
 
