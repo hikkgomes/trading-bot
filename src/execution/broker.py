@@ -82,6 +82,18 @@ class BrokerOrderState:
 
 
 @dataclass(frozen=True)
+class BrokerIncome:
+    income_id: str
+    symbol: str
+    income_type: str
+    amount: float
+    asset: str
+    occurred_at: float
+    exchange_order_id: str | None = None
+    trade_id: str | None = None
+
+
+@dataclass(frozen=True)
 class BrokerFill:
     trade_id: str
     exchange_order_id: str
@@ -92,6 +104,7 @@ class BrokerFill:
     price: float
     fee: float
     occurred_at: float
+    fee_asset: str | None = None
 
 
 @dataclass(frozen=True)
@@ -205,6 +218,14 @@ class Broker(ABC):
         self, *, symbol: str, exchange_order_id: str, client_order_id: str
     ) -> BrokerOrderState:
         raise NotImplementedError(f"{self.name} cannot query exchange order state")
+
+    def query_order_fills(
+        self, *, symbol: str, exchange_order_id: str, client_order_id: str
+    ) -> tuple[BrokerFill, ...]:
+        raise NotImplementedError(f"{self.name} cannot query exchange order fills")
+
+    def query_income(self, *, since: float | None = None) -> tuple[BrokerIncome, ...]:
+        raise NotImplementedError(f"{self.name} cannot query exchange income history")
 
     def cancel_order(
         self, *, symbol: str, exchange_order_id: str, client_order_id: str

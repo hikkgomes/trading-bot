@@ -33,8 +33,16 @@ from src.data.universe import (
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.instruments import Instrument, MarketType
 from src.domain.market_events import MarketEventType
-from src.domain.orders import OrderSide
-from src.execution.broker import FuturesPositionIdentity, OpenOrderIdentity
+from src.domain.orders import OrderIntent, OrderSide, OrderType
+from src.execution.broker import (
+    BrokerFill,
+    BrokerOrderState,
+    FuturesPositionIdentity,
+    OpenOrderIdentity,
+)
+from src.execution.broker import (
+    OrderSide as BrokerOrderSide,
+)
 from src.execution.ccxt_broker import CcxtBroker
 from src.execution.config import ExchangeConfig
 from src.execution.order_manager import OrderManager, SqlOrderStore
@@ -52,7 +60,7 @@ from src.services.account_reconciliation import AccountAuthorityError, AccountRe
 from src.services.config import load_platform_config, load_split_configuration
 from src.services.data_writer import DatabaseMarketDataWriter, _market_snapshot_values
 from src.services.health import DatabaseHeartbeatStore
-from src.services.live_execution import live_authority_configuration_hash
+from src.services.live_execution import ApprovedLiveExecution, live_authority_configuration_hash
 from src.services.market_gateway import UserStreamAccount, _stream_endpoints
 from src.services.order_execution import DatabasePaperExecutionWorker
 from src.services.paper_diagnostic import DatabaseDiagnosticPaperWorker
@@ -1345,6 +1353,142 @@ def test_ccxt_order_recovery_resolves_client_order_id() -> None:
     assert state.exchange_order_id == "exchange-order"
     assert state.client_order_id == "client-order"
     assert Client.calls == [("", "BTC/USDT:USDT", {"origClientOrderId": "client-order"})]
+
+
+def test_ccxt_rest_recovery_reads_exact_trades_and_signed_income() -> None:
+    class Client:
+        trade_calls = []
+        income_calls = []
+
+        @classmethod
+        def fetch_my_trades(cls, symbol, since, limit, params):
+            cls.trade_calls.append((symbol, since, limit, params))
+            return [
+                {
+                    "id": "trade-1",
+                    "order": "exchange-order",
+                    "clientOrderId": "client-order",
+                    "symbol": symbol,
+                    "side": "sell",
+                    "amount": 0.001,
+                    "price": 100_000.0,
+                    "fee": {"cost": 0.1, "currency": "USDT"},
+                    "timestamp": 1_777_000_000_000,
+                }
+            ]
+
+        @classmethod
+        def fapiPrivateGetIncome(cls, params):
+            cls.income_calls.append(params)
+            return [
+                {
+                    "tranId": "income-1",
+                    "symbol": "BTCUSDT",
+                    "incomeType": "FUNDING_FEE",
+                    "income": "-0.25",
+                    "asset": "USDT",
+                    "time": 1_777_000_000_000,
+                }
+            ]
+
+    broker = CcxtBroker.__new__(CcxtBroker)
+    broker.config = ExchangeConfig(
+        exchange="binanceusdm",
+        market_type="futures",
+        api_key="test-key",
+        testnet=True,
+        quote_asset="USDT",
+    )
+    broker._client = Client()
+
+    fills = broker.query_order_fills(
+        symbol="BTCUSDT",
+        exchange_order_id="exchange-order",
+        client_order_id="client-order",
+    )
+    income = broker.query_income(since=1_776_000_000.0)
+
+    assert len(fills) == 1
+    assert fills[0].fee_asset == "USDT"
+    assert fills[0].quantity == pytest.approx(0.001)
+    assert income[0].amount == pytest.approx(-0.25)
+    assert income[0].income_type == "FUNDING_FEE"
+    assert Client.trade_calls == [("BTC/USDT:USDT", None, None, {"orderId": "exchange-order"})]
+    assert Client.income_calls == [{"startTime": 1_776_000_000_000}]
+
+
+def test_approved_live_recovery_applies_rest_trade_fills_to_position_and_ledger(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    orders = OrderManager(SqlOrderStore(database.engine))
+    positions = PositionManager(SqlPositionStore(database.engine))
+    order_id = "rest-recovery-order"
+    order = OrderIntent(
+        order_id=order_id,
+        portfolio_id="active-income-portfolio",
+        instrument_id="binance:futures:BTCUSDT:USDT",
+        side=OrderSide.SELL,
+        quantity=0.01,
+        order_type=OrderType.MARKET,
+        created_at=NOW,
+        metadata={
+            "exchange_order_id": "exchange-order",
+            "client_order_id": "client-order",
+            "reference_price": 100.0,
+        },
+    )
+    orders.create(order)
+    orders.persist_for_submission(order_id)
+    orders.submitted(order_id)
+    orders.acknowledged(order_id, event_at=NOW)
+    orders.recovery_required(order_id)
+
+    class Broker:
+        def query_order(self, **_kwargs):
+            return BrokerOrderState("exchange-order", "client-order", "closed", 0.01, 90.0)
+
+        def query_order_fills(self, **_kwargs):
+            return (
+                BrokerFill(
+                    trade_id="trade-1",
+                    exchange_order_id="exchange-order",
+                    client_order_id="client-order",
+                    symbol="BTCUSDT",
+                    side=BrokerOrderSide.SELL,
+                    quantity=0.01,
+                    price=90.0,
+                    fee=0.01,
+                    occurred_at=1_777_000_000.0,
+                    fee_asset="USDT",
+                ),
+            )
+
+    venue = SimpleNamespace(
+        broker=Broker(),
+        instruments={"binance:futures:BTCUSDT:USDT": SimpleNamespace(exchange_symbol="BTCUSDT")},
+    )
+    approved = ApprovedLiveExecution.__new__(ApprovedLiveExecution)
+    approved.order_manager = orders
+    approved.positions = positions
+    approved.venues = {"active_income": venue}
+    approved.ledgers = {
+        "active_income": Ledger(
+            product_id="active_income",
+            accounting_asset="USDT",
+            store=SqlLedgerStore(database.engine, product_id="active_income"),
+        )
+    }
+
+    result = approved._reconcile_missing_order("active_income", order_id)
+
+    assert result["status"] == "reconciled"
+    assert result["recovered_fills"] == 1
+    assert orders.get(order_id).status.value == "reconciled"
+    assert positions.get(
+        "active-income-portfolio", "binance:futures:BTCUSDT:USDT"
+    ).quantity == pytest.approx(-0.01)
+    assert len(approved.ledgers["active_income"].entries) == 1
 
 
 def test_ccxt_futures_testnet_uses_binance_demo_routing(monkeypatch) -> None:

@@ -33,6 +33,8 @@ from typing import Any
 
 from src.execution.broker import (
     Broker,
+    BrokerFill,
+    BrokerIncome,
     BrokerOrderAcknowledgement,
     BrokerOrderState,
     Fill,
@@ -132,6 +134,140 @@ class CcxtBroker(Broker):
             filled_quantity=filled,
             average_price=average,
         )
+
+    def query_order_fills(
+        self, *, symbol: str, exchange_order_id: str, client_order_id: str
+    ) -> tuple[BrokerFill, ...]:
+        fetch = getattr(self._client, "fetch_my_trades", None)
+        if not callable(fetch):
+            raise RuntimeError("ccxt client cannot fetch account trades")
+        params = {"orderId": exchange_order_id} if exchange_order_id else {}
+        payload = fetch(self._ccxt_symbol(symbol), None, None, params)
+        if not isinstance(payload, list):
+            raise RuntimeError("exchange trade history response is not a list")
+        fills: list[BrokerFill] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                raise RuntimeError("exchange trade history contains a non-object")
+            info_value = item.get("info")
+            info = info_value if isinstance(info_value, dict) else {}
+            raw_order_id = str(item.get("order") or info.get("orderId") or "").strip()
+            raw_client_id = str(
+                item.get("clientOrderId") or info.get("clientOrderId") or ""
+            ).strip()
+            if exchange_order_id and raw_order_id != exchange_order_id:
+                continue
+            if client_order_id and raw_client_id and raw_client_id != client_order_id:
+                continue
+            if not raw_order_id and not raw_client_id:
+                continue
+            trade_id = str(item.get("id") or info.get("id") or "").strip()
+            if not trade_id:
+                raise RuntimeError("exchange trade has no trade ID")
+            quantity = self._finite_number(
+                item.get("amount") or info.get("qty"), "Recovered trade quantity", positive=True
+            )
+            price = self._finite_number(
+                item.get("price") or info.get("price"), "Recovered trade price", positive=True
+            )
+            side = self._trade_side(item, info)
+            fee, fee_asset = self._trade_fee(item, info)
+            occurred_at = self._trade_timestamp(item, info)
+            fills.append(
+                BrokerFill(
+                    trade_id=trade_id,
+                    exchange_order_id=raw_order_id or exchange_order_id,
+                    client_order_id=raw_client_id or client_order_id,
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    price=price,
+                    fee=fee,
+                    occurred_at=occurred_at,
+                    fee_asset=fee_asset,
+                )
+            )
+        return tuple(sorted(fills, key=lambda item: (item.occurred_at, item.trade_id)))
+
+    def query_income(self, *, since: float | None = None) -> tuple[BrokerIncome, ...]:
+        fetch = getattr(self._client, "fapiPrivateGetIncome", None)
+        if not callable(fetch):
+            raise RuntimeError("ccxt client cannot fetch futures income history")
+        params = {"startTime": int(since * 1_000)} if since is not None else {}
+        payload = fetch(params)
+        if not isinstance(payload, list):
+            raise RuntimeError("exchange income history response is not a list")
+        result: list[BrokerIncome] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                raise RuntimeError("exchange income history contains a non-object")
+            info_value = item.get("info")
+            info = info_value if isinstance(info_value, dict) else {}
+            income_id = str(
+                item.get("id") or item.get("tranId") or info.get("tranId") or ""
+            ).strip()
+            if not income_id:
+                raise RuntimeError("exchange income record has no identity")
+            amount = self._finite_number(
+                item.get("amount") or item.get("income") or info.get("income"),
+                "Recovered income amount",
+            )
+            occurred_at = self._trade_timestamp(item, info)
+            result.append(
+                BrokerIncome(
+                    income_id=income_id,
+                    symbol=str(item.get("symbol") or info.get("symbol") or ""),
+                    income_type=str(
+                        item.get("type")
+                        or item.get("incomeType")
+                        or info.get("incomeType")
+                        or "unknown"
+                    ),
+                    amount=amount,
+                    asset=str(
+                        item.get("currency") or item.get("asset") or info.get("asset") or "USDT"
+                    ).upper(),
+                    occurred_at=occurred_at,
+                    exchange_order_id=str(
+                        item.get("order") or item.get("orderId") or info.get("orderId") or ""
+                    ).strip()
+                    or None,
+                    trade_id=str(
+                        item.get("trade") or item.get("tradeId") or info.get("tradeId") or ""
+                    ).strip()
+                    or None,
+                )
+            )
+        return tuple(sorted(result, key=lambda item: (item.occurred_at, item.income_id)))
+
+    @staticmethod
+    def _trade_side(item: dict, info: dict) -> OrderSide:
+        raw = str(item.get("side") or "").lower()
+        if raw not in {"buy", "sell"}:
+            buyer = info.get("isBuyer")
+            raw = "buy" if buyer is True or str(buyer).lower() == "true" else "sell"
+        return OrderSide(raw)
+
+    def _trade_fee(self, item: dict, info: dict) -> tuple[float, str | None]:
+        fee_value = item.get("fee")
+        fee = fee_value.get("cost") if isinstance(fee_value, dict) else None
+        asset = fee_value.get("currency") if isinstance(fee_value, dict) else None
+        fee = fee if fee is not None else info.get("commission", 0.0)
+        asset = asset or info.get("commissionAsset")
+        return self._finite_number(fee, "Recovered trade fee", non_negative=True), (
+            str(asset).upper() if asset else None
+        )
+
+    @staticmethod
+    def _trade_timestamp(item: dict, info: dict) -> float:
+        raw = item.get("timestamp") or item.get("time") or info.get("time") or info.get("T")
+        try:
+            result = float(raw) / 1_000.0 if float(raw) > 10_000_000_000 else float(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("exchange trade timestamp is invalid") from exc
+        if not math.isfinite(result) or result <= 0:
+            raise RuntimeError("exchange trade timestamp is invalid")
+        return result
 
     def cancel_order(
         self, *, symbol: str, exchange_order_id: str, client_order_id: str

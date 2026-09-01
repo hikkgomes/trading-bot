@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,7 +18,8 @@ from src.data.database import account_snapshot
 from src.data.database import instrument as instrument_table
 from src.domain._codec import canonical_hash, timestamp, to_primitive
 from src.domain.instruments import Instrument, MarketType
-from src.domain.orders import OrderIntent, OrderSide, OrderStatus, OrderType
+from src.domain.orders import Fill, OrderIntent, OrderSide, OrderStatus, OrderType
+from src.execution.broker import BrokerFill
 from src.execution.ccxt_broker import CcxtBroker
 from src.execution.config import ExchangeConfig
 from src.execution.live_exchange import BrokerExecutionVenue
@@ -31,6 +34,7 @@ from src.research.canonical import (
     SqlStrategyArtefactRepository,
     preflight_is_fresh,
 )
+from src.services.execution_service import ExecutionService
 from src.services.exposure_budget import ExposureBudgetGuard
 from src.services.runtime import utc_now
 
@@ -92,6 +96,7 @@ class ApprovedLiveExecution:
         configuration: Mapping[str, Mapping[str, Any]],
         order_manager: OrderManager,
         positions: PositionManager,
+        ledgers: Mapping[str, Any] | None = None,
     ) -> None:
         products = _records(configuration["products"], "products", "product_id")
         accounts = _records(configuration["accounts"], "accounts", "account_id")
@@ -102,6 +107,7 @@ class ApprovedLiveExecution:
         }
         self.order_manager = order_manager
         self.positions = positions
+        self.ledgers = dict(ledgers or {})
         self.engine = engine
         self.products = products
         self.accounts = accounts
@@ -209,7 +215,7 @@ class ApprovedLiveExecution:
         if action.action_type is RecoveryActionType.CANCEL_UNKNOWN_ORDER:
             return self._cancel_unknown_order(broker, action.target)
         if action.action_type is RecoveryActionType.RECONCILE_ORDER:
-            return self._reconcile_missing_order(action.target)
+            return self._reconcile_missing_order(product_id, action.target)
         if action.action_type is RecoveryActionType.RECONCILE_POSITION:
             return self._reconcile_position(product_id, action.target, action.quantity)
         if action.action_type is RecoveryActionType.EMERGENCY_FLATTEN:
@@ -240,30 +246,189 @@ class ApprovedLiveExecution:
             raise RuntimeError(f"unknown exchange order remains open: {target}")
         return {"action": "cancel_unknown_order", "target": target, "status": status}
 
-    def _reconcile_missing_order(self, target: str) -> Mapping[str, Any]:
+    def _reconcile_missing_order(self, product_id: str, target: str) -> Mapping[str, Any]:
         self.order_manager.reload()
-        matches = tuple(
-            order
-            for order in self.order_manager.all()
-            if order.order_id == target
-            or str(order.metadata.get("client_order_id") or "") == target
-            or str(order.metadata.get("exchange_order_id") or "") == target
-        )
-        if not matches:
+        order = self._recovery_order(target)
+        if order is None:
             return {"action": "reconcile_order", "target": target, "status": "local_absent"}
-        if len(matches) != 1:
-            raise RuntimeError(f"local recovery order identity is ambiguous: {target}")
-        order = matches[0]
-        if order.status is not OrderStatus.RECONCILED:
-            if order.status is not OrderStatus.RECOVERY_REQUIRED:
-                self.order_manager.recovery_required(order.order_id)
-            self.order_manager.reconcile(order.order_id)
+        state, recovered = self._recovery_exchange_state(product_id, order, target)
+        _validate_recovered_fills(
+            order=order,
+            fills=recovered,
+            exchange_order_id=state.exchange_order_id
+            or str(order.metadata.get("exchange_order_id") or ""),
+            client_order_id=state.client_order_id
+            or str(order.metadata.get("client_order_id") or ""),
+        )
+        _validate_recovered_quantities(
+            order,
+            state,
+            recovered,
+            self.order_manager.fills_for(order.order_id),
+        )
+        recovered_count = self._apply_recovered_fills(product_id, order, recovered)
+        self._finish_recovered_order(order.order_id, state.status.casefold())
         return {
             "action": "reconcile_order",
             "target": target,
             "order_id": order.order_id,
             "status": "reconciled",
+            "recovered_fills": recovered_count,
         }
+
+    def _recovery_order(self, target: str) -> OrderIntent | None:
+        matches = tuple(
+            order
+            for order in self.order_manager.all()
+            if target
+            in {
+                order.order_id,
+                str(order.metadata.get("client_order_id") or ""),
+                str(order.metadata.get("exchange_order_id") or ""),
+            }
+        )
+        if len(matches) > 1:
+            raise RuntimeError(f"local recovery order identity is ambiguous: {target}")
+        return matches[0] if matches else None
+
+    def _recovery_exchange_state(
+        self, product_id: str, order: OrderIntent, target: str
+    ) -> tuple[Any, tuple[BrokerFill, ...]]:
+        venue = self.venues[product_id]
+        exchange_id = str(order.metadata.get("exchange_order_id") or "")
+        client_id = str(order.metadata.get("client_order_id") or "")
+        symbol = str(venue.instruments[order.instrument_id].exchange_symbol)
+        state = venue.broker.query_order(
+            symbol=symbol,
+            exchange_order_id=exchange_id,
+            client_order_id=client_id,
+        )
+        _validate_exchange_recovery_state(state, target=target)
+        fills_reader = getattr(venue.broker, "query_order_fills", None)
+        if not callable(fills_reader):
+            raise RuntimeError("live recovery cannot prove missing fills from the exchange")
+        return state, tuple(
+            fills_reader(
+                symbol=symbol,
+                exchange_order_id=state.exchange_order_id or exchange_id,
+                client_order_id=state.client_order_id or client_id,
+            )
+        )
+
+    def _finish_recovered_order(self, order_id: str, state_status: str) -> None:
+        current = self.order_manager.get(order_id)
+        if current.status is OrderStatus.RECONCILED:
+            return
+        if state_status in {"canceled", "cancelled"} and current.status in {
+            OrderStatus.RECOVERY_REQUIRED,
+            OrderStatus.ACKNOWLEDGED,
+            OrderStatus.PARTIALLY_FILLED,
+        }:
+            self.order_manager.cancelled(order_id)
+        elif state_status in {"rejected", "expired"} and current.status in {
+            OrderStatus.RECOVERY_REQUIRED,
+            OrderStatus.PARTIALLY_FILLED,
+        }:
+            self.order_manager.transition(
+                order_id,
+                OrderStatus.REJECTED if state_status == "rejected" else OrderStatus.EXPIRED,
+            )
+        current = self.order_manager.get(order_id)
+        if current.status is not OrderStatus.RECONCILED:
+            self.order_manager.reconcile(order_id)
+
+    def _apply_recovered_fills(
+        self, product_id: str, order: OrderIntent, fills: tuple[BrokerFill, ...]
+    ) -> int:
+        existing = {item.fill_id for item in self.order_manager.fills_for(order.order_id)}
+        recovered = 0
+        for broker_fill in fills:
+            fill = _domain_fill(order, broker_fill)
+            current = self.order_manager.get(order.order_id)
+            if fill.fill_id in existing or _matches_existing_recovered_fill(
+                self.order_manager.fills_for(order.order_id), broker_fill
+            ):
+                continue
+            if current.status is OrderStatus.RECOVERY_REQUIRED:
+                pass
+            elif current.status is OrderStatus.PERSISTED:
+                self.order_manager.submitted(order.order_id)
+                current = self.order_manager.get(order.order_id)
+            if current.status is OrderStatus.SUBMITTED:
+                self.order_manager.acknowledged(order.order_id, event_at=fill.occurred_at)
+            current = self.order_manager.get(order.order_id)
+            if current.status not in {
+                OrderStatus.RECOVERY_REQUIRED,
+                OrderStatus.ACKNOWLEDGED,
+                OrderStatus.PARTIALLY_FILLED,
+            }:
+                raise RuntimeError(
+                    f"recovered fill cannot be applied from order state {current.status.value}"
+                )
+            previous = self.positions.get(current.portfolio_id, current.instrument_id)
+            self.order_manager.apply_fill(fill)
+            self.positions.apply_fill(
+                current.portfolio_id,
+                fill,
+                contributions=dict(current.strategy_contributions),
+            )
+            ledger = self.ledgers.get(product_id)
+            if ledger is not None:
+                if fill.fee_asset not in {None, ledger.accounting_asset}:
+                    raise RuntimeError("recovered commission needs deterministic fee conversion")
+                ExecutionService(
+                    paper_exchange=_RecoveryVenue(self.order_manager),
+                    positions=self.positions,
+                    ledger=ledger,
+                ).record_execution_costs(current, fill, previous_position=previous)
+            existing.add(fill.fill_id)
+            recovered += 1
+        return recovered
+
+    def backfill_account(self, product_id: str, at: str) -> Mapping[str, Any]:
+        """Backfill commission, funding, and realised PnL from Binance REST."""
+
+        venue = self.venues[product_id]
+        query = getattr(venue.broker, "query_income", None)
+        ledger = self.ledgers.get(product_id)
+        if not callable(query) or ledger is None:
+            raise RuntimeError("account backfill requires a broker income reader and ledger")
+        incomes = tuple(query(since=_backfill_since(at)))
+        recorded = 0
+        for income in incomes:
+            if income.asset != ledger.accounting_asset:
+                raise RuntimeError("account income requires deterministic asset conversion")
+            attribution = {
+                "product": product_id,
+                "symbol": income.symbol,
+                "income_id": income.income_id,
+                "recovered_from_rest": True,
+            }
+            if income.income_type.casefold() == "funding_fee":
+                ledger.record_funding(
+                    entry_id=f"rest:{income.income_id}",
+                    amount=Decimal(str(income.amount)),
+                    occurred_at=_epoch_time(income.occurred_at),
+                    attribution=attribution,
+                )
+            elif income.income_type.casefold() in {"commission", "commission_fee"}:
+                ledger.record_fee(
+                    entry_id=f"rest:{income.income_id}",
+                    amount=Decimal(str(abs(income.amount))),
+                    occurred_at=_epoch_time(income.occurred_at),
+                    attribution=attribution,
+                )
+            elif income.income_type.casefold() in {"realized_pnl", "realised_pnl"}:
+                ledger.record_realised_pnl(
+                    entry_id=f"rest:{income.income_id}",
+                    amount=Decimal(str(income.amount)),
+                    occurred_at=_epoch_time(income.occurred_at),
+                    attribution=attribution,
+                )
+            else:
+                continue
+            recorded += 1
+        return {"product_id": product_id, "income_records": len(incomes), "recorded": recorded}
 
     def _reconcile_position(
         self, product_id: str, instrument_id: str, quantity: float | None
@@ -806,6 +971,154 @@ class ApprovedLiveExecution:
             raise PermissionError("live order instrument is not persisted and tradable")
         if instrument.instrument_id not in set(artifact.get("supported_instruments", [])):
             raise PermissionError("live order instrument is not bound to the canonical artefact")
+
+
+class _RecoveryVenue:
+    def __init__(self, order_manager: OrderManager) -> None:
+        self.order_manager = order_manager
+
+    def submit(self, _intent: OrderIntent) -> Fill:
+        raise RuntimeError("recovery accounting cannot submit orders")
+
+
+def _domain_fill(order: OrderIntent, recovered: BrokerFill) -> Fill:
+    if not _instrument_matches_symbol(order.instrument_id, recovered.symbol):
+        raise RuntimeError("recovered fill symbol does not match the local order")
+    if recovered.side.value != order.side.value:
+        raise RuntimeError("recovered fill side does not match the local order")
+    return Fill(
+        fill_id=canonical_hash(
+            {
+                "venue": "binance",
+                "instrument_id": order.instrument_id,
+                "trade_id": recovered.trade_id,
+            }
+        ),
+        order_id=order.order_id,
+        instrument_id=order.instrument_id,
+        side=OrderSide(recovered.side.value),
+        quantity=recovered.quantity,
+        price=recovered.price,
+        fee=recovered.fee,
+        occurred_at=_epoch_time(recovered.occurred_at),
+        fee_asset=recovered.fee_asset,
+        metadata={
+            "reference_price": recovered.price,
+            "slippage_cost": 0.0,
+            "rest_recovery": True,
+            "exchange_order_id": recovered.exchange_order_id,
+            "trade_id": recovered.trade_id,
+        },
+    )
+
+
+def _instrument_matches_symbol(instrument_id: str, symbol: str) -> bool:
+    canonical = str(instrument_id).upper()
+    compact = str(symbol).replace("/", "").replace(":", "").upper()
+    return compact in canonical.replace(":", "") or canonical.endswith(f":{str(symbol).upper()}")
+
+
+def _matches_existing_recovered_fill(existing: tuple[Fill, ...], recovered: BrokerFill) -> bool:
+    return any(
+        str(item.metadata.get("trade_id") or "") == recovered.trade_id
+        or (
+            str(item.metadata.get("exchange_order_id") or "") == recovered.exchange_order_id
+            and abs(item.quantity - recovered.quantity) <= max(item.quantity * 1e-9, 1e-12)
+            and abs(item.price - recovered.price) <= max(item.price * 1e-9, 1e-12)
+        )
+        for item in existing
+    )
+
+
+def _validate_recovered_fills(
+    *,
+    order: OrderIntent,
+    fills: tuple[BrokerFill, ...],
+    exchange_order_id: str,
+    client_order_id: str,
+) -> None:
+    for recovered in fills:
+        _validate_recovered_fill(
+            order=order,
+            recovered=recovered,
+            exchange_order_id=exchange_order_id,
+            client_order_id=client_order_id,
+        )
+
+
+def _validate_exchange_recovery_state(state: Any, *, target: str) -> None:
+    status = str(state.status).casefold()
+    if status in {"open", "new", "accepted", "partially_filled"}:
+        raise RuntimeError(f"exchange order remains active during recovery: {target}")
+    if status not in {"closed", "filled", "canceled", "cancelled", "rejected", "expired"}:
+        raise RuntimeError(f"exchange order has an unsupported terminal state: {state.status}")
+    if not math.isfinite(state.filled_quantity) or state.filled_quantity < 0:
+        raise RuntimeError("exchange order state has an invalid filled quantity")
+    if state.average_price is not None and (
+        not math.isfinite(state.average_price) or state.average_price <= 0
+    ):
+        raise RuntimeError("exchange order state has an invalid average price")
+
+
+def _validate_recovered_fill(
+    *,
+    order: OrderIntent,
+    recovered: BrokerFill,
+    exchange_order_id: str,
+    client_order_id: str,
+) -> None:
+    if not math.isfinite(recovered.quantity) or recovered.quantity <= 0:
+        raise RuntimeError("REST recovered fill quantity is invalid")
+    if not math.isfinite(recovered.price) or recovered.price <= 0:
+        raise RuntimeError("REST recovered fill price is invalid")
+    if not math.isfinite(recovered.fee) or recovered.fee < 0:
+        raise RuntimeError("REST recovered fill fee is invalid")
+    if recovered.exchange_order_id != exchange_order_id:
+        raise RuntimeError("REST recovered fill exchange order identity changed")
+    if client_order_id and recovered.client_order_id not in {"", client_order_id}:
+        raise RuntimeError("REST recovered fill client order identity changed")
+    if not _instrument_matches_symbol(order.instrument_id, recovered.symbol):
+        raise RuntimeError("REST recovered fill symbol does not match the local order")
+    if recovered.side.value != order.side.value:
+        raise RuntimeError("REST recovered fill side does not match the local order")
+
+
+def _validate_recovered_quantities(
+    order: OrderIntent,
+    state: Any,
+    recovered: tuple[BrokerFill, ...],
+    existing: tuple[Fill, ...],
+) -> None:
+    existing_quantity = sum(item.quantity for item in existing)
+    recovered_quantity = sum(
+        item.quantity for item in recovered if not _matches_existing_recovered_fill(existing, item)
+    )
+    total = existing_quantity + recovered_quantity
+    tolerance = max(order.quantity * 1e-9, 1e-12)
+    if total > order.quantity + tolerance:
+        raise RuntimeError("recovered fills exceed the local order quantity")
+    if abs(total - state.filled_quantity) > tolerance:
+        raise RuntimeError(
+            "exchange order filled quantity does not match exact REST trade quantities"
+        )
+    if (
+        str(state.status).casefold() in {"closed", "filled"}
+        and abs(total - order.quantity) > tolerance
+    ):
+        raise RuntimeError("closed exchange order is not fully filled")
+    if state.filled_quantity > 1e-12 and not recovered and not existing:
+        raise RuntimeError("exchange reports fills but REST trade history is unavailable")
+
+
+def _epoch_time(value: float) -> str:
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError("recovered exchange timestamp is invalid")
+    return dt.datetime.fromtimestamp(value, dt.UTC).replace(microsecond=0).isoformat()
+
+
+def _backfill_since(at: str) -> float:
+    observed = dt.datetime.fromisoformat(timestamp(at, field="backfill time"))
+    return max(0.0, observed.timestamp() - 90 * 86_400)
 
 
 def _records(

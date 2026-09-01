@@ -396,6 +396,7 @@ def _live_execution_components(
         configuration=configuration,
         order_manager=order_manager,
         positions=positions,
+        ledgers=ledgers,
     )
     live_product_ids = frozenset(approved_live.venues)
     protective_service = LiveProtectiveStopService(
@@ -441,6 +442,7 @@ def _live_execution_components(
         reconcile_product=approved_live.reconcile,
         account_products=account_products,
         execute_action=approved_live.recover_action,
+        backfill_account=approved_live.backfill_account,
     )
     return {
         "live_worker": live_worker,

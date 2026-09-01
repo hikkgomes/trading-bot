@@ -24,6 +24,7 @@ class DatabaseLiveRecoveryWorker:
         reconcile_product: Callable[[str], ReconciliationResult],
         account_products: Mapping[str, str],
         execute_action: Callable[[str, RecoveryAction], Mapping[str, Any]] | None = None,
+        backfill_account: Callable[[str, str], Mapping[str, Any]] | None = None,
         lease_seconds: int = 60,
     ) -> None:
         self.queue = queue
@@ -32,6 +33,7 @@ class DatabaseLiveRecoveryWorker:
         self.reconcile_product = reconcile_product
         self.account_products = dict(account_products)
         self.execute_action = execute_action
+        self.backfill_account = backfill_account
         self.lease_seconds = lease_seconds
 
     def run_once(self, *, now: str) -> dict[str, Any]:
@@ -47,6 +49,11 @@ class DatabaseLiveRecoveryWorker:
             product_id = str(claimed.payload.get("product_id") or "")
             if not product_id:
                 product_id = self.account_products[str(claimed.payload["account_id"])]
+            backfill = (
+                self.backfill_account(product_id, now)
+                if self.backfill_account is not None
+                else None
+            )
             reconciliation = self.reconcile_product(product_id)
             plan = plan_recovery(reconciliation, created_at=now, store=self.store)
             if plan is None:
@@ -57,6 +64,7 @@ class DatabaseLiveRecoveryWorker:
                         "job_id": claimed.job_id,
                         "product_id": product_id,
                         "recovery_kind": "user_stream_reconnect",
+                        **({"backfill": dict(backfill)} if backfill is not None else {}),
                     }
                 raise ValueError("recovery job found no exchange-state difference")
             action_results: tuple[dict[str, Any], ...] = ()
@@ -90,6 +98,7 @@ class DatabaseLiveRecoveryWorker:
             "actions": len(plan.actions),
             "operator_review_required": plan.requires_operator_review,
             "action_results": list(action_results),
+            **({"backfill": dict(backfill)} if backfill is not None else {}),
         }
 
 

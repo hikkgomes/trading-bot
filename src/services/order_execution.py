@@ -991,7 +991,6 @@ class DatabaseUserStreamWorker:
         fill_id = canonical_hash(
             {
                 "venue": "binance",
-                "account_id": account_id,
                 "instrument_id": order.instrument_id,
                 "trade_id": trade_id,
             }
@@ -1027,7 +1026,13 @@ class DatabaseUserStreamWorker:
             fee=fee,
             occurred_at=event.exchange_timestamp,
             fee_asset=fee_asset,
-            metadata={"reference_price": price, "slippage_cost": 0.0, "user_stream": True},
+            metadata={
+                "reference_price": price,
+                "slippage_cost": 0.0,
+                "user_stream": True,
+                "exchange_order_id": str(values.get("i") or "") or None,
+                "trade_id": trade_id,
+            },
         )
         updated = order_manager.apply_fill(fill)
         position = positions.apply_fill(

@@ -81,6 +81,10 @@ _NETWORK_METHOD_PREFIXES = (
     "transfer",
     "withdraw",
     "request",
+    "fapiPrivate",
+    "dapiPrivate",
+    "sapi",
+    "papi",
 )
 
 
