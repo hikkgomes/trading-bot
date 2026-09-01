@@ -312,6 +312,9 @@ class PlatformScheduler:
             if snapshot_id is None or snapshot_payload is None:
                 self._mark_dataset_waiting(candidate.candidate_id, requested_stage, now)
                 continue
+            if self._candidate_stage_dead_letter(candidate.candidate_id, requested_stage):
+                self._mark_candidate_dead_letter(candidate.candidate_id, requested_stage, now)
+                continue
             if self._candidate_stage_job_pending(candidate.candidate_id, requested_stage):
                 continue
             if state_value.startswith("waiting_for_dataset:"):
@@ -398,12 +401,61 @@ class PlatformScheduler:
             rows = connection.execute(
                 select(job.c.state, job.c.payload).where(job.c.name == "evaluate_candidate")
             ).mappings()
+        return any(
+            str(row["state"]) in {"pending", "running"}
+            and isinstance(row["payload"], Mapping)
+            and row["payload"].get("candidate_id") == candidate_id
+            and row["payload"].get("requested_stage") == stage
+            for row in rows
+        )
+
+    def _candidate_stage_dead_letter(self, candidate_id: str, stage: str) -> bool:
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(job.c.payload).where(
+                    job.c.name == "evaluate_candidate",
+                    job.c.state == "dead_letter",
+                )
+            ).scalars()
             return any(
-                str(row["state"]) in {"pending", "running"}
-                and isinstance(row["payload"], Mapping)
-                and row["payload"].get("candidate_id") == candidate_id
-                and row["payload"].get("requested_stage") == stage
-                for row in rows
+                isinstance(payload, Mapping)
+                and payload.get("candidate_id") == candidate_id
+                and payload.get("requested_stage") == stage
+                for payload in rows
+            )
+
+    def _mark_candidate_dead_letter(self, candidate_id: str, stage: str, now: str) -> None:
+        with self.engine.begin() as connection:
+            row = (
+                connection.execute(
+                    select(experiment.c.state, experiment.c.metadata).where(
+                        experiment.c.id == candidate_id
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if row is None:
+                return
+            metadata = dict(row["metadata"] or {})
+            blocked = {
+                "stage": stage,
+                "reason_code": "evaluation_job_dead_letter",
+                "observed_at": now,
+            }
+            if (
+                row["state"] == f"blocked_dead_letter:{stage}"
+                and metadata.get("blocked_reason") == blocked
+            ):
+                return
+            metadata["blocked_reason"] = blocked
+            connection.execute(
+                update(experiment)
+                .where(experiment.c.id == candidate_id)
+                .values(
+                    state=f"blocked_dead_letter:{stage}",
+                    metadata=json_value(metadata, field="metadata"),
+                )
             )
 
     def _pending_universe_refresh(self, product_id: str) -> bool:

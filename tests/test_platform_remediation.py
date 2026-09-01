@@ -5,12 +5,13 @@ import datetime as dt
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from src.data.database import (
     PlatformDatabase,
     cost_model_manifest,
     dataset_snapshot,
+    experiment,
     feature_manifest,
     job,
 )
@@ -32,6 +33,7 @@ from src.research.accounting import (
 )
 from src.research.artefacts import StrategyArtefact
 from src.research.catalogue import registered_strategy_candidates
+from src.research.coordinator import ResearchCoordinator
 from src.research.dataset_service import DatabaseDatasetBundleService
 from src.research.datasets import (
     CORE_RESEARCH_BUNDLE_ROLES,
@@ -55,14 +57,16 @@ from src.research.executors import (
     _portfolio_overlap,
     _product_accounting,
 )
+from src.research.generation import CAMPAIGNS, build_hypothesis
 from src.research.objectives import objective_passes
 from src.research.returns import PositionReturnLedger
 from src.research.store import SqlResearchStore
+from src.research.theses import SqlThesisRegistry
 from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.order_execution import _validate_btc_spot_orders
 from src.services.readiness import _dataset_readiness, _ready_dataset_roles
 from src.services.research_jobs import DatabaseResearchJobHandlers
-from src.services.scheduler import ClaimedJob, DatabaseJobQueue
+from src.services.scheduler import ClaimedJob, DatabaseJobQueue, PlatformScheduler
 from src.strategies.behaviour import RegisteredStrategyBehaviour
 
 NOW = "2026-08-30T10:00:00+00:00"
@@ -116,6 +120,101 @@ def test_job_retries_end_in_a_durable_dead_letter_state(tmp_path) -> None:
     assert (
         queue.claim(worker_id="worker", now="2026-08-30T10:00:10+00:00", lease_seconds=10) is None
     )
+
+
+def test_dead_lettered_stage_is_durably_blocked_from_recurring_resubmission(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'dead-letter-stage.sqlite3'}")
+    database.create_schema()
+    identity = "sha256:" + "f" * 64
+    intervals = {
+        role: {
+            "start": f"2026-08-{20 + index:02d}T00:00:00+00:00",
+            "end": f"2026-08-{21 + index:02d}T00:00:00+00:00",
+        }
+        for index, role in enumerate(CORE_RESEARCH_BUNDLE_ROLES)
+    }
+    bundle = CanonicalResearchDatasetBuilder(database.engine).build(
+        "active_income",
+        intervals=intervals,
+        payload_by_role={
+            role: {"market_frame": [{"close": 100.0}], "rows": [1]}
+            for role in CORE_RESEARCH_BUNDLE_ROLES
+        },
+        universe_snapshot_id=identity,
+        feature_manifest_id=identity,
+        cost_model_id=identity,
+        parameter_set_id=identity,
+        instrument_scope=("binance:futures:BTCUSDT:USDT",),
+        availability_timestamp=NOW,
+        created_at=NOW,
+    )
+    hypothesis = build_hypothesis(
+        CAMPAIGNS[2],
+        variant=0,
+        instrument_universe=("BTCUSDT",),
+        dataset_snapshot_hashes=tuple(bundle.stage_snapshot_ids.values()),
+        submitted_at=NOW,
+    )
+    SqlThesisRegistry(database.engine).register(hypothesis.thesis)
+    ResearchCoordinator(SqlResearchStore(database.engine)).submit(hypothesis.candidate)
+    with database.engine.begin() as connection:
+        connection.execute(
+            update(experiment)
+            .where(experiment.c.id == hypothesis.candidate.candidate_id)
+            .values(state="screening")
+        )
+    scheduler = PlatformScheduler(
+        engine=database.engine,
+        products={"active_income": {"universe_id": "unused"}},
+        node_id="linux-optiplex",
+    )
+    snapshot_id = bundle.stage_snapshot_ids["development"]
+    with database.engine.connect() as connection:
+        snapshot_payload = connection.execute(
+            select(dataset_snapshot.c.payload).where(dataset_snapshot.c.id == snapshot_id)
+        ).scalar_one()
+    request = scheduler._research_request(
+        candidate_id=hypothesis.candidate.candidate_id,
+        snapshot_id=snapshot_id,
+        snapshot_payload=snapshot_payload,
+        requested_stage="development",
+        evaluated_at=NOW,
+    )
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="dead-letter-worker",
+        node_id="node",
+        role="research-worker",
+        capabilities=("evaluate_candidate",),
+        observed_at=NOW,
+    )
+    queue.enqueue(
+        job_id="dead-letter-evaluation",
+        name="evaluate_candidate",
+        payload=request,
+        available_at=NOW,
+        max_attempts=1,
+    )
+    claimed = queue.claim(
+        worker_id="dead-letter-worker", now=NOW, lease_seconds=10, names=("evaluate_candidate",)
+    )
+    assert claimed is not None
+    queue.fail(
+        claimed,
+        completed_at="2026-08-30T10:00:01+00:00",
+        error="poison evaluation",
+        retry_at="2026-08-30T10:00:02+00:00",
+    )
+
+    assert scheduler._candidate_evaluation_jobs("active_income", NOW, NOW) == ()
+    with database.engine.connect() as connection:
+        state, metadata = connection.execute(
+            select(experiment.c.state, experiment.c.metadata).where(
+                experiment.c.id == hypothesis.candidate.candidate_id
+            )
+        ).one()
+    assert state == "blocked_dead_letter:development"
+    assert metadata["blocked_reason"]["reason_code"] == "evaluation_job_dead_letter"
 
 
 def test_evidence_policy_preserves_applicability_and_thesis_scoped_controls() -> None:
