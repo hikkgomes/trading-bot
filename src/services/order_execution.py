@@ -1405,9 +1405,16 @@ def _validate_btc_spot_orders(
     price = float(prices[instrument_id])
     if sell_quantity > owned_btc + max(1e-12, owned_btc * 1e-9):
         raise ValueError("BTC spot sell exceeds the reconciled owned BTC position")
-    slippage_bps = _btc_spot_costs(execution_costs)
+    fee_bps, slippage_bps = _btc_spot_costs(execution_costs)
     quote_balance = _btc_quote_balance(balances)
-    _assert_btc_quote_capacity(orders, price, slippage_bps, quote_balance, sell_quantity)
+    _assert_btc_quote_capacity(
+        orders,
+        price,
+        fee_bps,
+        slippage_bps,
+        quote_balance,
+        sell_quantity,
+    )
 
 
 def _validate_btc_spot_identity(
@@ -1427,7 +1434,7 @@ def _validate_owned_btc(value: float) -> None:
         raise ValueError("BTC spot position is invalid")
 
 
-def _btc_spot_costs(execution_costs: Mapping[str, Any]) -> float:
+def _btc_spot_costs(execution_costs: Mapping[str, Any]) -> tuple[float, float]:
     try:
         fee_bps = float(execution_costs["fee_bps"])
         slippage_bps = float(execution_costs["slippage_bps"])
@@ -1435,7 +1442,7 @@ def _btc_spot_costs(execution_costs: Mapping[str, Any]) -> float:
         raise ValueError("BTC spot execution costs are invalid") from exc
     if not all(math.isfinite(value) and value >= 0.0 for value in (fee_bps, slippage_bps)):
         raise ValueError("BTC spot execution costs are invalid")
-    return slippage_bps
+    return fee_bps, slippage_bps
 
 
 def _btc_quote_balance(balances: Mapping[str, Any]) -> float:
@@ -1452,6 +1459,7 @@ def _btc_quote_balance(balances: Mapping[str, Any]) -> float:
 def _assert_btc_quote_capacity(
     orders: tuple[OrderIntent, ...],
     price: float,
+    fee_bps: float,
     slippage_bps: float,
     quote_balance: float,
     sell_quantity: float,
@@ -1459,11 +1467,19 @@ def _assert_btc_quote_capacity(
     if not math.isfinite(price) or price <= 0:
         raise ValueError("BTC spot execution price is invalid")
     buy_cost = sum(
-        order.quantity * price * (1.0 + slippage_bps / 10_000.0)
+        order.quantity
+        * price
+        * (1.0 + slippage_bps / 10_000.0)
+        * (1.0 + fee_bps / 10_000.0)
         for order in orders
         if order.side is OrderSide.BUY
     )
-    sell_proceeds = sell_quantity * price * max(0.0, 1.0 - slippage_bps / 10_000.0)
+    sell_proceeds = (
+        sell_quantity
+        * price
+        * max(0.0, 1.0 - slippage_bps / 10_000.0)
+        * max(0.0, 1.0 - fee_bps / 10_000.0)
+    )
     if buy_cost > quote_balance + sell_proceeds + max(1e-12, quote_balance * 1e-9):
         raise ValueError("BTC spot buys exceed quote balance and same-cycle sell proceeds")
 

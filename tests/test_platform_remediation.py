@@ -1155,6 +1155,35 @@ def test_btc_step_aside_metadata_binds_lot_and_quote_budget() -> None:
     assert metadata["btc_quote_reinvest_budget"] == pytest.approx(39.964006)
 
 
+def test_btc_spot_quote_capacity_includes_fees() -> None:
+    target = TargetPosition(
+        portfolio_id="btc-accumulation-portfolio",
+        instrument_id="binance:spot:BTCUSDT",
+        target_quantity=1.0,
+        target_notional=100.0,
+        target_fraction=1.0,
+        strategy_contributions={"strategy": 1.0},
+        risk_budget=0.3,
+        valid_until="2026-08-30T11:00:00+00:00",
+        metadata={},
+    )
+    orders = plan_orders(
+        (target,),
+        current_quantities={"binance:spot:BTCUSDT": 0.7},
+        decided_at=NOW,
+        prices={"binance:spot:BTCUSDT": 100.0},
+    )
+
+    with pytest.raises(ValueError, match="quote balance"):
+        _validate_btc_spot_orders(
+            orders,
+            current={"binance:spot:BTCUSDT": 0.7},
+            balances={"USDT": 30.0},
+            prices={"binance:spot:BTCUSDT": 100.0},
+            execution_costs={"fee_bps": 10.0, "slippage_bps": 2.0},
+        )
+
+
 def test_product_objective_rejects_positive_usdt_result_that_loses_btc() -> None:
     assert not objective_passes(
         {
