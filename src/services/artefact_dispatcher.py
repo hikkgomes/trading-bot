@@ -309,8 +309,22 @@ def _semantic(
     except (SemanticEvaluationError, KeyError, TypeError, ValueError) as exc:
         raise ArtefactDispatchError(str(exc)) from exc
     result["semantic_strategy"] = name
-    result["semantic_input_hash"] = canonical_hash(semantic_input)
+    input_hash = canonical_hash(semantic_input)
+    output_hash = canonical_hash(output)
+    result["semantic_input_hash"] = input_hash
     result["behaviour_hash"] = artefact.get("behaviour_hash") or behaviour_hash_for_definition(
         definition
     )
+    parity_payload = {
+        "schema": "semantic_parity/v1",
+        "strategy": name,
+        "input_hash": input_hash,
+        "output_hash": output_hash,
+        "instrument_id": instrument_id,
+        "signal": result["semantic_signal"],
+    }
+    result["parity_receipt"] = {
+        **parity_payload,
+        "receipt_hash": canonical_hash(parity_payload),
+    }
     return result
