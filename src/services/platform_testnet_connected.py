@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import os
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -136,6 +137,7 @@ def run_connected_testnet_rehearsal(
     positions = context["positions"]
     assignment = context["assignment"]
     now = context["now"]
+    rehearsal_id = context["rehearsal_id"]
     signing_key = context["signing_key"]
     try:
         runtime = _prepare_rehearsal_runtime(
@@ -190,6 +192,7 @@ def run_connected_testnet_rehearsal(
             opening_side=opening_side,
             now=now,
             reference_price=reference_price,
+            rehearsal_id=rehearsal_id,
         )
         opened = cycle["opened"]
         closed = cycle["closed"]
@@ -307,7 +310,8 @@ def _prepare_connected_context(
         raise ConnectedTestnetError("connected rehearsal requires PostgreSQL")
     database.assert_migrated()
     now = utc_now()
-    queue = DatabaseJobQueue(database.engine, claim_scope="connected-testnet-rehearsal")
+    rehearsal_id = f"connected-testnet:{uuid.uuid4().hex[:16]}"
+    queue = DatabaseJobQueue(database.engine, claim_scope=rehearsal_id)
     order_manager = OrderManager(SqlOrderStore(database.engine))
     positions = PositionManager(SqlPositionStore(database.engine))
     assignment = SqlActiveStrategyAssignmentRepository(database.engine).active(
@@ -328,6 +332,7 @@ def _prepare_connected_context(
         "positions": positions,
         "assignment": assignment,
         "now": now,
+        "rehearsal_id": rehearsal_id,
         "signing_key": signing_key,
     }
 
@@ -451,6 +456,7 @@ def _prepare_rehearsal_runtime(
         "accounting_before": accounting_before,
         "now": now,
         "reference_price": price,
+        "rehearsal_id": str(queue.claim_scope),
         "gateway": gateway,
         "user_stream_worker": user_stream_worker,
         "accounting_worker": accounting_worker,
@@ -515,6 +521,7 @@ def _perform_connected_round_trip(
     opening_side: OrderSide,
     now: str,
     reference_price: float,
+    rehearsal_id: str,
 ) -> dict[str, Any]:
     gateway.start()
     open_quantity = 0.0
@@ -538,6 +545,7 @@ def _perform_connected_round_trip(
             opening_side=opening_side,
             now=now,
             reference_price=reference_price,
+            rehearsal_id=rehearsal_id,
         )
         closed, close_recovery = _close_connected_order(
             account=account,
@@ -553,6 +561,7 @@ def _perform_connected_round_trip(
             open_quantity=open_quantity,
             opening_side=opening_side,
             reference_price=reference_price,
+            rehearsal_id=rehearsal_id,
         )
         return {
             "opened": opened,
@@ -596,6 +605,7 @@ def _open_connected_order(
     opening_side: OrderSide,
     now: str,
     reference_price: float,
+    rehearsal_id: str,
 ) -> tuple[dict[str, Any], float, Mapping[str, Any], Any]:
     timeout = min(30.0, float(os.environ.get("PLATFORM_TESTNET_TIMEOUT_SECONDS", "120")))
     if not gateway.wait_for_user_stream(str(account["account_id"]), timeout_seconds=timeout):
@@ -617,6 +627,7 @@ def _open_connected_order(
         strategy_version_id=str(assignment["strategy_version_id"]),
         artefact_hash=str(assignment["artefact_hash"]),
         reference_price=reference_price,
+        rehearsal_id=rehearsal_id,
     )
     open_quantity = float(order_manager.get(opened["order_id"]).filled_quantity)
     if open_quantity <= 0:
@@ -656,6 +667,7 @@ def _close_connected_order(
     open_quantity: float,
     opening_side: OrderSide,
     reference_price: float,
+    rehearsal_id: str,
 ) -> tuple[dict[str, Any], Mapping[str, Any]]:
     closed = _submit_and_wait(
         order_manager=order_manager,
@@ -673,6 +685,7 @@ def _close_connected_order(
         strategy_version_id=str(assignment["strategy_version_id"]),
         artefact_hash=str(assignment["artefact_hash"]),
         reference_price=reference_price,
+        rehearsal_id=rehearsal_id,
     )
     if order_manager.get(closed["order_id"]).status is not OrderStatus.FILLED:
         raise ConnectedTestnetError("testnet close order was not filled")
@@ -1175,11 +1188,13 @@ def _submit_and_wait(
     strategy_version_id: str,
     artefact_hash: str,
     reference_price: float,
+    rehearsal_id: str,
 ) -> dict[str, Any]:
     order = OrderIntent(
         order_id=canonical_hash(
             {
                 "rehearsal": "connected-testnet",
+                "rehearsal_id": rehearsal_id,
                 "side": side.value,
                 "quantity": quantity,
                 "at": now,
