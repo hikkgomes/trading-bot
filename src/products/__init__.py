@@ -6,6 +6,7 @@ from src.products.btc_accumulation import (
     BtcAllocationPolicy,
     BtcAllocationTarget,
     assert_btc_spot_instrument,
+    btc_step_aside_metadata,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "BtcAllocationPolicy",
     "BtcAllocationTarget",
     "assert_btc_spot_instrument",
+    "btc_step_aside_metadata",
 ]

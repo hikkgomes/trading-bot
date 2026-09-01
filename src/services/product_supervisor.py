@@ -14,6 +14,7 @@ from src.products.btc_accumulation import (
     BtcAllocationPolicy,
     BtcAllocationTarget,
     assert_btc_spot_instrument,
+    btc_step_aside_metadata,
     target_btc_allocation,
 )
 from src.risk.engine import REQUIRED_RISK_SCOPES, HierarchicalRiskAssessment
@@ -212,6 +213,14 @@ class BtcAccumulationProductSupervisor:
         btc_nav = btc_balance + stablecoin_balance / stablecoin_per_btc
         allocation = target_btc_allocation(materialised, policy=self.policy)
         target_quantity = btc_nav * allocation.target_btc_fraction
+        cycle_metadata = btc_step_aside_metadata(
+            instrument_id=instrument_id,
+            current_btc=btc_balance,
+            target_btc=target_quantity,
+            price=stablecoin_per_btc,
+            stablecoin_balance=stablecoin_balance,
+            state_id=event_id,
+        )
         self.execution_service.positions.reconcile_position(
             portfolio_id=self.portfolio_id,
             instrument_id=instrument_id,
@@ -234,6 +243,7 @@ class BtcAccumulationProductSupervisor:
                 "btc_nav_before_costs": btc_nav,
                 "stablecoin_balance": stablecoin_balance,
                 "stablecoin_per_btc": stablecoin_per_btc,
+                **cycle_metadata,
             },
         )
         orders, fills, traces = self.execution_service.execute_targets(

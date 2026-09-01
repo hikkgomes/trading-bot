@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from src.domain._codec import canonical_hash
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 
 BTC_SPOT_INSTRUMENT_ID = "binance:spot:BTCUSDT"
@@ -17,6 +19,47 @@ def assert_btc_spot_instrument(instrument_id: str) -> str:
     if value != BTC_SPOT_INSTRUMENT_ID:
         raise ValueError("BTC accumulation requires binance:spot:BTCUSDT")
     return value
+
+
+def btc_step_aside_metadata(
+    *,
+    instrument_id: str,
+    current_btc: float,
+    target_btc: float,
+    price: float,
+    stablecoin_balance: float,
+    state_id: str,
+    fee_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+) -> dict[str, object]:
+    """Create restart-safe metadata for one bounded BTC tactical cycle."""
+
+    assert_btc_spot_instrument(instrument_id)
+    values = (current_btc, target_btc, price, stablecoin_balance, fee_bps, slippage_bps)
+    if any(not math.isfinite(float(value)) or float(value) < 0.0 for value in values) or price <= 0.0:
+        raise ValueError("BTC step-aside values must be non-negative with a positive price")
+    sell_quantity = max(0.0, current_btc - target_btc)
+    sell_price = price * max(0.0, 1.0 - slippage_bps / 10_000.0)
+    quote_proceeds = sell_quantity * sell_price * max(0.0, 1.0 - fee_bps / 10_000.0)
+    budget = stablecoin_balance + quote_proceeds
+    state = "step_aside" if sell_quantity > 0.0 else "rebuy" if target_btc > current_btc else "core_hold"
+    lot_payload = {
+        "instrument_id": instrument_id,
+        "state_id": str(state_id),
+        "current_btc": current_btc,
+        "target_btc": target_btc,
+        "price": price,
+        "sell_quantity_btc": sell_quantity,
+    }
+    return {
+        "btc_cycle_state": state,
+        "btc_step_aside_lot_id": canonical_hash(lot_payload) if sell_quantity > 0.0 else None,
+        "btc_step_aside_sold_quantity": sell_quantity,
+        "btc_step_aside_quote_proceeds": quote_proceeds,
+        "btc_quote_reinvest_budget": budget,
+        "btc_quote_budget_source": "owned_balance_plus_step_aside_proceeds",
+        "btc_step_aside_state_hash": canonical_hash(lot_payload),
+    }
 
 
 @dataclass(frozen=True)

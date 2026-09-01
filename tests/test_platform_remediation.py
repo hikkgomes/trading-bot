@@ -24,7 +24,11 @@ from src.domain.orders import OrderSide
 from src.domain.portfolios import TargetPosition
 from src.execution.order_planner import plan_orders
 from src.portfolio.optimiser import PortfolioConstraints, optimise_targets
-from src.products.btc_accumulation import BtcAllocationPolicy, target_btc_allocation
+from src.products.btc_accumulation import (
+    BtcAllocationPolicy,
+    btc_step_aside_metadata,
+    target_btc_allocation,
+)
 from src.research.accounting import (
     BtcAccumulationAccounting,
     BtcResearchAccounting,
@@ -862,6 +866,24 @@ def test_btc_spot_execution_is_limited_to_owned_inventory_and_quote_proceeds() -
             execution_costs={"fee_bps": 10.0, "slippage_bps": 2.0},
         )
 
+
+def test_btc_step_aside_metadata_binds_lot_and_quote_budget() -> None:
+    metadata = btc_step_aside_metadata(
+        instrument_id="binance:spot:BTCUSDT",
+        current_btc=1.0,
+        target_btc=0.7,
+        price=100.0,
+        stablecoin_balance=10.0,
+        state_id="state-1",
+        fee_bps=10.0,
+        slippage_bps=2.0,
+    )
+
+    assert metadata["btc_cycle_state"] == "step_aside"
+    assert metadata["btc_step_aside_lot_id"]
+    assert metadata["btc_step_aside_sold_quantity"] == pytest.approx(0.3)
+    assert metadata["btc_step_aside_quote_proceeds"] == pytest.approx(29.964006)
+    assert metadata["btc_quote_reinvest_budget"] == pytest.approx(39.964006)
 
 def test_product_objective_rejects_positive_usdt_result_that_loses_btc() -> None:
     assert not objective_passes(

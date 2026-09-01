@@ -21,6 +21,7 @@ from src.products.active_income import ActiveIncomePortfolio
 from src.products.btc_accumulation import (
     BtcAllocationPolicy,
     assert_btc_spot_instrument,
+    btc_step_aside_metadata,
     target_btc_allocation,
 )
 from src.risk.engine import SqlRiskDecisionStore, SqlRiskSnapshotStore
@@ -208,7 +209,8 @@ class DatabasePortfolioTargetBuilder:
     ) -> tuple[tuple[TargetPosition, ...], float, dict[str, float]]:
         instrument_id = assert_btc_spot_instrument(seed.instrument_id)
         price = prices[instrument_id]
-        current_positions[instrument_id] = float(balances.get("BTC", 0.0))
+        current_btc = float(balances.get("BTC", 0.0))
+        current_positions[instrument_id] = current_btc
         equity_btc = balances.get("BTC", 0.0) + balances.get("USDT", 0.0) / price
         if equity_btc <= 0:
             raise ValueError("BTC accumulation equity must be positive")
@@ -218,6 +220,18 @@ class DatabasePortfolioTargetBuilder:
         )
         allocation = target_btc_allocation(forecasts, policy=policy)
         quantity = max(0.0, allocation.target_btc_fraction * equity_btc)
+        costs = product.get("execution_costs")
+        costs = costs if isinstance(costs, Mapping) else {}
+        cycle_metadata = btc_step_aside_metadata(
+            instrument_id=instrument_id,
+            current_btc=current_btc,
+            target_btc=quantity,
+            price=price,
+            stablecoin_balance=float(balances.get("USDT", 0.0)),
+            state_id=state_id,
+            fee_bps=float(costs.get("fee_bps", 0.0)),
+            slippage_bps=float(costs.get("slippage_bps", 0.0)),
+        )
         target = TargetPosition(
             portfolio_id=str(product["portfolio_id"]),
             instrument_id=instrument_id,
@@ -236,6 +250,7 @@ class DatabasePortfolioTargetBuilder:
                 "stablecoin_fraction": allocation.stablecoin_fraction,
                 "quote_currency": "USDT",
                 "actual_stablecoin_balance": balances.get("USDT", 0.0),
+                **cycle_metadata,
             },
         )
         return (target,), equity_btc * price, current_positions
@@ -942,6 +957,14 @@ class DatabasePortfolioWorker:
         allocation = target_btc_allocation(forecasts, policy=btc_policy)
         btc_nav = btc_balance + stablecoin_balance / price
         target_quantity = btc_nav * allocation.target_btc_fraction
+        cycle_metadata = btc_step_aside_metadata(
+            instrument_id=instrument_id,
+            current_btc=btc_balance,
+            target_btc=target_quantity,
+            price=price,
+            stablecoin_balance=stablecoin_balance,
+            state_id=str(payload["event_id"]),
+        )
         target = TargetPosition(
             portfolio_id="btc-accumulation-portfolio",
             instrument_id=instrument_id,
@@ -957,6 +980,7 @@ class DatabasePortfolioWorker:
                 "btc_nav_before_costs": btc_nav,
                 "stablecoin_balance": stablecoin_balance,
                 "stablecoin_per_btc": price,
+                **cycle_metadata,
             },
         )
         return (target,), {instrument_id: price}, {instrument_id: btc_balance}
