@@ -34,10 +34,7 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
     assert "TimeoutStartSec=300" in instance
     assert "TimeoutStopSec=120" in instance
     assert "ExecStartPre=/opt/trading-bot/.venv-runtime/bin/python" in instance
-    assert (
-        'install_platform_unit "$REPO/deploy/systemd/trading-platform@.service"'
-        in installer
-    )
+    assert 'install_platform_unit "$REPO/deploy/systemd/trading-platform@.service"' in installer
     assert "common.env" not in runtime + research + agent + migration
     assert 'install -d -m 0750 -o root -g trading-platform "$REPO/data"' in installer
     assert (
