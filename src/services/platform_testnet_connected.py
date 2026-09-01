@@ -594,6 +594,7 @@ def _perform_connected_round_trip(
             opening_side=opening_side,
             reference_price=reference_price,
             rehearsal_id=rehearsal_id,
+            approved_live=approved_live,
         )
         return {
             "opened": opened,
