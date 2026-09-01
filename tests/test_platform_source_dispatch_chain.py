@@ -11,6 +11,7 @@ from src.data.binance_market import normalise_public_event
 from src.data.database import PlatformDatabase, strategy_definition, strategy_version
 from src.data.feature_store import SqlFeatureStore
 from src.domain._codec import canonical_hash, to_primitive
+from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.domain.instruments import Instrument, MarketType
 from src.domain.market_events import MarketEvent, MarketEventType
 from src.domain.strategies import StrategyDefinition, StrategySourceType
@@ -19,6 +20,7 @@ from src.research.canonical import (
     SqlActiveStrategyAssignmentRepository,
     SqlStrategyArtefactRepository,
 )
+from src.risk.engine import SqlRiskSnapshotStore
 from src.services.data_writer import DatabaseMarketDataWriter
 from src.services.feature_worker import DatabaseFeatureWorker
 from src.services.portfolio_service import SqlPortfolioRepository
@@ -308,6 +310,7 @@ def test_every_promotable_source_type_runs_a_complete_paper_service_chain(
         store=feature_store,
         job_names=("live_feature_calculation",),
         parquet_root=tmp_path / "data",
+        snapshot_store=SqlRiskSnapshotStore(database.engine),
         active_assignments=lambda instrument_id: tuple(
             item
             for item in assignments.active_assignments(product_id)
@@ -353,6 +356,23 @@ def test_every_promotable_source_type_runs_a_complete_paper_service_chain(
         instrument_id=instrument.instrument_id,
     )
     graph_enabled = True
+    if source_type is StrategySourceType.ENSEMBLE:
+        SqlPortfolioRepository(database.engine).save_forecast(
+            AlphaForecast(
+                strategy_version_id="upstream-strategy",
+                product_id=product_id,
+                instrument_id=instrument.instrument_id,
+                direction=ForecastDirection.LONG,
+                score=0.5,
+                expected_return=0.01,
+                confidence=0.8,
+                horizon_seconds=60,
+                valid_from=NOW,
+                valid_until="2026-08-25T01:00:00+00:00",
+                target_volatility=0.1,
+                maximum_position=0.1,
+            )
+        )
     final_event = _candle_event(
         market="futures",
         symbol="BTCUSDT",
@@ -368,6 +388,7 @@ def test_every_promotable_source_type_runs_a_complete_paper_service_chain(
         feature_store=feature_store,
         portfolio=SqlPortfolioRepository(database.engine, require_pipeline_identity=True),
         assignments=assignments,
+        snapshot_store=SqlRiskSnapshotStore(database.engine),
     )
     evaluated = strategy_worker.run_once(now=NOW)
 

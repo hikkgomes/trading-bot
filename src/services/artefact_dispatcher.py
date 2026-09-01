@@ -13,6 +13,13 @@ from src.strategies.behaviour import (
     TypedRuleBehaviour,
     behaviour_hash_for_definition,
 )
+from src.strategies.semantic import (
+    SEMANTIC_STRATEGIES,
+    SemanticEvaluationError,
+    semantic_forecast_from_output,
+    semantic_input_from_features,
+    semantic_strategy_name,
+)
 
 
 class ArtefactDispatchError(RuntimeError):
@@ -38,10 +45,8 @@ class ArtefactDispatcher:
         dispatcher.register("agent_generated_python", _agent_registered_python)
         dispatcher.register("generated_dsl", _generated_dsl)
         dispatcher.register("machine_learning", _machine_learning)
-        dispatcher.register("cross_sectional", _cross_sectional)
-        dispatcher.register("relative_value", _relative_value)
-        dispatcher.register("microstructure", _microstructure)
-        dispatcher.register("ensemble", _ensemble)
+        for source_type in ("cross_sectional", "relative_value", "microstructure", "ensemble"):
+            dispatcher.register(source_type, _semantic)
         return dispatcher
 
     def register(self, source_type: str, evaluator: Evaluator) -> None:
@@ -279,38 +284,33 @@ def _machine_learning(
     return _forecast(score, artefact, confidence=float(model.get("calibration", 0.7)))
 
 
-def _cross_sectional(
-    features: Mapping[str, float], artefact: Mapping[str, Any]
+def _semantic(
+    features: Mapping[str, Any], artefact: Mapping[str, Any]
 ) -> Mapping[str, Any]:
-    return _forecast(_feature(features, "cross_sectional_rank", "funding_rank"), artefact)
-
-
-def _relative_value(
-    features: Mapping[str, float], artefact: Mapping[str, Any]
-) -> Mapping[str, Any]:
-    return _forecast(
-        -_feature(
-            features,
-            "spot_perpetual_basis",
-            "spread_zscore",
-            "basis_zscore",
-            "basis",
-        ),
-        artefact,
+    definition = _definition(artefact)
+    model = definition.get("signal_model")
+    model = model if isinstance(model, Mapping) else {}
+    source_type = str(definition.get("source_type") or "")
+    name = semantic_strategy_name(source_type, model.get("semantic_strategy"))
+    instrument_id = str(
+        features.get("instrument_id")
+        or next(iter(artefact.get("supported_instruments", ())), "")
     )
-
-
-def _microstructure(
-    features: Mapping[str, float], artefact: Mapping[str, Any]
-) -> Mapping[str, Any]:
-    score = 0.5 * _feature(features, "depth_imbalance", "microprice_displacement") + 0.5 * float(
-        features.get("aggressor_flow", 0.0)
+    if not instrument_id:
+        raise ArtefactDispatchError("semantic evaluation requires an instrument identity")
+    try:
+        semantic_input = semantic_input_from_features(name, features)
+        output = SEMANTIC_STRATEGIES.get(name).evaluate(semantic_input)
+        result = semantic_forecast_from_output(
+            output,
+            instrument_id=instrument_id,
+            position_limits=artefact.get("position_limits"),
+        )
+    except (SemanticEvaluationError, KeyError, TypeError, ValueError) as exc:
+        raise ArtefactDispatchError(str(exc)) from exc
+    result["semantic_strategy"] = name
+    result["semantic_input_hash"] = canonical_hash(semantic_input)
+    result["behaviour_hash"] = artefact.get("behaviour_hash") or behaviour_hash_for_definition(
+        definition
     )
-    return _forecast(score, artefact)
-
-
-def _ensemble(features: Mapping[str, float], artefact: Mapping[str, Any]) -> Mapping[str, Any]:
-    values = [float(value) for key, value in features.items() if key.startswith("forecast_")]
-    if not values:
-        values = [_feature(features, "signal", "bar_return")]
-    return _forecast(sum(values) / len(values), artefact)
+    return result

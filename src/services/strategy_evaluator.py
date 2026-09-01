@@ -138,6 +138,8 @@ class DatabaseStrategyEvaluator:
         if feature_ids != tuple(payload["feature_ids"]):
             raise ValueError("feature batch is not the exact immutable input requested")
         features: dict[str, Any] = {value.feature_name: value.value for value in values}
+        features["instrument_id"] = str(payload["instrument_id"])
+        features["information_time"] = at
         self._add_market_frame(features, payload)
         return features, feature_ids
 
@@ -149,6 +151,9 @@ class DatabaseStrategyEvaluator:
         snapshot_values = snapshot.get("values")
         if not isinstance(snapshot_values, Mapping):
             return
+        for name, value in snapshot_values.items():
+            if name != "market_frame" and name not in features:
+                features[str(name)] = value
         market_frame = snapshot_values.get("market_frame")
         if isinstance(market_frame, list | tuple) and market_frame:
             features["market_frame"] = market_frame
@@ -164,7 +169,14 @@ class DatabaseStrategyEvaluator:
         artefact_hash: str,
     ) -> AlphaForecast:
         artefact = self._load_artefact(artefact_hash)
-        forecast_values = dict(self.forecast_fn(features, artefact))
+        evaluation_features = dict(features)
+        definition = artefact.get("definition")
+        source_type = definition.get("source_type") if isinstance(definition, Mapping) else None
+        if str(source_type) == "ensemble":
+            evaluation_features["forecasts"] = self.portfolio.active_forecasts(
+                product_id=str(payload["product_id"]), at=at
+            )
+        forecast_values = dict(self.forecast_fn(evaluation_features, artefact))
         valid_until = (
             (dt.datetime.fromisoformat(at) + dt.timedelta(seconds=int(payload["horizon_seconds"])))
             .replace(microsecond=0)
@@ -190,6 +202,8 @@ class DatabaseStrategyEvaluator:
                 "engine_version": self.engine_version,
                 "assignment_id": assignment["id"],
                 "execution_receipt": forecast_values.get("execution_receipt", {}),
+                "parity_receipt": forecast_values.get("parity_receipt"),
+                "semantic_strategy": forecast_values.get("semantic_strategy"),
             },
         )
 

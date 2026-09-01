@@ -22,6 +22,10 @@ class SemanticFamily(StrEnum):
     EXECUTION_POLICY = "execution_policy"
 
 
+class SemanticEvaluationError(ValueError):
+    """A semantic strategy lacks a complete canonical input or output."""
+
+
 @dataclass(frozen=True)
 class PointInTimePanel:
     information_time: str
@@ -259,6 +263,196 @@ def market_execution(value: TargetDeltaBatch) -> tuple[OrderIntent, ...]:
         current_quantities=value.current_quantities,
         decided_at=value.decided_at,
     )
+
+
+SEMANTIC_DEFAULTS = {
+    "cross_sectional": "relative_momentum",
+    "relative_value": "spot_perpetual_basis",
+    "microstructure": "bid_ask_depth_imbalance",
+    "ensemble": "correlation_aware_ensemble",
+}
+
+
+def semantic_strategy_name(source_type: str, declared: object = None) -> str:
+    name = str(declared or SEMANTIC_DEFAULTS.get(source_type) or "").strip()
+    if not name:
+        raise SemanticEvaluationError("semantic strategy identity is missing")
+    return name
+
+
+def semantic_input_from_features(name: str, features: Mapping[str, Any]) -> Any:
+    """Build the exact typed semantic input from persisted feature inputs."""
+
+    registration = SEMANTIC_STRATEGIES.get(name)
+    raw = features.get("semantic_input")
+    if isinstance(raw, registration.input_type):
+        return raw
+    if isinstance(raw, Mapping):
+        return _semantic_mapping_input(registration, raw)
+    if registration.input_type is PointInTimePanel:
+        return _panel_from_features(features)
+    if registration.input_type is LinkedInstrumentState:
+        return _linked_state_from_features(features)
+    if registration.input_type is MicrostructureState:
+        return _microstructure_from_features(features)
+    if registration.input_type is ForecastCollection:
+        return _forecast_collection_from_features(features)
+    raise SemanticEvaluationError(f"{name} has no typed canonical input")
+
+
+def semantic_forecast_from_output(
+    output: Any,
+    *,
+    instrument_id: str,
+    position_limits: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Map one shared semantic output to the forecast contract."""
+
+    signed = semantic_signal(output, instrument_id=instrument_id)
+    limits = position_limits if isinstance(position_limits, Mapping) else {}
+    maximum = _bounded_float(limits.get("maximum_position", limits.get("maximum_fraction", 0.1)))
+    target_volatility = _bounded_float(limits.get("target_volatility", 0.1))
+    return_scale = _finite_float(limits.get("return_scale", 0.01), field="return_scale")
+    direction = "long" if signed > 0.0 else "short" if signed < 0.0 else "flat"
+    return {
+        "direction": direction,
+        "score": abs(signed),
+        "expected_return": signed * return_scale,
+        "confidence": _bounded_float(limits.get("confidence", 0.7)),
+        "target_volatility": target_volatility,
+        "maximum_position": maximum if direction != "flat" else 0.0,
+        "semantic_signal": signed,
+        "semantic_output_hash": canonical_hash(output),
+    }
+
+
+def semantic_signal(output: Any, *, instrument_id: str) -> float:
+    if isinstance(output, RankedTargets):
+        return _target_value(output.target_fractions, instrument_id)
+    if isinstance(output, HedgedTargets):
+        return _target_value(output.target_notionals, instrument_id)
+    if isinstance(output, MicrostructureForecast):
+        return float(output.score)
+    if isinstance(output, tuple) and all(isinstance(item, AlphaForecast) for item in output):
+        matching = tuple(item for item in output if item.instrument_id == instrument_id)
+        if len(matching) != 1:
+            raise SemanticEvaluationError(
+                "ensemble output must contain exactly one forecast for the instrument"
+            )
+        return matching[0].signed_strength
+    raise SemanticEvaluationError("semantic output cannot produce an instrument forecast")
+
+
+def _semantic_mapping_input(registration: SemanticRegistration[Any, Any], raw: Mapping[str, Any]) -> Any:
+    if registration.input_type is ForecastCollection:
+        forecasts = raw.get("forecasts")
+        if not isinstance(forecasts, list | tuple):
+            raise SemanticEvaluationError("ensemble input has no forecast collection")
+        return ForecastCollection(
+            tuple(
+                item if isinstance(item, AlphaForecast) else AlphaForecast(**dict(item))
+                for item in forecasts
+            )
+        )
+    try:
+        return registration.input_type(**dict(raw))
+    except (TypeError, ValueError) as exc:
+        raise SemanticEvaluationError("semantic input does not match its typed contract") from exc
+
+
+def _panel_from_features(features: Mapping[str, Any]) -> PointInTimePanel:
+    raw = features.get("cross_sectional_values")
+    if not isinstance(raw, Mapping):
+        raise SemanticEvaluationError("cross-sectional input has no point-in-time panel")
+    instruments: dict[str, Mapping[str, float]] = {}
+    for instrument, value in raw.items():
+        if str(instrument).startswith("__"):
+            continue
+        if isinstance(value, Mapping):
+            instruments[str(instrument)] = {
+                str(key): _finite_float(item, field=f"panel.{instrument}.{key}")
+                for key, item in value.items()
+            }
+        else:
+            instruments[str(instrument)] = {
+                "momentum": _finite_float(value, field=f"panel.{instrument}.momentum"),
+                "funding": _finite_float(features.get("funding_rate", 0.0), field="funding_rate"),
+            }
+    information_time = str(features.get("information_time") or "")
+    if len(instruments) < 2 or not information_time:
+        raise SemanticEvaluationError("cross-sectional input needs two instruments and a timestamp")
+    return PointInTimePanel(information_time, instruments)
+
+
+def _linked_state_from_features(features: Mapping[str, Any]) -> LinkedInstrumentState:
+    raw = features.get("linked_instruments")
+    if isinstance(raw, Mapping):
+        legs = {str(key): dict(value) for key, value in raw.items() if isinstance(value, Mapping)}
+    else:
+        legs = {
+            "spot": {"price": _finite_float(features.get("spot_price"), field="spot_price")},
+            "perpetual": {
+                "price": _finite_float(features.get("perpetual_price"), field="perpetual_price"),
+                "beta": _finite_float(features.get("beta", 1.0), field="beta"),
+            },
+        }
+    information_time = str(features.get("information_time") or "")
+    if len(legs) < 2 or not information_time:
+        raise SemanticEvaluationError("relative-value input needs linked legs and a timestamp")
+    return LinkedInstrumentState(information_time, legs)
+
+
+def _microstructure_from_features(features: Mapping[str, Any]) -> MicrostructureState:
+    information_time = str(features.get("information_time") or "")
+    if not information_time:
+        raise SemanticEvaluationError("microstructure input has no information timestamp")
+    return MicrostructureState(
+        information_time=information_time,
+        sequence=int(features.get("sequence", 0)),
+        bid_price=_finite_float(features.get("bid_price"), field="bid_price"),
+        ask_price=_finite_float(features.get("ask_price"), field="ask_price"),
+        bid_depth=_finite_float(features.get("bid_depth"), field="bid_depth"),
+        ask_depth=_finite_float(features.get("ask_depth"), field="ask_depth"),
+        signed_trade_flow=_finite_float(features.get("signed_trade_flow", 0.0), field="signed_trade_flow"),
+    )
+
+
+def _forecast_collection_from_features(features: Mapping[str, Any]) -> ForecastCollection:
+    raw = features.get("forecasts") or features.get("semantic_forecasts")
+    if not isinstance(raw, list | tuple):
+        raise SemanticEvaluationError("ensemble input has no forecast collection")
+    return ForecastCollection(
+        tuple(item if isinstance(item, AlphaForecast) else AlphaForecast(**dict(item)) for item in raw)
+    )
+
+
+def _target_value(values: Mapping[str, float], instrument_id: str) -> float:
+    key = instrument_id
+    if key not in values:
+        market_key = "perpetual" if ":futures:" in instrument_id.casefold() else "spot"
+        matches = tuple(name for name in values if market_key in str(name).casefold())
+        if len(matches) == 1:
+            key = matches[0]
+    if key not in values:
+        raise SemanticEvaluationError(f"semantic output has no target for {instrument_id}")
+    value = float(values[key])
+    if not math.isfinite(value):
+        raise SemanticEvaluationError("semantic target is not finite")
+    return max(-1.0, min(1.0, value))
+
+
+def _finite_float(value: Any, *, field: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise SemanticEvaluationError(f"{field} must be numeric") from exc
+    if not math.isfinite(result):
+        raise SemanticEvaluationError(f"{field} must be finite")
+    return result
+
+
+def _bounded_float(value: Any) -> float:
+    return max(0.0, min(1.0, _finite_float(value, field="semantic limit")))
 
 
 SEMANTIC_STRATEGIES = SemanticStrategyRegistry()

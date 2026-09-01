@@ -383,7 +383,11 @@ class DatabaseFeatureWorker:
                 "instrument_id": str(payload["instrument_id"]),
                 "source_event_time": str(payload["source_event_time"]),
                 "availability_time": str(payload["availability_time"]),
-                "values": {**scalar_inputs, "market_frame": list(market_frame)},
+                "values": {
+                    **{str(key): value for key, value in raw_inputs.items()},
+                    **scalar_inputs,
+                    "market_frame": list(market_frame),
+                },
             },
             created_at=str(payload["availability_time"]),
         )

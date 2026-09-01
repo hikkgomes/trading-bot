@@ -25,8 +25,16 @@ from src.strategies.behaviour import (
     RegisteredStrategyBehaviour,
     StrategyBehaviourError,
     TypedRuleBehaviour,
+    behaviour_hash_for_definition,
 )
-from src.strategies.semantic import SEMANTIC_STRATEGIES
+from src.strategies.semantic import (
+    SEMANTIC_STRATEGIES,
+    SemanticEvaluationError,
+    semantic_forecast_from_output,
+    semantic_input_from_features,
+    semantic_signal,
+    semantic_strategy_name,
+)
 
 
 class ExecutorError(RuntimeError):
@@ -2000,34 +2008,19 @@ def _build_ml_context(candidate: ContextCandidate, context: Mapping[str, Any]) -
 def _build_semantic_context(
     candidate: ContextCandidate, context: Mapping[str, Any]
 ) -> Mapping[str, Any]:
-    name = str(
-        candidate.definition.signal_model.get("semantic_strategy") or candidate.definition.identity
+    model = candidate.definition.signal_model
+    name = semantic_strategy_name(
+        candidate.definition.source_type.value,
+        model.get("semantic_strategy") if isinstance(model, Mapping) else None,
     )
-    registration = SEMANTIC_STRATEGIES.get(name)
     if candidate.definition.source_type is StrategySourceType.MICROSTRUCTURE and not context.get(
         "event_data_segment_ids"
     ):
         raise ExecutorError("microstructure context needs immutable event-data segments")
-    raw = context.get("semantic_input")
-    if isinstance(raw, registration.input_type):
-        value = raw
-    elif isinstance(raw, Mapping):
-        if registration.input_type.__name__ == "ForecastCollection":
-            from src.domain.forecasts import AlphaForecast
-
-            forecasts = raw.get("forecasts")
-            if not isinstance(forecasts, list | tuple):
-                raise ExecutorError("ensemble context has no alpha forecasts")
-            value = registration.input_type(
-                tuple(
-                    item if isinstance(item, AlphaForecast) else AlphaForecast(**dict(item))
-                    for item in forecasts
-                )
-            )
-        else:
-            value = registration.input_type(**dict(raw))
-    else:
-        raise ExecutorError(f"{name} context has no typed semantic input")
+    try:
+        value = semantic_input_from_features(name, context)
+    except (SemanticEvaluationError, KeyError, TypeError, ValueError) as exc:
+        raise ExecutorError(str(exc)) from exc
     return {**dict(context), "semantic_input": value}
 
 
@@ -2119,14 +2112,68 @@ def execute_agent_generated_python(
 
 
 def _execute_semantic(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
-    name = str(
-        candidate.definition.signal_model.get("semantic_strategy") or candidate.definition.identity
+    model = candidate.definition.signal_model
+    name = semantic_strategy_name(
+        candidate.definition.source_type.value,
+        model.get("semantic_strategy") if isinstance(model, Mapping) else None,
     )
-    semantic_input = context.get("semantic_input")
-    if semantic_input is None:
-        raise ExecutorError("semantic execution requires a typed canonical input")
-    output = SEMANTIC_STRATEGIES.get(name).evaluate(semantic_input)
-    return _measured_result(candidate, context, output)
+    try:
+        semantic_input = semantic_input_from_features(name, context)
+        output = SEMANTIC_STRATEGIES.get(name).evaluate(semantic_input)
+        instrument_id = _semantic_instrument_id(candidate, context, output)
+        forecast = semantic_forecast_from_output(
+            output,
+            instrument_id=instrument_id,
+            position_limits=(
+                context.get("position_limits")
+                if isinstance(context.get("position_limits"), Mapping)
+                else candidate.definition.position_model
+            ),
+        )
+        signal = semantic_signal(output, instrument_id=instrument_id)
+    except (SemanticEvaluationError, KeyError, TypeError, ValueError) as exc:
+        raise ExecutorError(str(exc)) from exc
+    parity_payload = {
+        "schema": "semantic_parity/v1",
+        "strategy": name,
+        "input_hash": canonical_hash(semantic_input),
+        "output_hash": canonical_hash(output),
+        "instrument_id": instrument_id,
+        "signal": signal,
+    }
+    parity = {**parity_payload, "receipt_hash": canonical_hash(parity_payload)}
+    return _measured_result(
+        candidate,
+        {
+            **context,
+            "signals": context.get("signals") or [signal],
+            "behaviour_hash": behaviour_hash_for_definition(candidate.definition),
+            "parity_receipt": parity,
+        },
+        forecast,
+    )
+
+
+def _semantic_instrument_id(candidate: Candidate, context: Mapping[str, Any], output: Any) -> str:
+    explicit = str(context.get("instrument_id") or "").strip()
+    if explicit:
+        return explicit
+    scope = context.get("instrument_scope")
+    if isinstance(scope, list | tuple) and scope:
+        return str(scope[0])
+    universe = candidate.definition.universe
+    for field in ("instrument_ids", "symbols"):
+        values = universe.get(field) if isinstance(universe, Mapping) else None
+        if isinstance(values, list | tuple) and values:
+            return str(values[0])
+    for field in ("target_fractions", "target_notionals"):
+        values = getattr(output, field, None)
+        if isinstance(values, Mapping) and values:
+            return str(next(iter(values)))
+    forecasts = output if isinstance(output, tuple) else ()
+    if forecasts and hasattr(forecasts[0], "instrument_id"):
+        return str(forecasts[0].instrument_id)
+    raise ExecutorError("semantic execution requires an instrument identity")
 
 
 def execution_receipt(
