@@ -926,7 +926,8 @@ def _readiness_inventory(
                 .where(
                     service_heartbeat.c.service_name.in_(
                         ("platform-scheduler", "account-reconciliation")
-                    )
+                    ),
+                    service_heartbeat.c.observed_at <= current,
                 )
                 .order_by(service_heartbeat.c.observed_at.desc())
             )
@@ -1065,6 +1066,8 @@ def _heartbeat_readiness(
 ) -> dict[str, Any]:
     latest: dict[str, Mapping[str, Any]] = {}
     for row in rows:
+        if timestamp(str(row["observed_at"]), field="heartbeat.observed_at") > current:
+            continue
         latest.setdefault(str(row["service_name"]), row)
     details: dict[str, Any] = {}
     ok = True
