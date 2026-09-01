@@ -72,8 +72,8 @@
     "sql_pool_size": 2
   },
   "security_domains": {
-    "trading-runtime": ["market-gateway", "data-writer", "feature-service", "strategy-evaluator", "portfolio-engine", "portfolio-state-service", "risk-engine", "execution-engine", "paper-engine", "product-supervisor", "accounting-service", "account-reconciliation", "promotion-engine", "control-api", "universe-service", "platform-scheduler"],
-    "trading-research": ["research-worker", "ml-worker", "event-replay-worker", "feature-build-worker", "report-worker"],
+    "trading-runtime": ["market-gateway", "data-writer", "feature-service", "strategy-evaluator", "portfolio-engine", "portfolio-state-service", "risk-engine", "execution-engine", "paper-engine", "product-supervisor", "accounting-service", "account-reconciliation", "control-api", "universe-service", "platform-scheduler"],
+    "trading-research": ["promotion-engine", "research-worker", "ml-worker", "event-replay-worker", "feature-build-worker", "report-worker"],
     "trading-agent": ["agent-sandbox"],
     "trading-migration": ["migration-service"]
   },
