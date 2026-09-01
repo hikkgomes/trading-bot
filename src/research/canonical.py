@@ -758,11 +758,9 @@ def _prepare_summary_payload(
             "elapsed_days": _finite_nonnegative(
                 payload.get("elapsed_days", 0.0), field="summary elapsed days"
             ),
-            "independent_decisions": int(
-                _finite_nonnegative(
-                    payload.get("independent_decisions", 0),
-                    field="summary independent decisions",
-                )
+            "independent_decisions": _summary_integer(
+                payload.get("independent_decisions", 0),
+                field="summary independent decisions",
             ),
             "net_pnl": _finite_number(payload.get("net_pnl", 0.0), field="summary net_pnl"),
         }

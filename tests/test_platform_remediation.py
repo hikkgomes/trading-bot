@@ -38,6 +38,7 @@ from src.research.accounting import (
     ProductAccountingError,
 )
 from src.research.artefacts import StrategyArtefact
+from src.research.canonical import CanonicalEvidenceError, _prepare_summary_payload
 from src.research.catalogue import registered_strategy_candidates
 from src.research.coordinator import ResearchCoordinator
 from src.research.dataset_service import DatabaseDatasetBundleService, _bounded_instrument_rows
@@ -83,6 +84,22 @@ from src.services.scheduler import ClaimedJob, DatabaseJobQueue, PlatformSchedul
 from src.strategies.behaviour import RegisteredStrategyBehaviour, TypedRuleBehaviour
 
 NOW = "2026-08-30T10:00:00+00:00"
+
+
+def test_forward_summary_rejects_fractional_independent_decisions() -> None:
+    identity = "sha256:" + "a" * 64
+
+    with pytest.raises(CanonicalEvidenceError, match="independent decisions must be an integer"):
+        _prepare_summary_payload(
+            strategy_version_id="strategy:v1",
+            product_id="active_income",
+            observed_at=NOW,
+            artefact_hash=identity,
+            evidence={
+                "independent_decisions": 1.5,
+                "observation_ids": [identity],
+            },
+        )
 
 
 def test_job_retries_end_in_a_durable_dead_letter_state(tmp_path) -> None:
