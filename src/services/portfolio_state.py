@@ -277,6 +277,7 @@ class DatabasePortfolioSourceService:
                     "stablecoin_per_btc": price,
                 },
                 passive_benchmark_nav=passive,
+                portfolio_id=str(product["portfolio_id"]),
             )
         if product_id != "active_income":
             return None
@@ -303,6 +304,7 @@ class DatabasePortfolioSourceService:
                 "cash_balance": float(balances.get("USDT", 0.0)),
                 "position_count": len(position_terms),
             },
+            portfolio_id=str(product["portfolio_id"]),
         )
 
     def _position_terms(self, portfolio_id: str, at: str) -> dict[str, tuple[float, float]]:

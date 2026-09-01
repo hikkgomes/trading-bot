@@ -156,7 +156,11 @@ class ForwardEvidenceCollector:
             start=window_start,
             at=evaluated_at,
         )
-        nav_rows = self._nav_rows(product_id=product_id, at=evaluated_at)
+        nav_rows = self._nav_rows(
+            product_id=product_id,
+            portfolio_id=str(assignment.get("portfolio_id") or ""),
+            at=evaluated_at,
+        )
         reconciliations = self._reconciliation_rows(
             product_id=product_id,
             instrument_id=instrument_id,
@@ -384,7 +388,9 @@ class ForwardEvidenceCollector:
             and str(row["payload"].get("instrument_id")) == instrument_id
         )
 
-    def _nav_rows(self, *, product_id: str, at: str) -> tuple[Mapping[str, Any], ...]:
+    def _nav_rows(
+        self, *, product_id: str, portfolio_id: str, at: str
+    ) -> tuple[Mapping[str, Any], ...]:
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(nav_snapshot.c.id, nav_snapshot.c.created_at, nav_snapshot.c.payload)
@@ -396,6 +402,7 @@ class ForwardEvidenceCollector:
             for row in rows
             if isinstance(row["payload"], Mapping)
             and str(row["payload"].get("product_id")) == product_id
+            and (not portfolio_id or str(row["payload"].get("portfolio_id") or "") == portfolio_id)
         )
 
     def _reconciliation_rows(
@@ -532,9 +539,7 @@ class ForwardEvidenceCollector:
         return max(0.0, worst)
 
     @staticmethod
-    def _nav_drawdown(
-        rows: tuple[Mapping[str, Any], ...], *, start: str, at: str
-    ) -> float:
+    def _nav_drawdown(rows: tuple[Mapping[str, Any], ...], *, start: str, at: str) -> float:
         points: list[tuple[str, float]] = []
         for row in rows:
             payload = row["payload"]
@@ -643,17 +648,6 @@ class ForwardEvidenceCollector:
     ) -> tuple[str, float | None, float | None, float | None, float | None, tuple[str, ...]]:
         nav_points = self._objective_nav_points(nav_rows, start=artefact_created_at)
         if product_id == "active_income":
-            if nav_points is not None:
-                initial, final, source_ids = nav_points
-                excess = final - initial
-                return (
-                    "USDT",
-                    final,
-                    initial,
-                    excess,
-                    excess / initial if initial > 0.0 else None,
-                    source_ids,
-                )
             initial = self._starting_equity(product_id, assignment, at=artefact_created_at)
             excess = self._ledger_pnl(ledger_rows)
             return (

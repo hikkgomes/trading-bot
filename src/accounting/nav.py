@@ -16,6 +16,7 @@ class NavSnapshot:
     observed_at: str
     components: Mapping[str, float]
     passive_benchmark_nav: float | None = None
+    portfolio_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "product_id", non_empty(self.product_id, field="product_id"))
@@ -38,6 +39,10 @@ class NavSnapshot:
                 self,
                 "passive_benchmark_nav",
                 finite(self.passive_benchmark_nav, field="passive_benchmark_nav", minimum=0.0),
+            )
+        if self.portfolio_id is not None:
+            object.__setattr__(
+                self, "portfolio_id", non_empty(self.portfolio_id, field="portfolio_id")
             )
 
 
