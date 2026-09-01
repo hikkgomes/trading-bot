@@ -902,9 +902,7 @@ def _futures_return_ledger(
         "effective_observations": observations,
         "turnover_notional": turnover_notional,
         "implementation_shortfall": fees + slippage,
-        "capital_efficiency": (
-            net_pnl / turnover_notional if turnover_notional > 0.0 else 0.0
-        ),
+        "capital_efficiency": (net_pnl / turnover_notional if turnover_notional > 0.0 else 0.0),
         "funding_adjusted_expectancy": net_pnl / observations if observations > 0 else 0.0,
         "margin_mode": "isolated",
         "target_notional": None,

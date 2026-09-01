@@ -103,14 +103,13 @@ class PositionReturnLedger:
             position * market_return
             for position, market_return in zip(held_positions, held_returns, strict=False)
         )
-        period_turnover = [
-            abs(position_values[index + 1] - position_values[index])
-            for index in range(aligned)
+        period_turnover_values = [
+            abs(position_values[index + 1] - position_values[index]) for index in range(aligned)
         ]
         if initial_position is not None and aligned:
             initial_values = _series((initial_position,), field="initial_position")
-            period_turnover[0] += abs(position_values[0] - initial_values[0])
-        period_turnover = tuple(period_turnover)
+            period_turnover_values[0] += abs(position_values[0] - initial_values[0])
+        period_turnover = tuple(period_turnover_values)
         turnover = sum(period_turnover)
         fee_rate = _rate(self.fee_rate, field="fee_rate")
         slippage_rate = _rate(self.slippage_rate, field="slippage_rate")

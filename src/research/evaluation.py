@@ -1914,7 +1914,8 @@ class CanonicalResearchEvaluator:
             field
             for field in required_fields
             if field not in evidence_status
-            or field not in policy_fields and field != "objective_excess_fraction"
+            or field not in policy_fields
+            and field != "objective_excess_fraction"
         ]
         decision = self.evidence_policy.decide(
             stage,

@@ -257,8 +257,7 @@ class ForwardEvidenceCollector:
             evidence_days=max(
                 0.0,
                 (
-                    dt.datetime.fromisoformat(evaluated_at)
-                    - dt.datetime.fromisoformat(created)
+                    dt.datetime.fromisoformat(evaluated_at) - dt.datetime.fromisoformat(created_at)
                 ).total_seconds()
                 / 86_400,
             ),

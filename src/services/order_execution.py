@@ -1467,10 +1467,7 @@ def _assert_btc_quote_capacity(
     if not math.isfinite(price) or price <= 0:
         raise ValueError("BTC spot execution price is invalid")
     buy_cost = sum(
-        order.quantity
-        * price
-        * (1.0 + slippage_bps / 10_000.0)
-        * (1.0 + fee_bps / 10_000.0)
+        order.quantity * price * (1.0 + slippage_bps / 10_000.0) * (1.0 + fee_bps / 10_000.0)
         for order in orders
         if order.side is OrderSide.BUY
     )
