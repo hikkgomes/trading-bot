@@ -253,7 +253,11 @@ class SqlResearchStore:
 
     def load_candidates(self) -> tuple[Candidate, ...]:
         with self.engine.connect() as connection:
-            rows = connection.execute(select(experiment).order_by(experiment.c.id)).mappings()
+            rows = connection.execute(
+                select(experiment)
+                .where(experiment.c.state != "legacy_import")
+                .order_by(experiment.c.id)
+            ).mappings()
             return tuple(self._candidate_from_row(connection, row) for row in rows)
 
     def get_candidate(self, candidate_id: str) -> Candidate:
@@ -265,6 +269,8 @@ class SqlResearchStore:
             )
             if row is None:
                 raise KeyError(f"research candidate does not exist: {candidate_id}")
+            if row["state"] == "legacy_import":
+                raise KeyError(f"research candidate is immutable legacy history: {candidate_id}")
             candidate = self._candidate_from_row(connection, row)
             if candidate.candidate_id != candidate_id:
                 raise ValueError("persisted research candidate identity does not match its payload")

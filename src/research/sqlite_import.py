@@ -373,7 +373,7 @@ def _import_strategy_row(target, row: sqlite3.Row, evaluation_rows: Iterable[sql
             "id": _experiment_id(behavior_hash),
             "strategy_version_id": _strategy_version_id(row),
             "provider": "legacy_sqlite_import",
-            "state": "queued",
+            "state": "legacy_import",
             "submitted_at": _timestamp(row["created_at"]),
             "dataset_snapshot_hashes": _strategy_snapshot_ids(evaluation_rows, behavior_hash)
             or [behavior_hash],
