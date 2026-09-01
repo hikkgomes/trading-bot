@@ -516,12 +516,18 @@ class DatabasePlatformReport:
 
     def _missing_risk_data(self) -> dict[str, Any]:
         missing: list[dict[str, Any]] = []
+        latest: dict[str, dict[str, Any]] = {}
         for row in self._rows(risk_snapshot, order_by=risk_snapshot.c.created_at.desc()):
             payload = row.get("payload")
             if not isinstance(payload, Mapping):
                 continue
             if payload.get("kind") != "canonical_portfolio_risk_state":
                 continue
+            product_id = str(payload.get("product_id") or "")
+            if product_id and product_id not in latest:
+                latest[product_id] = row
+        for row in latest.values():
+            payload = row["payload"]
             values = payload.get("risk_data_missing")
             if payload.get("risk_data_available") is False or values:
                 missing.append(

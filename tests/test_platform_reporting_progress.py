@@ -185,6 +185,39 @@ def test_report_exposes_funnel_and_operational_sli_state(tmp_path) -> None:
     database.dispose()
 
 
+def test_report_only_alerts_on_latest_missing_risk_state(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'risk-report.sqlite3'}")
+    database.create_schema()
+    with database.engine.begin() as connection:
+        connection.execute(
+            risk_snapshot.insert().values(
+                id="risk-old",
+                created_at="2026-08-31T09:00:00+00:00",
+                payload={
+                    "kind": "canonical_portfolio_risk_state",
+                    "product_id": "active_income",
+                    "risk_data_available": False,
+                    "risk_data_missing": ["beta:ETHUSDT"],
+                },
+            )
+        )
+        connection.execute(
+            risk_snapshot.insert().values(
+                id="risk-new",
+                created_at=NOW,
+                payload={
+                    "kind": "canonical_portfolio_risk_state",
+                    "product_id": "active_income",
+                    "risk_data_available": True,
+                    "risk_data_missing": [],
+                },
+            )
+        )
+
+    assert DatabasePlatformReport(database.engine)._missing_risk_data()["count"] == 0
+    database.dispose()
+
+
 def test_report_worker_alerts_on_funnel_and_live_safety_slis(tmp_path) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'sli-alerts.sqlite3'}")
     database.create_schema()
