@@ -87,6 +87,10 @@ Only the runtime environment may contain exchange credentials. Research and
 agent processes cannot submit exchange orders. Never include environment-file
 contents in an audit archive.
 
+Use separate API keys for the spot and futures production accounts. Connected
+testnet rehearsals must use dedicated testnet keys and a testnet account
+configuration. Testnet keys must never be copied into production account files.
+
 ## 4. Start the platform
 
 The code remains modular, but units follow privilege and failure domains.

@@ -1043,8 +1043,8 @@ def test_live_readiness_accepts_exact_connected_authority(tmp_path: Path, monkey
     assert assignment is not None
     gate_now = "2026-08-27T10:00:01+00:00"
     artefact = SqlStrategyArtefactRepository(database.engine).get(str(assignment["artefact_hash"]))
-    monkeypatch.setenv("BINANCE_API_KEY", "test-key")
-    monkeypatch.setenv("BINANCE_API_SECRET", "test-secret")
+    monkeypatch.setenv(str(account["api_key_env"]), "test-key")
+    monkeypatch.setenv(str(account["api_secret_env"]), "test-secret")
     monkeypatch.setenv("TRADING_LIVE", "1")
     monkeypatch.setenv("EXCHANGE_TESTNET", "0")
     monkeypatch.setenv("TRADING_PLATFORM_REHEARSAL_SIGNING_KEY", "test-signing-key")

@@ -11,8 +11,8 @@
       "environment": "production",
       "maximum_leverage": 1.0,
       "margin_mode": "cash",
-      "api_key_env": "BINANCE_API_KEY",
-      "api_secret_env": "BINANCE_API_SECRET",
+      "api_key_env": "BINANCE_SPOT_API_KEY",
+      "api_secret_env": "BINANCE_SPOT_API_SECRET",
       "paper_starting_balances": {"BTC": 0.01, "USDT": 1000.0},
       "paper_starting_positions": {},
       "paper_capital_limit": 1000.0
@@ -27,8 +27,8 @@
       "environment": "production",
       "maximum_leverage": 3.0,
       "margin_mode": "isolated",
-      "api_key_env": "BINANCE_API_KEY",
-      "api_secret_env": "BINANCE_API_SECRET",
+      "api_key_env": "BINANCE_FUTURES_API_KEY",
+      "api_secret_env": "BINANCE_FUTURES_API_SECRET",
       "paper_starting_balances": {"USDT": 10000.0},
       "paper_starting_positions": {},
       "paper_capital_limit": 10000.0

@@ -81,8 +81,8 @@ def _fixture(tmp_path: Path, monkeypatch) -> tuple[PlatformDatabase, PlatformLiv
         if item["account_id"] == product["account_id"]
     )
     account["environment"] = "testnet"
-    monkeypatch.setenv("BINANCE_API_KEY", "testnet-key")
-    monkeypatch.setenv("BINANCE_API_SECRET", "testnet-secret")
+    monkeypatch.setenv(str(account["api_key_env"]), "testnet-key")
+    monkeypatch.setenv(str(account["api_secret_env"]), "testnet-secret")
     monkeypatch.setenv("TRADING_LIVE", "1")
     monkeypatch.setenv("EXCHANGE_TESTNET", "1")
     fingerprint = ExchangeConfig(
