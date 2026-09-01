@@ -298,22 +298,6 @@ class PlatformConfig:
         for node in self.nodes:
             if node.node_id == node_id:
                 return node
-        if node_id == "macbook-research":
-            # Compatibility alias for older local service-runtime fixtures.
-            # It is not part of platform/v2 and is always a non-authoritative
-            # Linux research worker.
-            return NodeConfig(
-                node_id=node_id,
-                operating_system="linux",
-                production_authority=False,
-                services=(
-                    "research-worker",
-                    "ml-worker",
-                    "event-replay-worker",
-                    "feature-build-worker",
-                    "report-worker",
-                ),
-            )
         raise ValueError(f"unknown node_id: {node_id}")
 
     def assert_service_assignment(self, *, node_id: str, service: str) -> NodeConfig:

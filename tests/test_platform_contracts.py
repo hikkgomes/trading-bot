@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -1408,6 +1409,17 @@ def test_bar_engine_rebalances_multi_symbol_targets_with_costs_and_funding():
 
 def test_split_configuration_assigns_every_service_and_blocks_mac_execution():
     config = load_platform_config()
+    non_authoritative = replace(
+        config,
+        nodes=(
+            replace(
+                config.node("linux-optiplex"),
+                node_id="research-fixture",
+                production_authority=False,
+                services=("research-worker",),
+            ),
+        ),
+    )
 
     assert config.node("linux-optiplex").production_authority is True
     assert set(load_split_configuration()) == {
@@ -1419,7 +1431,9 @@ def test_split_configuration_assigns_every_service_and_blocks_mac_execution():
         "risk",
     }
     with pytest.raises(PermissionError, match="not assigned"):
-        config.assert_service_assignment(node_id="macbook-research", service="execution-engine")
+        non_authoritative.assert_service_assignment(
+            node_id="research-fixture", service="execution-engine"
+        )
     with pytest.raises(ValueError, match="PostgreSQL"):
         config.database_url({config.database_url_env: "sqlite:///platform.db"})
     with pytest.raises(ValueError, match="TLS"):
@@ -1450,7 +1464,7 @@ def test_platform_configuration_rejects_execution_on_non_linux_authority():
                 "node_id": "linux",
                 "operating_system": "linux",
                 "production_authority": False,
-                "services": sorted(load_platform_config().node("macbook-research").services),
+                "services": ["research-worker"],
             },
         ],
         "postgresql": {"url_env": "DATABASE_URL"},
@@ -1482,9 +1496,20 @@ def test_service_runtime_persists_health_and_enforces_order_authority(tmp_path: 
         service_name="execution-engine",
         heartbeat_store=store,
     )
+    research_config = replace(
+        load_platform_config(),
+        nodes=(
+            replace(
+                load_platform_config().node("linux-optiplex"),
+                node_id="research-fixture",
+                production_authority=False,
+                services=("research-worker",),
+            ),
+        ),
+    )
     research = ServiceRuntime(
-        config=load_platform_config(),
-        node_id="macbook-research",
+        config=research_config,
+        node_id="research-fixture",
         service_name="research-worker",
         heartbeat_store=store,
     )
@@ -2711,7 +2736,7 @@ def test_live_and_historical_feature_workers_produce_the_same_values(tmp_path: P
     ):
         queue.register_worker(
             worker_id=worker_id,
-            node_id="linux-optiplex" if worker_id.startswith("linux") else "macbook-research",
+            node_id="linux-optiplex",
             role=role,
             capabilities=(capability,),
             observed_at=NOW,
@@ -3028,7 +3053,7 @@ def test_openclaw_context_excludes_holdout_and_agent_jobs_are_bounded(tmp_path: 
     )
     queue.register_worker(
         worker_id="mac-agent",
-        node_id="macbook-research",
+        node_id="linux-optiplex",
         role="agent-sandbox",
         capabilities=("agent_research",),
         observed_at=NOW,
