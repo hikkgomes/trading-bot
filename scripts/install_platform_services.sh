@@ -122,6 +122,8 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   setfacl -m u:trading-agent:rwx "$REPO/runtime/agent-worktrees"
   install_platform_unit "$REPO/deploy/systemd/trading-platform-migration.service" \
     /etc/systemd/system/trading-platform-migration.service
+  install_platform_unit "$REPO/deploy/systemd/trading-platform@.service" \
+    /etc/systemd/system/trading-platform@.service
   install_platform_unit "$REPO/deploy/systemd/trading-platform-runtime.service" \
     /etc/systemd/system/trading-platform-runtime.service
   install_platform_unit "$REPO/deploy/systemd/trading-platform-research.service" \

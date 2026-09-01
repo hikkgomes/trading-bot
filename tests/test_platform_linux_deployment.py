@@ -17,6 +17,7 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
     agent = (ROOT / "deploy/systemd/trading-platform-agent.service").read_text()
     control = (ROOT / "deploy/systemd/trading-platform-control.service").read_text()
     migration = (ROOT / "deploy/systemd/trading-platform-migration.service").read_text()
+    instance = (ROOT / "deploy/systemd/trading-platform@.service").read_text()
 
     assert "trading-platform" in installer
     assert 'REPO="${REPO:-/home/alfred/trading-bot}"' in installer
@@ -30,6 +31,13 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
     assert "EnvironmentFile=/etc/trading-platform/agent.env" in agent
     assert "EnvironmentFile=/etc/trading-platform/runtime.env" in control
     assert "EnvironmentFile=/etc/trading-platform/migration.env" in migration
+    assert "TimeoutStartSec=300" in instance
+    assert "TimeoutStopSec=120" in instance
+    assert "ExecStartPre=/opt/trading-bot/.venv-runtime/bin/python" in instance
+    assert (
+        'install_platform_unit "$REPO/deploy/systemd/trading-platform@.service"'
+        in installer
+    )
     assert "common.env" not in runtime + research + agent + migration
     assert 'install -d -m 0750 -o root -g trading-platform "$REPO/data"' in installer
     assert (
