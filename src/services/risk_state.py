@@ -271,12 +271,14 @@ class PortfolioRiskCalculator:
                 .order_by(position.c.created_at.desc(), position.c.id.desc())
             ).scalars()
         result: dict[str, tuple[float, float]] = {}
+        seen: set[str] = set()
         for payload in rows:
             if not isinstance(payload, Mapping) or str(payload.get("portfolio_id")) != portfolio_id:
                 continue
             instrument_id = str(payload.get("instrument_id") or "")
-            if not instrument_id or instrument_id in result:
+            if not instrument_id or instrument_id in seen:
                 continue
+            seen.add(instrument_id)
             quantity = _finite_number(payload.get("quantity", 0.0), "position quantity")
             if abs(quantity) <= 1e-12:
                 continue

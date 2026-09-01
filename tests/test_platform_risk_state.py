@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from src.accounting.ledger import Ledger, SqlLedgerStore
-from src.data.database import PlatformDatabase, account_snapshot, nav_snapshot
+from src.data.database import PlatformDatabase, account_snapshot, nav_snapshot, position
 from src.domain._codec import canonical_hash
 from src.risk.engine import SqlRiskSnapshotStore
 from src.services.portfolio_engine import _validate_state_health
@@ -236,4 +236,42 @@ def test_risk_measurements_use_canonical_nav_for_open_position_loss(tmp_path) ->
 
     assert measurements.product_drawdown_fraction == pytest.approx(0.05)
     assert measurements.daily_pnl_fraction == pytest.approx(-0.05)
+    database.dispose()
+
+
+def test_latest_flat_position_does_not_reuse_an_older_entry_price(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'risk-position-history.sqlite3'}")
+    database.create_schema()
+    with database.engine.begin() as connection:
+        connection.execute(
+            position.insert().values(
+                id="position-open",
+                created_at="2026-08-30T00:00:00+00:00",
+                payload={
+                    "portfolio_id": "portfolio-active-income",
+                    "instrument_id": "BTCUSDT",
+                    "quantity": 1.0,
+                    "average_entry_price": 100.0,
+                },
+            )
+        )
+        connection.execute(
+            position.insert().values(
+                id="position-flat",
+                created_at="2026-08-30T01:00:00+00:00",
+                payload={
+                    "portfolio_id": "portfolio-active-income",
+                    "instrument_id": "BTCUSDT",
+                    "quantity": 0.0,
+                    "average_entry_price": 100.0,
+                },
+            )
+        )
+
+    assert (
+        PortfolioRiskCalculator(database.engine)._position_terms(
+            portfolio_id="portfolio-active-income", at="2026-08-30T01:00:00+00:00"
+        )
+        == {}
+    )
     database.dispose()
