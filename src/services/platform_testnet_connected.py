@@ -26,10 +26,12 @@ from src.data.event_capture import load_event_capture_config
 from src.data.feature_store import SqlFeatureStore
 from src.domain._codec import canonical_hash
 from src.domain.forecasts import AlphaForecast, ForecastDirection
+from src.domain.instruments import MarketType, canonical_instrument_id
 from src.domain.orders import OrderIntent, OrderSide, OrderStatus, OrderType
 from src.execution.broker import Order as BrokerOrder
 from src.execution.broker import OrderSide as BrokerOrderSide
 from src.execution.broker import OrderType as BrokerOrderType
+from src.execution.ccxt_broker import CcxtBroker
 from src.execution.order_manager import OrderManager, SqlOrderStore
 from src.execution.position_manager import PositionManager, SqlPositionStore
 from src.observability.decision_trace import SqlDecisionTraceStore
@@ -43,7 +45,11 @@ from src.services.accounting_service import AccountingService, DatabaseAccountin
 from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.config import load_platform_config, load_split_configuration
 from src.services.health import DatabaseHeartbeatStore
-from src.services.live_execution import ApprovedLiveExecution, execution_engine_identity
+from src.services.live_execution import (
+    ApprovedLiveExecution,
+    _exchange_config,
+    execution_engine_identity,
+)
 from src.services.market_gateway import DatabaseMarketGateway, UserStreamAccount
 from src.services.order_execution import DatabaseLiveExecutionWorker, DatabaseUserStreamWorker
 from src.services.portfolio_engine import (
@@ -157,6 +163,7 @@ def run_connected_testnet_rehearsal(
         quantity = runtime["quantity"]
         opening_side = runtime["opening_side"]
         accounting_before = runtime["accounting_before"]
+        now = runtime["now"]
         gateway = runtime["gateway"]
         user_stream_worker = runtime["user_stream_worker"]
         accounting_worker = runtime["accounting_worker"]
@@ -356,6 +363,12 @@ def _prepare_rehearsal_runtime(
     _assert_initial_account_clean(initial_account, account=account)
     account_detail = initial_account["accounts"][0]
     initial_positions = dict(account_detail.get("positions") or {})
+    market = "spot" if account.get("market") == "spot" else "futures"
+    market_symbol = str((product.get("live_exchange_symbols") or ["BTCUSDT"])[0])
+    market_price = CcxtBroker(_exchange_config(account, market=market)).get_price(market_symbol)
+    if market_price <= 0:
+        raise ConnectedTestnetError("testnet market price is not positive")
+    now = utc_now()
     state = _refresh_reconciled_state(
         database=database,
         queue=queue,
@@ -365,6 +378,8 @@ def _prepare_rehearsal_runtime(
         accounts=accounts,
         reconciled_at=now,
         account_fingerprint=str(account_detail["account_fingerprint"]),
+        market_symbol=market_symbol,
+        market_price=market_price,
     )
     if not state:
         raise ConnectedTestnetError("no reconciled canonical portfolio/risk state is available")
@@ -431,6 +446,7 @@ def _prepare_rehearsal_runtime(
         "quantity": quantity,
         "opening_side": opening_side,
         "accounting_before": accounting_before,
+        "now": now,
         "gateway": gateway,
         "user_stream_worker": user_stream_worker,
         "accounting_worker": accounting_worker,
@@ -728,8 +744,36 @@ def _refresh_reconciled_state(
     accounts: Mapping[str, Mapping[str, Any]],
     reconciled_at: str,
     account_fingerprint: str,
+    market_symbol: str,
+    market_price: float,
 ) -> dict[str, Any]:
     store = SqlRiskSnapshotStore(database.engine)
+    is_spot = accounts[str(product["account_id"])].get("market") == "spot"
+    instrument_id = canonical_instrument_id(
+        market_symbol,
+        market_type=MarketType.SPOT if is_spot else MarketType.FUTURES,
+        settlement_asset=(
+            None
+            if is_spot
+            else str(accounts[str(product["account_id"])].get("settlement_assets", ["USDT"])[0])
+        ),
+    )
+    store.save(
+        {
+            "kind": "market_data_input",
+            "product_id": product_id,
+            "instrument_id": instrument_id,
+            "observed_at": reconciled_at,
+            "values": {
+                "close": float(market_price),
+                "spread_bps": 1.0,
+                "visible_depth": 100_000_000.0,
+                "volatility": 0.2,
+                "funding": 0.0,
+            },
+        },
+        created_at=reconciled_at,
+    )
     DatabaseHeartbeatStore(database.engine).record(
         service_name="connected-testnet",
         node_id=_HEALTH_NODE_ID,
