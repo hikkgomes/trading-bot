@@ -64,6 +64,7 @@ from src.research.returns import PositionReturnLedger
 from src.research.store import SqlResearchStore
 from src.research.theses import SqlThesisRegistry
 from src.services.artefact_dispatcher import ArtefactDispatcher
+from src.services.forward_metrics import ForwardEvidenceCollector
 from src.services.order_execution import _validate_btc_spot_orders
 from src.services.readiness import _dataset_readiness, _ready_dataset_roles
 from src.services.research_jobs import DatabaseResearchJobHandlers
@@ -775,6 +776,31 @@ def test_executor_does_not_charge_non_event_funding_quotes() -> None:
 
     assert accounting is not None
     assert accounting["funding_pnl"] == pytest.approx(0.0)
+
+
+def test_forward_metrics_use_canonical_nav_for_drawdown() -> None:
+    rows = (
+        {
+            "id": "nav-1",
+            "created_at": NOW,
+            "payload": {"product_id": "active_income", "observed_at": NOW, "nav": 100.0},
+        },
+        {
+            "id": "nav-2",
+            "created_at": "2026-08-30T10:01:00+00:00",
+            "payload": {
+                "product_id": "active_income",
+                "observed_at": "2026-08-30T10:01:00+00:00",
+                "nav": 90.0,
+            },
+        },
+    )
+
+    assert ForwardEvidenceCollector._nav_drawdown(
+        rows,
+        start=NOW,
+        at="2026-08-30T10:01:00+00:00",
+    ) == pytest.approx(0.1)
 
 
 def test_btc_spot_execution_is_limited_to_owned_inventory_and_quote_proceeds() -> None:

@@ -303,6 +303,7 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
         assigned_at="2026-08-24T01:00:00+00:00",
         assigned_by="test",
         instrument_id="BTCUSDT",
+        risk_budget=100.0,
     )
     queue = DatabaseJobQueue(database.engine)
     queue.register_worker(
@@ -355,6 +356,8 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
     assert summary.benchmark_pnl == pytest.approx(0.25)
     assert summary.excess_benchmark_pnl == pytest.approx(0.75)
     assert second_observation_id in summary.observation_ids
+    assert summary.assignment_ids == (assignment_id,)
+    assert summary.instrument_ids == ("BTCUSDT",)
     decision_id, accepted, reason_code = repository.decide_summary(
         summary_id,
         decided_at="2026-08-26T00:00:01+00:00",

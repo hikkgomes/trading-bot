@@ -528,6 +528,8 @@ class ForwardPaperSummary:
     cycles: int = 0
     effective_independent_episodes: int = 0
     tail_loss: float = 0.0
+    assignment_ids: tuple[str, ...] = ()
+    instrument_ids: tuple[str, ...] = ()
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -564,6 +566,8 @@ class ForwardPaperSummary:
             "cycles": self.cycles,
             "effective_independent_episodes": self.effective_independent_episodes,
             "tail_loss": self.tail_loss,
+            "assignment_ids": list(self.assignment_ids),
+            "instrument_ids": list(self.instrument_ids),
         }
 
 
@@ -584,7 +588,12 @@ def _validated_observation_facts(row: object) -> tuple[str, ...]:
         raise CanonicalEvidenceError("forward evidence facts hash is invalid")
     source_ids = facts.get("source_event_ids")
     metrics = facts.get("metrics")
-    if not isinstance(source_ids, list | tuple) or not source_ids:
+    if (
+        not isinstance(source_ids, list | tuple)
+        or not source_ids
+        or any(not str(source_id).strip() for source_id in source_ids)
+        or len({str(source_id) for source_id in source_ids}) != len(source_ids)
+    ):
         raise CanonicalEvidenceError("forward evidence facts need source identities")
     if not isinstance(metrics, Mapping):
         raise CanonicalEvidenceError("forward evidence facts need metrics")
@@ -677,6 +686,21 @@ def _normalise_summary_metrics(payload: dict[str, Any]) -> None:
     )
 
 
+def _normalise_summary_scope(payload: dict[str, Any]) -> None:
+    for field_name in ("assignment_ids", "instrument_ids"):
+        raw = payload.get(field_name)
+        if raw is None:
+            continue
+        if (
+            not isinstance(raw, list | tuple)
+            or not raw
+            or any(not str(value).strip() for value in raw)
+            or len({str(value) for value in raw}) != len(raw)
+        ):
+            raise CanonicalEvidenceError(f"summary {field_name} must contain unique identities")
+        payload[field_name] = [str(value) for value in raw]
+
+
 def _summary_observation_ids(payload: dict[str, Any]) -> tuple[str, ...]:
     observation_ids = payload.get("observation_ids", ())
     if (
@@ -742,6 +766,7 @@ def _prepare_summary_payload(
         raise CanonicalEvidenceError("forward summary interval is not chronological")
     _normalise_summary_objective(payload, product_id)
     _normalise_summary_metrics(payload)
+    _normalise_summary_scope(payload)
     observation_ids = _summary_observation_ids(payload)
     identity = _hash(payload, field="forward summary")
     return strategy_version_id, product_id, observed_at, payload, observation_ids, identity
@@ -780,6 +805,8 @@ def _assert_summary_bindings(
                 forward_paper_observation.c.strategy_version_id,
                 forward_paper_observation.c.product_id,
                 forward_paper_observation.c.artefact_hash,
+                forward_paper_observation.c.instrument_id,
+                forward_paper_observation.c.payload,
                 forward_paper_observation.c.observed_at,
             ).where(forward_paper_observation.c.id.in_(observation_ids))
         )
@@ -800,6 +827,22 @@ def _assert_summary_bindings(
             raise CanonicalEvidenceError(
                 "forward summary observation binding or interval is invalid"
             )
+    declared_instruments = {
+        str(value) for value in payload.get("instrument_ids", ())
+    }
+    declared_assignments = {str(value) for value in payload.get("assignment_ids", ())}
+    observed_instruments = {str(row["instrument_id"]) for row in observations}
+    observed_assignments = {
+        str(row["payload"]["observation"]["assignment_id"])
+        for row in observations
+        if isinstance(row.get("payload"), Mapping)
+        and isinstance(row["payload"].get("observation"), Mapping)
+        and row["payload"]["observation"].get("assignment_id") is not None
+    }
+    if declared_instruments and observed_instruments != declared_instruments:
+        raise CanonicalEvidenceError("forward summary instrument scope is invalid")
+    if declared_assignments and not observed_assignments.issubset(declared_assignments):
+        raise CanonicalEvidenceError("forward summary assignment scope is invalid")
 
 
 class SqlForwardEvidenceRepository:
@@ -959,6 +1002,7 @@ class SqlForwardEvidenceRepository:
             rows = connection.execute(
                 select(
                     forward_paper_observation.c.id,
+                    forward_paper_observation.c.instrument_id,
                     forward_paper_observation.c.observed_at,
                     forward_paper_observation.c.payload,
                 )
@@ -1031,14 +1075,32 @@ class SqlForwardEvidenceRepository:
         objective_excess_fractions = [
             optional_value(payload, "objective_excess_fraction") for payload in payloads
         ]
-        complete_objective = all(
-            value is not None
-            for value in (
-                objective_values[-1] if objective_values else None,
-                benchmark_values[-1] if benchmark_values else None,
-                objective_excesses[-1] if objective_excesses else None,
-                objective_excess_fractions[-1] if objective_excess_fractions else None,
+        complete_objective = (
+            bool(objective_units)
+            and len(set(objective_units)) == 1
+            and all(
+                all(value is not None for value in values)
+                for values in zip(
+                    objective_values,
+                    benchmark_values,
+                    objective_excesses,
+                    objective_excess_fractions,
+                    strict=True,
+                )
             )
+        )
+        assignment_ids = tuple(
+            sorted(
+                {
+                    str(payload["observation"]["assignment_id"])
+                    for payload in payloads
+                    if isinstance(payload.get("observation"), Mapping)
+                    and payload["observation"].get("assignment_id") is not None
+                }
+            )
+        )
+        instrument_ids = tuple(
+            sorted({str(row["instrument_id"]) for row in materialised})
         )
         first_return = returns[0] if returns else 0.0
         last_return = returns[-1] if returns else 0.0
@@ -1094,6 +1156,8 @@ class SqlForwardEvidenceRepository:
             objective_excess_fraction=(
                 objective_excess_fractions[-1] if complete_objective else None
             ),
+            assignment_ids=assignment_ids,
+            instrument_ids=instrument_ids,
         )
         summary_id = self.append_summary(
             strategy_version_id=strategy_version_id,

@@ -14,6 +14,7 @@ from src.data.database import (
     accounting_entry,
     exchange_order,
     fill,
+    nav_snapshot,
     order_intent,
     reconciliation_event,
     risk_snapshot,
@@ -155,6 +156,7 @@ class ForwardEvidenceCollector:
             start=window_start,
             at=evaluated_at,
         )
+        nav_rows = self._nav_rows(product_id=product_id, at=evaluated_at)
         reconciliations = self._reconciliation_rows(
             product_id=product_id,
             instrument_id=instrument_id,
@@ -169,6 +171,10 @@ class ForwardEvidenceCollector:
             assignment,
             at=created_at,
         )
+        drawdown = max(
+            drawdown,
+            self._nav_drawdown(nav_rows, start=created_at, at=evaluated_at),
+        )
         slippage = self._slippage(fills)
         execution_drift = self._execution_drift(fills)
         model_drift = self._model_drift(net_pnl, forecast, bool(fills))
@@ -179,6 +185,7 @@ class ForwardEvidenceCollector:
             evaluation_time=evaluated_at,
             ledger_rows=all_ledger_rows,
             market_rows=all_market_rows,
+            nav_rows=nav_rows,
         )
         attempted = len(orders)
         completed = sum(1 for row in orders if self._order_filled(row["id"]))
@@ -194,6 +201,7 @@ class ForwardEvidenceCollector:
                     *(str(row["id"]) for row in market_rows),
                     *(str(row["id"]) for row in ledger_rows),
                     *(str(row["id"]) for row in all_market_rows),
+                    *(str(row["id"]) for row in nav_rows),
                     *objective[5],
                 ]
             )
@@ -203,7 +211,7 @@ class ForwardEvidenceCollector:
             raise ValueError("forward evidence has no durable source identities")
         capacity = _positive_or_zero(assignment.get("capital_limit"))
         configured_budget = _positive_or_zero(assignment.get("risk_budget"))
-        risk_budget = min(capacity, configured_budget or capacity)
+        risk_budget = min(capacity, configured_budget)
         trading_days = len(
             {str(row.get("created_at") or row.get("observed_at"))[:10] for row in market_rows}
         )
@@ -376,6 +384,20 @@ class ForwardEvidenceCollector:
             and str(row["payload"].get("instrument_id")) == instrument_id
         )
 
+    def _nav_rows(self, *, product_id: str, at: str) -> tuple[Mapping[str, Any], ...]:
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(nav_snapshot.c.id, nav_snapshot.c.created_at, nav_snapshot.c.payload)
+                .where(nav_snapshot.c.created_at <= at)
+                .order_by(nav_snapshot.c.created_at, nav_snapshot.c.id)
+            ).mappings()
+        return tuple(
+            row
+            for row in rows
+            if isinstance(row["payload"], Mapping)
+            and str(row["payload"].get("product_id")) == product_id
+        )
+
     def _reconciliation_rows(
         self, *, product_id: str, instrument_id: str, start: str, at: str
     ) -> tuple[Mapping[str, Any], ...]:
@@ -510,6 +532,36 @@ class ForwardEvidenceCollector:
         return max(0.0, worst)
 
     @staticmethod
+    def _nav_drawdown(
+        rows: tuple[Mapping[str, Any], ...], *, start: str, at: str
+    ) -> float:
+        points: list[tuple[str, float]] = []
+        for row in rows:
+            payload = row["payload"]
+            if not isinstance(payload, Mapping) or payload.get("nav") is None:
+                continue
+            observed_at = str(payload.get("observed_at") or row["created_at"])
+            if observed_at > at:
+                continue
+            try:
+                value = _positive_or_zero(payload["nav"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if value > 0.0:
+                points.append((observed_at, value))
+        if not points:
+            return 0.0
+        baseline = [value for observed_at, value in points if observed_at <= start]
+        after = [value for observed_at, value in points if observed_at > start]
+        values = ([baseline[-1]] if baseline else [after[0]]) + after
+        peak = values[0]
+        worst = 0.0
+        for value in values:
+            peak = max(peak, value)
+            worst = max(worst, (peak - value) / peak)
+        return max(0.0, worst)
+
+    @staticmethod
     def _data_uptime(market_rows: tuple[Mapping[str, Any], ...], *, data_gaps: int) -> float:
         observed = len(market_rows)
         if observed == 0:
@@ -587,8 +639,21 @@ class ForwardEvidenceCollector:
         evaluation_time: str,
         ledger_rows: tuple[Mapping[str, Any], ...],
         market_rows: tuple[Mapping[str, Any], ...],
+        nav_rows: tuple[Mapping[str, Any], ...],
     ) -> tuple[str, float | None, float | None, float | None, float | None, tuple[str, ...]]:
+        nav_points = self._objective_nav_points(nav_rows, start=artefact_created_at)
         if product_id == "active_income":
+            if nav_points is not None:
+                initial, final, source_ids = nav_points
+                excess = final - initial
+                return (
+                    "USDT",
+                    final,
+                    initial,
+                    excess,
+                    excess / initial if initial > 0.0 else None,
+                    source_ids,
+                )
             initial = self._starting_equity(product_id, assignment, at=artefact_created_at)
             excess = self._ledger_pnl(ledger_rows)
             return (
@@ -601,6 +666,33 @@ class ForwardEvidenceCollector:
             )
         if product_id != "btc_accumulation":
             return (product_id, None, None, None, None, ())
+        if nav_points is not None:
+            initial, final, source_ids = nav_points
+            final_payload = next(
+                (
+                    row["payload"]
+                    for row in reversed(nav_rows)
+                    if isinstance(row["payload"], Mapping)
+                    and str(row["payload"].get("observed_at") or row["created_at"])
+                    > artefact_created_at
+                ),
+                None,
+            )
+            benchmark = (
+                _positive_or_zero(final_payload.get("passive_benchmark_nav"))
+                if isinstance(final_payload, Mapping)
+                else 0.0
+            )
+            benchmark = benchmark or initial
+            excess = final - benchmark
+            return (
+                "BTC",
+                final,
+                benchmark,
+                excess,
+                excess / benchmark if benchmark > 0.0 else None,
+                source_ids,
+            )
         snapshots = self._account_snapshot_rows(
             account_id=_assignment_account_id(assignment), at=evaluation_time
         )
@@ -624,6 +716,39 @@ class ForwardEvidenceCollector:
             initial_btc_nav,
             excess,
             excess / initial_btc_nav,
+            source_ids,
+        )
+
+    @staticmethod
+    def _objective_nav_points(
+        rows: tuple[Mapping[str, Any], ...], *, start: str
+    ) -> tuple[float, float, tuple[str, ...]] | None:
+        points = [
+            row
+            for row in rows
+            if isinstance(row["payload"], Mapping)
+            and _positive_or_zero(row["payload"].get("nav")) > 0.0
+        ]
+        if not points:
+            return None
+        baseline = [
+            row
+            for row in points
+            if str(row["payload"].get("observed_at") or row["created_at"]) <= start
+        ]
+        after = [
+            row
+            for row in points
+            if str(row["payload"].get("observed_at") or row["created_at"]) > start
+        ]
+        if not after:
+            return None
+        initial_row = baseline[-1] if baseline else after[0]
+        final_row = after[-1]
+        source_ids = tuple(str(row["id"]) for row in (*baseline[-1:], *after))
+        return (
+            _positive_or_zero(initial_row["payload"]["nav"]),
+            _positive_or_zero(final_row["payload"]["nav"]),
             source_ids,
         )
 
