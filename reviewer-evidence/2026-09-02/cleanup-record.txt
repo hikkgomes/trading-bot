@@ -1,0 +1,17 @@
+Cleanup completed on 2 September 2026.
+
+Removed from the OptiPlex:
+
+- Two 25.78 GB copies of the film `Good Luck, Have Fun, Don't Die (2026)` and three subtitle files.
+- The filesystem report directory and its 109 generated JSON reports, approximately 14.8 GB.
+- The derived `data/research` backtest tree.
+- Obsolete and partial virtual environments.
+
+Retained:
+
+- Raw Binance market data in Parquet format.
+- Production PostgreSQL data.
+- The isolated testnet rehearsal database and signed rehearsal record.
+- `.venv-runtime`, `.venv-research`, and `.venv-agent`, which are referenced by the installed service units.
+
+The report worker and reporting schedule were removed from the active platform wiring. The in-memory PostgreSQL control report remains available and is not written to the filesystem.

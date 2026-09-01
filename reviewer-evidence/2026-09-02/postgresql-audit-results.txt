@@ -1,0 +1,345 @@
+Pager usage is off.
+Timing is off.
+=== DATABASE AND MIGRATIONS ===
+  database_name   |         observed_at          
+------------------+------------------------------
+ trading_platform | 2026-09-02 00:31:32.55872+02
+(1 row)
+
+ version | applied_at | content_hash | revision_hash 
+---------+------------+--------------+---------------
+(0 rows)
+
+=== EXPERIMENTS BY STATE ===
+       state        | experiments 
+--------------------+-------------
+ legacy_import      |        1644
+ queued             |           2
+ screening_rejected |          38
+(3 rows)
+
+=== EXPERIMENTS BY DAY ===
+          day           | experiments 
+------------------------+-------------
+ 2026-08-30 00:00:00+02 |        1684
+(1 row)
+
+=== DEFINITIONS BY PRODUCT, SOURCE AND FAMILY ===
+                       product_id                        |    source_type    |      family      | definitions 
+---------------------------------------------------------+-------------------+------------------+-------------
+ active_income                                           | generated_dsl     | time_series      |           1
+ active_income                                           | machine_learning  | machine_learning |          39
+ active_income                                           | registered_python | mean_reversion   |         477
+ active_income                                           | registered_python | time_series      |         689
+ active_income:smoke:2c09ea7579e743899ef1a10a1a41194a    | registered_python | time_series      |           1
+ btc_accumulation                                        | generated_dsl     | time_series      |           1
+ btc_accumulation                                        | machine_learning  | machine_learning |          17
+ btc_accumulation                                        | registered_python | mean_reversion   |         189
+ btc_accumulation                                        | registered_python | time_series      |         274
+ btc_accumulation:smoke:2c09ea7579e743899ef1a10a1a41194a | registered_python | time_series      |           1
+ btc_accumulation:smoke:461e456d1696460388e7b88e2f03b29a | registered_python | time_series      |           1
+ btc_accumulation:smoke:790cbb9b529b427d95267e759e4d03e7 | registered_python | time_series      |           1
+(12 rows)
+
+=== CANDIDATE IDENTITIES AND DUPLICATES ===
+ is_duplicate | identities 
+--------------+------------
+ f            |       1684
+(1 row)
+
+=== VALIDATION ATTRITION ===
+   stage   | accepted |             reason_code             | decisions 
+-----------+----------+-------------------------------------+-----------
+ screening | f        | screening_measured_evidence_missing |       786
+ screening | f        | candidate_execution_failed          |       164
+ screening | t        | accepted                            |       341
+(3 rows)
+
+=== FIRST REJECTION PER EXPERIMENT ===
+   stage   |             reason_code             | experiments 
+-----------+-------------------------------------+-------------
+ screening | screening_measured_evidence_missing |         786
+ screening | candidate_execution_failed          |         164
+(2 rows)
+
+=== CANDIDATES NEVER EVALUATED ===
+           provider            |     state     | candidates |    first_submitted     |     last_submitted     
+-------------------------------+---------------+------------+------------------------+------------------------
+ registered_strategy_catalogue | legacy_import |        388 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ platform-scheduler            | legacy_import |          3 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ platform-scheduler            | queued        |          2 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+(3 rows)
+
+=== STAGE LIFECYCLE TIME ===
+ experiments |     first_stage_at     |     last_stage_at      | shortest_elapsed | average_elapsed | longest_elapsed 
+-------------+------------------------+------------------------+------------------+-----------------+-----------------
+        1291 | 2026-08-30 03:54:35+02 | 2026-08-30 18:36:06+02 | 00:00:00         | 00:00:00        | 00:00:00
+(1 row)
+
+=== STAGE LIFECYCLE BY STAGE COUNT ===
+ stage_records | experiments 
+---------------+-------------
+             1 |        1291
+(1 row)
+
+=== THESIS TRIAL BUDGET USE ===
+      creator_identity      | theses | trial_budget | claimed_trials | remaining_trials | minimum_remaining_trials | maximum_remaining_trials 
+----------------------------+--------+--------------+----------------+------------------+--------------------------+--------------------------
+ strategy-thesis-factory/v2 |   4740 |        56880 |           1684 |            55196 |                       11 |                       12
+(1 row)
+
+=== DATASETS BY PRODUCT AND ROLE ===
+    product_id    |        role         | diagnostic | synthetic | snapshots |     first_created      |      last_created      
+------------------+---------------------+------------+-----------+-----------+------------------------+------------------------
+ active_income    | development         | true       | true      |         1 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ active_income    | forward_observation | true       | true      |         1 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ active_income    | protected_holdout   | true       | true      |         1 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ active_income    | robustness          | true       | true      |         1 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ active_income    | screening           | true       | true      |         2 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ btc_accumulation | development         | true       | true      |         1 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ btc_accumulation | forward_observation | true       | true      |         1 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ btc_accumulation | protected_holdout   | true       | true      |         1 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ btc_accumulation | robustness          | true       | true      |         1 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ btc_accumulation | screening           | true       | true      |         2 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+(10 rows)
+
+=== HOLDOUT CLAIMS AND OUTCOMES ===
+ claims | outcomes | accepted_outcomes 
+--------+----------+-------------------
+      0 |        0 |                 0
+(1 row)
+
+=== ARTEFACTS ===
+                       product_id                        |                           strategy_version_id                           | artefacts |     first_created      |      last_created      
+---------------------------------------------------------+-------------------------------------------------------------------------+-----------+------------------------+------------------------
+ active_income                                           | sha256:52acddbb61938351e36517e0ba19c5e5c0f9577433a6f5d5cf5c3ce5d69efdff |         3 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ active_income:smoke:2c09ea7579e743899ef1a10a1a41194a    | sha256:22302b657db459eeb977455cff2d6d00955c02ecb1cda249c0b0de44059f632b |         1 | 2026-09-01 16:33:23+02 | 2026-09-01 16:33:23+02
+ btc_accumulation                                        | sha256:5f94f2df53b9db0c389f9f3fad3ef20fe3a32a4b23d737b84e89da853be4286b |         3 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ btc_accumulation                                        | sha256:7536c81e17e3e220b7e47540cc5e2c35617cef6e2c17c41940b50b7f9ebf4f42 |         1 | 2026-08-23 02:00:00+02 | 2026-08-23 02:00:00+02
+ btc_accumulation:smoke:2c09ea7579e743899ef1a10a1a41194a | sha256:93abbcb7b165121127cd0b69ae0af6521b33c3412d3a2ca4e8fe9f735ca7e5e3 |         1 | 2026-09-01 16:33:23+02 | 2026-09-01 16:33:23+02
+ btc_accumulation:smoke:461e456d1696460388e7b88e2f03b29a | sha256:e4e3682caf6ef90fd85301a470803a9760202df906437bb4e37a488078ce5c2a |         1 | 2026-09-01 16:08:31+02 | 2026-09-01 16:08:31+02
+ btc_accumulation:smoke:790cbb9b529b427d95267e759e4d03e7 | sha256:078d87dd91429bb05488400ced0f25d2a1a768bcfc9c45e87c1321a3420bbe1c |         1 | 2026-09-01 16:18:26+02 | 2026-09-01 16:18:26+02
+(7 rows)
+
+=== ACTIVE ASSIGNMENTS ===
+                       product_id                        | lifecycle_state | execution_mode | active | assignments | instrument_scoped | universe_scoped |     first_assigned     |     last_assigned      
+---------------------------------------------------------+-----------------+----------------+--------+-------------+-------------------+-----------------+------------------------+------------------------
+ active_income                                           | development     | paper          | t      |           3 |                 3 |               0 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ active_income:smoke:2c09ea7579e743899ef1a10a1a41194a    | forward_paper   | paper          | f      |           1 |                 1 |               0 | 2026-09-01 20:06:53+02 | 2026-09-01 20:06:53+02
+ active_income:smoke:2c09ea7579e743899ef1a10a1a41194a    | forward_paper   | paper          | t      |           1 |                 1 |               0 | 2026-09-01 16:33:23+02 | 2026-09-01 16:33:23+02
+ btc_accumulation                                        | development     | paper          | t      |           3 |                 3 |               0 | 2026-08-30 03:38:53+02 | 2026-08-30 03:38:53+02
+ btc_accumulation                                        | forward_paper   | paper          | t      |           1 |                 1 |               0 | 2026-08-23 02:00:00+02 | 2026-08-23 02:00:00+02
+ btc_accumulation:smoke:2c09ea7579e743899ef1a10a1a41194a | forward_paper   | paper          | f      |           1 |                 1 |               0 | 2026-09-01 20:06:53+02 | 2026-09-01 20:06:53+02
+ btc_accumulation:smoke:2c09ea7579e743899ef1a10a1a41194a | forward_paper   | paper          | t      |           1 |                 1 |               0 | 2026-09-01 16:33:23+02 | 2026-09-01 16:33:23+02
+ btc_accumulation:smoke:461e456d1696460388e7b88e2f03b29a | forward_paper   | paper          | f      |           1 |                 1 |               0 | 2026-09-01 20:06:53+02 | 2026-09-01 20:06:53+02
+ btc_accumulation:smoke:461e456d1696460388e7b88e2f03b29a | forward_paper   | paper          | t      |           1 |                 1 |               0 | 2026-09-01 16:08:31+02 | 2026-09-01 16:08:31+02
+ btc_accumulation:smoke:790cbb9b529b427d95267e759e4d03e7 | forward_paper   | paper          | f      |           1 |                 1 |               0 | 2026-09-01 20:06:54+02 | 2026-09-01 20:06:54+02
+ btc_accumulation:smoke:790cbb9b529b427d95267e759e4d03e7 | forward_paper   | paper          | t      |           1 |                 1 |               0 | 2026-09-01 16:18:26+02 | 2026-09-01 16:18:26+02
+(11 rows)
+
+=== FORWARD OBSERVATIONS ===
+ product_id | strategy_version_id | observations | first_observation | last_observation | accepted_rows | rejected_rows 
+------------+---------------------+--------------+-------------------+------------------+---------------+---------------
+(0 rows)
+
+=== FORWARD REASONS ===
+ reason_code | observations 
+-------------+--------------
+(0 rows)
+
+=== PROMOTION EVENTS ===
+ prior_state | next_state | accepted | reason_code | events 
+-------------+------------+----------+-------------+--------
+(0 rows)
+
+=== APPROVALS ===
+ product_id | status | approvals | first_approval | last_approval 
+------------+--------+-----------+----------------+---------------
+(0 rows)
+
+=== PREFLIGHTS ===
+ product_id | accepted | preflights | first_checked | last_checked 
+------------+----------+------------+---------------+--------------
+(0 rows)
+
+=== JOB QUEUE ===
+            name             |    state    | jobs  | maximum_attempts |    oldest_available    |    newest_available    
+-----------------------------+-------------+-------+------------------+------------------------+------------------------
+ accounting_event            | completed   |     8 |                1 | 2026-08-23 02:00:00+02 | 2026-09-01 16:33:23+02
+ agent_review                | dead_letter |     3 |                3 | 2026-09-01 17:19:11+02 | 2026-09-01 18:59:16+02
+ agent_review                | pending     |     2 |                0 | 2026-09-01 19:54:57+02 | 2026-09-01 20:55:33+02
+ bounded_backtest            | completed   | 27526 |               36 | 2026-08-30 03:54:39+02 | 2026-09-01 19:42:47+02
+ bounded_backtest            | dead_letter |   745 |                7 | 2026-09-01 14:55:45+02 | 2026-09-01 19:41:31+02
+ bounded_backtest            | pending     | 65823 |               28 | 2026-08-30 19:11:20+02 | 2026-09-01 19:44:24+02
+ dataset_snapshot_validate   | completed   |     2 |                2 | 2026-08-30 03:40:11+02 | 2026-08-30 05:40:02+02
+ dataset_snapshot_validate   | dead_letter |     2 |                3 | 2026-09-01 15:06:30+02 | 2026-09-01 15:09:09+02
+ diagnostic_paper_close      | completed   |     2 |                2 | 2026-08-30 03:40:54+02 | 2026-08-30 03:40:54+02
+ diagnostic_paper_open       | completed   |     2 |                1 | 2026-08-30 03:39:49+02 | 2026-08-30 03:39:50+02
+ evaluate_candidate          | completed   |  1291 |               13 | 2026-08-30 03:54:37+02 | 2026-08-31 02:20:44+02
+ evaluate_candidate          | dead_letter |    54 |               28 | 2026-09-01 15:14:13+02 | 2026-09-01 16:44:53+02
+ evaluate_candidate          | pending     | 13183 |               22 | 2026-08-30 19:10:26+02 | 2026-09-01 21:49:56+02
+ event_replay                | completed   | 21852 |               28 | 2026-08-30 04:09:55+02 | 2026-09-01 19:49:42+02
+ event_replay                | dead_letter |   596 |               27 | 2026-09-01 15:37:02+02 | 2026-09-01 19:50:25+02
+ event_replay                | pending     | 25600 |               11 | 2026-08-30 22:07:56+02 | 2026-09-01 19:25:40+02
+ execute_targets             | completed   |     2 |                1 | 2026-09-01 16:33:23+02 | 2026-09-01 16:33:23+02
+ forward_paper_observation   | dead_letter |    46 |               12 | 2026-09-01 15:53:06+02 | 2026-09-01 20:58:43+02
+ forward_paper_observation   | pending     |     1 |                0 | 2026-09-01 21:00:28+02 | 2026-09-01 21:00:28+02
+ generate_hypotheses         | pending     |    46 |                0 | 2026-08-31 11:30:56+02 | 2026-09-01 20:58:53+02
+ live_feature_calculation    | completed   |   487 |                2 | 2026-08-23 02:00:00+02 | 2026-09-01 16:33:23+02
+ live_feature_calculation    | dead_letter |     2 |                6 | 2026-08-30 09:47:01+02 | 2026-09-01 16:09:31+02
+ live_feature_calculation    | pending     |  1395 |                0 | 2026-08-30 09:47:01+02 | 2026-08-31 02:06:00+02
+ live_feature_calculation    | running     |     1 |                2 | 2026-08-30 09:47:01+02 | 2026-08-30 09:47:01+02
+ maintenance                 | completed   |    30 |                1 | 2026-08-30 03:39:35+02 | 2026-09-01 20:55:48+02
+ market_data_gap_recovery    | completed   |  1558 |                2 | 2026-09-01 15:10:22+02 | 2026-09-02 00:31:23+02
+ market_event_batch_write    | completed   |  6980 |                2 | 2026-08-30 03:39:57+02 | 2026-09-02 00:31:24+02
+ market_event_batch_write    | pending     |  1555 |                1 | 2026-08-31 02:15:29+02 | 2026-09-02 00:31:23+02
+ market_event_batch_write    | running     |     1 |                2 | 2026-08-31 02:15:03+02 | 2026-08-31 02:15:03+02
+ market_event_write          | completed   |    13 |                1 | 2026-08-23 02:00:00+02 | 2026-09-01 16:33:23+02
+ market_event_write          | dead_letter |     3 |                0 | 2026-09-01 16:08:31+02 | 2026-09-01 16:08:31+02
+ paper_order_continue        | completed   |     2 |                1 | 2026-09-01 16:33:23+02 | 2026-09-01 16:33:23+02
+ paper_order_submit          | completed   |     6 |                1 | 2026-08-30 03:39:49+02 | 2026-09-01 16:33:23+02
+ portfolio_state_publish     | completed   |  2405 |                1 | 2026-08-30 03:41:04+02 | 2026-09-01 20:06:24+02
+ portfolio_state_publish     | dead_letter |     3 |                3 | 2026-09-01 15:13:19+02 | 2026-09-01 15:18:32+02
+ portfolio_target_build      | completed   |     2 |                1 | 2026-09-01 16:33:23+02 | 2026-09-01 16:33:23+02
+ portfolio_target_build      | dead_letter |     2 |               29 | 2026-09-01 14:56:32+02 | 2026-09-01 16:49:13+02
+ promotion_evaluation        | dead_letter |    17 |               12 | 2026-09-01 15:53:10+02 | 2026-09-01 20:48:03+02
+ promotion_evaluation        | pending     |     1 |                2 | 2026-09-01 21:01:32+02 | 2026-09-01 21:01:32+02
+ register_ml_candidate       | completed   |    84 |               14 | 2026-08-30 03:54:36+02 | 2026-08-31 00:46:27+02
+ register_ml_candidate       | dead_letter |     2 |                5 | 2026-09-01 15:15:36+02 | 2026-09-01 15:15:38+02
+ register_ml_candidate       | pending     |   106 |               17 | 2026-08-30 19:11:17+02 | 2026-09-01 19:29:02+02
+ register_strategy_catalogue | completed   |   179 |               13 | 2026-08-30 03:40:13+02 | 2026-08-31 02:40:32+02
+ register_strategy_catalogue | dead_letter |     1 |                5 | 2026-09-01 15:15:51+02 | 2026-09-01 15:15:51+02
+ register_strategy_catalogue | pending     |   250 |               13 | 2026-08-30 19:11:17+02 | 2026-09-01 20:58:53+02
+ reporting                   | completed   |   102 |             1198 | 2026-08-30 03:39:56+02 | 2026-09-01 19:39:18+02
+ reporting                   | dead_letter |     1 |                3 | 2026-08-31 11:30:56+02 | 2026-08-31 11:30:56+02
+ reporting                   | pending     |     7 |                2 | 2026-09-01 19:15:46+02 | 2026-09-01 20:58:53+02
+ risk_assessment             | completed   |     2 |                1 | 2026-09-01 16:33:23+02 | 2026-09-01 16:33:23+02
+ strategy_evaluation         | completed   |     4 |                1 | 2026-08-31 10:56:33+02 | 2026-09-01 16:33:23+02
+ train_ml_experiment         | completed   |   315 |               18 | 2026-08-30 04:40:14+02 | 2026-08-31 02:12:24+02
+ train_ml_experiment         | pending     |   892 |               12 | 2026-08-30 19:16:51+02 | 2026-09-01 20:55:33+02
+ universe_refresh            | completed   |   573 |                2 | 2026-08-30 03:39:49+02 | 2026-09-01 20:10:58+02
+ universe_refresh            | pending     |     2 |                1 | 2026-09-01 20:10:54+02 | 2026-09-01 20:15:57+02
+(54 rows)
+
+=== JOB ATTEMPT FAILURES ===
+               error_type               | failures |     first_failure      |      last_failure      
+----------------------------------------+----------+------------------------+------------------------
+ heavy_compute_slot_unavailable         |   155302 | 2026-08-30 03:54:36+02 | 2026-09-01 19:49:40+02
+ worker_lease_expired                   |     2699 | 2026-08-30 03:39:56+02 | 2026-09-01 20:12:29+02
+ CanonicalEvidenceError                 |     1206 | 2026-08-30 09:19:43+02 | 2026-09-01 14:38:54+02
+ LookupError                            |      147 | 2026-08-31 11:15:39+02 | 2026-09-01 20:57:43+02
+ KeyError                               |       74 | 2026-08-31 10:56:54+02 | 2026-09-01 19:49:53+02
+ ValueError                             |       72 | 2026-08-31 11:15:46+02 | 2026-09-01 21:00:32+02
+ OSError                                |       22 | 2026-08-31 01:55:34+02 | 2026-08-31 15:07:22+02
+ OperationalError                       |        4 | 2026-08-31 02:26:21+02 | 2026-08-31 15:09:48+02
+ diagnostic closing order is not filled |        2 | 2026-08-30 03:39:51+02 | 2026-08-30 03:39:52+02
+ missing                                |        2 | 2026-09-01 23:11:48+02 | 2026-09-02 00:31:26+02
+ ThesisError                            |        2 | 2026-08-30 03:39:56+02 | 2026-08-30 03:39:56+02
+ ConnectionError                        |        1 | 2026-08-30 23:34:12+02 | 2026-08-30 23:34:12+02
+ ReadTimeout                            |        1 | 2026-09-01 19:06:14+02 | 2026-09-01 19:06:14+02
+ SSLError                               |        1 | 2026-09-01 15:07:41+02 | 2026-09-01 15:07:41+02
+(14 rows)
+
+=== SCHEDULES ===
+                  id                  |          job_name           |       state        | interval_seconds |      last_run_at       |      next_run_at       | age_since_last_run |                                                                        last_job_id                                                                         
+--------------------------------------+-----------------------------+--------------------+------------------+------------------------+------------------------+--------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------
+ platform:agent_review                | agent_review                | scheduled          |             3600 | 2026-09-01 20:55:48+02 | 2026-09-01 21:55:48+02 | 03:35:45.019961    | scheduled:agent_review:active_income:2026-09-01T18:55:33+00:00
+ platform:bounded_backtest            | bounded_backtest            | waiting_for_inputs |              900 | 2026-09-01 20:58:56+02 | 2026-09-01 21:13:56+02 | 03:32:37.019961    | scheduled:bounded_backtest:sha256:ff86ffb6fe1f4564a931103aef36bec99aee8e00fabd5a9ee333c5287da0ed9f:2026-08-31T09:11:28+00:00
+ platform:candidate_evaluation        | candidate_evaluation        | waiting_for_inputs |              900 | 2026-09-01 20:58:56+02 | 2026-09-01 21:13:56+02 | 03:32:37.019961    | scheduled:candidate_evaluation:sha256:ff86ffb6fe1f4564a931103aef36bec99aee8e00fabd5a9ee333c5287da0ed9f:screening:2026-08-31T09:11:28+00:00
+ platform:candidate_generation        | candidate_generation        | scheduled          |              900 | 2026-09-01 20:58:56+02 | 2026-09-01 21:13:56+02 | 03:32:37.019961    | scheduled:candidate_generation:btc_accumulation:hypotheses:2026-09-01T18:58:53+00:00
+ platform:event_replay                | event_replay                | waiting_for_inputs |             1800 | 2026-09-01 20:58:56+02 | 2026-09-01 21:28:56+02 | 03:32:37.019961    | scheduled:event_replay:sha256:ff86ffb6fe1f4564a931103aef36bec99aee8e00fabd5a9ee333c5287da0ed9f:2026-08-31T01:50:16+00:00
+ platform:forward_paper_observation   | forward_paper_observation   | scheduled          |              300 | 2026-09-01 21:00:41+02 | 2026-09-01 21:05:41+02 | 03:30:52.019961    | scheduled:forward_paper_observation:sha256:faed6fe37dceac5ad396bd1a3c68f0e9f30db13e39f65059a9961a3570493859:binance:spot:BTCUSDT:2026-09-01T19:00:28+00:00
+ platform:forward_paper_summary       | forward_paper_summary       | waiting_for_inputs |              900 | 2026-09-01 20:58:56+02 | 2026-09-01 21:13:56+02 | 03:32:37.019961    | 
+ platform:live_account_backfill       | live_account_backfill       | waiting_for_inputs |              300 | 2026-09-01 21:00:41+02 | 2026-09-01 21:05:41+02 | 03:30:52.019961    | 
+ platform:maintenance                 | maintenance                 | scheduled          |             3600 | 2026-09-01 20:55:48+02 | 2026-09-01 21:55:48+02 | 03:35:45.019961    | scheduled:maintenance:active_income:2026-09-01T18:55:33+00:00
+ platform:ml_research                 | ml_research                 | scheduled          |             3600 | 2026-09-01 20:55:48+02 | 2026-09-01 21:55:48+02 | 03:35:45.019961    | scheduled:ml_research:sha256:cc06c312068d061de0a22fcc1344c5206da3eb65fe89da482bf6cd91a64de9af:2026-09-01T18:55:33+00:00
+ platform:promotion_evaluation        | promotion_evaluation        | scheduled          |              900 | 2026-09-01 20:58:56+02 | 2026-09-01 21:13:56+02 | 03:32:37.019961    | scheduled:promotion_evaluation:sha256:7536c81e17e3e220b7e47540cc5e2c35617cef6e2c17c41940b50b7f9ebf4f42:2026-09-01T18:58:53+00:00
+ platform:register_strategy_catalogue | register_strategy_catalogue | scheduled          |              900 | 2026-09-01 20:58:56+02 | 2026-09-01 21:13:56+02 | 03:32:37.019961    | scheduled:register_strategy_catalogue:btc_accumulation:2026-09-01T18:58:53+00:00
+ platform:reporting                   | reporting                   | scheduled          |              900 | 2026-09-01 20:58:56+02 | 2026-09-01 21:13:56+02 | 03:32:37.019961    | scheduled:reporting:active_income:2026-09-01T18:58:53+00:00
+ platform:universe_refresh            | universe_refresh            | waiting_for_inputs |              300 | 2026-09-01 21:00:41+02 | 2026-09-01 21:05:41+02 | 03:30:52.019961    | scheduled:universe_refresh:active_income:2026-09-01T18:15:57+00:00
+(14 rows)
+
+=== WORKERS ===
+    node_id     |          role           | status | workers |    oldest_heartbeat    |    newest_heartbeat    
+----------------+-------------------------+--------+---------+------------------------+------------------------
+ linux-optiplex | accounting              | ready  |       5 | 2026-08-23 02:00:00+02 | 2026-09-01 16:33:23+02
+ linux-optiplex | accounting-service      | ready  |       1 | 2026-09-01 17:04:44+02 | 2026-09-01 17:04:44+02
+ linux-optiplex | agent-sandbox           | ready  |       1 | 2026-09-01 18:58:16+02 | 2026-09-01 18:58:16+02
+ linux-optiplex | data                    | ready  |       5 | 2026-08-23 02:00:00+02 | 2026-09-01 16:33:23+02
+ linux-optiplex | data-writer             | busy   |       1 | 2026-09-02 00:31:26+02 | 2026-09-02 00:31:26+02
+ linux-optiplex | event-replay-worker     | ready  |       1 | 2026-09-01 19:49:42+02 | 2026-09-01 19:49:42+02
+ linux-optiplex | execution               | ready  |       5 | 2026-08-23 02:00:00+02 | 2026-09-01 16:33:23+02
+ linux-optiplex | execution-engine        | ready  |       1 | 2026-09-01 17:00:21+02 | 2026-09-01 17:00:21+02
+ linux-optiplex | feature                 | ready  |       5 | 2026-08-23 02:00:00+02 | 2026-09-01 16:33:23+02
+ linux-optiplex | feature-build-worker    | ready  |       1 | 2026-09-01 18:34:06+02 | 2026-09-01 18:34:06+02
+ linux-optiplex | feature-service         | busy   |       1 | 2026-09-01 23:11:48+02 | 2026-09-01 23:11:48+02
+ linux-optiplex | ml-worker               | ready  |       1 | 2026-09-01 19:49:56+02 | 2026-09-01 19:49:56+02
+ linux-optiplex | paper                   | ready  |       5 | 2026-08-23 02:00:00+02 | 2026-09-01 16:33:23+02
+ linux-optiplex | paper-engine            | ready  |       1 | 2026-09-01 17:04:44+02 | 2026-09-01 17:04:44+02
+ linux-optiplex | platform-scheduler      | ready  |       1 | 2026-09-01 21:00:41+02 | 2026-09-01 21:00:41+02
+ linux-optiplex | portfolio               | ready  |       5 | 2026-08-23 02:00:00+02 | 2026-09-01 16:33:23+02
+ linux-optiplex | portfolio-engine        | ready  |       1 | 2026-09-01 16:59:20+02 | 2026-09-01 16:59:20+02
+ linux-optiplex | portfolio-state-service | ready  |       1 | 2026-09-01 20:06:24+02 | 2026-09-01 20:06:24+02
+ linux-optiplex | product-supervisor      | ready  |       1 | 2026-09-01 17:50:18+02 | 2026-09-01 17:50:18+02
+ linux-optiplex | promotion-engine        | ready  |       1 | 2026-09-01 21:00:32+02 | 2026-09-01 21:00:32+02
+ linux-optiplex | report-worker           | busy   |       1 | 2026-09-01 19:49:28+02 | 2026-09-01 19:49:28+02
+ linux-optiplex | research-worker         | ready  |       1 | 2026-09-01 19:49:40+02 | 2026-09-01 19:49:40+02
+ linux-optiplex | risk                    | ready  |       5 | 2026-08-23 02:00:00+02 | 2026-09-01 16:33:23+02
+ linux-optiplex | risk-engine             | ready  |       1 | 2026-09-01 16:59:53+02 | 2026-09-01 16:59:53+02
+ linux-optiplex | state                   | ready  |       5 | 2026-08-23 02:00:00+02 | 2026-09-01 16:33:23+02
+ linux-optiplex | strategy                | ready  |       5 | 2026-08-23 02:00:00+02 | 2026-09-01 16:33:23+02
+ linux-optiplex | strategy-evaluator      | ready  |       1 | 2026-09-01 17:39:33+02 | 2026-09-01 17:39:33+02
+ linux-optiplex | universe-service        | busy   |       1 | 2026-09-01 20:12:29+02 | 2026-09-01 20:12:29+02
+(28 rows)
+
+=== SERVICE HEARTBEATS ===
+      service_name       |                     node_id                     | healthy |      observed_at       |     heartbeat_age      
+-------------------------+-------------------------------------------------+---------+------------------------+------------------------
+ accounting-service      | linux-optiplex                                  | t       | 2026-09-01 21:01:02+02 | 03:30:31.021594
+ account-reconciliation  | linux-optiplex                                  | t       | 2026-09-01 21:01:10+02 | 03:30:23.021594
+ agent-sandbox           | linux-optiplex                                  | t       | 2026-09-01 19:50:03+02 | 04:41:30.021594
+ control-api             | linux-optiplex                                  | t       | 2026-09-01 17:09:31+02 | 07:22:02.021594
+ data-writer             | linux-optiplex                                  | t       | 2026-09-02 00:31:24+02 | 00:00:09.021594
+ data-writer             | platform-smoke:2c09ea7579e743899ef1a10a1a41194a | t       | 2026-09-01 16:33:23+02 | 07:58:10.021594
+ event-replay-worker     | linux-optiplex                                  | t       | 2026-09-01 19:50:08+02 | 04:41:25.021594
+ execution-engine        | linux-optiplex                                  | t       | 2026-09-01 21:01:01+02 | 03:30:32.021594
+ feature-build-worker    | linux-optiplex                                  | t       | 2026-09-01 19:50:00+02 | 04:41:33.021594
+ feature-service         | linux-optiplex                                  | f       | 2026-08-30 23:55:35+02 | 2 days 00:35:58.021594
+ market-gateway          | linux-optiplex                                  | t       | 2026-09-02 00:31:22+02 | 00:00:11.021594
+ migration-service       | linux-optiplex                                  | t       | 2026-09-01 16:54:13+02 | 07:37:20.021594
+ ml-worker               | linux-optiplex                                  | t       | 2026-09-01 19:49:57+02 | 04:41:36.021594
+ paper-engine            | linux-optiplex                                  | t       | 2026-09-01 21:01:10+02 | 03:30:23.021594
+ platform-scheduler      | linux-optiplex                                  | t       | 2026-09-01 21:01:10+02 | 03:30:23.021594
+ portfolio-engine        | linux-optiplex                                  | t       | 2026-09-01 21:01:10+02 | 03:30:23.021594
+ portfolio-state-service | linux-optiplex                                  | t       | 2026-09-01 20:06:24+02 | 04:25:09.021594
+ product-supervisor      | linux-optiplex                                  | t       | 2026-09-01 21:00:55+02 | 03:30:38.021594
+ promotion-engine        | linux-optiplex                                  | t       | 2026-09-01 21:01:07+02 | 03:30:26.021594
+ report-worker           | linux-optiplex                                  | f       | 2026-09-01 19:46:57+02 | 04:44:36.021594
+ research-worker         | linux-optiplex                                  | t       | 2026-09-01 19:49:59+02 | 04:41:34.021594
+ risk-engine             | linux-optiplex                                  | t       | 2026-09-01 21:01:08+02 | 03:30:25.021594
+ strategy-evaluator      | linux-optiplex                                  | t       | 2026-09-01 21:01:01+02 | 03:30:32.021594
+ universe-service        | linux-optiplex                                  | t       | 2026-09-01 20:10:58+02 | 04:20:35.021594
+(24 rows)
+
+=== UNIVERSE ATTRITION ===
+                                                universe_id                                                | eligible |       reason_code        | instruments 
+-----------------------------------------------------------------------------------------------------------+----------+--------------------------+-------------
+ binance-usdt-perpetuals                                                                                   | t        | eligible                 |       14268
+ binance-usdt-perpetuals                                                                                   | f        | depth_too_low            |       10772
+ binance-usdt-perpetuals                                                                                   | f        | volatility_out_of_bounds |        3016
+ binance-usdt-perpetuals                                                                                   | f        | listing_too_new          |         635
+ binance-usdt-perpetuals                                                                                   | f        | funding_out_of_bounds    |         207
+ binance-usdt-perpetuals                                                                                   | f        | spread_too_wide          |           3
+ btc-spot                                                                                                  | t        | eligible                 |        5905
+ btc-spot                                                                                                  | f        | quote_volume_too_low     |       16136
+ btc-spot                                                                                                  | f        | depth_too_low            |         966
+ btc-spot                                                                                                  | f        | volatility_out_of_bounds |         920
+ btc-spot                                                                                                  | f        | spread_too_wide          |         218
+ smoke:2c09ea7579e743899ef1a10a1a41194a:active_income:smoke:2c09ea7579e743899ef1a10a1a41194a:1:universe    | t        | eligible                 |           1
+ smoke:2c09ea7579e743899ef1a10a1a41194a:btc_accumulation:smoke:2c09ea7579e743899ef1a10a1a41194a:0:universe | t        | eligible                 |           1
+ smoke:461e456d1696460388e7b88e2f03b29a:btc_accumulation:smoke:461e456d1696460388e7b88e2f03b29a:0:universe | t        | eligible                 |           1
+ smoke:790cbb9b529b427d95267e759e4d03e7:btc_accumulation:smoke:790cbb9b529b427d95267e759e4d03e7:0:universe | t        | eligible                 |           1
+ smoke:btc_accumulation:0:universe                                                                         | t        | eligible                 |           1
+(16 rows)
+
+

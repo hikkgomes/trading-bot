@@ -1,0 +1,749 @@
+=== UTC TIME ===
+2026-09-01T22:35:55+00:00
+=== KERNEL ===
+Linux alfred 6.12.85+deb13-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.85-1 (2026-04-30) x86_64 GNU/Linux
+=== UPTIME ===
+ 00:35:55 up 55 days,  8:12,  9 users,  load average: 4.25, 4.48, 4.50
+=== MEMORY ===
+               total        used        free      shared  buff/cache   available
+Mem:           7.6Gi       3.8Gi       135Mi       384Mi       4.5Gi       3.9Gi
+Swap:          5.9Gi       2.3Gi       3.7Gi
+=== FILESYSTEMS ===
+Filesystem     Type      Size  Used Avail Use% Mounted on
+udev           devtmpfs  3.8G     0  3.8G   0% /dev
+tmpfs          tmpfs     783M  2.5M  781M   1% /run
+/dev/sda5      ext4      108G   63G   40G  62% /
+tmpfs          tmpfs     3.9G  126M  3.7G   4% /dev/shm
+tmpfs          tmpfs     1.0M     0  1.0M   0% /run/credentials/systemd-journald.service
+tmpfs          tmpfs     5.0M  8.0K  5.0M   1% /run/lock
+tmpfs          tmpfs     3.9G  561M  3.3G  15% /tmp
+tmpfs          tmpfs     783M   96K  783M   1% /run/user/1000
+tmpfs          tmpfs     1.0M     0  1.0M   0% /run/credentials/getty@tty1.service
+tmpfs          tmpfs     783M   80K  783M   1% /run/user/106
+overlay        overlay   108G   63G   40G  62% /var/lib/docker/overlay2/8733a43038120cc8c9389e32c0ea1ebf4fb29c870fbfae2cca8d6db71929a25b/merged
+overlay        overlay   108G   63G   40G  62% /var/lib/docker/overlay2/87cd3614c1ebba1c8af524ae2d44545fc8601400d8e97d0c1a30bebf3b88099e/merged
+overlay        overlay   108G   63G   40G  62% /var/lib/docker/overlay2/572e66449e40a8b7135c171b9dfc759b21fb14a69c80c59de518786d4adca53d/merged
+overlay        overlay   108G   63G   40G  62% /var/lib/docker/overlay2/729dc3d3a55950250e0758a4e4b9562e1180aaf3877f174b6e9ae496e04c3ff6/merged
+overlay        overlay   108G   63G   40G  62% /var/lib/docker/overlay2/2fb354a69ef3105affab7603c8731990fd306773145ec294cdb2f4735dd7191a/merged
+overlay        overlay   108G   63G   40G  62% /var/lib/docker/overlay2/0cdf371e255d107b3a8a89643de7416624082f6a4ae373acf5b863c510e4caa1/merged
+overlay        overlay   108G   63G   40G  62% /var/lib/docker/overlay2/7a70b3d39c8038c3775cfb74cca310ce5aee08ade486b99d7bdfb761347a4f3e/merged
+overlay        overlay   108G   63G   40G  62% /var/lib/docker/overlay2/512109f371351af038fdf16aaa102737cc2297ba38557f8faef7de619e1c5e3c/merged
+overlay        overlay   108G   63G   40G  62% /var/lib/docker/overlay2/9e9b1dd07578a48d1dd195df0176cbbf14d2be54ae97683233964efd0485a4cc/merged
+/dev/sda4      ext4      115G  3.5G  106G   4% /srv
+overlay        overlay   108G   63G   40G  62% /var/lib/docker/overlay2/17277f70de6f16dd0ba8b8979b869ab9bf77323b342100cdebda13a4b75879e4/merged
+=== SYSTEM UNIT FILES ===
+trading-bot-openclaw-research.service        static          -
+trading-platform-agent@.service              indirect        enabled
+trading-platform-backup@.service             static          -
+trading-platform-migration.service           static          -
+trading-platform-research@.service           indirect        enabled
+trading-platform@.service                    indirect        enabled
+=== SYSTEM SERVICES ===
+  trading-platform-agent@agent-sandbox.service                                              loaded    inactive   dead          Trading platform Linux agent service agent-sandbox
+● trading-platform-backup@parquet.service                                                   loaded    activating start   start Trading platform parquet backup
+  trading-platform-backup@postgresql.service                                                loaded    inactive   dead          Trading platform postgresql backup
+  trading-platform-backup@verify.service                                                    loaded    inactive   dead          Trading platform verify backup
+  trading-platform-migration.service                                                        loaded    active     exited        Trading platform PostgreSQL migration service
+  trading-platform-research@event-replay-worker.service                                     loaded    inactive   dead          Trading platform Linux research service event-replay-worker
+  trading-platform-research@feature-build-worker.service                                    loaded    inactive   dead          Trading platform Linux research service feature-build-worker
+  trading-platform-research@ml-worker.service                                               loaded    inactive   dead          Trading platform Linux research service ml-worker
+  trading-platform-research@report-worker.service                                           loaded    inactive   dead          Trading platform Linux research service report-worker
+  trading-platform-research@research-worker.service                                         loaded    inactive   dead          Trading platform Linux research service research-worker
+  trading-platform@account-reconciliation.service                                           loaded    inactive   dead          Trading platform service account-reconciliation
+  trading-platform@accounting-service.service                                               loaded    inactive   dead          Trading platform service accounting-service
+  trading-platform@control-api.service                                                      loaded    inactive   dead          Trading platform service control-api
+  trading-platform@data-writer.service                                                      loaded    active     running       Trading platform service data-writer
+  trading-platform@execution-engine.service                                                 loaded    inactive   dead          Trading platform service execution-engine
+  trading-platform@feature-service.service                                                  loaded    active     running       Trading platform service feature-service
+  trading-platform@market-gateway.service                                                   loaded    active     running       Trading platform service market-gateway
+  trading-platform@paper-engine.service                                                     loaded    inactive   dead          Trading platform service paper-engine
+  trading-platform@platform-scheduler.service                                               loaded    inactive   dead          Trading platform service platform-scheduler
+  trading-platform@portfolio-engine.service                                                 loaded    inactive   dead          Trading platform service portfolio-engine
+  trading-platform@portfolio-state-service.service                                          loaded    inactive   dead          Trading platform service portfolio-state-service
+  trading-platform@product-supervisor.service                                               loaded    inactive   dead          Trading platform service product-supervisor
+  trading-platform@promotion-engine.service                                                 loaded    inactive   dead          Trading platform service promotion-engine
+  trading-platform@risk-engine.service                                                      loaded    inactive   dead          Trading platform service risk-engine
+  trading-platform@strategy-evaluator.service                                               loaded    inactive   dead          Trading platform service strategy-evaluator
+  trading-platform@universe-service.service                                                 loaded    inactive   dead          Trading platform service universe-service
+=== SYSTEM TIMERS ===
+Wed 2026-09-02 01:01:34 CEST    25min Wed 2026-09-02 00:02:31 CEST     33min ago trading-platform-backup-postgresql.timer trading-platform-backup@postgresql.service
+Mon 2026-09-07 00:17:02 CEST   4 days Mon 2026-08-31 00:27:30 CEST    2 days ago trading-platform-backup-verify.timer     trading-platform-backup@verify.service
+-                                   - Wed 2026-09-02 00:10:54 CEST     25min ago trading-platform-backup-parquet.timer    trading-platform-backup@parquet.service
+=== SERVICE DETAILS ===
+### trading-platform-agent@agent-sandbox.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 18:32:32 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 19:51:24 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=5596253000
+Id=trading-platform-agent@agent-sandbox.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform-agent@.service
+UnitFileState=enabled
+### trading-platform-backup@parquet.service
+NRestarts=0
+ExecMainStartTimestamp=Wed 2026-09-02 00:10:55 CEST
+ExecMainExitTimestamp=
+ExecMainCode=0
+ExecMainStatus=0
+MemoryCurrent=414195712
+CPUUsageNSec=25599627000
+Id=trading-platform-backup@parquet.service
+LoadState=loaded
+ActiveState=activating
+SubState=start
+FragmentPath=/etc/systemd/system/trading-platform-backup@.service
+UnitFileState=static
+### trading-platform-backup@postgresql.service
+NRestarts=0
+ExecMainStartTimestamp=Wed 2026-09-02 00:02:31 CEST
+ExecMainExitTimestamp=Wed 2026-09-02 00:12:40 CEST
+ExecMainCode=1
+ExecMainStatus=0
+MemoryCurrent=[not set]
+CPUUsageNSec=33115347000
+Id=trading-platform-backup@postgresql.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform-backup@.service
+UnitFileState=static
+### trading-platform-backup@verify.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 17:32:25 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 17:35:51 CEST
+ExecMainCode=1
+ExecMainStatus=0
+MemoryCurrent=[not set]
+CPUUsageNSec=12056979000
+Id=trading-platform-backup@verify.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform-backup@.service
+UnitFileState=static
+### trading-platform-migration.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 16:53:37 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 16:54:13 CEST
+ExecMainCode=1
+ExecMainStatus=0
+MemoryCurrent=[not set]
+CPUUsageNSec=5028669000
+Id=trading-platform-migration.service
+LoadState=loaded
+ActiveState=active
+SubState=exited
+FragmentPath=/etc/systemd/system/trading-platform-migration.service
+UnitFileState=static
+### trading-platform-research@event-replay-worker.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 18:32:32 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 19:51:24 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=21953773000
+Id=trading-platform-research@event-replay-worker.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform-research@.service
+UnitFileState=enabled
+### trading-platform-research@feature-build-worker.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 18:32:32 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 19:51:25 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=5325527000
+Id=trading-platform-research@feature-build-worker.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform-research@.service
+UnitFileState=enabled
+### trading-platform-research@ml-worker.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 18:32:32 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 19:51:25 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=16023089000
+Id=trading-platform-research@ml-worker.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform-research@.service
+UnitFileState=enabled
+### trading-platform-research@report-worker.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 18:32:32 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 19:51:25 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=1090695759000
+Id=trading-platform-research@report-worker.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform-research@.service
+UnitFileState=enabled
+### trading-platform-research@research-worker.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 18:32:32 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 19:51:25 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=14191269000
+Id=trading-platform-research@research-worker.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform-research@.service
+UnitFileState=enabled
+### trading-platform@account-reconciliation.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 17:04:39 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 21:01:28 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=17046603000
+Id=trading-platform@account-reconciliation.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@accounting-service.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 17:03:28 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 21:01:28 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=13668006000
+Id=trading-platform@accounting-service.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@control-api.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 17:09:28 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 21:01:29 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=134021237000
+Id=trading-platform@control-api.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@data-writer.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 23:11:44 CEST
+ExecMainExitTimestamp=
+ExecMainCode=0
+ExecMainStatus=0
+MemoryCurrent=321978368
+CPUUsageNSec=125614654000
+Id=trading-platform@data-writer.service
+LoadState=loaded
+ActiveState=active
+SubState=running
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@execution-engine.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 17:00:18 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 21:01:29 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=13910161000
+Id=trading-platform@execution-engine.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@feature-service.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 23:11:44 CEST
+ExecMainExitTimestamp=
+ExecMainCode=0
+ExecMainStatus=0
+MemoryCurrent=884133888
+CPUUsageNSec=280430420000
+Id=trading-platform@feature-service.service
+LoadState=loaded
+ActiveState=active
+SubState=running
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@market-gateway.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 23:11:44 CEST
+ExecMainExitTimestamp=
+ExecMainCode=0
+ExecMainStatus=0
+MemoryCurrent=186994688
+CPUUsageNSec=33207807000
+Id=trading-platform@market-gateway.service
+LoadState=loaded
+ActiveState=active
+SubState=running
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@paper-engine.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 17:03:28 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 21:01:28 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=14132491000
+Id=trading-platform@paper-engine.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@platform-scheduler.service
+NRestarts=0
+ExecMainStartTimestamp=
+ExecMainExitTimestamp=
+ExecMainCode=0
+ExecMainStatus=0
+MemoryCurrent=[not set]
+CPUUsageNSec=2543104000
+Id=trading-platform@platform-scheduler.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@portfolio-engine.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 16:59:17 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 21:01:28 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=13815664000
+Id=trading-platform@portfolio-engine.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@portfolio-state-service.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 16:58:56 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 21:01:29 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=5697223340000
+Id=trading-platform@portfolio-state-service.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@product-supervisor.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 17:07:32 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 21:01:29 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=13475162000
+Id=trading-platform@product-supervisor.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@promotion-engine.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 17:05:12 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 21:01:29 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=25671503000
+Id=trading-platform@promotion-engine.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@risk-engine.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 16:59:50 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 21:01:29 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=13746869000
+Id=trading-platform@risk-engine.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@strategy-evaluator.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 17:39:29 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 21:01:29 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=12018923000
+Id=trading-platform@strategy-evaluator.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+### trading-platform@universe-service.service
+NRestarts=0
+ExecMainStartTimestamp=Tue 2026-09-01 17:08:22 CEST
+ExecMainExitTimestamp=Tue 2026-09-01 21:01:29 CEST
+ExecMainCode=2
+ExecMainStatus=9
+MemoryCurrent=[not set]
+CPUUsageNSec=68369572000
+Id=trading-platform@universe-service.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+FragmentPath=/etc/systemd/system/trading-platform@.service
+UnitFileState=enabled
+=== RECENT PLATFORM WARNINGS ===
+Sep 01 17:00:48 alfred systemd[1]: trading-platform@paper-engine.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:00:48 alfred systemd[1]: trading-platform@paper-engine.service: Failed with result 'timeout'.
+Sep 01 17:02:18 alfred systemd[1]: trading-platform@paper-engine.service: start-pre operation timed out. Terminating.
+Sep 01 17:02:21 alfred systemd[1]: trading-platform@paper-engine.service: Control process exited, code=killed, status=2/INT
+Sep 01 17:02:21 alfred systemd[1]: trading-platform@paper-engine.service: Failed with result 'timeout'.
+Sep 01 17:02:21 alfred systemd[1]: Failed to start trading-platform@paper-engine.service - Trading platform service paper-engine.
+Sep 01 17:02:52 alfred systemd[1]: trading-platform@accounting-service.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:02:52 alfred systemd[1]: trading-platform@accounting-service.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:02:52 alfred systemd[1]: trading-platform@accounting-service.service: Failed with result 'timeout'.
+Sep 01 17:03:59 alfred systemd[1]: trading-platform@account-reconciliation.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:03:59 alfred systemd[1]: trading-platform@account-reconciliation.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:03:59 alfred systemd[1]: trading-platform@account-reconciliation.service: Failed with result 'timeout'.
+Sep 01 17:05:09 alfred systemd[1]: trading-platform@promotion-engine.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:05:09 alfred systemd[1]: trading-platform@promotion-engine.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:05:09 alfred systemd[1]: trading-platform@promotion-engine.service: Failed with result 'timeout'.
+Sep 01 17:05:42 alfred systemd[1]: trading-platform@product-supervisor.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:05:42 alfred systemd[1]: trading-platform@product-supervisor.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:05:42 alfred systemd[1]: trading-platform@product-supervisor.service: Failed with result 'timeout'.
+Sep 01 17:07:13 alfred systemd[1]: trading-platform@product-supervisor.service: start-pre operation timed out. Terminating.
+Sep 01 17:07:13 alfred systemd[1]: trading-platform@product-supervisor.service: Control process exited, code=killed, status=2/INT
+Sep 01 17:07:13 alfred systemd[1]: trading-platform@product-supervisor.service: Failed with result 'timeout'.
+Sep 01 17:07:13 alfred systemd[1]: Failed to start trading-platform@product-supervisor.service - Trading platform service product-supervisor.
+Sep 01 17:07:43 alfred systemd[1]: trading-platform@universe-service.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:07:43 alfred systemd[1]: trading-platform@universe-service.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:07:43 alfred systemd[1]: trading-platform@universe-service.service: Failed with result 'timeout'.
+Sep 01 17:08:52 alfred systemd[1]: trading-platform@platform-scheduler.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:08:52 alfred systemd[1]: trading-platform@platform-scheduler.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:08:52 alfred systemd[1]: trading-platform@platform-scheduler.service: Failed with result 'timeout'.
+Sep 01 17:09:25 alfred systemd[1]: trading-platform@control-api.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:09:25 alfred systemd[1]: trading-platform@control-api.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:09:25 alfred systemd[1]: trading-platform@control-api.service: Failed with result 'timeout'.
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@research-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@feature-build-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@report-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@ml-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@event-replay-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@ml-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@ml-worker.service: Failed with result 'timeout'.
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@feature-build-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@feature-build-worker.service: Failed with result 'timeout'.
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@event-replay-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@event-replay-worker.service: Failed with result 'timeout'.
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@research-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@research-worker.service: Failed with result 'timeout'.
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@report-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:25:48 alfred systemd[1]: trading-platform-research@report-worker.service: Failed with result 'timeout'.
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@research-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@feature-build-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@report-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-agent@agent-sandbox.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@event-replay-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@ml-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-agent@agent-sandbox.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-agent@agent-sandbox.service: Failed with result 'timeout'.
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@research-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@research-worker.service: Failed with result 'timeout'.
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@event-replay-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@event-replay-worker.service: Failed with result 'timeout'.
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@feature-build-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@feature-build-worker.service: Failed with result 'timeout'.
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@ml-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@ml-worker.service: Failed with result 'timeout'.
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@report-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 17:49:00 alfred systemd[1]: trading-platform-research@report-worker.service: Failed with result 'timeout'.
+Sep 01 18:13:48 alfred systemd[1]: trading-platform-research@ml-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 18:13:48 alfred systemd[1]: trading-platform-research@feature-build-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 18:13:48 alfred systemd[1]: trading-platform-research@report-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 18:13:48 alfred systemd[1]: trading-platform-research@event-replay-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 18:13:48 alfred systemd[1]: trading-platform-research@research-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 18:13:48 alfred systemd[1]: trading-platform-research@ml-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 18:13:48 alfred systemd[1]: trading-platform-research@ml-worker.service: Failed with result 'timeout'.
+Sep 01 18:13:48 alfred systemd[1]: trading-platform-research@event-replay-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 18:13:48 alfred systemd[1]: trading-platform-research@event-replay-worker.service: Failed with result 'timeout'.
+Sep 01 18:13:49 alfred systemd[1]: trading-platform-research@feature-build-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 18:13:49 alfred systemd[1]: trading-platform-research@feature-build-worker.service: Failed with result 'timeout'.
+Sep 01 18:13:49 alfred systemd[1]: trading-platform-research@report-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 18:13:49 alfred systemd[1]: trading-platform-research@report-worker.service: Failed with result 'timeout'.
+Sep 01 18:13:49 alfred systemd[1]: trading-platform-research@research-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 18:13:49 alfred systemd[1]: trading-platform-research@research-worker.service: Failed with result 'timeout'.
+Sep 01 18:25:57 alfred systemd[1]: trading-platform@feature-service.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 18:25:57 alfred systemd[1]: trading-platform@data-writer.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 18:25:57 alfred systemd[1]: trading-platform@market-gateway.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 18:25:57 alfred systemd[1]: trading-platform@market-gateway.service: Main process exited, code=killed, status=9/KILL
+Sep 01 18:25:57 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 18:25:58 alfred systemd[1]: trading-platform@data-writer.service: Main process exited, code=killed, status=9/KILL
+Sep 01 18:25:58 alfred systemd[1]: trading-platform@data-writer.service: Failed with result 'timeout'.
+Sep 01 18:25:58 alfred systemd[1]: trading-platform@feature-service.service: Main process exited, code=killed, status=9/KILL
+Sep 01 18:25:58 alfred systemd[1]: trading-platform@feature-service.service: Failed with result 'timeout'.
+Sep 01 19:51:24 alfred systemd[1]: trading-platform-research@event-replay-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 19:51:24 alfred systemd[1]: trading-platform-agent@agent-sandbox.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 19:51:24 alfred systemd[1]: trading-platform-research@research-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 19:51:24 alfred systemd[1]: trading-platform-research@report-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 19:51:24 alfred systemd[1]: trading-platform-research@feature-build-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 19:51:24 alfred systemd[1]: trading-platform-research@ml-worker.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 19:51:24 alfred systemd[1]: trading-platform-agent@agent-sandbox.service: Main process exited, code=killed, status=9/KILL
+Sep 01 19:51:24 alfred systemd[1]: trading-platform-agent@agent-sandbox.service: Failed with result 'timeout'.
+Sep 01 19:51:24 alfred systemd[1]: trading-platform-research@event-replay-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 19:51:24 alfred systemd[1]: trading-platform-research@event-replay-worker.service: Failed with result 'timeout'.
+Sep 01 19:51:25 alfred systemd[1]: trading-platform-research@ml-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 19:51:25 alfred systemd[1]: trading-platform-research@ml-worker.service: Failed with result 'timeout'.
+Sep 01 19:51:25 alfred systemd[1]: trading-platform-research@feature-build-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 19:51:25 alfred systemd[1]: trading-platform-research@feature-build-worker.service: Failed with result 'timeout'.
+Sep 01 19:51:25 alfred systemd[1]: trading-platform-research@report-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 19:51:25 alfred systemd[1]: trading-platform-research@report-worker.service: Failed with result 'timeout'.
+Sep 01 19:51:25 alfred systemd[1]: trading-platform-research@research-worker.service: Main process exited, code=killed, status=9/KILL
+Sep 01 19:51:25 alfred systemd[1]: trading-platform-research@research-worker.service: Failed with result 'timeout'.
+Sep 01 19:53:50 alfred systemd[1]: trading-platform@feature-service.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 19:53:50 alfred systemd[1]: trading-platform@market-gateway.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 19:53:50 alfred systemd[1]: trading-platform@data-writer.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 19:53:50 alfred systemd[1]: trading-platform@market-gateway.service: Main process exited, code=killed, status=9/KILL
+Sep 01 19:53:50 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 19:53:50 alfred systemd[1]: trading-platform@data-writer.service: Main process exited, code=killed, status=9/KILL
+Sep 01 19:53:50 alfred systemd[1]: trading-platform@data-writer.service: Failed with result 'timeout'.
+Sep 01 19:53:50 alfred systemd[1]: trading-platform@feature-service.service: Main process exited, code=killed, status=9/KILL
+Sep 01 19:53:50 alfred systemd[1]: trading-platform@feature-service.service: Failed with result 'timeout'.
+Sep 01 20:09:54 alfred systemd[1]: trading-platform@market-gateway.service: start-pre operation timed out. Terminating.
+Sep 01 20:09:56 alfred systemd[1]: trading-platform@market-gateway.service: Control process exited, code=killed, status=2/INT
+Sep 01 20:09:56 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 20:09:56 alfred systemd[1]: Failed to start trading-platform@market-gateway.service - Trading platform service market-gateway.
+Sep 01 20:11:26 alfred systemd[1]: trading-platform@data-writer.service: start-pre operation timed out. Terminating.
+Sep 01 20:11:31 alfred systemd[1]: trading-platform@market-gateway.service: start-pre operation timed out. Terminating.
+Sep 01 20:11:54 alfred systemd[1]: trading-platform@market-gateway.service: Control process exited, code=killed, status=2/INT
+Sep 01 20:11:54 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 20:11:54 alfred systemd[1]: Failed to start trading-platform@market-gateway.service - Trading platform service market-gateway.
+Sep 01 20:11:56 alfred systemd[1]: trading-platform@data-writer.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:11:56 alfred systemd[1]: trading-platform@data-writer.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:11:56 alfred systemd[1]: trading-platform@data-writer.service: Failed with result 'timeout'.
+Sep 01 20:11:56 alfred systemd[1]: Failed to start trading-platform@data-writer.service - Trading platform service data-writer.
+Sep 01 20:13:26 alfred systemd[1]: trading-platform@feature-service.service: start-pre operation timed out. Terminating.
+Sep 01 20:13:29 alfred systemd[1]: trading-platform@market-gateway.service: start-pre operation timed out. Terminating.
+Sep 01 20:13:32 alfred systemd[1]: trading-platform@data-writer.service: start-pre operation timed out. Terminating.
+Sep 01 20:13:57 alfred systemd[1]: trading-platform@feature-service.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:13:57 alfred systemd[1]: trading-platform@feature-service.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:13:57 alfred systemd[1]: trading-platform@feature-service.service: Failed with result 'timeout'.
+Sep 01 20:13:57 alfred systemd[1]: Failed to start trading-platform@feature-service.service - Trading platform service feature-service.
+Sep 01 20:14:00 alfred systemd[1]: trading-platform@market-gateway.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:14:00 alfred systemd[1]: trading-platform@market-gateway.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:14:00 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 20:14:00 alfred systemd[1]: Failed to start trading-platform@market-gateway.service - Trading platform service market-gateway.
+Sep 01 20:14:02 alfred systemd[1]: trading-platform@data-writer.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:14:02 alfred systemd[1]: trading-platform@data-writer.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:14:02 alfred systemd[1]: trading-platform@data-writer.service: Failed with result 'timeout'.
+Sep 01 20:14:02 alfred systemd[1]: Failed to start trading-platform@data-writer.service - Trading platform service data-writer.
+Sep 01 20:15:32 alfred systemd[1]: trading-platform@feature-service.service: start-pre operation timed out. Terminating.
+Sep 01 20:15:35 alfred systemd[1]: trading-platform@market-gateway.service: start-pre operation timed out. Terminating.
+Sep 01 20:15:37 alfred systemd[1]: trading-platform@data-writer.service: start-pre operation timed out. Terminating.
+Sep 01 20:16:02 alfred systemd[1]: trading-platform@feature-service.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:16:02 alfred systemd[1]: trading-platform@feature-service.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:16:02 alfred systemd[1]: trading-platform@feature-service.service: Failed with result 'timeout'.
+Sep 01 20:16:02 alfred systemd[1]: Failed to start trading-platform@feature-service.service - Trading platform service feature-service.
+Sep 01 20:16:05 alfred systemd[1]: trading-platform@market-gateway.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:16:05 alfred systemd[1]: trading-platform@market-gateway.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:16:05 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 20:16:05 alfred systemd[1]: Failed to start trading-platform@market-gateway.service - Trading platform service market-gateway.
+Sep 01 20:16:08 alfred systemd[1]: trading-platform@data-writer.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:16:08 alfred systemd[1]: trading-platform@data-writer.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:16:08 alfred systemd[1]: trading-platform@data-writer.service: Failed with result 'timeout'.
+Sep 01 20:16:08 alfred systemd[1]: Failed to start trading-platform@data-writer.service - Trading platform service data-writer.
+Sep 01 20:17:38 alfred systemd[1]: trading-platform@feature-service.service: start-pre operation timed out. Terminating.
+Sep 01 20:17:41 alfred systemd[1]: trading-platform@market-gateway.service: start-pre operation timed out. Terminating.
+Sep 01 20:17:43 alfred systemd[1]: trading-platform@data-writer.service: start-pre operation timed out. Terminating.
+Sep 01 20:18:08 alfred systemd[1]: trading-platform@feature-service.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:18:08 alfred systemd[1]: trading-platform@feature-service.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:18:08 alfred systemd[1]: trading-platform@feature-service.service: Failed with result 'timeout'.
+Sep 01 20:18:08 alfred systemd[1]: Failed to start trading-platform@feature-service.service - Trading platform service feature-service.
+Sep 01 20:18:11 alfred systemd[1]: trading-platform@market-gateway.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:18:11 alfred systemd[1]: trading-platform@market-gateway.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:18:11 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 20:18:11 alfred systemd[1]: Failed to start trading-platform@market-gateway.service - Trading platform service market-gateway.
+Sep 01 20:18:13 alfred systemd[1]: trading-platform@data-writer.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:18:13 alfred systemd[1]: trading-platform@data-writer.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:18:13 alfred systemd[1]: trading-platform@data-writer.service: Failed with result 'timeout'.
+Sep 01 20:18:13 alfred systemd[1]: Failed to start trading-platform@data-writer.service - Trading platform service data-writer.
+Sep 01 20:19:44 alfred systemd[1]: trading-platform@feature-service.service: start-pre operation timed out. Terminating.
+Sep 01 20:19:47 alfred systemd[1]: trading-platform@market-gateway.service: start-pre operation timed out. Terminating.
+Sep 01 20:19:49 alfred systemd[1]: trading-platform@data-writer.service: start-pre operation timed out. Terminating.
+Sep 01 20:20:03 alfred systemd[1]: trading-platform@data-writer.service: Control process exited, code=killed, status=2/INT
+Sep 01 20:20:03 alfred systemd[1]: trading-platform@data-writer.service: Failed with result 'timeout'.
+Sep 01 20:20:03 alfred systemd[1]: Failed to start trading-platform@data-writer.service - Trading platform service data-writer.
+Sep 01 20:20:03 alfred systemd[1]: trading-platform@feature-service.service: Control process exited, code=killed, status=2/INT
+Sep 01 20:20:03 alfred systemd[1]: trading-platform@feature-service.service: Failed with result 'timeout'.
+Sep 01 20:20:03 alfred systemd[1]: Failed to start trading-platform@feature-service.service - Trading platform service feature-service.
+Sep 01 20:20:03 alfred systemd[1]: trading-platform@market-gateway.service: Control process exited, code=killed, status=2/INT
+Sep 01 20:20:03 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 20:20:03 alfred systemd[1]: Failed to start trading-platform@market-gateway.service - Trading platform service market-gateway.
+Sep 01 20:25:08 alfred systemd[1]: trading-platform@feature-service.service: start-pre operation timed out. Terminating.
+Sep 01 20:25:08 alfred systemd[1]: trading-platform@market-gateway.service: start-pre operation timed out. Terminating.
+Sep 01 20:25:08 alfred systemd[1]: trading-platform@data-writer.service: start-pre operation timed out. Terminating.
+Sep 01 20:27:09 alfred systemd[1]: trading-platform@feature-service.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:27:09 alfred systemd[1]: trading-platform@data-writer.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:27:09 alfred systemd[1]: trading-platform@market-gateway.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:27:09 alfred systemd[1]: trading-platform@data-writer.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:27:09 alfred systemd[1]: trading-platform@data-writer.service: Failed with result 'timeout'.
+Sep 01 20:27:09 alfred systemd[1]: Failed to start trading-platform@data-writer.service - Trading platform service data-writer.
+Sep 01 20:27:09 alfred systemd[1]: trading-platform@market-gateway.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:27:09 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 20:27:09 alfred systemd[1]: Failed to start trading-platform@market-gateway.service - Trading platform service market-gateway.
+Sep 01 20:27:09 alfred systemd[1]: trading-platform@feature-service.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:27:09 alfred systemd[1]: trading-platform@feature-service.service: Failed with result 'timeout'.
+Sep 01 20:27:09 alfred systemd[1]: Failed to start trading-platform@feature-service.service - Trading platform service feature-service.
+Sep 01 20:32:14 alfred systemd[1]: trading-platform@market-gateway.service: start-pre operation timed out. Terminating.
+Sep 01 20:32:14 alfred systemd[1]: trading-platform@data-writer.service: start-pre operation timed out. Terminating.
+Sep 01 20:32:14 alfred systemd[1]: trading-platform@feature-service.service: start-pre operation timed out. Terminating.
+Sep 01 20:34:14 alfred systemd[1]: trading-platform@market-gateway.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:34:14 alfred systemd[1]: trading-platform@data-writer.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:34:14 alfred systemd[1]: trading-platform@feature-service.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:34:14 alfred systemd[1]: trading-platform@feature-service.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:34:14 alfred systemd[1]: trading-platform@feature-service.service: Failed with result 'timeout'.
+Sep 01 20:34:14 alfred systemd[1]: Failed to start trading-platform@feature-service.service - Trading platform service feature-service.
+Sep 01 20:34:14 alfred systemd[1]: trading-platform@market-gateway.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:34:14 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 20:34:14 alfred systemd[1]: Failed to start trading-platform@market-gateway.service - Trading platform service market-gateway.
+Sep 01 20:34:14 alfred systemd[1]: trading-platform@data-writer.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:34:14 alfred systemd[1]: trading-platform@data-writer.service: Failed with result 'timeout'.
+Sep 01 20:34:14 alfred systemd[1]: Failed to start trading-platform@data-writer.service - Trading platform service data-writer.
+Sep 01 20:39:20 alfred systemd[1]: trading-platform@market-gateway.service: start-pre operation timed out. Terminating.
+Sep 01 20:39:20 alfred systemd[1]: trading-platform@data-writer.service: start-pre operation timed out. Terminating.
+Sep 01 20:39:20 alfred systemd[1]: trading-platform@feature-service.service: start-pre operation timed out. Terminating.
+Sep 01 20:41:20 alfred systemd[1]: trading-platform@market-gateway.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:41:20 alfred systemd[1]: trading-platform@feature-service.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:41:20 alfred systemd[1]: trading-platform@data-writer.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:41:20 alfred systemd[1]: trading-platform@market-gateway.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:41:20 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 20:41:20 alfred systemd[1]: Failed to start trading-platform@market-gateway.service - Trading platform service market-gateway.
+Sep 01 20:41:20 alfred systemd[1]: trading-platform@data-writer.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:41:20 alfred systemd[1]: trading-platform@data-writer.service: Failed with result 'timeout'.
+Sep 01 20:41:20 alfred systemd[1]: Failed to start trading-platform@data-writer.service - Trading platform service data-writer.
+Sep 01 20:41:21 alfred systemd[1]: trading-platform@feature-service.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:41:21 alfred systemd[1]: trading-platform@feature-service.service: Failed with result 'timeout'.
+Sep 01 20:41:21 alfred systemd[1]: Failed to start trading-platform@feature-service.service - Trading platform service feature-service.
+Sep 01 20:46:26 alfred systemd[1]: trading-platform@market-gateway.service: start-pre operation timed out. Terminating.
+Sep 01 20:46:26 alfred systemd[1]: trading-platform@data-writer.service: start-pre operation timed out. Terminating.
+Sep 01 20:46:26 alfred systemd[1]: trading-platform@feature-service.service: start-pre operation timed out. Terminating.
+Sep 01 20:48:26 alfred systemd[1]: trading-platform@market-gateway.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:48:26 alfred systemd[1]: trading-platform@data-writer.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:48:26 alfred systemd[1]: trading-platform@market-gateway.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:48:26 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 20:48:26 alfred systemd[1]: Failed to start trading-platform@market-gateway.service - Trading platform service market-gateway.
+Sep 01 20:48:26 alfred systemd[1]: trading-platform@data-writer.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:48:26 alfred systemd[1]: trading-platform@data-writer.service: Failed with result 'timeout'.
+Sep 01 20:48:26 alfred systemd[1]: Failed to start trading-platform@data-writer.service - Trading platform service data-writer.
+Sep 01 20:48:26 alfred systemd[1]: trading-platform@feature-service.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:48:26 alfred systemd[1]: trading-platform@feature-service.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:48:26 alfred systemd[1]: trading-platform@feature-service.service: Failed with result 'timeout'.
+Sep 01 20:48:26 alfred systemd[1]: Failed to start trading-platform@feature-service.service - Trading platform service feature-service.
+Sep 01 20:53:31 alfred systemd[1]: trading-platform@market-gateway.service: start-pre operation timed out. Terminating.
+Sep 01 20:53:31 alfred systemd[1]: trading-platform@data-writer.service: start-pre operation timed out. Terminating.
+Sep 01 20:53:32 alfred systemd[1]: trading-platform@feature-service.service: start-pre operation timed out. Terminating.
+Sep 01 20:55:32 alfred systemd[1]: trading-platform@market-gateway.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:55:32 alfred systemd[1]: trading-platform@data-writer.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:55:32 alfred systemd[1]: trading-platform@market-gateway.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:55:32 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 20:55:32 alfred systemd[1]: Failed to start trading-platform@market-gateway.service - Trading platform service market-gateway.
+Sep 01 20:55:32 alfred systemd[1]: trading-platform@data-writer.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:55:32 alfred systemd[1]: trading-platform@data-writer.service: Failed with result 'timeout'.
+Sep 01 20:55:32 alfred systemd[1]: Failed to start trading-platform@data-writer.service - Trading platform service data-writer.
+Sep 01 20:55:32 alfred systemd[1]: trading-platform@feature-service.service: State 'stop-sigterm' timed out. Killing.
+Sep 01 20:55:32 alfred systemd[1]: trading-platform@feature-service.service: Control process exited, code=killed, status=9/KILL
+Sep 01 20:55:32 alfred systemd[1]: trading-platform@feature-service.service: Failed with result 'timeout'.
+Sep 01 20:55:32 alfred systemd[1]: Failed to start trading-platform@feature-service.service - Trading platform service feature-service.
+Sep 01 21:00:37 alfred systemd[1]: trading-platform@market-gateway.service: start-pre operation timed out. Terminating.
+Sep 01 21:00:37 alfred systemd[1]: trading-platform@data-writer.service: start-pre operation timed out. Terminating.
+Sep 01 21:00:38 alfred systemd[1]: trading-platform@feature-service.service: start-pre operation timed out. Terminating.
+Sep 01 21:01:28 alfred systemd[1]: trading-platform@account-reconciliation.service: Main process exited, code=killed, status=9/KILL
+Sep 01 21:01:28 alfred systemd[1]: trading-platform@account-reconciliation.service: Failed with result 'signal'.
+Sep 01 21:01:28 alfred systemd[1]: trading-platform@portfolio-engine.service: Main process exited, code=killed, status=9/KILL
+Sep 01 21:01:28 alfred systemd[1]: trading-platform@portfolio-engine.service: Failed with result 'signal'.
+Sep 01 21:01:28 alfred systemd[1]: trading-platform@data-writer.service: Control process exited, code=killed, status=9/KILL
+Sep 01 21:01:28 alfred systemd[1]: trading-platform@data-writer.service: Failed with result 'timeout'.
+Sep 01 21:01:28 alfred systemd[1]: trading-platform@market-gateway.service: Control process exited, code=killed, status=9/KILL
+Sep 01 21:01:28 alfred systemd[1]: trading-platform@market-gateway.service: Failed with result 'timeout'.
+Sep 01 21:01:28 alfred systemd[1]: trading-platform@accounting-service.service: Main process exited, code=killed, status=9/KILL
+Sep 01 21:01:28 alfred systemd[1]: trading-platform@accounting-service.service: Failed with result 'signal'.
+Sep 01 21:01:28 alfred systemd[1]: trading-platform@paper-engine.service: Main process exited, code=killed, status=9/KILL
+Sep 01 21:01:28 alfred systemd[1]: trading-platform@paper-engine.service: Failed with result 'signal'.
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@feature-service.service: Control process exited, code=killed, status=9/KILL
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@feature-service.service: Failed with result 'timeout'.
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@promotion-engine.service: Main process exited, code=killed, status=9/KILL
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@promotion-engine.service: Failed with result 'signal'.
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@risk-engine.service: Main process exited, code=killed, status=9/KILL
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@risk-engine.service: Failed with result 'signal'.
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@execution-engine.service: Main process exited, code=killed, status=9/KILL
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@execution-engine.service: Failed with result 'signal'.
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@product-supervisor.service: Main process exited, code=killed, status=9/KILL
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@product-supervisor.service: Failed with result 'signal'.
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@platform-scheduler.service: Main process exited, code=killed, status=9/KILL
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@platform-scheduler.service: Failed with result 'signal'.
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@strategy-evaluator.service: Main process exited, code=killed, status=9/KILL
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@strategy-evaluator.service: Failed with result 'signal'.
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@control-api.service: Main process exited, code=killed, status=9/KILL
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@control-api.service: Failed with result 'signal'.
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@portfolio-state-service.service: Main process exited, code=killed, status=9/KILL
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@portfolio-state-service.service: Failed with result 'signal'.
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@universe-service.service: Main process exited, code=killed, status=9/KILL
+Sep 01 21:01:29 alfred systemd[1]: trading-platform@universe-service.service: Failed with result 'signal'.
+Sep 01 23:46:07 alfred systemd[1]: trading-platform@platform-scheduler.service: Control process exited, code=killed, status=9/KILL
+Sep 01 23:46:07 alfred systemd[1]: trading-platform@platform-scheduler.service: Failed with result 'signal'.
+Sep 01 23:46:07 alfred systemd[1]: Failed to start trading-platform@platform-scheduler.service - Trading platform service platform-scheduler.
+Sep 01 23:46:21 alfred systemd[1]: trading-platform@platform-scheduler.service: Control process exited, code=killed, status=2/INT
+Sep 01 23:46:21 alfred systemd[1]: trading-platform@platform-scheduler.service: Failed with result 'signal'.
+=== ENVIRONMENT FILE METADATA ===
+/etc/trading-platform/agent.env root:trading-agent mode=640 bytes=200
+/etc/trading-platform/backup.env root:trading-runtime mode=640 bytes=187
+/etc/trading-platform/migration.env root:trading-platform-owner mode=640 bytes=224
+/etc/trading-platform/research.env root:trading-research mode=640 bytes=203
+/etc/trading-platform/runtime.env root:trading-runtime mode=640 bytes=578
+=== ACTIVE PROCESS INTERPRETERS ===
+trading+ 1758663 Dsl     01:24:23 /home/alfred/trading-bot/.venv-runtime/bin/python -m src.services.supervisor --config /home/alfred/trading-bot/config/platform.json --node linux-optiplex --service feature-service
+trading+ 1758666 Ssl     01:24:23 /home/alfred/trading-bot/.venv-runtime/bin/python -m src.services.supervisor --config /home/alfred/trading-bot/config/platform.json --node linux-optiplex --service market-gateway
+trading+ 1758667 Dsl     01:24:23 /home/alfred/trading-bot/.venv-runtime/bin/python -m src.services.supervisor --config /home/alfred/trading-bot/config/platform.json --node linux-optiplex --service data-writer
+trading+ 1782718 Dsl        25:12 /home/alfred/trading-bot/.venv-runtime/bin/python -m src.services.backup_service --config /home/alfred/trading-bot/config/platform.json --mode parquet
+

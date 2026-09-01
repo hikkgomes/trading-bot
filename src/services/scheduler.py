@@ -241,9 +241,7 @@ class PlatformScheduler:
         now: str,
         due_at: str,
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
-        if schedule_name in {"agent_review", "maintenance"} and product_id != min(
-            self.products
-        ):
+        if schedule_name in {"agent_review", "maintenance"} and product_id != min(self.products):
             return ()
         return (
             (

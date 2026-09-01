@@ -1,0 +1,43 @@
+=== DATA FILE INVENTORY ===
+data/raw files=272108 bytes=1549559744 newest=data/raw/binance/futures/aggregate_trade/APTUSDT/date=2026-08-31/.batch-ccec50e2c504abf4a359a615b67c243ddae1565afe31debb4a3e240b7bd08d10.parquet.9b92d56101c94655977a2ecc610349d7.tmp
+data/bars files=1900 bytes=8646240 newest=data/bars/binance/futures/1000SHIBUSDT/1m/date=2026-08-31/dc595d003a5d6bb218c9b46d9ca7fc39f2feb7c587d2d784d1827da1f47f2b86.parquet
+data/features files=499 bytes=1703890 newest=data/features/core-bars-v1/binance/futures/OPGUSDT/1m/date=2026-08-30/c760ad25e3cf2bc129cb982c09706392b99d60f2cdd7468922e5ecbd8df0b8ae.parquet
+data/research MISSING
+data/artefacts files=52 bytes=48027 newest=data/artefacts/models/b1/b1a40e9b75eea289821c5480d8a3673abe7299b8b60bfb6f36872505b509227a.joblib
+data/reports MISSING
+runtime/research files=0 bytes=0 newest=none
+runtime/candidates MISSING
+runtime/events files=8657 bytes=297664832 newest=runtime/events/spool/segment-36bc525b38d7328c289ebed0ad4684aba9ada781cad7d85816ef15bf5a66f06a.jsonl
+=== RAW BINANCE PARTITIONS ===
+  41523 futures/aggregate_trade
+  22876 futures/best_bid_ask
+  62429 futures/candle
+  21803 futures/depth_update
+  60438 futures/funding_rate
+    353 futures/liquidation
+  60391 futures/mark_price
+    607 spot/aggregate_trade
+   1686 spot/best_bid_ask
+     21 spot/candle
+=== PARQUET SAMPLE METADATA ===
+data/features/core-bars-v1/binance/futures/XPLUSDT/1m/date=2026-08-30/63f6b35c12f0f4e517027ef7d15749f4275ea1c3f007f500d5c4e31d133c5d8d.parquet	rows=3	row_groups=1	bytes=3411
+data/features/core-bars-v1/binance/futures/XPLUSDT/1m/date=2026-08-30/c09f2ea048bd8383f968c0162946d9f0718d9ff21896702d82b9ccdb4e64e980.parquet	rows=3	row_groups=1	bytes=3412
+data/features/core-bars-v1/binance/futures/XPLUSDT/1m/date=2026-08-30/1fb7c407eadcaa2c9c2c51321590e507d803023b9e381d72533d06385079755b.parquet	rows=3	row_groups=1	bytes=3411
+data/features/core-bars-v1/binance/futures/XPLUSDT/1m/date=2026-08-30/d915881840ff5be165b7746fa2e9c899ec29c795a4b6b0158128033fdba2afba.parquet	rows=3	row_groups=1	bytes=3412
+data/features/core-bars-v1/binance/futures/XPLUSDT/1m/date=2026-08-30/0085d8137e0e77e7b52d28f4dd593be35e6661f03d6e22427b845dbc6b3c0e11.parquet	rows=3	row_groups=1	bytes=3409
+data/features/core-bars-v1/binance/futures/XPLUSDT/1m/date=2026-08-30/dee26757bf61b03c4fdb04e7abd8798307d2b4219a9dc1d6427b8aa77c32d337.parquet	rows=3	row_groups=1	bytes=3409
+data/features/core-bars-v1/binance/futures/UNIUSDT/1m/date=2026-08-30/704f0c99d674d6b3615a0ee145f11d89407aa1a83c02bfd2d7e2f7598813fc89.parquet	rows=3	row_groups=1	bytes=3412
+data/features/core-bars-v1/binance/futures/UNIUSDT/1m/date=2026-08-30/9f257272376e7fa5d1349d2bda026ebe94441c04ef6c15291e23de0776c96730.parquet	rows=3	row_groups=1	bytes=3412
+data/features/core-bars-v1/binance/futures/UNIUSDT/1m/date=2026-08-30/8601d517115e5ed45f6d70058a79dda8eea846b3001316de4050171f9c679aa9.parquet	rows=3	row_groups=1	bytes=3411
+data/features/core-bars-v1/binance/futures/UNIUSDT/1m/date=2026-08-30/d37aa89f21141d0dbf3fcc56d3ffa44e93e82322c9dddf08047d3015220fe608.parquet	rows=3	row_groups=1	bytes=3410
+data/features/core-bars-v1/binance/futures/UNIUSDT/1m/date=2026-08-30/c4c28f47b7a8391bd4c5352c8d653f28360c57c96d3e99c9371adc95f6ab6400.parquet	rows=3	row_groups=1	bytes=3409
+data/features/core-bars-v1/binance/futures/UNIUSDT/1m/date=2026-08-30/f00eaca82b0c1a0953447a6888709d5d8d6d5eb9ca1595cff0c83fb2b04d7af5.parquet	rows=3	row_groups=1	bytes=3410
+data/features/core-bars-v1/binance/futures/UNIUSDT/1m/date=2026-08-30/c4b656c240d806140da3d20904bdc8fe53e1f764123fa919bf8e6d3f418f50ea.parquet	rows=3	row_groups=1	bytes=3411
+data/features/core-bars-v1/binance/futures/UNIUSDT/1m/date=2026-08-30/cce3d732040cca9305ba0e7932225ee8725722abf29a0e495fdb4960ae0af4d7.parquet	rows=3	row_groups=1	bytes=3411
+data/features/core-bars-v1/binance/futures/UNIUSDT/1m/date=2026-08-30/e58e37071f29e57c5bc8c6ccfebcaf4a88aa8caa47da725a7333a76882cff15c.parquet	rows=3	row_groups=1	bytes=3409
+data/features/core-bars-v1/binance/futures/TRXUSDT/1m/date=2026-08-30/9d425d83b8cbd7bffd2fdc90de780fca9a7e31f3501c2ae7fbd0f5bd92f7a6e6.parquet	rows=3	row_groups=1	bytes=3409
+data/features/core-bars-v1/binance/futures/TRXUSDT/1m/date=2026-08-30/8f723486d17a8d66e88346ba7091306522c0069c3d6693a84b5e1a20981e98e5.parquet	rows=3	row_groups=1	bytes=3411
+data/features/core-bars-v1/binance/futures/TRXUSDT/1m/date=2026-08-30/58c49deca876e7edde01070ca76eb423752c2144c474c94d856b70e601e38d1f.parquet	rows=3	row_groups=1	bytes=3411
+data/features/core-bars-v1/binance/futures/TRXUSDT/1m/date=2026-08-30/225d4d251c262df19c07bf4997e6a3aa7a7cc519717d498d0045f7260435226c.parquet	rows=3	row_groups=1	bytes=3410
+data/features/core-bars-v1/binance/futures/TRXUSDT/1m/date=2026-08-30/d388127d65d92c49cb5df5c74491d1cf46edeb23e1848f81a09b334fd034a2bc.parquet	rows=3	row_groups=1	bytes=3412
+
