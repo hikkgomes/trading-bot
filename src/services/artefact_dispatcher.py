@@ -284,17 +284,14 @@ def _machine_learning(
     return _forecast(score, artefact, confidence=float(model.get("calibration", 0.7)))
 
 
-def _semantic(
-    features: Mapping[str, Any], artefact: Mapping[str, Any]
-) -> Mapping[str, Any]:
+def _semantic(features: Mapping[str, Any], artefact: Mapping[str, Any]) -> Mapping[str, Any]:
     definition = _definition(artefact)
     model = definition.get("signal_model")
     model = model if isinstance(model, Mapping) else {}
     source_type = str(definition.get("source_type") or "")
     name = semantic_strategy_name(source_type, model.get("semantic_strategy"))
     instrument_id = str(
-        features.get("instrument_id")
-        or next(iter(artefact.get("supported_instruments", ())), "")
+        features.get("instrument_id") or next(iter(artefact.get("supported_instruments", ())), "")
     )
     if not instrument_id:
         raise ArtefactDispatchError("semantic evaluation requires an instrument identity")

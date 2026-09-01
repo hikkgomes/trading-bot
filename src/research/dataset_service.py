@@ -224,9 +224,7 @@ class DatabaseDatasetBundleService:
                 cost_model_id=cost_id,
                 parameter_set_id=_parameter_set_id(product_id),
                 instrument_scope=scope,
-                availability_timestamp={
-                    "forward_observation": max(created, interval["end"])
-                },
+                availability_timestamp={"forward_observation": max(created, interval["end"])},
                 created_at=created,
                 engine_version="dataset-service/forward-v1",
                 source_partition_hashes=source_hashes,
@@ -471,12 +469,12 @@ def _bounded_instrument_rows(
     total = sum(len(rows) for rows in rows_by_instrument.values())
     if total <= maximum_rows:
         rows = [row for values in rows_by_instrument.values() for row in values]
-        return sorted(rows, key=lambda row: (str(row["close_timestamp"]), str(row["instrument_id"])))
+        return sorted(
+            rows, key=lambda row: (str(row["close_timestamp"]), str(row["instrument_id"]))
+        )
     instrument_ids = tuple(sorted(rows_by_instrument))
     if len(instrument_ids) > maximum_rows:
-        raise DatasetBundleBuildError(
-            "maximum_rows cannot represent every instrument in the scope"
-        )
+        raise DatasetBundleBuildError("maximum_rows cannot represent every instrument in the scope")
     base, remainder = divmod(maximum_rows, len(instrument_ids))
     quotas = {
         instrument_id: min(len(rows_by_instrument[instrument_id]), base + (index < remainder))
@@ -499,7 +497,9 @@ def _bounded_instrument_rows(
         for instrument_id in instrument_ids
         for row in _evenly_sample(rows_by_instrument[instrument_id], quotas[instrument_id])
     ]
-    return sorted(selected, key=lambda row: (str(row["close_timestamp"]), str(row["instrument_id"])))
+    return sorted(
+        selected, key=lambda row: (str(row["close_timestamp"]), str(row["instrument_id"]))
+    )
 
 
 def _evenly_sample(rows: list[dict[str, Any]], quota: int) -> tuple[dict[str, Any], ...]:

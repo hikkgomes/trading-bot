@@ -28,13 +28,7 @@ def instrument_asset(instrument_id: str, asset: str) -> str | None:
     symbol = parts[-2] if len(parts) >= 2 and parts[-1] in _KNOWN_QUOTES else parts[-1]
     for quote in _KNOWN_QUOTES:
         if symbol.endswith(quote) and len(symbol) > len(quote):
-            return (
-                symbol[: -len(quote)]
-                if asset == "base"
-                else quote
-                if asset == "quote"
-                else None
-            )
+            return symbol[: -len(quote)] if asset == "base" else quote if asset == "quote" else None
     return None
 
 

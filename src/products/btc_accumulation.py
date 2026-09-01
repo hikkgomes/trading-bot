@@ -36,13 +36,22 @@ def btc_step_aside_metadata(
 
     assert_btc_spot_instrument(instrument_id)
     values = (current_btc, target_btc, price, stablecoin_balance, fee_bps, slippage_bps)
-    if any(not math.isfinite(float(value)) or float(value) < 0.0 for value in values) or price <= 0.0:
+    if (
+        any(not math.isfinite(float(value)) or float(value) < 0.0 for value in values)
+        or price <= 0.0
+    ):
         raise ValueError("BTC step-aside values must be non-negative with a positive price")
     sell_quantity = max(0.0, current_btc - target_btc)
     sell_price = price * max(0.0, 1.0 - slippage_bps / 10_000.0)
     quote_proceeds = sell_quantity * sell_price * max(0.0, 1.0 - fee_bps / 10_000.0)
     budget = stablecoin_balance + quote_proceeds
-    state = "step_aside" if sell_quantity > 0.0 else "rebuy" if target_btc > current_btc else "core_hold"
+    state = (
+        "step_aside"
+        if sell_quantity > 0.0
+        else "rebuy"
+        if target_btc > current_btc
+        else "core_hold"
+    )
     lot_payload = {
         "instrument_id": instrument_id,
         "state_id": str(state_id),

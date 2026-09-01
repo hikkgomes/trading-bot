@@ -343,7 +343,9 @@ def semantic_signal(output: Any, *, instrument_id: str) -> float:
     raise SemanticEvaluationError("semantic output cannot produce an instrument forecast")
 
 
-def _semantic_mapping_input(registration: SemanticRegistration[Any, Any], raw: Mapping[str, Any]) -> Any:
+def _semantic_mapping_input(
+    registration: SemanticRegistration[Any, Any], raw: Mapping[str, Any]
+) -> Any:
     if registration.input_type is ForecastCollection:
         forecasts = raw.get("forecasts")
         if not isinstance(forecasts, list | tuple):
@@ -413,7 +415,9 @@ def _microstructure_from_features(features: Mapping[str, Any]) -> Microstructure
         ask_price=_finite_float(features.get("ask_price"), field="ask_price"),
         bid_depth=_finite_float(features.get("bid_depth"), field="bid_depth"),
         ask_depth=_finite_float(features.get("ask_depth"), field="ask_depth"),
-        signed_trade_flow=_finite_float(features.get("signed_trade_flow", 0.0), field="signed_trade_flow"),
+        signed_trade_flow=_finite_float(
+            features.get("signed_trade_flow", 0.0), field="signed_trade_flow"
+        ),
     )
 
 
@@ -422,7 +426,9 @@ def _forecast_collection_from_features(features: Mapping[str, Any]) -> ForecastC
     if not isinstance(raw, list | tuple):
         raise SemanticEvaluationError("ensemble input has no forecast collection")
     return ForecastCollection(
-        tuple(item if isinstance(item, AlphaForecast) else AlphaForecast(**dict(item)) for item in raw)
+        tuple(
+            item if isinstance(item, AlphaForecast) else AlphaForecast(**dict(item)) for item in raw
+        )
     )
 
 

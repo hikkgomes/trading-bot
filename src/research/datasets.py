@@ -561,7 +561,9 @@ class CanonicalResearchDatasetBuilder:
                 raise DatasetResolutionError(
                     f"dataset data_pending: no available bars for role {role}"
                 )
-            selected_scope = {str(row.get("instrument_id") or row.get("symbol") or "") for row in selected}
+            selected_scope = {
+                str(row.get("instrument_id") or row.get("symbol") or "") for row in selected
+            }
             missing = sorted(scope - selected_scope)
             if missing:
                 raise DatasetResolutionError(

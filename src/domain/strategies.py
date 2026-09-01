@@ -19,7 +19,11 @@ def _validate_universe(value: Mapping[str, Any], *, product: str) -> None:
     if unknown:
         raise ValueError("universe contains unsupported fields: " + ", ".join(unknown))
     universe_type = value.get("type")
-    if universe_type is not None and str(universe_type) not in {"fixed", "point_in_time", "dynamic"}:
+    if universe_type is not None and str(universe_type) not in {
+        "fixed",
+        "point_in_time",
+        "dynamic",
+    }:
         raise ValueError("universe type is unsupported")
     for field_name in ("symbols", "instrument_ids"):
         declared = value.get(field_name)
