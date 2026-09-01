@@ -20,6 +20,7 @@ from src.services.config import load_split_configuration
 from src.services.platform_live_authority import (
     PlatformLiveAuthority,
     PlatformLiveAuthorityError,
+    _btc_inventory_checks,
 )
 from src.services.platform_smoke import _seed_strategy
 
@@ -280,6 +281,31 @@ def test_manual_authority_records_exact_preflight_approval_and_live_assignment(
         assert active["sleeve_id"] == selection["sleeve_id"]
     finally:
         database.dispose()
+
+
+def test_btc_live_authority_requires_core_and_limits_tactical_inventory() -> None:
+    product = {
+        "product_id": "btc_accumulation",
+        "btc_minimum_fraction": 0.7,
+        "btc_max_tactical_fraction": 0.3,
+    }
+
+    accepted = _btc_inventory_checks(
+        product=product,
+        snapshot={"balances": {"BTC": 0.007, "USDT": 300.0}},
+        price=100_000.0,
+    )
+    rejected = _btc_inventory_checks(
+        product=product,
+        snapshot={"balances": {"BTC": 0.001, "USDT": 900.0}},
+        price=100_000.0,
+    )
+
+    assert accepted == {"btc_core_inventory": True, "btc_tactical_inventory": True}
+    assert rejected == {"btc_core_inventory": False, "btc_tactical_inventory": False}
+    assert (
+        _btc_inventory_checks(product={"product_id": "active_income"}, snapshot={}, price=1.0) == {}
+    )
 
 
 def test_live_assignment_replacement_is_ordered_and_single_authority(

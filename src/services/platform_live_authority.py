@@ -162,6 +162,13 @@ class PlatformLiveAuthority:
             "native_futures_stops": market != "futures"
             or bool(getattr(broker, "supports_native_protective_stops", lambda: False)()),
         }
+        checks.update(
+            _btc_inventory_checks(
+                product=product,
+                snapshot=snapshot,
+                price=price,
+            )
+        )
         failed = sorted(name for name, accepted in checks.items() if not accepted)
         if failed:
             raise PlatformLiveAuthorityError("preflight checks failed: " + ", ".join(failed))
@@ -737,6 +744,54 @@ def _records(
 
 def _market(account: Mapping[str, Any]) -> str:
     return "spot" if account.get("market") == "spot" else "futures"
+
+
+def _btc_inventory_checks(
+    *,
+    product: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    price: float,
+) -> dict[str, bool]:
+    if product.get("product_id") != "btc_accumulation":
+        return {}
+    balances = snapshot.get("balances")
+    if not isinstance(balances, Mapping) or price <= 0:
+        return {"btc_core_inventory": False, "btc_tactical_inventory": False}
+    btc = _nonnegative_balance(balances.get("BTC"))
+    stable = _nonnegative_balance(balances.get("USDT"))
+    nav = btc + stable / price
+    if nav <= 0:
+        return {"btc_core_inventory": False, "btc_tactical_inventory": False}
+    core = btc / nav
+    stable_fraction = stable / price / nav
+    minimum_core = _bounded_fraction(product.get("btc_minimum_fraction"), default=1.0)
+    maximum_tactical = _bounded_fraction(product.get("btc_max_tactical_fraction"), default=0.0)
+    return {
+        "btc_core_inventory": core + 1e-12 >= minimum_core,
+        "btc_tactical_inventory": stable_fraction <= maximum_tactical + 1e-12,
+    }
+
+
+def _nonnegative_balance(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if math.isfinite(parsed) and parsed >= 0.0 else 0.0
+
+
+def _bounded_fraction(value: object, *, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) and 0.0 <= parsed <= 1.0 else default
 
 
 def _contains_forbidden_btc_term(value: object, forbidden: set[str]) -> bool:
