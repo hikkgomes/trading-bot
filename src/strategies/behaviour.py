@@ -27,15 +27,36 @@ class TypedRuleBehaviour:
         if not isinstance(self.rule, Mapping):
             raise StrategyBehaviourError("typed strategy rule must be an object")
         object.__setattr__(self, "rule", json_value(dict(self.rule), field="typed strategy rule"))
-        feature = str(self.rule.get("feature") or "")
-        operator = str(self.rule.get("operator") or "")
-        threshold = self.rule.get("threshold")
-        if not feature or operator not in {"gt", "ge", "lt", "le"}:
-            raise StrategyBehaviourError("typed strategy rule feature or operator is invalid")
-        if isinstance(threshold, bool) or not isinstance(threshold, int | float):
-            raise StrategyBehaviourError("typed strategy rule threshold is invalid")
-        if not math.isfinite(float(threshold)):
-            raise StrategyBehaviourError("typed strategy rule threshold is not finite")
+        if not any(
+            key in self.rule
+            for key in (
+                "conditions",
+                "positive_conditions",
+                "negative_conditions",
+                "long_conditions",
+                "short_conditions",
+                "exit_conditions",
+            )
+        ):
+            _validate_condition(self.rule, field="rule")
+        else:
+            condition_groups = tuple(
+                key
+                for key in (
+                    "conditions",
+                    "positive_conditions",
+                    "negative_conditions",
+                    "long_conditions",
+                    "short_conditions",
+                    "exit_conditions",
+                )
+                if key in self.rule
+            )
+            if not any(
+                _conditions(self.rule, key, required=key != "exit_conditions")
+                for key in condition_groups
+            ):
+                raise StrategyBehaviourError("typed strategy rule has no entry conditions")
         direction = str(self.rule.get("direction") or "long")
         if direction not in {"long", "short", "signed", "market_neutral", "hedged"}:
             raise StrategyBehaviourError("typed strategy rule direction is invalid")
@@ -57,6 +78,10 @@ class TypedRuleBehaviour:
         return canonical_hash({"contract_version": self.contract_version, "rule": self.rule})
 
     def signal(self, features: Mapping[str, Any]) -> int:
+        direction = str(self.rule.get("direction") or "long")
+        if _has_composite_conditions(self.rule):
+            return _composite_signal(self.rule, features, direction=direction)
+        threshold = float(self.rule.get("threshold", 0.0))
         feature = str(self.rule["feature"])
         if feature not in features:
             raise StrategyBehaviourError(f"typed strategy feature is unavailable: {feature}")
@@ -66,8 +91,6 @@ class TypedRuleBehaviour:
             raise StrategyBehaviourError("typed strategy feature value is invalid") from exc
         if not math.isfinite(value):
             raise StrategyBehaviourError("typed strategy feature value is not finite")
-        threshold = float(self.rule["threshold"])
-        direction = str(self.rule.get("direction") or "long")
         if direction in {"signed", "market_neutral", "hedged"}:
             magnitude = abs(threshold)
             long_operator = str(self.rule.get("positive_operator") or "gt")
@@ -249,6 +272,117 @@ class RegisteredStrategyBehaviour:
         if number not in {-1, 0, 1} or float(value) != number:
             raise StrategyBehaviourError("strategy signal must be -1, 0, or 1")
         return number
+
+
+def _validate_condition(value: Mapping[str, Any], *, field: str) -> None:
+    feature = str(value.get("feature") or "")
+    operator = str(value.get("operator") or "")
+    threshold = value.get("threshold")
+    if not feature or operator not in {"gt", "ge", "lt", "le"}:
+        raise StrategyBehaviourError(f"typed strategy {field} feature or operator is invalid")
+    if isinstance(threshold, bool) or not isinstance(threshold, int | float):
+        raise StrategyBehaviourError(f"typed strategy {field} threshold is invalid")
+    if not math.isfinite(float(threshold)):
+        raise StrategyBehaviourError(f"typed strategy {field} threshold is not finite")
+
+
+def _has_composite_conditions(rule: Mapping[str, Any]) -> bool:
+    return any(
+        key in rule
+        for key in (
+            "conditions",
+            "positive_conditions",
+            "negative_conditions",
+            "long_conditions",
+            "short_conditions",
+            "exit_conditions",
+        )
+    )
+
+
+def _composite_signal(
+    rule: Mapping[str, Any], features: Mapping[str, Any], *, direction: str
+) -> int:
+    if _conditions_pass(rule, "exit_conditions", features):
+        return 0
+    default = next(
+        key
+        for key in (
+            "conditions",
+            "long_conditions",
+            "positive_conditions",
+            "short_conditions",
+            "negative_conditions",
+        )
+        if key in rule
+    )
+    long_group = (
+        "long_conditions"
+        if "long_conditions" in rule
+        else "positive_conditions"
+        if "positive_conditions" in rule
+        else default
+    )
+    short_group = (
+        "short_conditions"
+        if "short_conditions" in rule
+        else "negative_conditions"
+        if "negative_conditions" in rule
+        else default
+    )
+    if direction in {"signed", "market_neutral", "hedged"}:
+        positive_group = "positive_conditions" if "positive_conditions" in rule else long_group
+        negative_group = "negative_conditions" if "negative_conditions" in rule else short_group
+        return (
+            1
+            if _conditions_pass(rule, positive_group, features)
+            else -1
+            if _conditions_pass(rule, negative_group, features)
+            else 0
+        )
+    passed = _conditions_pass(rule, long_group, features)
+    return -1 if passed and direction == "short" else 1 if passed else 0
+
+
+def _conditions(
+    rule: Mapping[str, Any], key: str, *, required: bool
+) -> tuple[Mapping[str, Any], ...]:
+    raw = rule.get(key)
+    if raw is None:
+        if required:
+            raise StrategyBehaviourError(f"typed strategy rule has no {key}")
+        return ()
+    if not isinstance(raw, list | tuple) or not raw:
+        raise StrategyBehaviourError(f"typed strategy {key} must be a non-empty list")
+    result: list[Mapping[str, Any]] = []
+    for index, condition in enumerate(raw):
+        if not isinstance(condition, Mapping):
+            raise StrategyBehaviourError(f"typed strategy {key}[{index}] is invalid")
+        _validate_condition(condition, field=f"{key}[{index}]")
+        result.append(condition)
+    return tuple(result)
+
+
+def _conditions_pass(rule: Mapping[str, Any], key: str, features: Mapping[str, Any]) -> bool:
+    conditions = _conditions(rule, key, required=False)
+    if not conditions:
+        return False
+    mode = str(rule.get("condition_mode") or "all")
+    if mode not in {"all", "any"}:
+        raise StrategyBehaviourError("typed strategy condition_mode is invalid")
+    results = []
+    for condition in conditions:
+        feature = str(condition["feature"])
+        if feature not in features:
+            raise StrategyBehaviourError(f"typed strategy feature is unavailable: {feature}")
+        try:
+            value = float(features[feature])
+        except (TypeError, ValueError) as exc:
+            raise StrategyBehaviourError("typed strategy feature value is invalid") from exc
+        if not math.isfinite(value):
+            raise StrategyBehaviourError("typed strategy feature value is not finite")
+        results.append(_compare(value, str(condition["operator"]), float(condition["threshold"])))
+    return any(results) if mode == "any" else all(results)
 
 
 def _validate_operator(value: str, *, field: str) -> None:

@@ -343,6 +343,30 @@ def test_typed_rule_behaviour_supports_signed_long_and_short_outputs() -> None:
     )
 
 
+def test_typed_rule_behaviour_supports_multi_condition_entries_and_exits() -> None:
+    behaviour = TypedRuleBehaviour(
+        {
+            "conditions": [
+                {"feature": "trend", "operator": "gt", "threshold": 0.1},
+                {"feature": "volatility", "operator": "lt", "threshold": 0.5},
+            ],
+            "condition_mode": "all",
+            "exit_conditions": [
+                {"feature": "volatility", "operator": "ge", "threshold": 0.9}
+            ],
+            "direction": "long",
+        }
+    )
+
+    assert behaviour.generate_signals(
+        [
+            {"trend": 0.2, "volatility": 0.2},
+            {"trend": 0.2, "volatility": 0.9},
+            {"trend": 0.0, "volatility": 0.2},
+        ]
+    ) == (1, 0, 0)
+
+
 def _evidence_hashes(index: int) -> dict[str, str]:
     return {
         "run_id": "sha256:" + str(index) * 64,
