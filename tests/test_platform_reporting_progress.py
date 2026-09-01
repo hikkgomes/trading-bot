@@ -5,12 +5,16 @@ from sqlalchemy import insert
 from src.data.database import (
     PlatformDatabase,
     account_snapshot,
+    instrument,
     job,
     job_attempt,
     platform_schedule,
     promotion_event,
     reconciliation_event,
     risk_snapshot,
+    universe,
+    universe_member,
+    universe_snapshot,
 )
 from src.observability.reports import DatabasePlatformReport
 from src.services.alerting import SqlAlertService
@@ -85,6 +89,60 @@ def test_report_counts_only_accepted_state_advances_as_promotions(tmp_path) -> N
         )
     report = DatabasePlatformReport(database.engine).build()
     assert report["research"]["funnel"]["strategy_promotions"] == 1
+    database.dispose()
+
+
+def test_report_exposes_latest_universe_attrition(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'universe-report.sqlite3'}")
+    database.create_schema()
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(universe).values(
+                id="universe-report",
+                created_at=NOW,
+                payload={"market": "futures"},
+            )
+        )
+        connection.execute(
+            insert(instrument).values(
+                id="instrument-report",
+                venue="binance",
+                market_type="futures",
+                exchange_symbol="ETHUSDT",
+                base_asset="ETH",
+                quote_asset="USDT",
+                settlement_asset="USDT",
+                payload={},
+            )
+        )
+        connection.execute(
+            insert(universe_snapshot).values(
+                id="universe-snapshot-report",
+                universe_id="universe-report",
+                observed_at=NOW,
+                content_hash="sha256:" + "a" * 64,
+                payload={},
+            )
+        )
+        connection.execute(
+            insert(universe_member).values(
+                id="universe-member-report",
+                snapshot_id="universe-snapshot-report",
+                instrument_id="instrument-report",
+                eligible=False,
+                reason_code="low_volume",
+                payload={},
+            )
+        )
+
+    attrition = DatabasePlatformReport(database.engine).build()["research"]["universe_attrition"]
+
+    assert attrition["snapshot_count"] == 1
+    latest = attrition["latest_by_universe"]["universe-report"]
+    assert latest["total_members"] == 1
+    assert latest["eligible_members"] == 0
+    assert latest["excluded_members"] == 1
+    assert latest["exclusion_reasons"] == {"low_volume": 1}
     database.dispose()
 
 

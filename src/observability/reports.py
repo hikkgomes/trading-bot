@@ -49,6 +49,8 @@ from src.data.database import (
     strategy_lineage,
     target_position,
     thesis_trial,
+    universe_member,
+    universe_snapshot,
     validation_result,
     validation_stage,
     worker,
@@ -137,6 +139,9 @@ class DatabasePlatformReport:
             ),
             "strategy_identities": self._rows(strategy_identity),
             "strategy_lineage": self._rows(strategy_lineage),
+            "research_theses": self._rows(research_thesis),
+            "thesis_trials": self._rows(thesis_trial),
+            "universe_attrition": self._universe_attrition(),
             "strategy_artefacts": self._rows(strategy_artefact),
             "strategy_approvals": self._rows(strategy_approval),
             "production_preflights": self._rows(production_preflight),
@@ -229,7 +234,7 @@ class DatabasePlatformReport:
             definition: dict[str, Any] = raw_definition if isinstance(raw_definition, dict) else {}
             family = str(definition.get("family") or "unknown")
             feature_families[family] = feature_families.get(family, 0) + 1
-        for row in self._rows(research_thesis):
+        for row in research["research_theses"]:
             raw_payload = row.get("payload")
             payload = raw_payload if isinstance(raw_payload, dict) else {}
             family = str(payload.get("mechanism_category") or "unknown")
@@ -255,6 +260,7 @@ class DatabasePlatformReport:
             "signal_frequency_distribution": sorted(signal_frequencies),
             "feature_family_concentration": feature_families,
             "thesis_family_coverage": thesis_families,
+            "universe_attrition": research["universe_attrition"],
             "candidate_correlation": [
                 row.get("payload", {}).get("candidate_correlation")
                 for row in stages
@@ -385,6 +391,47 @@ class DatabasePlatformReport:
                     "fees_paid_btc": str(btc.fees_paid_btc),
                 }
         return products
+
+    def _universe_attrition(self) -> dict[str, Any]:
+        snapshots = self._rows(universe_snapshot, order_by=universe_snapshot.c.observed_at)
+        members = self._rows(universe_member, order_by=universe_member.c.id)
+        by_snapshot: dict[str, dict[str, Any]] = {}
+        for snapshot in snapshots:
+            snapshot_id = str(snapshot.get("id") or "")
+            if snapshot_id:
+                by_snapshot[snapshot_id] = {
+                    "universe_id": snapshot.get("universe_id"),
+                    "observed_at": snapshot.get("observed_at"),
+                    "total_members": 0,
+                    "eligible_members": 0,
+                    "excluded_members": 0,
+                    "exclusion_reasons": {},
+                }
+        for member in members:
+            snapshot_id = str(member.get("snapshot_id") or "")
+            summary = by_snapshot.get(snapshot_id)
+            if summary is None:
+                continue
+            summary["total_members"] += 1
+            if member.get("eligible") is True:
+                summary["eligible_members"] += 1
+                continue
+            summary["excluded_members"] += 1
+            reason = str(member.get("reason_code") or "unknown")
+            reasons = summary["exclusion_reasons"]
+            reasons[reason] = int(reasons.get(reason, 0)) + 1
+        latest: dict[str, dict[str, Any]] = {}
+        for snapshot in by_snapshot.values():
+            universe_id = str(snapshot.get("universe_id") or "")
+            previous = latest.get(universe_id)
+            if previous is None or str(snapshot.get("observed_at")) > str(
+                previous.get("observed_at")
+            ):
+                latest[universe_id] = snapshot
+        return {
+            "snapshot_count": len(by_snapshot),
+            "latest_by_universe": {key: latest[key] for key in sorted(latest) if key},
+        }
 
     def _operations(self, *, now: str) -> dict[str, Any]:
         traces = SqlDecisionTraceStore(self.engine).read()
