@@ -159,6 +159,10 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   )
   for unit in "${legacy_units[@]}"; do
     systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "$unit"; then
+      echo "Refusing to enable the PostgreSQL platform while legacy unit is active: $unit" >&2
+      exit 1
+    fi
   done
   systemctl enable trading-platform-runtime.service
   systemctl enable trading-platform-research.service
