@@ -836,9 +836,18 @@ class PlatformScheduler:
 
 
 class DatabaseJobQueue:
-    def __init__(self, engine: Engine, *, alerts: SqlAlertService | None = None):
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        alerts: SqlAlertService | None = None,
+        claim_scope: str | None = None,
+    ):
         self.engine = engine
         self.alerts = alerts or configured_alert_service(engine)
+        self.claim_scope = (
+            non_empty(claim_scope, field="claim_scope") if claim_scope is not None else None
+        )
 
     def register_worker(
         self,
@@ -885,9 +894,8 @@ class DatabaseJobQueue:
             if self.engine.dialect.name != "sqlite" or not _legacy_risk_fixture(payload):
                 raise
             clean_payload = json_value(dict(payload), field=f"{name} payload")
-        producer = non_empty(
-            producer_identity or str(clean_payload.get("producer_identity") or f"service:{name}"),
-            field="producer_identity",
+        producer = self._producer_identity(
+            name=name, payload=clean_payload, producer_identity=producer_identity
         )
         values = {
             "id": non_empty(job_id, field="job_id"),
@@ -928,9 +936,8 @@ class DatabaseJobQueue:
             if self.engine.dialect.name != "sqlite" or not _legacy_risk_fixture(payload):
                 raise
             clean_payload = json_value(dict(payload), field=f"{name} payload")
-        producer = non_empty(
-            producer_identity or str(clean_payload.get("producer_identity") or f"service:{name}"),
-            field="producer_identity",
+        producer = self._producer_identity(
+            name=name, payload=clean_payload, producer_identity=producer_identity
         )
         values = {
             "id": non_empty(job_id, field="job_id"),
@@ -990,6 +997,7 @@ class DatabaseJobQueue:
         now: str,
         lease_seconds: int,
         names: tuple[str, ...] = (),
+        producer_identity: str | None = None,
     ) -> ClaimedJob | None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -1010,6 +1018,12 @@ class DatabaseJobQueue:
             )
             if names:
                 eligible = and_(eligible, job.c.name.in_(names))
+            claim_producer = producer_identity or self.claim_scope
+            if claim_producer is not None:
+                eligible = and_(
+                    eligible,
+                    job.c.producer_identity == non_empty(claim_producer, field="producer_identity"),
+                )
             statement = (
                 select(job)
                 .where(eligible)
@@ -1082,6 +1096,20 @@ class DatabaseJobQueue:
                 attempt=attempt,
                 lease_expires_at=expires_at,
             )
+
+    def _producer_identity(
+        self,
+        *,
+        name: str,
+        payload: Mapping[str, Any],
+        producer_identity: str | None,
+    ) -> str:
+        if self.claim_scope is not None:
+            return self.claim_scope
+        return non_empty(
+            producer_identity or str(payload.get("producer_identity") or f"service:{name}"),
+            field="producer_identity",
+        )
 
     def heartbeat(self, claimed: ClaimedJob, *, now: str, lease_seconds: int) -> ClaimedJob:
         now = timestamp(now, field="now")

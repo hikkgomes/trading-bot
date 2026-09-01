@@ -153,6 +153,43 @@ def test_job_retries_end_in_a_durable_dead_letter_state(tmp_path) -> None:
     )
 
 
+def test_scoped_queue_claims_only_its_diagnostic_jobs(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'scoped-queue.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine, claim_scope="diagnostic-run")
+    queue.register_worker(
+        worker_id="worker",
+        node_id="node",
+        role="diagnostic",
+        capabilities=("diagnostic",),
+        observed_at=NOW,
+    )
+    queue.enqueue(
+        job_id="scoped",
+        name="research",
+        payload={"candidate": "scoped"},
+        available_at=NOW,
+        producer_identity="untrusted-producer",
+    )
+    DatabaseJobQueue(database.engine).enqueue(
+        job_id="unscoped",
+        name="research",
+        payload={"candidate": "unscoped"},
+        available_at=NOW,
+        producer_identity="untrusted-producer",
+    )
+
+    claimed = queue.claim(
+        worker_id="worker",
+        now=NOW,
+        lease_seconds=10,
+        names=("research",),
+    )
+
+    assert claimed is not None
+    assert claimed.job_id == "scoped"
+
+
 def test_dead_lettered_stage_is_durably_blocked_from_recurring_resubmission(tmp_path) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'dead-letter-stage.sqlite3'}")
     database.create_schema()

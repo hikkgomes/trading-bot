@@ -154,7 +154,10 @@ def _product_fixture(
         minimum_notional=5.0,
     )
     prefix = f"smoke:{run_id}:{product_id}:{index}"
-    queue = DatabaseJobQueue(database.engine)
+    queue = DatabaseJobQueue(
+        database.engine,
+        claim_scope=f"platform-smoke:{prefix}",
+    )
     workers_ids = {
         name: f"{prefix}:{name}"
         for name in (
