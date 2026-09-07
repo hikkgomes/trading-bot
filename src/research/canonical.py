@@ -515,6 +515,7 @@ class ForwardPaperSummary:
     data_gaps: int
     strategy_decay: float
     observation_ids: tuple[str, ...]
+    data_gap_ids: tuple[str, ...] = ()
     effective_trades: int = 0
     fill_rate: float = 0.0
     slippage: float = 0.0
@@ -560,6 +561,7 @@ class ForwardPaperSummary:
             "portfolio_capacity": self.portfolio_capacity,
             "risk_budget_available": self.risk_budget_available,
             "data_gaps": self.data_gaps,
+            "data_gap_ids": list(self.data_gap_ids),
             "strategy_decay": self.strategy_decay,
             "observation_ids": list(self.observation_ids),
             "effective_trades": self.effective_trades,
@@ -706,6 +708,14 @@ def _validate_forward_fact_id_lists(metrics: Mapping[str, Any]) -> None:
             dt.date.fromisoformat(str(day))
         except ValueError as exc:
             raise CanonicalEvidenceError("forward facts trading_dates must be UTC dates") from exc
+    if "data_gap_ids" in metrics:
+        values = metrics["data_gap_ids"]
+        if (
+            not isinstance(values, list | tuple)
+            or len({str(value) for value in values}) != len(values)
+            or any(not str(value).strip() for value in values)
+        ):
+            raise CanonicalEvidenceError("forward facts data_gap_ids must be unique lists")
 
 
 def _has_known_observation_source(connection, source_ids: tuple[str, ...], tables) -> bool:
@@ -790,6 +800,14 @@ def _normalise_summary_evidence_accounting(payload: dict[str, Any]) -> None:
     if not required.issubset(payload):
         raise CanonicalEvidenceError("forward summary accounting fields are incomplete")
     _validate_forward_fact_metrics(payload)
+    if "data_gap_ids" in payload:
+        values = payload["data_gap_ids"]
+        if (
+            not isinstance(values, list | tuple)
+            or len({str(value) for value in values}) != len(values)
+            or any(not str(value).strip() for value in values)
+        ):
+            raise CanonicalEvidenceError("forward summary data_gap_ids must be unique lists")
 
 
 def _normalise_summary_scope(payload: dict[str, Any]) -> None:
@@ -882,6 +900,37 @@ def _prepare_summary_payload(
     observation_ids = _summary_observation_ids(payload)
     identity = _hash(payload, field="forward summary")
     return strategy_version_id, product_id, observed_at, payload, observation_ids, identity
+
+
+def _deduplicate_forward_observations(
+    rows: tuple[Mapping[str, Any], ...],
+) -> tuple[Mapping[str, Any], ...]:
+    """Remove exact repeated fact payloads before summary aggregation.
+
+    Observation identities include operational metadata such as evaluation time.
+    The immutable facts hash is the economic identity used for aggregation, so a
+    retry cannot inflate PnL, trading days, or fill evidence.
+    """
+
+    unique: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    for row in rows:
+        payload = row.get("payload")
+        observation = payload.get("observation") if isinstance(payload, Mapping) else None
+        facts = observation.get("facts") if isinstance(observation, Mapping) else None
+        facts_hash = str(facts.get("facts_hash") or "") if isinstance(facts, Mapping) else ""
+        if not facts_hash:
+            facts_hash = canonical_hash(facts or {})
+        assignment_id = (
+            str(observation.get("assignment_id") or "") if isinstance(observation, Mapping) else ""
+        )
+        key = (str(row["instrument_id"]), assignment_id, facts_hash)
+        unique.setdefault(key, row)
+    return tuple(
+        sorted(
+            unique.values(),
+            key=lambda row: (str(row["observed_at"]), str(row["id"])),
+        )
+    )
 
 
 def _assert_summary_bindings(
@@ -1127,6 +1176,7 @@ class SqlForwardEvidenceRepository:
             materialised = tuple(row for row in rows if isinstance(row["payload"], Mapping))
         if not materialised:
             raise CanonicalEvidenceError("no forward observations exist for summary")
+        materialised = _deduplicate_forward_observations(materialised)
         with self.engine.connect() as connection:
             self._assert_observation_facts(
                 connection, tuple(str(row["id"]) for row in materialised)
@@ -1293,11 +1343,31 @@ class SqlForwardEvidenceRepository:
             if order_ids
             else int(sum(value(payload, "completed_attempts") for payload in payloads))
         )
-        expected_observations = int(
-            sum(value(payload, "expected_observations") for payload in payloads)
+        expected_by_instrument: dict[str, int] = {}
+        for row, payload in zip(materialised, payloads, strict=True):
+            instrument = str(row["instrument_id"])
+            expected_by_instrument[instrument] = max(
+                expected_by_instrument.get(instrument, 0),
+                int(value(payload, "expected_observations")),
+            )
+        expected_observations = sum(expected_by_instrument.values())
+        observed_observations = len(
+            {(str(row["instrument_id"]), str(row["observed_at"])) for row in materialised}
         )
-        observed_observations = int(
-            sum(value(payload, "observed_observations") for payload in payloads)
+        data_gap_ids = tuple(
+            sorted(
+                {
+                    str(gap_id)
+                    for payload in payloads
+                    for gap_id in payload["observation"]["facts"]["metrics"].get("data_gap_ids", ())
+                    if str(gap_id).strip()
+                }
+            )
+        )
+        data_gaps = (
+            len(data_gap_ids)
+            if data_gap_ids
+            else int(sum(value(payload, "data_gaps", "missing_data_count") for payload in payloads))
         )
         first_return = returns[0] if returns else 0.0
         last_return = returns[-1] if returns else 0.0
@@ -1338,10 +1408,8 @@ class SqlForwardEvidenceRepository:
             risk_budget_available=min(
                 value(payload, "risk_budget_available", default=0.0) for payload in payloads
             ),
-            data_gaps=max(
-                int(sum(value(payload, "data_gaps", "missing_data_count") for payload in payloads)),
-                max(0, expected_observations - observed_observations),
-            ),
+            data_gaps=data_gaps,
+            data_gap_ids=data_gap_ids,
             strategy_decay=max(0.0, first_return - last_return),
             observation_ids=tuple(str(row["id"]) for row in materialised),
             effective_trades=len(episode_ids)
@@ -1350,7 +1418,9 @@ class SqlForwardEvidenceRepository:
             fill_rate=(completed_attempts / valid_attempts if valid_attempts else 0.0),
             slippage=max(value(payload, "slippage") for payload in payloads),
             data_uptime=(
-                observed_observations / expected_observations if expected_observations else 0.0
+                min(1.0, observed_observations / expected_observations)
+                if expected_observations
+                else 0.0
             ),
             rejected_orders=int(sum(value(payload, "rejected_orders") for payload in payloads)),
             trading_days=len(trading_dates)
@@ -1389,6 +1459,7 @@ class SqlForwardEvidenceRepository:
                 "completed_attempts": completed_attempts,
                 "expected_observations": expected_observations,
                 "observed_observations": observed_observations,
+                "data_gap_ids": list(data_gap_ids),
                 "trading_dates": list(trading_dates),
                 "order_ids": list(order_ids),
                 "fill_ids": list(fill_ids),

@@ -31,6 +31,8 @@ class PointInTimePanel:
     information_time: str
     instruments: Mapping[str, Mapping[str, float]]
     minimum_score: float = 0.0
+    long_count: int = 1
+    short_count: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -40,6 +42,13 @@ class PointInTimePanel:
             raise ValueError("cross-sectional panels need at least two instruments")
         if not math.isfinite(float(self.minimum_score)) or self.minimum_score < 0.0:
             raise ValueError("cross-sectional minimum score is invalid")
+        if (
+            isinstance(self.long_count, bool)
+            or isinstance(self.short_count, bool)
+            or self.long_count < 1
+            or self.short_count < 1
+        ):
+            raise ValueError("cross-sectional long and short counts must be positive")
         for instrument, values in self.instruments.items():
             if not str(instrument).strip() or not isinstance(values, Mapping) or not values:
                 raise ValueError("cross-sectional panel contains an invalid instrument")
@@ -251,13 +260,14 @@ def relative_momentum(panel: PointInTimePanel) -> RankedTargets:
     }
     mean = sum(raw.values()) / len(raw)
     active = {key: value for key, value in raw.items() if abs(value - mean) >= panel.minimum_score}
-    active_mean = sum(active.values()) / len(active) if len(active) >= 2 else 0.0
-    centred = {
-        key: value - active_mean if key in active and len(active) >= 2 else 0.0
-        for key, value in raw.items()
-    }
-    gross = sum(abs(value) for value in centred.values())
-    targets = {key: value / gross if gross else 0.0 for key, value in centred.items()}
+    ranked = sorted(active.items(), key=lambda item: (item[1], item[0]))
+    short = tuple(key for key, _value in ranked[: panel.short_count])
+    long = tuple(key for key, _value in ranked[-panel.long_count :])
+    long = tuple(key for key in long if key not in short)
+    targets = {key: 0.0 for key in raw}
+    if long and short:
+        targets.update({key: 0.5 / len(long) for key in long})
+        targets.update({key: -0.5 / len(short) for key in short})
     ranks = {
         key: float(rank)
         for rank, (key, _) in enumerate(sorted(raw.items(), key=lambda item: (item[1], item[0])))
@@ -271,13 +281,15 @@ def funding_adjusted_ranking(panel: PointInTimePanel) -> RankedTargets:
         {
             key: {
                 "momentum": _panel_signal_value(
-                    values, preferred=("momentum", "relative_return", "funding_rank")
+                    values, preferred=("funding_rank", "relative_return", "momentum")
                 )
                 - float(values.get("funding", 0.0))
             }
             for key, values in panel.instruments.items()
         },
         minimum_score=panel.minimum_score,
+        long_count=panel.long_count,
+        short_count=panel.short_count,
     )
     return relative_momentum(adjusted)
 
@@ -427,6 +439,12 @@ def semantic_contract_features(
         if threshold is None and isinstance(parameters, Mapping):
             threshold = parameters.get("threshold")
         result["panel_threshold"] = abs(_finite_float(threshold or 0.0, field="panel_threshold"))
+        result["panel_long_count"] = _panel_count(
+            panel_contract, parameters, "long_count", default=1
+        )
+        result["panel_short_count"] = _panel_count(
+            panel_contract, parameters, "short_count", default=1
+        )
     if name in {"bid_ask_depth_imbalance", "microprice_displacement"}:
         _require_microstructure_sequence(result)
         event_contract = model.get("event_contract")
@@ -613,7 +631,42 @@ def _panel_from_features(features: Mapping[str, Any]) -> PointInTimePanel:
     minimum_score = _finite_float(features.get("panel_threshold", 0.0), field="panel_threshold")
     if minimum_score < 0.0:
         raise SemanticEvaluationError("panel_threshold must be non-negative")
-    return PointInTimePanel(information_time, instruments, minimum_score=minimum_score)
+    return PointInTimePanel(
+        information_time,
+        instruments,
+        minimum_score=minimum_score,
+        long_count=_panel_count_value(features.get("panel_long_count"), field="panel_long_count"),
+        short_count=_panel_count_value(
+            features.get("panel_short_count"), field="panel_short_count"
+        ),
+    )
+
+
+def _panel_count(
+    panel_contract: object,
+    parameters: object,
+    name: str,
+    *,
+    default: int,
+) -> int:
+    value = None
+    if isinstance(panel_contract, Mapping):
+        value = panel_contract.get(name)
+    if value is None and isinstance(parameters, Mapping):
+        value = parameters.get(name)
+    return _panel_count_value(default if value is None else value, field=name)
+
+
+def _panel_count_value(value: object, *, field: str) -> int:
+    if value is None:
+        return 1
+    if isinstance(value, bool):
+        raise SemanticEvaluationError(f"{field} must be a positive integer")
+    numeric = _finite_float(value, field=field)
+    result = int(numeric)
+    if result < 1 or numeric != result:
+        raise SemanticEvaluationError(f"{field} must be a positive integer")
+    return result
 
 
 def _linked_state_from_features(features: Mapping[str, Any]) -> LinkedInstrumentState:

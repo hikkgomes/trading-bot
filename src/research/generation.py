@@ -199,7 +199,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         ("point_in_time_rank", "relative_return", "funding_rank"),
         "funding_rank",
         "gt",
-        (0.0001, 0.0005, 0.001),
+        (0.1, 0.25, 0.5),
         "market_neutral",
         "4h to 7d",
         "cross_sectional",
@@ -284,7 +284,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         ("point_in_time_rank", "relative_return", "funding_rank"),
         "funding_rank",
         "gt",
-        (0.0001, 0.0005, 0.001),
+        (0.1, 0.25, 0.5),
         "market_neutral",
         "4h to 7d",
         "funding_carry",
@@ -1212,12 +1212,13 @@ def _mutate_contract_parameters(
     if campaign.source_type is StrategySourceType.CROSS_SECTIONAL:
         values = [float(item.get("top_k", 1)) for item in parameters]
         thresholds = [float(item.get("threshold", 0.0)) for item in parameters]
+        threshold_step = 0.05 if campaign.feature == "funding_rank" else 0.001
         return {
             "top_k": max(
                 1, int(round(sum(values) / len(values))) + (1 if method == "mutation" else 0)
             ),
             "threshold": abs(sum(thresholds) / len(thresholds))
-            + (0.0001 if method == "mutation" else 0.0),
+            + (threshold_step if method == "mutation" else 0.0),
         }
     if campaign.source_type is StrategySourceType.RELATIVE_VALUE:
         values = [float(item.get("hedge_ratio", 1.0)) for item in parameters]

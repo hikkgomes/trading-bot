@@ -48,6 +48,7 @@ class ForwardEvidenceMetrics:
     rejected_orders: int
     source_event_ids: tuple[str, ...]
     window_start: str
+    data_gap_ids: tuple[str, ...] = ()
     objective_unit: str | None = None
     objective_value: float | None = None
     benchmark_value: float | None = None
@@ -87,6 +88,7 @@ class ForwardEvidenceMetrics:
                 "portfolio_capacity": self.portfolio_capacity,
                 "risk_budget_available": self.risk_budget_available,
                 "data_gaps": self.data_gaps,
+                "data_gap_ids": list(self.data_gap_ids),
                 "effective_trades": self.effective_trades,
                 "fill_rate": self.fill_rate,
                 "slippage": self.slippage,
@@ -273,7 +275,10 @@ class ForwardEvidenceCollector:
         attempted = len(orders)
         completed = sum(1 for row in orders if self._order_filled(row["id"]))
         rejected = sum(1 for row in orders if self._order_rejected(row["id"]))
-        data_gaps = sum(1 for row in reconciliations if self._is_data_gap(row))
+        data_gap_ids = tuple(
+            sorted({str(row["id"]) for row in reconciliations if self._is_data_gap(row)})
+        )
+        data_gaps = len(data_gap_ids)
         source_ids = tuple(
             dict.fromkeys(
                 [
@@ -347,15 +352,16 @@ class ForwardEvidenceCollector:
                 for row in market_rows
             }
         )
-        repaired_gaps = sum(
-            1
-            for row in reconciliations
-            if isinstance(row.get("payload"), Mapping)
-            and row["payload"].get("data_gap")
-            and row["payload"].get("repaired") is True
-        )
-        schedule_deficit = max(0, expected_observations - observed_observations)
-        data_gaps = max(data_gaps, max(0, schedule_deficit - repaired_gaps))
+        if expected_observations > observed_observations and observed_observations == 0:
+            data_gap_ids = tuple(
+                sorted(
+                    {
+                        *data_gap_ids,
+                        f"schedule-gap:{window_start}:{evaluated_at}",
+                    }
+                )
+            )
+            data_gaps = len(data_gap_ids)
         data_uptime = self._data_uptime(
             observed_observations,
             expected_observations=expected_observations,
@@ -370,6 +376,7 @@ class ForwardEvidenceCollector:
             portfolio_capacity=capacity,
             risk_budget_available=risk_budget,
             data_gaps=data_gaps,
+            data_gap_ids=data_gap_ids,
             effective_trades=cycles,
             fill_rate=(completed / attempted if attempted else 0.0),
             slippage=slippage,

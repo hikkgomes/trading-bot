@@ -275,7 +275,8 @@ def _measured_result(
     gross = list(return_report.gross_returns)
     net = list(return_report.net_returns)
     analysis_returns = net or gross
-    bootstrap_values = analysis_returns
+    independent_values = _independent_return_observations(signals, analysis_returns)
+    bootstrap_values = independent_values
     fees = return_report.fees
     slippage = return_report.slippage
     funding_pnl = return_report.funding_pnl
@@ -342,7 +343,7 @@ def _measured_result(
     )
     pbo, pbo_matrix = _pbo_measurements(context, parameter_stability, window_returns)
     trial_sharpes, trial_count, trial_sharpe_std, dsr = _trial_statistics(
-        context, parameter_stability, analysis_returns
+        context, parameter_stability, bootstrap_values
     )
     expected_definition_hash = candidate.definition.definition_hash
     observed_definition_hash = str(context.get("strategy_definition_hash") or "")
@@ -480,12 +481,13 @@ def _measured_result(
             "closed_trades": int(
                 context.get(
                     "closed_trades",
-                    _closed_signal_episodes(signals),
+                    len(independent_values),
                 )
             ),
             "effective_independent_episodes": int(
-                context.get("effective_independent_episodes", len(window_returns))
+                context.get("effective_independent_episodes", len(independent_values))
             ),
+            "independent_observations": len(independent_values),
             "trading_days": int(context.get("trading_days", context.get("evidence_days", 0))),
             "calendar_days": float(context.get("calendar_days", 0.0)),
             "run_id": canonical_hash(
@@ -916,7 +918,7 @@ def _futures_return_ledger(
         "liquidation_buffer_fraction": 0.0,
         "terminal_liquidation_cost": float(fallback_return.terminal_liquidation_cost)
         * initial_equity,
-        "terminal_exposure": float(fallback_return.terminal_exposure),
+        "terminal_exposure": float(fallback_return.terminal_exposure) * initial_equity,
         "event_receipts": (),
         "source": "canonical_return_ledger",
     }
@@ -1826,7 +1828,7 @@ def _purged_walk_forward(
             "embargo_rows": embargo,
             "train_values": train_values,
             "test_values": test_values,
-            "parameter_selection": "sealed_before_test_window",
+            "parameter_selection": "training_only_fit_then_freeze",
         }
         per_window.append(
             {
@@ -1857,6 +1859,7 @@ def _purged_walk_forward(
                     }
                 ),
                 "frozen_parameters": frozen_parameters,
+                "test_uses_frozen_parameters": True,
                 "train_fit_summary": {
                     "mean_return": train_mean,
                     "return_volatility": train_deviation,
@@ -1946,6 +1949,8 @@ def _regime_breakdown(context: Mapping[str, Any], values: list[float]) -> dict[s
     labels = context.get("regime_labels")
     if not isinstance(labels, list | tuple):
         rows = context.get("market_frame")
+        if rows is not None and hasattr(rows, "to_dict"):
+            rows = rows.to_dict(orient="records")
         if isinstance(rows, list | tuple):
             labels = [
                 row.get("regime", row.get("regime_id", "unclassified"))
@@ -1957,12 +1962,13 @@ def _regime_breakdown(context: Mapping[str, Any], values: list[float]) -> dict[s
                 labels = _derived_regime_labels(rows)
     if not isinstance(labels, list | tuple) or len(labels) < len(values):
         return {
-            "passed": bool(values),
-            "status": "not_applicable",
+            "passed": False,
+            "status": "measured",
             "regimes": {"unclassified": sum(values)},
             "regime_count": 1,
             "concentration_fraction": 1.0,
-            "reason": "no_regime_partition_in_canonical_dataset",
+            "observations_by_regime": {"unclassified": len(values)},
+            "reason": "no_meaningful_regime_partition_in_canonical_dataset",
         }
     grouped: dict[str, list[float]] = {}
     for label, value in zip(labels[: len(values)], values, strict=True):
@@ -1972,14 +1978,16 @@ def _regime_breakdown(context: Mapping[str, Any], values: list[float]) -> dict[s
     concentration = max((abs(value) for value in totals.values()), default=0.0) / max(
         total_abs, 1e-12
     )
+    meaningful = bool(values) and len(grouped) >= 2 and "unclassified" not in grouped
     return {
-        "passed": bool(values) and len(grouped) >= 2,
+        "passed": meaningful,
         "status": "measured",
         "regimes": totals,
         "observations_by_regime": {label: len(items) for label, items in grouped.items()},
         "regime_count": len(grouped),
         "concentration_fraction": concentration,
         "input_hash": canonical_hash({"labels": list(labels[: len(values)]), "returns": values}),
+        "reason": None if meaningful else "insufficient_meaningful_regimes",
     }
 
 
@@ -2026,6 +2034,41 @@ def _closed_signal_episodes(signals: Sequence[float]) -> int:
         previous = current
     if abs(previous) > 1e-12:
         episodes += 1
+    return episodes
+
+
+def _independent_return_observations(
+    signals: Sequence[float], returns: Sequence[float]
+) -> list[float]:
+    """Aggregate marked returns into independent holding episodes.
+
+    A bar return is not an independent trade observation. Returns stay in one
+    episode until the position goes flat or changes direction. A terminal
+    liquidation-cost return is assigned to the open episode so the evidence
+    cannot omit the cost of closing terminal exposure.
+    """
+
+    if not signals or not returns:
+        return []
+    episodes: list[float] = []
+    current_direction = 0
+    current_return = 0.0
+    for index, value in enumerate(returns):
+        signal = float(signals[min(index, len(signals) - 1)])
+        direction = 1 if signal > 1e-12 else -1 if signal < -1e-12 else 0
+        if direction == 0:
+            if current_direction:
+                episodes.append(current_return)
+                current_direction = 0
+                current_return = 0.0
+            continue
+        if current_direction and direction != current_direction:
+            episodes.append(current_return)
+            current_return = 0.0
+        current_direction = direction
+        current_return += float(value)
+    if current_direction:
+        episodes.append(current_return)
     return episodes
 
 

@@ -1321,6 +1321,8 @@ class DatabaseResearchJobHandlers:
         result = EventReplayEngine(
             cancel_latency_seconds=float(loaded["cancel_latency_seconds"]),
             impact_bps_per_depth_fraction=float(loaded["impact_bps_per_depth_fraction"]),
+            terminal_fee_bps=float(loaded.get("terminal_fee_bps", 5.0)),
+            terminal_slippage_bps=float(loaded.get("terminal_slippage_bps", 2.0)),
         ).simulate(events=events, orders=orders)
         order_evidence = [
             {
@@ -1369,6 +1371,8 @@ class DatabaseResearchJobHandlers:
             metrics={
                 **{str(key): float(value) for key, value in result.metrics.items()},
                 "funding_paid": result.funding_paid,
+                "terminal_liquidation_cost": result.terminal_liquidation_cost,
+                "terminal_exposure": result.terminal_exposure,
             },
             receipt=_execution_receipt(request, executor_version="event-replay/v2"),
         )

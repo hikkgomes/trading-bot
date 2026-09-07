@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from math import isfinite
 
 from src.domain._codec import timestamp
 
@@ -19,9 +20,12 @@ class BarStep:
         object.__setattr__(self, "timestamp", timestamp(self.timestamp, field="timestamp"))
         if not self.prices:
             raise ValueError("bar step needs prices")
-        if any(float(price) <= 0 for price in self.prices.values()):
+        if any(not isfinite(float(price)) or float(price) <= 0 for price in self.prices.values()):
             raise ValueError("bar prices must be positive")
-        if any(not -1 <= float(value) <= 1 for value in self.target_fractions.values()):
+        if any(
+            not isfinite(float(value)) or not -1 <= float(value) <= 1
+            for value in self.target_fractions.values()
+        ):
             raise ValueError("target fractions must be in [-1, 1]")
 
 
@@ -32,6 +36,8 @@ class BarSimulationResult:
     fees_paid: float
     funding_paid: float
     slippage_paid: float = 0.0
+    terminal_liquidation_cost: float = 0.0
+    terminal_exposure: float = 0.0
 
 
 class BarPortfolioEngine:
@@ -48,9 +54,15 @@ class BarPortfolioEngine:
         self.fee_bps = float(fee_bps)
         self.slippage_bps = float(slippage_bps)
 
-    def simulate(self, steps: tuple[BarStep, ...]) -> BarSimulationResult:
+    def simulate(
+        self, steps: tuple[BarStep, ...], *, liquidate_terminal: bool = True
+    ) -> BarSimulationResult:
         if not steps:
             return BarSimulationResult((), {}, 0.0, 0.0)
+        if any(
+            steps[index].timestamp <= steps[index - 1].timestamp for index in range(1, len(steps))
+        ):
+            raise ValueError("bar steps must be chronological")
         cash = self.initial_equity
         quantities: dict[str, float] = {}
         fees_paid = funding_paid = slippage_paid = 0.0
@@ -61,9 +73,11 @@ class BarPortfolioEngine:
                 for symbol, quantity in quantities.items()
                 if symbol in step.prices
             )
-            for symbol, target_fraction in step.target_fractions.items():
+            symbols = sorted(set(quantities) | set(step.target_fractions))
+            for symbol in symbols:
                 price = float(step.prices[symbol])
-                target_quantity = equity_before * float(target_fraction) / price
+                target_fraction = float(step.target_fractions.get(symbol, 0.0))
+                target_quantity = equity_before * target_fraction / price
                 current_quantity = quantities.get(symbol, 0.0)
                 delta = target_quantity - current_quantity
                 fee = abs(delta * price) * self.fee_bps / 10_000
@@ -81,4 +95,33 @@ class BarPortfolioEngine:
                 quantity * float(step.prices[symbol]) for symbol, quantity in quantities.items()
             )
             curve.append((step.timestamp, equity))
-        return BarSimulationResult(tuple(curve), quantities, fees_paid, funding_paid, slippage_paid)
+        terminal_exposure = sum(
+            abs(quantity * float(steps[-1].prices[symbol]))
+            for symbol, quantity in quantities.items()
+        )
+        terminal_liquidation_cost = 0.0
+        if liquidate_terminal:
+            for symbol, quantity in tuple(quantities.items()):
+                price = float(steps[-1].prices[symbol])
+                notional = abs(quantity * price)
+                fee = notional * self.fee_bps / 10_000.0
+                slippage = notional * self.slippage_bps / 10_000.0
+                # A terminal close trades against the existing position. The
+                # notional changes cash; only the fee and slippage are costs.
+                cash -= -quantity * price + fee + slippage
+                fees_paid += fee
+                slippage_paid += slippage
+            terminal_liquidation_cost = (
+                terminal_exposure * (self.fee_bps + self.slippage_bps) / 10_000.0
+            )
+            quantities = {symbol: 0.0 for symbol in quantities}
+            curve[-1] = (steps[-1].timestamp, cash)
+        return BarSimulationResult(
+            tuple(curve),
+            quantities,
+            fees_paid,
+            funding_paid,
+            slippage_paid,
+            terminal_liquidation_cost,
+            terminal_exposure,
+        )

@@ -644,6 +644,7 @@ class CanonicalResearchDatasetBuilder:
             if close_value > 0.0:
                 history.append(close_value)
                 previous_by_instrument[instrument] = close_value
+        _add_panel_ranks(panels_by_time)
         panel_time, panel = _latest_panel(panels_by_time)
         linked = _latest_linked_instruments(market_frame, panel_time)
         cross_sectional_history = _cross_sectional_history(panels_by_time)
@@ -847,6 +848,31 @@ class CanonicalResearchDatasetBuilder:
 def _validate_product_scope(product_id: str, scope: tuple[str, ...]) -> None:
     if product_id == "btc_accumulation" and scope != (BTC_SPOT_INSTRUMENT_ID,):
         raise DatasetResolutionError("BTC accumulation datasets require BTCUSDT spot only")
+
+
+def _add_panel_ranks(panels_by_time: dict[str, dict[str, dict[str, float]]]) -> None:
+    """Add point-in-time rank features without mixing timestamps or instruments."""
+
+    for values in panels_by_time.values():
+        ordered = sorted(
+            values,
+            key=lambda instrument: (
+                float(values[instrument].get("funding", 0.0)),
+                instrument,
+            ),
+        )
+        denominator = max(1, len(ordered) - 1)
+        for rank, instrument in enumerate(ordered):
+            values[instrument]["funding_rank"] = rank / denominator
+        ordered_returns = sorted(
+            values,
+            key=lambda instrument: (
+                float(values[instrument].get("relative_return", 0.0)),
+                instrument,
+            ),
+        )
+        for rank, instrument in enumerate(ordered_returns):
+            values[instrument]["point_in_time_rank"] = rank / denominator
 
 
 def _numeric_close(value: Any) -> float:

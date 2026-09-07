@@ -35,6 +35,14 @@ from src.domain._codec import canonical_hash
 from src.domain.orders import Fill, OrderIntent, OrderSide, OrderType
 from src.domain.positions import Position, PositionStatus
 from src.research.accounting import FuturesIncomeAccounting
+from src.research.backtest.bar_engine import BarPortfolioEngine, BarStep
+from src.research.backtest.event_engine import (
+    EventReplayEngine,
+    ReplayEvent,
+    SimulatedLimitOrder,
+    SimulatedOrderSide,
+)
+from src.research.evidence import regime_breakdown_passes
 from src.research.generation import CAMPAIGNS, build_hypothesis
 from src.research.returns import PositionReturnLedger
 from src.services.alerting import AlertSeverity, SqlAlertService
@@ -681,6 +689,65 @@ def test_forward_facts_count_closed_episodes_and_do_not_invent_fill_rate() -> No
         window_start=NOW,
     )
     assert facts.fill_rate_applicable is False
+
+
+def test_backtests_charge_terminal_exposure_and_preserve_terminal_state() -> None:
+    bars = BarPortfolioEngine(initial_equity=1_000.0, fee_bps=10.0, slippage_bps=5.0).simulate(
+        (
+            BarStep(
+                timestamp=NOW,
+                prices={"BTC": 100.0},
+                target_fractions={"BTC": 0.5},
+            ),
+        )
+    )
+    assert bars.terminal_exposure == pytest.approx(500.0)
+    assert bars.terminal_liquidation_cost == pytest.approx(0.75)
+    assert bars.quantities == {"BTC": 0.0}
+    assert bars.equity_curve[-1][1] == pytest.approx(998.5)
+
+    events = EventReplayEngine(terminal_fee_bps=10.0, terminal_slippage_bps=5.0).simulate(
+        events=(
+            ReplayEvent(
+                event_time=NOW,
+                receive_time=NOW,
+                instrument_id="BTC",
+                best_bid=99.0,
+                best_ask=101.0,
+                ask_depth=1.0,
+                mark_price=100.0,
+            ),
+        ),
+        orders=(
+            SimulatedLimitOrder(
+                order_id="terminal-order",
+                instrument_id="BTC",
+                side=SimulatedOrderSide.BUY,
+                quantity=1.0,
+                limit_price=101.0,
+                submitted_at=NOW,
+                expires_at="2026-09-01T00:05:00+00:00",
+            ),
+        ),
+    )
+    assert events.terminal_exposure == pytest.approx(100.0)
+    assert events.terminal_liquidation_cost == pytest.approx(0.15)
+
+
+def test_regime_evidence_rejects_placeholder_single_bucket() -> None:
+    assert (
+        regime_breakdown_passes(
+            {
+                "passed": True,
+                "status": "measured",
+                "regimes": {"all": 0.04},
+                "observations_by_regime": {"all": 100},
+                "regime_count": 1,
+                "concentration_fraction": 1.0,
+            }
+        )
+        is False
+    )
 
 
 def test_ambiguous_emergency_submission_never_reports_success_without_reconcile() -> None:

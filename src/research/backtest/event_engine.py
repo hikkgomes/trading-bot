@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -44,10 +45,18 @@ class ReplayEvent:
         object.__setattr__(
             self, "instrument_id", non_empty(self.instrument_id, field="instrument_id")
         )
-        if self.best_bid is not None and self.best_bid <= 0:
+        if self.best_bid is not None and (
+            not math.isfinite(float(self.best_bid)) or self.best_bid <= 0
+        ):
             raise ValueError("best_bid must be positive")
-        if self.best_ask is not None and self.best_ask <= 0:
+        if self.best_ask is not None and (
+            not math.isfinite(float(self.best_ask)) or self.best_ask <= 0
+        ):
             raise ValueError("best_ask must be positive")
+        if self.mark_price is not None and (
+            not math.isfinite(float(self.mark_price)) or self.mark_price <= 0
+        ):
+            raise ValueError("mark_price must be positive")
         if (
             self.best_bid is not None
             and self.best_ask is not None
@@ -121,6 +130,8 @@ class EventSimulationResult:
     funding_paid: float
     connection_gaps: tuple[str, ...]
     metrics: Mapping[str, float] = field(default_factory=dict)
+    terminal_liquidation_cost: float = 0.0
+    terminal_exposure: float = 0.0
 
 
 @dataclass
@@ -139,14 +150,27 @@ class EventReplayEngine:
         cancel_latency_seconds: float = 0.25,
         impact_bps_per_depth_fraction: float = 5.0,
         adverse_selection_horizon_events: int = 1,
+        terminal_fee_bps: float = 5.0,
+        terminal_slippage_bps: float = 2.0,
     ) -> None:
-        if cancel_latency_seconds < 0 or impact_bps_per_depth_fraction < 0:
+        if (
+            not math.isfinite(float(cancel_latency_seconds))
+            or not math.isfinite(float(impact_bps_per_depth_fraction))
+            or cancel_latency_seconds < 0
+            or impact_bps_per_depth_fraction < 0
+            or not math.isfinite(float(terminal_fee_bps))
+            or not math.isfinite(float(terminal_slippage_bps))
+            or terminal_fee_bps < 0
+            or terminal_slippage_bps < 0
+        ):
             raise ValueError("event simulation latency and impact must be non-negative")
         if adverse_selection_horizon_events < 1:
             raise ValueError("adverse-selection horizon must be positive")
         self.cancel_latency_seconds = cancel_latency_seconds
         self.impact_bps_per_depth_fraction = impact_bps_per_depth_fraction
         self.adverse_selection_horizon_events = adverse_selection_horizon_events
+        self.terminal_fee_bps = float(terminal_fee_bps)
+        self.terminal_slippage_bps = float(terminal_slippage_bps)
 
     def simulate(
         self,
@@ -190,6 +214,20 @@ class EventReplayEngine:
                 * float(event.mark_price or 0.0)
                 * event.funding_rate
             )
+        terminal_marks = _terminal_marks(replay)
+        terminal_exposure = 0.0
+        terminal_liquidation_cost = 0.0
+        for instrument_id, quantity in positions.items():
+            if abs(quantity) <= 1e-12:
+                continue
+            mark = terminal_marks.get(instrument_id)
+            if mark is None:
+                raise ValueError(f"terminal position has no authenticated mark: {instrument_id}")
+            notional = abs(quantity) * mark
+            terminal_exposure += notional
+            terminal_liquidation_cost += (
+                notional * (self.terminal_fee_bps + self.terminal_slippage_bps) / 10_000.0
+            )
         fill_count = sum(len(result.fills) for result in results)
         total_filled = sum(fill.quantity for result in results for fill in result.fills)
         return EventSimulationResult(
@@ -197,7 +235,14 @@ class EventReplayEngine:
             positions=positions,
             funding_paid=funding_paid,
             connection_gaps=gaps,
-            metrics={"fill_count": float(fill_count), "filled_quantity": total_filled},
+            metrics={
+                "fill_count": float(fill_count),
+                "filled_quantity": total_filled,
+                "terminal_liquidation_cost": terminal_liquidation_cost,
+                "terminal_exposure": terminal_exposure,
+            },
+            terminal_liquidation_cost=terminal_liquidation_cost,
+            terminal_exposure=terminal_exposure,
         )
 
     def _simulate_order(
@@ -343,3 +388,17 @@ def _plus_seconds(value: str, seconds: float) -> str:
 
     parsed = dt.datetime.fromisoformat(value)
     return (parsed + dt.timedelta(seconds=seconds)).isoformat()
+
+
+def _terminal_marks(events: tuple[ReplayEvent, ...]) -> dict[str, float]:
+    marks: dict[str, float] = {}
+    for event in events:
+        if (
+            event.mark_price is not None
+            and math.isfinite(float(event.mark_price))
+            and float(event.mark_price) > 0.0
+        ):
+            marks[event.instrument_id] = float(event.mark_price)
+        elif event.best_bid is not None and event.best_ask is not None:
+            marks[event.instrument_id] = (float(event.best_bid) + float(event.best_ask)) / 2.0
+    return marks

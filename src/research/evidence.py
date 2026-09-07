@@ -476,11 +476,25 @@ def regime_breakdown_passes(value: object) -> bool:
     if not isinstance(value, Mapping) or value.get("passed") is not True:
         return False
     regimes = value.get("regimes")
-    return (
-        isinstance(regimes, Mapping)
-        and bool(regimes)
-        and all(_finite(measured) is not None for measured in regimes.values())
-    )
+    observations = value.get("observations_by_regime")
+    concentration = _finite(value.get("concentration_fraction"))
+    if (
+        value.get("status") != "measured"
+        or not isinstance(regimes, Mapping)
+        or len(regimes) < 2
+        or any(not str(name).strip() or str(name) == "unclassified" for name in regimes)
+        or any(_finite(measured) is None for measured in regimes.values())
+        or not isinstance(observations, Mapping)
+        or {str(name) for name in observations} != {str(name) for name in regimes}
+        or any(
+            isinstance(measured, bool) or not isinstance(measured, int) or measured < 1
+            for measured in observations.values()
+        )
+        or concentration is None
+        or not 0.0 <= concentration <= 1.0
+    ):
+        return False
+    return True
 
 
 def _objective_or_return(value: Mapping[str, Any]) -> float | None:
