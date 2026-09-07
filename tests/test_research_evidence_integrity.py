@@ -253,6 +253,15 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
                 "slippage": 0.0,
                 "data_uptime": 1.0,
                 "rejected_orders": 0,
+                "valid_attempts": 1,
+                "completed_attempts": 1,
+                "expected_observations": 1,
+                "observed_observations": 1,
+                "fill_rate_applicable": True,
+                "trading_dates": ["2026-08-24"],
+                "order_ids": ["test-order"],
+                "fill_ids": ["test-fill"],
+                "episode_ids": ["test-episode"],
             },
             "forecast_hash": canonical_hash(forecast_payload),
             "target_hash": None,
@@ -365,8 +374,8 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
         minimum_decisions=2,
     )
     assert decision_id.startswith("sha256:")
-    assert accepted is True
-    assert reason_code is None
+    assert accepted is False
+    assert reason_code == "forward_data_gaps"
     with pytest.raises(CanonicalEvidenceError, match="unknown observation identity"):
         repository.append_summary(
             strategy_version_id=definition.strategy_version_id,
@@ -377,6 +386,15 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
                 "observation_ids": ["sha256:" + "f" * 64],
                 "observed_from": "2026-08-24T00:00:00+00:00",
                 "observed_until": "2026-08-26T00:00:00+00:00",
+                "valid_attempts": 0,
+                "completed_attempts": 0,
+                "expected_observations": 0,
+                "observed_observations": 0,
+                "fill_rate_applicable": False,
+                "trading_dates": [],
+                "order_ids": [],
+                "fill_ids": [],
+                "episode_ids": [],
             },
         )
     with pytest.raises(CanonicalEvidenceError, match="artefact-bound"):

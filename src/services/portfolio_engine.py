@@ -152,9 +152,22 @@ class DatabasePortfolioTargetBuilder:
         seed = self.repository.forecast(str(payload["forecast_id"]))
         if seed.product_id != product_id:
             raise ValueError("forecast product differs from target product")
-        forecasts = self.repository.active_forecasts(product_id=product_id, at=evaluated_at)
+        requested_assignment_id = str(payload.get("assignment_id") or "").strip()
+        assignment_id = (
+            requested_assignment_id or str(seed.metadata.get("assignment_id") or "").strip()
+        )
+        all_forecasts = self.repository.active_forecasts(product_id=product_id, at=evaluated_at)
+        forecasts = (
+            tuple(
+                item
+                for item in all_forecasts
+                if str(item.metadata.get("assignment_id") or "") == assignment_id
+            )
+            if assignment_id
+            else all_forecasts
+        )
         if seed not in forecasts:
-            raise ValueError("trigger forecast is not active at the rebalance timestamp")
+            raise ValueError("trigger forecast is not active in its assignment sleeve")
         return product_id, product, evaluated_at, seed, forecasts
 
     def _product_targets(
@@ -218,6 +231,12 @@ class DatabasePortfolioTargetBuilder:
             core_btc_fraction=float(product.get("btc_core_fraction", 1.0)),
             max_tactical_fraction=float(product.get("btc_max_tactical_fraction", 0.0)),
         )
+        configured_minimum = product.get("btc_minimum_fraction")
+        if (
+            configured_minimum is not None
+            and abs(float(configured_minimum) - policy.minimum_btc_fraction) > 1e-12
+        ):
+            raise ValueError("BTC minimum allocation conflicts with the core and tactical limits")
         allocation = target_btc_allocation(forecasts, policy=policy)
         quantity = max(0.0, allocation.target_btc_fraction * equity_btc)
         costs = product.get("execution_costs")

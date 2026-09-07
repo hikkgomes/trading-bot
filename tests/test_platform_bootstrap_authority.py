@@ -142,7 +142,7 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
     repeated = scheduler.run_once(now=NOW)
 
     assert scheduled["schedules"] == 14
-    assert scheduled["jobs_enqueued"] == 7
+    assert scheduled["jobs_enqueued"] == 8
     assert repeated["jobs_enqueued"] == 0
     assert scheduled["maintenance"]["reason_code"] == "platform_maintenance_completed"
     with database.engine.connect() as connection:
@@ -150,7 +150,7 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
             connection.execute(select(func.count()).select_from(platform_schedule)).scalar_one()
             == 14
         )
-        assert connection.execute(select(func.count()).select_from(job)).scalar_one() == 13
+        assert connection.execute(select(func.count()).select_from(job)).scalar_one() == 14
         assert "diagnostic_paper_open" in set(connection.execute(select(job.c.name)).scalars())
         assert "dataset_snapshot_validate" in set(connection.execute(select(job.c.name)).scalars())
         assert "universe_refresh" in set(connection.execute(select(job.c.name)).scalars())
@@ -287,9 +287,11 @@ def test_scheduler_research_jobs_are_processed_automatically(
 
     results = [research() for _ in range(6)]
 
-    assert all(result["reason_code"] == "research_job_completed" for result in results)
-    assert any(
-        result.get("handler_reason_code") == "historical_bars_incomplete" for result in results
+    assert sum(result["reason_code"] == "research_job_completed" for result in results) == 2
+    assert all(
+        result["reason_code"]
+        in {"research_job_completed", "research_job_deferred", "historical_bars_incomplete"}
+        for result in results
     )
     assert SqlResearchStore(database.engine).load_candidates() == ()
 
@@ -1228,6 +1230,13 @@ def test_live_readiness_accepts_exact_connected_authority(tmp_path: Path, monkey
         "recovery_identifiers": {"open": {}, "close": {}},
         "recovery_lookup": True,
         "flat_reconciliation": True,
+        "native_stop_created": True,
+        "native_stop_readback_matched": True,
+        "algo_update_processed": True,
+        "partial_fill_quantity_handled": True,
+        "stop_resize_or_replacement_handled": True,
+        "native_stop_cancelled": True,
+        "emergency_reduction_tested": True,
     }
     assert report_payload["execution_engine_identity"] == connected_execution_engine_identity()
     report_hash = canonical_hash(report_payload)

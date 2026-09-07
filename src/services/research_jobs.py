@@ -55,7 +55,9 @@ from src.research.ml import MlExperimentRunner
 from src.research.providers import provider_candidate
 from src.research.store import SqlResearchStore
 from src.research.theses import SqlThesisRegistry, StrategyThesisFactory, ThesisError
+from src.services.historical_bootstrap import HistoricalBootstrapService
 from src.services.job_schemas import JobSchemaError, ResearchJobRequest
+from src.services.runtime import utc_now
 from src.services.scheduler import ClaimedJob
 
 _REQUIRED_EVIDENCE: dict[str, frozenset[str]] = {
@@ -91,6 +93,20 @@ _REQUIRED_EVIDENCE: dict[str, frozenset[str]] = {
     ),
     "protected": frozenset({"frozen_cohort", "holdout_claim", "data_hashes", "code_hash"}),
 }
+
+_EPOCH_TIMESTAMP = "1970-01-01T00:00:00+00:00"
+
+
+def _runtime_data_timestamp(payload: Mapping[str, Any], *fields: str) -> str:
+    for field in fields:
+        value = payload.get(field)
+        if value is None:
+            continue
+        candidate = str(value)
+        if candidate and candidate != _EPOCH_TIMESTAMP:
+            return candidate
+    return utc_now()
+
 
 _EVIDENCE_UNITS: dict[str, frozenset[str]] = {
     "scalping": frozenset({"independent_trades", "event_windows"}),
@@ -251,6 +267,17 @@ def _candidate_scope_context(candidate: Candidate, context: Mapping[str, Any]) -
         result["symbol_returns"] = scoped_returns
         if len(scoped_returns) == 1:
             result["returns"] = next(iter(scoped_returns.values()))
+    for field_name in ("cross_sectional_values", "linked_instruments"):
+        values = result.get(field_name)
+        if isinstance(values, Mapping):
+            result[field_name] = _scoped_mapping(values, selected)
+    for field_name, value_field in (
+        ("cross_sectional_history", "cross_sectional_values"),
+        ("linked_instrument_history", "linked_instruments"),
+    ):
+        history = result.get(field_name)
+        if isinstance(history, list | tuple):
+            result[field_name] = _scoped_history(history, value_field, selected)
     result["instrument_scope"] = scope
     return result
 
@@ -271,6 +298,38 @@ def _value_in_scope(value: str, scope: set[str]) -> bool:
         or item.endswith(f":{upper}:USDT")
         for item in scope
     )
+
+
+def _scoped_mapping(value: Mapping[str, Any], scope: set[str]) -> dict[str, Any]:
+    return {
+        str(key): item
+        for key, item in value.items()
+        if not str(key).startswith("__") and _value_in_scope(str(key), scope)
+    }
+
+
+def _scoped_history(
+    history: list[Any] | tuple[Any, ...], value_field: str, scope: set[str]
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for raw in history:
+        if not isinstance(raw, Mapping):
+            continue
+        values = raw.get(value_field)
+        if not isinstance(values, Mapping):
+            continue
+        scoped_values = _scoped_mapping(values, scope)
+        forward = raw.get("forward_returns")
+        scoped_forward = _scoped_mapping(forward, scope) if isinstance(forward, Mapping) else {}
+        if len(scoped_values) >= 2:
+            result.append(
+                {
+                    **dict(raw),
+                    value_field: scoped_values,
+                    "forward_returns": scoped_forward,
+                }
+            )
+    return result
 
 
 @dataclass(frozen=True)
@@ -295,6 +354,7 @@ class DatabaseResearchJobHandlers:
         evidence_policy: EvidencePolicy | None = None,
         configuration: Mapping[str, Mapping[str, Any]] | None = None,
         dataset_bundle_service: DatabaseDatasetBundleService | None = None,
+        historical_bootstrap_service: HistoricalBootstrapService | None = None,
     ):
         self.store = store
         self.artefact_store = artefact_store
@@ -306,6 +366,7 @@ class DatabaseResearchJobHandlers:
         self.evidence_policy = evidence_policy or EvidencePolicy()
         self.configuration = configuration
         self.dataset_bundle_service = dataset_bundle_service
+        self.historical_bootstrap_service = historical_bootstrap_service
 
     def handlers(self) -> dict[str, Callable]:
         return {
@@ -318,7 +379,56 @@ class DatabaseResearchJobHandlers:
             "bounded_backtest": self.bounded_backtest,
             "event_replay": self.event_replay,
             "train_ml_experiment": self.train_ml_experiment,
+            "historical_bootstrap": self.historical_bootstrap,
         }
+
+    def historical_bootstrap(
+        self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
+    ) -> dict[str, Any]:
+        if self.historical_bootstrap_service is None:
+            raise JobSchemaError("historical bootstrap service is not configured")
+        required = {
+            "product_id",
+            "market_type",
+            "symbols",
+            "minimum_history_days",
+            "timeframe",
+        }
+        if not required.issubset(claimed.payload):
+            raise JobSchemaError("historical bootstrap command is incomplete")
+        symbols = claimed.payload["symbols"]
+        if not isinstance(symbols, list | tuple) or not symbols:
+            raise JobSchemaError("historical bootstrap needs at least one symbol")
+        market = str(claimed.payload["market_type"])
+        if market == "usdt_futures":
+            market = "futures"
+        if market not in {"spot", "futures"}:
+            raise JobSchemaError("historical bootstrap market is invalid")
+        renew()
+        reports = self.historical_bootstrap_service.bootstrap_product(
+            product_id=str(claimed.payload["product_id"]),
+            market=market,
+            symbols=tuple(str(symbol) for symbol in symbols),
+            minimum_history_days=int(claimed.payload["minimum_history_days"]),
+            timeframe=str(claimed.payload["timeframe"]),
+            heartbeat=renew,
+        )
+        result: dict[str, Any] = {
+            "product_id": str(claimed.payload["product_id"]),
+            "reports": [report.to_payload() for report in reports],
+            "completed": all(report.completed for report in reports),
+        }
+        if not result["completed"] or not all(
+            report.get("metadata_fetched") is True for report in result["reports"]
+        ):
+            result["completed"] = False
+            result.update(
+                {
+                    "_defer": True,
+                    "_defer_reason": "historical_bootstrap_incomplete",
+                }
+            )
+        return result
 
     def validate_dataset_snapshot(
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
@@ -355,11 +465,37 @@ class DatabaseResearchJobHandlers:
     ) -> dict[str, Any]:
         renew()
         product_id = str(claimed.payload["product_id"])
-        dataset, waiting = self._catalogue_dataset(claimed.payload, product_id=product_id)
+        catalogue_at = _runtime_data_timestamp(claimed.payload, "catalogue_submitted_at")
+        dataset, waiting = self._catalogue_dataset(
+            claimed.payload,
+            product_id=product_id,
+            created_at=catalogue_at,
+        )
         if waiting is not None:
-            return waiting
+            if waiting.get("state") == "blocked_dataset":
+                raise JobSchemaError(str(waiting.get("reason_code") or "catalogue_dataset_blocked"))
+            return {
+                **waiting,
+                "_defer": True,
+                "_defer_reason": str(waiting.get("reason_code") or "catalogue_waiting"),
+            }
         if dataset is None:
             raise JobSchemaError("catalogue dataset resolution returned no result")
+        return self._register_catalogue_candidates(
+            claimed,
+            dataset=dataset,
+            product_id=product_id,
+            catalogue_at=catalogue_at,
+        )
+
+    def _register_catalogue_candidates(
+        self,
+        claimed: ClaimedJob,
+        *,
+        dataset: _CatalogueDataset,
+        product_id: str,
+        catalogue_at: str,
+    ) -> dict[str, Any]:
         snapshot_ids = dataset.snapshot_ids
         bundle_id = dataset.bundle_id
         bundle = dataset.bundle
@@ -370,6 +506,8 @@ class DatabaseResearchJobHandlers:
                 "product_id": product_id,
                 "state": "waiting_for_universe",
                 "reason_code": "point_in_time_universe_unavailable",
+                "_defer": True,
+                "_defer_reason": "point_in_time_universe_unavailable",
             }
         theses = registered_strategy_theses(product=product_id, instrument_universe=universe)
         thesis_registry = SqlThesisRegistry(self.store.engine)
@@ -391,11 +529,7 @@ class DatabaseResearchJobHandlers:
                 else _optional_text(claimed.payload.get("universe_snapshot_id"))
             ),
             instrument_universe=universe,
-            submitted_at=(
-                str(claimed.payload["catalogue_submitted_at"])
-                if claimed.payload.get("catalogue_submitted_at")
-                else None
-            ),
+            submitted_at=catalogue_at,
         )
         if plan is not None:
             if bundle is None:
@@ -413,7 +547,7 @@ class DatabaseResearchJobHandlers:
         return {"registered_candidates": len(identities), "candidate_ids": list(identities)}
 
     def _catalogue_dataset(
-        self, payload: Mapping[str, Any], *, product_id: str
+        self, payload: Mapping[str, Any], *, product_id: str, created_at: str | None = None
     ) -> tuple[_CatalogueDataset | None, dict[str, Any] | None]:
         snapshot_ids = tuple(str(item) for item in payload["dataset_snapshot_hashes"])
         bundle_id = _optional_text(payload.get("dataset_bundle_id"))
@@ -423,7 +557,9 @@ class DatabaseResearchJobHandlers:
                 universe_id=str(payload.get("universe_id") or ""),
                 market_type=str(payload.get("market_type") or "futures"),
                 created_at=str(
-                    payload.get("catalogue_submitted_at") or payload.get("available_at")
+                    created_at
+                    or payload.get("catalogue_submitted_at")
+                    or payload.get("available_at")
                 ),
                 timeframe=_optional_text(payload.get("dataset_timeframe")),
             )
@@ -528,13 +664,14 @@ class DatabaseResearchJobHandlers:
             product_id=str(payload["product_id"]),
             universe_id=str(payload.get("universe_id") or ""),
             market_type=str(payload.get("market_type") or "futures"),
-            created_at=str(payload.get("submitted_at") or payload.get("available_at")),
+            created_at=_runtime_data_timestamp(payload, "submitted_at", "available_at"),
             timeframe=_optional_text(payload.get("dataset_timeframe")),
         )
         if built.state != "ready" or built.bundle_id is None:
             return resolved
         return {
             **resolved,
+            "submitted_at": _runtime_data_timestamp(payload, "submitted_at", "available_at"),
             "dataset_snapshot_hashes": list(built.snapshot_ids),
             "dataset_bundle_id": built.bundle_id,
             "universe_snapshot_id": self._bundle_universe_snapshot(built.bundle_id),
@@ -567,9 +704,16 @@ class DatabaseResearchJobHandlers:
     def _generation_waiting_response(
         product_id: str, *, universe_available: bool
     ) -> dict[str, Any]:
+        reason_code = (
+            "canonical_dataset_bundle_unavailable"
+            if universe_available
+            else "point_in_time_universe_unavailable"
+        )
         return {
             "product_id": product_id,
             "state": "waiting_for_dataset" if universe_available else "waiting_for_universe",
+            "_defer": True,
+            "_defer_reason": reason_code,
         }
 
     @staticmethod
@@ -586,7 +730,7 @@ class DatabaseResearchJobHandlers:
             else "point_in_time_universe_unavailable"
         )
         for campaign in CAMPAIGNS:
-            if campaign.product == product_id:
+            if campaign.product == product_id and campaign.enabled_by_default:
                 feedback_store.append(
                     GenerationFeedback(
                         campaign=campaign.name,

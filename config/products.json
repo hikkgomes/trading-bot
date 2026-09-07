@@ -20,6 +20,7 @@
       "btc_core_fraction": 1.0,
       "btc_max_tactical_fraction": 0.3,
       "btc_minimum_fraction": 0.7,
+      "dataset_timeframe": "1m",
       "execution_costs": {"fee_bps": 10.0, "slippage_bps": 2.0},
       "execution_mode": "paper"
     },
@@ -36,9 +37,13 @@
         "generated_dsl",
         "python",
         "ml",
+        "cross_sectional",
         "relative_value",
+        "microstructure",
+        "ensemble",
         "agent"
       ],
+      "research_max_symbols": 12,
       "promotion_policy_id": "active-income-v2",
       "preflight_max_age_seconds": 3600,
       "account_snapshot_max_age_seconds": 60,
@@ -47,6 +52,7 @@
       "risk_policy_id": "active-income",
       "accounting_policy": "usdt_nav",
       "live_exchange_symbols": ["BTCUSDT"],
+      "dataset_timeframe": "1m",
       "execution_costs": {"fee_bps": 5.0, "slippage_bps": 2.0},
       "protective_stop_fraction": 0.02,
       "execution_mode": "paper"

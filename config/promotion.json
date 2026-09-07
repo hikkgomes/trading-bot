@@ -1,5 +1,62 @@
 {
   "schema": "promotion/v1",
+  "forward_profiles": [
+    {
+      "product_id": "btc_accumulation",
+      "family": "btc_allocation",
+      "required_forward_evidence_days": 90,
+      "minimum_forward_independent_decisions": 8,
+      "minimum_forward_effective_trades": 8,
+      "minimum_forward_effective_episodes": 8,
+      "minimum_forward_cycles": 8,
+      "minimum_forward_trading_days": 0
+    },
+    {
+      "product_id": "active_income",
+      "family": "scalping",
+      "required_forward_evidence_days": 14,
+      "minimum_forward_independent_decisions": 200,
+      "minimum_forward_effective_trades": 200,
+      "minimum_forward_effective_episodes": 200,
+      "minimum_forward_trading_days": 10
+    },
+    {
+      "product_id": "active_income",
+      "family": "intraday",
+      "required_forward_evidence_days": 30,
+      "minimum_forward_independent_decisions": 60,
+      "minimum_forward_effective_trades": 60,
+      "minimum_forward_effective_episodes": 60,
+      "minimum_forward_trading_days": 0
+    },
+    {
+      "product_id": "active_income",
+      "family": "cross_sectional",
+      "required_forward_evidence_days": 30,
+      "minimum_forward_independent_decisions": 60,
+      "minimum_forward_effective_trades": 60,
+      "minimum_forward_effective_episodes": 60,
+      "minimum_forward_trading_days": 10
+    },
+    {
+      "product_id": "active_income",
+      "family": "pairs",
+      "required_forward_evidence_days": 60,
+      "minimum_forward_independent_decisions": 20,
+      "minimum_forward_effective_trades": 20,
+      "minimum_forward_effective_episodes": 20,
+      "minimum_forward_trading_days": 10
+    },
+    {
+      "product_id": "active_income",
+      "family": "swing",
+      "required_forward_evidence_days": 60,
+      "minimum_forward_independent_decisions": 20,
+      "minimum_forward_effective_trades": 20,
+      "minimum_forward_effective_episodes": 20,
+      "minimum_forward_trading_days": 0
+    }
+  ],
   "policies": [
     {
       "policy_id": "btc-accumulation-v2",

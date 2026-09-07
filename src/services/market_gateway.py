@@ -7,6 +7,7 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import math
 import os
 import threading
 import time
@@ -92,13 +93,45 @@ class DatabaseGatewaySink:
         spool: DurableMarketBatchSpool | None = None,
         user_stream_job_name: str = "user_stream_event",
         user_stream_job_prefix: str = "user-stream",
+        retention_seconds: int = 7 * 86_400,
     ):
         self.queue = queue
         self.spool = spool
         self.user_stream_job_name = user_stream_job_name
         self.user_stream_job_prefix = user_stream_job_prefix
+        if retention_seconds <= 0:
+            raise ValueError("spool retention must be positive")
+        self.retention_seconds = retention_seconds
         self.events = 0
         self.bytes = 0
+        if self.spool is not None:
+            self._recover_spool_segments()
+
+    def _recover_spool_segments(self) -> None:
+        """Re-admit segments whose enqueue step was interrupted."""
+
+        assert self.spool is not None
+        for path in self.spool.recoverable():
+            rows = DurableMarketBatchSpool.read(path)
+            body = "".join(
+                json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
+            )
+            content_hash = canonical_hash(body)
+            expected = f"segment-{content_hash.removeprefix('sha256:')}.jsonl"
+            if path.name != expected:
+                raise ValueError("spool segment filename does not match its content hash")
+            job_id = f"work:market_event_batch:{content_hash.removeprefix('sha256:')}"
+            if self.queue.state(job_id) == "completed":
+                committed = self.spool.commit(path)
+                self.spool.delete(committed)
+                continue
+            if self.queue.state(job_id) == "dead_letter":
+                self.queue.requeue(
+                    job_id,
+                    available_at=dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
+                    reason="market_spool_recovery",
+                )
+            self._enqueue_segment(MarketEventBatchSegment(path, content_hash, len(rows)))
 
     def write(self, event: Mapping[str, Any]) -> None:
         raw_payload = event.get("payload")
@@ -191,11 +224,13 @@ class DatabaseGatewaySink:
             self._enqueue_segment(segment)
 
     def _enqueue_segment(self, segment: MarketEventBatchSegment) -> None:
+        assert self.spool is not None
+        canonical_path = self.spool.root / "pending" / segment.path.name
         self.queue.enqueue_if_absent(
-            job_id=f"market-batch:{segment.content_hash.removeprefix('sha256:')}",
+            job_id=f"work:market_event_batch:{segment.content_hash.removeprefix('sha256:')}",
             name="market_event_batch_write",
             payload={
-                "segment_path": str(segment.path),
+                "segment_path": str(canonical_path),
                 "segment_hash": segment.content_hash,
                 "row_count": segment.row_count,
                 "producer_identity": "market-gateway",
@@ -215,10 +250,17 @@ class DatabaseGatewaySink:
         self.flush()
 
     def enforce_retention(self, *, now: float | None = None) -> dict[str, int]:
-        del now
         if self.spool is None:
             return {"removed_files": 0, "removed_bytes": 0, "total_bytes": 0}
-        return _spool_retention(self.spool.root)
+        return _spool_retention(
+            self.spool.root,
+            retention_seconds=self.retention_seconds,
+            now=now,
+            is_acknowledged=lambda path: self.queue.state(
+                f"work:market_event_batch:{path.stem.removeprefix('segment-')}"
+            )
+            == "completed",
+        )
 
 
 class BinanceUserStreams:
@@ -432,20 +474,37 @@ def funding_event_from_mark_price(event: MarketEvent) -> MarketEvent | None:
     )
 
 
-def _spool_retention(root: Path, *, retention_seconds: int = 7 * 86_400) -> dict[str, int]:
-    now = time.time()
+def _spool_retention(
+    root: Path,
+    *,
+    retention_seconds: int = 7 * 86_400,
+    now: float | None = None,
+    is_acknowledged: Callable[[Path], bool] | None = None,
+) -> dict[str, int]:
+    if retention_seconds <= 0:
+        raise ValueError("spool retention must be positive")
+    current_time = time.time() if now is None else float(now)
+    if not math.isfinite(current_time):
+        raise ValueError("spool retention time must be finite")
     removed_files = 0
     removed_bytes = 0
-    for path in root.glob("segment-*.jsonl"):
+    paths = tuple(
+        path
+        for state in ("pending", "claimed", "committed", "deleted")
+        for path in (root / state).glob("segment-*.jsonl")
+    )
+    for path in paths:
         if path.is_symlink() or not path.is_file():
             continue
-        if now - path.stat().st_mtime > retention_seconds:
+        if path.parent.name != "committed":
+            continue
+        if is_acknowledged is not None and not is_acknowledged(path):
+            continue
+        if current_time - path.stat().st_mtime > retention_seconds:
             removed_bytes += path.stat().st_size
             path.unlink()
             removed_files += 1
-    total_bytes = sum(
-        path.stat().st_size for path in root.glob("segment-*.jsonl") if path.is_file()
-    )
+    total_bytes = sum(path.stat().st_size for path in paths if path.is_file())
     return {
         "removed_files": removed_files,
         "removed_bytes": removed_bytes,
@@ -562,6 +621,7 @@ class DatabaseMarketGateway:
                 max_rows=min(self.capture_config.queue_max_events, 5_000),
                 max_bytes=self.capture_config.max_file_bytes,
             ),
+            retention_seconds=self.capture_config.retention_seconds,
         )
         async with aiohttp.ClientSession(timeout=timeout) as session:
             clocks = await self._clock_status(session)
@@ -588,10 +648,12 @@ class DatabaseMarketGateway:
                 while True:
                     await asyncio.sleep(self.capture_config.flush_seconds)
                     sink.flush()
+                    spool_status = sink.enforce_retention()
                     self._continuous_status = {
                         **self._continuous_status,
                         "events_enqueued": sink.events,
                         "bytes_received": sink.bytes,
+                        "spool": spool_status,
                     }
                     failed = next(
                         (
@@ -672,31 +734,36 @@ class DatabaseMarketGateway:
                 max_rows=min(self.capture_config.queue_max_events, 5_000),
                 max_bytes=self.capture_config.max_file_bytes,
             ),
+            retention_seconds=self.capture_config.retention_seconds,
         )
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            clocks = await self._clock_status(session)
-            await asyncio.to_thread(self.public_rate_limiter.acquire)
-            public_task = asyncio.create_task(
-                capture(
-                    self.capture_config,
-                    max_events=maximum_events,
-                    max_seconds=maximum_seconds,
-                    sink=sink,
-                    dynamic_symbols=self.universe_symbols(),
-                )
-            )
-            user_tasks = [
-                asyncio.create_task(
-                    self.user_streams.capture(
-                        session=session,
-                        account=account,
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                clocks = await self._clock_status(session)
+                await asyncio.to_thread(self.public_rate_limiter.acquire)
+                public_task = asyncio.create_task(
+                    capture(
+                        self.capture_config,
+                        max_events=maximum_events,
+                        max_seconds=maximum_seconds,
                         sink=sink,
-                        maximum_seconds=maximum_seconds,
+                        dynamic_symbols=self.universe_symbols(),
                     )
                 )
-                for account in self.accounts
-            ]
-            results = await asyncio.gather(public_task, *user_tasks, return_exceptions=True)
+                user_tasks = [
+                    asyncio.create_task(
+                        self.user_streams.capture(
+                            session=session,
+                            account=account,
+                            sink=sink,
+                            maximum_seconds=maximum_seconds,
+                        )
+                    )
+                    for account in self.accounts
+                ]
+                results = await asyncio.gather(public_task, *user_tasks, return_exceptions=True)
+        finally:
+            sink.close()
+            spool_status = sink.enforce_retention()
         public_result = results[0]
         if isinstance(public_result, BaseException):
             raise public_result
@@ -714,6 +781,7 @@ class DatabaseMarketGateway:
             "clock_status": clocks,
             "user_stream_accounts": len(self.accounts),
             "user_stream_errors": [],
+            "spool": spool_status,
         }
 
     async def _clock_status(self, session: aiohttp.ClientSession) -> dict[str, Any]:

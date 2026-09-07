@@ -113,7 +113,15 @@ def target_btc_allocation(
     """Merge strategy sleeves into a BTC fraction in [0, 1]."""
     contributions: dict[str, float] = {}
     for forecast in forecasts:
-        if forecast.direction is ForecastDirection.FLAT:
+        explicit_target = forecast.metadata.get("btc_target_fraction")
+        if explicit_target is not None:
+            target = float(explicit_target)
+            if not math.isfinite(target) or not 0.0 <= target <= 1.0:
+                raise ValueError("BTC forecast target fraction must be in [0, 1]")
+            # Allocation forecasts are already expressed in product space. A
+            # long/short price direction must not be inferred from them.
+            contribution = target - policy.core_btc_fraction
+        elif forecast.direction is ForecastDirection.FLAT:
             contribution = 0.0
         else:
             sign = 1.0 if forecast.direction is ForecastDirection.LONG else -1.0

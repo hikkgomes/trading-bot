@@ -1,0 +1,31 @@
+[Unit]
+Description=Trading platform data writer
+After=network-online.target postgresql.service trading-platform-migration.service trading-platform-market-gateway.service
+Wants=network-online.target
+Requires=postgresql.service trading-platform-migration.service
+
+[Service]
+Type=simple
+User=trading-runtime
+Group=trading-runtime
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=/etc/trading-platform/runtime.env
+Environment=PYTHONUNBUFFERED=1
+Environment=OMP_NUM_THREADS=2
+Environment=OPENBLAS_NUM_THREADS=2
+ExecStartPre=/opt/trading-bot/.venv-runtime/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process data-writer --validate
+ExecStart=/opt/trading-bot/.venv-runtime/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process data-writer
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot/data /opt/trading-bot/runtime
+Slice=trading-platform-critical.slice
+
+[Install]
+WantedBy=multi-user.target

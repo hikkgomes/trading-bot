@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import insert, select
 
+from src.accounting.paper_account import PaperAccountLedger
 from src.data.database import (
     account_snapshot,
     balance_snapshot,
@@ -62,8 +63,8 @@ class AccountReconciliationService:
                 payload = self._authenticated(account, product, observed_at=now)
                 source = "authenticated_rest"
             else:
-                payload = self._paper(account, product)
-                source = "paper_config"
+                payload = self._paper_ledger(account, product, observed_at=now)
+                source = "paper_ledger"
             payload = {
                 **payload,
                 "account_id": account_id,
@@ -372,6 +373,28 @@ class AccountReconciliationService:
                 }
             ),
         }
+
+    def _paper_ledger(
+        self,
+        account: Mapping[str, Any],
+        product: Mapping[str, Any],
+        *,
+        observed_at: str,
+    ) -> dict[str, Any]:
+        """Read paper state from the durable accounting ledger after one seed."""
+
+        try:
+            ledger = PaperAccountLedger(
+                engine=self.engine,
+                account_id=str(account["account_id"]),
+                product_id=str(product["product_id"]),
+                accounting_asset=str(product.get("base_accounting_asset") or "USDT"),
+                starting_balances=account.get("paper_starting_balances", {}),
+                starting_positions=account.get("paper_starting_positions", {}),
+            )
+            return ledger.account_payload(observed_at=observed_at)
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            raise AccountAuthorityError(f"paper ledger state is invalid: {exc}") from exc
 
     @staticmethod
     def _default_broker(account: Mapping[str, Any], market: str) -> CcxtBroker:

@@ -59,7 +59,11 @@ class DatabaseAgentJobHandlers:
         renew()
         now = str(claimed.payload.get("available_at") or utc_now())
         report = DatabasePlatformReport(self.queue.engine).build(now=now)
-        context = build_agent_review_context(report, created_at=now)
+        context = build_agent_review_context(
+            report,
+            created_at=now,
+            product_id=str(claimed.payload.get("product_id") or ""),
+        )
         review_id = (
             f"scheduled-agent-review:{canonical_hash(context.values).removeprefix('sha256:')}"
         )
@@ -71,6 +75,8 @@ class DatabaseAgentJobHandlers:
                 "review_id": review_id,
                 "context": dict(context.values),
                 "context_hash": context.content_hash,
+                "transport": "postgresql_agent_review",
+                "response_required": True,
             },
         )
         return {
@@ -187,14 +193,16 @@ class DatabaseAgentJobHandlers:
         }
 
 
-def build_agent_review_context(report: Mapping[str, Any], *, created_at: str) -> AgentContext:
+def build_agent_review_context(
+    report: Mapping[str, Any], *, created_at: str, product_id: str | None = None
+) -> AgentContext:
     """Extract only adaptive, non-protected research feedback for OpenClaw."""
 
     research = report.get("research")
     research = research if isinstance(research, Mapping) else {}
     funnel = research.get("funnel")
     funnel = funnel if isinstance(funnel, Mapping) else {}
-    values = {
+    values: dict[str, Any] = {
         "failure_reasons": dict(funnel.get("top_rejection_reasons", {})),
         "family_coverage": dict(funnel.get("feature_family_concentration", {})),
         "duplicate_feedback": {
@@ -217,4 +225,6 @@ def build_agent_review_context(report: Mapping[str, Any], *, created_at: str) ->
             "jobs_dead_letter": funnel.get("jobs_dead_letter", 0),
         },
     }
+    if product_id:
+        values["product_id"] = product_id
     return AgentContext(created_at=created_at, values=values)

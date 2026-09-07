@@ -12,10 +12,10 @@ from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.engine import Engine
 
-from src.data.database import alert
+from src.data.database import alert, alert_delivery_attempt
 from src.domain._codec import canonical_hash, finite, json_value, non_empty, timestamp
 
 
@@ -187,13 +187,29 @@ class SqlAlertService:
         failed: list[str] = []
         for sink in self.sinks:
             sink_name = _sink_name(sink)
+            attempt_no = self._start_delivery_attempt(record, sink_name, emitted_at)
             try:
                 sink.send(record)
             except Exception as exc:  # external delivery must not stop trading controls
                 failed.append(sink_name)
+                self._finish_delivery_attempt(
+                    record,
+                    sink_name,
+                    attempt_no=attempt_no,
+                    status="failed",
+                    attempted_at=emitted_at,
+                    error=exc,
+                )
                 self._append_delivery_failure(record, sink_name, exc, emitted_at)
             else:
                 delivered.append(sink_name)
+                self._finish_delivery_attempt(
+                    record,
+                    sink_name,
+                    attempt_no=attempt_no,
+                    status="delivered",
+                    attempted_at=emitted_at,
+                )
         if failed:
             return AlertRecord(
                 **{
@@ -219,6 +235,7 @@ class SqlAlertService:
     ) -> AlertRecord:
         alert_id = non_empty(alert_id, field="alert_id")
         acknowledged_by = non_empty(acknowledged_by, field="acknowledged_by")
+        _assert_human_acknowledger(acknowledged_by)
         acknowledged_at = timestamp(acknowledged_at, field="acknowledged_at")
         source = self._get(alert_id)
         if source is None:
@@ -243,7 +260,113 @@ class SqlAlertService:
             parent_alert_id=alert_id,
         )
         self._append(record)
+        with self.engine.begin() as connection:
+            connection.execute(
+                update(alert_delivery_attempt)
+                .where(
+                    alert_delivery_attempt.c.alert_id == alert_id,
+                )
+                .values(acknowledged_at=acknowledged_at)
+            )
         return record
+
+    def deliver_pending(self, *, now: str, maximum_attempts: int = 8) -> AlertDelivery:
+        """Retry failed deliveries from durable attempt state."""
+
+        now = timestamp(now, field="delivery timestamp")
+        if maximum_attempts <= 0:
+            raise ValueError("maximum_attempts must be positive")
+        delivered: list[str] = []
+        failed: list[str] = []
+        with self.engine.connect() as connection:
+            attempts = (
+                connection.execute(
+                    select(alert_delivery_attempt).order_by(
+                        alert_delivery_attempt.c.attempt_no,
+                        alert_delivery_attempt.c.id,
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        latest: dict[tuple[str, str], Mapping[str, Any]] = {}
+        for row in attempts:
+            key = (str(row["alert_id"]), str(row["sink"]))
+            latest[key] = row
+        rows = tuple(
+            row
+            for row in latest.values()
+            if (
+                row["status"] == "failed"
+                and row["next_attempt_at"] is not None
+                and str(row["next_attempt_at"]) <= now
+                and int(row["attempt_no"]) < maximum_attempts
+            )
+            or (row["status"] == "running" and str(row["attempted_at"]) <= _plus_seconds(now, -60))
+        )
+        for row in rows:
+            attempt_no = int(row["attempt_no"])
+            source = self._get(str(row["alert_id"]))
+            if source is None:
+                failed.append(str(row["alert_id"]))
+                continue
+            if row["status"] == "running":
+                if attempt_no >= maximum_attempts:
+                    self._finish_delivery_attempt(
+                        source,
+                        str(row["sink"]),
+                        attempt_no=attempt_no,
+                        status="dead_letter",
+                        attempted_at=now,
+                        error=RuntimeError("alert delivery attempt lease expired"),
+                    )
+                    failed.append(str(row["alert_id"]))
+                    continue
+                self._finish_delivery_attempt(
+                    source,
+                    str(row["sink"]),
+                    attempt_no=attempt_no,
+                    status="failed",
+                    attempted_at=now,
+                    error=RuntimeError("alert delivery attempt lease expired"),
+                )
+            sink = next((item for item in self.sinks if _sink_name(item) == row["sink"]), None)
+            if sink is None:
+                failed.append(str(row["alert_id"]))
+                continue
+            attempt_no = self._start_delivery_attempt(source, str(row["sink"]), now)
+            try:
+                sink.send(source)
+            except Exception as exc:
+                failed.append(str(row["alert_id"]))
+                self._finish_delivery_attempt(
+                    source,
+                    str(row["sink"]),
+                    attempt_no=attempt_no,
+                    status=("dead_letter" if attempt_no >= maximum_attempts else "failed"),
+                    attempted_at=now,
+                    error=exc,
+                )
+            else:
+                delivered.append(str(row["alert_id"]))
+                self._finish_delivery_attempt(
+                    source,
+                    str(row["sink"]),
+                    attempt_no=attempt_no,
+                    status="delivered",
+                    attempted_at=now,
+                )
+        return AlertDelivery("delivery-retry", tuple(delivered), tuple(failed))
+
+    def delivery_attempts(self, *, alert_id: str | None = None) -> tuple[dict[str, Any], ...]:
+        with self.engine.connect() as connection:
+            statement = select(alert_delivery_attempt).order_by(
+                alert_delivery_attempt.c.attempted_at,
+                alert_delivery_attempt.c.id,
+            )
+            if alert_id is not None:
+                statement = statement.where(alert_delivery_attempt.c.alert_id == alert_id)
+            return tuple(dict(row) for row in connection.execute(statement).mappings())
 
     def events(self, *, dedupe_key: str | None = None) -> tuple[AlertRecord, ...]:
         with self.engine.connect() as connection:
@@ -321,6 +444,68 @@ class SqlAlertService:
         )
         self._append(failure)
 
+    def _start_delivery_attempt(
+        self, record: AlertRecord, sink_name: str, attempted_at: str
+    ) -> int:
+        with self.engine.begin() as connection:
+            if connection.dialect.name == "postgresql":
+                connection.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:delivery_key))"),
+                    {"delivery_key": f"alert-delivery:{record.alert_id}:{sink_name}"},
+                )
+            current = connection.execute(
+                select(func.max(alert_delivery_attempt.c.attempt_no)).where(
+                    alert_delivery_attempt.c.alert_id == record.alert_id,
+                    alert_delivery_attempt.c.sink == sink_name,
+                )
+            ).scalar_one()
+            attempt_no = int(current or 0) + 1
+            attempt_id = f"{record.alert_id}:{sink_name}:{attempt_no}"
+            connection.execute(
+                insert(alert_delivery_attempt).values(
+                    id=attempt_id,
+                    alert_id=record.alert_id,
+                    sink=sink_name,
+                    attempt_no=attempt_no,
+                    attempted_at=attempted_at,
+                    status="running",
+                    error=None,
+                    next_attempt_at=None,
+                    acknowledged_at=None,
+                    payload={"alert_id": record.alert_id, "sink": sink_name},
+                )
+            )
+        return attempt_no
+
+    def _finish_delivery_attempt(
+        self,
+        record: AlertRecord,
+        sink_name: str,
+        *,
+        attempt_no: int,
+        status: str,
+        attempted_at: str,
+        error: Exception | None = None,
+    ) -> None:
+        next_attempt = None
+        if status == "failed":
+            next_attempt = _plus_seconds(attempted_at, min(3_600, 60 * (2 ** (attempt_no - 1))))
+        with self.engine.begin() as connection:
+            connection.execute(
+                update(alert_delivery_attempt)
+                .where(
+                    alert_delivery_attempt.c.alert_id == record.alert_id,
+                    alert_delivery_attempt.c.sink == sink_name,
+                    alert_delivery_attempt.c.attempt_no == attempt_no,
+                )
+                .values(
+                    status=status,
+                    error=f"{type(error).__name__}: {error}" if error else None,
+                    next_attempt_at=next_attempt,
+                    acknowledged_at=attempted_at if status == "delivered" else None,
+                )
+            )
+
 
 def configured_alert_service(
     engine: Engine,
@@ -380,6 +565,13 @@ def _record_from_payload(payload: Mapping[str, Any]) -> AlertRecord:
     )
 
 
+def _assert_human_acknowledger(value: str) -> None:
+    token = value.strip().casefold().replace("_", "-").replace(" ", "-")
+    automation = {"agent", "automation", "bot", "ci", "cron", "scheduler", "service", "system"}
+    if token in automation or token.endswith("-bot") or token.endswith("[bot]"):
+        raise ValueError("alert acknowledgements require a human operator")
+
+
 def _cooldown_seconds(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError("cooldown_seconds must be a non-negative integer")
@@ -393,6 +585,11 @@ def _within_cooldown(previous: str, current: str, seconds: int) -> bool:
     current_at = dt.datetime.fromisoformat(timestamp(current, field="current alert"))
     elapsed = (current_at - previous_at).total_seconds()
     return 0 <= elapsed < seconds
+
+
+def _plus_seconds(value: str, seconds: int) -> str:
+    parsed = dt.datetime.fromisoformat(timestamp(value, field="delivery time"))
+    return (parsed + dt.timedelta(seconds=seconds)).replace(microsecond=0).isoformat()
 
 
 def _sink_name(sink: AlertSink) -> str:

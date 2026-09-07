@@ -1425,7 +1425,8 @@ def test_short_forecast_is_ranked_and_allocated_after_funding() -> None:
 
     assert len(targets) == 1
     assert targets[0].target_fraction < 0
-    assert targets[0].metadata["net_expected_return"] == pytest.approx(0.11)
+    assert targets[0].metadata["net_expected_return"] == pytest.approx(0.1)
+    assert targets[0].metadata["funding_event_count"] == 0
 
 
 def test_position_return_ledger_accumulates_signed_costs_once() -> None:
@@ -2031,5 +2032,5 @@ def test_dataset_row_budget_preserves_each_instrument_and_history_endpoints() ->
         timestamps = [
             str(row["close_timestamp"]) for row in sampled if row["instrument_id"] == instrument_id
         ]
-        assert timestamps[0] == "2026-08-20T00:00:00+00:00"
+        assert timestamps[0] == "2026-08-26T00:00:00+00:00"
         assert timestamps[-1] == "2026-08-29T00:00:00+00:00"

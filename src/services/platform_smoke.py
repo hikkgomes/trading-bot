@@ -652,7 +652,7 @@ def _seed_strategy(
         product_id=product_id,
         portfolio_id=str(product["portfolio_id"]),
         account_id=str(product["account_id"]),
-        promotion_policy_id=str(product["promotion_policy_id"]),
+        promotion_policy_id=str(product.get("promotion_policy_id") or "active-income-v2"),
         engine_version="strategy-evaluator/v1",
     )
     SqlStrategyArtefactRepository(database.engine).put(

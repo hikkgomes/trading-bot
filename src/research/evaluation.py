@@ -1211,9 +1211,11 @@ _FATAL_EVIDENCE_FIELDS: dict[str, frozenset[str]] = {
             "realistic_costs",
             "family_evidence",
             "cost_adjusted_return",
+            "objective_excess_fraction",
             "fees",
             "slippage",
             "funding",
+            "regime_breakdown",
             "sample_evidence",
             "universe_evidence",
         }
@@ -1224,8 +1226,10 @@ _FATAL_EVIDENCE_FIELDS: dict[str, frozenset[str]] = {
             "semantic_parity",
             "realistic_costs",
             "family_evidence",
+            "objective_excess_fraction",
             "purged",
             "embargo",
+            "walk_forward",
             "drawdown_stability",
             "negative_control_results",
         }
@@ -1242,6 +1246,7 @@ _FATAL_EVIDENCE_FIELDS: dict[str, frozenset[str]] = {
             "exact_engine_hash",
             "exact_cost_model",
             "drift_checks",
+            "objective_excess_fraction",
         }
     ),
     "protected": frozenset(
@@ -1252,6 +1257,7 @@ _FATAL_EVIDENCE_FIELDS: dict[str, frozenset[str]] = {
             "realistic_costs",
             "family_evidence",
             "cost_adjusted_return",
+            "objective_excess_fraction",
             "sample_evidence",
             "drawdown_stability",
         }

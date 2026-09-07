@@ -9,7 +9,9 @@ import hmac
 import json
 import math
 import os
-from collections.abc import Mapping
+import subprocess
+import time
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -18,19 +20,26 @@ from sqlalchemy import func, inspect, select
 from src.data.database import (
     PlatformDatabase,
     account_snapshot,
+    active_strategy_assignment,
+    alert_delivery_attempt,
     cost_model_manifest,
     dataset_bundle,
     dataset_snapshot,
     experiment,
     feature_manifest,
+    historical_bootstrap_progress,
+    job,
+    job_quarantine,
     platform_rehearsal_report,
     platform_schedule,
     production_preflight,
+    promotion_event,
     service_heartbeat,
     strategy_approval,
     strategy_artefact,
     strategy_definition,
     strategy_version,
+    universe_member,
     universe_snapshot,
     validation_stage,
 )
@@ -42,7 +51,11 @@ from src.execution.config import ACCOUNT_FINGERPRINT_PREFIX
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.research.datasets import dataset_payload_is_non_promotable
 from src.risk.engine import SqlRiskSnapshotStore
-from src.services.config import load_platform_config, load_split_configuration
+from src.services.config import (
+    PLATFORM_PROCESS_SERVICES,
+    load_platform_config,
+    load_split_configuration,
+)
 from src.services.live_execution import (
     _exchange_config,
     execution_engine_identity,
@@ -608,6 +621,49 @@ def _live_rehearsal_checks(
         .first()
     )
     report_payload = report["payload"] if report else None
+    rehearsal_assignment = assignment
+    if (
+        isinstance(report_payload, Mapping)
+        and report_payload.get("assignment_id") != assignment["id"]
+        and assignment.get("lifecycle_state") == "live"
+    ):
+        assignment_payload = assignment.get("payload")
+        canary_evidence_id = (
+            assignment_payload.get("canary_evidence_id")
+            if isinstance(assignment_payload, Mapping)
+            else None
+        )
+        if canary_evidence_id:
+            canary_report = (
+                connection.execute(
+                    select(platform_rehearsal_report).where(
+                        platform_rehearsal_report.c.id == str(canary_evidence_id)
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if canary_report is not None:
+                report = canary_report
+                report_payload = report["payload"]
+                canary_assignment_id = (
+                    report_payload.get("assignment_id")
+                    if isinstance(report_payload, Mapping)
+                    else None
+                )
+                canary_assignment = (
+                    connection.execute(
+                        select(active_strategy_assignment).where(
+                            active_strategy_assignment.c.id == str(canary_assignment_id)
+                        )
+                    )
+                    .mappings()
+                    .first()
+                    if canary_assignment_id
+                    else None
+                )
+                if canary_assignment is not None:
+                    rehearsal_assignment = dict(canary_assignment)
     report_age = _record_age(now, str(report["created_at"])) if report else None
     integrity = _rehearsal_report_integrity(
         report=report,
@@ -615,7 +671,7 @@ def _live_rehearsal_checks(
         product=product,
         product_id=product_id,
         account_id=account_id,
-        assignment=assignment,
+        assignment=rehearsal_assignment,
         now=now,
         engine_identity=engine_identity,
         report_age=report_age,
@@ -648,6 +704,10 @@ def _rehearsal_report_integrity(
     declared_hash = unsigned.pop("report_hash", None)
     signature = unsigned.pop("signature", None)
     signature_valid = _rehearsal_signature_valid(declared_hash, signature)
+    protective_stop_applicable = payload.get(
+        "protective_stop_applicable", product_id == "active_income"
+    )
+    stop_lifecycle = _rehearsal_stop_lifecycle(payload, applicable=protective_stop_applicable)
     return bool(
         report["accepted"]
         and report["content_hash"] == declared_hash == canonical_hash(unsigned)
@@ -676,7 +736,25 @@ def _rehearsal_report_integrity(
         )
         and isinstance(payload.get("recovery_identifiers"), Mapping)
         and payload.get("recovery_lookup") is True
+        and stop_lifecycle
+        and payload.get("emergency_reduction_tested") is True
         and _valid_account_fingerprint(payload.get("account_fingerprint"))
+    )
+
+
+def _rehearsal_stop_lifecycle(payload: Mapping[str, Any], *, applicable: Any) -> bool:
+    if applicable is not True:
+        return payload.get("protective_stop_not_applicable") is True
+    return all(
+        payload.get(field) is True
+        for field in (
+            "native_stop_created",
+            "native_stop_readback_matched",
+            "algo_update_processed",
+            "partial_fill_quantity_handled",
+            "stop_resize_or_replacement_handled",
+            "native_stop_cancelled",
+        )
     )
 
 
@@ -824,15 +902,14 @@ def _database_readiness_checks(
             detail=inventory["progress"],
         )
     )
+    account_readiness = _account_snapshot_readiness(
+        database=database,
+        products=selected_products,
+        live=live,
+        current=current,
+    )
     checks.append(
-        _check(
-            "account_snapshot_authority",
-            inventory["counts"]["account_snapshots"] >= len(split["products"]["products"]),
-            detail={
-                "account_snapshot_rows": inventory["counts"]["account_snapshots"],
-                "required": len(split["products"]["products"]),
-            },
-        )
+        _check("account_snapshot_authority", account_readiness["ok"], detail=account_readiness)
     )
     required_manifests = len(split["products"]["products"])
     checks.append(
@@ -854,6 +931,14 @@ def _database_readiness_checks(
             detail=inventory["heartbeats"],
         )
     )
+    operational = _operational_readiness(
+        database=database,
+        config=config,
+        required_products=required_products,
+        products=products,
+        current=current,
+    )
+    checks.extend(_check(name, detail["ok"], detail=detail) for name, detail in operational.items())
     if live:
         checks.append(_live_readiness_check(database, split, selected_products, current))
     return checks
@@ -877,6 +962,10 @@ def _readiness_inventory(
             ("experiments", experiment),
             ("schedules", platform_schedule),
             ("account_snapshots", account_snapshot),
+            ("historical_bootstrap_progress", historical_bootstrap_progress),
+            ("alert_delivery_attempts", alert_delivery_attempt),
+            ("quarantined_jobs", job_quarantine),
+            ("jobs", job),
         )
         counts = {
             name: int(connection.execute(select(func.count()).select_from(table)).scalar_one())
@@ -949,6 +1038,593 @@ def _readiness_inventory(
             heartbeat_rows, current=current, maximum_age=maximum_heartbeat_age
         ),
     }
+
+
+def _operational_readiness(
+    *,
+    database: PlatformDatabase,
+    config: Any,
+    required_products: set[str],
+    products: Mapping[str, Mapping[str, Any]],
+    current: str,
+) -> dict[str, dict[str, Any]]:
+    with database.engine.connect() as connection:
+        jobs = (
+            connection.execute(select(job.c.name, job.c.state, job.c.available_at)).mappings().all()
+        )
+        bootstrap = (
+            connection.execute(
+                select(
+                    historical_bootstrap_progress.c.product_id,
+                    historical_bootstrap_progress.c.market,
+                    historical_bootstrap_progress.c.symbol,
+                    historical_bootstrap_progress.c.timeframe,
+                    historical_bootstrap_progress.c.range_start,
+                    historical_bootstrap_progress.c.range_end,
+                    historical_bootstrap_progress.c.status,
+                    historical_bootstrap_progress.c.updated_at,
+                )
+            )
+            .mappings()
+            .all()
+        )
+        delivery_attempt_rows = (
+            connection.execute(
+                select(
+                    alert_delivery_attempt.c.alert_id,
+                    alert_delivery_attempt.c.sink,
+                    alert_delivery_attempt.c.attempt_no,
+                    alert_delivery_attempt.c.status,
+                    alert_delivery_attempt.c.acknowledged_at,
+                ).order_by(
+                    alert_delivery_attempt.c.attempt_no,
+                    alert_delivery_attempt.c.id,
+                )
+            )
+            .mappings()
+            .all()
+        )
+    latest_delivery: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for row in delivery_attempt_rows:
+        latest_delivery[(str(row["alert_id"]), str(row["sink"]))] = row
+    failed_deliveries = sum(
+        row["status"] in {"failed", "dead_letter"} and row["acknowledged_at"] is None
+        for row in latest_delivery.values()
+    )
+    data_root = Path(config.paths["parquet"])
+    spool = data_root.parent / "runtime" / "events" / "spool"
+    current_epoch = dt.datetime.fromisoformat(current).timestamp()
+    stale_spool = (
+        tuple(
+            str(path)
+            for path in spool.rglob("segment-*.jsonl")
+            if path.is_file() and path.stat().st_mtime < current_epoch - 7 * 86_400
+        )
+        if spool.is_dir()
+        else ()
+    )
+    storage_files = (
+        sum(
+            1
+            for kind in ("raw", "bars", "features", "funding", "metadata")
+            for path in (data_root / kind).rglob("*.parquet")
+            if path.is_file()
+        )
+        if data_root.is_dir()
+        else 0
+    )
+    progress_by_product: dict[str, list[Mapping[str, Any]]] = {}
+    for row in bootstrap:
+        progress_by_product.setdefault(str(row["product_id"]), []).append(row)
+    with database.engine.connect() as connection:
+        expected_symbols_by_product = {
+            product_id: _expected_bootstrap_symbols(
+                connection,
+                product=products.get(product_id, {}),
+                current=current,
+            )
+            for product_id in required_products
+        }
+    completed_products = {
+        product_id
+        for product_id in required_products
+        if _history_progress_complete(
+            progress_by_product.get(product_id, ()),
+            product=products.get(product_id, {}),
+            expected_symbols=expected_symbols_by_product[product_id],
+        )
+    }
+    research_names = {
+        "dataset_snapshot_validate",
+        "register_strategy_catalogue",
+        "generate_hypotheses",
+        "register_candidate",
+        "evaluate_candidate",
+        "bounded_backtest",
+        "event_replay",
+        "register_ml_candidate",
+        "train_ml_experiment",
+        "historical_feature_calculation",
+        "historical_bootstrap",
+    }
+    pending_research = [
+        str(row["name"])
+        for row in jobs
+        if row["state"] in {"pending", "running"} and str(row["name"]) in research_names
+    ]
+    dead_research = [
+        str(row["name"])
+        for row in jobs
+        if row["state"] == "dead_letter" and str(row["name"]) in research_names
+    ]
+    maximum_queue_age = int(config.resource_limits.get("maximum_queue_age_seconds", 86_400))
+    current_datetime = dt.datetime.fromisoformat(current)
+    stale_jobs = []
+    for row in jobs:
+        if row["state"] not in {"pending", "running"}:
+            continue
+        available_at = dt.datetime.fromisoformat(str(row["available_at"]))
+        age_seconds = (current_datetime - available_at).total_seconds()
+        if available_at <= current_datetime and age_seconds > maximum_queue_age:
+            stale_jobs.append(
+                {
+                    "job_id": str(row["id"]),
+                    "name": str(row["name"]),
+                    "state": str(row["state"]),
+                    "age_seconds": age_seconds,
+                }
+            )
+    emergency = [
+        str(row["name"])
+        for row in jobs
+        if row["state"] in {"pending", "running"}
+        and str(row["name"])
+        in {
+            "emergency_flatten",
+            "emergency_reduction",
+            "cancel_entry_orders",
+        }
+    ]
+    configured_topology_ok = all(
+        "@" not in process and all("@" not in service for service in services)
+        for process, services in PLATFORM_PROCESS_SERVICES.items()
+    ) and {"market-gateway", "data-writer", "trading-runtime", "scheduler-operations"}.issubset(
+        PLATFORM_PROCESS_SERVICES
+    )
+    systemd = _systemd_topology()
+    topology_ok = configured_topology_ok and systemd["ok"]
+    storage = _storage_metrics(data_root, spool)
+    metadata_files = (
+        sum(
+            1
+            for path in (data_root / "metadata").rglob("metadata-*.json")
+            if path.is_file() and not path.is_symlink()
+        )
+        if (data_root / "metadata").is_dir()
+        else 0
+    )
+    metadata_products = {
+        product_id
+        for product_id, symbols in expected_symbols_by_product.items()
+        if symbols
+        and all(
+            any(
+                path.is_file() and not path.is_symlink()
+                for path in (data_root / "metadata" / "binance" / market / symbol).glob(
+                    "metadata-*.json"
+                )
+            )
+            for market, symbol in (
+                (
+                    "spot"
+                    if str(products[product_id].get("product_id")) == "btc_accumulation"
+                    else "futures",
+                    symbol,
+                )
+                for symbol in symbols
+            )
+        )
+    }
+    backup_root = Path(config.paths["backups"])
+    parquet_backups = (
+        tuple(
+            path
+            for path in backup_root.glob("*/parquet.tar.gz")
+            if path.is_file() and not path.is_symlink()
+        )
+        if backup_root.is_dir()
+        else ()
+    )
+    newest_parquet_backup_age = (
+        max(0.0, current_epoch - max(path.stat().st_mtime for path in parquet_backups))
+        if parquet_backups
+        else None
+    )
+    compact_backup = newest_parquet_backup_age is not None and newest_parquet_backup_age <= int(
+        config.backup["maximum_age_seconds"]
+    )
+    return {
+        "service_topology": {
+            "ok": topology_ok,
+            "processes": sorted(PLATFORM_PROCESS_SERVICES),
+            "systemd": systemd,
+        },
+        "storage_health": {
+            "ok": not stale_spool and storage["stale_spool_files"] == 0,
+            "active_parquet_files": storage_files,
+            "stale_spool": list(stale_spool),
+            **storage,
+        },
+        "research_queue_health": {
+            "ok": not dead_research,
+            "pending_research_jobs": len(pending_research),
+            "dead_letter_research_jobs": dead_research,
+        },
+        "queue_health": {
+            "ok": not stale_jobs,
+            "maximum_age_seconds": maximum_queue_age,
+            "stale_jobs": stale_jobs,
+        },
+        "historical_bootstrap": {
+            "ok": required_products.issubset(completed_products)
+            and required_products.issubset(metadata_products),
+            "required_products": sorted(required_products),
+            "completed_products": sorted(completed_products),
+            "metadata_files": metadata_files,
+            "metadata_products": sorted(metadata_products),
+        },
+        "compact_backup": {
+            "ok": compact_backup,
+            "backup_root": str(backup_root),
+            "latest_age_seconds": newest_parquet_backup_age,
+            "maximum_age_seconds": int(config.backup["maximum_age_seconds"]),
+        },
+        "alert_delivery": {"ok": failed_deliveries == 0, "failed_attempts": failed_deliveries},
+        "emergency_actions": {"ok": not emergency, "pending_jobs": emergency},
+        "lifecycle_authority": _lifecycle_readiness(
+            database,
+            required_products=required_products,
+            current=current,
+        ),
+    }
+
+
+def _lifecycle_readiness(
+    database: PlatformDatabase,
+    *,
+    required_products: set[str],
+    current: str,
+) -> dict[str, Any]:
+    """Ensure assignments and promotion events expose one lifecycle state."""
+
+    repository = SqlActiveStrategyAssignmentRepository(database.engine)
+    assignments = tuple(
+        row
+        for product_id in sorted(required_products)
+        for row in repository.active_assignments(product_id, at=current)
+    )
+    with database.engine.connect() as connection:
+        events = {
+            str(row["id"]): row["payload"]
+            for row in connection.execute(select(promotion_event)).mappings()
+            if isinstance(row["payload"], Mapping)
+        }
+        assignment_event_ids = {
+            str(payload.get("promotion_event_id"))
+            for row in connection.execute(select(active_strategy_assignment.c.payload)).scalars()
+            if isinstance(payload := row, Mapping) and payload.get("promotion_event_id")
+        }
+    failures: list[dict[str, Any]] = []
+    checked = 0
+    for row in assignments:
+        payload = row.get("payload")
+        if isinstance(payload, Mapping) and payload.get("diagnostic") is True:
+            continue
+        lifecycle = str(row.get("lifecycle_state") or "")
+        if lifecycle not in {"forward_paper", "live_ready", "live_canary", "live"}:
+            continue
+        checked += 1
+        event_id = (
+            str(payload.get("promotion_event_id") or "") if isinstance(payload, Mapping) else ""
+        )
+        event = events.get(event_id)
+        if not event or (
+            str(event.get("strategy_version_id")) != str(row["strategy_version_id"])
+            or str(event.get("next_state")) != lifecycle
+            or event.get("accepted") is not True
+        ):
+            failures.append(
+                {
+                    "assignment_id": str(row["id"]),
+                    "lifecycle_state": lifecycle,
+                    "promotion_event_id": event_id or None,
+                    "reason": "assignment_and_promotion_event_diverged",
+                }
+            )
+    for event_id, event in events.items():
+        if (
+            event.get("accepted") is True
+            and str(event.get("prior_state") or "") != str(event.get("next_state") or "")
+            and str(event.get("next_state") or "")
+            in {"forward_paper", "live_ready", "live_canary", "live"}
+            and str(event.get("product_id") or "") in required_products
+            and event_id not in assignment_event_ids
+        ):
+            failures.append(
+                {
+                    "promotion_event_id": event_id,
+                    "lifecycle_state": str(event.get("next_state")),
+                    "reason": "promotion_event_has_no_assignment",
+                }
+            )
+    return {
+        "ok": not failures,
+        "checked_assignments": checked,
+        "divergences": failures,
+    }
+
+
+def _history_progress_complete(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    product: Mapping[str, Any],
+    expected_symbols: set[str],
+) -> bool:
+    latest_by_range: dict[tuple[str, str, str, str, str], Mapping[str, Any]] = {}
+    for row in rows:
+        identity = (
+            str(row.get("market")),
+            str(row.get("symbol")),
+            str(row.get("timeframe")),
+            str(row.get("range_start")),
+            str(row.get("range_end")),
+        )
+        previous = latest_by_range.get(identity)
+        if previous is None or str(row.get("updated_at")) > str(previous.get("updated_at")):
+            latest_by_range[identity] = row
+    materialised = tuple(latest_by_range.values())
+    if not materialised or any(row.get("status") != "completed" for row in materialised):
+        return False
+    try:
+        minimum_history = dt.timedelta(days=365)
+        if any(
+            dt.datetime.fromisoformat(str(row["range_end"]))
+            - dt.datetime.fromisoformat(str(row["range_start"]))
+            < minimum_history
+            for row in materialised
+        ):
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    bars = {
+        str(row.get("symbol")) for row in materialised if str(row.get("timeframe")) != "funding"
+    }
+    funding = {
+        str(row.get("symbol")) for row in materialised if str(row.get("timeframe")) == "funding"
+    }
+    has_bars = bool(expected_symbols) and expected_symbols.issubset(bars)
+    account_market = str(product.get("market") or "")
+    requires_funding = product.get("product_id") == "active_income" or account_market in {
+        "futures",
+        "usdt_futures",
+    }
+    return has_bars and (not requires_funding or expected_symbols.issubset(funding))
+
+
+def _expected_bootstrap_symbols(
+    connection: Any, *, product: Mapping[str, Any], current: str
+) -> set[str]:
+    product_id = str(product.get("product_id") or "")
+    if product_id == "btc_accumulation":
+        return {"BTCUSDT"}
+    universe_id = str(product.get("universe_id") or "")
+    if not universe_id:
+        return set()
+    snapshot_id = connection.execute(
+        select(universe_snapshot.c.id)
+        .where(
+            universe_snapshot.c.universe_id == universe_id,
+            universe_snapshot.c.observed_at <= current,
+        )
+        .order_by(universe_snapshot.c.observed_at.desc(), universe_snapshot.c.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if snapshot_id is None:
+        return set()
+    return {
+        str(value)
+        for value in connection.execute(
+            select(instrument_table.c.exchange_symbol)
+            .select_from(
+                universe_member.join(
+                    instrument_table,
+                    universe_member.c.instrument_id == instrument_table.c.id,
+                )
+            )
+            .where(
+                universe_member.c.snapshot_id == snapshot_id,
+                universe_member.c.eligible.is_(True),
+            )
+        ).scalars()
+        if str(value).strip()
+    }
+
+
+def _account_snapshot_readiness(
+    *,
+    database: PlatformDatabase,
+    products: list[Mapping[str, Any]],
+    live: bool,
+    current: str,
+) -> dict[str, Any]:
+    details: dict[str, Any] = {}
+    for product in products:
+        product_id = str(product["product_id"])
+        account_id = str(product["account_id"])
+        with database.engine.connect() as connection:
+            row = (
+                connection.execute(
+                    select(account_snapshot)
+                    .where(
+                        account_snapshot.c.account_id == account_id,
+                        account_snapshot.c.observed_at <= current,
+                    )
+                    .order_by(account_snapshot.c.observed_at.desc(), account_snapshot.c.id.desc())
+                    .limit(1)
+                )
+                .mappings()
+                .first()
+            )
+        payload = row["payload"] if row is not None else None
+        expected_source = "authenticated_rest" if live else "paper_ledger"
+        age = _record_age(current, str(row["observed_at"])) if row is not None else None
+        fresh = age is not None and 0 <= age <= float(
+            product.get("account_snapshot_max_age_seconds", 60)
+        )
+        valid = (
+            row is not None
+            and isinstance(payload, Mapping)
+            and payload.get("product_id") == product_id
+            and payload.get("account_state_known") is True
+            and payload.get("account_state_authority") == expected_source
+            and fresh
+        )
+        details[product_id] = {
+            "account_id": account_id,
+            "source": payload.get("account_state_authority")
+            if isinstance(payload, Mapping)
+            else None,
+            "age_seconds": age,
+            "maximum_age_seconds": product.get("account_snapshot_max_age_seconds", 60),
+            "fresh": fresh,
+            "valid": valid,
+        }
+    return {
+        "ok": bool(details) and all(item["valid"] for item in details.values()),
+        "products": details,
+    }
+
+
+def _storage_metrics(data_root: Path, spool: Path) -> dict[str, Any]:
+    feature_spool = spool.parent / "feature-spool"
+    quarantine_roots = tuple(
+        path
+        for path in (data_root / "quarantine", spool.parent.parent / "quarantine" / "storage")
+        if path.is_dir()
+    )
+    kinds = ("raw", "bars", "features", "funding", "metadata")
+    active_files = {
+        kind: sum(
+            1
+            for path in (data_root / kind).rglob(
+                "metadata-*.json" if kind == "metadata" else "*.parquet"
+            )
+            if path.is_file() and not path.is_symlink()
+        )
+        if (data_root / kind).is_dir()
+        else 0
+        for kind in kinds
+    }
+    spool_by_state = {
+        state: sum(
+            1
+            for path in (
+                tuple((spool / state).glob("segment-*.jsonl"))
+                + tuple((feature_spool / state).glob("segment-*.jsonl"))
+            )
+            if path.is_file() and not path.is_symlink()
+        )
+        if (spool / state).is_dir() or (feature_spool / state).is_dir()
+        else 0
+        for state in ("pending", "claimed", "committed", "deleted")
+    }
+    spool_files = [
+        path
+        for state in spool_by_state
+        for path in (
+            tuple((spool / state).glob("segment-*.jsonl"))
+            + tuple((feature_spool / state).glob("segment-*.jsonl"))
+        )
+        if path.is_file() and not path.is_symlink()
+    ]
+    quarantine_files = [
+        path
+        for root in quarantine_roots
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    ]
+    spool_ages = [time.time() - path.stat().st_mtime for path in spool_files]
+    return {
+        "active_files_by_kind": active_files,
+        "active_inode_count": sum(active_files.values()),
+        "active_file_count": sum(active_files.values()),
+        "spool_files_by_state": spool_by_state,
+        "spool_inode_count": len(spool_files),
+        "spool_bytes": sum(path.stat().st_size for path in spool_files),
+        "spool_oldest_age_seconds": max(spool_ages, default=0.0),
+        "stale_spool_files": sum(
+            path.stat().st_mtime < dt.datetime.now(dt.UTC).timestamp() - 7 * 86_400
+            for path in spool_files
+        ),
+        "quarantine_file_count": len(quarantine_files),
+        "quarantine_bytes": sum(path.stat().st_size for path in quarantine_files),
+    }
+
+
+def _systemd_topology() -> dict[str, Any]:
+    if os.name != "posix" or not Path("/run/systemd/system").exists():
+        return {"ok": True, "available": False, "reason": "systemd_not_active"}
+    legacy_patterns = (
+        "trading-platform@*.service",
+        "trading-platform-research@*.service",
+        "trading-bot-*.service",
+        "trading-bot-*.timer",
+    )
+    unit_directories = (Path("/etc/systemd/system"), Path("/run/systemd/system"))
+    installed = tuple(
+        sorted(
+            str(path)
+            for directory in unit_directories
+            for pattern in legacy_patterns
+            for path in directory.glob(pattern)
+            if path.is_file() and not path.is_symlink()
+        )
+    )
+    try:
+        result = subprocess.run(
+            ["systemctl", "list-units", "--all", "--no-legend", "--plain"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {
+            "ok": not installed,
+            "available": False,
+            "installed_legacy_units": list(installed),
+            "active_legacy_units": [],
+        }
+    active = tuple(
+        sorted(
+            line.split()[0]
+            for line in result.stdout.splitlines()
+            if line.split()
+            and any(_unit_matches(line.split()[0], pattern) for pattern in legacy_patterns)
+        )
+    )
+    return {
+        "ok": not installed and not active,
+        "available": result.returncode == 0,
+        "installed_legacy_units": list(installed),
+        "active_legacy_units": list(active),
+    }
+
+
+def _unit_matches(unit: str, pattern: str) -> bool:
+    import fnmatch
+
+    return fnmatch.fnmatchcase(unit, pattern)
 
 
 def _ready_dataset_roles(

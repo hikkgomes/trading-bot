@@ -5,8 +5,9 @@ from __future__ import annotations
 import math
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from sqlalchemy import insert, select
 from sqlalchemy.engine import Engine
@@ -45,12 +46,35 @@ class CampaignSpec:
     expected_direction: str
     expected_horizon: str
     evidence_type: str
+    enabled_by_default: bool = True
     failure_regimes: tuple[str, ...] = (
         "structural break",
         "insufficient liquidity",
         "capacity breach",
     )
     cumulative_trial_budget: int = 12
+
+    @property
+    def source_type(self) -> StrategySourceType:
+        return {
+            "cross_sectional": StrategySourceType.CROSS_SECTIONAL,
+            "relative_value": StrategySourceType.RELATIVE_VALUE,
+            "microstructure": StrategySourceType.MICROSTRUCTURE,
+            "meta_strategy": StrategySourceType.ENSEMBLE,
+        }.get(self.family, StrategySourceType.GENERATED_DSL)
+
+    @property
+    def semantic_strategy(self) -> str | None:
+        return {
+            "cross_sectional_carry": "funding_adjusted_ranking",
+            "cross_sectional_momentum": "relative_momentum",
+            "funding_carry": "funding_adjusted_ranking",
+            "basis_convergence": "beta_neutral_spreads",
+            "pairs_mean_reversion": "beta_neutral_spreads",
+            "liquidation_flow_reversion": "bid_ask_depth_imbalance",
+            "event_microstructure": "microprice_displacement",
+            "ensemble_regime": "correlation_aware_ensemble",
+        }.get(self.name)
 
     def __post_init__(self) -> None:
         for name in (
@@ -89,6 +113,8 @@ def _campaign(
     direction: str,
     horizon: str,
     evidence_type: str,
+    *,
+    enabled_by_default: bool = True,
 ) -> CampaignSpec:
     return CampaignSpec(
         name=name,
@@ -103,6 +129,7 @@ def _campaign(
         expected_direction=direction,
         expected_horizon=horizon,
         evidence_type=evidence_type,
+        enabled_by_default=enabled_by_default,
     )
 
 
@@ -116,7 +143,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         ("returns", "trend", "breakout", "realised_volatility"),
         "trend",
         "gt",
-        (-0.25, 0.0, 0.25),
+        (0.0005, 0.001, 0.002),
         "long",
         "1h to 7d",
         "btc_allocation",
@@ -144,7 +171,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         ("returns", "trend", "breakout", "realised_volatility"),
         "trend",
         "gt",
-        (-0.25, 0.0, 0.25),
+        (0.0005, 0.001, 0.002),
         "signed",
         "15m to 3d",
         "swing",
@@ -172,7 +199,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         ("point_in_time_rank", "relative_return", "funding_rank"),
         "funding_rank",
         "gt",
-        (-0.5, 0.0, 0.5),
+        (0.0001, 0.0005, 0.001),
         "market_neutral",
         "4h to 7d",
         "cross_sectional",
@@ -186,7 +213,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         ("causal_spread", "hedge_ratio", "basis", "funding_differential"),
         "basis",
         "lt",
-        (-2.0, -1.0, -0.5),
+        (-0.005, -0.002, -0.001),
         "hedged",
         "1h to 30d",
         "pairs",
@@ -204,6 +231,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         "signed",
         "event-time to 5m",
         "scalping",
+        enabled_by_default=False,
     ),
     _campaign(
         "btc_risk_off_reentry",
@@ -214,7 +242,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         ("returns", "trend", "breakout", "realised_volatility"),
         "realised_volatility",
         "gt",
-        (0.5, 1.0, 1.5),
+        (0.005, 0.01, 0.02),
         "long",
         "1h to 7d",
         "btc_allocation",
@@ -228,7 +256,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         ("returns", "trend", "breakout", "realised_volatility"),
         "breakout",
         "gt",
-        (0.25, 0.5, 1.0),
+        (0.002, 0.005, 0.01),
         "signed",
         "15m to 3d",
         "swing",
@@ -242,7 +270,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         ("point_in_time_rank", "relative_return", "funding_rank"),
         "relative_return",
         "gt",
-        (0.25, 0.5, 1.0),
+        (0.002, 0.005, 0.01),
         "market_neutral",
         "4h to 7d",
         "cross_sectional",
@@ -256,7 +284,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         ("point_in_time_rank", "relative_return", "funding_rank"),
         "funding_rank",
         "gt",
-        (0.25, 0.5, 1.0),
+        (0.0001, 0.0005, 0.001),
         "market_neutral",
         "4h to 7d",
         "funding_carry",
@@ -270,7 +298,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         ("causal_spread", "hedge_ratio", "basis", "funding_differential"),
         "causal_spread",
         "lt",
-        (-2.0, -1.0, -0.5),
+        (-0.005, -0.002, -0.001),
         "hedged",
         "1h to 30d",
         "pairs",
@@ -284,10 +312,11 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         ("spread", "depth_imbalance", "microprice", "aggressor_flow", "liquidation_flow"),
         "aggressor_flow",
         "gt",
-        (0.5, 1.0, 2.0),
+        (0.1, 0.2, 0.4),
         "signed",
         "event-time to 5m",
         "scalping",
+        enabled_by_default=False,
     ),
     _campaign(
         "ensemble_regime",
@@ -295,13 +324,14 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         "meta_strategy",
         MechanismCategory.RISK_PREMIUM,
         ("as_of_alpha_forecasts",),
-        ("forecast_conflict", "forecast_decay", "correlation", "regime"),
-        "regime",
+        ("correlation",),
+        "correlation",
         "gt",
-        (0.25, 0.5, 1.0),
+        (0.25, 0.5, 0.75),
         "signed",
         "15m to 3d",
         "intraday",
+        enabled_by_default=False,
     ),
 )
 
@@ -510,8 +540,42 @@ def semantic_distance(
     keys = tuple(sorted(set(left_payload) | set(right_payload)))
     if not keys:
         return 0.0
-    equal = sum(left_payload.get(key) == right_payload.get(key) for key in keys)
-    return 1.0 - (equal / len(keys))
+    return sum(
+        _value_distance(left_payload.get(key), right_payload.get(key)) for key in keys
+    ) / len(keys)
+
+
+def _value_distance(left: Any, right: Any) -> float:
+    if left == right:
+        return 0.0
+    if (
+        isinstance(left, int | float)
+        and not isinstance(left, bool)
+        and isinstance(right, int | float)
+        and not isinstance(right, bool)
+    ):
+        difference = abs(float(left) - float(right))
+        return min(1.0, difference / (1.0 + max(abs(float(left)), abs(float(right)))))
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        keys = tuple(sorted(set(left) | set(right)))
+        return sum(_value_distance(left.get(key), right.get(key)) for key in keys) / max(
+            1, len(keys)
+        )
+    if isinstance(left, list | tuple) and isinstance(right, list | tuple):
+        if not left and not right:
+            return 0.0
+        length = max(len(left), len(right))
+        return (
+            sum(
+                _value_distance(
+                    left[index] if index < len(left) else None,
+                    right[index] if index < len(right) else None,
+                )
+                for index in range(length)
+            )
+            / length
+        )
+    return 1.0
 
 
 class HypothesisMemory(Protocol):
@@ -592,8 +656,12 @@ class HypothesisGenerator:
         parent_thesis_ids: tuple[str, ...] = (),
         parent_candidates: Sequence[Candidate] = (),
     ) -> tuple[GeneratedHypothesis, ...]:
+        available_campaigns = CAMPAIGNS if campaigns is None else campaigns
         selected = tuple(
-            campaign for campaign in (campaigns or CAMPAIGNS) if campaign.product == self.product
+            campaign
+            for campaign in available_campaigns
+            if campaign.product == self.product
+            and (campaigns is not None or campaign.enabled_by_default)
         )
         allocations = self.allocator.allocate(
             selected,
@@ -606,16 +674,25 @@ class HypothesisGenerator:
             campaign = by_name[allocation.campaign]
             variants = min(allocation.trials, len(campaign.thresholds))
             for variant in range(variants):
-                hypothesis = build_hypothesis(
-                    campaign,
-                    variant=variant,
-                    instrument_universe=self.instrument_universe,
-                    dataset_snapshot_hashes=dataset_snapshot_hashes,
-                    submitted_at=submitted_at,
-                    dataset_bundle_id=dataset_bundle_id,
-                    universe_snapshot_id=universe_snapshot_id,
-                    parent_thesis_ids=parent_thesis_ids,
-                )
+                try:
+                    hypothesis = build_hypothesis(
+                        campaign,
+                        variant=variant,
+                        instrument_universe=self.instrument_universe,
+                        dataset_snapshot_hashes=dataset_snapshot_hashes,
+                        submitted_at=submitted_at,
+                        dataset_bundle_id=dataset_bundle_id,
+                        universe_snapshot_id=universe_snapshot_id,
+                        parent_thesis_ids=parent_thesis_ids,
+                    )
+                except GenerationError as exc:
+                    self._record_generation_failure(
+                        campaign,
+                        variant=variant,
+                        observed_at=submitted_at,
+                        reason_code=str(exc),
+                    )
+                    continue
                 match = self.memory.find(hypothesis.candidate) if self.memory is not None else None
                 if match is not None:
                     derived = _derive_duplicate_hypothesis(
@@ -670,6 +747,26 @@ class HypothesisGenerator:
                 candidate_id=candidate_id,
                 semantic_signature=hypothesis.semantic_signature,
                 distance=distance,
+            )
+        )
+
+    def _record_generation_failure(
+        self,
+        campaign: CampaignSpec,
+        *,
+        variant: int,
+        observed_at: str,
+        reason_code: str,
+    ) -> None:
+        if self.feedback_store is None:
+            return
+        self.feedback_store.append(
+            GenerationFeedback(
+                campaign=campaign.name,
+                outcome="retired",
+                observed_at=observed_at,
+                reason_code=reason_code,
+                semantic_signature=canonical_hash({"campaign": campaign.name, "variant": variant}),
             )
         )
 
@@ -735,7 +832,7 @@ def _derive_duplicate_hypothesis(
         for candidate in parent_candidates
         if candidate.definition.product == base.campaign.product
         and candidate.definition.family == base.campaign.family
-        and isinstance(candidate.definition.signal_model.get("rule"), Mapping)
+        and isinstance(candidate.definition.signal_model, Mapping)
     )
     if not parents:
         return None
@@ -763,45 +860,27 @@ def _derive_hypothesis(
 ) -> GeneratedHypothesis:
     if method not in {"mutation", "crossover"} or not parents:
         raise GenerationError("unsupported derived hypothesis method")
-    rules = [
-        dict(candidate.definition.signal_model["rule"])
-        for candidate in parents
-        if isinstance(candidate.definition.signal_model.get("rule"), Mapping)
-    ]
-    if len(rules) != len(parents):
-        raise GenerationError("derived hypotheses need executable parent rules")
-    if method == "mutation":
-        rule = dict(rules[0])
-        threshold = float(rule.get("threshold", base.campaign.thresholds[0]))
-        step = max(abs(threshold) * 0.1, 0.1)
-        rule["threshold"] = threshold + step
-    else:
-        rule = {
-            "feature": base.campaign.feature,
-            "operator": base.campaign.operator,
-            "threshold": sum(float(item.get("threshold", 0.0)) for item in rules) / len(rules),
-            "direction": (
-                rules[0].get("direction")
-                if all(item.get("direction") == rules[0].get("direction") for item in rules)
-                else "signed"
-            ),
-        }
-    source_payload = {
-        "kind": "typed_rule",
-        "method": method,
-        "rule": rule,
-        "parameters": {"threshold": float(rule["threshold"])},
-        "parameter_free": False,
-        "parents": [candidate.candidate_id for candidate in parents],
-        "generator_schema": "bounded_hypothesis/v1",
-    }
+    parent_models = [candidate.definition.signal_model for candidate in parents]
+    if not all(isinstance(model, Mapping) for model in parent_models):
+        raise GenerationError("derived hypotheses need executable parent models")
+    source_payload = _derived_source_payload(
+        base.campaign,
+        parent_models,
+        parents=parents,
+        method=method,
+    )
     identity = f"{method}:{base.campaign.name}:{canonical_hash(source_payload).removeprefix('sha256:')[:16]}"
     definition = replace(
         base.candidate.definition,
         identity=identity,
         version=f"{method}-v1",
         signal_model=source_payload,
-        source_type=StrategySourceType.GENERATED_DSL,
+        position_model=_derived_position_model(
+            base.candidate.definition.position_model,
+            base.campaign,
+            method=method,
+        ),
+        source_type=base.campaign.source_type,
         source_hash=canonical_hash(source_payload),
         metadata={
             **dict(base.candidate.definition.metadata),
@@ -837,6 +916,330 @@ def _derive_hypothesis(
     )
 
 
+def _derived_source_payload(
+    campaign: CampaignSpec,
+    parent_models: Sequence[Mapping[str, Any]],
+    *,
+    parents: Sequence[Candidate],
+    method: str,
+) -> dict[str, Any]:
+    """Mutate the economic contract, not only a display threshold."""
+
+    first = deepcopy(dict(parent_models[0]))
+    if campaign.source_type is StrategySourceType.GENERATED_DSL:
+        return _derived_dsl_source_payload(
+            campaign, first, parent_models, parents=parents, method=method
+        )
+    contract = dict(first)
+    contract["method"] = method
+    contract["parents"] = [candidate.candidate_id for candidate in parents]
+    contract["mutation_contract"] = {
+        "mechanism": campaign.mechanism.value,
+        "feature_space": list(campaign.permitted_features),
+        "horizon": campaign.expected_horizon,
+        "position_model": _campaign_position_model(campaign),
+    }
+    contract["parameters"] = _mutate_contract_parameters(
+        campaign,
+        parent_models,
+        method=method,
+    )
+    if campaign.source_type is StrategySourceType.CROSS_SECTIONAL:
+        panel = dict(contract.get("panel_contract") or {})
+        panel["long_count"] = contract["parameters"]["top_k"]
+        panel["short_count"] = contract["parameters"]["top_k"]
+        panel["minimum_score"] = abs(float(contract["parameters"].get("threshold", 0.0)))
+        contract["panel_contract"] = panel
+    elif campaign.source_type is StrategySourceType.RELATIVE_VALUE:
+        hedge_ratio = float(contract["parameters"]["hedge_ratio"])
+        contract["hedge_ratio"] = hedge_ratio
+        legs = list(contract.get("paired_legs") or ())
+        if len(legs) >= 2 and isinstance(legs[1], Mapping):
+            legs[1] = {**dict(legs[1]), "weight": -hedge_ratio}
+        contract["paired_legs"] = legs
+    elif campaign.source_type is StrategySourceType.MICROSTRUCTURE:
+        event_contract = dict(contract.get("event_contract") or {})
+        event_contract["minimum_score"] = contract["parameters"]["minimum_score"]
+        contract["event_contract"] = event_contract
+    contract["generator_schema"] = "economic_contract/v1"
+    return contract
+
+
+def _derived_dsl_source_payload(
+    campaign: CampaignSpec,
+    first: Mapping[str, Any],
+    parent_models: Sequence[Mapping[str, Any]],
+    *,
+    parents: Sequence[Candidate],
+    method: str,
+) -> dict[str, Any]:
+    base_rule = first.get("rule")
+    if not isinstance(base_rule, Mapping):
+        raise GenerationError("directional derived strategy has no typed rule")
+    rule = dict(base_rule)
+    if method == "mutation":
+        _mutate_rule(rule, campaign)
+    else:
+        sibling = parent_models[1].get("rule") if len(parent_models) > 1 else None
+        if not isinstance(sibling, Mapping):
+            raise GenerationError("directional crossover has no second typed rule")
+        rule = _crossover_rule(rule, sibling, campaign)
+    parent_ids = [candidate.candidate_id for candidate in parents]
+    if campaign.product != "btc_accumulation":
+        return {
+            "kind": "typed_rule",
+            "method": method,
+            "mechanism": campaign.mechanism.value,
+            "horizon": campaign.expected_horizon,
+            "rule": rule,
+            "entry_contract": {
+                "feature_space": list(campaign.permitted_features),
+                "threshold_unit": _threshold_unit(campaign),
+            },
+            "exit_contract": {
+                "kind": "signal_reversal_or_terminal_close",
+                "horizon": campaign.expected_horizon,
+            },
+            "parameters": _rule_parameters(rule),
+            "parameter_free": False,
+            "parents": parent_ids,
+            "generator_schema": "bounded_hypothesis/v2",
+        }
+    if first.get("kind") != "btc_target_allocation":
+        raise GenerationError("BTC derived strategy lost its allocation contract")
+    parameters = dict(first.get("parameters") or {})
+    for group in ("negative_conditions", "positive_conditions"):
+        conditions = rule.get(group)
+        if isinstance(conditions, list) and conditions:
+            parameters["threshold"] = conditions[0].get("threshold", parameters.get("threshold"))
+            break
+    return {
+        "kind": "btc_target_allocation",
+        "method": method,
+        "mechanism": campaign.mechanism.value,
+        "horizon": campaign.expected_horizon,
+        "rule": rule,
+        "entry_contract": {
+            "feature_space": list(campaign.permitted_features),
+            "threshold_unit": _threshold_unit(campaign),
+        },
+        "exit_contract": {
+            "kind": "state_reversal_or_terminal_close",
+            "horizon": campaign.expected_horizon,
+        },
+        "target_states": dict(first.get("target_states") or {}),
+        "minimum_btc_fraction": float(first.get("minimum_btc_fraction", 0.7)),
+        "maximum_tactical_fraction": float(first.get("maximum_tactical_fraction", 0.3)),
+        "parameters": parameters,
+        "parameter_free": False,
+        "parents": parent_ids,
+        "generator_schema": "btc_allocation_contract/v1",
+    }
+
+
+def _mutate_rule(rule: dict[str, Any], campaign: CampaignSpec) -> None:
+    original_feature = str(rule.get("feature") or campaign.feature)
+    alternate = next(
+        (feature for feature in campaign.permitted_features if feature != original_feature),
+        original_feature,
+    )
+    changed_feature = False
+    for group in (
+        "conditions",
+        "positive_conditions",
+        "negative_conditions",
+        "long_conditions",
+        "short_conditions",
+    ):
+        conditions = rule.get(group)
+        if not isinstance(conditions, list):
+            continue
+        for condition in conditions:
+            if isinstance(condition, dict) and "threshold" in condition:
+                threshold = float(condition["threshold"])
+                condition["threshold"] = threshold + max(abs(threshold) * 0.1, 0.001)
+                if str(condition.get("feature") or "") == original_feature:
+                    condition["feature"] = alternate
+                    condition["threshold"] = _mutated_feature_threshold(
+                        alternate, condition["threshold"]
+                    )
+                    changed_feature = changed_feature or alternate != original_feature
+                break
+        else:
+            continue
+        break
+    else:
+        threshold = float(rule.get("threshold", campaign.thresholds[0]))
+        rule["threshold"] = threshold + max(abs(threshold) * 0.1, 0.001)
+        if str(rule.get("feature") or "") == original_feature:
+            rule["feature"] = alternate
+            rule["threshold"] = _mutated_feature_threshold(alternate, rule["threshold"])
+            changed_feature = changed_feature or alternate != original_feature
+    if len(campaign.permitted_features) < 2:
+        return
+    if "feature" in rule:
+        entry = {
+            "feature": str(rule["feature"]),
+            "operator": str(rule["operator"]),
+            "threshold": float(rule["threshold"]),
+        }
+        direction = str(rule.get("direction") or campaign.expected_direction)
+        if direction in {"signed", "market_neutral", "hedged"}:
+            rule.pop("feature", None)
+            rule.pop("operator", None)
+            rule.pop("threshold", None)
+            rule["positive_conditions"] = [entry]
+            rule["negative_conditions"] = [
+                {
+                    "feature": entry["feature"],
+                    "operator": "lt",
+                    "threshold": -abs(float(cast(Any, entry["threshold"]))),
+                }
+            ]
+        else:
+            rule.pop("feature", None)
+            rule.pop("operator", None)
+            rule.pop("threshold", None)
+            rule["conditions"] = [entry]
+    rule["mutation_feature"] = alternate
+    rule["mutation_changed_feature"] = changed_feature
+    exit_threshold = 1.0 if "z_score" in _threshold_unit(campaign) else 0.0
+    rule["exit_conditions"] = [
+        {
+            "feature": alternate,
+            "operator": "gt",
+            "threshold": exit_threshold,
+        }
+    ]
+
+
+def _crossover_rule(
+    left: Mapping[str, Any], right: Mapping[str, Any], campaign: CampaignSpec
+) -> dict[str, Any]:
+    result = dict(left)
+    for group in (
+        "conditions",
+        "positive_conditions",
+        "negative_conditions",
+        "long_conditions",
+        "short_conditions",
+    ):
+        merged = _crossover_condition_group(left.get(group), right.get(group), campaign)
+        if merged is not None:
+            result[group] = merged
+    for key in ("threshold", "positive_threshold", "negative_threshold"):
+        if key in left and key in right:
+            result[key] = (float(left[key]) + float(right[key])) / 2.0
+    if left.get("feature") != right.get("feature"):
+        result["feature"] = campaign.feature
+    if left.get("direction") != right.get("direction"):
+        result["direction"] = campaign.expected_direction
+    return result
+
+
+def _crossover_condition_group(
+    left: Any, right: Any, campaign: CampaignSpec
+) -> list[dict[str, Any]] | None:
+    if not isinstance(left, list | tuple) or not isinstance(right, list | tuple):
+        return None
+    if len(left) != len(right):
+        return None
+    merged: list[dict[str, Any]] = []
+    for first, second in zip(left, right, strict=True):
+        if not isinstance(first, Mapping) or not isinstance(second, Mapping):
+            return None
+        item = dict(first)
+        item["feature"] = (
+            first.get("feature")
+            if first.get("feature") == second.get("feature")
+            else campaign.feature
+        )
+        item["operator"] = (
+            first.get("operator")
+            if first.get("operator") == second.get("operator")
+            else campaign.operator
+        )
+        if first.get("threshold") is not None and second.get("threshold") is not None:
+            item["threshold"] = (float(first["threshold"]) + float(second["threshold"])) / 2.0
+        merged.append(item)
+    return merged
+
+
+def _rule_parameters(rule: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: rule[key]
+        for key in ("feature", "threshold", "positive_threshold", "negative_threshold")
+        if key in rule
+    }
+
+
+def _mutated_feature_threshold(feature: str, threshold: float) -> float:
+    """Keep a mutation in the units of the feature it actually uses."""
+
+    scales = {
+        "returns": 0.001,
+        "trend": 0.001,
+        "relative_return": 0.001,
+        "breakout": 0.001,
+        "realised_volatility": 0.005,
+        "normalised_price_deviation": 0.5,
+        "oscillator": 0.5,
+        "range_state": 0.001,
+    }
+    minimum = scales.get(feature, 0.001)
+    return math.copysign(max(abs(threshold), minimum), threshold or 1.0)
+
+
+def _derived_position_model(
+    base: Mapping[str, Any], campaign: CampaignSpec, *, method: str
+) -> dict[str, Any]:
+    result = deepcopy(dict(base))
+    result.update(_campaign_position_model(campaign))
+    result["derived_method"] = method
+    return result
+
+
+def _mutate_contract_parameters(
+    campaign: CampaignSpec,
+    parent_models: Sequence[Mapping[str, Any]],
+    *,
+    method: str,
+) -> dict[str, Any]:
+    parameters: list[Mapping[str, Any]] = []
+    for model in parent_models:
+        raw_parameters = model.get("parameters")
+        parameters.append(raw_parameters if isinstance(raw_parameters, Mapping) else {})
+    if campaign.source_type is StrategySourceType.CROSS_SECTIONAL:
+        values = [float(item.get("top_k", 1)) for item in parameters]
+        thresholds = [float(item.get("threshold", 0.0)) for item in parameters]
+        return {
+            "top_k": max(
+                1, int(round(sum(values) / len(values))) + (1 if method == "mutation" else 0)
+            ),
+            "threshold": abs(sum(thresholds) / len(thresholds))
+            + (0.0001 if method == "mutation" else 0.0),
+        }
+    if campaign.source_type is StrategySourceType.RELATIVE_VALUE:
+        values = [float(item.get("hedge_ratio", 1.0)) for item in parameters]
+        ratio = sum(values) / len(values)
+        return {"hedge_ratio": ratio * (1.05 if method == "mutation" else 1.0)}
+    if campaign.source_type is StrategySourceType.MICROSTRUCTURE:
+        values = [
+            abs(float(item.get("minimum_score", item.get("threshold", 0.1)))) for item in parameters
+        ]
+        return {
+            "minimum_score": min(
+                1.0, sum(values) / len(values) + (0.02 if method == "mutation" else 0.0)
+            )
+        }
+    aggregation_values = [str(item.get("aggregation", "correlation_aware")) for item in parameters]
+    return {
+        "aggregation": (
+            aggregation_values[0] if len(set(aggregation_values)) == 1 else "correlation_aware"
+        )
+    }
+
+
 def build_hypothesis(
     campaign: CampaignSpec,
     *,
@@ -859,32 +1262,38 @@ def build_hypothesis(
         parent_thesis_ids=parent_thesis_ids,
     )
     threshold = campaign.thresholds[variant]
-    rule = {
-        "feature": campaign.feature,
-        "operator": campaign.operator,
-        "threshold": float(threshold),
-        "direction": campaign.expected_direction,
-    }
-    source_payload = {
-        "kind": "typed_rule",
-        "campaign": campaign.name,
-        "rule": rule,
-        "parameters": {"threshold": float(threshold)},
-        "parameter_free": False,
-        "generator_schema": "bounded_hypothesis/v1",
-    }
+    source_type = campaign.source_type
+    if (
+        source_type
+        in {
+            StrategySourceType.CROSS_SECTIONAL,
+            StrategySourceType.RELATIVE_VALUE,
+            StrategySourceType.MICROSTRUCTURE,
+            StrategySourceType.ENSEMBLE,
+        }
+        and len(instrument_universe) < 2
+    ):
+        raise GenerationError(
+            f"{campaign.name} requires at least two instruments for its economic contract"
+        )
     market_type = MarketType.SPOT if campaign.product == "btc_accumulation" else MarketType.FUTURES
+    instrument_ids = tuple(
+        canonical_instrument_id(
+            symbol,
+            market_type=market_type,
+            settlement_asset="USDT" if market_type is MarketType.FUTURES else None,
+        )
+        for symbol in instrument_universe
+    )
+    source_payload = _campaign_source_payload(
+        campaign,
+        threshold=float(threshold),
+        instrument_universe=instrument_ids,
+    )
     universe: dict[str, Any] = {
         "type": "fixed",
         "symbols": list(instrument_universe),
-        "instrument_ids": [
-            canonical_instrument_id(
-                symbol,
-                market_type=market_type,
-                settlement_asset="USDT" if market_type is MarketType.FUTURES else None,
-            )
-            for symbol in instrument_universe
-        ],
+        "instrument_ids": list(instrument_ids),
     }
     if universe_snapshot_id is not None:
         universe = {
@@ -905,11 +1314,11 @@ def build_hypothesis(
             "required_nodes": list(campaign.permitted_features),
         },
         signal_model=source_payload,
-        position_model={"kind": "volatility_scaled", "signal_timing": "next_bar"},
+        position_model=_campaign_position_model(campaign),
         execution_preferences={"policy": "market", "paper_only_until_approved": True},
         risk_policy={"product_policy": campaign.product},
         validation_policy={"evidence_type": campaign.evidence_type, "promotable": True},
-        source_type=StrategySourceType.GENERATED_DSL,
+        source_type=source_type,
         source_hash=canonical_hash(source_payload),
         metadata={
             "generated": True,
@@ -940,6 +1349,180 @@ def build_hypothesis(
         dataset_bundle_id=dataset_bundle_id,
     )
     return GeneratedHypothesis(campaign, thesis, candidate, hypothesis_signature(definition))
+
+
+def _campaign_source_payload(
+    campaign: CampaignSpec,
+    *,
+    threshold: float,
+    instrument_universe: tuple[str, ...],
+) -> dict[str, Any]:
+    if campaign.source_type is StrategySourceType.GENERATED_DSL:
+        if campaign.product == "btc_accumulation":
+            risk_off = {
+                "feature": campaign.feature,
+                "operator": campaign.operator,
+                "threshold": threshold,
+            }
+            risk_on = {
+                "feature": campaign.feature,
+                "operator": "le" if campaign.operator in {"gt", "ge"} else "ge",
+                "threshold": threshold,
+            }
+            rule = {
+                "direction": "signed",
+                "positive_conditions": [risk_on],
+                "negative_conditions": [risk_off],
+                "condition_mode": "all",
+            }
+            return {
+                "kind": "btc_target_allocation",
+                "campaign": campaign.name,
+                "mechanism": campaign.mechanism.value,
+                "horizon": campaign.expected_horizon,
+                "rule": rule,
+                "entry_contract": {
+                    "feature": campaign.feature,
+                    "operator": campaign.operator,
+                    "threshold_unit": _threshold_unit(campaign),
+                },
+                "exit_contract": {
+                    "kind": "state_reversal_or_terminal_close",
+                    "horizon": campaign.expected_horizon,
+                },
+                "target_states": {
+                    "risk_on": {"btc_fraction": 1.0, "tactical_fraction": 0.0},
+                    "risk_off": {"btc_fraction": 0.7, "tactical_fraction": 0.3},
+                    "reentry": {"btc_fraction": 1.0, "tactical_fraction": 0.0},
+                },
+                "minimum_btc_fraction": 0.7,
+                "maximum_tactical_fraction": 0.3,
+                "parameters": {
+                    "feature": campaign.feature,
+                    "threshold": threshold,
+                    "threshold_unit": _threshold_unit(campaign),
+                },
+                "parameter_free": False,
+                "generator_schema": "btc_allocation_contract/v1",
+            }
+        directional_rule = {
+            "feature": campaign.feature,
+            "operator": campaign.operator,
+            "threshold": threshold,
+            "direction": campaign.expected_direction,
+        }
+        return {
+            "kind": "signed_directional_forecast",
+            "campaign": campaign.name,
+            "mechanism": campaign.mechanism.value,
+            "horizon": campaign.expected_horizon,
+            "rule": directional_rule,
+            "entry_contract": {
+                "feature": campaign.feature,
+                "operator": campaign.operator,
+                "threshold_unit": _threshold_unit(campaign),
+            },
+            "exit_contract": {
+                "kind": "signal_reversal_or_terminal_close",
+                "horizon": campaign.expected_horizon,
+            },
+            "parameters": {
+                "feature": campaign.feature,
+                "threshold": threshold,
+                "threshold_unit": _threshold_unit(campaign),
+            },
+            "parameter_free": False,
+            "generator_schema": "directional_contract/v1",
+        }
+    contract: dict[str, Any] = {
+        "kind": {
+            StrategySourceType.CROSS_SECTIONAL: "ranked_long_short_panel",
+            StrategySourceType.RELATIVE_VALUE: "paired_legs_hedged",
+            StrategySourceType.MICROSTRUCTURE: "event_time_microstructure",
+            StrategySourceType.ENSEMBLE: "forecast_ensemble",
+        }[campaign.source_type],
+        "campaign": campaign.name,
+        "mechanism": campaign.mechanism.value,
+        "horizon": campaign.expected_horizon,
+        "semantic_strategy": campaign.semantic_strategy,
+        "instrument_scope": list(instrument_universe),
+        "parameters": {"threshold": threshold, "threshold_unit": _threshold_unit(campaign)},
+        "parameter_free": False,
+        "generator_schema": "economic_contract/v1",
+        "execution_contract": {
+            "signal_timing": "next_observation",
+            "terminal_close_required": True,
+            "leg_failure_recovery": "block_new_exposure",
+        },
+    }
+    if campaign.source_type is StrategySourceType.CROSS_SECTIONAL:
+        contract["panel_contract"] = {
+            "rank_feature": campaign.feature,
+            "long_count": 1,
+            "short_count": 1,
+            "minimum_score": abs(threshold),
+            "gross_target_fraction": 1.0,
+            "net_target_fraction": 0.0,
+        }
+    elif campaign.source_type is StrategySourceType.RELATIVE_VALUE:
+        contract["paired_legs"] = [
+            {"instrument_id": instrument_universe[0], "weight": 1.0},
+            {"instrument_id": instrument_universe[1], "weight": -1.0},
+        ]
+        contract["hedge_ratio"] = 1.0
+    elif campaign.source_type is StrategySourceType.MICROSTRUCTURE:
+        contract["parameters"]["minimum_score"] = abs(threshold)
+        contract["event_contract"] = {
+            "requires_sequence": True,
+            "requires_bid_ask": True,
+            "requires_trade_flow": True,
+            "minimum_score": abs(threshold),
+            "maximum_spread_bps": 10.0,
+        }
+    else:
+        contract["forecast_inputs"] = ["directional", "cross_sectional", "relative_value"]
+        contract["aggregation"] = "correlation_aware"
+    return contract
+
+
+def _campaign_position_model(campaign: CampaignSpec) -> dict[str, Any]:
+    if campaign.product == "btc_accumulation":
+        return {
+            "kind": "target_allocation",
+            "base_asset": "BTC",
+            "minimum_btc_fraction": 0.7,
+            "maximum_tactical_fraction": 0.3,
+            "states": ("risk_on", "risk_off", "reentry"),
+            "signal_timing": "next_bar",
+        }
+    if campaign.source_type is StrategySourceType.CROSS_SECTIONAL:
+        return {"kind": "ranked_panel_targets", "net_exposure": 0.0, "gross_exposure": 1.0}
+    if campaign.source_type is StrategySourceType.RELATIVE_VALUE:
+        return {"kind": "paired_hedged_targets", "net_beta": 0.0, "legs": 2}
+    if campaign.source_type is StrategySourceType.MICROSTRUCTURE:
+        return {"kind": "event_time_signed_position", "maximum_holding_seconds": 300}
+    if campaign.source_type is StrategySourceType.ENSEMBLE:
+        return {"kind": "portfolio_forecast_aggregation", "net_exposure": 0.5}
+    return {"kind": "volatility_scaled", "signal_timing": "next_bar"}
+
+
+def _threshold_unit(campaign: CampaignSpec) -> str:
+    return {
+        "breakout": "fraction_of_prior_high",
+        "trend": "fractional_return",
+        "realised_volatility": "fractional_volatility",
+        "normalised_price_deviation": "z_score",
+        "oscillator": "oscillator_unit",
+        "range_state": "fractional_range",
+        "funding_rank": "cross_sectional_rank",
+        "relative_return": "fractional_return",
+        "causal_spread": "standardised_spread",
+        "basis": "fractional_basis",
+        "liquidation_flow": "signed_flow_z_score",
+        "aggressor_flow": "signed_flow_z_score",
+        "regime": "regime_score",
+        "correlation": "correlation_unit",
+    }.get(campaign.feature, "feature_units")
 
 
 def _feedback_from_payload(payload: object) -> GenerationFeedback:

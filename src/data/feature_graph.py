@@ -306,6 +306,60 @@ class FeatureGraphRegistry:
                 {},
                 1,
             ),
+            "returns": (FeatureNodeType.BAR_INDICATOR, (), ("open", "close"), {}, 1),
+            "trend": (FeatureNodeType.BAR_INDICATOR, (), ("open", "close"), {}, 1),
+            "relative_return": (FeatureNodeType.BAR_INDICATOR, (), ("open", "close"), {}, 1),
+            "normalised_price_deviation": (
+                FeatureNodeType.BAR_INDICATOR,
+                ("sma",),
+                ("close_history",),
+                {},
+                20,
+            ),
+            "oscillator": (
+                FeatureNodeType.BAR_INDICATOR,
+                ("sma",),
+                ("close_history",),
+                {},
+                20,
+            ),
+            "point_in_time_rank": (
+                FeatureNodeType.CROSS_SECTIONAL_RANK,
+                (),
+                ("cross_sectional_values",),
+                {},
+                2,
+            ),
+            "funding_rank": (FeatureNodeType.FUNDING_OPEN_INTEREST, (), ("funding_rate",), {}, 1),
+            "spread": (FeatureNodeType.ORDER_BOOK, (), ("bid_price", "ask_price"), {}, 1),
+            "hedge_ratio": (
+                FeatureNodeType.CORRELATION_BETA,
+                (),
+                ("asset_returns", "benchmark_returns"),
+                {},
+                2,
+            ),
+            "causal_spread": (
+                FeatureNodeType.CORRELATION_BETA,
+                (),
+                ("asset_returns", "benchmark_returns"),
+                {},
+                2,
+            ),
+            "basis": (
+                FeatureNodeType.CORRELATION_BETA,
+                (),
+                ("asset_returns", "benchmark_returns"),
+                {},
+                2,
+            ),
+            "funding_differential": (
+                FeatureNodeType.FUNDING_OPEN_INTEREST,
+                (),
+                ("funding_rate",),
+                {},
+                1,
+            ),
         }
         for name, (
             node_type,
@@ -394,206 +448,24 @@ def _validate_node_inputs(node: FeatureNode, inputs: Mapping[str, AvailableValue
 def _evaluate_default_node(
     node: FeatureNode, dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
 ) -> Any:
-    close = float(_raw(inputs, "close", 0.0))
-    open_price = float(_raw(inputs, "open", close))
-    high = float(_raw(inputs, "high", close))
-    low = float(_raw(inputs, "low", close))
-    volume = max(0.0, float(_raw(inputs, "volume", 0.0)))
-    closes = _series(inputs, "close_history") or [close]
-    returns = [
-        closes[index] / closes[index - 1] - 1.0
-        for index in range(1, len(closes))
-        if closes[index - 1] > 0
-    ]
-    name = node.name
-    if name == "bar_return":
-        return close / open_price - 1.0 if open_price > 0 else 0.0
-    if name == "log_volume":
-        return math.log1p(volume)
-    if name == "range_fraction":
-        return (high - low) / close if close > 0 else 0.0
-    if name in {"sma", "sma_fast", "sma_slow"}:
-        return statistics.fmean(closes[-int(node.parameters.get("period", 20)) :])
-    if name == "ema":
-        period = int(node.parameters.get("period", 20))
-        alpha = 2.0 / (period + 1)
-        value = closes[0]
-        for item in closes[1:]:
-            value = alpha * item + (1 - alpha) * value
-        return value
-    if name == "rsi":
-        period = int(node.parameters.get("period", 14))
-        changes = [closes[index] - closes[index - 1] for index in range(1, len(closes))]
-        gains = [max(0.0, value) for value in changes[-period:]]
-        losses = [max(0.0, -value) for value in changes[-period:]]
-        average_gain = _wilder_last(gains, period)
-        average_loss = _wilder_last(losses, period)
-        if average_loss == 0:
-            return 100.0 if average_gain else 50.0
-        return 100.0 - 100.0 / (1.0 + average_gain / average_loss)
-    if name == "macd":
-        return _ema(closes, int(node.parameters.get("fast", 12))) - _ema(
-            closes, int(node.parameters.get("slow", 26))
-        )
-    if name == "atr":
-        highs, lows = _series(inputs, "high_history"), _series(inputs, "low_history")
-        period = int(node.parameters.get("period", 14))
-        return _wilder_last(_true_ranges(highs, lows, closes), period)
-    if name == "realised_volatility":
-        return statistics.pstdev(returns) * math.sqrt(len(returns)) if len(returns) > 1 else 0.0
-    if name == "bollinger":
-        deviation = statistics.pstdev(closes[-20:]) if len(closes) > 1 else 0.0
-        return (close - float(dependencies["sma"])) / deviation if deviation else 0.0
-    if name == "keltner":
-        width = float(dependencies["atr"])
-        return (
-            (close - float(dependencies["ema"])) / (close * width) if close > 0 and width else 0.0
-        )
-    if name == "adx":
-        highs, lows = _series(inputs, "high_history"), _series(inputs, "low_history")
-        period = int(node.parameters.get("period", 14))
-        true_ranges = _true_ranges(highs, lows, closes)
-        plus_dm: list[float] = [0.0]
-        minus_dm: list[float] = [0.0]
-        for index in range(1, min(len(highs), len(lows))):
-            up = highs[index] - highs[index - 1]
-            down = lows[index - 1] - lows[index]
-            plus_dm.append(up if up > down and up > 0 else 0.0)
-            minus_dm.append(down if down > up and down > 0 else 0.0)
-        smoothed_tr = _wilder_series(true_ranges, period)
-        smoothed_plus = _wilder_series(plus_dm, period)
-        smoothed_minus = _wilder_series(minus_dm, period)
-        directional: list[float] = []
-        for tr, plus, minus in zip(smoothed_tr, smoothed_plus, smoothed_minus, strict=False):
-            plus_di = 100.0 * plus / tr if tr > 0 else 0.0
-            minus_di = 100.0 * minus / tr if tr > 0 else 0.0
-            denominator = plus_di + minus_di
-            directional.append(
-                100.0 * abs(plus_di - minus_di) / denominator if denominator else 0.0
-            )
-        return _wilder_last(directional, period)
-    if name == "supertrend":
-        highs, lows = _series(inputs, "high_history"), _series(inputs, "low_history")
-        period = int(node.parameters.get("period", 10))
-        multiplier = float(node.parameters.get("multiplier", 3.0))
-        atr = _wilder_series(_true_ranges(highs, lows, closes), period)
-        length = min(len(highs), len(lows), len(closes), len(atr))
-        if not length:
-            return 0.0
-        upper: list[float] = []
-        lower: list[float] = []
-        for index in range(length):
-            midpoint = (highs[index] + lows[index]) / 2.0
-            upper.append(midpoint + multiplier * atr[index])
-            lower.append(midpoint - multiplier * atr[index])
-        final_upper, final_lower = [upper[0]], [lower[0]]
-        direction = 1
-        for index in range(1, length):
-            final_upper.append(
-                upper[index]
-                if upper[index] < final_upper[index - 1]
-                or closes[index - 1] > final_upper[index - 1]
-                else final_upper[index - 1]
-            )
-            final_lower.append(
-                lower[index]
-                if lower[index] > final_lower[index - 1]
-                or closes[index - 1] < final_lower[index - 1]
-                else final_lower[index - 1]
-            )
-            if closes[index] > final_upper[index - 1]:
-                direction = 1
-            elif closes[index] < final_lower[index - 1]:
-                direction = -1
-        line = final_lower[-1] if direction > 0 else final_upper[-1]
-        return direction * (close - line) / max(close, 1e-12)
-    if name == "breakout":
-        period = int(node.parameters.get("period", 20))
-        previous_high = max(closes[-period - 1 : -1], default=close)
-        return close / previous_high - 1.0 if previous_high > 0 else 0.0
-    if name == "range_state":
-        return (max(closes) - min(closes)) / close if close > 0 else 0.0
-    if name == "multi_timeframe":
-        return float(_raw(inputs, "higher_timeframe_return"))
-    if name == "taker_flow":
-        buy = float(_raw(inputs, "taker_buy_volume", 0.0))
-        return (2.0 * buy - volume) / volume if volume else 0.0
-    if name == "aggressor_flow":
-        buy = float(_raw(inputs, "aggressor_buy_volume"))
-        sell = float(_raw(inputs, "aggressor_sell_volume"))
-        return (buy - sell) / (buy + sell) if buy + sell else 0.0
-    if name in {"funding", "open_interest", "sentiment"}:
-        source = {
-            "funding": "funding_rate",
-            "open_interest": "open_interest",
-            "sentiment": "sentiment_score",
-        }[name]
-        return float(_raw(inputs, source))
-    if name in {"beta", "correlation"}:
-        asset = _series(inputs, "asset_returns")
-        benchmark = _series(inputs, "benchmark_returns")
-        pairs = tuple(zip(asset, benchmark, strict=False))
-        if len(pairs) < 2:
-            return 0.0
-        asset_mean = statistics.fmean(a for a, _ in pairs)
-        benchmark_mean = statistics.fmean(b for _, b in pairs)
-        covariance = sum((a - asset_mean) * (b - benchmark_mean) for a, b in pairs)
-        variance = sum((b - benchmark_mean) ** 2 for _, b in pairs)
-        if name == "correlation":
-            asset_variance = sum((a - asset_mean) ** 2 for a, _ in pairs)
-            return (
-                covariance / math.sqrt(asset_variance * variance)
-                if asset_variance and variance
-                else 0.0
-            )
-        return covariance / variance if variance else 0.0
-    if name == "spot_perpetual_basis":
-        spot, perpetual = (
-            float(_raw(inputs, "spot_price", close)),
-            float(_raw(inputs, "perpetual_price", close)),
-        )
-        return perpetual / spot - 1.0 if spot > 0 else 0.0
-    if name == "cross_sectional_rank":
-        raw_values = dict(_raw(inputs, "cross_sectional_values"))
-        marker = raw_values.pop("__current__", None)
-        current = float(
-            marker
-            if marker is not None
-            else node.parameters.get("current_value", max(raw_values.values()))
-        )
-        values = sorted(float(value) for value in raw_values.values())
-        if not values:
-            raise FeatureGraphError("cross-sectional input has no instrument values")
-        return (sum(value <= current for value in values)) / len(values)
-    if name == "bid_ask_spread":
-        bid, ask = float(_raw(inputs, "bid_price", close)), float(_raw(inputs, "ask_price", close))
-        return (ask - bid) / ((ask + bid) / 2) if ask + bid > 0 else 0.0
-    if name == "depth_imbalance":
-        bid, ask = float(_raw(inputs, "bid_depth", 0.0)), float(_raw(inputs, "ask_depth", 0.0))
-        return (bid - ask) / (bid + ask) if bid + ask else 0.0
-    if name == "microprice":
-        bid, ask = float(_raw(inputs, "bid_price", close)), float(_raw(inputs, "ask_price", close))
-        bid_depth, ask_depth = (
-            float(_raw(inputs, "bid_depth", 0.0)),
-            float(_raw(inputs, "ask_depth", 0.0)),
-        )
-        return (
-            (ask * bid_depth + bid * ask_depth) / (bid_depth + ask_depth)
-            if bid_depth + ask_depth
-            else (bid + ask) / 2
-        )
-    if name == "seasonality":
-        return float(_raw(inputs, "seasonality_score", 0.0))
-    if name == "liquidation_flow":
-        buy = float(_raw(inputs, "liquidation_buy_volume"))
-        sell = float(_raw(inputs, "liquidation_sell_volume"))
-        return (buy - sell) / (buy + sell) if buy + sell else 0.0
-    if name == "frozen_ml_feature_vector":
-        return {
-            str(feature): float(value)
-            for feature, value in dict(_raw(inputs, "feature_vector")).items()
-        }
-    raise FeatureGraphError(f"no default evaluator for {name}")
+    name = _canonical_node_name(node.name)
+    try:
+        evaluator = _NODE_EVALUATORS[name]
+    except KeyError as exc:
+        raise FeatureGraphError(f"no default evaluator for {name}") from exc
+    return evaluator(node, dependencies, inputs)
+
+
+def _canonical_node_name(name: str) -> str:
+    return {
+        "point_in_time_rank": "cross_sectional_rank",
+        "funding_rank": "funding",
+        "spread": "bid_ask_spread",
+        "hedge_ratio": "beta",
+        "causal_spread": "beta",
+        "basis": "beta",
+        "funding_differential": "funding",
+    }.get(name, name)
 
 
 def _ema(values: list[float], period: int) -> float:
@@ -637,3 +509,405 @@ def _wilder_series(values: list[float], period: int) -> list[float]:
 def _wilder_last(values: list[float], period: int) -> float:
     series = _wilder_series(values, period)
     return series[-1] if series else 0.0
+
+
+_DefaultEvaluator = Callable[[FeatureNode, Mapping[str, Any], Mapping[str, AvailableValue]], Any]
+
+
+def _bar_inputs(
+    inputs: Mapping[str, AvailableValue],
+) -> tuple[float, float, float, float, float, list[float], list[float]]:
+    close = float(_raw(inputs, "close", 0.0))
+    open_price = float(_raw(inputs, "open", close))
+    high = float(_raw(inputs, "high", close))
+    low = float(_raw(inputs, "low", close))
+    volume = max(0.0, float(_raw(inputs, "volume", 0.0)))
+    closes = _series(inputs, "close_history") or [close]
+    returns = [
+        closes[index] / closes[index - 1] - 1.0
+        for index in range(1, len(closes))
+        if closes[index - 1] > 0
+    ]
+    return close, open_price, high, low, volume, closes, returns
+
+
+def _eval_bar_return(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    close, open_price, _high, _low, _volume, _closes, _returns = _bar_inputs(inputs)
+    return close / open_price - 1.0 if open_price > 0 else 0.0
+
+
+def _eval_log_volume(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    return math.log1p(_bar_inputs(inputs)[4])
+
+
+def _eval_range_fraction(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    close, _open, high, low, _volume, _closes, _returns = _bar_inputs(inputs)
+    return (high - low) / close if close > 0 else 0.0
+
+
+def _eval_sma(
+    node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    closes = _bar_inputs(inputs)[5]
+    return statistics.fmean(closes[-int(node.parameters.get("period", 20)) :])
+
+
+def _eval_ema(
+    node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    closes = _bar_inputs(inputs)[5]
+    return _ema(closes, int(node.parameters.get("period", 20)))
+
+
+def _eval_rsi(
+    node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    closes = _bar_inputs(inputs)[5]
+    period = int(node.parameters.get("period", 14))
+    changes = [closes[index] - closes[index - 1] for index in range(1, len(closes))]
+    gains = [max(0.0, value) for value in changes[-period:]]
+    losses = [max(0.0, -value) for value in changes[-period:]]
+    average_gain = _wilder_last(gains, period)
+    average_loss = _wilder_last(losses, period)
+    if average_loss == 0:
+        return 100.0 if average_gain else 50.0
+    return 100.0 - 100.0 / (1.0 + average_gain / average_loss)
+
+
+def _eval_macd(
+    node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    closes = _bar_inputs(inputs)[5]
+    return _ema(closes, int(node.parameters.get("fast", 12))) - _ema(
+        closes, int(node.parameters.get("slow", 26))
+    )
+
+
+def _eval_atr(
+    node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    closes = _bar_inputs(inputs)[5]
+    highs = _series(inputs, "high_history")
+    lows = _series(inputs, "low_history")
+    return _wilder_last(_true_ranges(highs, lows, closes), int(node.parameters.get("period", 14)))
+
+
+def _eval_realised_volatility(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    returns = _bar_inputs(inputs)[6]
+    return statistics.pstdev(returns) * math.sqrt(len(returns)) if len(returns) > 1 else 0.0
+
+
+def _eval_bollinger(
+    _node: FeatureNode, dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    close = _bar_inputs(inputs)[0]
+    closes = _bar_inputs(inputs)[5]
+    deviation = statistics.pstdev(closes[-20:]) if len(closes) > 1 else 0.0
+    return (close - float(dependencies["sma"])) / deviation if deviation else 0.0
+
+
+def _eval_keltner(
+    _node: FeatureNode, dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    close = _bar_inputs(inputs)[0]
+    width = float(dependencies["atr"])
+    return (close - float(dependencies["ema"])) / (close * width) if close > 0 and width else 0.0
+
+
+def _eval_adx(
+    node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    highs = _series(inputs, "high_history")
+    lows = _series(inputs, "low_history")
+    closes = _bar_inputs(inputs)[5]
+    period = int(node.parameters.get("period", 14))
+    true_ranges = _true_ranges(highs, lows, closes)
+    plus_dm: list[float] = [0.0]
+    minus_dm: list[float] = [0.0]
+    for index in range(1, min(len(highs), len(lows))):
+        up = highs[index] - highs[index - 1]
+        down = lows[index - 1] - lows[index]
+        plus_dm.append(up if up > down and up > 0 else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+    smoothed_tr = _wilder_series(true_ranges, period)
+    smoothed_plus = _wilder_series(plus_dm, period)
+    smoothed_minus = _wilder_series(minus_dm, period)
+    directional = [
+        _directional_index(tr, plus, minus)
+        for tr, plus, minus in zip(smoothed_tr, smoothed_plus, smoothed_minus, strict=False)
+    ]
+    return _wilder_last(directional, period)
+
+
+def _directional_index(tr: float, plus: float, minus: float) -> float:
+    plus_di = 100.0 * plus / tr if tr > 0 else 0.0
+    minus_di = 100.0 * minus / tr if tr > 0 else 0.0
+    denominator = plus_di + minus_di
+    return 100.0 * abs(plus_di - minus_di) / denominator if denominator else 0.0
+
+
+def _eval_supertrend(
+    node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    highs = _series(inputs, "high_history")
+    lows = _series(inputs, "low_history")
+    closes = _bar_inputs(inputs)[5]
+    period = int(node.parameters.get("period", 10))
+    multiplier = float(node.parameters.get("multiplier", 3.0))
+    atr = _wilder_series(_true_ranges(highs, lows, closes), period)
+    length = min(len(highs), len(lows), len(closes), len(atr))
+    if not length:
+        return 0.0
+    upper = [
+        (highs[index] + lows[index]) / 2.0 + multiplier * atr[index] for index in range(length)
+    ]
+    lower = [
+        (highs[index] + lows[index]) / 2.0 - multiplier * atr[index] for index in range(length)
+    ]
+    final_upper, final_lower = [upper[0]], [lower[0]]
+    direction = 1
+    for index in range(1, length):
+        final_upper.append(
+            upper[index]
+            if upper[index] < final_upper[index - 1] or closes[index - 1] > final_upper[index - 1]
+            else final_upper[index - 1]
+        )
+        final_lower.append(
+            lower[index]
+            if lower[index] > final_lower[index - 1] or closes[index - 1] < final_lower[index - 1]
+            else final_lower[index - 1]
+        )
+        direction = _supertrend_direction(
+            closes[index], final_upper[index - 1], final_lower[index - 1], direction
+        )
+    close = _bar_inputs(inputs)[0]
+    line = final_lower[-1] if direction > 0 else final_upper[-1]
+    return direction * (close - line) / max(close, 1e-12)
+
+
+def _supertrend_direction(close: float, upper: float, lower: float, previous: int) -> int:
+    if close > upper:
+        return 1
+    if close < lower:
+        return -1
+    return previous
+
+
+def _eval_breakout(
+    node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    close = _bar_inputs(inputs)[0]
+    closes = _bar_inputs(inputs)[5]
+    period = int(node.parameters.get("period", 20))
+    previous_high = max(closes[-period - 1 : -1], default=close)
+    return close / previous_high - 1.0 if previous_high > 0 else 0.0
+
+
+def _eval_range_state(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    close, _open, _high, _low, _volume, closes, _returns = _bar_inputs(inputs)
+    return (max(closes) - min(closes)) / close if close > 0 else 0.0
+
+
+def _eval_multi_timeframe(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    return float(_raw(inputs, "higher_timeframe_return"))
+
+
+def _eval_taker_flow(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    volume = _bar_inputs(inputs)[4]
+    buy = float(_raw(inputs, "taker_buy_volume", 0.0))
+    return (2.0 * buy - volume) / volume if volume else 0.0
+
+
+def _eval_aggressor_flow(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    buy = float(_raw(inputs, "aggressor_buy_volume"))
+    sell = float(_raw(inputs, "aggressor_sell_volume"))
+    return (buy - sell) / (buy + sell) if buy + sell else 0.0
+
+
+def _eval_funding_family(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    source = {
+        "funding": "funding_rate",
+        "open_interest": "open_interest",
+        "sentiment": "sentiment_score",
+    }[_canonical_node_name(_node.name)]
+    return float(_raw(inputs, source))
+
+
+def _eval_correlation_family(
+    node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    asset = _series(inputs, "asset_returns")
+    benchmark = _series(inputs, "benchmark_returns")
+    pairs = tuple(zip(asset, benchmark, strict=False))
+    if len(pairs) < 2:
+        return 0.0
+    asset_mean = statistics.fmean(a for a, _ in pairs)
+    benchmark_mean = statistics.fmean(b for _, b in pairs)
+    covariance = sum((a - asset_mean) * (b - benchmark_mean) for a, b in pairs)
+    variance = sum((b - benchmark_mean) ** 2 for _, b in pairs)
+    if node.name == "correlation":
+        asset_variance = sum((a - asset_mean) ** 2 for a, _ in pairs)
+        return (
+            covariance / math.sqrt(asset_variance * variance)
+            if asset_variance and variance
+            else 0.0
+        )
+    return covariance / variance if variance else 0.0
+
+
+def _eval_cross_sectional_rank(
+    node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    raw_values = dict(_raw(inputs, "cross_sectional_values"))
+    marker = raw_values.pop("__current__", None)
+    current = float(
+        marker
+        if marker is not None
+        else node.parameters.get("current_value", max(raw_values.values()))
+    )
+    values = sorted(float(value) for value in raw_values.values())
+    if not values:
+        raise FeatureGraphError("cross-sectional input has no instrument values")
+    return sum(value <= current for value in values) / len(values)
+
+
+def _eval_bid_ask_spread(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    close = _bar_inputs(inputs)[0]
+    bid = float(_raw(inputs, "bid_price", close))
+    ask = float(_raw(inputs, "ask_price", close))
+    return (ask - bid) / ((ask + bid) / 2) if ask + bid > 0 else 0.0
+
+
+def _eval_depth_imbalance(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    bid = float(_raw(inputs, "bid_depth", 0.0))
+    ask = float(_raw(inputs, "ask_depth", 0.0))
+    return (bid - ask) / (bid + ask) if bid + ask else 0.0
+
+
+def _eval_microprice(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    close = _bar_inputs(inputs)[0]
+    bid = float(_raw(inputs, "bid_price", close))
+    ask = float(_raw(inputs, "ask_price", close))
+    bid_depth = float(_raw(inputs, "bid_depth", 0.0))
+    ask_depth = float(_raw(inputs, "ask_depth", 0.0))
+    return (
+        (ask * bid_depth + bid * ask_depth) / (bid_depth + ask_depth)
+        if bid_depth + ask_depth
+        else (bid + ask) / 2
+    )
+
+
+def _eval_seasonality(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    return float(_raw(inputs, "seasonality_score", 0.0))
+
+
+def _eval_liquidation_flow(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    buy = float(_raw(inputs, "liquidation_buy_volume"))
+    sell = float(_raw(inputs, "liquidation_sell_volume"))
+    return (buy - sell) / (buy + sell) if buy + sell else 0.0
+
+
+def _eval_frozen_model(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> dict[str, float]:
+    return {
+        str(feature): float(value)
+        for feature, value in dict(_raw(inputs, "feature_vector")).items()
+    }
+
+
+def _eval_spot_perpetual_basis(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    close = _bar_inputs(inputs)[0]
+    spot = float(_raw(inputs, "spot_price", close))
+    perpetual = float(_raw(inputs, "perpetual_price", close))
+    return perpetual / spot - 1.0 if spot > 0 else 0.0
+
+
+def _eval_return_alias(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    returns = _bar_inputs(inputs)[6]
+    return returns[-1] if returns else 0.0
+
+
+def _eval_normalised_alias(
+    _node: FeatureNode, _dependencies: Mapping[str, Any], inputs: Mapping[str, AvailableValue]
+) -> float:
+    close, _open, _high, _low, _volume, closes, _returns = _bar_inputs(inputs)
+    history = closes[:-1] if len(closes) > 1 else closes
+    recent = history[-20:]
+    mean = statistics.fmean(recent) if recent else close
+    deviation = statistics.pstdev(recent) if len(recent) > 1 else 0.0
+    return (close - mean) / deviation if deviation else 0.0
+
+
+_NODE_EVALUATORS: dict[str, _DefaultEvaluator] = {
+    "bar_return": _eval_bar_return,
+    "log_volume": _eval_log_volume,
+    "range_fraction": _eval_range_fraction,
+    "sma": _eval_sma,
+    "sma_fast": _eval_sma,
+    "sma_slow": _eval_sma,
+    "ema": _eval_ema,
+    "rsi": _eval_rsi,
+    "macd": _eval_macd,
+    "atr": _eval_atr,
+    "realised_volatility": _eval_realised_volatility,
+    "bollinger": _eval_bollinger,
+    "keltner": _eval_keltner,
+    "adx": _eval_adx,
+    "supertrend": _eval_supertrend,
+    "breakout": _eval_breakout,
+    "range_state": _eval_range_state,
+    "multi_timeframe": _eval_multi_timeframe,
+    "taker_flow": _eval_taker_flow,
+    "aggressor_flow": _eval_aggressor_flow,
+    "funding": _eval_funding_family,
+    "open_interest": _eval_funding_family,
+    "sentiment": _eval_funding_family,
+    "beta": _eval_correlation_family,
+    "correlation": _eval_correlation_family,
+    "spot_perpetual_basis": _eval_spot_perpetual_basis,
+    "cross_sectional_rank": _eval_cross_sectional_rank,
+    "bid_ask_spread": _eval_bid_ask_spread,
+    "depth_imbalance": _eval_depth_imbalance,
+    "microprice": _eval_microprice,
+    "seasonality": _eval_seasonality,
+    "liquidation_flow": _eval_liquidation_flow,
+    "frozen_ml_feature_vector": _eval_frozen_model,
+    "returns": _eval_return_alias,
+    "trend": _eval_return_alias,
+    "relative_return": _eval_return_alias,
+    "normalised_price_deviation": _eval_normalised_alias,
+    "oscillator": _eval_normalised_alias,
+}

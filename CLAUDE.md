@@ -41,7 +41,7 @@ make control ARGS="status"
 For 24/7 Linux operation use the user-level systemd installer:
 
 ```bash
-bash scripts/install_autopilot_service.sh
+bash scripts/install_platform_services.sh
 ```
 
 Do not reintroduce the old cron deployment scripts. Historical search outputs

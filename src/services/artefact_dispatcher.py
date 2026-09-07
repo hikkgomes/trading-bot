@@ -9,6 +9,7 @@ from typing import Any
 from src.domain._codec import canonical_hash
 from src.domain.forecasts import AlphaForecast
 from src.strategies.behaviour import (
+    BtcTargetAllocationBehaviour,
     RegisteredStrategyBehaviour,
     StrategyBehaviourError,
     TypedRuleBehaviour,
@@ -19,6 +20,7 @@ from src.strategies.semantic import (
     HedgedTargets,
     RankedTargets,
     SemanticEvaluationError,
+    semantic_contract_features,
     semantic_forecast_from_output,
     semantic_input_from_features,
     semantic_strategy_name,
@@ -202,7 +204,7 @@ def _registered_strategy_behaviour(
             input_status = (
                 "registered_signal" if "registered_signal" in features else "history_unavailable"
             )
-    except StrategyBehaviourError as exc:
+    except (StrategyBehaviourError, KeyError, TypeError, ValueError) as exc:
         raise ArtefactDispatchError(str(exc)) from exc
     forecast = dict(_forecast(float(signal), artefact))
     forecast["expected_return"] = float(signal) * float(forecast["target_volatility"])
@@ -254,12 +256,34 @@ def _agent_registered_python(
 
 
 def _generated_dsl(features: Mapping[str, float], artefact: Mapping[str, Any]) -> Mapping[str, Any]:
+    behaviour: Any
     try:
-        behaviour = TypedRuleBehaviour.from_definition(_definition(artefact))
-        signal = behaviour.signal(features)
-    except StrategyBehaviourError as exc:
+        model = _definition(artefact).get("signal_model")
+        if isinstance(model, Mapping) and model.get("kind") == "btc_target_allocation":
+            behaviour = BtcTargetAllocationBehaviour.from_definition(_definition(artefact))
+            state, signal, target, tactical = behaviour.target(features)
+            limits = artefact.get("position_limits")
+            limits = limits if isinstance(limits, Mapping) else {}
+            target_volatility = float(limits.get("target_volatility", 0.1))
+            if not math.isfinite(target_volatility) or target_volatility < 0:
+                raise ArtefactDispatchError("BTC target volatility is invalid")
+            result = {
+                "direction": "long",
+                "score": 1.0,
+                "expected_return": signal * float(limits.get("return_scale", target_volatility)),
+                "confidence": 1.0,
+                "target_volatility": target_volatility,
+                "maximum_position": target,
+                "btc_target_fraction": target,
+                "btc_tactical_fraction": tactical,
+                "btc_cycle_state": state,
+            }
+        else:
+            behaviour = TypedRuleBehaviour.from_definition(_definition(artefact))
+            signal = behaviour.signal(features)
+            result = dict(_forecast(float(signal), artefact))
+    except (StrategyBehaviourError, KeyError, TypeError, ValueError) as exc:
         raise ArtefactDispatchError(str(exc)) from exc
-    result = dict(_forecast(float(signal), artefact))
     result["behaviour_hash"] = behaviour.behaviour_hash
     result["behaviour_input_hash"] = canonical_hash(
         {"behaviour_hash": behaviour.behaviour_hash, "features": dict(features)}
@@ -299,7 +323,8 @@ def _semantic(features: Mapping[str, Any], artefact: Mapping[str, Any]) -> Mappi
     if not instrument_id:
         raise ArtefactDispatchError("semantic evaluation requires an instrument identity")
     try:
-        semantic_input = semantic_input_from_features(name, features)
+        semantic_features = semantic_contract_features(name, model, features)
+        semantic_input = semantic_input_from_features(name, semantic_features)
         output = SEMANTIC_STRATEGIES.get(name).evaluate(semantic_input)
         result = semantic_forecast_from_output(
             output,
@@ -309,6 +334,21 @@ def _semantic(features: Mapping[str, Any], artefact: Mapping[str, Any]) -> Mappi
     except (SemanticEvaluationError, KeyError, TypeError, ValueError) as exc:
         raise ArtefactDispatchError(str(exc)) from exc
     result["semantic_strategy"] = name
+    if isinstance(output, RankedTargets | HedgedTargets):
+        target_values = (
+            output.target_fractions
+            if isinstance(output, RankedTargets)
+            else output.target_notionals
+        )
+        result["semantic_target_fraction"] = float(target_values.get(instrument_id, 0.0))
+        result["semantic_target_max_abs"] = max(
+            abs(float(value)) for value in target_values.values()
+        )
+        if isinstance(output, HedgedTargets):
+            result["semantic_target_notional"] = float(
+                output.target_notionals.get(instrument_id, 0.0)
+            )
+            result["semantic_hedge_error"] = float(output.hedge_error)
     input_hash = canonical_hash(semantic_input)
     output_hash = canonical_hash(output)
     result["semantic_input_hash"] = input_hash

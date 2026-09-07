@@ -143,7 +143,12 @@ def test_generated_thesis_and_candidate_are_product_and_universe_bound() -> None
     )
     assert hypothesis.thesis.generalisation_scope["product"] == "active_income"
     assert hypothesis.candidate.definition.universe["type"] == "point_in_time"
-    assert hypothesis.candidate.definition.signal_model["rule"]["direction"] == "signed"
+    assert hypothesis.candidate.definition.signal_model["kind"] == "forecast_ensemble"
+    assert hypothesis.candidate.definition.signal_model["aggregation"] in {
+        "confidence_weighted",
+        "risk_weighted",
+        "correlation_aware",
+    }
     assert hypothesis.semantic_signature == hypothesis_signature(hypothesis.candidate.definition)
 
 
@@ -290,6 +295,8 @@ def test_catalogue_registration_waits_without_a_ready_dataset() -> None:
         "product_id": "btc_accumulation",
         "state": "waiting_for_dataset",
         "reason_code": "canonical_dataset_bundle_unavailable",
+        "_defer": True,
+        "_defer_reason": "canonical_dataset_bundle_unavailable",
     }
 
 

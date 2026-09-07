@@ -6,6 +6,7 @@ PLATFORM_CONFIG ?= config/platform.json
 BACKUP_ID ?=
 DESTINATION ?=
 PROCESS ?= trading-runtime
+PARQUET_ROOT ?= data
 
 .DEFAULT_GOAL := help
 
@@ -69,7 +70,7 @@ platform-process-once:  ## Run one grouped platform process cycle
 	$(PY) -m src.services.process --config $(PLATFORM_CONFIG) \
 		--node linux-optiplex --process $(PROCESS) --once
 
-.PHONY: platform-smoke platform-testnet-rehearsal platform-testnet-connected
+.PHONY: platform-smoke platform-testnet-rehearsal platform-testnet-connected platform-testnet-emergency
 platform-smoke:  ## Run the closed-event PostgreSQL smoke for both products
 	$(PY) -m src.services.platform_smoke --database-url "$(TRADING_PLATFORM_DATABASE_URL)"
 
@@ -80,6 +81,11 @@ platform-testnet-rehearsal:  ## Run the deterministic live/user-stream rehearsal
 platform-testnet-connected:  ## Run a confirmed connected Binance testnet rehearsal
 	@test "$(CONFIRM)" = "1" || (echo "Set CONFIRM=1 to place real testnet orders." >&2; exit 1)
 	$(PY) -m src.services.platform_testnet_connected --config $(PLATFORM_CONFIG) \
+		--product $(or $(PRODUCT),active_income) --notional-usd $(or $(NOTIONAL_USD),10) --confirm
+
+platform-testnet-emergency:  ## Run the confirmed emergency flatten testnet rehearsal
+	@test "$(CONFIRM)" = "1" || (echo "Set CONFIRM=1 to place real testnet orders." >&2; exit 1)
+	$(PY) -m src.services.platform_testnet_emergency --config $(PLATFORM_CONFIG) \
 		--product $(or $(PRODUCT),active_income) --notional-usd $(or $(NOTIONAL_USD),10) --confirm
 
 .PHONY: platform-live-authority platform-permissions-test platform-report control
@@ -112,7 +118,7 @@ sqlite-import:  ## Import legacy SQLite memory with immutable provenance
 	$(PY) -m src.research.sqlite_import --source "$(SOURCE)" \
 		--database-url "$(TRADING_PLATFORM_DATABASE_URL)" $(if $(ARCHIVE),--archive "$(ARCHIVE)",)
 
-.PHONY: platform-backup-postgresql platform-backup-parquet platform-backup-verify
+.PHONY: platform-backup-postgresql platform-backup-parquet platform-backup-verify platform-compact-data platform-upgrade
 platform-backup-postgresql:  ## Create and verify a PostgreSQL backup
 	$(PY) -m src.services.backup_service --config $(PLATFORM_CONFIG) --mode postgresql
 
@@ -121,6 +127,13 @@ platform-backup-parquet:  ## Create and verify a Parquet backup
 
 platform-backup-verify:  ## Verify every platform backup
 	$(PY) -m src.services.backup_service --config $(PLATFORM_CONFIG) --mode verify
+
+platform-compact-data:  ## Compact active Parquet partitions and quarantine sources
+	$(PY) -m src.services.storage_compaction --root "$(PARQUET_ROOT)"
+
+platform-upgrade:  ## Stop services, back up PostgreSQL, retire old units, and migrate
+	REPO="$(CURDIR)" PYTHON="$(PY)" PLATFORM_CONFIG="$(PLATFORM_CONFIG)" \
+		bash scripts/upgrade_platform.sh
 
 .PHONY: platform-backup-restore-postgresql platform-backup-restore-parquet
 platform-backup-restore-postgresql:  ## Restore a PostgreSQL backup into a new database
@@ -147,6 +160,7 @@ research-policy-check:  ## Run canonical research policy tests
 		tests/test_strategy_evaluation_pipeline.py
 
 platform-ci:  ## Run the complete platform quality gate
+	$(PY) -m pip check
 	$(MAKE) platform-validate
 	$(MAKE) lint
 	$(MAKE) lint-complexity

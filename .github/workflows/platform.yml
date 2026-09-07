@@ -2,7 +2,9 @@ name: Platform quality
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -26,8 +28,11 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
+      # The local CI service container does not expose TLS. Production service
+      # files still require sslmode=require.
       TRADING_PLATFORM_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/trading_bot
       TRADING_PLATFORM_TESTNET_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/trading_bot
+      TRADING_PLATFORM_PRIVILEGE_TEST: "1"
 
     steps:
       - name: Check out repository
@@ -40,7 +45,9 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Run platform quality and integration gate
-        run: make platform-ci
+        run: make platform-ci PY=.venv/bin/python

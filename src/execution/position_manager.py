@@ -11,7 +11,7 @@ from sqlalchemy.engine import Engine
 from src.data.database import position as position_table
 from src.data.database import position_event
 from src.domain._codec import canonical_hash, to_primitive
-from src.domain.orders import Fill, OrderSide
+from src.domain.orders import Fill, OrderIntent, OrderSide
 from src.domain.positions import Position, PositionStatus
 
 if TYPE_CHECKING:
@@ -151,7 +151,12 @@ class PositionManager:
         return position
 
     def apply_fill(
-        self, portfolio_id: str, fill: Fill, *, contributions: dict[str, float] | None = None
+        self,
+        portfolio_id: str,
+        fill: Fill,
+        *,
+        contributions: dict[str, float] | None = None,
+        assignment_id: str | None = None,
     ) -> Position:
         current = self.get(portfolio_id, fill.instrument_id)
         base_fee_quantity = float(fill.metadata.get("base_fee_quantity") or 0.0)
@@ -199,7 +204,11 @@ class PositionManager:
             status=status,
             updated_at=fill.occurred_at,
             strategy_contributions=contributions or dict(current.strategy_contributions),
-            metadata={**dict(current.metadata), "reference_entry_price": reference_average},
+            metadata={
+                **dict(current.metadata),
+                "reference_entry_price": reference_average,
+                **({"assignment_id": assignment_id} if assignment_id else {}),
+            },
         )
         self._positions[(portfolio_id, fill.instrument_id)] = position
         if self.store is not None:
@@ -218,4 +227,14 @@ class PositionManager:
                 order.portfolio_id,
                 fill,
                 contributions=dict(order.strategy_contributions),
+                assignment_id=_order_assignment_id(order),
             )
+
+
+def _order_assignment_id(order: OrderIntent) -> str | None:
+    target_metadata = order.metadata.get("target_metadata")
+    if isinstance(target_metadata, dict) and target_metadata.get("assignment_id"):
+        return str(target_metadata["assignment_id"])
+    if order.metadata.get("assignment_id"):
+        return str(order.metadata["assignment_id"])
+    return None

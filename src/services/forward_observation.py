@@ -7,7 +7,14 @@ from typing import Any
 
 from sqlalchemy import select
 
-from src.data.database import alpha_forecast, position, target_position
+from src.data.database import (
+    alpha_forecast,
+    position,
+    position_event,
+    strategy_artefact,
+    target_position,
+)
+from src.data.universe import SqlUniverseStore
 from src.domain._codec import timestamp
 from src.research.canonical import (
     SqlActiveStrategyAssignmentRepository,
@@ -64,6 +71,16 @@ class DatabaseForwardObservationWorker:
                 raise ValueError("forward observation command has an invalid field set")
             evaluation_time = timestamp(str(payload["evaluation_time"]), field="evaluation_time")
             assignment = self.assignments.by_id(str(payload["assignment_id"]))
+            if assignment is not None and self._superseded_by_live(
+                assignment=assignment,
+                product_id=str(payload["product_id"]),
+                at=now,
+            ):
+                self.queue.complete(claimed, completed_at=now)
+                return {
+                    "reason_code": "forward_observation_stopped_after_live_activation",
+                    "job_id": claimed.job_id,
+                }
             if payload.get("waiting_reason") is not None:
                 if (
                     assignment is None
@@ -88,7 +105,12 @@ class DatabaseForwardObservationWorker:
                 or assignment.get("strategy_version_id") != payload["strategy_version_id"]
                 or assignment.get("product_id") != payload["product_id"]
                 or assignment.get("artefact_hash") != payload["artefact_hash"]
-                or assignment.get("instrument_id") != payload["instrument_id"]
+                or not _assignment_allows_instrument(
+                    self.engine,
+                    assignment,
+                    instrument_id=str(payload["instrument_id"]),
+                    at=evaluation_time,
+                )
             ):
                 raise ValueError("forward observation assignment binding is invalid")
             artefact = self.artefacts.get(str(payload["artefact_hash"]))
@@ -118,12 +140,14 @@ class DatabaseForwardObservationWorker:
                 portfolio_id=str(assignment["portfolio_id"]),
                 instrument_id=str(payload["instrument_id"]),
                 at=evaluation_time,
+                assignment_id=str(payload["assignment_id"]),
             )
             previous_observed_at = self.metrics.latest_observed_at(
                 strategy_version_id=str(payload["strategy_version_id"]),
                 product_id=str(payload["product_id"]),
                 instrument_id=str(payload["instrument_id"]),
                 artefact_hash=str(payload["artefact_hash"]),
+                assignment_id=str(payload["assignment_id"]),
             )
             forecast_fact = {**forecast_payload, "forecast_id": forecast_id}
             target_fact = (
@@ -180,6 +204,17 @@ class DatabaseForwardObservationWorker:
             "observed_at": observed_at,
         }
 
+    def _superseded_by_live(
+        self, *, assignment: Mapping[str, Any], product_id: str, at: str
+    ) -> bool:
+        return any(
+            row["execution_mode"] == "live"
+            and row["lifecycle_state"] in {"live_canary", "live"}
+            and row["strategy_version_id"] == assignment["strategy_version_id"]
+            and row["artefact_hash"] == assignment["artefact_hash"]
+            for row in self.assignments.active_assignments(product_id, at=at)
+        )
+
     def _latest_payload(
         self,
         table,
@@ -218,13 +253,19 @@ class DatabaseForwardObservationWorker:
         return None
 
     def _latest_position(
-        self, *, portfolio_id: str, instrument_id: str, at: str
+        self,
+        *,
+        portfolio_id: str,
+        instrument_id: str,
+        at: str,
+        assignment_id: str | None = None,
     ) -> Mapping[str, Any] | None:
         with self.engine.connect() as connection:
+            table = position_event if assignment_id is not None else position
             rows = connection.execute(
-                select(position.c.payload)
-                .where(position.c.created_at <= at)
-                .order_by(position.c.created_at.desc(), position.c.id.desc())
+                select(table.c.payload)
+                .where(table.c.created_at <= at)
+                .order_by(table.c.created_at.desc(), table.c.id.desc())
             ).scalars()
             for payload in rows:
                 if (
@@ -232,8 +273,42 @@ class DatabaseForwardObservationWorker:
                     and payload.get("portfolio_id") == portfolio_id
                     and payload.get("instrument_id") == instrument_id
                 ):
+                    if assignment_id is not None:
+                        metadata = payload.get("metadata")
+                        if not isinstance(metadata, Mapping) or str(
+                            metadata.get("assignment_id") or ""
+                        ) != str(assignment_id):
+                            continue
                     return dict(payload)
         return None
+
+
+def _assignment_allows_instrument(
+    engine,
+    assignment: Mapping[str, Any],
+    *,
+    instrument_id: str,
+    at: str,
+) -> bool:
+    assigned = str(assignment.get("instrument_id") or "")
+    if assigned:
+        return assigned == instrument_id
+    payload = assignment.get("payload")
+    if isinstance(payload, Mapping):
+        configured = payload.get("instrument_ids") or payload.get("instruments")
+        if isinstance(configured, list | tuple):
+            return instrument_id in {str(value) for value in configured}
+    universe_id = str(assignment.get("universe_id") or "")
+    if not universe_id:
+        return False
+    return any(
+        member.instrument.instrument_id == instrument_id
+        for member in SqlUniverseStore(engine).members_at(
+            universe_id=universe_id,
+            observed_at=at,
+            eligible_only=True,
+        )
+    )
 
 
 def _target_belongs_to_strategy(candidate: Mapping[str, Any], strategy_version_id: str) -> bool:
@@ -279,6 +354,7 @@ class DatabaseForwardSummaryWorker:
         minimum_days_by_product: Mapping[str, int] | None = None,
         minimum_decisions: int = 1,
         policies_by_product: Mapping[str, Mapping[str, Any]] | None = None,
+        policies_by_product_family: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
         lease_seconds: int = 60,
     ) -> None:
         self.engine = engine
@@ -290,6 +366,10 @@ class DatabaseForwardSummaryWorker:
         self.minimum_decisions = minimum_decisions
         self.policies_by_product = {
             str(key): dict(value) for key, value in (policies_by_product or {}).items()
+        }
+        self.policies_by_product_family = {
+            (str(key[0]), str(key[1])): dict(value)
+            for key, value in (policies_by_product_family or {}).items()
         }
         self.lease_seconds = lease_seconds
         self.evidence = SqlForwardEvidenceRepository(engine)
@@ -323,7 +403,11 @@ class DatabaseForwardSummaryWorker:
                 artefact_hash=str(claimed.payload["artefact_hash"]),
                 observed_at=evaluated_at,
             )
-            policy = self.policies_by_product.get(product_id, {})
+            policy = self._policy_for(
+                product_id=product_id,
+                strategy_version_id=str(claimed.payload["strategy_version_id"]),
+                artefact_hash=str(claimed.payload["artefact_hash"]),
+            )
             decision_id, accepted, reason_code = self.evidence.decide_summary(
                 summary_id,
                 decided_at=evaluated_at,
@@ -377,3 +461,24 @@ class DatabaseForwardSummaryWorker:
             "reason_code_detail": reason_code,
             "independent_decisions": summary.independent_decisions,
         }
+
+    def _policy_for(
+        self, *, product_id: str, strategy_version_id: str, artefact_hash: str
+    ) -> dict[str, Any]:
+        base = dict(self.policies_by_product.get(product_id, {}))
+        with self.engine.connect() as connection:
+            payload = connection.execute(
+                select(strategy_artefact.c.payload).where(strategy_artefact.c.id == artefact_hash)
+            ).scalar_one_or_none()
+        definition = payload.get("definition") if isinstance(payload, Mapping) else None
+        family = str(definition.get("family") or "") if isinstance(definition, Mapping) else ""
+        selected = self.policies_by_product_family.get((product_id, family))
+        if selected is None and isinstance(definition, Mapping):
+            validation = definition.get("validation_policy")
+            evidence_type = (
+                str(validation.get("evidence_type") or "")
+                if isinstance(validation, Mapping)
+                else ""
+            )
+            selected = self.policies_by_product_family.get((product_id, evidence_type))
+        return {**base, **(selected or {})}

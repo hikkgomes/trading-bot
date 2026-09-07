@@ -683,6 +683,8 @@ class FuturesAccountingReport:
     margin_mode: str = "isolated"
     target_notional: float | None = None
     liquidation_buffer_fraction: float = 0.0
+    terminal_liquidation_cost: float = 0.0
+    terminal_exposure: float = 0.0
 
     @property
     def objective_unit(self) -> str:
@@ -705,6 +707,8 @@ class _FuturesEvaluationOptions:
     target_by_symbol: Mapping[str, float]
     margin_mode: str
     liquidation_buffer: float
+    terminal_fee_rate: float
+    terminal_slippage_rate: float
 
 
 @dataclass
@@ -740,6 +744,8 @@ def _prepare_futures_evaluation(
     target_notional: float | Mapping[str, float] | None,
     margin_mode: str,
     liquidation_buffer_fraction: float,
+    terminal_fee_rate: float,
+    terminal_slippage_rate: float,
 ) -> tuple[
     _FuturesEvaluationOptions, tuple[tuple[str, Mapping[str, Any]], ...], _FuturesEvaluationState
 ]:
@@ -770,6 +776,10 @@ def _prepare_futures_evaluation(
     if liquidation_buffer > 1.0:
         raise ProductAccountingError("liquidation_buffer_fraction must be at most 1")
     target_value, target_by_symbol = _target_notionals(target_notional)
+    terminal_fee = _number(terminal_fee_rate, field_name="terminal_fee_rate", minimum=0.0)
+    terminal_slippage = _number(
+        terminal_slippage_rate, field_name="terminal_slippage_rate", minimum=0.0
+    )
     ordered = _events(events)
     if not ordered:
         raise ProductAccountingError("futures accounting requires events")
@@ -784,6 +794,8 @@ def _prepare_futures_evaluation(
         target_by_symbol=target_by_symbol,
         margin_mode=mode,
         liquidation_buffer=liquidation_buffer,
+        terminal_fee_rate=terminal_fee,
+        terminal_slippage_rate=terminal_slippage,
     )
     state = _FuturesEvaluationState(cash=starting_cash, positions={}, marks={})
     return options, ordered, state
@@ -962,10 +974,24 @@ def _build_futures_report(
     state: _FuturesEvaluationState,
     options: _FuturesEvaluationOptions,
 ) -> FuturesAccountingReport:
-    final_equity, unrealised, _ = FuturesIncomeAccounting._equity(
+    final_equity, unrealised, positions_notional = FuturesIncomeAccounting._equity(
         state.cash, state.positions, state.marks
     )
-    implementation_shortfall = state.fees + state.spread + state.slippage
+    terminal_turnover = (
+        positions_notional
+        if options.terminal_fee_rate + options.terminal_slippage_rate > 0.0
+        else 0.0
+    )
+    terminal_liquidation_cost = terminal_turnover * (
+        options.terminal_fee_rate + options.terminal_slippage_rate
+    )
+    final_equity -= terminal_liquidation_cost
+    terminal_fees = terminal_turnover * options.terminal_fee_rate
+    terminal_slippage = terminal_turnover * options.terminal_slippage_rate
+    implementation_shortfall = (
+        state.fees + state.spread + state.slippage + terminal_fees + terminal_slippage
+    )
+    total_turnover = state.turnover_notional + terminal_turnover
     return FuturesAccountingReport(
         initial_equity=options.starting_cash,
         final_equity=final_equity,
@@ -975,10 +1001,10 @@ def _build_futures_report(
         ),
         realised_pnl=state.realised,
         unrealised_pnl=unrealised,
-        fees=state.fees,
+        fees=state.fees + terminal_fees,
         funding_pnl=state.funding_pnl,
         spread_cost=state.spread,
-        slippage_cost=state.slippage,
+        slippage_cost=state.slippage + terminal_slippage,
         fills=state.fills,
         partial_fills=state.partials,
         capacity_violations=state.capacity_violations,
@@ -987,12 +1013,10 @@ def _build_futures_report(
         liquidation=state.liquidation,
         effective_observations=state.observations + state.fills,
         event_receipts=tuple(state.receipts),
-        turnover_notional=state.turnover_notional,
+        turnover_notional=total_turnover,
         implementation_shortfall=implementation_shortfall,
         capital_efficiency=(
-            (final_equity - options.starting_cash) / state.turnover_notional
-            if state.turnover_notional > 0.0
-            else 0.0
+            (final_equity - options.starting_cash) / total_turnover if total_turnover > 0.0 else 0.0
         ),
         funding_adjusted_expectancy=(
             (final_equity - options.starting_cash) / state.fills if state.fills > 0 else 0.0
@@ -1000,6 +1024,8 @@ def _build_futures_report(
         margin_mode=options.margin_mode,
         target_notional=options.target_value,
         liquidation_buffer_fraction=options.liquidation_buffer,
+        terminal_liquidation_cost=terminal_liquidation_cost,
+        terminal_exposure=positions_notional,
     )
 
 
@@ -1019,6 +1045,8 @@ class FuturesIncomeAccounting:
         target_notional: float | Mapping[str, float] | None = None,
         margin_mode: str = "isolated",
         liquidation_buffer_fraction: float = 0.0,
+        terminal_fee_rate: float = 0.0,
+        terminal_slippage_rate: float = 0.0,
     ) -> FuturesAccountingReport:
         options, ordered, state = _prepare_futures_evaluation(
             events=events,
@@ -1031,6 +1059,8 @@ class FuturesIncomeAccounting:
             target_notional=target_notional,
             margin_mode=margin_mode,
             liquidation_buffer_fraction=liquidation_buffer_fraction,
+            terminal_fee_rate=terminal_fee_rate,
+            terminal_slippage_rate=terminal_slippage_rate,
         )
         for observed_at, event in ordered:
             kind, symbol, funding_applied, funding_amount = _apply_futures_event(

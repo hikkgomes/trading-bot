@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import hmac
 from pathlib import Path
 
 import pytest
+from sqlalchemy import insert
 
-from src.data.database import PlatformDatabase
+from src.data.database import PlatformDatabase, platform_rehearsal_report
 from src.data.universe import InstrumentObservation, SqlUniverseStore, UniverseEligibilityPolicy
 from src.domain._codec import canonical_hash
 from src.domain.instruments import Instrument, MarketType
@@ -17,6 +20,7 @@ from src.research.canonical import (
     SqlPreflightRepository,
 )
 from src.services.config import load_split_configuration
+from src.services.live_execution import execution_engine_identity
 from src.services.platform_live_authority import (
     PlatformLiveAuthority,
     PlatformLiveAuthorityError,
@@ -159,6 +163,15 @@ def _fixture(tmp_path: Path, monkeypatch) -> tuple[PlatformDatabase, PlatformLiv
             "slippage": 0.0,
             "data_uptime": 1.0,
             "rejected_orders": 0,
+            "valid_attempts": 1,
+            "completed_attempts": 1,
+            "expected_observations": 1,
+            "observed_observations": 1,
+            "fill_rate_applicable": True,
+            "trading_dates": ["2026-08-29"],
+            "order_ids": ["authority-order"],
+            "fill_ids": ["authority-fill"],
+            "episode_ids": ["authority-episode"],
         },
         "forecast_hash": canonical_hash({"source": "authority-test"}),
         "target_hash": None,
@@ -196,6 +209,15 @@ def _fixture(tmp_path: Path, monkeypatch) -> tuple[PlatformDatabase, PlatformLiv
             "slippage": 0.0,
             "data_uptime": 1.0,
             "rejected_orders": 0,
+            "valid_attempts": 1,
+            "completed_attempts": 1,
+            "expected_observations": 1,
+            "observed_observations": 1,
+            "fill_rate_applicable": True,
+            "trading_dates": ["2026-08-29"],
+            "order_ids": ["authority-order"],
+            "fill_ids": ["authority-fill"],
+            "episode_ids": ["authority-episode"],
             "observation_ids": [observation_id],
         },
     )
@@ -279,6 +301,80 @@ def test_manual_authority_records_exact_preflight_approval_and_live_assignment(
         assert active["artefact_hash"] == selection["artefact_hash"]
         assert active["instrument_id"] == selection["instrument_id"]
         assert active["sleeve_id"] == selection["sleeve_id"]
+    finally:
+        database.dispose()
+
+
+def test_canary_to_live_requires_signed_canary_evidence_and_replaces_canary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    database, authority, selection = _fixture(tmp_path, monkeypatch)
+    monkeypatch.setenv("TRADING_PLATFORM_REHEARSAL_SIGNING_KEY", "rehearsal-signing-key")
+    try:
+        preflight, approval = _preflight_and_approve(authority, selection)
+        canary = authority.assign(
+            **selection,
+            expected_preflight_id=preflight["preflight_id"],
+            expected_approval_id=approval["approval_id"],
+            capital_limit=0.01,
+            risk_budget=0.01,
+            assigned_by="henrique",
+            assigned_at=ASSIGNED_AT,
+            confirm=True,
+        )
+        evidence = {
+            "schema": "platform.connected-testnet-report/v1",
+            "environment": "testnet",
+            "real_exchange": True,
+            "product_id": "active_income",
+            "account_id": "binance-futures-main",
+            "assignment_id": canary["assignment_id"],
+            "artefact_hash": selection["artefact_hash"],
+            "execution_engine_identity": execution_engine_identity(),
+            "account_fingerprint": "account-v1:" + "a" * 64,
+            "flat_reconciliation": True,
+            "accounting_reconciled": True,
+            "protective_stop_applicable": True,
+            "native_stop_created": True,
+            "native_stop_readback_matched": True,
+            "algo_update_processed": True,
+            "partial_fill_quantity_handled": True,
+            "stop_resize_or_replacement_handled": True,
+            "native_stop_cancelled": True,
+        }
+        report_hash = canonical_hash(evidence)
+        evidence["report_hash"] = report_hash
+        evidence["signature"] = hmac.new(
+            b"rehearsal-signing-key", report_hash.encode(), hashlib.sha256
+        ).hexdigest()
+        with database.engine.begin() as connection:
+            connection.execute(
+                insert(platform_rehearsal_report).values(
+                    id=report_hash,
+                    product_id="active_income",
+                    account_id="binance-futures-main",
+                    created_at="2026-08-29T10:00:04+00:00",
+                    content_hash=report_hash,
+                    accepted=True,
+                    payload=evidence,
+                )
+            )
+        result = authority.promote_canary_to_live(
+            **selection,
+            expected_preflight_id=preflight["preflight_id"],
+            expected_approval_id=approval["approval_id"],
+            canary_evidence_id=report_hash,
+            capital_limit=0.01,
+            risk_budget=0.01,
+            assigned_by="henrique",
+            assigned_at="2026-08-29T10:00:10+00:00",
+            confirm=True,
+        )
+        active = authority.assignments.active("active_income", execution_mode="live")
+        assert active is not None
+        assert active["id"] == result["assignment_id"]
+        assert active["lifecycle_state"] == "live"
+        assert active["payload"]["canary_evidence_id"] == report_hash
     finally:
         database.dispose()
 

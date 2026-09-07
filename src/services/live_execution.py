@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
 from src.accounting.fees import FeeConversion, FeeConversionError, convert_fee, instrument_asset
-from src.data.database import account_snapshot
+from src.data.database import account_snapshot, universe_member, universe_snapshot
 from src.data.database import instrument as instrument_table
 from src.domain._codec import canonical_hash, timestamp, to_primitive
 from src.domain.instruments import Instrument, MarketType
@@ -127,7 +127,12 @@ class ApprovedLiveExecution:
         self.venues: dict[str, BrokerExecutionVenue] = {}
         current = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
         for product_id, product in live_products.items():
-            if self.assignments.active(product_id, execution_mode="live", at=current) is None:
+            assignments = tuple(
+                row
+                for row in self.assignments.active_assignments(product_id, at=current)
+                if row["execution_mode"] == "live"
+            )
+            if not assignments:
                 raise ValueError(
                     f"live product {product_id} has no active canonical strategy assignment"
                 )
@@ -137,6 +142,17 @@ class ApprovedLiveExecution:
                 identity: item
                 for identity, item in instruments.items()
                 if item.market_type.value == market
+            }
+            allowed_ids = _live_assignment_instrument_ids(
+                engine,
+                assignments,
+                product=product,
+                at=current,
+            )
+            product_instruments = {
+                identity: item
+                for identity, item in product_instruments.items()
+                if identity in allowed_ids
             }
             configured_symbols = product.get("live_exchange_symbols")
             if isinstance(configured_symbols, list):
@@ -168,11 +184,17 @@ class ApprovedLiveExecution:
         self.positions.reload()
         portfolio_id = self.product_portfolios[product_id]
         local_positions = self.positions.current_quantities(portfolio_id)
-        local_orders = {
-            order.order_id[:36]
-            for order in self.order_manager.all()
-            if order.portfolio_id == portfolio_id and not order.is_terminal
-        }
+        local_orders: set[str] = set()
+        for order in self.order_manager.all():
+            if order.portfolio_id != portfolio_id or order.is_terminal:
+                continue
+            local_orders.add(
+                str(
+                    order.metadata.get("client_order_id")
+                    or order.metadata.get("exchange_order_id")
+                    or order.order_id
+                )
+            )
         if broker.config.market_type == "futures":
             exchange_positions = {
                 symbol_to_instrument.get(
@@ -609,12 +631,17 @@ class ApprovedLiveExecution:
             (order for order in self.order_manager.all() if order.order_id == order_id), None
         )
         if existing is not None:
-            return {
+            result = {
                 "action": "emergency_flatten",
                 "instrument_id": instrument_id,
                 "order_id": order_id,
                 "status": existing.status.value,
             }
+            if self._recovery_instrument_flat(broker, instrument.exchange_symbol, instrument_id):
+                result["status"] = "flat_reconciled"
+            else:
+                result["status"] = "pending_reconciliation"
+            return result
         intent = OrderIntent(
             order_id=order_id,
             portfolio_id=self.product_portfolios[product_id],
@@ -632,12 +659,39 @@ class ApprovedLiveExecution:
             },
         )
         venue.submit(intent)
+        status = (
+            "flat_reconciled"
+            if self._recovery_instrument_flat(broker, instrument.exchange_symbol, instrument_id)
+            else "pending_reconciliation"
+        )
         return {
             "action": "emergency_flatten",
             "instrument_id": instrument_id,
             "order_id": order_id,
-            "status": "submitted",
+            "status": status,
         }
+
+    @staticmethod
+    def _recovery_instrument_flat(broker: Any, exchange_symbol: str, instrument_id: str) -> bool:
+        reader = getattr(broker, "account_snapshot", None)
+        if not callable(reader):
+            return False
+        state = reader(expected_symbols=(exchange_symbol,))
+        if not isinstance(state, Mapping):
+            return False
+        if (
+            state.get("account_state_known") is not True
+            or state.get("account_state_authority") != "authenticated_rest"
+        ):
+            return False
+        positions = state.get("positions")
+        if not isinstance(positions, Mapping):
+            return False
+        quantity = positions.get(instrument_id, positions.get(exchange_symbol, 0.0))
+        try:
+            return abs(float(quantity)) <= 1e-12
+        except (TypeError, ValueError):
+            return False
 
     def authorise(self, payload: Mapping[str, Any], order: OrderIntent) -> None:
         product_id, product, account_id, authority_at = self._order_context(payload, order)
@@ -799,14 +853,7 @@ class ApprovedLiveExecution:
         current = self._current_assignment(
             payload, product_id=product_id, order=order, at=authority_at
         )
-        assignment = self.assignments.assert_binding(
-            product_id=product_id,
-            strategy_version_id=str(current["strategy_version_id"]),
-            artefact_hash=str(current["artefact_hash"]),
-            execution_mode="live",
-            at=authority_at,
-            instrument_id=order.instrument_id,
-        )
+        assignment = current
         artifact = self.artefacts.get(str(assignment["artefact_hash"]))
         self._assert_artifact_identity(
             artifact,
@@ -822,6 +869,7 @@ class ApprovedLiveExecution:
             authority_at=authority_at,
             product=product,
             actual_fingerprint=actual_fingerprint,
+            instrument_id=order.instrument_id,
         )
         return assignment, artifact
 
@@ -836,21 +884,28 @@ class ApprovedLiveExecution:
         requested_strategy_id = str(payload.get("strategy_version_id") or "")
         requested_assignment_id = str(payload.get("assignment_id") or "")
         live_assignments = self.assignments.active_assignments(product_id, at=at)
-        current = next(
-            (
-                item
-                for item in live_assignments
-                if item["execution_mode"] == "live"
-                and item.get("instrument_id") == order.instrument_id
-            ),
-            None,
+        candidates = tuple(
+            item
+            for item in live_assignments
+            if item["execution_mode"] == "live"
+            and order.instrument_id
+            in _live_assignment_instrument_ids(
+                self.engine,
+                (item,),
+                product=self.products[product_id],
+                at=at,
+            )
         )
-        if current is None:
-            raise PermissionError("live instrument has no active canonical assignment")
-        if requested_strategy_id and requested_strategy_id != current["strategy_version_id"]:
-            raise PermissionError("live order strategy identity does not match assignment")
-        if requested_assignment_id and requested_assignment_id != current["id"]:
-            raise PermissionError("live order assignment identity does not match assignment")
+        if requested_assignment_id:
+            candidates = tuple(item for item in candidates if item["id"] == requested_assignment_id)
+        if requested_strategy_id:
+            candidates = tuple(
+                item for item in candidates if item["strategy_version_id"] == requested_strategy_id
+            )
+        if len(candidates) != 1:
+            reason = "no" if not candidates else "ambiguous"
+            raise PermissionError(f"{reason} live assignment matches the order instrument")
+        current = candidates[0]
         requested_artefact_hash = str(payload.get("artefact_hash") or "")
         if requested_artefact_hash and requested_artefact_hash != current["artefact_hash"]:
             raise PermissionError("live order artefact identity does not match assignment")
@@ -888,6 +943,7 @@ class ApprovedLiveExecution:
         authority_at: str,
         product: Mapping[str, Any],
         actual_fingerprint: str,
+        instrument_id: str,
     ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
         strategy_version_id = str(assignment["strategy_version_id"])
         approval = self.approvals.latest(
@@ -925,6 +981,7 @@ class ApprovedLiveExecution:
             account_id=account_id,
             product=product,
             actual_fingerprint=actual_fingerprint,
+            instrument_id=instrument_id,
         )
         return approval, preflight
 
@@ -951,8 +1008,8 @@ class ApprovedLiveExecution:
         account_id: str,
         product: Mapping[str, Any],
         actual_fingerprint: str,
+        instrument_id: str,
     ) -> None:
-        instrument_id = str(assignment.get("instrument_id") or "")
         authority_instrument = self.instruments.get(instrument_id)
         if authority_instrument is None:
             raise PermissionError("live assignment instrument is not persisted")
@@ -1235,6 +1292,53 @@ def _records(
     if not isinstance(rows, list):
         raise ValueError(f"{collection} must be a list")
     return {str(row[identity]): dict(row) for row in rows}
+
+
+def _live_assignment_instrument_ids(
+    engine,
+    assignments: tuple[Mapping[str, Any], ...],
+    *,
+    product: Mapping[str, Any],
+    at: str,
+) -> set[str]:
+    direct = {str(row["instrument_id"]) for row in assignments if row.get("instrument_id")}
+    universe_ids = {str(row["universe_id"]) for row in assignments if row.get("universe_id")}
+    configured_universe = str(product.get("universe_id") or "")
+    if any(value.startswith("product:") for value in universe_ids) and configured_universe:
+        universe_ids = {
+            configured_universe if value.startswith("product:") else value for value in universe_ids
+        }
+    if not universe_ids and product.get("live_instrument_scope") == "current_eligible_universe":
+        universe_ids.add(configured_universe)
+    for universe_id in tuple(value for value in universe_ids if value):
+        snapshot_id = _latest_universe_snapshot_id(engine, universe_id, at=at)
+        if snapshot_id is None:
+            continue
+        with engine.connect() as connection:
+            direct.update(
+                str(value)
+                for value in connection.execute(
+                    select(universe_member.c.instrument_id).where(
+                        universe_member.c.snapshot_id == snapshot_id,
+                        universe_member.c.eligible.is_(True),
+                    )
+                ).scalars()
+            )
+    return direct
+
+
+def _latest_universe_snapshot_id(engine, universe_id: str, *, at: str) -> str | None:
+    with engine.connect() as connection:
+        value = connection.execute(
+            select(universe_snapshot.c.id)
+            .where(
+                universe_snapshot.c.universe_id == universe_id,
+                universe_snapshot.c.observed_at <= at,
+            )
+            .order_by(universe_snapshot.c.observed_at.desc(), universe_snapshot.c.id.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+    return None if value is None else str(value)
 
 
 def _load_instruments(engine: Engine) -> dict[str, Instrument]:

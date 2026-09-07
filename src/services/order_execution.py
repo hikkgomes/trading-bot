@@ -11,6 +11,7 @@ from sqlalchemy import insert, select
 from sqlalchemy.engine import Engine
 
 from src.accounting.ledger import Ledger
+from src.accounting.paper_account import PaperAccountLedger
 from src.data.database import account_snapshot, reconciliation_event
 from src.domain._codec import canonical_hash, timestamp
 from src.domain.market_events import MarketEvent, MarketEventType
@@ -31,6 +32,7 @@ from src.observability.decision_trace import (
     SqlDecisionTraceStore,
 )
 from src.products.btc_accumulation import assert_btc_spot_instrument
+from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.risk.engine import SqlRiskDecisionStore, SqlRiskSnapshotStore
 from src.services.execution_service import ExecutionService
 from src.services.scheduler import DatabaseJobQueue
@@ -157,7 +159,7 @@ class DatabaseExecutionWorker:
         self.order_manager.reload()
         self.positions.reload()
         product_id, mode, configuration, assessment, inputs, targets = self._execution_inputs(
-            payload
+            payload, now=now
         )
         if not assessment.accepted:
             self._record_risk_rejections(
@@ -204,7 +206,7 @@ class DatabaseExecutionWorker:
         }
 
     def _execution_inputs(
-        self, payload: Mapping[str, Any]
+        self, payload: Mapping[str, Any], *, now: str | None = None
     ) -> tuple[str, str, Mapping[str, Any], Any, Mapping[str, Any], tuple[TargetPosition, ...]]:
         product_id = str(payload["product_id"])
         configuration = self.product_execution[product_id]
@@ -220,7 +222,38 @@ class DatabaseExecutionWorker:
         targets = tuple(TargetPosition(**dict(item)) for item in inputs["targets"])
         if not targets:
             raise ValueError("execution job has no targets")
+        if mode == "paper" and now is not None:
+            self._assert_paper_assignment_current(
+                product_id=product_id,
+                targets=targets,
+                now=now,
+            )
         return product_id, mode, configuration, assessment, inputs, targets
+
+    def _assert_paper_assignment_current(
+        self, *, product_id: str, targets: tuple[TargetPosition, ...], now: str
+    ) -> None:
+        assignment_ids = {
+            str(target.metadata.get("assignment_id") or "")
+            for target in targets
+            if target.metadata.get("assignment_id")
+        }
+        if not assignment_ids:
+            return
+        active = {
+            str(row["id"]): row
+            for row in SqlActiveStrategyAssignmentRepository(
+                self.risk_store.engine
+            ).active_assignments(product_id, at=now)
+        }
+        if not assignment_ids.issubset(active):
+            raise PermissionError("paper target assignment is no longer active")
+        if any(
+            active[assignment_id]["execution_mode"] == "live"
+            or active[assignment_id]["lifecycle_state"] in {"live_canary", "live"}
+            for assignment_id in assignment_ids
+        ):
+            raise PermissionError("paper execution is blocked after live authority activation")
 
     def _record_risk_rejections(
         self, targets: tuple[TargetPosition, ...], *, event_id: str, reason_code: str
@@ -326,6 +359,7 @@ class DatabaseExecutionWorker:
             "product_id": product_id,
             "event_id": str(payload["event_id"]),
             "price": float(prices[order.instrument_id]),
+            "quantity": order.quantity,
             "execution_costs": configuration["execution_costs"],
             "accounting_asset": configuration["base_accounting_asset"],
             "fee_in_base": product_id == "btc_accumulation",
@@ -465,6 +499,7 @@ class DatabaseLiveExecutionWorker:
         venues: Mapping[str, Any],
         authorise: Callable[[Mapping[str, Any], OrderIntent], None],
         order_groups: OrderGroupManager | None = None,
+        paper_accounts: Mapping[str, PaperAccountLedger] | None = None,
         lease_seconds: int = 60,
         job_name: str = "live_order_submit",
         prepare_protective_stop: Callable[[str, OrderIntent, str], object] | None = None,
@@ -479,6 +514,7 @@ class DatabaseLiveExecutionWorker:
         self.venues = dict(venues)
         self.authorise = authorise
         self.order_groups = order_groups
+        self.paper_accounts = dict(paper_accounts or {})
         self.lease_seconds = lease_seconds
         self.job_name = job_name
         self.prepare_protective_stop = prepare_protective_stop
@@ -637,6 +673,7 @@ class DatabasePaperExecutionWorker:
         ledgers: Mapping[str, Ledger],
         trace_store: SqlDecisionTraceStore,
         order_groups: OrderGroupManager | None = None,
+        paper_accounts: Mapping[str, PaperAccountLedger] | None = None,
         lease_seconds: int = 60,
     ) -> None:
         self.queue = queue
@@ -646,6 +683,7 @@ class DatabasePaperExecutionWorker:
         self.ledgers = dict(ledgers)
         self.trace_store = trace_store
         self.order_groups = order_groups
+        self.paper_accounts = dict(paper_accounts or {})
         self.lease_seconds = lease_seconds
 
     def run_once(self, *, now: str) -> dict[str, Any]:
@@ -658,86 +696,7 @@ class DatabasePaperExecutionWorker:
         if claimed is None:
             return {"reason_code": "paper_order_queue_empty"}
         try:
-            payload = claimed.payload
-            self.order_manager.reload()
-            self.positions.reload()
-            order = self.order_manager.get(str(payload["order_id"]))
-            if order.status is OrderStatus.FILLED:
-                fills = self.order_manager.fills_for(order.order_id)
-                fill_id = fills[-1].fill_id if fills else None
-                self.queue.complete(claimed, completed_at=now)
-                return {
-                    "reason_code": "paper_order_already_filled",
-                    "job_id": claimed.job_id,
-                    "order_id": order.order_id,
-                    "fill_id": fill_id,
-                }
-            if now >= order.valid_until and not order.is_terminal:
-                self.order_manager.transition(
-                    order.order_id,
-                    OrderStatus.EXPIRED,
-                    event_at=now,
-                )
-                self.queue.complete(claimed, completed_at=now)
-                return {
-                    "reason_code": "paper_order_expired",
-                    "job_id": claimed.job_id,
-                    "order_id": order.order_id,
-                    "valid_until": order.valid_until,
-                }
-            previous_position = self.positions.get(order.portfolio_id, order.instrument_id)
-            costs = dict(payload["execution_costs"])
-            venue = PaperExchange(
-                order_manager=self.order_manager,
-                position_manager=self.positions,
-                price_source=lambda _instrument_id: float(payload["price"]),
-                fee_bps=float(costs["fee_bps"]),
-                slippage_bps=float(costs["slippage_bps"]),
-                fill_fraction=float(payload.get("fill_fraction", 1.0)),
-                fee_asset=str(payload["accounting_asset"]),
-                fee_in_base=bool(payload["fee_in_base"]),
-            )
-            _before_group_submission(self.order_groups, order)
-            fill = (
-                venue.fill_remaining(order.order_id, fill_fraction=1.0)
-                if order.status is OrderStatus.PARTIALLY_FILLED
-                else venue.submit(order)
-            )
-            recorder = ExecutionService(
-                paper_exchange=venue,
-                positions=self.positions,
-                ledger=self.ledgers[str(payload["product_id"])],
-                trace_store=self.trace_store,
-            )
-            recorder.record_execution_costs(order, fill, previous_position=previous_position)
-            updated = self.order_manager.get(order.order_id)
-            position = self.positions.get(order.portfolio_id, order.instrument_id)
-            trace = _filled_trace(
-                event_id=str(payload["event_id"]),
-                order_id=order.order_id,
-                instrument_id=order.instrument_id,
-                fill_id=fill.fill_id,
-                partial=updated.status is OrderStatus.PARTIALLY_FILLED,
-                position_quantity=position.quantity,
-            )
-            self.trace_store.append(trace)
-            _after_group_fill(self.order_groups, self.order_manager, updated)
-            continuation_job_id = None
-            if updated.status is OrderStatus.PARTIALLY_FILLED:
-                continuation_payload = {**payload, "fill_fraction": 1.0}
-                continuation_job_id = "paper-order-continue:" + canonical_hash(
-                    {
-                        "order_id": order.order_id,
-                        "filled_quantity": updated.filled_quantity,
-                    }
-                ).removeprefix("sha256:")
-                self.queue.enqueue_if_absent(
-                    job_id=continuation_job_id,
-                    name="paper_order_continue",
-                    payload=continuation_payload,
-                    available_at=now,
-                    priority=32,
-                )
+            return self._execute_paper_order(claimed, now=now)
         except Exception as exc:
             try:
                 current = self.order_manager.get(str(claimed.payload.get("order_id") or ""))
@@ -764,6 +723,136 @@ class DatabasePaperExecutionWorker:
                 "error_type": type(exc).__name__,
                 "error": str(exc),
             }
+
+    def _repair_paper_account(
+        self,
+        *,
+        paper_account: PaperAccountLedger,
+        order: OrderIntent,
+        fills: tuple[Fill, ...],
+    ) -> None:
+        """Replay durable fills missing after a crash in paper bookkeeping."""
+
+        state = paper_account.ensure_seed(observed_at=fills[0].occurred_at)
+        replay_positions = PositionManager()
+        for instrument_id, quantity in state.positions.items():
+            replay_positions.reconcile_position(
+                portfolio_id=order.portfolio_id,
+                instrument_id=instrument_id,
+                quantity=float(quantity),
+                average_entry_price=float(state.position_entry_prices.get(instrument_id, 0.0)),
+                updated_at=state.observed_at,
+            )
+        recorded = paper_account.recorded_fill_ids()
+        for fill in fills:
+            if fill.fill_id in recorded:
+                continue
+            previous_position = replay_positions.get(order.portfolio_id, fill.instrument_id)
+            updated_position = replay_positions.apply_fill(
+                order.portfolio_id,
+                fill,
+                contributions=dict(order.strategy_contributions),
+                assignment_id=_order_assignment_id(order),
+            )
+            paper_account.record_fill(
+                order=order,
+                fill=fill,
+                position=updated_position,
+                previous_position=previous_position,
+            )
+            recorded = paper_account.recorded_fill_ids()
+
+    def _execute_paper_order(self, claimed, *, now: str) -> dict[str, Any]:
+        payload = claimed.payload
+        self.order_manager.reload()
+        self.positions.reload()
+        order = self.order_manager.get(str(payload["order_id"]))
+        if order.status is OrderStatus.FILLED:
+            fills = self.order_manager.fills_for(order.order_id)
+            paper_account = self.paper_accounts.get(str(payload["product_id"]))
+            if paper_account is not None:
+                if not fills:
+                    raise RuntimeError("filled paper order has no durable fill records")
+                self._repair_paper_account(
+                    paper_account=paper_account,
+                    order=order,
+                    fills=fills,
+                )
+            return self._complete_already_filled(claimed, now=now, order=order, fills=fills)
+        if now >= order.valid_until and not order.is_terminal:
+            self.order_manager.transition(
+                order.order_id,
+                OrderStatus.EXPIRED,
+                event_at=now,
+            )
+            self.queue.complete(claimed, completed_at=now)
+            return {
+                "reason_code": "paper_order_expired",
+                "job_id": claimed.job_id,
+                "order_id": order.order_id,
+                "valid_until": order.valid_until,
+            }
+        previous_position = self.positions.get(order.portfolio_id, order.instrument_id)
+        costs = dict(payload["execution_costs"])
+        venue = PaperExchange(
+            order_manager=self.order_manager,
+            position_manager=self.positions,
+            price_source=lambda _instrument_id: float(payload["price"]),
+            fee_bps=float(costs["fee_bps"]),
+            slippage_bps=float(costs["slippage_bps"]),
+            fill_fraction=float(payload.get("fill_fraction", 1.0)),
+            fee_asset=str(payload["accounting_asset"]),
+            fee_in_base=bool(payload["fee_in_base"]),
+        )
+        _before_group_submission(self.order_groups, order)
+        fill = (
+            venue.fill_remaining(order.order_id, fill_fraction=1.0)
+            if order.status is OrderStatus.PARTIALLY_FILLED
+            else venue.submit(order)
+        )
+        recorder = ExecutionService(
+            paper_exchange=venue,
+            positions=self.positions,
+            ledger=self.ledgers[str(payload["product_id"])],
+            trace_store=self.trace_store,
+        )
+        recorder.record_execution_costs(order, fill, previous_position=previous_position)
+        updated = self.order_manager.get(order.order_id)
+        position = self.positions.get(order.portfolio_id, order.instrument_id)
+        paper_account = self.paper_accounts.get(str(payload["product_id"]))
+        if paper_account is not None:
+            paper_account.record_fill(
+                order=order,
+                fill=fill,
+                position=position,
+                previous_position=previous_position,
+            )
+        trace = _filled_trace(
+            event_id=str(payload["event_id"]),
+            order_id=order.order_id,
+            instrument_id=order.instrument_id,
+            fill_id=fill.fill_id,
+            partial=updated.status is OrderStatus.PARTIALLY_FILLED,
+            position_quantity=position.quantity,
+        )
+        self.trace_store.append(trace)
+        _after_group_fill(self.order_groups, self.order_manager, updated)
+        continuation_job_id = None
+        if updated.status is OrderStatus.PARTIALLY_FILLED:
+            continuation_payload = {**payload, "fill_fraction": 1.0}
+            continuation_job_id = "paper-order-continue:" + canonical_hash(
+                {
+                    "order_id": order.order_id,
+                    "filled_quantity": updated.filled_quantity,
+                }
+            ).removeprefix("sha256:")
+            self.queue.enqueue_if_absent(
+                job_id=continuation_job_id,
+                name="paper_order_continue",
+                payload=continuation_payload,
+                available_at=now,
+                priority=32,
+            )
         self.queue.complete(claimed, completed_at=now)
         return {
             "reason_code": (
@@ -776,6 +865,18 @@ class DatabasePaperExecutionWorker:
             "fill_id": fill.fill_id,
             "remaining_quantity": updated.remaining_quantity,
             "continuation_job_id": continuation_job_id,
+        }
+
+    def _complete_already_filled(
+        self, claimed, *, now: str, order: OrderIntent, fills: tuple[Fill, ...]
+    ) -> dict[str, Any]:
+        fill_id = fills[-1].fill_id if fills else None
+        self.queue.complete(claimed, completed_at=now)
+        return {
+            "reason_code": "paper_order_already_filled",
+            "job_id": claimed.job_id,
+            "order_id": order.order_id,
+            "fill_id": fill_id,
         }
 
 
@@ -1064,6 +1165,7 @@ class DatabaseUserStreamWorker:
             order.portfolio_id,
             fill,
             contributions=dict(order.strategy_contributions),
+            assignment_id=_order_assignment_id(order),
         )
         if product_id is not None and product_id in self.ledgers:
             recorder = ExecutionService(
@@ -1515,6 +1617,15 @@ def _filled_trace(
         trace = trace.pass_stage(DecisionTraceStage.POSITION_OPENED)
         return trace.pass_stage(DecisionTraceStage.POSITION_CLOSED, quantity=position_quantity)
     return trace.pass_stage(DecisionTraceStage.POSITION_OPENED, quantity=position_quantity)
+
+
+def _order_assignment_id(order: OrderIntent) -> str | None:
+    target_metadata = order.metadata.get("target_metadata")
+    if isinstance(target_metadata, Mapping) and target_metadata.get("assignment_id"):
+        return str(target_metadata["assignment_id"])
+    if order.metadata.get("assignment_id"):
+        return str(order.metadata["assignment_id"])
+    return None
 
 
 def _retry_at(value: str, seconds: int) -> str:

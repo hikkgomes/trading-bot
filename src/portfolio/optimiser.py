@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -145,7 +147,8 @@ def _sized_forecast(
     funding_rate = float(funding_rates.get(forecast.instrument_id, 0.0))
     direction_sign = 1.0 if forecast.direction is ForecastDirection.LONG else -1.0
     gross_expected_return = forecast.expected_strategy_return
-    net_expected_return = gross_expected_return - direction_sign * funding_rate
+    effective_funding_rate = _effective_funding_rate(forecast, funding_rate)
+    net_expected_return = gross_expected_return - direction_sign * effective_funding_rate
     if net_expected_return <= 0:
         return None
     signal_scale = forecast.score * forecast.confidence
@@ -159,12 +162,34 @@ def _sized_forecast(
         1.0,
         net_expected_return / gross_expected_return if gross_expected_return > 0 else 0.0,
     )
-    fraction = (
-        min(constraints.max_symbol_fraction, forecast.maximum_position)
-        * signal_scale
-        * volatility_scale
-        * funding_scale
-    )
+    semantic_target = forecast.metadata.get("semantic_target_fraction")
+    if semantic_target is not None:
+        try:
+            semantic_target_value = float(semantic_target)
+            semantic_target_max_abs = float(
+                forecast.metadata.get("semantic_target_max_abs", abs(semantic_target_value))
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("semantic target fraction is invalid") from exc
+        if (
+            not math.isfinite(semantic_target_value)
+            or not math.isfinite(semantic_target_max_abs)
+            or semantic_target_max_abs <= 0.0
+        ):
+            raise ValueError("semantic target fraction is invalid")
+        target_fraction = (
+            abs(semantic_target_value)
+            / semantic_target_max_abs
+            * min(constraints.max_symbol_fraction, forecast.maximum_position)
+        )
+        fraction = target_fraction * forecast.confidence * volatility_scale * funding_scale
+    else:
+        fraction = (
+            min(constraints.max_symbol_fraction, forecast.maximum_position)
+            * signal_scale
+            * volatility_scale
+            * funding_scale
+        )
     fraction = min(
         fraction,
         max(0.0, float(liquidity_fraction_caps.get(forecast.instrument_id, 1.0))),
@@ -212,9 +237,14 @@ def _try_allocate_forecast(
     margin_limit: float,
     leverage: float,
 ) -> bool:
+    semantic_group = str(forecast.metadata.get("semantic_group_id") or "")
     if any(
         _correlation(correlations, forecast.instrument_id, previous.instrument_id)
         > constraints.max_correlation
+        and (
+            not semantic_group
+            or str(previous.metadata.get("semantic_group_id") or "") != semantic_group
+        )
         for previous, _ in state.selected
     ):
         return False
@@ -242,14 +272,36 @@ def _try_allocate_forecast(
     fraction, current_fraction, sleeve, cluster = sizing
     if fraction <= 1e-12:
         return False
-    signed = fraction if forecast.direction is ForecastDirection.LONG else -fraction
+    semantic_target = forecast.metadata.get("semantic_target_fraction")
+    semantic_sign = (
+        math.copysign(1.0, float(semantic_target))
+        if semantic_target is not None and float(semantic_target) != 0.0
+        else None
+    )
+    signed = (
+        semantic_sign * fraction
+        if semantic_sign is not None
+        else fraction
+        if forecast.direction is ForecastDirection.LONG
+        else -fraction
+    )
     candidate_turnover = state.turnover + abs(signed - current_fraction)
     candidate_beta = state.beta + signed * float(
         beta_by_instrument.get(forecast.instrument_id, 0.0)
     )
+    same_semantic_group = bool(
+        semantic_group
+        and any(
+            str(previous.metadata.get("semantic_group_id") or "") == semantic_group
+            for previous, _ in state.selected
+        )
+    )
     if (
-        abs(state.net + signed) > constraints.max_net_fraction + 1e-12
-        or abs(candidate_beta) > constraints.max_abs_beta + 1e-12
+        not same_semantic_group
+        and (
+            abs(state.net + signed) > constraints.max_net_fraction + 1e-12
+            or abs(candidate_beta) > constraints.max_abs_beta + 1e-12
+        )
         or candidate_turnover > constraints.max_turnover_fraction + 1e-12
     ):
         return False
@@ -277,7 +329,8 @@ def _target_metadata(
     funding_rate = float(funding_rates.get(forecast.instrument_id, 0.0))
     direction_sign = 1.0 if forecast.direction is ForecastDirection.LONG else -1.0
     gross_expected_return = forecast.expected_strategy_return
-    net_expected_return = gross_expected_return - direction_sign * funding_rate
+    effective_funding_rate = _effective_funding_rate(forecast, funding_rate)
+    net_expected_return = gross_expected_return - direction_sign * effective_funding_rate
     metadata: dict[str, object] = {
         "expected_return": forecast.expected_return,
         "expected_asset_return": forecast.expected_asset_return,
@@ -288,6 +341,8 @@ def _target_metadata(
         "score": forecast.score,
         "observed_volatility": observed_volatility.get(forecast.instrument_id),
         "funding_rate": funding_rate,
+        "funding_event_count": _funding_event_count(forecast),
+        "expected_funding_cost_fraction": effective_funding_rate,
         "liquidity_fraction_cap": liquidity_fraction_caps.get(forecast.instrument_id, 1.0),
         "sleeve": forecast.metadata.get("sleeve") or "directional",
         "cluster": cluster_by_instrument.get(
@@ -305,11 +360,100 @@ def _target_metadata(
         metadata["order_group_key"] = str(forecast.metadata["order_group_key"])
     if forecast.metadata.get("semantic_group_id"):
         metadata["semantic_group_id"] = str(forecast.metadata["semantic_group_id"])
+    for key in (
+        "semantic_strategy",
+        "semantic_target_fraction",
+        "semantic_target_max_abs",
+        "semantic_target_notional",
+    ):
+        if forecast.metadata.get(key) is not None:
+            metadata[key] = forecast.metadata[key]
+    if forecast.metadata.get("semantic_hedge_error") is not None:
+        metadata["semantic_hedge_error"] = forecast.metadata["semantic_hedge_error"]
     if forecast.metadata.get("recovery_policy"):
         metadata["recovery_policy"] = str(forecast.metadata["recovery_policy"])
     if forecast.metadata.get("assignment_id"):
         metadata["assignment_id"] = str(forecast.metadata["assignment_id"])
     return metadata
+
+
+def _funding_event_count(forecast: AlphaForecast) -> int:
+    """Estimate funding events inside the forecast holding horizon.
+
+    Binance funding is charged at discrete events. A short forecast should not
+    be penalised as if it held through an event merely because a current rate
+    exists. Runtime metadata may provide the next event explicitly; otherwise
+    the conservative default uses the standard eight-hour interval.
+    """
+
+    raw_count = forecast.metadata.get("expected_funding_events")
+    if raw_count is not None:
+        return _explicit_funding_event_count(raw_count)
+    interval = _funding_interval(forecast)
+    horizon = _funding_horizon(forecast)
+    next_event = forecast.metadata.get("next_funding_at")
+    if next_event is None:
+        return int(horizon // interval)
+    return _scheduled_funding_event_count(forecast, interval=interval, horizon=horizon)
+
+
+def _explicit_funding_event_count(raw_count: object) -> int:
+    if isinstance(raw_count, bool):
+        raise ValueError("expected_funding_events must be an integer")
+    try:
+        count = int(raw_count)
+        exact = float(raw_count)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("expected_funding_events must be an integer") from exc
+    if exact != count or count < 0:
+        raise ValueError("expected_funding_events must be non-negative")
+    return count
+
+
+def _funding_interval(forecast: AlphaForecast) -> float:
+    try:
+        interval = float(forecast.metadata.get("funding_interval_seconds", 8 * 3_600))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("funding_interval_seconds must be numeric") from exc
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError("funding_interval_seconds must be positive")
+    return interval
+
+
+def _funding_horizon(forecast: AlphaForecast) -> float:
+    raw_horizon = forecast.metadata.get("expected_holding_seconds", forecast.horizon_seconds)
+    if isinstance(raw_horizon, bool):
+        raise ValueError("expected_holding_seconds must be non-negative")
+    try:
+        horizon = float(raw_horizon)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("expected_holding_seconds must be non-negative") from exc
+    if not math.isfinite(horizon) or horizon < 0:
+        raise ValueError("expected_holding_seconds must be non-negative")
+    return horizon
+
+
+def _scheduled_funding_event_count(
+    forecast: AlphaForecast, *, interval: float, horizon: float
+) -> int:
+    try:
+        start = dt.datetime.fromisoformat(forecast.valid_from)
+        first = dt.datetime.fromisoformat(str(forecast.metadata["next_funding_at"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("next_funding_at must be an ISO timestamp") from exc
+    if first < start:
+        first += dt.timedelta(
+            seconds=interval * math.ceil((start - first).total_seconds() / interval)
+        )
+    if first > start + dt.timedelta(seconds=horizon):
+        return 0
+    return int((start + dt.timedelta(seconds=horizon) - first).total_seconds() // interval) + 1
+
+
+def _effective_funding_rate(forecast: AlphaForecast, current_rate: float) -> float:
+    if not math.isfinite(current_rate):
+        raise ValueError("funding rate must be finite")
+    return current_rate * _funding_event_count(forecast)
 
 
 def _build_open_targets(

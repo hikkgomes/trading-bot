@@ -461,6 +461,7 @@ def validate_job_payload(name: str, payload: Mapping[str, Any]) -> dict[str, Any
         "strategy_evaluation": _validate_strategy_evaluation,
         "portfolio_target_build": _validate_portfolio_target_build,
         "emergency_reduction": _validate_emergency_reduction,
+        "historical_bootstrap": _validate_historical_bootstrap,
     }
     validator = validators.get(name)
     return (
@@ -544,6 +545,7 @@ def _validate_portfolio_target_build(payload: Mapping[str, Any]) -> dict[str, An
                 "event_id",
                 "product_id",
                 "forecast_id",
+                "assignment_id",
                 "market_data_snapshot_id",
                 "evaluated_at",
                 "producer_identity",
@@ -555,6 +557,7 @@ def _validate_portfolio_target_build(payload: Mapping[str, Any]) -> dict[str, An
                 "event_id",
                 "product_id",
                 "forecast_id",
+                "assignment_id",
                 "evaluated_at",
                 "producer_identity",
                 "content_hash",
@@ -604,6 +607,42 @@ def _validate_emergency_reduction(payload: Mapping[str, Any]) -> dict[str, Any]:
     if content_hash != canonical_hash(unsigned):
         raise JobSchemaError("emergency reduction content_hash does not match its payload")
     return {**dict(payload), "position_quantity": numeric_quantity, "evaluated_at": evaluated_at}
+
+
+def _validate_historical_bootstrap(payload: Mapping[str, Any]) -> dict[str, Any]:
+    allowed = frozenset(
+        {
+            "schedule_name",
+            "product_id",
+            "universe_id",
+            "available_at",
+            "producer_identity",
+            "market_type",
+            "minimum_history_days",
+            "symbols",
+            "timeframe",
+            "content_hash",
+        }
+    )
+    _strict_fields(payload, allowed, name="historical bootstrap")
+    for field in ("product_id", "producer_identity", "market_type", "timeframe"):
+        _required_text(payload, field)
+    symbols = payload.get("symbols")
+    if not isinstance(symbols, Sequence) or isinstance(symbols, str) or not symbols:
+        raise JobSchemaError("historical bootstrap symbols must be a non-empty list")
+    if len(symbols) > 100:
+        raise JobSchemaError("historical bootstrap symbols exceed the bounded universe limit")
+    if any(not isinstance(symbol, str) or not symbol.strip() for symbol in symbols):
+        raise JobSchemaError("historical bootstrap symbols must be non-empty strings")
+    days = payload.get("minimum_history_days")
+    if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
+        raise JobSchemaError("minimum_history_days must be a positive integer")
+    _hash_id(payload, "content_hash")
+    unsigned = dict(payload)
+    unsigned.pop("content_hash", None)
+    if canonical_hash(unsigned) != payload["content_hash"]:
+        raise JobSchemaError("historical bootstrap content_hash does not match the payload")
+    return json_value(dict(payload), field="historical bootstrap payload")
 
 
 def build_content_hash(payload: Mapping[str, Any]) -> str:

@@ -7,6 +7,7 @@ import os
 import signal
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,6 @@ from src.services.supervisor import (
     _account_reconciliation_cycle,
     _accounting_cycle,
     _agent_cycle,
-    _by_id,
     _data_writer_cycle,
     _execution_cycle,
     _feature_cycle,
@@ -44,14 +44,16 @@ from src.services.supervisor import (
 PROCESS_SERVICES = {
     process: services
     for process, services in PLATFORM_PROCESS_SERVICES.items()
-    if process in {"trading-runtime", "research-runtime", "agent-runtime"}
+    if process
+    in {
+        "market-gateway",
+        "data-writer",
+        "trading-runtime",
+        "scheduler-operations",
+        "research-runtime",
+        "agent-runtime",
+    }
 }
-
-
-def _configuration_by_id(configuration: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    products = _by_id(configuration["products"], collection="products", identity="product_id")
-    accounts = _by_id(configuration["accounts"], collection="accounts", identity="account_id")
-    return products, accounts
 
 
 def _build_trading_work(
@@ -61,66 +63,81 @@ def _build_trading_work(
     node_id: str,
     configuration: Mapping[str, Any],
     alerts: Any,
+    selected_services: tuple[str, ...] | None = None,
 ) -> dict[str, Callable[[], Mapping[str, Any] | None]]:
-    products, _accounts = _configuration_by_id(configuration)
+    selected = set(selected_services or PLATFORM_PROCESS_SERVICES["trading-runtime"])
     heartbeat_store = DatabaseHeartbeatStore(database.engine)
     control_plane = DatabaseControlPlane(
         database.engine,
         heartbeat_store,
         configuration={str(key): dict(value) for key, value in configuration.items()},
     )
-    return {
-        "market-gateway": _market_gateway_cycle(
+    builders: dict[str, Callable[[], Callable[[], Mapping[str, Any] | None]]] = {
+        "market-gateway": lambda: _market_gateway_cycle(
             database=database,
             configuration=configuration,
             config_root=Path("config"),
             maximum_seconds=15.0,
         ),
-        "data-writer": _data_writer_cycle(
+        "data-writer": lambda: _data_writer_cycle(
             database=database,
             node_id=node_id,
             root=Path(config.paths["parquet"]),
             configuration=configuration,
         ),
-        "feature-service": _feature_cycle(
+        "feature-service": lambda: _feature_cycle(
             database=database,
             node_id=node_id,
             service_name="feature-service",
             parquet_root=Path(config.paths["parquet"]),
         ),
-        "universe-service": _universe_cycle(database=database, node_id=node_id),
-        "platform-scheduler": _platform_scheduler_cycle(
+        "universe-service": lambda: _universe_cycle(database=database, node_id=node_id),
+        "platform-scheduler": lambda: _platform_scheduler_cycle(
             database=database, node_id=node_id, configuration=configuration
         ),
-        "strategy-evaluator": _strategy_evaluator_cycle(database=database, node_id=node_id),
-        "product-supervisor": _product_coordination_cycle(database=database, node_id=node_id),
-        "portfolio-engine": _portfolio_cycle(
+        "strategy-evaluator": lambda: _strategy_evaluator_cycle(database=database, node_id=node_id),
+        "product-supervisor": lambda: _product_coordination_cycle(
+            database=database, node_id=node_id
+        ),
+        "portfolio-engine": lambda: _portfolio_cycle(
             database=database, configuration=configuration, node_id=node_id
         ),
-        "portfolio-state-service": _portfolio_state_cycle(
+        "portfolio-state-service": lambda: _portfolio_state_cycle(
             database=database, configuration=configuration, node_id=node_id
         ),
-        "risk-engine": _risk_cycle(database=database, node_id=node_id, configuration=configuration),
-        "execution-engine": _execution_cycle(
+        "risk-engine": lambda: _risk_cycle(
+            database=database, node_id=node_id, configuration=configuration
+        ),
+        "execution-engine": lambda: _execution_cycle(
             database=database,
             configuration=configuration,
             node_id=node_id,
             alerts=alerts,
             control_plane=control_plane,
         ),
-        "paper-engine": _paper_cycle(
+        "paper-engine": lambda: _paper_cycle(
             database=database, node_id=node_id, configuration=configuration
         ),
-        "accounting-service": _accounting_cycle(database=database, node_id=node_id),
-        "account-reconciliation": _account_reconciliation_cycle(
+        "accounting-service": lambda: _accounting_cycle(database=database, node_id=node_id),
+        "account-reconciliation": lambda: _account_reconciliation_cycle(
             database=database, configuration=configuration, alerts=alerts
         ),
+        "promotion-engine": lambda: _promotion_cycle(
+            database=database, node_id=node_id, configuration=configuration
+        ),
     }
+    return {name: builders[name]() for name in selected if name in builders}
 
 
 def _build_research_work(
-    *, database: PlatformDatabase, config: Any, configuration: Mapping[str, Any], node_id: str
+    *,
+    database: PlatformDatabase,
+    config: Any,
+    configuration: Mapping[str, Any],
+    node_id: str,
+    selected_services: tuple[str, ...] | None = None,
 ) -> dict[str, Callable[[], Mapping[str, Any] | None]]:
+    selected = set(selected_services or PLATFORM_PROCESS_SERVICES["research-runtime"])
     heartbeat_store = DatabaseHeartbeatStore(database.engine)
     runtime_by_service = {
         service: ServiceRuntime(
@@ -129,13 +146,15 @@ def _build_research_work(
             service_name=service,
             heartbeat_store=heartbeat_store,
         )
-        for service in PROCESS_SERVICES["research-runtime"]
+        for service in selected
     }
-    work: dict[str, Callable[[], Mapping[str, Any] | None]] = {
-        "promotion-engine": _promotion_cycle(
+    work: dict[str, Callable[[], Mapping[str, Any] | None]] = {}
+    if "promotion-engine" in selected:
+        work["promotion-engine"] = _promotion_cycle(
             database=database, node_id=node_id, configuration=configuration
-        ),
-        "research-worker": _research_cycle(
+        )
+    if "research-worker" in selected:
+        work["research-worker"] = _research_cycle(
             database=database,
             node_id=node_id,
             service_name="research-worker",
@@ -147,8 +166,9 @@ def _build_research_work(
             artefact_root=Path(config.paths["artefacts"]),
             research_configuration=configuration["research"],
             configuration=configuration,
-        ),
-        "ml-worker": _research_cycle(
+        )
+    if "ml-worker" in selected:
+        work["ml-worker"] = _research_cycle(
             database=database,
             node_id=node_id,
             service_name="ml-worker",
@@ -160,8 +180,9 @@ def _build_research_work(
             artefact_root=Path(config.paths["artefacts"]),
             research_configuration=configuration["research"],
             configuration=configuration,
-        ),
-        "event-replay-worker": _research_cycle(
+        )
+    if "event-replay-worker" in selected:
+        work["event-replay-worker"] = _research_cycle(
             database=database,
             node_id=node_id,
             service_name="event-replay-worker",
@@ -173,14 +194,14 @@ def _build_research_work(
             artefact_root=Path(config.paths["artefacts"]),
             research_configuration=configuration["research"],
             configuration=configuration,
-        ),
-        "feature-build-worker": _feature_cycle(
+        )
+    if "feature-build-worker" in selected:
+        work["feature-build-worker"] = _feature_cycle(
             database=database,
             node_id=node_id,
             service_name="feature-build-worker",
             parquet_root=Path(config.paths["parquet"]),
-        ),
-    }
+        )
     return work
 
 
@@ -204,6 +225,12 @@ def _build_agent_work(
             repository=Path.cwd(),
             worktree_root=Path(root),
             research_configuration=configuration["research"],
+            forbidden_secret_names=tuple(
+                str(account[field])
+                for account in configuration["accounts"]["accounts"]
+                for field in ("api_key_env", "api_secret_env")
+                if account.get(field)
+            ),
         )
     }
 
@@ -217,17 +244,27 @@ def _build_work(
     node_id: str,
     alerts: Any,
 ) -> dict[str, Callable[[], Mapping[str, Any] | None]]:
-    if process_name == "trading-runtime":
+    if process_name in {
+        "market-gateway",
+        "data-writer",
+        "trading-runtime",
+        "scheduler-operations",
+    }:
         return _build_trading_work(
             database=database,
             config=config,
             node_id=node_id,
             configuration=configuration,
             alerts=alerts,
+            selected_services=PROCESS_SERVICES[process_name],
         )
     if process_name == "research-runtime":
         return _build_research_work(
-            database=database, config=config, configuration=configuration, node_id=node_id
+            database=database,
+            config=config,
+            configuration=configuration,
+            node_id=node_id,
+            selected_services=PROCESS_SERVICES[process_name],
         )
     if process_name == "agent-runtime":
         return _build_agent_work(
@@ -260,6 +297,23 @@ def run(args: argparse.Namespace) -> int:
         node_id=args.node,
         alerts=alerts,
     )
+    return _run_process_loop(
+        args,
+        database=database,
+        work=work,
+        config=config,
+        heartbeat_store=heartbeat_store,
+    )
+
+
+def _run_process_loop(
+    args: argparse.Namespace,
+    *,
+    database: PlatformDatabase,
+    work: Mapping[str, Callable[[], Mapping[str, Any] | None]],
+    config: Any,
+    heartbeat_store: DatabaseHeartbeatStore,
+) -> int:
     runtimes = {
         service: ServiceRuntime(
             config=config,
@@ -277,18 +331,32 @@ def run(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    while not stopping:
-        cycles = {service: runtimes[service].run_once(work[service]) for service in work}
-        if args.once:
-            database.dispose()
-            return 0 if all(cycle.healthy for cycle in cycles.values()) else 1
-        time.sleep(args.interval_seconds)
-    gateway = work.get("market-gateway")
-    stop = getattr(gateway, "stop", None)
-    if callable(stop):
-        stop()
+    with ThreadPoolExecutor(
+        max_workers=max(1, len(work)), thread_name_prefix="platform-service"
+    ) as pool:
+        while not stopping:
+            futures = {
+                service: pool.submit(runtimes[service].run_once, work[service]) for service in work
+            }
+            cycles = {service: future.result() for service, future in futures.items()}
+            if args.once:
+                _shutdown_work(work)
+                database.dispose()
+                return 0 if all(cycle.healthy for cycle in cycles.values()) else 1
+            time.sleep(args.interval_seconds)
+    _shutdown_work(work)
     database.dispose()
     return 0
+
+
+def _shutdown_work(work: Mapping[str, Callable[[], Mapping[str, Any] | None]]) -> None:
+    for cycle in work.values():
+        stop = getattr(cycle, "stop", None)
+        if callable(stop):
+            stop()
+        close = getattr(cycle, "close", None)
+        if callable(close):
+            close()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

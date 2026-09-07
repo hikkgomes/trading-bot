@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from src.data.database import strategy_artefact
 from src.data.feature_store import SqlFeatureStore
+from src.data.universe import SqlUniverseStore
 from src.domain._codec import canonical_hash, timestamp
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
@@ -51,6 +52,7 @@ class DatabaseStrategyEvaluator:
         self.lease_seconds = lease_seconds
 
     def run_once(self, *, now: str) -> dict[str, Any]:
+        now = timestamp(now, field="now")
         claimed = self.queue.claim(
             worker_id=self.worker_id,
             now=now,
@@ -62,7 +64,11 @@ class DatabaseStrategyEvaluator:
         try:
             payload = validate_job_payload("strategy_evaluation", claimed.payload)
             product_id = payload["product_id"]
-            assignment = self._active_assignment(payload, product_id=product_id)
+            assignment = self._active_assignment(
+                payload,
+                product_id=product_id,
+                current_at=now,
+            )
             if self._is_diagnostic_assignment(assignment):
                 self.queue.complete(claimed, completed_at=now)
                 return {
@@ -85,6 +91,7 @@ class DatabaseStrategyEvaluator:
                 payload=payload,
                 product_id=product_id,
                 forecast_id=forecast_id,
+                assignment_id=str(assignment["id"]),
                 at=at,
             )
         except Exception as exc:
@@ -109,13 +116,44 @@ class DatabaseStrategyEvaluator:
         }
 
     def _active_assignment(
-        self, payload: Mapping[str, Any], *, product_id: str
+        self,
+        payload: Mapping[str, Any],
+        *,
+        product_id: str,
+        current_at: str | None = None,
     ) -> Mapping[str, Any]:
         assignment = self.assignments.by_id(str(payload["assignment_id"]))
+        if current_at is not None:
+            active_rows = self.assignments.active_assignments(product_id, at=current_at)
+            if isinstance(active_rows, tuple):
+                assignment = next(
+                    (
+                        row
+                        for row in active_rows
+                        if str(row.get("id")) == str(payload["assignment_id"])
+                    ),
+                    None,
+                )
         if assignment is None or not assignment["active"] or assignment["product_id"] != product_id:
             raise ValueError(f"no active strategy assignment for {product_id}")
+        if not self._is_diagnostic_assignment(assignment) and assignment.get(
+            "lifecycle_state"
+        ) not in {
+            "forward_paper",
+            "live_ready",
+            "live_canary",
+            "live",
+        }:
+            raise ValueError(f"no executable lifecycle assignment for {product_id}")
         if assignment["id"] != payload["assignment_id"]:
             raise ValueError("strategy assignment changed after feature publication")
+        if not self._is_diagnostic_assignment(assignment) and not _assignment_allows_instrument(
+            self.portfolio.engine,
+            assignment,
+            instrument_id=str(payload["instrument_id"]),
+            at=str(payload["evaluated_at"]),
+        ):
+            raise ValueError("strategy evaluation instrument is outside its assignment scope")
         return assignment
 
     @staticmethod
@@ -139,7 +177,11 @@ class DatabaseStrategyEvaluator:
             raise ValueError("feature batch is not the exact immutable input requested")
         features: dict[str, Any] = {value.feature_name: value.value for value in values}
         features["instrument_id"] = str(payload["instrument_id"])
-        features["information_time"] = at
+        features["information_time"] = max(
+            (str(value.source_close_time) for value in values),
+            default=at,
+        )
+        features["availability_time"] = at
         self._add_market_frame(features, payload)
         return features, feature_ids
 
@@ -173,9 +215,29 @@ class DatabaseStrategyEvaluator:
         definition = artefact.get("definition")
         source_type = definition.get("source_type") if isinstance(definition, Mapping) else None
         if str(source_type) == "ensemble":
-            evaluation_features["forecasts"] = self.portfolio.active_forecasts(
+            assignment_id = str(assignment["id"])
+            active_forecasts = self.portfolio.active_forecasts(
                 product_id=str(payload["product_id"]), at=at
             )
+            scoped_forecasts = tuple(
+                forecast
+                for forecast in active_forecasts
+                if str(forecast.metadata.get("assignment_id") or "") == assignment_id
+            )
+            unscoped_forecasts = tuple(
+                forecast
+                for forecast in active_forecasts
+                if not str(forecast.metadata.get("assignment_id") or "").strip()
+            )
+            if scoped_forecasts:
+                evaluation_features["forecasts"] = scoped_forecasts
+            elif len(unscoped_forecasts) == 1:
+                # A single unbound upstream forecast is accepted only for a
+                # clean bootstrap fixture. Runtime forecasts are assignment
+                # stamped before they can participate in an ensemble.
+                evaluation_features["forecasts"] = unscoped_forecasts
+            else:
+                raise ValueError("ensemble inputs are not isolated to one assignment")
         forecast_values = dict(self.forecast_fn(evaluation_features, artefact))
         valid_until = (
             (dt.datetime.fromisoformat(at) + dt.timedelta(seconds=int(payload["horizon_seconds"])))
@@ -206,8 +268,32 @@ class DatabaseStrategyEvaluator:
                 "semantic_strategy": forecast_values.get("semantic_strategy"),
                 **{
                     key: forecast_values[key]
-                    for key in ("semantic_group_id", "order_group_key")
+                    for key in (
+                        "semantic_group_id",
+                        "order_group_key",
+                        "semantic_target_fraction",
+                        "semantic_target_max_abs",
+                        "semantic_target_notional",
+                        "semantic_hedge_error",
+                        "btc_target_fraction",
+                        "btc_tactical_fraction",
+                        "btc_cycle_state",
+                        "funding_rate",
+                        "funding_interval_seconds",
+                        "expected_funding_events",
+                        "next_funding_at",
+                    )
                     if forecast_values.get(key) is not None
+                },
+                **{
+                    key: features[key]
+                    for key in (
+                        "funding_rate",
+                        "funding_interval_seconds",
+                        "expected_funding_events",
+                        "next_funding_at",
+                    )
+                    if key not in forecast_values and features.get(key) is not None
                 },
             },
         )
@@ -227,6 +313,7 @@ class DatabaseStrategyEvaluator:
         payload: Mapping[str, Any],
         product_id: str,
         forecast_id: str,
+        assignment_id: str,
         at: str,
     ) -> str:
         portfolio_job_id = canonical_hash(
@@ -240,6 +327,7 @@ class DatabaseStrategyEvaluator:
             "event_id": payload["event_id"],
             "product_id": product_id,
             "forecast_id": forecast_id,
+            "assignment_id": assignment_id,
             "evaluated_at": at,
             "producer_identity": self.worker_id,
             **(
@@ -258,6 +346,34 @@ class DatabaseStrategyEvaluator:
             producer_identity=self.worker_id,
         )
         return portfolio_job_id
+
+
+def _assignment_allows_instrument(
+    engine,
+    assignment: Mapping[str, Any],
+    *,
+    instrument_id: str,
+    at: str,
+) -> bool:
+    assigned = str(assignment.get("instrument_id") or "")
+    if assigned:
+        return assigned == instrument_id
+    payload = assignment.get("payload")
+    if isinstance(payload, Mapping):
+        configured = payload.get("instrument_ids") or payload.get("instruments")
+        if isinstance(configured, list | tuple):
+            return instrument_id in {str(value) for value in configured}
+    universe_id = str(assignment.get("universe_id") or "")
+    if not universe_id:
+        return False
+    return any(
+        member.instrument.instrument_id == instrument_id
+        for member in SqlUniverseStore(engine).members_at(
+            universe_id=universe_id,
+            observed_at=at,
+            eligible_only=True,
+        )
+    )
 
 
 def _strict_payload(payload: Mapping[str, Any]) -> dict[str, Any]:

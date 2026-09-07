@@ -14,6 +14,15 @@ class StrategyBehaviourError(ValueError):
     """A registered strategy behaviour cannot be evaluated safely."""
 
 
+def _finite_fraction(value: Any, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise StrategyBehaviourError(f"BTC allocation {field} is invalid")
+    result = float(value)
+    if not math.isfinite(result) or not 0.0 <= result <= 1.0:
+        raise StrategyBehaviourError(f"BTC allocation {field} is invalid")
+    return result
+
+
 @dataclass(frozen=True)
 class TypedRuleBehaviour:
     """Immutable typed-rule behaviour shared by research and production."""
@@ -123,6 +132,115 @@ class TypedRuleBehaviour:
             "signals": list(signals),
         }
         return {**payload, "receipt_hash": canonical_hash(payload)}
+
+
+@dataclass(frozen=True)
+class BtcTargetAllocationBehaviour:
+    """Evaluate the BTC spot contract without ever producing a short order."""
+
+    model: Mapping[str, Any]
+    contract_version: str = "btc_allocation_contract/v1"
+
+    def __post_init__(self) -> None:
+        if self.contract_version != "btc_allocation_contract/v1":
+            raise StrategyBehaviourError("unsupported BTC allocation behaviour contract")
+        if not isinstance(self.model, Mapping) or self.model.get("kind") != "btc_target_allocation":
+            raise StrategyBehaviourError("BTC allocation model is invalid")
+        object.__setattr__(
+            self, "model", json_value(dict(self.model), field="BTC allocation model")
+        )
+        rule = self.model.get("rule")
+        states = self.model.get("target_states")
+        if not isinstance(rule, Mapping) or not isinstance(states, Mapping):
+            raise StrategyBehaviourError("BTC allocation model needs a rule and target states")
+        TypedRuleBehaviour(rule)
+        required = {"risk_on", "risk_off", "reentry"}
+        if set(states) != required:
+            raise StrategyBehaviourError("BTC allocation target states are incomplete")
+        minimum_btc = _finite_fraction(
+            self.model.get("minimum_btc_fraction", 0.7), field="minimum_btc_fraction"
+        )
+        maximum_tactical = _finite_fraction(
+            self.model.get("maximum_tactical_fraction", 0.3),
+            field="maximum_tactical_fraction",
+        )
+        _validate_btc_target_states(
+            states,
+            minimum_btc=minimum_btc,
+            maximum_tactical=maximum_tactical,
+        )
+
+    @classmethod
+    def from_definition(cls, definition: Any) -> BtcTargetAllocationBehaviour:
+        model = (
+            definition.get("signal_model")
+            if isinstance(definition, Mapping)
+            else getattr(definition, "signal_model", None)
+        )
+        if not isinstance(model, Mapping):
+            raise StrategyBehaviourError("strategy definition has no BTC allocation model")
+        return cls(model)
+
+    @property
+    def behaviour_hash(self) -> str:
+        return canonical_hash({"contract_version": self.contract_version, "model": self.model})
+
+    def target(self, features: Mapping[str, Any]) -> tuple[str, int, float, float]:
+        signal = TypedRuleBehaviour(self.model["rule"]).signal(features)
+        state_name = "risk_off" if signal < 0 else "risk_on" if signal > 0 else "reentry"
+        state = self.model["target_states"][state_name]
+        return (
+            state_name,
+            signal,
+            float(state["btc_fraction"]),
+            float(state["tactical_fraction"]),
+        )
+
+    def signal(self, features: Mapping[str, Any]) -> int:
+        return self.target(features)[1]
+
+    def generate_signals(self, rows: Any) -> tuple[int, ...]:
+        if hasattr(rows, "to_dict"):
+            rows = rows.to_dict(orient="records")
+        if not isinstance(rows, list | tuple) or not rows:
+            raise StrategyBehaviourError("BTC allocation rows must be a non-empty sequence")
+        if not all(isinstance(row, Mapping) for row in rows):
+            raise StrategyBehaviourError("BTC allocation rows must be objects")
+        return tuple(self.signal(row) for row in rows)
+
+    def parity_receipt(self, rows: Any) -> Mapping[str, Any]:
+        if hasattr(rows, "to_dict"):
+            rows = rows.to_dict(orient="records")
+        signals = self.generate_signals(rows)
+        states = [self.target(row)[0] for row in rows]
+        targets = [self.target(row)[2] for row in rows]
+        payload = {
+            "schema": "btc_target_allocation_parity/v1",
+            "behaviour_hash": self.behaviour_hash,
+            "input_hash": canonical_hash(rows),
+            "signals": list(signals),
+            "states": states,
+            "target_btc_fractions": targets,
+        }
+        return {**payload, "receipt_hash": canonical_hash(payload)}
+
+
+def _validate_btc_target_states(
+    states: Mapping[str, Any], *, minimum_btc: float, maximum_tactical: float
+) -> None:
+    for state in states.values():
+        if not isinstance(state, Mapping):
+            raise StrategyBehaviourError("BTC allocation target state is invalid")
+        fractions = {
+            field: _finite_fraction(state.get(field), field="target fraction")
+            for field in ("btc_fraction", "tactical_fraction")
+        }
+        if fractions["btc_fraction"] < minimum_btc - 1e-12:
+            raise StrategyBehaviourError("BTC allocation target is below its core reserve")
+        if fractions["tactical_fraction"] > maximum_tactical + 1e-12:
+            raise StrategyBehaviourError("BTC tactical allocation exceeds its limit")
+        if abs(sum(fractions.values()) - 1.0) > 1e-12:
+            raise StrategyBehaviourError("BTC target state does not conserve allocation")
 
 
 def _hash_identity(value: str, *, field: str) -> str:
@@ -429,6 +547,8 @@ def behaviour_hash_for_definition(definition: Any) -> str:
     )
     if isinstance(signal_model, Mapping) and signal_model.get("registered_strategy"):
         return RegisteredStrategyBehaviour.from_definition(definition).behaviour_hash
+    if isinstance(signal_model, Mapping) and signal_model.get("kind") == "btc_target_allocation":
+        return BtcTargetAllocationBehaviour.from_definition(definition).behaviour_hash
     if isinstance(signal_model, Mapping) and isinstance(signal_model.get("rule"), Mapping):
         return TypedRuleBehaviour.from_definition(definition).behaviour_hash
     definition_hash = (

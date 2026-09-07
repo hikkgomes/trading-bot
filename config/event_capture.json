@@ -18,7 +18,7 @@
       "url": "wss://fstream.binance.com/market/stream",
       "symbols": ["BTCUSDT"],
       "dynamic_universe": true,
-      "max_dynamic_symbols": 1000,
+      "max_dynamic_symbols": 12,
       "streams": ["kline_1m"],
       "include_liquidations": false
     },

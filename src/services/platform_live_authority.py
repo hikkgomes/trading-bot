@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import math
+import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -15,10 +17,14 @@ from src.data.database import (
     PlatformDatabase,
     account_snapshot,
     instrument,
+    platform_rehearsal_report,
     production_preflight,
+    promotion_event,
     strategy_approval,
+    universe_member,
+    universe_snapshot,
 )
-from src.domain._codec import timestamp
+from src.domain._codec import canonical_hash, timestamp
 from src.execution.ccxt_broker import CcxtBroker
 from src.research.canonical import (
     CanonicalEvidenceError,
@@ -26,6 +32,7 @@ from src.research.canonical import (
     SqlApprovalRepository,
     SqlPreflightRepository,
     SqlStrategyArtefactRepository,
+    _human_actor,
     latest_accepted_forward_summary,
     preflight_is_fresh,
 )
@@ -302,6 +309,12 @@ class PlatformLiveAuthority:
     ) -> dict[str, Any]:
         if not confirm:
             raise PlatformLiveAuthorityError("explicit operator confirmation is required")
+        if not isinstance(assigned_by, str) or not assigned_by.strip():
+            raise PlatformLiveAuthorityError("assignment operator is required")
+        try:
+            assigned_by = _human_actor(assigned_by, field="live canary operator")
+        except CanonicalEvidenceError as exc:
+            raise PlatformLiveAuthorityError(str(exc)) from exc
         assigned_at = timestamp(assigned_at, field="assigned_at")
         capital_limit = self._capital_cap(product_id, capital_limit)
         if not math.isfinite(float(risk_budget)) or not 0 <= float(risk_budget) <= capital_limit:
@@ -311,6 +324,7 @@ class PlatformLiveAuthority:
             artefact_hash=artefact_hash,
             instrument_id=instrument_id,
             sleeve_id=sleeve_id,
+            at=assigned_at,
         )
         preflight = self._current_preflight(
             product=product,
@@ -335,47 +349,88 @@ class PlatformLiveAuthority:
             product_id=product_id,
             strategy_version_id=str(artefact["strategy_version_id"]),
             artefact_hash=artefact_hash,
+            instrument_id=instrument_id,
+            sleeve_id=sleeve_id,
             at=assigned_at,
         )
         if capital_limit > min(float(preflight["capital_cap"]), float(approval["capital_cap"])):
             raise PlatformLiveAuthorityError("assignment capital exceeds approved authority")
         if not isinstance(assigned_by, str) or not assigned_by.strip():
             raise PlatformLiveAuthorityError("assignment operator is required")
-        self.assignments.deactivate(
-            product_id,
-            at=assigned_at,
-            assignment_reason="paper authority replaced by live canary",
-            portfolio_id=str(product["portfolio_id"]),
-            strategy_version_id=str(artefact["strategy_version_id"]),
-            artefact_hash=artefact_hash,
-            sleeve_id=sleeve_id,
-            instrument_id=instrument_id,
-        )
-        assignment_id = self.assignments.assign(
-            product_id=product_id,
-            portfolio_id=str(product["portfolio_id"]),
-            sleeve_id=sleeve_id,
-            strategy_version_id=str(artefact["strategy_version_id"]),
-            instrument_id=instrument_id,
-            artefact_hash=artefact_hash,
-            lifecycle_state="live_canary",
-            execution_mode="live",
-            capital_limit=capital_limit,
-            risk_budget=float(risk_budget),
-            assigned_at=assigned_at,
-            assigned_by=assigned_by.strip(),
-            assignment_reason="explicit operator-approved live canary",
-            payload={
-                "instrument_ids": [instrument_id],
-                "sleeve_id": sleeve_id,
-                "approval_id": expected_approval_id,
-                "preflight_id": expected_preflight_id,
-                "execution_engine_identity": execution_engine_identity(),
-            },
-        )
+        event_payload = {
+            "strategy_version_id": str(artefact["strategy_version_id"]),
+            "product_id": product_id,
+            "artefact_hash": artefact_hash,
+            "prior_state": "live_ready",
+            "next_state": "live_canary",
+            "accepted": True,
+            "reason_code": "explicit_operator_live_canary",
+            "evaluated_at": assigned_at,
+            "capital_limit": capital_limit,
+            "evidence_hash": canonical_hash(
+                {
+                    "artefact_hash": artefact_hash,
+                    "approval_id": expected_approval_id,
+                    "preflight_id": expected_preflight_id,
+                }
+            ),
+            "operator": assigned_by.strip(),
+            "instrument_id": instrument_id,
+            "sleeve_id": sleeve_id,
+        }
+        promotion_event_id = canonical_hash(event_payload)
+        with self.engine.begin() as connection:
+            existing_event = connection.execute(
+                select(promotion_event.c.payload).where(promotion_event.c.id == promotion_event_id)
+            ).scalar_one_or_none()
+            if existing_event is not None and dict(existing_event) != event_payload:
+                raise PlatformLiveAuthorityError("live lifecycle event identity collision")
+            if existing_event is None:
+                connection.execute(
+                    promotion_event.insert().values(
+                        id=promotion_event_id,
+                        created_at=assigned_at,
+                        payload=event_payload,
+                    )
+                )
+            self.assignments.deactivate_in_connection(
+                connection,
+                product_id,
+                at=assigned_at,
+                assignment_reason="paper authority replaced by live canary",
+                portfolio_id=str(product["portfolio_id"]),
+                strategy_version_id=str(artefact["strategy_version_id"]),
+                artefact_hash=artefact_hash,
+                execution_mode="paper",
+            )
+            assignment_id = self.assignments.assign_in_connection(
+                connection,
+                product_id=product_id,
+                portfolio_id=str(product["portfolio_id"]),
+                sleeve_id=sleeve_id,
+                strategy_version_id=str(artefact["strategy_version_id"]),
+                instrument_id=instrument_id,
+                artefact_hash=artefact_hash,
+                lifecycle_state="live_canary",
+                execution_mode="live",
+                capital_limit=capital_limit,
+                risk_budget=float(risk_budget),
+                assigned_at=assigned_at,
+                assigned_by=assigned_by.strip(),
+                assignment_reason="explicit operator-approved live canary",
+                payload={
+                    "instrument_ids": [instrument_id],
+                    "sleeve_id": sleeve_id,
+                    "approval_id": expected_approval_id,
+                    "preflight_id": expected_preflight_id,
+                    "promotion_event_id": promotion_event_id,
+                    "execution_engine_identity": execution_engine_identity(),
+                },
+            )
         return {
             "schema": "platform.live-assignment-result/v1",
             "assignment_id": assignment_id,
+            "promotion_event_id": promotion_event_id,
             "approval_id": expected_approval_id,
             "preflight_id": expected_preflight_id,
             "product_id": product_id,
@@ -394,23 +449,291 @@ class PlatformLiveAuthority:
         product_id: str,
         strategy_version_id: str,
         artefact_hash: str,
+        instrument_id: str,
+        sleeve_id: str,
         at: str,
-    ) -> None:
+    ) -> Mapping[str, Any]:
         assignments = self.assignments.active_assignments(product_id, at=at)
-        if any(
-            row["execution_mode"] == "paper"
-            and row["lifecycle_state"] == "live_ready"
-            and row["strategy_version_id"] == strategy_version_id
-            and row["artefact_hash"] == artefact_hash
-            for row in assignments
-        ):
-            return
+        matching = next(
+            (
+                row
+                for row in assignments
+                if row["execution_mode"] == "paper"
+                and row["lifecycle_state"] == "live_ready"
+                and row["strategy_version_id"] == strategy_version_id
+                and row["artefact_hash"] == artefact_hash
+                and row["instrument_id"] == instrument_id
+                and row["sleeve_id"] in {sleeve_id, "default"}
+            ),
+            None,
+        )
+        if matching is not None:
+            return matching
         raise PlatformLiveAuthorityError(
             "live assignment requires a current live_ready lifecycle assignment"
         )
 
+    def promote_canary_to_live(
+        self,
+        *,
+        product_id: str,
+        artefact_hash: str,
+        instrument_id: str,
+        sleeve_id: str,
+        expected_preflight_id: str,
+        expected_approval_id: str,
+        canary_evidence_id: str,
+        capital_limit: float,
+        risk_budget: float,
+        assigned_by: str,
+        assigned_at: str,
+        confirm: bool,
+    ) -> dict[str, Any]:
+        """Atomically promote an operator-approved canary after test evidence."""
+
+        if not confirm:
+            raise PlatformLiveAuthorityError("explicit operator confirmation is required")
+        if not isinstance(assigned_by, str) or not assigned_by.strip():
+            raise PlatformLiveAuthorityError("live transition operator is required")
+        try:
+            assigned_by = _human_actor(assigned_by, field="live transition operator")
+        except CanonicalEvidenceError as exc:
+            raise PlatformLiveAuthorityError(str(exc)) from exc
+        assigned_at = timestamp(assigned_at, field="assigned_at")
+        capital_limit = self._live_capital_cap(product_id, capital_limit)
+        if not math.isfinite(float(risk_budget)) or not 0 <= float(risk_budget) <= capital_limit:
+            raise PlatformLiveAuthorityError("risk budget must be within the capital limit")
+        product, account, artefact, instrument_payload = self._selection(
+            product_id=product_id,
+            artefact_hash=artefact_hash,
+            instrument_id=instrument_id,
+            sleeve_id=sleeve_id,
+            at=assigned_at,
+        )
+        _, evidence = self._canary_evidence(
+            canary_evidence_id=canary_evidence_id,
+            product_id=product_id,
+            artefact_hash=artefact_hash,
+            product=product,
+            assigned_at=assigned_at,
+        )
+        preflight = self._current_preflight(
+            product=product,
+            account=account,
+            artefact=artefact,
+            instrument_payload=instrument_payload,
+            sleeve_id=sleeve_id,
+            expected_id=expected_preflight_id,
+            at=assigned_at,
+        )
+        approval = self._current_approval(
+            product=product,
+            account=account,
+            artefact=artefact,
+            instrument_payload=instrument_payload,
+            sleeve_id=sleeve_id,
+            expected_id=expected_approval_id,
+            expected_preflight_id=expected_preflight_id,
+            at=assigned_at,
+        )
+        if capital_limit > min(float(preflight["capital_cap"]), float(approval["capital_cap"])):
+            raise PlatformLiveAuthorityError("full live capital exceeds approved authority")
+        current = self._live_canary_assignment(
+            product_id=product_id,
+            strategy_version_id=str(artefact["strategy_version_id"]),
+            artefact_hash=artefact_hash,
+            instrument_id=instrument_id,
+            sleeve_id=sleeve_id,
+            at=assigned_at,
+        )
+        self._assert_canary_evidence(evidence, current=current, account=account)
+        event_payload = {
+            "strategy_version_id": str(artefact["strategy_version_id"]),
+            "product_id": product_id,
+            "artefact_hash": artefact_hash,
+            "prior_state": "live_canary",
+            "next_state": "live",
+            "accepted": True,
+            "reason_code": "explicit_operator_canary_to_live",
+            "evaluated_at": assigned_at,
+            "capital_limit": capital_limit,
+            "evidence_hash": canary_evidence_id,
+            "operator": assigned_by.strip(),
+            "instrument_id": instrument_id,
+            "sleeve_id": sleeve_id,
+        }
+        event_id = canonical_hash(event_payload)
+        with self.engine.begin() as connection:
+            existing = connection.execute(
+                select(promotion_event.c.payload).where(promotion_event.c.id == event_id)
+            ).scalar_one_or_none()
+            if existing is None:
+                connection.execute(
+                    promotion_event.insert().values(
+                        id=event_id,
+                        created_at=assigned_at,
+                        payload=event_payload,
+                    )
+                )
+            elif dict(existing) != event_payload:
+                raise PlatformLiveAuthorityError("live transition identity collision")
+            self.assignments.deactivate_in_connection(
+                connection,
+                product_id,
+                at=assigned_at,
+                assignment_reason="canary promoted to full live",
+                portfolio_id=str(product["portfolio_id"]),
+                strategy_version_id=str(artefact["strategy_version_id"]),
+                artefact_hash=artefact_hash,
+                sleeve_id=sleeve_id,
+                instrument_id=instrument_id,
+            )
+            assignment_id = self.assignments.assign_in_connection(
+                connection,
+                product_id=product_id,
+                portfolio_id=str(product["portfolio_id"]),
+                sleeve_id=sleeve_id,
+                strategy_version_id=str(artefact["strategy_version_id"]),
+                instrument_id=instrument_id,
+                artefact_hash=artefact_hash,
+                lifecycle_state="live",
+                execution_mode="live",
+                capital_limit=capital_limit,
+                risk_budget=float(risk_budget),
+                assigned_at=assigned_at,
+                assigned_by=assigned_by.strip(),
+                assignment_reason="explicit operator-approved full live",
+                payload={
+                    "instrument_ids": [instrument_id],
+                    "sleeve_id": sleeve_id,
+                    "approval_id": expected_approval_id,
+                    "preflight_id": expected_preflight_id,
+                    "promotion_event_id": event_id,
+                    "canary_evidence_id": canary_evidence_id,
+                    "execution_engine_identity": execution_engine_identity(),
+                },
+            )
+        return {
+            "schema": "platform.live-transition-result/v1",
+            "assignment_id": assignment_id,
+            "promotion_event_id": event_id,
+            "canary_evidence_id": canary_evidence_id,
+            "product_id": product_id,
+            "artefact_hash": artefact_hash,
+            "instrument_id": instrument_id,
+            "sleeve_id": sleeve_id,
+        }
+
+    def _canary_evidence(
+        self,
+        *,
+        canary_evidence_id: str,
+        product_id: str,
+        artefact_hash: str,
+        product: Mapping[str, Any],
+        assigned_at: str,
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        with self.engine.connect() as connection:
+            row = (
+                connection.execute(
+                    select(platform_rehearsal_report).where(
+                        platform_rehearsal_report.c.id == canary_evidence_id
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        evidence = row["payload"] if row is not None else None
+        if (
+            row is None
+            or row["accepted"] is not True
+            or not isinstance(evidence, Mapping)
+            or evidence.get("product_id") != product_id
+            or evidence.get("assignment_id") is None
+            or evidence.get("artefact_hash") != artefact_hash
+            or evidence.get("flat_reconciliation") is not True
+            or evidence.get("accounting_reconciled") is not True
+        ):
+            raise PlatformLiveAuthorityError("fresh accepted canary evidence is required")
+        if not _signed_report_is_valid(row, evidence, canary_evidence_id):
+            raise PlatformLiveAuthorityError("canary evidence signature or content hash is invalid")
+        if not preflight_is_fresh(
+            str(row["created_at"]),
+            reference_at=assigned_at,
+            maximum_age_seconds=int(product.get("connected_testnet_max_age_seconds", 86_400)),
+        ):
+            raise PlatformLiveAuthorityError("canary evidence is stale")
+        return row, evidence
+
+    @staticmethod
+    def _assert_canary_evidence(
+        evidence: Mapping[str, Any],
+        *,
+        current: Mapping[str, Any],
+        account: Mapping[str, Any],
+    ) -> None:
+        if str(evidence.get("assignment_id")) != str(current["id"]):
+            raise PlatformLiveAuthorityError("canary evidence is bound to another assignment")
+        if evidence.get("execution_engine_identity") != execution_engine_identity():
+            raise PlatformLiveAuthorityError("canary evidence engine identity is stale")
+        if evidence.get("account_id") != account["account_id"]:
+            raise PlatformLiveAuthorityError("canary evidence account identity is stale")
+        if account.get("market") == "usdt_futures":
+            if evidence.get("protective_stop_applicable") is not True:
+                raise PlatformLiveAuthorityError("canary evidence did not require native stops")
+            fields = (
+                "native_stop_created",
+                "native_stop_readback_matched",
+                "algo_update_processed",
+                "partial_fill_quantity_handled",
+                "stop_resize_or_replacement_handled",
+                "native_stop_cancelled",
+            )
+            if not all(evidence.get(field) is True for field in fields):
+                raise PlatformLiveAuthorityError(
+                    "canary evidence is missing connected stop controls"
+                )
+        elif (
+            evidence.get("protective_stop_applicable") is True
+            or evidence.get("protective_stop_not_applicable") is not True
+        ):
+            raise PlatformLiveAuthorityError("canary evidence did not declare stop applicability")
+
+    def _live_canary_assignment(
+        self,
+        *,
+        product_id: str,
+        strategy_version_id: str,
+        artefact_hash: str,
+        instrument_id: str,
+        sleeve_id: str,
+        at: str,
+    ) -> Mapping[str, Any]:
+        current = next(
+            (
+                row
+                for row in self.assignments.active_assignments(product_id, at=at)
+                if row["execution_mode"] == "live"
+                and row["lifecycle_state"] == "live_canary"
+                and row["strategy_version_id"] == strategy_version_id
+                and row["artefact_hash"] == artefact_hash
+                and row.get("instrument_id") == instrument_id
+                and row.get("sleeve_id") == sleeve_id
+            ),
+            None,
+        )
+        if current is None:
+            raise PlatformLiveAuthorityError("a matching active live canary is required")
+        return current
+
     def _selection(
-        self, *, product_id: str, artefact_hash: str, instrument_id: str, sleeve_id: str
+        self,
+        *,
+        product_id: str,
+        artefact_hash: str,
+        instrument_id: str,
+        sleeve_id: str,
+        at: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
         product, account = self._selected_product(product_id=product_id, sleeve_id=sleeve_id)
         artefact = self._selected_artefact(
@@ -427,6 +750,7 @@ class PlatformLiveAuthority:
             instrument_id=instrument_id,
             account=account,
             product=product,
+            at=at,
         )
         return product, account, artefact, instrument_payload
 
@@ -479,6 +803,7 @@ class PlatformLiveAuthority:
         instrument_id: str,
         account: Mapping[str, Any],
         product: Mapping[str, Any],
+        at: str | None = None,
     ) -> dict[str, Any]:
         with self.engine.connect() as connection:
             row = connection.execute(
@@ -499,6 +824,33 @@ class PlatformLiveAuthority:
             raise PlatformLiveAuthorityError(
                 "selected instrument is not in the configured live product scope"
             )
+        if product.get("live_instrument_scope") == "current_eligible_universe":
+            with self.engine.connect() as connection:
+                statement = select(universe_snapshot.c.id).where(
+                    universe_snapshot.c.universe_id == product.get("universe_id")
+                )
+                if at is not None:
+                    statement = statement.where(universe_snapshot.c.observed_at <= at)
+                snapshot_id = connection.execute(
+                    statement.order_by(
+                        universe_snapshot.c.observed_at.desc(), universe_snapshot.c.id.desc()
+                    ).limit(1)
+                ).scalar_one_or_none()
+                eligible = (
+                    connection.execute(
+                        select(universe_member.c.id).where(
+                            universe_member.c.snapshot_id == snapshot_id,
+                            universe_member.c.instrument_id == instrument_id,
+                            universe_member.c.eligible.is_(True),
+                        )
+                    ).first()
+                    if snapshot_id is not None
+                    else None
+                )
+            if eligible is None:
+                raise PlatformLiveAuthorityError(
+                    "selected instrument is not in the current eligible universe"
+                )
         return instrument_payload
 
     @staticmethod
@@ -567,6 +919,22 @@ class PlatformLiveAuthority:
     def _maximum_canary_capital(self, product: Mapping[str, Any]) -> float:
         policy = self.policies[str(product["promotion_policy_id"])]
         return float(policy["canary_capital_limit"])
+
+    def _live_capital_cap(self, product_id: str, value: float) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError) as exc:
+            raise PlatformLiveAuthorityError("capital cap must be numeric") from exc
+        product = self.products.get(product_id)
+        if product is None:
+            raise PlatformLiveAuthorityError(f"unknown product: {product_id}")
+        policy = self.policies[str(product["promotion_policy_id"])]
+        maximum = float(product.get("live_capital_limit", policy.get("paper_capital_limit", 0.0)))
+        if not math.isfinite(result) or result <= 0 or result > maximum:
+            raise PlatformLiveAuthorityError(
+                f"capital must be in (0, {maximum}] for full live authority"
+            )
+        return result
 
     def _capital_cap(self, product_id: str, value: float) -> float:
         try:
@@ -817,6 +1185,24 @@ def _tokens(value: object) -> set[str]:
     }
 
 
+def _signed_report_is_valid(row: Mapping[str, Any], payload: object, expected_hash: str) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    unsigned = dict(payload)
+    declared_hash = unsigned.pop("report_hash", None)
+    signature = unsigned.pop("signature", None)
+    signing_key = os.environ.get("TRADING_PLATFORM_REHEARSAL_SIGNING_KEY", "")
+    if not signing_key or not isinstance(declared_hash, str) or not isinstance(signature, str):
+        return False
+    return bool(
+        row.get("content_hash") == expected_hash == declared_hash == canonical_hash(unsigned)
+        and hmac.compare_digest(
+            signature,
+            hmac.new(signing_key.encode(), declared_hash.encode(), "sha256").hexdigest(),
+        )
+    )
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Manage exact canonical live authority.")
     parser.add_argument("--config", type=Path, default=Path("config/platform.json"))
@@ -850,6 +1236,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     assign_parser.add_argument("--risk-budget", type=float, required=True)
     assign_parser.add_argument("--assigned-by", required=True)
     assign_parser.add_argument("--confirm", action="store_true")
+    live_parser = subparsers.add_parser("canary-to-live")
+    selection(live_parser)
+    live_parser.add_argument("--expected-preflight-id", required=True)
+    live_parser.add_argument("--expected-approval-id", required=True)
+    live_parser.add_argument("--canary-evidence-id", required=True)
+    live_parser.add_argument("--capital-limit", type=float, required=True)
+    live_parser.add_argument("--risk-budget", type=float, required=True)
+    live_parser.add_argument("--assigned-by", required=True)
+    live_parser.add_argument("--confirm", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -887,11 +1282,23 @@ def main(argv: list[str] | None = None) -> None:
                 approved_at=now,
                 confirm=args.confirm,
             )
-        else:
+        elif args.command == "assign":
             result = authority.assign(
                 **selection,
                 expected_preflight_id=args.expected_preflight_id,
                 expected_approval_id=args.expected_approval_id,
+                capital_limit=args.capital_limit,
+                risk_budget=args.risk_budget,
+                assigned_by=args.assigned_by,
+                assigned_at=now,
+                confirm=args.confirm,
+            )
+        else:
+            result = authority.promote_canary_to_live(
+                **selection,
+                expected_preflight_id=args.expected_preflight_id,
+                expected_approval_id=args.expected_approval_id,
+                canary_evidence_id=args.canary_evidence_id,
                 capital_limit=args.capital_limit,
                 risk_budget=args.risk_budget,
                 assigned_by=args.assigned_by,

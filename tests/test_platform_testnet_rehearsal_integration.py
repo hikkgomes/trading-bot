@@ -8,14 +8,15 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import insert
 
 from src.accounting.ledger import Ledger, SqlLedgerStore
 from src.data.binance_market import normalise_public_event
 from src.data.binance_user_stream import normalise_user_event
-from src.data.database import PlatformDatabase
+from src.data.database import PlatformDatabase, account_snapshot
 from src.data.feature_store import SqlFeatureStore
 from src.data.universe import InstrumentObservation, SqlUniverseStore, UniverseEligibilityPolicy
-from src.domain._codec import to_primitive
+from src.domain._codec import canonical_hash, to_primitive
 from src.domain.instruments import Instrument, MarketType
 from src.execution.broker import (
     Broker,
@@ -187,7 +188,9 @@ def test_postgresql_platform_testnet_rehearsal_uses_real_service_chain(tmp_path:
 
 def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
     suffix = uuid4().hex[:10]
-    now = dt.datetime(2026, 8, 24, tzinfo=dt.UTC).isoformat()
+    base_now = dt.datetime(2026, 8, 24, tzinfo=dt.UTC)
+    run_offset = int(suffix[:8], 16) % (365 * 24 * 60 * 60)
+    now = (base_now + dt.timedelta(seconds=run_offset)).isoformat()
     prefix = f"platform-testnet:{suffix}"
     product_id = f"active_income_testnet_{suffix}"
     account_id = f"testnet-account-{suffix}"
@@ -269,6 +272,7 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
         universe_snapshot_id,
         now,
         prefix,
+        strategy_name="condition_grid",
         execution_mode="live",
     )
     assignments = SqlActiveStrategyAssignmentRepository(database.engine)
@@ -307,6 +311,42 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
         service=accounting_service,
     ).run_once(now=now)
     assert initial_accounting["reason_code"] == "accounting_event_recorded"
+    account_payload = {
+        "account_id": account_id,
+        "product_id": product_id,
+        "balances": {"USDT": 10_000.0},
+        "free_balances": {"USDT": 10_000.0},
+        "positions": {},
+        "regular_orders": [],
+        "conditional_orders": [],
+        "used_margin": 0.0,
+        "maintenance_margin": 0.0,
+        "used_margin_fraction": 0.0,
+        "liquidation_buffer_fraction": 1.0,
+        "account_mode": "one_way",
+        "unknown_exposure": {},
+        "account_state_known": True,
+        "account_state_authority": "authenticated_rest",
+        "account_fingerprint": canonical_hash(
+            {"account_id": account_id, "product_id": product_id, "source": "testnet"}
+        ),
+        "observed_at": now,
+    }
+    account_content_hash = canonical_hash(account_payload)
+    account_snapshot_id = canonical_hash(
+        {"account_id": account_id, "observed_at": now, "content_hash": account_content_hash}
+    )
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(account_snapshot).values(
+                id=account_snapshot_id,
+                account_id=account_id,
+                observed_at=now,
+                source="authenticated_rest",
+                content_hash=account_content_hash,
+                payload=account_payload,
+            )
+        )
 
     close_ms = int(dt.datetime.fromisoformat(now).timestamp() * 1_000) - 1
     market_event = normalise_public_event(
@@ -384,6 +424,7 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
         feature_store=feature_store,
         portfolio=repository,
         assignments=assignments,
+        snapshot_store=snapshots,
     )
     portfolio_worker = DatabasePortfolioTargetWorker(
         queue=queue,
@@ -576,6 +617,7 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
         has_pending_accounting=lambda: flags["accounting"],
         has_pending_recovery=lambda: flags["recovery"],
     )
+    recovery_count_before = len(SqlRecoveryStore(database.engine).read())
     report = rehearsal.run(now=now)
     assert report.ok, report.to_dict()
     assert len(broker.submissions) == 1
@@ -583,7 +625,7 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
     assert order_manager.all()[0].status.value == "filled"
     positions.reload()
     assert positions.get(portfolio_id, instrument.instrument_id).quantity > 0
-    assert len(SqlRecoveryStore(database.engine).read()) == 1
+    assert len(SqlRecoveryStore(database.engine).read()) == recovery_count_before + 1
 
 
 class _AssignmentCheck:

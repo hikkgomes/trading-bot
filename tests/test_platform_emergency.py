@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from sqlalchemy import select
 
 from src.data.database import PlatformDatabase, job
-from src.domain.orders import OrderSide
+from src.domain.orders import Fill, OrderSide
+from src.execution.live_exchange import SubmissionAcknowledgement, bounded_client_order_id
 from src.execution.order_manager import OrderManager, SqlOrderStore
 from src.execution.position_manager import PositionManager, SqlPositionStore
 from src.services.emergency import DatabaseEmergencyFlattenWorker
@@ -25,15 +26,54 @@ class _Broker:
         assert symbol == "BTCUSDT"
         return 100.0
 
+    @staticmethod
+    def account_snapshot(*, expected_symbols):
+        return {
+            "positions": {},
+            "regular_orders": [],
+            "conditional_orders": [],
+            "unknown_exposure": {},
+            "account_state_known": True,
+            "account_state_authority": "authenticated_rest",
+        }
+
 
 class _Venue:
     def __init__(self) -> None:
         self.broker = _Broker()
         self.instruments = {INSTRUMENT: _Instrument()}
         self.submitted = []
+        self.order_manager = None
+        self.position_manager = None
 
     def submit(self, order):
         self.submitted.append(order)
+        assert self.order_manager is not None
+        self.order_manager.submitted(order.order_id)
+        fill = Fill(
+            fill_id=f"fill:{order.order_id}",
+            order_id=order.order_id,
+            instrument_id=order.instrument_id,
+            side=order.side,
+            quantity=order.quantity,
+            price=100.0,
+            fee=0.0,
+            occurred_at=NOW,
+            metadata={"reference_price": 100.0},
+        )
+        updated = self.order_manager.apply_fill(fill)
+        if self.position_manager is not None:
+            self.position_manager.apply_fill(
+                updated.portfolio_id,
+                fill,
+                contributions=dict(updated.strategy_contributions),
+            )
+        return SubmissionAcknowledgement(
+            order_id=order.order_id,
+            client_order_id=bounded_client_order_id(order),
+            exchange_order_id=f"exchange:{order.order_id}",
+            status="acknowledged",
+        )
 
 
 def test_emergency_flatten_is_reduce_only_and_idempotent_after_restart(tmp_path) -> None:
@@ -80,6 +120,8 @@ def test_emergency_flatten_is_reduce_only_and_idempotent_after_restart(tmp_path)
             }
         },
     )
+    venue.order_manager = orders
+    venue.position_manager = positions
     first = worker.run_once(now=NOW)
     assert first["reason_code"] == "emergency_action_completed"
     assert len(venue.submitted) == 1
@@ -145,6 +187,8 @@ def test_emergency_reduction_uses_authoritative_stop_quantity(tmp_path) -> None:
         venues={"active_income": venue},
         products={"active_income": {"portfolio_id": "active-income-portfolio"}},
     )
+    venue.order_manager = worker.order_manager
+    venue.position_manager = worker.positions
 
     result = worker.run_once(now=NOW)
 

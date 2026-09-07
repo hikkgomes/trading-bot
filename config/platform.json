@@ -63,26 +63,29 @@
     "heavy_compute_slots": 1,
     "research_job_memory_mb": 2048,
     "numerical_threads": 2,
-    "parquet_scan_rows": 250000,
+    "parquet_scan_rows": 1000000,
     "event_replay_window_seconds": 86400,
+    "maximum_queue_age_seconds": 86400,
     "ml_trials": 8,
     "sql_pool_size": 2
   },
   "security_domains": {
-    "trading-runtime": ["market-gateway", "data-writer", "feature-service", "strategy-evaluator", "portfolio-engine", "portfolio-state-service", "risk-engine", "execution-engine", "paper-engine", "product-supervisor", "accounting-service", "account-reconciliation", "control-api", "universe-service", "platform-scheduler"],
-    "trading-research": ["promotion-engine", "research-worker", "ml-worker", "event-replay-worker", "feature-build-worker"],
+    "trading-runtime": ["market-gateway", "data-writer", "feature-service", "strategy-evaluator", "portfolio-engine", "portfolio-state-service", "risk-engine", "execution-engine", "paper-engine", "product-supervisor", "accounting-service", "account-reconciliation", "control-api"],
+    "trading-research": ["universe-service", "platform-scheduler", "promotion-engine", "research-worker", "ml-worker", "event-replay-worker", "feature-build-worker"],
     "trading-agent": ["agent-sandbox"],
     "trading-migration": ["migration-service"]
   },
   "processes": {
+    "market-gateway": ["market-gateway"],
+    "data-writer": ["data-writer"],
     "trading-runtime": [
-      "market-gateway", "data-writer", "feature-service", "universe-service",
-      "platform-scheduler", "strategy-evaluator", "product-supervisor",
+      "feature-service", "strategy-evaluator", "product-supervisor",
       "portfolio-engine", "portfolio-state-service", "risk-engine",
       "execution-engine", "paper-engine", "accounting-service", "account-reconciliation"
     ],
+    "scheduler-operations": ["universe-service", "platform-scheduler", "promotion-engine"],
     "research-runtime": [
-      "promotion-engine", "research-worker", "ml-worker", "event-replay-worker",
+      "research-worker", "ml-worker", "event-replay-worker",
       "feature-build-worker"
     ],
     "agent-runtime": ["agent-sandbox"],

@@ -13,7 +13,11 @@ import pyarrow.parquet as pq
 
 from src.data.feature_graph import AvailableValue, FeatureGraphRegistry, default_feature_engine
 from src.data.feature_store import DeterministicFeatureCalculator, FeatureValue, SqlFeatureStore
-from src.data.parquet_store import PartitionedFeatureStore
+from src.data.parquet_store import (
+    DurableFeatureBatchSpool,
+    FeatureBatchSegment,
+    PartitionedFeatureStore,
+)
 from src.domain._codec import canonical_hash
 from src.risk.engine import SqlRiskSnapshotStore
 from src.services.job_schemas import build_content_hash
@@ -54,6 +58,11 @@ class DatabaseFeatureWorker:
         self.parquet_store = (
             PartitionedFeatureStore(parquet_root) if parquet_root is not None else None
         )
+        self.feature_spool = (
+            DurableFeatureBatchSpool(parquet_root.parent / "runtime" / "events" / "feature-spool")
+            if parquet_root is not None
+            else None
+        )
         self.active_assignments = active_assignments or (lambda _instrument_id: ())
         self.snapshot_store = snapshot_store
         self.feature_graph_for_assignment = feature_graph_for_assignment
@@ -63,6 +72,14 @@ class DatabaseFeatureWorker:
         self.lease_seconds = lease_seconds
 
     def run_once(self, *, now: str) -> dict[str, Any]:
+        try:
+            self._flush_recoverable_features()
+        except Exception as exc:
+            return {
+                "reason_code": "feature_spool_recovery_failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
         claimed = self.queue.claim(
             worker_id=self.worker_id,
             now=now,
@@ -248,15 +265,90 @@ class DatabaseFeatureWorker:
     def _persist_parquet(
         self, values: tuple[FeatureValue, ...], payload: Mapping[str, Any]
     ) -> Path | None:
-        if self.parquet_store is None:
+        if self.parquet_store is None or self.feature_spool is None:
             return None
-        return self.parquet_store.put(
+        segment = self.feature_spool.append(
             values,
             venue=str(payload["venue"]),
             market=str(payload["market"]),
             symbol=str(payload["symbol"]),
             timeframe=str(payload["timeframe"]),
         )
+        if segment is None:
+            return None
+        paths = self._write_feature_segment(segment)
+        return paths[0] if paths else None
+
+    def flush(self) -> tuple[Path, ...]:
+        """Flush in-memory and recoverable feature batches before shutdown."""
+
+        if self.feature_spool is None or self.parquet_store is None:
+            return ()
+        paths: list[Path] = []
+        for path in self.feature_spool.recoverable():
+            paths.extend(
+                self._write_feature_segment(FeatureBatchSegment(path, _segment_hash(path), 0))
+            )
+        segment = self.feature_spool.flush()
+        if segment is not None:
+            paths.extend(self._write_feature_segment(segment))
+        return tuple(paths)
+
+    def _flush_recoverable_features(self) -> None:
+        if self.feature_spool is None:
+            return
+        for path in self.feature_spool.recoverable():
+            self._write_feature_segment(FeatureBatchSegment(path, _segment_hash(path), 0))
+
+    def _write_feature_segment(self, segment: FeatureBatchSegment) -> tuple[Path, ...]:
+        assert self.feature_spool is not None
+        assert self.parquet_store is not None
+        claimed = self.feature_spool.claim(segment.path)
+        rows = self.feature_spool.read(claimed)
+        body = "".join(
+            json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
+        )
+        content_hash = canonical_hash(body)
+        if content_hash != segment.content_hash:
+            raise ValueError("feature batch segment content hash is invalid")
+        grouped: dict[tuple[str, str, str, str, str, str, str], list[FeatureValue]] = {}
+        for row in rows:
+            raw = row.get("value")
+            if not isinstance(raw, Mapping):
+                raise ValueError("feature batch row has no feature value")
+            value = FeatureValue(**dict(raw))
+            key = (
+                str(row["venue"]),
+                str(row["market"]),
+                str(row["symbol"]),
+                str(row["timeframe"]),
+                value.feature_set_version,
+                value.instrument_id,
+                value.availability_time[:10],
+            )
+            grouped.setdefault(key, []).append(value)
+        paths = tuple(
+            path
+            for (
+                venue,
+                market,
+                symbol,
+                timeframe,
+                _feature_set,
+                _instrument,
+                _date,
+            ), values in sorted(grouped.items())
+            for path in self.parquet_store.put_batch(
+                values,
+                venue=venue,
+                market=market,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+        )
+        committed = self.feature_spool.commit(claimed)
+        self.feature_spool.delete(committed)
+        return paths
 
     def _enqueue_evaluation_jobs(
         self,
@@ -461,7 +553,7 @@ class DatabaseFeatureWorker:
         for path in self.parquet_store.root.glob(pattern):
             if path.is_symlink() or not path.is_file():
                 continue
-            for row in pq.read_table(path).to_pylist():
+            for row in pq.ParquetFile(path).read().to_pylist():
                 if str(row.get("instrument_id")) != str(payload["instrument_id"]):
                     continue
                 close_time = dt.datetime.fromtimestamp(float(row["close_time_ms"]) / 1_000, dt.UTC)
@@ -539,7 +631,12 @@ class DatabaseFeatureWorker:
                 available_at=available_at,
                 through=reference_through,
                 same_instrument=name
-                not in {"cross_sectional", "correlation_beta", "spot_perpetual"},
+                not in {
+                    "cross_sectional",
+                    "correlation_beta",
+                    "spot_perpetual",
+                    "linked_instruments",
+                },
             )
             _merge_auxiliary_inputs(
                 resolved,
@@ -578,7 +675,7 @@ class DatabaseFeatureWorker:
         for path in self.parquet_store.root.glob(pattern):
             if path.is_symlink() or not path.is_file():
                 continue
-            for row in pq.read_table(path).to_pylist():
+            for row in pq.ParquetFile(path).read().to_pylist():
                 decoded = self._auxiliary_row(
                     row,
                     source_ids=source_ids,
@@ -634,6 +731,7 @@ class DatabaseFeatureWorker:
             "event_id": str(row.get("event_id")),
             "instrument_id": str(row.get("instrument_id")),
             "event_type": str(row.get("event_type")),
+            "sequence": row.get("sequence"),
             "exchange_timestamp": row_exchange,
             "availability_time": row_availability,
             "payload": decoded,
@@ -653,6 +751,10 @@ def _auxiliary_filters(reference: Mapping[str, Any]) -> tuple[set[str], set[str]
 def _retry_at(value: str, seconds: int) -> str:
     parsed = dt.datetime.fromisoformat(value)
     return (parsed + dt.timedelta(seconds=seconds)).replace(microsecond=0).isoformat()
+
+
+def _segment_hash(path: Path) -> str:
+    return canonical_hash(path.read_text(encoding="utf-8"))
 
 
 def _payload_views(payload: Any) -> tuple[Mapping[str, Any], ...]:
@@ -719,6 +821,7 @@ def _merge_auxiliary_inputs(
         "spot_perpetual": _merge_spot_perpetual,
         "cross_sectional": _merge_cross_sectional,
         "correlation_beta": _merge_correlation_beta,
+        "linked_instruments": _merge_linked_instruments,
         "sentiment": _merge_sentiment,
         "ml_manifest": _merge_ml_manifest,
         "liquidation": _merge_liquidation,
@@ -741,7 +844,7 @@ def _merge_higher_timeframe(
 
 
 def _merge_order_book(
-    resolved: dict[str, Any], _rows: list[dict[str, Any]], views: Any, _instrument_id: str
+    resolved: dict[str, Any], rows: list[dict[str, Any]], views: Any, _instrument_id: str
 ) -> None:
     bid = _number(views, "bid_price", "b")
     ask = _number(views, "ask_price", "a")
@@ -761,6 +864,15 @@ def _merge_order_book(
     ):
         if value is not None:
             resolved[key] = value
+    sequences = [
+        int(row["sequence"])
+        for row in rows
+        if isinstance(row.get("sequence"), int)
+        and not isinstance(row.get("sequence"), bool)
+        and int(row["sequence"]) >= 0
+    ]
+    if sequences:
+        resolved["sequence"] = max(sequences)
 
 
 def _merge_trade_flow(
@@ -807,9 +919,11 @@ def _merge_funding_open_interest(
 def _merge_spot_perpetual(
     resolved: dict[str, Any], rows: list[dict[str, Any]], _views: Any, instrument_id: str
 ) -> None:
+    latest_time, latest_rows = _latest_synchronised_rows(rows)
+    del latest_time
     prices = {
         str(row.get("instrument_id")): price
-        for row in rows
+        for row in latest_rows
         if (price := _number(_payload_views(row["payload"]), "close", "c", "price")) is not None
         and price > 0
     }
@@ -826,6 +940,20 @@ def _merge_spot_perpetual(
         resolved["spot_price" if current_market == "futures" else "perpetual_price"] = other_price
 
 
+def _merge_linked_instruments(
+    resolved: dict[str, Any], rows: list[dict[str, Any]], _views: Any, _instrument_id: str
+) -> None:
+    _latest_time, rows = _latest_synchronised_rows(rows)
+    legs: dict[str, dict[str, float]] = {}
+    for row in rows:
+        price = _number(_payload_views(row["payload"]), "close", "c", "price")
+        identity = str(row.get("instrument_id") or "").strip()
+        if identity and price is not None and price > 0.0:
+            legs[identity] = {"price": price, "beta": 1.0}
+    if len(legs) >= 2:
+        resolved["linked_instruments"] = legs
+
+
 def _merge_cross_sectional(
     resolved: dict[str, Any], rows: list[dict[str, Any]], views: Any, instrument_id: str
 ) -> None:
@@ -838,22 +966,75 @@ def _merge_cross_sectional(
         None,
     )
     if isinstance(explicit, Mapping) and explicit:
-        panel = {str(key): float(value) for key, value in explicit.items()}
-    else:
-        closes: dict[str, list[float]] = {}
-        for row in rows:
-            close = _number(_payload_views(row["payload"]), "c", "close")
-            if close is not None:
-                closes.setdefault(str(row.get("instrument_id")), []).append(close)
         panel = {
-            identity: values[-1] / values[-2] - 1.0
-            for identity, values in closes.items()
-            if len(values) >= 2 and values[-2] > 0
+            str(key): float(
+                value.get("momentum", value.get("relative_return", value.get("value", 0.0)))
+                if isinstance(value, Mapping)
+                else value
+            )
+            for key, value in explicit.items()
+            if not str(key).startswith("__")
         }
+    else:
+        latest_time, latest_rows = _latest_synchronised_rows(rows)
+        if latest_time is None:
+            panel = {}
+        else:
+            current = {
+                str(row.get("instrument_id")): close
+                for row in latest_rows
+                if (close := _number(_payload_views(row["payload"]), "c", "close")) is not None
+            }
+            previous: dict[str, tuple[dt.datetime, float]] = {}
+            for row in rows:
+                identity = str(row.get("instrument_id") or "")
+                observed = row.get("exchange_timestamp")
+                close = _number(_payload_views(row["payload"]), "c", "close")
+                if not identity or close is None or observed is None:
+                    continue
+                if not isinstance(observed, dt.datetime):
+                    try:
+                        observed = dt.datetime.fromisoformat(str(observed))
+                    except (TypeError, ValueError):
+                        continue
+                if observed < latest_time and (
+                    identity not in previous or observed > previous[identity][0]
+                ):
+                    previous[identity] = (observed, close)
+            panel = {
+                identity: close / previous[identity][1] - 1.0
+                for identity, close in current.items()
+                if identity in previous and previous[identity][1] > 0.0
+            }
     if instrument_id in panel:
         panel["__current__"] = panel[instrument_id]
     if panel:
         resolved["cross_sectional_values"] = panel
+
+
+def _latest_synchronised_rows(
+    rows: list[dict[str, Any]],
+) -> tuple[dt.datetime | None, list[dict[str, Any]]]:
+    """Keep only the latest exchange-time cross-section for linked inputs."""
+
+    by_time: dict[dt.datetime, list[dict[str, Any]]] = {}
+    for row in rows:
+        value = row.get("exchange_timestamp")
+        if not isinstance(value, dt.datetime):
+            try:
+                value = dt.datetime.fromisoformat(str(value))
+            except (TypeError, ValueError):
+                continue
+        by_time.setdefault(value, []).append(row)
+    candidates = [
+        (observed_at, values)
+        for observed_at, values in by_time.items()
+        if len({str(row.get("instrument_id") or "") for row in values}) >= 2
+    ]
+    if not candidates:
+        return None, []
+    observed_at, values = max(candidates, key=lambda item: item[0])
+    return observed_at, values
 
 
 def _merge_correlation_beta(

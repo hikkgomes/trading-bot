@@ -45,7 +45,7 @@ def test_default_event_capture_config_is_bounded_and_uses_approved_streams():
     assert "!forceOrder@arr" in market_names
     candle_source = next(source for source in config.sources if source.streams == ("kline_1m",))
     assert candle_source.url == "wss://fstream.binance.com/market/stream"
-    assert candle_source.max_dynamic_symbols == 1_000
+    assert candle_source.max_dynamic_symbols == 12
     assert "ethusdt@kline_1m" in stream_names(candle_source, ("ETHUSDT",))
 
 

@@ -16,6 +16,7 @@ from src.services.backups import (
     verify_directory_archive,
 )
 from src.services.config import load_platform_config
+from src.services.storage_compaction import compact_data_root
 
 
 def _backup_id(kind: str, now: dt.datetime) -> str:
@@ -44,9 +45,15 @@ def create_parquet_backup(*, config_path: Path, now: dt.datetime | None = None) 
     now = now or dt.datetime.now(dt.UTC)
     backup_id = _backup_id("parquet", now)
     store = BackupStore(Path(config.paths["backups"]))
+    # The archive is of the immutable data tree only. Compact before the
+    # snapshot so consumed spool segments and superseded tiny partitions are
+    # never treated as backup content.
+    compact_data_root(Path(config.paths["parquet"]))
     with tempfile.TemporaryDirectory(prefix="platform-parquet-backup-") as raw_directory:
         archive = create_directory_archive(
-            Path(config.paths["parquet"]), Path(raw_directory) / "parquet.tar.gz"
+            Path(config.paths["parquet"]),
+            Path(raw_directory) / "parquet.tar.gz",
+            exclude_prefixes=("quarantine",),
         )
         verify_directory_archive(archive)
         store.create(

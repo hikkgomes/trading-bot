@@ -10,6 +10,10 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+import requests
+from sqlalchemy import select
+
+from src.data.database import job
 from src.data.parquet_store import (
     DurableMarketBatchSpool,
     PartitionedBarStore,
@@ -18,8 +22,10 @@ from src.data.parquet_store import (
 from src.domain._codec import canonical_hash
 from src.domain.market_events import ExchangeSequenceTracker, MarketEvent, MarketEventType
 from src.risk.engine import SqlRiskSnapshotStore
+from src.services.historical_bootstrap import HistoricalBootstrapError, HistoricalBootstrapService
 from src.services.market_gap_recovery import BinanceMarketGapRepair
 from src.services.scheduler import DatabaseJobQueue
+from src.services.storage_compaction import compact_data_root
 
 _PARTITION_TOKEN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -34,7 +40,10 @@ class DatabaseMarketDataWriter:
         snapshot_store: SqlRiskSnapshotStore | None = None,
         product_ids_by_market: Mapping[str, Iterable[str]] | None = None,
         gap_repair: Callable[[Mapping[str, Any]], Iterable[MarketEvent]] | None = None,
+        historical_bootstrap_service: HistoricalBootstrapService | None = None,
         lease_seconds: int = 60,
+        compaction_interval_seconds: int = 3_600,
+        compaction_maximum_rows: int = 5_000,
     ) -> None:
         self.queue = queue
         self.worker_id = worker_id
@@ -48,8 +57,15 @@ class DatabaseMarketDataWriter:
         self.lease_seconds = lease_seconds
         self.sequence_tracker = ExchangeSequenceTracker()
         self.gap_repair = gap_repair or BinanceMarketGapRepair()
+        self.historical_bootstrap_service = historical_bootstrap_service
+        if compaction_interval_seconds <= 0 or compaction_maximum_rows <= 0:
+            raise ValueError("storage compaction bounds must be positive")
+        self.compaction_interval_seconds = compaction_interval_seconds
+        self.compaction_maximum_rows = compaction_maximum_rows
+        self._last_compaction_at: dt.datetime | None = None
 
     def run_once(self, *, now: str) -> dict[str, Any]:
+        self._cleanup_completed_spool_segments()
         claimed = self.queue.claim(
             worker_id=self.worker_id,
             now=now,
@@ -58,21 +74,57 @@ class DatabaseMarketDataWriter:
                 "market_event_batch_write",
                 "market_event_write",
                 "market_data_gap_recovery",
+                *(
+                    ("historical_bootstrap",)
+                    if self.historical_bootstrap_service is not None
+                    else ()
+                ),
             ),
         )
         if claimed is None:
+            compaction = self._maybe_compact(now)
+            if compaction is not None:
+                return compaction
             return {"reason_code": "market_event_queue_empty"}
+        if claimed.name == "historical_bootstrap":
+            return self._run_historical_bootstrap(claimed, now=now)
         if claimed.name == "market_data_gap_recovery":
             return self._run_gap_recovery(claimed, now=now)
+        if claimed.name == "market_event_batch_write":
+            return self._run_batch_write(claimed, now=now)
+        return self._run_single_event_write(claimed, now=now)
+
+    def _run_batch_write(self, claimed, *, now: str) -> dict[str, Any]:
         try:
-            if claimed.name == "market_event_batch_write":
-                result = self._write_batch(claimed.payload)
-                self.queue.complete(claimed, completed_at=now)
-                return {
-                    "reason_code": "market_event_batch_written",
-                    "job_id": claimed.job_id,
-                    **result,
-                }
+            result = self._write_batch(claimed.payload)
+        except Exception as exc:
+            self.queue.fail(
+                claimed,
+                completed_at=now,
+                error=f"{type(exc).__name__}: {exc}",
+                retry_at=_retry_at(now, self.lease_seconds),
+            )
+            return {
+                "reason_code": "market_event_write_failed",
+                "job_id": claimed.job_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        self.queue.complete(claimed, completed_at=now)
+        committed_segment = result.pop("committed_segment", None)
+        if committed_segment is not None:
+            try:
+                DurableMarketBatchSpool(
+                    Path(str(claimed.payload["segment_path"])).parent.parent
+                ).delete(Path(str(committed_segment)))
+            except (OSError, ValueError):
+                # The queue is already complete and the segment is still
+                # recoverable on the next writer cycle.
+                pass
+        return {"reason_code": "market_event_batch_written", "job_id": claimed.job_id, **result}
+
+    def _run_single_event_write(self, claimed, *, now: str) -> dict[str, Any]:
+        try:
             raw_event = claimed.payload.get("event")
             if not isinstance(raw_event, dict):
                 raise ValueError("market-event job has no event object")
@@ -133,8 +185,19 @@ class DatabaseMarketDataWriter:
             "market_snapshot_ids": list(market_snapshot_ids),
         }
 
+    def _cleanup_completed_spool_segments(self) -> None:
+        spool = DurableMarketBatchSpool(self.store.root.parent / "runtime" / "events" / "spool")
+        for path in spool.recoverable():
+            if path.parent.name != "committed":
+                continue
+            job_id = f"work:market_event_batch:{path.stem.removeprefix('segment-')}"
+            if self.queue.state(job_id) == "completed":
+                spool.delete(path)
+
     def _write_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
         segment_path = Path(str(payload["segment_path"]))
+        spool = DurableMarketBatchSpool(segment_path.parent.parent)
+        segment_path = spool.claim(segment_path)
         rows = DurableMarketBatchSpool.read(segment_path)
         body = "".join(
             json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
@@ -143,7 +206,6 @@ class DatabaseMarketDataWriter:
             raise ValueError("market batch segment content hash is invalid")
         events = []
         gap_recovery_job_ids: list[str] = []
-        dropped_rows = 0
         for row in rows:
             event = row.get("event")
             if not isinstance(event, dict):
@@ -156,8 +218,10 @@ class DatabaseMarketDataWriter:
                 str(row.get("symbol") or "").upper(),
             )
             if any(not _PARTITION_TOKEN.fullmatch(value) for value in partition_values):
-                dropped_rows += 1
-                continue
+                raise ValueError("market batch row contains an unsafe partition token")
+            expected_prefix = f"{partition_values[0]}:{partition_values[1]}:{partition_values[3]}"
+            if not canonical_event.instrument_id.startswith(expected_prefix):
+                raise ValueError("market batch row partition does not match its instrument")
             events.append(
                 (
                     canonical_event,
@@ -182,9 +246,14 @@ class DatabaseMarketDataWriter:
                     )
                 )
         paths = self.store.put_batch(events) if events else ()
-        for event, venue, market, symbol in events:
-            if _is_closed_candle(event):
-                self.bar_store.put(event, venue=venue, market=market, symbol=symbol)
+        closed_bars = [
+            (event, venue, market, symbol)
+            for event, venue, market, symbol in events
+            if _is_closed_candle(event)
+        ]
+        if closed_bars:
+            self.bar_store.put_batch(closed_bars)
+            for event, venue, market, symbol in closed_bars:
                 self._enqueue_closed_candle_features(
                     event=event, venue=venue, market=market, symbol=symbol
                 )
@@ -193,14 +262,115 @@ class DatabaseMarketDataWriter:
             for event, _venue, market, _symbol in events
             for snapshot_id in self._publish_market_snapshots(event=event, market=market)
         ]
+        committed = spool.commit(segment_path)
         return {
             "segments": len(paths),
             "events": len(events),
-            "dropped_rows": dropped_rows,
             "paths": [str(path) for path in paths],
             "gap_recovery_job_ids": gap_recovery_job_ids,
             "market_snapshot_ids": snapshot_ids,
+            "committed_segment": str(committed),
         }
+
+    def _maybe_compact(self, now: str) -> dict[str, Any] | None:
+        if self._storage_consumers_busy():
+            return None
+        observed = dt.datetime.fromisoformat(now)
+        if (
+            self._last_compaction_at is not None
+            and (observed - self._last_compaction_at).total_seconds()
+            < self.compaction_interval_seconds
+        ):
+            return None
+        result = compact_data_root(
+            self.store.root,
+            maximum_rows=self.compaction_maximum_rows,
+        )
+        self._last_compaction_at = observed
+        return {"reason_code": "storage_compacted", **result}
+
+    def _storage_consumers_busy(self) -> bool:
+        with self.queue.engine.connect() as connection:
+            rows = connection.execute(
+                select(job.c.state).where(
+                    job.c.name.in_(
+                        (
+                            "market_event_batch_write",
+                            "market_event_write",
+                            "live_feature_calculation",
+                            "historical_feature_calculation",
+                        )
+                    ),
+                    job.c.state.in_(("pending", "running")),
+                )
+            )
+            return next(iter(rows), None) is not None
+
+    def _run_historical_bootstrap(self, claimed, *, now: str) -> dict[str, Any]:
+        current = claimed
+
+        def heartbeat():
+            nonlocal current
+            current = self.queue.heartbeat(
+                current,
+                now=dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
+                lease_seconds=self.lease_seconds,
+            )
+            return current
+
+        try:
+            if self.historical_bootstrap_service is None:
+                raise RuntimeError("historical bootstrap service is not configured")
+            reports = self.historical_bootstrap_service.bootstrap_product(
+                product_id=str(claimed.payload["product_id"]),
+                market=str(claimed.payload["market_type"]),
+                symbols=tuple(str(symbol) for symbol in claimed.payload["symbols"]),
+                minimum_history_days=int(claimed.payload["minimum_history_days"]),
+                timeframe=str(claimed.payload["timeframe"]),
+                heartbeat=heartbeat,
+            )
+            result = {
+                "reason_code": "historical_bootstrap_completed",
+                "job_id": claimed.job_id,
+                "reports": [report.to_payload() for report in reports],
+            }
+            if not all(report.completed and report.metadata_fetched for report in reports):
+                self.queue.defer(
+                    current,
+                    available_at=_retry_at(now, min(self.lease_seconds, 300)),
+                    reason="historical_bootstrap_incomplete",
+                )
+                return {
+                    **result,
+                    "reason_code": "historical_bootstrap_incomplete",
+                }
+        except Exception as exc:
+            retryable = isinstance(
+                exc, HistoricalBootstrapError | requests.RequestException | TimeoutError
+            )
+            if retryable:
+                self.queue.defer(
+                    current,
+                    available_at=_retry_at(now, min(self.lease_seconds, 300)),
+                    reason="historical_bootstrap_waiting_for_retry",
+                )
+            else:
+                self.queue.fail(
+                    current,
+                    completed_at=now,
+                    error=f"{type(exc).__name__}: {exc}",
+                    retry_at=_retry_at(now, self.lease_seconds),
+                )
+            return {
+                "reason_code": "historical_bootstrap_deferred"
+                if retryable
+                else "historical_bootstrap_failed",
+                "job_id": current.job_id,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        self.queue.complete(current, completed_at=now)
+        return result
 
     def _enqueue_gap_recovery(
         self,
@@ -239,38 +409,35 @@ class DatabaseMarketDataWriter:
             repaired = tuple(self.gap_repair(claimed.payload))
             if not repaired:
                 raise RuntimeError("REST gap repair returned no events")
-            paths: list[str] = []
+            venue = str(claimed.payload["venue"])
+            market = str(claimed.payload["market"])
+            symbol = str(claimed.payload["symbol"])
             for event in repaired:
                 if event.instrument_id != claimed.payload["instrument_id"]:
                     raise ValueError("REST gap repair changed the instrument identity")
+            repaired = tuple({event.event_id: event for event in repaired}.values())
+            raw_events = tuple((event, venue, market, symbol) for event in repaired)
+            raw_paths = self.store.put_batch(raw_events)
+            paths = [str(path) for path in raw_paths]
+            closed_bars = []
+            for event in repaired:
                 self.sequence_tracker.observe(
                     event,
                     contiguous=_has_contiguous_sequence(event),
                 )
-                path = self.store.put(
-                    event,
-                    venue=str(claimed.payload["venue"]),
-                    market=str(claimed.payload["market"]),
-                    symbol=str(claimed.payload["symbol"]),
-                )
-                paths.append(str(path))
                 if _is_closed_candle(event):
-                    self.bar_store.put(
-                        event,
-                        venue=str(claimed.payload["venue"]),
-                        market=str(claimed.payload["market"]),
-                        symbol=str(claimed.payload["symbol"]),
-                    )
+                    closed_bars.append((event, venue, market, symbol))
                 self._publish_market_snapshots(
                     event=event,
                     market=str(claimed.payload["market"]),
                 )
                 self._enqueue_closed_candle_features(
                     event=event,
-                    venue=str(claimed.payload["venue"]),
-                    market=str(claimed.payload["market"]),
-                    symbol=str(claimed.payload["symbol"]),
+                    venue=venue,
+                    market=market,
+                    symbol=symbol,
                 )
+            bar_paths = self.bar_store.put_batch(closed_bars) if closed_bars else ()
         except Exception as exc:
             self.queue.fail(
                 claimed,
@@ -290,6 +457,7 @@ class DatabaseMarketDataWriter:
             "job_id": claimed.job_id,
             "repaired_events": len(repaired),
             "paths": paths,
+            "bar_paths": [str(path) for path in bar_paths],
         }
 
     def _publish_market_snapshots(self, *, event: MarketEvent, market: str) -> tuple[str, ...]:
@@ -355,6 +523,7 @@ class DatabaseMarketDataWriter:
             "spot_perpetual": ("spot_perpetual_snapshot", ("candle",)),
             "cross_sectional": ("cross_sectional_snapshot", ("candle",)),
             "correlation_beta": ("correlation_beta_snapshot", ("candle",)),
+            "linked_instruments": ("linked_instrument_snapshot", ("candle",)),
             "sentiment": ("sentiment_snapshot", ()),
             "ml_manifest": ("frozen_ml_manifest", ()),
             "liquidation": ("liquidation_snapshot", ("liquidation",)),
@@ -362,7 +531,7 @@ class DatabaseMarketDataWriter:
         for name, (kind, event_types) in auxiliary_specs.items():
             pattern = (
                 f"raw/{venue.lower()}/{market.lower()}/candle/**/*.parquet"
-                if name in {"cross_sectional", "correlation_beta"}
+                if name in {"cross_sectional", "correlation_beta", "linked_instruments"}
                 else f"raw/{venue.lower()}/**/candle/{symbol.upper()}/**/*.parquet"
                 if name == "spot_perpetual"
                 else f"raw/{venue.lower()}/{market.lower()}/**/{symbol.upper()}/**/*.parquet"

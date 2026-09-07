@@ -58,6 +58,8 @@ class PositionReturnReport:
     period_fees: tuple[float, ...] = ()
     period_slippage: tuple[float, ...] = ()
     period_funding_pnl: tuple[float, ...] = ()
+    terminal_liquidation_cost: float = 0.0
+    terminal_exposure: float = 0.0
 
     @property
     def effective_observations(self) -> int:
@@ -93,6 +95,8 @@ class PositionReturnLedger:
         *,
         funding_rates: float | Sequence[Any] | Iterable[Any] | None = None,
         initial_position: Any | None = None,
+        terminal_position: Any | None = None,
+        liquidate_terminal: bool = False,
     ) -> PositionReturnReport:
         position_values = _series(positions, field="positions")
         return_values = _series(market_returns, field="market_returns")
@@ -109,6 +113,18 @@ class PositionReturnLedger:
         if initial_position is not None and aligned:
             initial_values = _series((initial_position,), field="initial_position")
             period_turnover_values[0] += abs(position_values[0] - initial_values[0])
+        if terminal_position is None:
+            terminal_exposure = float(position_values[-1]) if position_values else 0.0
+        else:
+            terminal_exposure = float(_series((terminal_position,), field="terminal_position")[0])
+        terminal_turnover = abs(terminal_exposure) if liquidate_terminal else 0.0
+        if terminal_turnover:
+            if period_turnover_values:
+                period_turnover_values[-1] += terminal_turnover
+            else:
+                # An open terminal position still incurs a close cost when
+                # the source contains no further market-return period.
+                period_turnover_values.append(terminal_turnover)
         period_turnover = tuple(period_turnover_values)
         turnover = sum(period_turnover)
         fee_rate = _rate(self.fee_rate, field="fee_rate")
@@ -121,8 +137,12 @@ class PositionReturnLedger:
         period_funding_pnl = tuple(
             -position * rate for position, rate in zip(held_positions, funding_values, strict=False)
         )
+        if len(period_funding_pnl) < len(period_turnover):
+            period_funding_pnl += (0.0,) * (len(period_turnover) - len(period_funding_pnl))
+        if len(gross_returns) < len(period_turnover):
+            gross_returns += (0.0,) * (len(period_turnover) - len(gross_returns))
         funding_pnl = sum(period_funding_pnl)
-        net_returns = tuple(
+        net_returns = [
             gross - fee - slip + funding
             for gross, fee, slip, funding in zip(
                 gross_returns,
@@ -131,7 +151,8 @@ class PositionReturnLedger:
                 period_funding_pnl,
                 strict=True,
             )
-        )
+        ]
+        terminal_liquidation_cost = terminal_turnover * (fee_rate + slippage_rate)
         net_pnl = sum(net_returns)
         maximum_drawdown = self._maximum_drawdown(net_returns)
         return PositionReturnReport(
@@ -150,6 +171,8 @@ class PositionReturnLedger:
             period_fees=period_fees,
             period_slippage=period_slippage,
             period_funding_pnl=period_funding_pnl,
+            terminal_liquidation_cost=terminal_liquidation_cost,
+            terminal_exposure=terminal_exposure,
         )
 
     def _funding_values(
@@ -180,5 +203,6 @@ class PositionReturnLedger:
         for value in values:
             equity += value
             peak = max(peak, equity)
-            maximum = max(maximum, peak - equity)
+            if peak > 0:
+                maximum = max(maximum, (peak - equity) / peak)
         return maximum

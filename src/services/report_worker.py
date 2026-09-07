@@ -117,7 +117,7 @@ class DatabaseReportWorker:
         return {
             "healthy": usage.free >= self.minimum_free_bytes,
             "path": str(path),
-            "free_bytes": usage.free // (1024 * 1024) * (1024 * 1024),
+            "free_bytes": usage.free // (1024 * 1024 * 1024) * (1024 * 1024 * 1024),
             "total_bytes": usage.total // (1024 * 1024) * (1024 * 1024),
             "minimum_free_bytes": self.minimum_free_bytes,
         }

@@ -15,6 +15,17 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def file_hash(path: Path) -> str:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"backup input must be a regular file: {path}")
@@ -74,6 +85,8 @@ class BackupStore:
                 shutil.copyfile(source, target)
                 if file_hash(target) != digest:
                     raise RuntimeError(f"backup verification failed: {logical_name}")
+                with target.open("rb") as handle:
+                    os.fsync(handle.fileno())
                 hashes[logical_name] = digest
             bundle = BackupBundle(backup_id=backup_id, created_at=created_at, files=hashes)
             manifest = temporary / "manifest.json"
@@ -84,6 +97,7 @@ class BackupStore:
             with manifest.open("rb") as handle:
                 os.fsync(handle.fileno())
             os.replace(temporary, destination)
+            _fsync_directory(self.root)
         except Exception:
             shutil.rmtree(temporary, ignore_errors=True)
             raise
@@ -257,16 +271,37 @@ class PostgreSQLBackup:
         )
 
 
-def create_directory_archive(source: Path, destination: Path) -> Path:
+def create_directory_archive(
+    source: Path,
+    destination: Path,
+    *,
+    exclude_prefixes: tuple[str, ...] = (),
+) -> Path:
     if source.is_symlink() or not source.is_dir():
         raise ValueError(f"archive source must be a regular directory: {source}")
     source = source.resolve()
+    excluded: list[tuple[str, ...]] = []
+    for raw_prefix in exclude_prefixes:
+        if not str(raw_prefix).strip():
+            continue
+        prefix = Path(str(raw_prefix))
+        if prefix.is_absolute() or ".." in prefix.parts:
+            raise ValueError("archive exclusions must be safe relative paths")
+        excluded.append(prefix.parts)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp")
     temporary.unlink(missing_ok=True)
     try:
         with tarfile.open(temporary, "w:gz") as archive:
-            archive.add(source, arcname=source.name, recursive=True)
+
+            def include(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
+                parts = Path(member.name).parts
+                relative = parts[1:] if parts and parts[0] == source.name else parts
+                if any(relative[: len(prefix)] == prefix for prefix in excluded):
+                    return None
+                return member
+
+            archive.add(source, arcname=source.name, recursive=True, filter=include)
         with tarfile.open(temporary, "r:gz") as archive:
             for member in archive.getmembers():
                 if member.islnk() or member.issym() or member.name.startswith("/"):
@@ -274,6 +309,7 @@ def create_directory_archive(source: Path, destination: Path) -> Path:
                 if ".." in Path(member.name).parts:
                     raise ValueError("backup archive escapes its restore root")
         os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
     finally:
         temporary.unlink(missing_ok=True)
     return destination

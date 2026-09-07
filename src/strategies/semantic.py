@@ -30,6 +30,7 @@ class SemanticEvaluationError(ValueError):
 class PointInTimePanel:
     information_time: str
     instruments: Mapping[str, Mapping[str, float]]
+    minimum_score: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -37,6 +38,18 @@ class PointInTimePanel:
         )
         if len(self.instruments) < 2:
             raise ValueError("cross-sectional panels need at least two instruments")
+        if not math.isfinite(float(self.minimum_score)) or self.minimum_score < 0.0:
+            raise ValueError("cross-sectional minimum score is invalid")
+        for instrument, values in self.instruments.items():
+            if not str(instrument).strip() or not isinstance(values, Mapping) or not values:
+                raise ValueError("cross-sectional panel contains an invalid instrument")
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(float(value))
+                for value in values.values()
+            ):
+                raise ValueError("cross-sectional panel contains a non-finite value")
 
 
 @dataclass(frozen=True)
@@ -46,8 +59,16 @@ class RankedTargets:
     target_fractions: Mapping[str, float]
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "information_time", timestamp(self.information_time, field="information_time")
+        )
         if set(self.scores) != set(self.target_fractions):
             raise ValueError("rank scores and target instruments must match")
+        if any(
+            not math.isfinite(float(value))
+            for value in (*self.scores.values(), *self.target_fractions.values())
+        ):
+            raise ValueError("cross-sectional scores and targets must be finite")
         if abs(sum(self.target_fractions.values())) > 1e-12:
             raise ValueError("cross-sectional targets must be net neutral")
         if sum(abs(value) for value in self.target_fractions.values()) > 1.0 + 1e-12:
@@ -65,6 +86,15 @@ class LinkedInstrumentState:
         )
         if len(self.legs) < 2:
             raise ValueError("relative-value strategies need linked instruments")
+        for instrument, values in self.legs.items():
+            if not str(instrument).strip() or not isinstance(values, Mapping):
+                raise ValueError("relative-value legs contain an invalid instrument")
+            price = values.get("price")
+            if price is None or not math.isfinite(float(price)) or float(price) <= 0:
+                raise ValueError("relative-value legs need positive prices")
+            for name in ("beta", "spread", "causal_spread", "threshold"):
+                if values.get(name) is not None and not math.isfinite(float(values[name])):
+                    raise ValueError("relative-value leg values must be finite")
 
 
 @dataclass(frozen=True)
@@ -74,8 +104,16 @@ class HedgedTargets:
     hedge_error: float
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "information_time", timestamp(self.information_time, field="information_time")
+        )
         if len(self.target_notionals) < 2:
             raise ValueError("hedged targets need at least two legs")
+        if any(
+            not str(instrument).strip() or not math.isfinite(float(value))
+            for instrument, value in self.target_notionals.items()
+        ):
+            raise ValueError("hedged targets must contain finite leg notionals")
         if abs(float(self.hedge_error)) > 1e-9:
             raise ValueError("relative-value targets must be hedged at creation")
 
@@ -89,12 +127,29 @@ class MicrostructureState:
     bid_depth: float
     ask_depth: float
     signed_trade_flow: float
+    minimum_score: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self, "information_time", timestamp(self.information_time, field="information_time")
         )
-        if self.sequence < 0 or self.bid_price <= 0 or self.ask_price <= self.bid_price:
+        if (
+            self.sequence < 0
+            or not all(
+                math.isfinite(float(value))
+                for value in (
+                    self.bid_price,
+                    self.ask_price,
+                    self.bid_depth,
+                    self.ask_depth,
+                    self.signed_trade_flow,
+                    self.minimum_score,
+                )
+            )
+            or self.minimum_score < 0.0
+            or self.bid_price <= 0
+            or self.ask_price <= self.bid_price
+        ):
             raise ValueError("microstructure state has invalid event or book identity")
         if self.bid_depth < 0 or self.ask_depth < 0:
             raise ValueError("order-book depth cannot be negative")
@@ -107,7 +162,14 @@ class MicrostructureForecast:
     expected_direction: int
 
     def __post_init__(self) -> None:
-        if self.expected_direction not in {-1, 0, 1} or not -1 <= self.score <= 1:
+        object.__setattr__(
+            self, "information_time", timestamp(self.information_time, field="information_time")
+        )
+        if (
+            self.expected_direction not in {-1, 0, 1}
+            or not math.isfinite(float(self.score))
+            or not -1 <= self.score <= 1
+        ):
             raise ValueError("microstructure forecast is outside its contract")
 
 
@@ -130,6 +192,8 @@ class TargetDeltaBatch:
         if not self.targets:
             raise ValueError("execution policies need target deltas")
         object.__setattr__(self, "decided_at", timestamp(self.decided_at, field="decided_at"))
+        if any(not math.isfinite(float(value)) for value in self.current_quantities.values()):
+            raise ValueError("execution current quantities must be finite")
 
 
 InputT = TypeVar("InputT")
@@ -181,9 +245,17 @@ class SemanticStrategyRegistry:
 
 
 def relative_momentum(panel: PointInTimePanel) -> RankedTargets:
-    raw = {key: float(values["momentum"]) for key, values in panel.instruments.items()}
+    raw = {
+        key: _panel_signal_value(values, preferred=("momentum", "relative_return", "funding_rank"))
+        for key, values in panel.instruments.items()
+    }
     mean = sum(raw.values()) / len(raw)
-    centred = {key: value - mean for key, value in raw.items()}
+    active = {key: value for key, value in raw.items() if abs(value - mean) >= panel.minimum_score}
+    active_mean = sum(active.values()) / len(active) if len(active) >= 2 else 0.0
+    centred = {
+        key: value - active_mean if key in active and len(active) >= 2 else 0.0
+        for key, value in raw.items()
+    }
     gross = sum(abs(value) for value in centred.values())
     targets = {key: value / gross if gross else 0.0 for key, value in centred.items()}
     ranks = {
@@ -197,11 +269,24 @@ def funding_adjusted_ranking(panel: PointInTimePanel) -> RankedTargets:
     adjusted = PointInTimePanel(
         panel.information_time,
         {
-            key: {"momentum": float(values["momentum"]) - float(values["funding"])}
+            key: {
+                "momentum": _panel_signal_value(
+                    values, preferred=("momentum", "relative_return", "funding_rank")
+                )
+                - float(values.get("funding", 0.0))
+            }
             for key, values in panel.instruments.items()
         },
+        minimum_score=panel.minimum_score,
     )
     return relative_momentum(adjusted)
+
+
+def _panel_signal_value(values: Mapping[str, float], *, preferred: tuple[str, ...]) -> float:
+    for name in preferred:
+        if values.get(name) is not None:
+            return float(values[name])
+    raise SemanticEvaluationError("cross-sectional panel has no ranking value")
 
 
 def spot_perpetual_basis(state: LinkedInstrumentState) -> HedgedTargets:
@@ -221,10 +306,30 @@ def beta_neutral_spread(state: LinkedInstrumentState) -> HedgedTargets:
     beta = float(state.legs[first].get("beta", 1.0))
     if not math.isfinite(beta) or beta <= 0:
         raise ValueError("spread hedge beta must be positive")
-    first_target = 1.0
-    second_target = -beta
+    first_price = float(state.legs[first]["price"])
+    second_price = float(state.legs[second]["price"])
+    spread = state.legs[first].get("causal_spread", state.legs[first].get("spread"))
+    if spread is None:
+        spread = first_price / second_price - 1.0
+    spread = float(spread)
+    threshold = abs(float(state.legs[first].get("threshold", 0.0)))
+    if abs(spread) <= threshold:
+        first_target = 0.0
+        second_target = 0.0
+    else:
+        # A rich first leg is sold and the second leg is bought. The opposite
+        # trade is used when the first leg is cheap. The signed hedge ratio is
+        # part of the output, so the two legs cannot be collapsed into one
+        # directional forecast.
+        direction = -1.0 if spread > 0.0 else 1.0
+        first_target = direction
+        second_target = -direction * beta
     normaliser = abs(first_target) + abs(second_target)
-    targets = {first: first_target / normaliser, second: second_target / normaliser}
+    targets = (
+        {first: first_target / normaliser, second: second_target / normaliser}
+        if normaliser
+        else {first: 0.0, second: 0.0}
+    )
     hedge_error = targets[first] * beta + targets[second]
     return HedgedTargets(state.information_time, targets, hedge_error)
 
@@ -232,6 +337,8 @@ def beta_neutral_spread(state: LinkedInstrumentState) -> HedgedTargets:
 def depth_imbalance(state: MicrostructureState) -> MicrostructureForecast:
     total = state.bid_depth + state.ask_depth
     score = (state.bid_depth - state.ask_depth) / total if total else 0.0
+    if abs(score) < state.minimum_score:
+        score = 0.0
     direction = 1 if score > 0 else -1 if score < 0 else 0
     return MicrostructureForecast(state.information_time, score, direction)
 
@@ -245,6 +352,8 @@ def microprice_displacement(state: MicrostructureState) -> MicrostructureForecas
     )
     mid = (state.bid_price + state.ask_price) / 2
     score = max(-1.0, min(1.0, (microprice - mid) / (state.ask_price - state.bid_price)))
+    if abs(score) < state.minimum_score:
+        score = 0.0
     direction = 1 if score > 0 else -1 if score < 0 else 0
     return MicrostructureForecast(state.information_time, score, direction)
 
@@ -298,6 +407,124 @@ def semantic_input_from_features(name: str, features: Mapping[str, Any]) -> Any:
     if registration.input_type is ForecastCollection:
         return _forecast_collection_from_features(features)
     raise SemanticEvaluationError(f"{name} has no typed canonical input")
+
+
+def semantic_contract_features(
+    name: str, model: Mapping[str, Any], features: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Apply the immutable family contract before semantic evaluation."""
+
+    result = dict(features)
+    if name == "beta_neutral_spreads" and model.get("paired_legs") is not None:
+        result["linked_instruments"] = _relative_contract_features(model, result)
+    if name in {"relative_momentum", "funding_adjusted_ranking"}:
+        result["cross_sectional_values"] = _panel_contract_features(model, result)
+        panel_contract = model.get("panel_contract")
+        parameters = model.get("parameters")
+        threshold = (
+            panel_contract.get("minimum_score") if isinstance(panel_contract, Mapping) else None
+        )
+        if threshold is None and isinstance(parameters, Mapping):
+            threshold = parameters.get("threshold")
+        result["panel_threshold"] = abs(_finite_float(threshold or 0.0, field="panel_threshold"))
+    if name in {"bid_ask_depth_imbalance", "microprice_displacement"}:
+        _require_microstructure_sequence(result)
+        event_contract = model.get("event_contract")
+        parameters = model.get("parameters")
+        threshold = (
+            event_contract.get("minimum_score") if isinstance(event_contract, Mapping) else None
+        )
+        if threshold is None and isinstance(parameters, Mapping):
+            threshold = parameters.get("threshold")
+        result["minimum_score"] = abs(_finite_float(threshold or 0.0, field="minimum_score"))
+    return result
+
+
+def _relative_contract_features(
+    model: Mapping[str, Any], features: Mapping[str, Any]
+) -> dict[str, Any]:
+    raw_legs = model.get("paired_legs")
+    linked = features.get("linked_instruments")
+    if not isinstance(raw_legs, list | tuple) or len(raw_legs) != 2:
+        raise SemanticEvaluationError("relative-value contract needs exactly two paired legs")
+    if not isinstance(linked, Mapping):
+        raise SemanticEvaluationError("relative-value input has no linked instrument panel")
+    leg_ids = tuple(
+        str(item.get("instrument_id") or "") for item in raw_legs if isinstance(item, Mapping)
+    )
+    if len(leg_ids) != 2 or any(not item for item in leg_ids) or not set(leg_ids).issubset(linked):
+        raise SemanticEvaluationError("linked instruments differ from the paired-leg contract")
+    hedge_ratio = _finite_float(model.get("hedge_ratio"), field="hedge_ratio")
+    if hedge_ratio <= 0:
+        raise SemanticEvaluationError("relative-value hedge ratio must be positive")
+    first = sorted(leg_ids)[0]
+    threshold = _contract_threshold(model)
+    first_price = float(linked[sorted(leg_ids)[0]]["price"])
+    second_price = float(linked[sorted(leg_ids)[1]]["price"])
+    derived_spread = first_price / second_price - 1.0
+    explicit_spread = next(
+        (
+            value
+            for key in ("causal_spread", "spread", "basis")
+            if (value := features.get(key)) is not None
+        ),
+        derived_spread,
+    )
+    return {
+        str(key): {
+            **dict(value),
+            **(
+                {
+                    "beta": hedge_ratio,
+                    "causal_spread": float(explicit_spread),
+                    "threshold": threshold,
+                }
+                if str(key) == first
+                else {}
+            ),
+        }
+        for key, value in linked.items()
+        if str(key) in leg_ids and isinstance(value, Mapping)
+    }
+
+
+def _contract_threshold(model: Mapping[str, Any]) -> float:
+    parameters = model.get("parameters")
+    raw = parameters.get("threshold") if isinstance(parameters, Mapping) else None
+    if raw is None:
+        raw = model.get("threshold", 0.0)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise SemanticEvaluationError("relative-value threshold is invalid") from exc
+    if not math.isfinite(value):
+        raise SemanticEvaluationError("relative-value threshold is invalid")
+    return value
+
+
+def _panel_contract_features(
+    model: Mapping[str, Any], features: Mapping[str, Any]
+) -> dict[str, Any]:
+    scope = model.get("instrument_scope")
+    panel = features.get("cross_sectional_values")
+    if isinstance(scope, list | tuple) and isinstance(panel, Mapping):
+        declared = {str(value) for value in scope}
+        observed = {str(key) for key in panel if not str(key).startswith("__")}
+        if not declared.issubset(observed):
+            raise SemanticEvaluationError("cross-sectional panel is outside its instrument scope")
+        return {
+            str(key): value
+            for key, value in panel.items()
+            if str(key).startswith("__") or str(key) in declared
+        }
+    if not isinstance(panel, Mapping):
+        raise SemanticEvaluationError("cross-sectional input has no point-in-time panel")
+    return {str(key): value for key, value in panel.items()}
+
+
+def _require_microstructure_sequence(features: Mapping[str, Any]) -> None:
+    if "sequence" not in features:
+        raise SemanticEvaluationError("microstructure contract has no event sequence")
 
 
 def semantic_forecast_from_output(
@@ -383,7 +610,10 @@ def _panel_from_features(features: Mapping[str, Any]) -> PointInTimePanel:
     information_time = str(features.get("information_time") or "")
     if len(instruments) < 2 or not information_time:
         raise SemanticEvaluationError("cross-sectional input needs two instruments and a timestamp")
-    return PointInTimePanel(information_time, instruments)
+    minimum_score = _finite_float(features.get("panel_threshold", 0.0), field="panel_threshold")
+    if minimum_score < 0.0:
+        raise SemanticEvaluationError("panel_threshold must be non-negative")
+    return PointInTimePanel(information_time, instruments, minimum_score=minimum_score)
 
 
 def _linked_state_from_features(features: Mapping[str, Any]) -> LinkedInstrumentState:
@@ -391,26 +621,61 @@ def _linked_state_from_features(features: Mapping[str, Any]) -> LinkedInstrument
     if isinstance(raw, Mapping):
         legs = {str(key): dict(value) for key, value in raw.items() if isinstance(value, Mapping)}
     else:
-        legs = {
-            "spot": {"price": _finite_float(features.get("spot_price"), field="spot_price")},
-            "perpetual": {
-                "price": _finite_float(features.get("perpetual_price"), field="perpetual_price"),
-                "beta": _finite_float(features.get("beta", 1.0), field="beta"),
-            },
-        }
+        legs = _linked_legs_from_frame(features.get("market_frame"))
+        if len(legs) < 2:
+            legs = {
+                "spot": {"price": _finite_float(features.get("spot_price"), field="spot_price")},
+                "perpetual": {
+                    "price": _finite_float(
+                        features.get("perpetual_price"), field="perpetual_price"
+                    ),
+                    "beta": _finite_float(features.get("beta", 1.0), field="beta"),
+                },
+            }
     information_time = str(features.get("information_time") or "")
     if len(legs) < 2 or not information_time:
         raise SemanticEvaluationError("relative-value input needs linked legs and a timestamp")
     return LinkedInstrumentState(information_time, legs)
 
 
+def _linked_legs_from_frame(value: Any) -> dict[str, dict[str, float]]:
+    if not isinstance(value, list | tuple):
+        return {}
+    legs: dict[str, dict[str, float]] = {}
+    for row in value:
+        if not isinstance(row, Mapping):
+            continue
+        instrument_id = str(row.get("instrument_id") or row.get("symbol") or "").strip()
+        price = row.get("close", row.get("price"))
+        if not instrument_id or price is None:
+            continue
+        try:
+            parsed = float(price)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed) and parsed > 0.0:
+            legs[instrument_id] = {"price": parsed, "beta": 1.0}
+    return legs
+
+
 def _microstructure_from_features(features: Mapping[str, Any]) -> MicrostructureState:
     information_time = str(features.get("information_time") or "")
     if not information_time:
         raise SemanticEvaluationError("microstructure input has no information timestamp")
+    if "sequence" not in features:
+        raise SemanticEvaluationError("microstructure input has no exchange event sequence")
+    raw_sequence = features["sequence"]
+    if isinstance(raw_sequence, bool):
+        raise SemanticEvaluationError("microstructure event sequence is invalid")
+    try:
+        sequence = int(raw_sequence)
+    except (TypeError, ValueError) as exc:
+        raise SemanticEvaluationError("microstructure event sequence is invalid") from exc
+    if sequence < 0 or float(raw_sequence) != sequence:
+        raise SemanticEvaluationError("microstructure event sequence is invalid")
     return MicrostructureState(
         information_time=information_time,
-        sequence=int(features.get("sequence", 0)),
+        sequence=sequence,
         bid_price=_finite_float(features.get("bid_price"), field="bid_price"),
         ask_price=_finite_float(features.get("ask_price"), field="ask_price"),
         bid_depth=_finite_float(features.get("bid_depth"), field="bid_depth"),
@@ -418,6 +683,7 @@ def _microstructure_from_features(features: Mapping[str, Any]) -> Microstructure
         signed_trade_flow=_finite_float(
             features.get("signed_trade_flow", 0.0), field="signed_trade_flow"
         ),
+        minimum_score=_finite_float(features.get("minimum_score", 0.0), field="minimum_score"),
     )
 
 

@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import and_, insert, or_, select, update
+from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
@@ -47,6 +47,21 @@ def _plus_seconds(value: str, seconds: int) -> str:
     return (parsed + dt.timedelta(seconds=seconds)).replace(microsecond=0).isoformat()
 
 
+def immutable_work_id(
+    name: str, payload: Mapping[str, Any], *, volatile: set[str] | None = None
+) -> str:
+    """Return the stable identity for one immutable unit of work.
+
+    Scheduling time is deliberately excluded by callers for research work.
+    Observation work keeps its observation timestamp because each observation is
+    a separate immutable fact.
+    """
+
+    ignored = volatile or set()
+    identity = {str(key): value for key, value in payload.items() if key not in ignored}
+    return f"work:{name}:{canonical_hash(identity).removeprefix('sha256:')}"
+
+
 @dataclass(frozen=True)
 class ClaimedJob:
     job_id: str
@@ -78,6 +93,7 @@ AUTONOMOUS_SCHEDULES = (
     ScheduleSpec("live_account_backfill", 300),
     ScheduleSpec("agent_review", 3600),
     ScheduleSpec("maintenance", 3600),
+    ScheduleSpec("historical_bootstrap", 3600),
 )
 
 
@@ -203,6 +219,7 @@ class PlatformScheduler:
             "live_account_backfill": "live_account_backfill",
             "agent_review": "agent_review",
             "maintenance": "maintenance",
+            "historical_bootstrap": "historical_bootstrap",
         }.get(schedule_name)
 
     def _jobs(
@@ -213,7 +230,7 @@ class PlatformScheduler:
         now: str,
         due_at: str,
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
-        if schedule_name in {"agent_review", "maintenance"}:
+        if schedule_name in {"agent_review", "maintenance", "historical_bootstrap"}:
             return self._single_job(schedule_name, product_id, product, now, due_at)
         if schedule_name == "live_account_backfill" and product.get("execution_mode") != "live":
             return ()
@@ -243,6 +260,54 @@ class PlatformScheduler:
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
         if schedule_name in {"agent_review", "maintenance"} and product_id != min(self.products):
             return ()
+        if schedule_name == "historical_bootstrap":
+            symbols = (
+                ["BTCUSDT"]
+                if product_id == "btc_accumulation"
+                else self._universe_symbols(product_id, product, now)
+            )
+            if not symbols:
+                return ()
+            payload = {
+                **self._payload(schedule_name, product_id, product, now),
+                "minimum_history_days": 365,
+                "symbols": symbols,
+                "timeframe": str(product.get("dataset_timeframe") or "1m"),
+            }
+            payload["available_at"] = "1970-01-01T00:00:00+00:00"
+            payload["content_hash"] = canonical_hash(payload)
+            return (
+                (
+                    immutable_work_id(
+                        "historical_bootstrap",
+                        {
+                            "product_id": product_id,
+                            "market_type": payload["market_type"],
+                            "symbols": symbols,
+                            "minimum_history_days": payload["minimum_history_days"],
+                            "timeframe": payload["timeframe"],
+                        },
+                    ),
+                    "historical_bootstrap",
+                    payload,
+                ),
+            )
+        if schedule_name == "register_strategy_catalogue":
+            payload = self._payload(schedule_name, product_id, product, now)
+            payload["available_at"] = "1970-01-01T00:00:00+00:00"
+            if not payload.get("dataset_snapshot_hashes"):
+                payload["catalogue_submitted_at"] = "1970-01-01T00:00:00+00:00"
+            return (
+                (
+                    immutable_work_id(
+                        "register_strategy_catalogue",
+                        payload,
+                        volatile={"available_at", "catalogue_submitted_at"},
+                    ),
+                    schedule_name,
+                    payload,
+                ),
+            )
         return (
             (
                 f"scheduled:{schedule_name}:{product_id}:{due_at}",
@@ -259,11 +324,12 @@ class PlatformScheduler:
         now: str,
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
         catalogue = self._payload("register_strategy_catalogue", product_id, product, now)
+        payload = self._hypothesis_generation_payload(product_id, product, catalogue)
         return (
             (
-                f"scheduled:candidate_generation:{product_id}:hypotheses:{due_at}",
+                immutable_work_id("generate_hypotheses", payload),
                 "generate_hypotheses",
-                self._hypothesis_generation_payload(product_id, product, catalogue),
+                payload,
             ),
         )
 
@@ -328,7 +394,17 @@ class PlatformScheduler:
                 )
             jobs.append(
                 (
-                    f"scheduled:candidate_evaluation:{candidate.candidate_id}:{requested_stage}:{due_at}",
+                    immutable_work_id(
+                        "candidate_evaluation",
+                        self._research_request(
+                            candidate_id=candidate.candidate_id,
+                            snapshot_id=snapshot_id,
+                            snapshot_payload=snapshot_payload,
+                            requested_stage=requested_stage,
+                            evaluated_at=now,
+                        ),
+                        volatile={"evaluated_at", "content_hash"},
+                    ),
                     "evaluate_candidate",
                     self._research_request(
                         candidate_id=candidate.candidate_id,
@@ -499,7 +575,17 @@ class PlatformScheduler:
                 continue
             jobs.append(
                 (
-                    f"scheduled:{schedule_name}:{candidate.candidate_id}:{due_at}",
+                    immutable_work_id(
+                        job_name,
+                        self._research_request(
+                            candidate_id=candidate.candidate_id,
+                            snapshot_id=snapshot_id,
+                            snapshot_payload=payload,
+                            requested_stage=stage,
+                            evaluated_at=now,
+                        ),
+                        volatile={"evaluated_at", "content_hash"},
+                    ),
                     job_name,
                     self._research_request(
                         candidate_id=candidate.candidate_id,
@@ -524,12 +610,16 @@ class PlatformScheduler:
             "dataset_snapshot_hashes": list(catalogue["dataset_snapshot_hashes"]),
             "dataset_bundle_id": catalogue.get("dataset_bundle_id"),
             "universe_snapshot_id": catalogue.get("universe_snapshot_id"),
-            "submitted_at": str(catalogue["catalogue_submitted_at"]),
+            "submitted_at": (
+                str(catalogue["catalogue_submitted_at"])
+                if catalogue.get("dataset_snapshot_hashes")
+                else "1970-01-01T00:00:00+00:00"
+            ),
             "generation_budget": int(product.get("generation_budget", 6)),
             "universe_id": str(product.get("universe_id") or ""),
             "market_type": "spot" if product_id == "btc_accumulation" else "futures",
             "dataset_timeframe": str(product.get("dataset_timeframe") or "1m"),
-            "available_at": str(catalogue["catalogue_submitted_at"]),
+            "available_at": ("1970-01-01T00:00:00+00:00"),
         }
         return {key: value for key, value in payload.items() if value is not None}
 
@@ -578,7 +668,7 @@ class PlatformScheduler:
             "parameter_set_id": str(snapshot_payload.get("parameter_set_id") or ""),
             "evaluator_version": "platform-scheduler/v1",
             "requested_stage": requested_stage,
-            "evaluated_at": evaluated_at,
+            "evaluated_at": str(snapshot_payload.get("availability_timestamp") or evaluated_at),
             "producer_identity": "platform-scheduler",
             "dataset_roles": {snapshot_id: role},
         }
@@ -592,6 +682,14 @@ class PlatformScheduler:
             rows = connection.execute(select(strategy_artefact.c.payload)).scalars()
             artefacts = [dict(payload) for payload in rows if isinstance(payload, Mapping)]
         jobs: list[tuple[str, str, dict[str, Any]]] = []
+        active_assignments = SqlActiveStrategyAssignmentRepository(self.engine).active_assignments(
+            product_id, at=now
+        )
+        pending_strategy_ids = {
+            str(payload.get("strategy_version_id"))
+            for payload in self._pending_payloads("promotion_evaluation")
+            if payload.get("product_id") in {None, product_id}
+        }
         for artefact in artefacts:
             metadata = artefact.get("metadata")
             if (
@@ -603,19 +701,82 @@ class PlatformScheduler:
             strategy_version_id = str(artefact.get("strategy_version_id") or "")
             if not strategy_version_id:
                 continue
+            if strategy_version_id in pending_strategy_ids:
+                continue
+            if any(
+                row["strategy_version_id"] == strategy_version_id
+                and row["lifecycle_state"] in {"live_canary", "live"}
+                for row in active_assignments
+            ):
+                continue
+            latest_summary = self._latest_forward_summary(
+                strategy_version_id=strategy_version_id,
+                product_id=product_id,
+                artefact_hash=str(artefact.get("artefact_hash") or ""),
+                at=due_at,
+            )
+            # Promotion is evidence-driven. Do not create a timestamped error
+            # job for an artefact which has not produced a forward summary.
+            if latest_summary is None:
+                continue
+            summary_id = str(latest_summary["id"])
+            evaluated_at = str(latest_summary["created_at"])
             jobs.append(
                 (
-                    f"scheduled:promotion_evaluation:{strategy_version_id}:{due_at}",
+                    immutable_work_id(
+                        "promotion_evaluation",
+                        {
+                            "strategy_version_id": strategy_version_id,
+                            "requested_transition": "forward_paper",
+                            "forward_summary_id": summary_id,
+                        },
+                    ),
                     "promotion_evaluation",
                     {
                         "strategy_version_id": strategy_version_id,
                         "requested_transition": "forward_paper",
                         "requested_capital": 0.0,
-                        "evaluated_at": now,
+                        "evaluated_at": evaluated_at,
+                        "forward_summary_id": summary_id,
                     },
                 )
             )
         return tuple(jobs)
+
+    def _latest_forward_summary(
+        self,
+        *,
+        strategy_version_id: str,
+        product_id: str,
+        artefact_hash: str,
+        at: str,
+    ) -> Mapping[str, Any] | None:
+        if not artefact_hash:
+            return None
+        from src.data.database import forward_paper_summary
+
+        with self.engine.connect() as connection:
+            return (
+                connection.execute(
+                    select(
+                        forward_paper_summary.c.id,
+                        forward_paper_summary.c.created_at,
+                    )
+                    .where(
+                        forward_paper_summary.c.strategy_version_id == strategy_version_id,
+                        forward_paper_summary.c.product_id == product_id,
+                        forward_paper_summary.c.artefact_hash == artefact_hash,
+                        forward_paper_summary.c.created_at <= at,
+                    )
+                    .order_by(
+                        forward_paper_summary.c.created_at.desc(),
+                        forward_paper_summary.c.id.desc(),
+                    )
+                    .limit(1)
+                )
+                .mappings()
+                .first()
+            )
 
     def _forward_jobs(
         self, product_id: str, now: str, due_at: str
@@ -628,6 +789,13 @@ class PlatformScheduler:
             if assignment["execution_mode"] == "paper"
         )
         jobs: list[tuple[str, str, dict[str, Any]]] = []
+        pending = {
+            (
+                str(payload.get("assignment_id")),
+                str(payload.get("instrument_id")),
+            )
+            for payload in self._pending_payloads("forward_paper_observation")
+        }
         for assignment in assignments:
             payload = assignment.get("payload")
             if isinstance(payload, Mapping) and payload.get("promotable") is False:
@@ -637,6 +805,8 @@ class PlatformScheduler:
             if not instrument_ids:
                 instrument_ids = ("",)
             for instrument_id in instrument_ids:
+                if (assignment_id, instrument_id) in pending:
+                    continue
                 suffix = instrument_id or "waiting"
                 jobs.append(
                     (
@@ -662,18 +832,31 @@ class PlatformScheduler:
     def _summary_jobs(
         self, product_id: str, now: str, due_at: str
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
+        pending = {
+            (
+                str(payload.get("strategy_version_id")),
+                str(payload.get("artefact_hash")),
+                str(payload.get("evaluation_time")),
+            )
+            for payload in self._pending_payloads("forward_paper_summary")
+        }
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(
                     forward_paper_observation.c.strategy_version_id,
                     forward_paper_observation.c.product_id,
                     forward_paper_observation.c.artefact_hash,
+                    func.max(forward_paper_observation.c.observed_at).label("latest_observed_at"),
                 )
                 .where(
                     forward_paper_observation.c.product_id == product_id,
                     forward_paper_observation.c.observed_at <= now,
                 )
-                .distinct()
+                .group_by(
+                    forward_paper_observation.c.strategy_version_id,
+                    forward_paper_observation.c.product_id,
+                    forward_paper_observation.c.artefact_hash,
+                )
             ).mappings()
             groups = tuple(
                 sorted(
@@ -682,6 +865,7 @@ class PlatformScheduler:
                             str(row["strategy_version_id"]),
                             str(row["product_id"]),
                             str(row["artefact_hash"]),
+                            str(row["latest_observed_at"]),
                         )
                         for row in rows
                     }
@@ -689,17 +873,36 @@ class PlatformScheduler:
             )
         return tuple(
             (
-                f"scheduled:forward_paper_summary:{strategy_version_id}:{artefact_hash}:{due_at}",
+                immutable_work_id(
+                    "forward_paper_summary",
+                    {
+                        "strategy_version_id": strategy_version_id,
+                        "product_id": group_product_id,
+                        "artefact_hash": artefact_hash,
+                        "evaluation_time": evaluation_time,
+                    },
+                ),
                 "forward_paper_summary",
                 {
                     "strategy_version_id": strategy_version_id,
                     "product_id": group_product_id,
                     "artefact_hash": artefact_hash,
-                    "evaluation_time": now,
+                    "evaluation_time": evaluation_time,
                 },
             )
-            for strategy_version_id, group_product_id, artefact_hash in groups
+            for strategy_version_id, group_product_id, artefact_hash, evaluation_time in groups
+            if (strategy_version_id, artefact_hash, evaluation_time) not in pending
         )
+
+    def _pending_payloads(self, name: str) -> tuple[Mapping[str, Any], ...]:
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(job.c.payload).where(
+                    job.c.name == name,
+                    job.c.state.in_(("pending", "running")),
+                )
+            ).scalars()
+        return tuple(payload for payload in rows if isinstance(payload, Mapping))
 
     def _forward_instrument_ids(
         self, assignment: Mapping[str, Any], product_id: str, now: str
@@ -753,10 +956,15 @@ class PlatformScheduler:
             return {"reason_code": "maintenance_queue_empty"}
         recovered = self.queue.recover_expired(now=now)
         self.queue.complete(claimed, completed_at=now)
+        delivery = self.queue.alerts.deliver_pending(now=now)
         return {
             "reason_code": "platform_maintenance_completed",
             "job_id": claimed.job_id,
             "expired_jobs_recovered": recovered,
+            "alert_delivery": {
+                "delivered": list(delivery.delivered),
+                "failed": list(delivery.failed),
+            },
         }
 
     def _payload(
@@ -778,7 +986,7 @@ class PlatformScheduler:
             return {
                 **base,
                 "policy": {},
-                "maximum_symbols": 100,
+                "maximum_symbols": int(product.get("research_max_symbols", 100)),
             }
         if schedule_name == "register_strategy_catalogue":
             bundle = SqlDatasetBundleRepository(self.engine).latest_ready(product_id, at=now)
@@ -979,12 +1187,62 @@ class DatabaseJobQueue:
             "content_hash": values["content_hash"],
             "max_attempts": values["max_attempts"],
         }
-        if existing["state"] == "pending" and existing["attempts"] == 0:
+        if (
+            existing["state"] == "pending"
+            and existing["attempts"] == 0
+            and not job_id.startswith("work:")
+        ):
             expected["available_at"] = values["available_at"]
         actual = {key: existing[key] for key in expected}
         if actual != expected:
             raise ValueError(f"job identity collision: {job_id}")
         return False
+
+    def state(self, job_id: str) -> str | None:
+        """Read one durable job state without claiming or mutating it."""
+
+        with self.engine.connect() as connection:
+            value = connection.execute(
+                select(job.c.state).where(job.c.id == job_id)
+            ).scalar_one_or_none()
+        return None if value is None else str(value)
+
+    def requeue(
+        self,
+        job_id: str,
+        *,
+        available_at: str,
+        reason: str,
+        additional_attempts: int = 3,
+    ) -> bool:
+        """Re-admit one dead-letter job after an operator-safe recovery event."""
+
+        if isinstance(additional_attempts, bool) or additional_attempts < 1:
+            raise ValueError("additional_attempts must be positive")
+        available_at = timestamp(available_at, field="available_at")
+        non_empty(reason, field="requeue reason")
+        with self.engine.begin() as connection:
+            current = connection.execute(
+                select(job.c.state, job.c.attempts, job.c.max_attempts).where(job.c.id == job_id)
+            ).first()
+            if current is None or current.state != "dead_letter":
+                return False
+            next_max_attempts = max(
+                int(current.max_attempts), int(current.attempts) + additional_attempts
+            )
+            connection.execute(
+                update(job)
+                .where(job.c.id == job_id, job.c.state == "dead_letter")
+                .values(
+                    state="pending",
+                    available_at=available_at,
+                    max_attempts=next_max_attempts,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    terminal_reason=None,
+                )
+            )
+        return True
 
     def claim(
         self,
@@ -1164,6 +1422,52 @@ class DatabaseJobQueue:
             error=non_empty(error, field="error"),
             retry_at=retry_at,
         )
+
+    def defer(
+        self,
+        claimed: ClaimedJob,
+        *,
+        available_at: str,
+        reason: str,
+    ) -> None:
+        """Return a claimed job to the queue without consuming a retry.
+
+        Resource admission is not work failure. The claim record is removed so
+        the next real attempt can reuse the job's stable attempt identity.
+        """
+
+        available_at = timestamp(available_at, field="available_at")
+        reason = non_empty(reason, field="defer reason")
+        attempt_id = f"{claimed.job_id}:{claimed.attempt}"
+        with self.engine.begin() as connection:
+            current = connection.execute(
+                select(job.c.state, job.c.lease_owner, job.c.attempts).where(
+                    job.c.id == claimed.job_id
+                )
+            ).first()
+            if (
+                current is None
+                or current.state != "running"
+                or current.lease_owner != claimed.worker_id
+            ):
+                raise ValueError("worker no longer owns the job lease")
+            connection.execute(
+                update(job)
+                .where(job.c.id == claimed.job_id)
+                .values(
+                    state="pending",
+                    available_at=available_at,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    attempts=max(0, int(current.attempts) - 1),
+                    terminal_reason=None,
+                )
+            )
+            connection.execute(delete(job_attempt).where(job_attempt.c.id == attempt_id))
+            connection.execute(delete(worker_lease).where(worker_lease.c.id == attempt_id))
+            connection.execute(
+                update(worker).where(worker.c.id == claimed.worker_id).values(status="ready")
+            )
 
     def _finish(
         self,

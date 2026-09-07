@@ -9,7 +9,7 @@ from typing import Protocol
 
 from src.accounting.fees import FeeConversionError, convert_fee, instrument_asset
 from src.accounting.ledger import Ledger
-from src.domain._codec import timestamp
+from src.domain._codec import canonical_hash, timestamp
 from src.domain.orders import Fill, OrderIntent
 from src.domain.portfolios import TargetPosition
 from src.domain.positions import Position
@@ -246,32 +246,8 @@ class ExecutionService:
             )
         except FeeConversionError as exc:
             raise ValueError(str(exc)) from exc
-        contributions = sorted(order.strategy_contributions)
-        attribution = {
-            "product": self.ledger.product_id,
-            "symbol": order.instrument_id,
-            "instrument_id": order.instrument_id,
-            "order_id": order.order_id,
-            "strategy": contributions[0] if len(contributions) == 1 else "ensemble",
-            "strategy_version_id": contributions[0] if len(contributions) == 1 else None,
-            "sleeve": target_metadata.get("sleeve") or "unassigned",
-            "assignment_id": target_metadata.get("assignment_id"),
-            **fee_conversion.to_payload(),
-        }
-        self.ledger.record_fee(
-            entry_id=f"{fill.fill_id}:fee",
-            amount=Decimal(str(fee_conversion.accounting_amount)),
-            occurred_at=fill.occurred_at,
-            attribution=attribution,
-        )
-        slippage = Decimal(str(fill.metadata.get("slippage_cost") or 0))
-        if slippage:
-            self.ledger.record_slippage(
-                entry_id=f"{fill.fill_id}:slippage",
-                amount=slippage,
-                occurred_at=fill.occurred_at,
-                attribution=attribution,
-            )
+        allocations = _strategy_allocations(order.strategy_contributions)
+        multi_attribution = len(allocations) > 1
         fill_sign = 1.0 if fill.side.value == "buy" else -1.0
         opposing = previous_position.quantity != 0 and (previous_position.quantity > 0) != (
             fill_sign > 0
@@ -294,10 +270,54 @@ class ExecutionService:
                 if self.ledger.accounting_asset == "BTC"
                 else quote_pnl
             )
-            if realised_pnl:
+        else:
+            realised_pnl = Decimal("0")
+        for strategy, fraction in allocations:
+            suffix = (
+                ""
+                if not multi_attribution
+                else ":" + canonical_hash({"strategy": strategy}).removeprefix("sha256:")[:16]
+            )
+            attribution = {
+                "product": self.ledger.product_id,
+                "symbol": order.instrument_id,
+                "instrument_id": order.instrument_id,
+                "order_id": order.order_id,
+                "strategy": strategy,
+                "strategy_version_id": strategy if strategy != "ensemble" else None,
+                "strategy_contribution_fraction": fraction,
+                "sleeve": target_metadata.get("sleeve") or "unassigned",
+                "assignment_id": target_metadata.get("assignment_id"),
+                **fee_conversion.to_payload(),
+            }
+            fee_amount = (
+                Decimal(str(fee_conversion.accounting_amount))
+                if not multi_attribution
+                else Decimal(str(fee_conversion.accounting_amount * fraction))
+            )
+            self.ledger.record_fee(
+                entry_id=f"{fill.fill_id}:fee{suffix}",
+                amount=fee_amount,
+                occurred_at=fill.occurred_at,
+                attribution=attribution,
+            )
+            slippage = Decimal(str(fill.metadata.get("slippage_cost") or 0))
+            if multi_attribution:
+                slippage *= Decimal(str(fraction))
+            if slippage:
+                self.ledger.record_slippage(
+                    entry_id=f"{fill.fill_id}:slippage{suffix}",
+                    amount=slippage,
+                    occurred_at=fill.occurred_at,
+                    attribution=attribution,
+                )
+            allocated_pnl = (
+                realised_pnl if not multi_attribution else realised_pnl * Decimal(str(fraction))
+            )
+            if allocated_pnl:
                 self.ledger.record_realised_pnl(
-                    entry_id=f"{fill.fill_id}:realised_pnl",
-                    amount=realised_pnl,
+                    entry_id=f"{fill.fill_id}:realised_pnl{suffix}",
+                    amount=allocated_pnl,
                     occurred_at=fill.occurred_at,
                     attribution=attribution,
                 )
@@ -324,6 +344,18 @@ class ExecutionService:
             .pass_stage(DecisionTraceStage.PORTFOLIO_ACCEPTED)
             .pass_stage(DecisionTraceStage.RISK_ACCEPTED, decision_id=risk_decision.decision_id)
         )
+
+
+def _strategy_allocations(contributions) -> tuple[tuple[str, float], ...]:
+    weights = tuple(
+        (str(strategy), abs(float(weight)))
+        for strategy, weight in contributions.items()
+        if abs(float(weight)) > 0.0
+    )
+    total = sum(weight for _strategy, weight in weights)
+    if total <= 0.0:
+        return (("ensemble", 1.0),)
+    return tuple((strategy, weight / total) for strategy, weight in sorted(weights))
 
 
 def _instrument_asset(instrument_id: str, asset: str) -> str | None:

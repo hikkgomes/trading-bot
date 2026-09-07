@@ -1,0 +1,29 @@
+[Unit]
+Description=Trading platform scheduler and operations process
+After=network-online.target postgresql.service trading-platform-migration.service
+Wants=network-online.target
+Requires=postgresql.service trading-platform-migration.service
+
+[Service]
+Type=simple
+User=trading-research
+Group=trading-research
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=/etc/trading-platform/research.env
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/opt/trading-bot/.venv-research/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process scheduler-operations --validate
+ExecStart=/opt/trading-bot/.venv-research/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process scheduler-operations
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot/runtime
+Slice=trading-platform-background.slice
+
+[Install]
+WantedBy=multi-user.target

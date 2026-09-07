@@ -500,6 +500,18 @@ job = Table(
     Column("content_hash", String(80), nullable=False),
     Column("payload", JSON, nullable=False),
 )
+job_quarantine = Table(
+    "job_quarantine",
+    metadata,
+    Column("id", String(240), primary_key=True),
+    Column("job_id", ForeignKey("job.id"), nullable=False, index=True),
+    Column("quarantined_at", UtcTimestamp(), nullable=False, index=True),
+    Column("original_state", String(40), nullable=False),
+    Column("reason", String(160), nullable=False),
+    Column("content_hash", String(80), nullable=False),
+    Column("payload", JSON, nullable=False),
+    UniqueConstraint("job_id", name="uq_job_quarantine_job"),
+)
 job_attempt = Table(
     "job_attempt",
     metadata,
@@ -576,6 +588,19 @@ platform_bootstrap = Table(
     Column("content_hash", String(80), nullable=False, unique=True),
     Column("payload", JSON, nullable=False),
 )
+platform_upgrade_marker = _id_payload_table("platform_upgrade_marker")
+emergency_action = Table(
+    "emergency_action",
+    metadata,
+    Column("id", String(240), primary_key=True),
+    Column("job_id", ForeignKey("job.id"), nullable=False, unique=True, index=True),
+    Column("product_id", String(80), nullable=False, index=True),
+    Column("state", String(80), nullable=False, index=True),
+    Column("attempts", Integer, nullable=False, default=0),
+    Column("updated_at", UtcTimestamp(), nullable=False, index=True),
+    Column("content_hash", String(80), nullable=False, unique=True),
+    Column("payload", JSON, nullable=False),
+)
 account_snapshot = Table(
     "account_snapshot",
     metadata,
@@ -585,6 +610,31 @@ account_snapshot = Table(
     Column("source", String(80), nullable=False),
     Column("content_hash", String(80), nullable=False, unique=True),
     Column("payload", JSON, nullable=False),
+)
+historical_bootstrap_progress = Table(
+    "historical_bootstrap_progress",
+    metadata,
+    Column("id", String(240), primary_key=True),
+    Column("product_id", String(80), nullable=False, index=True),
+    Column("market", String(40), nullable=False),
+    Column("symbol", String(80), nullable=False),
+    Column("timeframe", String(40), nullable=False),
+    Column("range_start", UtcTimestamp(), nullable=False),
+    Column("range_end", UtcTimestamp(), nullable=False),
+    Column("next_start", UtcTimestamp(), nullable=False),
+    Column("status", String(40), nullable=False, index=True),
+    Column("updated_at", UtcTimestamp(), nullable=False, index=True),
+    Column("content_hash", String(80), nullable=False, unique=True),
+    Column("payload", JSON, nullable=False),
+    UniqueConstraint(
+        "product_id",
+        "market",
+        "symbol",
+        "timeframe",
+        "range_start",
+        "range_end",
+        name="uq_historical_bootstrap_range",
+    ),
 )
 platform_rehearsal_report = Table(
     "platform_rehearsal_report",
@@ -598,6 +648,21 @@ platform_rehearsal_report = Table(
     Column("payload", JSON, nullable=False),
 )
 alert = _id_payload_table("alert")
+alert_delivery_attempt = Table(
+    "alert_delivery_attempt",
+    metadata,
+    Column("id", String(240), primary_key=True),
+    Column("alert_id", ForeignKey("alert.id"), nullable=False, index=True),
+    Column("sink", String(120), nullable=False),
+    Column("attempt_no", Integer, nullable=False),
+    Column("attempted_at", UtcTimestamp(), nullable=False, index=True),
+    Column("status", String(40), nullable=False, index=True),
+    Column("error", Text),
+    Column("next_attempt_at", UtcTimestamp(), index=True),
+    Column("acknowledged_at", UtcTimestamp()),
+    Column("payload", JSON, nullable=False),
+    UniqueConstraint("alert_id", "sink", "attempt_no", name="uq_alert_delivery_attempt"),
+)
 control_event = _id_payload_table("control_event")
 promotion_event = _id_payload_table("promotion_event")
 promotion_policy = _id_payload_table("promotion_policy")
@@ -663,6 +728,11 @@ class PlatformDatabase:
                 "009_generation_feedback.py",
                 "010_live_ready_lifecycle.py",
                 "011_behavior_hash_identity.py",
+                "012_quarantine_invalid_candidates.py",
+                "013_quarantine_invalid_btc_scope.py",
+                "014_operational_durability.py",
+                "015_legacy_job_quarantine.py",
+                "016_emergency_action_state.py",
             )
             applied: list[str] = []
             with self.engine.begin() as connection:
@@ -712,7 +782,7 @@ class PlatformDatabase:
         if self.is_postgresql:
             with self.engine.connect() as connection:
                 revision = connection.execute(text("SELECT version_num FROM alembic_version"))
-                if revision.scalar_one_or_none() != "platform_v2_0013":
+                if revision.scalar_one_or_none() != "platform_v2_0016":
                     raise RuntimeError("database is not at the current Alembic revision")
 
     def dispose(self) -> None:

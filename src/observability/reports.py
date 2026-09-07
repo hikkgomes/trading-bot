@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, select
@@ -67,12 +68,16 @@ class DatabasePlatformReport:
         *,
         account_stale_after_seconds: int = 60,
         market_data_stale_after_seconds: int = 5,
+        storage_root: Path | None = None,
+        spool_root: Path | None = None,
     ):
         if account_stale_after_seconds <= 0 or market_data_stale_after_seconds <= 0:
             raise ValueError("report staleness thresholds must be positive")
         self.engine = engine
         self.account_stale_after_seconds = account_stale_after_seconds
         self.market_data_stale_after_seconds = market_data_stale_after_seconds
+        self.storage_root = storage_root.resolve() if storage_root is not None else None
+        self.spool_root = spool_root.resolve() if spool_root is not None else None
 
     def build(self, *, now: str | None = None) -> dict[str, Any]:
         report_time = timestamp(now or dt.datetime.now(dt.UTC), field="report time")
@@ -449,7 +454,7 @@ class DatabasePlatformReport:
         authority_conflicts = _execution_authority_conflicts(
             self._rows(worker), self._rows(active_strategy_assignment)
         )
-        return {
+        operations = {
             "job_queue": jobs,
             "workers": self._rows(worker, order_by=worker.c.last_heartbeat.desc()),
             "heartbeats": [
@@ -466,6 +471,12 @@ class DatabasePlatformReport:
                 "execution_authority_conflicts": authority_conflicts,
             },
         }
+        if self.storage_root is not None:
+            operations["storage_health"] = _storage_health(
+                self.storage_root,
+                self.spool_root or self.storage_root.parent / "runtime" / "events" / "spool",
+            )
+        return operations
 
     def _stale_account_authority(self, now: str) -> dict[str, Any]:
         rows = self._rows(account_snapshot, order_by=account_snapshot.c.observed_at.desc())
@@ -608,6 +619,48 @@ def _age_seconds(observed_at: str, now: str) -> float:
     current = dt.datetime.fromisoformat(timestamp(now, field="now"))
     observed = dt.datetime.fromisoformat(timestamp(observed_at, field="observed_at"))
     return max(0.0, (current - observed).total_seconds())
+
+
+def _storage_health(data_root: Path, spool_root: Path) -> dict[str, Any]:
+    kinds = ("raw", "bars", "features", "funding", "metadata")
+    active = {
+        kind: sum(
+            1
+            for path in (data_root / kind).rglob(
+                "metadata-*.json" if kind == "metadata" else "*.parquet"
+            )
+            if path.is_file() and not path.is_symlink()
+        )
+        if (data_root / kind).is_dir()
+        else 0
+        for kind in kinds
+    }
+    feature_spool = spool_root.parent / "feature-spool"
+    spool_paths = tuple(
+        path
+        for state in ("pending", "claimed", "committed", "deleted")
+        for root in (spool_root, feature_spool)
+        for path in (root / state).glob("segment-*.jsonl")
+        if path.is_file() and not path.is_symlink()
+    )
+    stale_cutoff = dt.datetime.now(dt.UTC).timestamp() - 7 * 86_400
+    return {
+        "active_files_by_kind": active,
+        "active_inode_count": sum(active.values()),
+        "active_file_count": sum(active.values()),
+        "spool_inode_count": len(spool_paths),
+        "spool_files_by_state": {
+            state: sum(
+                1
+                for root in (spool_root, feature_spool)
+                for path in (root / state).glob("segment-*.jsonl")
+                if path.is_file() and not path.is_symlink()
+            )
+            for state in ("pending", "claimed", "committed", "deleted")
+        },
+        "spool_bytes": sum(path.stat().st_size for path in spool_paths),
+        "stale_spool_files": sum(path.stat().st_mtime < stale_cutoff for path in spool_paths),
+    }
 
 
 def _candidate_age_by_state(

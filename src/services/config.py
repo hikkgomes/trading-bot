@@ -43,12 +43,10 @@ MAC_SERVICES: frozenset[str] = frozenset()
 ORDER_SUBMISSION_SERVICES = frozenset({"execution-engine"})
 
 PLATFORM_PROCESS_SERVICES: dict[str, tuple[str, ...]] = {
+    "market-gateway": ("market-gateway",),
+    "data-writer": ("data-writer",),
     "trading-runtime": (
-        "market-gateway",
-        "data-writer",
         "feature-service",
-        "universe-service",
-        "platform-scheduler",
         "strategy-evaluator",
         "product-supervisor",
         "portfolio-engine",
@@ -59,8 +57,12 @@ PLATFORM_PROCESS_SERVICES: dict[str, tuple[str, ...]] = {
         "accounting-service",
         "account-reconciliation",
     ),
-    "research-runtime": (
+    "scheduler-operations": (
+        "universe-service",
+        "platform-scheduler",
         "promotion-engine",
+    ),
+    "research-runtime": (
         "research-worker",
         "ml-worker",
         "event-replay-worker",
@@ -367,6 +369,7 @@ def _unique_records(
 def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> None:
     accounts, products, portfolios, policies, risk_products = _split_records(configuration)
     _validate_promotion_policies(policies)
+    _validate_forward_profiles(configuration["promotion"])
     _validate_products(products, accounts, portfolios, policies, risk_products)
     _validate_research_configuration(configuration["research"])
 
@@ -401,6 +404,43 @@ def _validate_promotion_policies(policies: dict[str, dict[str, Any]]) -> None:
         _validate_promotion_switches(policy_id, policy)
         _validate_promotion_fractions(policy_id, policy)
         _validate_promotion_counts(policy_id, policy)
+
+
+def _validate_forward_profiles(promotion: Mapping[str, Any]) -> None:
+    profiles = promotion.get("forward_profiles", [])
+    if not isinstance(profiles, list):
+        raise ValueError("promotion.forward_profiles must be a list")
+    identities: set[tuple[str, str]] = set()
+    for profile in profiles:
+        if not isinstance(profile, Mapping):
+            raise ValueError("promotion forward profiles must be objects")
+        product_id = _string(profile.get("product_id"), field="forward_profile.product_id")
+        family = _string(profile.get("family"), field="forward_profile.family")
+        identity = (product_id, family)
+        if identity in identities:
+            raise ValueError(f"duplicate forward profile: {product_id}/{family}")
+        identities.add(identity)
+        for field_name in (
+            "required_forward_evidence_days",
+            "minimum_forward_independent_decisions",
+            "minimum_forward_effective_trades",
+            "minimum_forward_effective_episodes",
+            "minimum_forward_trading_days",
+        ):
+            value = profile.get(field_name, 0)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"forward profile {product_id}/{family}.{field_name} is invalid")
+    required = {
+        ("btc_accumulation", "btc_allocation"),
+        ("active_income", "scalping"),
+        ("active_income", "intraday"),
+        ("active_income", "cross_sectional"),
+        ("active_income", "pairs"),
+        ("active_income", "swing"),
+    }
+    if not required.issubset(identities):
+        missing = sorted(required - identities)
+        raise ValueError(f"promotion.forward_profiles are missing: {missing}")
 
 
 def _validate_promotion_switches(policy_id: str, policy: Mapping[str, Any]) -> None:
@@ -500,6 +540,7 @@ def _validate_products(
         _validate_product_mode(product_id, product, accounts)
         _validate_product_timeouts(product_id, product)
         _validate_product_costs(product_id, product)
+        _validate_product_timeframe(product_id, product)
         if product_id == "btc_accumulation":
             _validate_btc_product(product_id, product, accounts)
         if product_id == "active_income":
@@ -576,6 +617,21 @@ def _validate_product_costs(product_id: str, product: Mapping[str, Any]) -> None
             raise ValueError(f"product {product_id} has an invalid {name}")
 
 
+def _validate_product_timeframe(product_id: str, product: Mapping[str, Any]) -> None:
+    timeframe = product.get("dataset_timeframe", "1m")
+    if not isinstance(timeframe, str) or not timeframe.strip():
+        raise ValueError(f"product {product_id}.dataset_timeframe must be non-empty")
+    value = timeframe.strip().lower()
+    if len(value) < 2 or value[-1] not in {"m", "h", "d"}:
+        raise ValueError(f"product {product_id}.dataset_timeframe is unsupported")
+    try:
+        amount = int(value[:-1])
+    except ValueError as exc:
+        raise ValueError(f"product {product_id}.dataset_timeframe is unsupported") from exc
+    if amount <= 0:
+        raise ValueError(f"product {product_id}.dataset_timeframe is unsupported")
+
+
 def _validate_btc_product(
     product_id: str,
     product: Mapping[str, Any],
@@ -614,7 +670,23 @@ def _validate_btc_symbol_scope(product_id: str, product: Mapping[str, Any]) -> N
 
 
 def _validate_active_income_product(product_id: str, product: Mapping[str, Any]) -> None:
+    research_max_symbols = product.get("research_max_symbols", 12)
+    if (
+        isinstance(research_max_symbols, bool)
+        or not isinstance(research_max_symbols, int)
+        or not 1 <= research_max_symbols <= 100
+    ):
+        raise ValueError(
+            f"product {product_id}.research_max_symbols must be an integer in [1, 100]"
+        )
     symbols = product.get("live_exchange_symbols")
+    dynamic_scope = product.get("live_instrument_scope")
+    if symbols is None and dynamic_scope == "current_eligible_universe":
+        return
+    if symbols is not None and dynamic_scope == "current_eligible_universe":
+        raise ValueError(
+            f"product {product_id} cannot combine live_exchange_symbols with dynamic live scope"
+        )
     if (
         not isinstance(symbols, list)
         or not symbols

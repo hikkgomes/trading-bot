@@ -24,6 +24,113 @@ install_platform_unit() {
     "$source" | install -m 0644 /dev/stdin "$destination"
 }
 
+refuse_duplicate_authorities() {
+  local current_active legacy_active
+  current_active="$({
+    systemctl list-units --state=active --no-legend --plain 2>/dev/null || true
+  } | awk '$1 ~ /^trading-platform-(runtime|market-gateway|data-writer|operations|research|agent|control|migration)\.service$/ {print $1}')"
+  legacy_active="$({
+    systemctl list-units --state=active --no-legend --plain 2>/dev/null || true
+  } | awk '$1 ~ /^(trading-platform(@|\-research@|\-bot\-)|trading-bot\-)/ && $1 ~ /\.(service|timer)$/ {print $1}')"
+  if [[ -n "$current_active" && -n "$legacy_active" ]]; then
+    echo "Refusing platform startup while replaced and current authorities are both active." >&2
+    printf '%s\n' "$current_active" "$legacy_active" >&2
+    exit 1
+  fi
+}
+
+stop_current_authorities() {
+  local unit
+  local -a current_units
+  current_units=(
+    trading-platform-runtime.service
+    trading-platform-market-gateway.service
+    trading-platform-data-writer.service
+    trading-platform-operations.service
+    trading-platform-research.service
+    trading-platform-agent.service
+    trading-platform-control.service
+    trading-platform-migration.service
+  )
+  for unit in "${current_units[@]}"; do
+    if systemctl is-active --quiet "$unit"; then
+      systemctl stop "$unit" || {
+        echo "Refusing platform upgrade because the current unit did not stop: $unit" >&2
+        exit 1
+      }
+    fi
+    systemctl disable "$unit" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "$unit"; then
+      echo "Refusing platform upgrade while current unit remains active: $unit" >&2
+      exit 1
+    fi
+  done
+}
+
+retire_legacy_units() {
+  local unit file
+  local -a legacy_units legacy_instances legacy_files
+  legacy_units=(
+    trading-platform@.service
+    trading-platform-research@.service
+    trading-bot-autopilot.service
+    trading-bot-autopilot-jobs.service
+    trading-bot-candidate-paper.service
+    trading-bot-candidate-paper.timer
+    trading-bot-event-capture.service
+    trading-bot-autopilot-backup.service
+    trading-bot-autopilot-backup.timer
+    trading-bot-autopilot-healthcheck.service
+    trading-bot-autopilot-healthcheck.timer
+    trading-bot-openclaw-bridge.service
+    trading-bot-openclaw-bridge.timer
+    trading-bot-telegram.service
+    trading-bot-telegram-report.service
+    trading-bot-telegram-report.timer
+  )
+  for unit in "${legacy_units[@]}"; do
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "$unit"; then
+      echo "Refusing to enable the PostgreSQL platform while legacy unit is active: $unit" >&2
+      exit 1
+    fi
+    rm -f "/etc/systemd/system/$unit"
+  done
+
+  legacy_instances=()
+  while read -r unit _rest; do
+    [[ -n "$unit" ]] && legacy_instances+=("$unit")
+  done < <(
+    systemctl list-units --all --no-legend --plain 2>/dev/null |
+      awk '$1 ~ /^trading-platform(@|-research@|-bot-)/ && $1 ~ /\.(service|timer)$/ {print $1}'
+  )
+  for unit in "${legacy_instances[@]}"; do
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "$unit"; then
+      echo "Refusing to enable the PostgreSQL platform while replaced unit is active: $unit" >&2
+      exit 1
+    fi
+  done
+
+  shopt -s nullglob
+  legacy_files=(
+    /etc/systemd/system/trading-platform@*.service
+    /etc/systemd/system/trading-platform-research@*.service
+    /etc/systemd/system/trading-bot-*.service
+    /etc/systemd/system/trading-bot-*.timer
+  )
+  shopt -u nullglob
+  for file in "${legacy_files[@]}"; do
+    unit="${file##*/}"
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "$unit"; then
+      echo "Refusing to enable the PostgreSQL platform while replaced unit is active: $unit" >&2
+      exit 1
+    fi
+    rm -f "$file"
+  done
+}
+
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   [[ "$NODE" == "linux-optiplex" ]] || { echo "NODE must be linux-optiplex." >&2; exit 1; }
   [[ -f "$REPO/config/platform.json" ]] || { echo "platform config is missing" >&2; exit 1; }
@@ -37,6 +144,7 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     echo "Linux platform service installation requires root." >&2
     exit 1
   fi
+  stop_current_authorities
   for group in trading-runtime trading-research trading-agent trading-platform-owner trading-platform; do
     if ! getent group "$group" >/dev/null; then
       groupadd --system "$group"
@@ -94,6 +202,9 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   for directory in raw bars features; do
     install -d -m 2770 -o trading-runtime -g trading-runtime "$REPO/data/$directory"
   done
+  for directory in funding metadata; do
+    install -d -m 2770 -o trading-runtime -g trading-runtime "$REPO/data/$directory"
+  done
   install -d -m 2770 -o trading-runtime -g trading-platform "$REPO/runtime/backups"
   for directory in research artefacts; do
     install -d -m 2770 -o trading-research -g trading-research "$REPO/data/$directory"
@@ -115,6 +226,11 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     # an installation upgrade does not leave historical Parquet unreadable.
     setfacl -R -m u:trading-research:r-X "$REPO/data/$directory"
   done
+  for directory in funding metadata; do
+    setfacl -m u:trading-research:rx "$REPO/data/$directory"
+    setfacl -m d:u:trading-research:rx "$REPO/data/$directory"
+    setfacl -R -m u:trading-research:r-X "$REPO/data/$directory"
+  done
   setfacl -m u:trading-runtime:rx "$REPO/data/research" "$REPO/data/artefacts"
   setfacl -m d:u:trading-runtime:rx "$REPO/data/research" "$REPO/data/artefacts"
   setfacl -m u:trading-runtime:rx "$REPO/runtime/research"
@@ -122,10 +238,14 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   setfacl -m u:trading-agent:rwx "$REPO/runtime/agent-worktrees"
   install_platform_unit "$REPO/deploy/systemd/trading-platform-migration.service" \
     /etc/systemd/system/trading-platform-migration.service
-  install_platform_unit "$REPO/deploy/systemd/trading-platform@.service" \
-    /etc/systemd/system/trading-platform@.service
   install_platform_unit "$REPO/deploy/systemd/trading-platform-runtime.service" \
     /etc/systemd/system/trading-platform-runtime.service
+  install_platform_unit "$REPO/deploy/systemd/trading-platform-market-gateway.service" \
+    /etc/systemd/system/trading-platform-market-gateway.service
+  install_platform_unit "$REPO/deploy/systemd/trading-platform-data-writer.service" \
+    /etc/systemd/system/trading-platform-data-writer.service
+  install_platform_unit "$REPO/deploy/systemd/trading-platform-operations.service" \
+    /etc/systemd/system/trading-platform-operations.service
   install_platform_unit "$REPO/deploy/systemd/trading-platform-research.service" \
     /etc/systemd/system/trading-platform-research.service
   install_platform_unit "$REPO/deploy/systemd/trading-platform-agent.service" \
@@ -144,35 +264,19 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
     /etc/systemd/system/trading-platform-backup-parquet.timer
   install -m 0644 "$REPO/deploy/systemd/trading-platform-backup-verify.timer" \
     /etc/systemd/system/trading-platform-backup-verify.timer
+  systemctl daemon-reload
+  retire_legacy_units
+  systemctl daemon-reload
+  # Retire old authorities before checking for duplicate ownership.
+  refuse_duplicate_authorities
   if [[ "$SKIP_SYSTEMD" == "1" ]]; then
     echo "Installed Linux service users, permissions, and units without enabling systemd."
     exit 0
   fi
-  systemctl daemon-reload
-  legacy_units=(
-    trading-bot-autopilot.service
-    trading-bot-autopilot-jobs.service
-    trading-bot-candidate-paper.service
-    trading-bot-candidate-paper.timer
-    trading-bot-event-capture.service
-    trading-bot-autopilot-backup.service
-    trading-bot-autopilot-backup.timer
-    trading-bot-autopilot-healthcheck.service
-    trading-bot-autopilot-healthcheck.timer
-    trading-bot-openclaw-bridge.service
-    trading-bot-openclaw-bridge.timer
-    trading-bot-telegram.service
-    trading-bot-telegram-report.service
-    trading-bot-telegram-report.timer
-  )
-  for unit in "${legacy_units[@]}"; do
-    systemctl disable --now "$unit" >/dev/null 2>&1 || true
-    if systemctl is-active --quiet "$unit"; then
-      echo "Refusing to enable the PostgreSQL platform while legacy unit is active: $unit" >&2
-      exit 1
-    fi
-  done
   systemctl enable trading-platform-runtime.service
+  systemctl enable trading-platform-market-gateway.service
+  systemctl enable trading-platform-data-writer.service
+  systemctl enable trading-platform-operations.service
   systemctl enable trading-platform-research.service
   systemctl enable trading-platform-agent.service
   systemctl enable trading-platform-control.service

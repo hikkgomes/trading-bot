@@ -10,6 +10,7 @@ from src.domain._codec import canonical_hash, json_value, timestamp
 
 ALLOWED_CONTEXT_KEYS = frozenset(
     {
+        "product_id",
         "strategy_catalogue",
         "feature_catalogue",
         "instrument_universe",

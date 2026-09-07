@@ -26,7 +26,11 @@ from src.data.database import (
     validation_stage,
 )
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
-from src.research.canonical import SqlActiveStrategyAssignmentRepository, preflight_is_fresh
+from src.research.canonical import (
+    SqlActiveStrategyAssignmentRepository,
+    _identity,
+    preflight_is_fresh,
+)
 from src.research.objectives import objective_unit
 from src.services.scheduler import DatabaseJobQueue
 
@@ -51,6 +55,7 @@ class PromotionRequest:
     requested_capital: float
     evaluated_at: str
     instrument_id: str | None = None
+    forward_summary_id: str | None = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> PromotionRequest:
@@ -62,6 +67,7 @@ class PromotionRequest:
             "requested_capital",
             "evaluated_at",
             "instrument_id",
+            "forward_summary_id",
         }
         forbidden = sorted(
             set(payload)
@@ -109,6 +115,11 @@ class PromotionRequest:
                 if payload.get("instrument_id") is not None
                 else None
             ),
+            forward_summary_id=(
+                _identity(str(payload["forward_summary_id"]), field="forward_summary_id")
+                if payload.get("forward_summary_id") is not None
+                else None
+            ),
         )
 
 
@@ -136,6 +147,28 @@ class PromotionPolicy:
     minimum_forward_cycles: int = 0
     minimum_forward_effective_episodes: int = 0
     maximum_forward_tail_loss: float = 1.0
+
+
+def overlay_family_policy(
+    policy: PromotionPolicy,
+    *,
+    product_id: str,
+    family: str,
+    profiles: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+) -> PromotionPolicy:
+    """Apply the exact product-and-family forward profile to a base policy."""
+
+    profile = (profiles or {}).get((str(product_id), str(family)))
+    if profile is None:
+        return policy
+    values = {
+        field_name: getattr(policy, field_name)
+        for field_name in PromotionPolicy.__dataclass_fields__
+    }
+    for field_name, value in profile.items():
+        if field_name in values:
+            values[field_name] = value
+    return PromotionPolicy(**values)
 
 
 @dataclass(frozen=True)
@@ -177,7 +210,8 @@ class PromotionEvidence:
     forward_data_gaps: int = 0
     canary_evidence_accepted: bool = False
     forward_effective_trades: int = 0
-    forward_fill_rate: float = 1.0
+    forward_fill_rate: float = 0.0
+    forward_fill_rate_applicable: bool = False
     forward_slippage: float = 0.0
     forward_data_uptime: float = 0.0
     forward_rejected_orders: int = 0
@@ -186,6 +220,7 @@ class PromotionEvidence:
     forward_effective_episodes: int = 0
     forward_tail_loss: float = 0.0
     supported_instruments: tuple[str, ...] = ()
+    sleeve_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -290,9 +325,18 @@ class SqlPromotionPolicyStore:
 class SqlCanonicalPromotionEvidence:
     """Build promotion evidence from canonical rows, never from a job payload."""
 
-    def __init__(self, engine: Engine, policy_store: SqlPromotionPolicyStore | None = None):
+    def __init__(
+        self,
+        engine: Engine,
+        policy_store: SqlPromotionPolicyStore | None = None,
+        policies_by_product_family: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+    ):
         self.engine = engine
         self.policy_store = policy_store or SqlPromotionPolicyStore(engine)
+        self.policies_by_product_family = {
+            (str(key[0]), str(key[1])): dict(value)
+            for key, value in (policies_by_product_family or {}).items()
+        }
 
     def build(
         self, request: PromotionRequest
@@ -318,6 +362,7 @@ class SqlCanonicalPromotionEvidence:
                 product_id=product_id,
                 account_id=account_id,
                 artefact_hash=artefact_hash,
+                forward_summary_id=request.forward_summary_id,
             )
 
         latest_approval = (
@@ -388,6 +433,14 @@ class SqlCanonicalPromotionEvidence:
         market_making = (
             isinstance(definition, Mapping) and definition.get("family") == "market_making"
         )
+        family = str(definition.get("family") or "") if isinstance(definition, Mapping) else ""
+        validation = (
+            definition.get("validation_policy") if isinstance(definition, Mapping) else None
+        )
+        evidence_type = (
+            str(validation.get("evidence_type") or "") if isinstance(validation, Mapping) else ""
+        )
+        sleeve_id = _promotion_sleeve(product_id, evidence_type or family)
         capability = artefact.get("promotion_policy")
         replay = authoritative.get("market_making_event_replay")
         evidence = PromotionEvidence(
@@ -400,9 +453,9 @@ class SqlCanonicalPromotionEvidence:
             drawdown=max(observation_values.get("drawdown") or [0.0]),
             execution_drift=max(observation_values.get("execution_drift") or [0.0]),
             model_drift=max(observation_values.get("model_drift") or [0.0]),
-            portfolio_capacity=max(observation_values.get("portfolio_capacity") or [0.0]),
+            portfolio_capacity=min(observation_values.get("portfolio_capacity") or [0.0]),
             requested_capital=request.requested_capital,
-            risk_budget_available=max(observation_values.get("risk_budget_available") or [0.0]),
+            risk_budget_available=min(observation_values.get("risk_budget_available") or [0.0]),
             live_approval=bool(latest_approval and latest_approval["status"] == "approved"),
             fresh_preflight=fresh_preflight,
             product_id=product_id,
@@ -451,7 +504,8 @@ class SqlCanonicalPromotionEvidence:
             forward_data_gaps=int(summary_payload.get("data_gaps", 0)),
             canary_evidence_accepted=bool(summary_payload.get("canary_evidence_accepted") is True),
             forward_effective_trades=int(summary_payload.get("effective_trades", 0)),
-            forward_fill_rate=float(summary_payload.get("fill_rate", 1.0)),
+            forward_fill_rate=float(summary_payload.get("fill_rate", 0.0)),
+            forward_fill_rate_applicable=summary_payload.get("fill_rate_applicable") is True,
             forward_slippage=float(summary_payload.get("slippage", 0.0)),
             forward_data_uptime=float(summary_payload.get("data_uptime", 0.0)),
             forward_rejected_orders=int(summary_payload.get("rejected_orders", 0)),
@@ -468,9 +522,19 @@ class SqlCanonicalPromotionEvidence:
                     if str(value).strip()
                 )
             ),
+            sleeve_id=sleeve_id,
         )
         policy_id = str(artefact.get("promotion_policy_id") or "")
         policy = self.policy_store.get(policy_id) if policy_id else self.policy_store.first()
+        policy_family = family
+        if (product_id, policy_family) not in self.policies_by_product_family:
+            policy_family = evidence_type or family
+        policy = overlay_family_policy(
+            policy,
+            product_id=product_id,
+            family=policy_family,
+            profiles=self.policies_by_product_family,
+        )
         return current_state, evidence, policy
 
 
@@ -480,6 +544,7 @@ def _promotion_artefact_row(connection: Any, request: PromotionRequest) -> Mappi
         for row in connection.execute(select(strategy_artefact)).mappings()
         if isinstance(row["payload"], dict)
         and row["payload"].get("strategy_version_id") == request.strategy_version_id
+        and _at_or_before(row["created_at"], request.evaluated_at)
     ]
     if len(rows) != 1:
         raise ValueError("canonical strategy artefact must have exactly one immutable version")
@@ -591,6 +656,8 @@ def _promotion_validation_rows(
     if missing:
         raise ValueError("canonical validation stage is missing: " + ", ".join(missing))
     rows = [validation_by_id[str(identity)] for identity in validation_stage_ids]
+    if any(not _at_or_before(row["evaluated_at"], request.evaluated_at) for row in rows):
+        raise ValueError("canonical validation stage is newer than the promotion request")
     if any(
         str(row["experiment_id"]) not in validation_experiment_ids
         and str(row["experiment_id"]) != request.strategy_version_id
@@ -619,6 +686,7 @@ def _promotion_holdout_rows(
         row
         for row in connection.execute(select(holdout_outcome)).mappings()
         if str(row["holdout_claim_id"]) == holdout_claim_id
+        and _at_or_before(row["evaluated_at"], request.evaluated_at)
     ]
     if not rows:
         raise ValueError("canonical holdout outcome is missing")
@@ -632,6 +700,7 @@ def _promotion_evidence_rows(
     product_id: str,
     account_id: str,
     artefact_hash: str,
+    forward_summary_id: str | None = None,
 ) -> tuple[
     Mapping[str, Any] | None,
     Mapping[str, Any] | None,
@@ -645,14 +714,20 @@ def _promotion_evidence_rows(
         if row["strategy_version_id"] == request.strategy_version_id
         and row["product_id"] == product_id
         and row["artefact_hash"] == artefact_hash
+        and _at_or_before(row["created_at"], request.evaluated_at)
     ]
     forward_summary = max(forward_summaries, key=lambda row: str(row["created_at"]), default=None)
+    if forward_summary_id is not None and (
+        forward_summary is None or str(forward_summary["id"]) != forward_summary_id
+    ):
+        raise ValueError("promotion request is bound to a different forward summary")
     forward_decisions = [
         row
         for row in connection.execute(select(forward_paper_decision)).mappings()
         if row["strategy_version_id"] == request.strategy_version_id
         and row["product_id"] == product_id
         and row["artefact_hash"] == artefact_hash
+        and _at_or_before(row["decided_at"], request.evaluated_at)
     ]
     forward_decision = _latest_forward_decision(forward_decisions, forward_summary)
     approvals = [
@@ -662,6 +737,7 @@ def _promotion_evidence_rows(
         and row["product_id"] == product_id
         and row["account_id"] == account_id
         and row["artefact_hash"] == artefact_hash
+        and _at_or_before(row["approved_at"], request.evaluated_at)
     ]
     preflights = [
         row
@@ -670,9 +746,35 @@ def _promotion_evidence_rows(
         and row["product_id"] == product_id
         and row["account_id"] == account_id
         and row["artefact_hash"] == artefact_hash
+        and _at_or_before(row["checked_at"], request.evaluated_at)
     ]
-    events = list(connection.execute(select(promotion_event)).mappings())
+    events = [
+        row
+        for row in connection.execute(select(promotion_event)).mappings()
+        if _at_or_before(row["created_at"], request.evaluated_at)
+    ]
     return forward_summary, forward_decision, approvals, preflights, events
+
+
+def _at_or_before(value: Any, boundary: str) -> bool:
+    try:
+        return timestamp(str(value), field="evidence timestamp") <= timestamp(
+            boundary, field="promotion timestamp"
+        )
+    except ValueError:
+        return False
+
+
+def _promotion_sleeve(product_id: str, family: str) -> str:
+    if product_id == "btc_accumulation":
+        return "tactical-allocation"
+    return {
+        "scalping": "microstructure",
+        "pairs": "relative-value",
+        "relative_value": "relative-value",
+        "cross_sectional": "funding",
+        "funding_carry": "funding",
+    }.get(family, "directional")
 
 
 def _latest_forward_decision(
@@ -1170,8 +1272,14 @@ def _forward_evidence_failures(
             "forward_effective_trades_insufficient",
         ),
         (
-            evidence.forward_fill_rate < policy.minimum_forward_fill_rate,
-            "forward_fill_rate_insufficient",
+            (policy.minimum_forward_fill_rate > 0.0 and not evidence.forward_fill_rate_applicable)
+            or evidence.forward_fill_rate < policy.minimum_forward_fill_rate,
+            (
+                "forward_fill_rate_not_applicable"
+                if policy.minimum_forward_fill_rate > 0.0
+                and not evidence.forward_fill_rate_applicable
+                else "forward_fill_rate_insufficient"
+            ),
         ),
         (
             evidence.forward_slippage > policy.maximum_forward_slippage,
@@ -1256,26 +1364,57 @@ class SqlPromotionStore:
         )
         identity = canonical_hash(payload)
         with self.engine.begin() as connection:
-            existing = connection.execute(
-                select(promotion_event.c.payload).where(promotion_event.c.id == identity)
-            ).scalar_one_or_none()
-            if existing is not None:
-                if dict(existing) != payload:
-                    raise ValueError("promotion decision identity collision")
-                return identity
-            connection.execute(
-                insert(promotion_event).values(
-                    id=identity,
-                    created_at=decision.evaluated_at,
-                    payload=payload,
-                )
+            return self.append_in_connection(
+                connection,
+                decision,
+                payload=payload,
+                identity=identity,
             )
-        return identity
+
+    @staticmethod
+    def append_in_connection(
+        connection,
+        decision: PromotionDecision,
+        *,
+        payload: Mapping[str, Any] | None = None,
+        identity: str | None = None,
+    ) -> str:
+        values = dict(
+            payload
+            or {
+                "strategy_version_id": decision.strategy_version_id,
+                "prior_state": decision.prior_state.value,
+                "next_state": decision.next_state.value,
+                "accepted": decision.accepted,
+                "reason_code": decision.reason_code,
+                "evaluated_at": decision.evaluated_at,
+                "capital_limit": decision.capital_limit,
+                "evidence_hash": decision.evidence_hash,
+            }
+        )
+        record_id = identity or canonical_hash(values)
+        existing = connection.execute(
+            select(promotion_event.c.payload).where(promotion_event.c.id == record_id)
+        ).scalar_one_or_none()
+        if existing is not None:
+            if dict(existing) != values:
+                raise ValueError("promotion decision identity collision")
+            return record_id
+        connection.execute(
+            insert(promotion_event).values(
+                id=record_id,
+                created_at=decision.evaluated_at,
+                payload=values,
+            )
+        )
+        return record_id
 
     def latest(self, strategy_version_id: str) -> PromotionDecision | None:
         with self.engine.connect() as connection:
             payloads = connection.execute(
-                select(promotion_event.c.payload).order_by(promotion_event.c.created_at.desc())
+                select(promotion_event.c.payload).order_by(
+                    promotion_event.c.created_at.desc(), promotion_event.c.id.desc()
+                )
             ).scalars()
             for payload in payloads:
                 if payload.get("strategy_version_id") != strategy_version_id:
@@ -1303,6 +1442,7 @@ class DatabasePromotionWorker:
         worker_id: str,
         store: SqlPromotionStore,
         policy_store: SqlPromotionPolicyStore | None = None,
+        policies_by_product_family: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
         strict_identity_contract: bool | None = None,
         lease_seconds: int = 60,
     ) -> None:
@@ -1310,6 +1450,10 @@ class DatabasePromotionWorker:
         self.worker_id = worker_id
         self.store = store
         self.policy_store = policy_store or SqlPromotionPolicyStore(store.engine)
+        self.policies_by_product_family = {
+            (str(key[0]), str(key[1])): dict(value)
+            for key, value in (policies_by_product_family or {}).items()
+        }
         self.strict_identity_contract = (
             store.engine.dialect.name == "postgresql"
             if strict_identity_contract is None
@@ -1342,13 +1486,27 @@ class DatabasePromotionWorker:
                     else None
                 ),
             )
-            identity = self.store.append(decision)
-            self._apply_assignment_transition(
-                decision=decision,
-                evidence=evidence,
-                current_state=current_state,
-                identity=identity,
-            )
+            if self.strict_identity_contract and decision.next_state in {
+                LifecycleState.FORWARD_PAPER,
+                LifecycleState.LIVE_READY,
+                LifecycleState.LIVE_CANARY,
+                LifecycleState.LIVE,
+                LifecycleState.SUSPENDED,
+                LifecycleState.RETIRED,
+            }:
+                identity = self._append_and_apply_atomic(
+                    decision=decision,
+                    evidence=evidence,
+                    current_state=current_state,
+                )
+            else:
+                identity = self.store.append(decision)
+                self._apply_assignment_transition(
+                    decision=decision,
+                    evidence=evidence,
+                    current_state=current_state,
+                    identity=identity,
+                )
         except Exception as exc:
             self.queue.fail(
                 claimed,
@@ -1372,13 +1530,51 @@ class DatabasePromotionWorker:
             "capital_limit": decision.capital_limit,
         }
 
+    def _append_and_apply_atomic(
+        self,
+        *,
+        decision: PromotionDecision,
+        evidence: PromotionEvidence,
+        current_state: LifecycleState,
+    ) -> str:
+        payload = {
+            "strategy_version_id": decision.strategy_version_id,
+            "product_id": evidence.product_id,
+            "artefact_hash": evidence.strategy_artefact_hash,
+            "prior_state": decision.prior_state.value,
+            "next_state": decision.next_state.value,
+            "accepted": decision.accepted,
+            "reason_code": decision.reason_code,
+            "evaluated_at": decision.evaluated_at,
+            "capital_limit": decision.capital_limit,
+            "evidence_hash": decision.evidence_hash,
+        }
+        identity = canonical_hash(payload)
+        with self.store.engine.begin() as connection:
+            identity = SqlPromotionStore.append_in_connection(
+                connection,
+                decision,
+                payload=payload,
+                identity=identity,
+            )
+            self._apply_assignment_transition_in_connection(
+                connection,
+                decision=decision,
+                evidence=evidence,
+                current_state=current_state,
+                identity=identity,
+            )
+        return identity
+
     def _load_promotion_context(
         self, payload: Mapping[str, Any], *, now: str
     ) -> tuple[LifecycleState, PromotionEvidence, PromotionPolicy, str, str]:
         if self.strict_identity_contract:
             request = PromotionRequest.from_payload(payload)
             state, evidence, policy = SqlCanonicalPromotionEvidence(
-                self.store.engine, self.policy_store
+                self.store.engine,
+                self.policy_store,
+                self.policies_by_product_family,
             ).build(request)
             return state, evidence, policy, request.strategy_version_id, request.evaluated_at
         raw_evidence = payload.get("evidence")
@@ -1393,7 +1589,9 @@ class DatabasePromotionWorker:
             )
         request = PromotionRequest.from_payload(payload)
         state, evidence, policy = SqlCanonicalPromotionEvidence(
-            self.store.engine, self.policy_store
+            self.store.engine,
+            self.policy_store,
+            self.policies_by_product_family,
         ).build(request)
         return state, evidence, policy, request.strategy_version_id, request.evaluated_at
 
@@ -1407,6 +1605,24 @@ class DatabasePromotionWorker:
     ) -> None:
         if not self.strict_identity_contract:
             return
+        with self.store.engine.begin() as connection:
+            self._apply_assignment_transition_in_connection(
+                connection,
+                decision=decision,
+                evidence=evidence,
+                current_state=current_state,
+                identity=identity,
+            )
+
+    def _apply_assignment_transition_in_connection(
+        self,
+        connection,
+        *,
+        decision: PromotionDecision,
+        evidence: PromotionEvidence,
+        current_state: LifecycleState,
+        identity: str,
+    ) -> None:
         assignments = SqlActiveStrategyAssignmentRepository(self.store.engine)
         assignable_states = {
             LifecycleState.FORWARD_PAPER,
@@ -1414,17 +1630,23 @@ class DatabasePromotionWorker:
             LifecycleState.LIVE_CANARY,
             LifecycleState.LIVE,
         }
-        if decision.accepted and decision.next_state in assignable_states:
+        if (
+            decision.accepted
+            and decision.next_state in assignable_states
+            and decision.next_state is not current_state
+        ):
             self._assign_promoted_state(
                 assignments,
                 decision=decision,
                 evidence=evidence,
                 current_state=current_state,
                 identity=identity,
+                connection=connection,
             )
         elif decision.next_state in {LifecycleState.SUSPENDED, LifecycleState.RETIRED}:
             if evidence.product_id:
-                assignments.deactivate(
+                assignments.deactivate_in_connection(
+                    connection,
                     evidence.product_id,
                     at=decision.evaluated_at,
                     assignment_reason=f"canonical promotion: {decision.reason_code}",
@@ -1441,6 +1663,7 @@ class DatabasePromotionWorker:
         evidence: PromotionEvidence,
         current_state: LifecycleState,
         identity: str,
+        connection=None,
     ) -> None:
         if not evidence.product_id or not evidence.portfolio_id:
             raise ValueError("accepted promotion evidence lacks product/portfolio identity")
@@ -1449,36 +1672,76 @@ class DatabasePromotionWorker:
             if decision.next_state in {LifecycleState.LIVE_CANARY, LifecycleState.LIVE}
             else "paper"
         )
+        if execution_mode == "live":
+            if connection is None:
+                assignments.deactivate(
+                    evidence.product_id,
+                    at=decision.evaluated_at,
+                    assignment_reason="promotion transition to live",
+                    portfolio_id=evidence.portfolio_id,
+                    strategy_version_id=decision.strategy_version_id,
+                    artefact_hash=evidence.strategy_artefact_hash,
+                    execution_mode="paper",
+                    sleeve_id=evidence.sleeve_id or None,
+                )
+            else:
+                assignments.deactivate_in_connection(
+                    connection,
+                    evidence.product_id,
+                    at=decision.evaluated_at,
+                    assignment_reason="promotion transition to live",
+                    portfolio_id=evidence.portfolio_id,
+                    strategy_version_id=decision.strategy_version_id,
+                    artefact_hash=evidence.strategy_artefact_hash,
+                    execution_mode="paper",
+                    sleeve_id=evidence.sleeve_id or None,
+                )
         if execution_mode == "live" and not evidence.supported_instruments:
             raise ValueError("live promotion evidence lacks exact supported instruments")
         if execution_mode == "live" and current_state is LifecycleState.LIVE_CANARY:
-            assignments.deactivate(
-                evidence.product_id,
-                at=decision.evaluated_at,
-                assignment_reason="promotion transition to live",
-                portfolio_id=evidence.portfolio_id,
-                strategy_version_id=decision.strategy_version_id,
-                artefact_hash=evidence.strategy_artefact_hash,
-            )
+            if connection is None:
+                assignments.deactivate(
+                    evidence.product_id,
+                    at=decision.evaluated_at,
+                    assignment_reason="promotion transition to live",
+                    portfolio_id=evidence.portfolio_id,
+                    strategy_version_id=decision.strategy_version_id,
+                    artefact_hash=evidence.strategy_artefact_hash,
+                )
+            else:
+                assignments.deactivate_in_connection(
+                    connection,
+                    evidence.product_id,
+                    at=decision.evaluated_at,
+                    assignment_reason="promotion transition to live",
+                    portfolio_id=evidence.portfolio_id,
+                    strategy_version_id=decision.strategy_version_id,
+                    artefact_hash=evidence.strategy_artefact_hash,
+                )
         for instrument_id in evidence.supported_instruments or (None,):
-            assignments.assign(
-                product_id=evidence.product_id,
-                portfolio_id=evidence.portfolio_id,
-                strategy_version_id=decision.strategy_version_id,
-                artefact_hash=evidence.strategy_artefact_hash,
-                lifecycle_state=decision.next_state.value,
-                execution_mode=execution_mode,
-                capital_limit=decision.capital_limit,
-                assigned_at=decision.evaluated_at,
-                assigned_by=self.worker_id,
-                instrument_id=instrument_id,
-                risk_budget=min(decision.capital_limit, evidence.risk_budget_available),
-                assignment_reason=f"canonical promotion: {decision.reason_code}",
-                payload={
+            assign_kwargs: dict[str, Any] = {
+                "product_id": evidence.product_id,
+                "portfolio_id": evidence.portfolio_id,
+                "strategy_version_id": decision.strategy_version_id,
+                "artefact_hash": evidence.strategy_artefact_hash,
+                "lifecycle_state": decision.next_state.value,
+                "execution_mode": execution_mode,
+                "capital_limit": decision.capital_limit,
+                "assigned_at": decision.evaluated_at,
+                "assigned_by": self.worker_id,
+                "instrument_id": instrument_id,
+                "sleeve_id": evidence.sleeve_id or "default",
+                "risk_budget": min(decision.capital_limit, evidence.risk_budget_available),
+                "assignment_reason": f"canonical promotion: {decision.reason_code}",
+                "payload": {
                     "promotion_event_id": identity,
                     "source": "canonical_promotion_worker",
                 },
-            )
+            }
+            if connection is None:
+                assignments.assign(**assign_kwargs)
+            else:
+                assignments.assign_in_connection(connection, **assign_kwargs)
 
 
 def _retry_at(value: str, seconds: int) -> str:

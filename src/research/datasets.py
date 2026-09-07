@@ -532,6 +532,7 @@ class CanonicalResearchDatasetBuilder:
         parameter_set_id: str,
         instrument_scope: tuple[str, ...] | list[str],
         created_at: str,
+        timeframe: str | None = None,
         engine_version: str | None = None,
         source_partition_hashes: tuple[str, ...] = (),
     ) -> DatasetBundle:
@@ -569,7 +570,7 @@ class CanonicalResearchDatasetBuilder:
                 raise DatasetResolutionError(
                     f"dataset data_pending: missing instruments for role {role}: {', '.join(missing)}"
                 )
-            payload_by_role[role] = self._bar_payload(selected)
+            payload_by_role[role] = self._bar_payload(selected, timeframe=timeframe)
             availability[role] = created
         return self.build(
             product_id,
@@ -587,43 +588,89 @@ class CanonicalResearchDatasetBuilder:
         )
 
     @staticmethod
-    def _bar_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
-        market_frame = [dict(row) for row in rows]
-        aligned_returns: list[float] = []
+    def _bar_payload(rows: list[dict[str, Any]], *, timeframe: str | None = None) -> dict[str, Any]:
+        market_frame = sorted(
+            (dict(row) for row in rows),
+            key=lambda row: (
+                str(row.get("close_timestamp", row.get("timestamp", ""))),
+                str(row.get("instrument_id") or row.get("symbol") or ""),
+            ),
+        )
         funding_rates: list[float] = []
         funding_period_rates: list[float] = []
         funding_timestamps: list[str] = []
         previous_by_instrument: dict[str, float] = {}
         history_by_instrument: dict[str, list[float]] = {}
         returns_by_instrument: dict[str, list[float]] = {}
+        panels_by_time: dict[str, dict[str, dict[str, float]]] = {}
         feature_rows: list[dict[str, Any]] = []
         for row in market_frame:
             close_value = _numeric_close(row.get("close"))
             instrument = str(row.get("instrument_id") or row.get("symbol") or "")
+            observed_at = str(row.get("close_timestamp", row.get("timestamp", "")))
             history = history_by_instrument.setdefault(instrument, [])
             previous = previous_by_instrument.get(instrument)
             row_return = close_value / previous - 1.0 if previous and close_value else 0.0
-            aligned_returns.append(row_return)
             if previous is not None:
                 returns_by_instrument.setdefault(instrument, []).append(row_return)
             funding_rate = _signed_numeric(row.get("funding_rate", row.get("funding")), default=0.0)
             funding_rates.append(funding_rate)
             funding_period_rates.append(funding_rate if row.get("funding_event") is True else 0.0)
             if row.get("funding_event") is True:
-                funding_timestamps.append(str(row.get("close_timestamp", row.get("timestamp"))))
-            feature_rows.append(_bar_feature_row(row, close_value, row_return, history))
+                funding_timestamps.append(
+                    str(
+                        row.get(
+                            "funding_timestamp",
+                            row.get("close_timestamp", row.get("timestamp")),
+                        )
+                    )
+                )
+            feature_rows.append(
+                _bar_feature_row(
+                    row,
+                    close_value,
+                    row_return,
+                    history,
+                    instrument_id=instrument,
+                )
+            )
+            if observed_at:
+                panels_by_time.setdefault(observed_at, {})[instrument] = {
+                    "momentum": row_return,
+                    "funding": funding_rate,
+                    "relative_return": row_return,
+                    "close": close_value,
+                }
             if close_value > 0.0:
                 history.append(close_value)
                 previous_by_instrument[instrument] = close_value
+        panel_time, panel = _latest_panel(panels_by_time)
+        linked = _latest_linked_instruments(market_frame, panel_time)
+        cross_sectional_history = _cross_sectional_history(panels_by_time)
+        linked_history = _linked_history(panels_by_time)
+        single_instrument_returns = next(iter(returns_by_instrument.values()), [])
         return {
             "bars": market_frame,
             "market_frame": market_frame,
-            "returns": aligned_returns[1:],
+            # Directional strategies consume a single instrument series. A
+            # panel gets an equal-weight time series by timestamp, which keeps
+            # cross-instrument rows from becoming false sequential returns.
+            "returns": (
+                single_instrument_returns
+                if len(returns_by_instrument) == 1
+                else _panel_returns(panels_by_time)
+            ),
             "funding_rates": funding_rates,
             "funding_period_rates": funding_period_rates,
             "funding_timestamps": funding_timestamps,
             "symbol_returns": returns_by_instrument,
             "feature_rows": feature_rows,
+            "information_time": panel_time
+            or (str(market_frame[-1].get("close_timestamp")) if market_frame else ""),
+            "cross_sectional_values": panel,
+            "linked_instruments": linked,
+            "cross_sectional_history": cross_sectional_history,
+            "linked_instrument_history": linked_history,
             "independent_units": len(market_frame),
             "data_quality": {
                 "rows": len(market_frame),
@@ -632,8 +679,67 @@ class CanonicalResearchDatasetBuilder:
                 ),
                 "missing_fields": [],
                 "duplicate_timestamps": 0,
+                "cadence": CanonicalResearchDatasetBuilder._cadence_report(
+                    market_frame, timeframe=timeframe
+                ),
             },
         }
+
+    @staticmethod
+    def _cadence_report(
+        rows: list[dict[str, Any]], *, timeframe: str | None = None
+    ) -> dict[str, Any]:
+        """Report timestamp gaps without replacing them with synthetic bars."""
+
+        by_instrument: dict[str, list[dt.datetime]] = {}
+        for row in rows:
+            value = row.get("close_timestamp", row.get("timestamp"))
+            if value is None:
+                continue
+            try:
+                observed = _bar_timestamp(value, field="cadence timestamp")
+                by_instrument.setdefault(
+                    str(row.get("instrument_id") or row.get("symbol") or ""), []
+                ).append(dt.datetime.fromisoformat(observed))
+            except (TypeError, ValueError, DatasetResolutionError):
+                continue
+        expected_interval = _cadence_interval_seconds(timeframe) if timeframe else None
+        result: dict[str, Any] = {}
+        for instrument_id, values in by_instrument.items():
+            ordered = sorted(set(values))
+            gaps = [
+                int((right - left).total_seconds())
+                for left, right in zip(ordered, ordered[1:], strict=False)
+                if right > left
+            ]
+            missing_ranges = []
+            if expected_interval is not None:
+                for left, right in zip(ordered, ordered[1:], strict=False):
+                    gap_seconds = int((right - left).total_seconds())
+                    if gap_seconds > expected_interval:
+                        missing_ranges.append(
+                            {
+                                "start": (
+                                    left + dt.timedelta(seconds=expected_interval)
+                                ).isoformat(),
+                                "end": (
+                                    right - dt.timedelta(seconds=expected_interval)
+                                ).isoformat(),
+                                "missing_intervals": max(1, gap_seconds // expected_interval - 1),
+                            }
+                        )
+            result[instrument_id] = {
+                "rows": len(ordered),
+                "start": ordered[0].isoformat() if ordered else None,
+                "end": ordered[-1].isoformat() if ordered else None,
+                "expected_interval_seconds": expected_interval,
+                "median_gap_seconds": sorted(gaps)[len(gaps) // 2] if gaps else None,
+                "max_gap_seconds": max(gaps, default=None),
+                "duplicate_timestamps": len(values) - len(ordered),
+                "missing_intervals": sum(item["missing_intervals"] for item in missing_ranges),
+                "missing_ranges": missing_ranges,
+            }
+        return result
 
     @staticmethod
     def _materialise_bars(bars: Any) -> tuple[dict[str, Any], ...]:
@@ -753,8 +859,27 @@ def _numeric_close(value: Any) -> float:
     return result if math.isfinite(result) and result > 0.0 else 0.0
 
 
+def _cadence_interval_seconds(value: str) -> int:
+    text = str(value).strip().lower()
+    units = {"m": 60, "h": 3_600, "d": 86_400}
+    if len(text) < 2 or text[-1] not in units:
+        raise DatasetResolutionError(f"unsupported timeframe for cadence: {value}")
+    try:
+        count = int(text[:-1])
+    except ValueError as exc:
+        raise DatasetResolutionError(f"unsupported timeframe for cadence: {value}") from exc
+    if count <= 0:
+        raise DatasetResolutionError(f"unsupported timeframe for cadence: {value}")
+    return count * units[text[-1]]
+
+
 def _bar_feature_row(
-    row: Mapping[str, Any], close: float, row_return: float, history: list[float]
+    row: Mapping[str, Any],
+    close: float,
+    row_return: float,
+    history: list[float],
+    *,
+    instrument_id: str,
 ) -> dict[str, Any]:
     recent = history[-20:]
     mean = sum(recent) / len(recent) if recent else close
@@ -763,6 +888,7 @@ def _bar_feature_row(
     prior_high = max(recent) if recent else close
     range_fraction = _range_fraction(row, close)
     return {
+        "instrument_id": instrument_id,
         "timestamp": row.get("close_timestamp", row.get("timestamp")),
         "bar_return": row_return,
         "trend": row_return,
@@ -776,6 +902,100 @@ def _bar_feature_row(
             row.get("funding", row.get("funding_rate", 0.0)), default=0.0
         ),
     }
+
+
+def _latest_panel(
+    panels_by_time: Mapping[str, Mapping[str, Mapping[str, float]]],
+) -> tuple[str | None, dict[str, dict[str, float]]]:
+    candidates = [(time, values) for time, values in panels_by_time.items() if len(values) >= 2]
+    if not candidates:
+        return None, {}
+    observed_at, values = max(candidates, key=lambda item: item[0])
+    return observed_at, {str(key): dict(value) for key, value in sorted(values.items())}
+
+
+def _latest_linked_instruments(
+    rows: list[dict[str, Any]], panel_time: str | None
+) -> dict[str, dict[str, float]]:
+    if not panel_time:
+        return {}
+    linked: dict[str, dict[str, float]] = {}
+    for row in rows:
+        if str(row.get("close_timestamp", row.get("timestamp", ""))) != panel_time:
+            continue
+        instrument_id = str(row.get("instrument_id") or row.get("symbol") or "")
+        close = _numeric_close(row.get("close"))
+        if instrument_id and close > 0.0:
+            linked[instrument_id] = {"price": close, "beta": 1.0}
+    return linked
+
+
+def _cross_sectional_history(
+    panels_by_time: Mapping[str, Mapping[str, Mapping[str, float]]],
+) -> list[dict[str, Any]]:
+    ordered = [
+        (observed_at, {str(key): dict(value) for key, value in sorted(values.items())})
+        for observed_at, values in sorted(panels_by_time.items())
+        if len(values) >= 2
+    ]
+    result: list[dict[str, Any]] = []
+    for index, (observed_at, values) in enumerate(ordered):
+        next_values = ordered[index + 1][1] if index + 1 < len(ordered) else {}
+        forward_returns = {
+            instrument: next_values[instrument]["close"] / values[instrument]["close"] - 1.0
+            for instrument in values
+            if instrument in next_values
+            and values[instrument].get("close", 0.0) > 0.0
+            and next_values[instrument].get("close", 0.0) > 0.0
+        }
+        result.append(
+            {
+                "information_time": observed_at,
+                "cross_sectional_values": values,
+                "forward_returns": forward_returns,
+            }
+        )
+    return result
+
+
+def _linked_history(
+    panels_by_time: Mapping[str, Mapping[str, Mapping[str, float]]],
+) -> list[dict[str, Any]]:
+    ordered = [
+        (observed_at, panel)
+        for observed_at, panel in sorted(panels_by_time.items())
+        if len(panel) >= 2
+    ]
+    result: list[dict[str, Any]] = []
+    for index, (observed_at, panel) in enumerate(ordered):
+        next_panel = ordered[index + 1][1] if index + 1 < len(ordered) else {}
+        forward_returns = {
+            instrument: next_panel[instrument]["close"] / values["close"] - 1.0
+            for instrument, values in panel.items()
+            if instrument in next_panel
+            and values.get("close", 0.0) > 0.0
+            and next_panel[instrument].get("close", 0.0) > 0.0
+        }
+        result.append(
+            {
+                "information_time": observed_at,
+                "linked_instruments": {
+                    instrument: {"price": float(values.get("close", 0.0)), "beta": 1.0}
+                    for instrument, values in sorted(panel.items())
+                    if float(values.get("close", 0.0)) > 0.0
+                },
+                "forward_returns": forward_returns,
+            }
+        )
+    return result
+
+
+def _panel_returns(panels_by_time: Mapping[str, Mapping[str, Mapping[str, float]]]) -> list[float]:
+    return [
+        sum(float(values.get("relative_return", 0.0)) for values in panels.values()) / len(panels)
+        for _time, panels in sorted(panels_by_time.items())
+        if panels
+    ]
 
 
 def _range_fraction(row: Mapping[str, Any], close: float) -> float:

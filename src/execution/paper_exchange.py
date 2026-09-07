@@ -116,5 +116,15 @@ class PaperExchange:
             updated.portfolio_id,
             fill,
             contributions=dict(updated.strategy_contributions),
+            assignment_id=_order_assignment_id(updated),
         )
         return fill
+
+
+def _order_assignment_id(order: OrderIntent) -> str | None:
+    target_metadata = order.metadata.get("target_metadata")
+    if isinstance(target_metadata, dict) and target_metadata.get("assignment_id"):
+        return str(target_metadata["assignment_id"])
+    if order.metadata.get("assignment_id"):
+        return str(order.metadata["assignment_id"])
+    return None

@@ -416,7 +416,7 @@ class PlatformBootstrap:
                 "producer_identity": "platform-scheduler",
                 "market_type": "spot" if instrument.market_type is MarketType.SPOT else "futures",
                 "policy": {},
-                "maximum_symbols": 100,
+                "maximum_symbols": int(product.get("research_max_symbols", 100)),
             },
             available_at=observed_at,
             priority=300,

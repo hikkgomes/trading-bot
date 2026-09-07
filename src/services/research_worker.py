@@ -23,12 +23,18 @@ class ResearchWorker:
         handlers: Mapping[str, JobHandler],
         lease_seconds: int = 120,
         heavy_compute: HeavyComputeLeaseStore | None = None,
+        forbidden_secret_names: tuple[str, ...] = (),
     ) -> None:
         if runtime.node.operating_system != "linux":
             raise ValueError("research workers must run on Linux")
         if runtime.can_submit_orders:
             raise PermissionError("research workers cannot submit exchange orders")
-        if any(name in os.environ for name in ("EXCHANGE_API_KEY", "EXCHANGE_API_SECRET")):
+        forbidden = {
+            "EXCHANGE_API_KEY",
+            "EXCHANGE_API_SECRET",
+            *(str(name).strip() for name in forbidden_secret_names if str(name).strip()),
+        }
+        if any(name in os.environ for name in forbidden):
             raise PermissionError("research workers must not receive exchange credentials")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -49,36 +55,45 @@ class ResearchWorker:
         )
         if claimed is None:
             return {"reason_code": "research_queue_empty"}
-        compute_lease = None
-        if self.heavy_compute is not None:
-            compute_lease = self.heavy_compute.acquire(
-                owner=self.worker_id,
-                job_id=claimed.job_id,
-                now=now,
-                lease_seconds=self.lease_seconds,
+        compute_lease = self._acquire_compute_lease(claimed, now=now)
+        if self.heavy_compute is not None and compute_lease is None:
+            self.queue.defer(
+                claimed,
+                available_at=_add_seconds(now, min(self.lease_seconds, 60)),
+                reason="heavy_compute_slot_unavailable",
             )
-            if compute_lease is None:
-                self.queue.fail(
-                    claimed,
-                    completed_at=now,
-                    error="heavy_compute_slot_unavailable",
-                    retry_at=_add_seconds(now, min(self.lease_seconds, 60)),
-                )
-                return {"reason_code": "heavy_compute_slot_unavailable", "job_id": claimed.job_id}
+            return {"reason_code": "heavy_compute_slot_unavailable", "job_id": claimed.job_id}
         handler = self.handlers.get(claimed.name)
         if handler is None:
-            retry_at = _add_seconds(now, self.lease_seconds)
-            self.queue.fail(
-                claimed,
-                completed_at=now,
-                error="unsupported_job_type",
-                retry_at=retry_at,
-            )
-            return {
-                "reason_code": "unsupported_job_type",
-                "job_id": claimed.job_id,
-                "job_name": claimed.name,
-            }
+            return self._fail_unsupported(claimed, now=now)
+        return self._execute_handler(claimed, handler, compute_lease)
+
+    def _acquire_compute_lease(self, claimed: ClaimedJob, *, now: str):
+        if self.heavy_compute is None:
+            return None
+        return self.heavy_compute.acquire(
+            owner=self.worker_id,
+            job_id=claimed.job_id,
+            now=now,
+            lease_seconds=self.lease_seconds,
+        )
+
+    def _fail_unsupported(self, claimed: ClaimedJob, *, now: str) -> dict[str, Any]:
+        self.queue.fail(
+            claimed,
+            completed_at=now,
+            error="unsupported_job_type",
+            retry_at=_add_seconds(now, self.lease_seconds),
+        )
+        return {
+            "reason_code": "unsupported_job_type",
+            "job_id": claimed.job_id,
+            "job_name": claimed.name,
+        }
+
+    def _execute_handler(
+        self, claimed: ClaimedJob, handler: JobHandler, compute_lease
+    ) -> dict[str, Any]:
         current = claimed
         heavy_compute = self.heavy_compute
 
@@ -116,6 +131,18 @@ class ResearchWorker:
                 "job_id": current.job_id,
                 "error_type": type(exc).__name__,
                 "error": str(exc),
+            }
+        if result.pop("_defer", False):
+            defer_reason = str(result.pop("_defer_reason", "research_work_deferred"))
+            defer_at = _add_seconds(utc_now(), min(self.lease_seconds, 300))
+            if compute_lease is not None and heavy_compute is not None:
+                heavy_compute.release(compute_lease)
+            self.queue.defer(current, available_at=defer_at, reason=defer_reason)
+            return {
+                "reason_code": "research_job_deferred",
+                "job_id": current.job_id,
+                **result,
+                "defer_reason": defer_reason,
             }
         self.queue.complete(current, completed_at=utc_now())
         if compute_lease is not None and heavy_compute is not None:

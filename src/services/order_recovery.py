@@ -59,13 +59,14 @@ class DatabaseLiveRecoveryWorker:
             reconciliation = self.reconcile_product(product_id)
             plan = plan_recovery(reconciliation, created_at=now, store=self.store)
             if plan is None:
-                if claimed.payload.get("recovery_kind") == "user_stream_reconnect":
+                recovery_kind = claimed.payload.get("recovery_kind")
+                if recovery_kind in {"user_stream_reconnect", "emergency_ambiguous_submission"}:
                     self.queue.complete(claimed, completed_at=now)
                     return {
                         "reason_code": "live_recovery_verified",
                         "job_id": claimed.job_id,
                         "product_id": product_id,
-                        "recovery_kind": "user_stream_reconnect",
+                        "recovery_kind": recovery_kind,
                         **({"backfill": dict(backfill)} if backfill is not None else {}),
                     }
                 if claimed.name == "live_account_backfill":
@@ -83,20 +84,32 @@ class DatabaseLiveRecoveryWorker:
                     dict(self.execute_action(product_id, action)) for action in plan.actions
                 )
                 verification = self.reconcile_product(product_id)
-                if not verification.recovery_required:
-                    resolution_id = self.store.resolve(
-                        plan.plan_id,
-                        resolved_at=now,
-                        verification_hash=canonical_hash(
-                            {
-                                "product_id": product_id,
-                                "recovery_plan_id": plan.plan_id,
-                                "matched": verification.matched,
-                            }
-                        ),
+                if verification.recovery_required:
+                    self.queue.defer(
+                        claimed,
+                        available_at=_retry_at(now, min(self.lease_seconds, 30)),
+                        reason="live_recovery_reconciliation_pending",
                     )
-                else:
-                    resolution_id = None
+                    return {
+                        "reason_code": "live_recovery_reconciliation_pending",
+                        "job_id": claimed.job_id,
+                        "product_id": product_id,
+                        "recovery_plan_id": plan.plan_id,
+                        "actions": len(plan.actions),
+                        "action_results": list(action_results),
+                        "operator_review_required": plan.requires_operator_review,
+                    }
+                resolution_id = self.store.resolve(
+                    plan.plan_id,
+                    resolved_at=now,
+                    verification_hash=canonical_hash(
+                        {
+                            "product_id": product_id,
+                            "recovery_plan_id": plan.plan_id,
+                            "matched": verification.matched,
+                        }
+                    ),
+                )
             else:
                 resolution_id = None
         except Exception as exc:

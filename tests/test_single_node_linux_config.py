@@ -16,7 +16,10 @@ def test_platform_processes_cover_each_service_once() -> None:
     assigned = [service for services in config.processes.values() for service in services]
 
     assert set(config.processes) == {
+        "market-gateway",
+        "data-writer",
         "trading-runtime",
+        "scheduler-operations",
         "research-runtime",
         "agent-runtime",
         "control-api",

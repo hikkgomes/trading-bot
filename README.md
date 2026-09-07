@@ -49,6 +49,9 @@ The installer uses separate runtime, research, agent, and migration users and
 installs the grouped units:
 
 - `trading-platform-runtime.service`
+- `trading-platform-market-gateway.service`
+- `trading-platform-data-writer.service`
+- `trading-platform-operations.service`
 - `trading-platform-research.service`
 - `trading-platform-agent.service`
 - `trading-platform-control.service`

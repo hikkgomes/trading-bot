@@ -7,6 +7,7 @@ import json
 import os
 
 from src.data.database import PlatformDatabase
+from src.services.platform_upgrade import quarantine_legacy_research_jobs
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -26,7 +27,12 @@ def main(argv: list[str] | None = None) -> None:
         database.assert_migrated()
         report = {"ok": True, "mode": "check"}
     else:
-        report = {"ok": True, "mode": "migrate", "applied": list(database.migrate())}
+        report = {
+            "ok": True,
+            "mode": "migrate",
+            "applied": list(database.migrate()),
+            "legacy_queue": quarantine_legacy_research_jobs(database.engine),
+        }
     print(json.dumps(report, sort_keys=True))
     database.dispose()
 

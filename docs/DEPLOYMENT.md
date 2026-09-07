@@ -60,6 +60,11 @@ PostgreSQL bootstrap. Verify migrations with:
 make db-migration-check
 ```
 
+For an upgrade of an existing database, run `make platform-upgrade` after the
+backup credentials are configured. It creates a PostgreSQL backup, then
+quarantines legacy pending and dead research jobs. The repaired scheduler does
+not import that queue state.
+
 ## 3. Configure isolated environments
 
 Create root-owned mode `0640` files under `/etc/trading-platform/`.
@@ -97,6 +102,9 @@ The code remains modular, but units follow privilege and failure domains.
 
 ```bash
 sudo systemctl start trading-platform-runtime.service
+sudo systemctl start trading-platform-market-gateway.service
+sudo systemctl start trading-platform-data-writer.service
+sudo systemctl start trading-platform-operations.service
 sudo systemctl start trading-platform-research.service
 sudo systemctl start trading-platform-agent.service
 sudo systemctl start trading-platform-control.service
@@ -105,11 +113,13 @@ sudo systemctl enable --now trading-platform-backup-parquet.timer
 sudo systemctl enable --now trading-platform-backup-verify.timer
 ```
 
-The runtime process owns market data, features, strategy evaluation, portfolio,
-risk, execution, paper execution, accounting, and reconciliation. The
-research process owns scheduling, staged evaluation, forward summaries,
-promotion, and reporting. The control API and agent sandbox use separate
-processes. `migration-service` is a one-shot process.
+The market gateway owns persistent exchange streams and the durable spool. The
+data-writer process owns raw, bar, and feature persistence. The runtime process
+owns strategy evaluation, portfolio, risk, execution, paper execution,
+accounting, and reconciliation. The operations process owns scheduling,
+universe refresh, and promotion. The research process owns staged evaluation,
+forward summaries, and research workers. The control API and agent sandbox use
+separate processes. `migration-service` is a one-shot process.
 
 Check the process and timer state:
 
@@ -167,13 +177,20 @@ The live authority command checks the exact product, account, instrument,
 artefact, behaviour hash, forward summary, approval, preflight, configuration,
 engine identity, account fingerprint, capital cap, and current risk state.
 BTC accumulation accepts only Binance BTCUSDT spot artefacts. Active income
-uses only the explicitly configured live symbol scope. No agent, scheduler, or
-automatic promotion can grant live authority.
+uses only the selected instrument from the current eligible universe. No agent,
+scheduler, or automatic promotion can grant live authority.
 
 Use the command only with an explicit human actor and confirmation:
 
 ```bash
-make platform-live-authority ARGS="inspect --product active_income --artefact <ARTEFACT_HASH> --instrument <INSTRUMENT_ID> --sleeve directional"
+make platform-live-authority ARGS="inspect --product active_income --artefact-hash <ARTEFACT_HASH> --instrument-id <INSTRUMENT_ID> --sleeve-id directional"
+```
+
+After the connected canary has fresh accepted evidence, promote that exact
+assignment with a separate human confirmation:
+
+```bash
+make platform-live-authority ARGS="canary-to-live --product active_income --artefact-hash <ARTEFACT_HASH> --instrument-id <INSTRUMENT_ID> --sleeve-id directional --expected-preflight-id <PREFLIGHT_ID> --expected-approval-id <APPROVAL_ID> --canary-evidence-id <CANARY_REPORT_ID> --capital-limit <CAPITAL> --risk-budget <RISK_BUDGET> --assigned-by <HUMAN_OPERATOR> --confirm"
 ```
 
 Do not run connected testnet orders automatically. Use a dedicated flat testnet

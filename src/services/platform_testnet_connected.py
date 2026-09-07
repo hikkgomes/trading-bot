@@ -6,6 +6,7 @@ import argparse
 import datetime as dt
 import hashlib
 import hmac
+import math
 import os
 import time
 import uuid
@@ -17,6 +18,7 @@ from typing import Any
 from sqlalchemy import func, insert, select
 
 from src.accounting.ledger import Ledger, SqlLedgerStore
+from src.data.binance_user_stream import normalise_user_event
 from src.data.database import (
     PlatformDatabase,
     accounting_entry,
@@ -25,7 +27,7 @@ from src.data.database import (
 )
 from src.data.event_capture import load_event_capture_config
 from src.data.feature_store import SqlFeatureStore
-from src.domain._codec import canonical_hash
+from src.domain._codec import canonical_hash, to_primitive
 from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.domain.instruments import MarketType, canonical_instrument_id
 from src.domain.orders import OrderIntent, OrderSide, OrderStatus, OrderType
@@ -36,6 +38,7 @@ from src.execution.ccxt_broker import CcxtBroker
 from src.execution.order_manager import OrderManager, SqlOrderStore
 from src.execution.position_manager import PositionManager, SqlPositionStore
 from src.execution.recovery import RecoveryAction, RecoveryActionType
+from src.execution.stops import SqlStopStore, StopManager, StopStatus
 from src.observability.decision_trace import SqlDecisionTraceStore
 from src.research.canonical import (
     SqlActiveStrategyAssignmentRepository,
@@ -46,6 +49,7 @@ from src.services.account_reconciliation import AccountReconciliationService
 from src.services.accounting_service import AccountingService, DatabaseAccountingWorker
 from src.services.artefact_dispatcher import ArtefactDispatcher
 from src.services.config import load_platform_config, load_split_configuration
+from src.services.emergency import DatabaseEmergencyFlattenWorker
 from src.services.health import DatabaseHeartbeatStore
 from src.services.live_execution import (
     ApprovedLiveExecution,
@@ -64,6 +68,7 @@ from src.services.portfolio_state import (
     DatabasePortfolioStateWorker,
     portfolio_state_policies,
 )
+from src.services.protective_stops import LiveProtectiveStopService
 from src.services.risk_service import DatabaseRiskWorker
 from src.services.runtime import utc_now
 from src.services.scheduler import DatabaseJobQueue
@@ -168,6 +173,7 @@ def run_connected_testnet_rehearsal(
         accounting_before = runtime["accounting_before"]
         now = runtime["now"]
         reference_price = runtime["reference_price"]
+        stop_evidence = runtime["stop_evidence"]
         gateway = runtime["gateway"]
         user_stream_worker = runtime["user_stream_worker"]
         accounting_worker = runtime["accounting_worker"]
@@ -194,6 +200,9 @@ def run_connected_testnet_rehearsal(
             now=now,
             reference_price=reference_price,
             rehearsal_id=rehearsal_id,
+            protective_stop=runtime["protective_service"],
+            stop_evidence=stop_evidence,
+            emergency_worker=runtime["emergency_worker"],
         )
         opened = cycle["opened"]
         closed = cycle["closed"]
@@ -218,6 +227,8 @@ def run_connected_testnet_rehearsal(
             "product_id": product_id,
             "account_id": str(account["account_id"]),
             "assignment_id": str(assignment["id"]),
+            "instrument_id": instrument_id,
+            "sleeve_id": str(assignment.get("sleeve_id") or ""),
             "artefact_hash": str(assignment["artefact_hash"]),
             "forecast_id": pipeline["forecast_id"],
             "target_position_snapshot_id": pipeline["target_position_snapshot_id"],
@@ -229,6 +240,8 @@ def run_connected_testnet_rehearsal(
             "requested_notional_usd": notional_usd,
             "execution_engine_identity": _execution_engine_identity(),
             "account_fingerprint": str(getattr(broker, "account_fingerprint", "")),
+            "protective_stop_applicable": str(account.get("market")) == "usdt_futures",
+            "protective_stop_not_applicable": str(account.get("market")) != "usdt_futures",
             "open_order_id": opened["order_id"],
             "open_exchange_order_id": opened["exchange_order_id"],
             "close_order_id": closed["order_id"],
@@ -254,8 +267,18 @@ def run_connected_testnet_rehearsal(
                 "recovery_required": open_reconciliation.recovery_required,
             },
             "flat_reconciliation": True,
+            "native_stop_created": bool(stop_evidence["native_stop_created"]),
+            "native_stop_readback_matched": bool(stop_evidence["native_stop_readback_matched"]),
+            "algo_update_processed": bool(stop_evidence["algo_update_processed"]),
+            "partial_fill_quantity_handled": bool(stop_evidence["partial_fill_quantity_handled"]),
+            "stop_resize_or_replacement_handled": bool(
+                stop_evidence["stop_resize_or_replacement_handled"]
+            ),
+            "native_stop_cancelled": bool(stop_evidence["native_stop_cancelled"]),
+            "emergency_reduction_tested": bool(stop_evidence["emergency_reduction_tested"]),
             "final_account": final_account,
         }
+        _assert_connected_report_evidence(result)
         report_hash = canonical_hash(result)
         signature = hmac.new(signing_key.encode(), report_hash.encode(), hashlib.sha256).hexdigest()
         report = {**result, "report_hash": report_hash, "signature": signature}
@@ -371,7 +394,10 @@ def _prepare_rehearsal_runtime(
     notional_usd: float,
 ) -> dict[str, Any]:
     market = "spot" if account.get("market") == "spot" else "futures"
-    market_symbol = str((product.get("live_exchange_symbols") or ["BTCUSDT"])[0])
+    market_symbol = _assigned_exchange_symbol(
+        assignment.get("instrument_id"),
+        fallback=str((product.get("live_exchange_symbols") or ["BTCUSDT"])[0]),
+    )
     market_price = CcxtBroker(_exchange_config(account, market=market)).get_price(market_symbol)
     if market_price <= 0:
         raise ConnectedTestnetError("testnet market price is not positive")
@@ -411,6 +437,17 @@ def _prepare_rehearsal_runtime(
         ledgers={product_id: rehearsal_ledger},
     )
     venue = approved_live.venues[product_id]
+    protective_service, stop_evidence, callbacks = _prepare_protective_runtime(
+        database=database,
+        product=product,
+        account=account,
+        product_id=product_id,
+        venue=venue,
+        queue=queue,
+        order_manager=order_manager,
+        positions=positions,
+        market=market,
+    )
     instrument_id = str(assignment.get("instrument_id") or "")
     instrument = venue.instruments.get(instrument_id)
     if instrument is None:
@@ -463,6 +500,9 @@ def _prepare_rehearsal_runtime(
         account_id=str(account["account_id"]),
         order_manager=order_manager,
         positions=positions,
+        on_live_fill=callbacks["on_live_fill"],
+        on_algo_update=callbacks["on_algo_update"],
+        on_order_status=callbacks["on_order_status"],
     )
     live_worker = _live_worker(
         database=database,
@@ -473,6 +513,24 @@ def _prepare_rehearsal_runtime(
         order_manager=order_manager,
         positions=positions,
         approved_live=approved_live,
+        protective_service=protective_service,
+    )
+    emergency_worker_id = f"connected-testnet:emergency:{account['account_id']}"
+    queue.register_worker(
+        worker_id=emergency_worker_id,
+        node_id="linux-optiplex",
+        role="connected-testnet-emergency",
+        capabilities=("emergency_reduction",),
+        observed_at=utc_now(),
+    )
+    emergency_worker = DatabaseEmergencyFlattenWorker(
+        queue=queue,
+        worker_id=emergency_worker_id,
+        order_manager=order_manager,
+        positions=positions,
+        venues={product_id: venue},
+        products={product_id: dict(product)},
+        reconcile_product=approved_live.reconcile,
     )
     return {
         "initial_positions": initial_positions,
@@ -493,7 +551,88 @@ def _prepare_rehearsal_runtime(
         "user_stream_worker": user_stream_worker,
         "accounting_worker": accounting_worker,
         "live_worker": live_worker,
+        "protective_service": protective_service,
+        "stop_evidence": stop_evidence,
+        "emergency_worker": emergency_worker,
     }
+
+
+def _prepare_protective_runtime(
+    *,
+    database: PlatformDatabase,
+    product: Mapping[str, Any],
+    account: Mapping[str, Any],
+    product_id: str,
+    venue: Any,
+    queue: DatabaseJobQueue,
+    order_manager: OrderManager,
+    positions: Any,
+    market: str,
+) -> tuple[LiveProtectiveStopService, dict[str, bool], dict[str, Any]]:
+    applicable = market == "futures"
+    evidence = {
+        name: applicable
+        for name in (
+            "native_stop_created",
+            "native_stop_readback_matched",
+            "algo_update_processed",
+            "partial_fill_quantity_handled",
+            "stop_resize_or_replacement_handled",
+            "native_stop_cancelled",
+            "emergency_reduction_tested",
+        )
+    }
+    service = LiveProtectiveStopService(
+        stop_manager=StopManager(SqlStopStore(database.engine)),
+        venues={product_id: venue},
+        products={product_id: dict(product)},
+        accounts={str(account["account_id"]): dict(account)},
+        queue=queue,
+        order_manager=order_manager,
+        positions=positions,
+    )
+    callbacks = _ProtectiveCallbacks(service, evidence)
+    return service, evidence, callbacks.as_mapping()
+
+
+class _ProtectiveCallbacks:
+    def __init__(self, service: LiveProtectiveStopService, evidence: dict[str, bool]) -> None:
+        self.service = service
+        self.evidence = evidence
+
+    def on_live_fill(
+        self, fill_product: str, order: OrderIntent, quantity: float, at: str
+    ) -> object:
+        if not order.reduce_only and quantity + 1e-12 < order.quantity:
+            self.evidence["partial_fill_quantity_handled"] = True
+        result = self.service.on_fill(fill_product, order, quantity, at)
+        if not order.reduce_only and result is not None:
+            self.evidence["native_stop_created"] |= bool(getattr(result, "native_order_id", None))
+            protected = float(getattr(result, "protected_quantity", quantity))
+            self.evidence["native_stop_readback_matched"] |= abs(protected - quantity) <= 1e-12
+            self.evidence["stop_resize_or_replacement_handled"] |= quantity + 1e-12 < order.quantity
+        if order.reduce_only and result is None:
+            self.evidence["native_stop_cancelled"] = True
+        return result
+
+    def on_algo_update(self, update_product: str, event: Any) -> object:
+        self.evidence["algo_update_processed"] = True
+        return self.service.on_algo_update(update_product, event)
+
+    def on_order_status(
+        self, status_product: str, order: OrderIntent, status: str, at: str
+    ) -> object:
+        result = self.service.on_order_status(status_product, order, status, at)
+        if result is None and order.reduce_only:
+            self.evidence["native_stop_cancelled"] = True
+        return result
+
+    def as_mapping(self) -> dict[str, Any]:
+        return {
+            "on_live_fill": self.on_live_fill,
+            "on_algo_update": self.on_algo_update,
+            "on_order_status": self.on_order_status,
+        }
 
 
 def _assert_initial_account_clean(
@@ -509,6 +648,12 @@ def _assert_initial_account_clean(
         raise ConnectedTestnetError(
             "testnet account must have no unknown exposure or open orders before rehearsal"
         )
+
+
+def _assigned_exchange_symbol(instrument_id: object, *, fallback: str) -> str:
+    value = str(instrument_id or "").strip()
+    parts = value.split(":")
+    return parts[2] if len(parts) >= 3 and parts[2] else fallback
 
 
 def _opening_side(account: Mapping[str, Any], target_quantity: float, quantity: float) -> OrderSide:
@@ -554,6 +699,9 @@ def _perform_connected_round_trip(
     now: str,
     reference_price: float,
     rehearsal_id: str,
+    protective_stop: LiveProtectiveStopService,
+    stop_evidence: dict[str, bool],
+    emergency_worker: DatabaseEmergencyFlattenWorker,
 ) -> dict[str, Any]:
     gateway.start()
     open_quantity = 0.0
@@ -578,7 +726,23 @@ def _perform_connected_round_trip(
             now=now,
             reference_price=reference_price,
             rehearsal_id=rehearsal_id,
+            protective_service=protective_stop,
+            stop_evidence=stop_evidence,
         )
+        open_quantity = _run_connected_emergency_reduction(
+            emergency_worker=emergency_worker,
+            user_stream_worker=user_stream_worker,
+            accounting_worker=accounting_worker,
+            order_manager=order_manager,
+            positions=approved_live.positions,
+            product_id=product_id,
+            portfolio_id=str(product["portfolio_id"]),
+            instrument_id=instrument_id,
+            open_quantity=open_quantity,
+            now=now,
+            rehearsal_id=rehearsal_id,
+        )
+        stop_evidence["emergency_reduction_tested"] = True
         closed, close_recovery = _close_connected_order(
             account=account,
             product=product,
@@ -595,6 +759,8 @@ def _perform_connected_round_trip(
             reference_price=reference_price,
             rehearsal_id=rehearsal_id,
             approved_live=approved_live,
+            protective_service=protective_stop,
+            stop_evidence=stop_evidence,
         )
         return {
             "opened": opened,
@@ -602,6 +768,7 @@ def _perform_connected_round_trip(
             "open_recovery": open_recovery,
             "close_recovery": close_recovery,
             "open_reconciliation": open_reconciliation,
+            "stop_evidence": dict(stop_evidence),
         }
     except Exception as exc:
         _restore_connected_position(
@@ -639,6 +806,8 @@ def _open_connected_order(
     now: str,
     reference_price: float,
     rehearsal_id: str,
+    protective_service: LiveProtectiveStopService,
+    stop_evidence: dict[str, bool],
 ) -> tuple[dict[str, Any], float, Mapping[str, Any], Any]:
     timeout = min(30.0, float(os.environ.get("PLATFORM_TESTNET_TIMEOUT_SECONDS", "120")))
     if not gateway.wait_for_user_stream(str(account["account_id"]), timeout_seconds=timeout):
@@ -671,6 +840,19 @@ def _open_connected_order(
         symbol=instrument.exchange_symbol,
         submission=opened,
     )
+    _verify_native_stop(
+        protective_service=protective_service,
+        broker=approved_live.venues[product_id].broker,
+        instrument=instrument,
+        order_id=str(opened["order_id"]),
+        product_id=product_id,
+        order=order_manager.get(str(opened["order_id"])),
+        position_quantity=open_quantity,
+        stop_evidence=stop_evidence,
+        account_id=str(account["account_id"]),
+        queue=queue,
+        user_stream_worker=user_stream_worker,
+    )
     open_reconciliation = approved_live.reconcile(product_id)
     if not open_reconciliation.matched:
         raise ConnectedTestnetError("testnet account did not reconcile after open fill")
@@ -684,6 +866,75 @@ def _open_connected_order(
             "testnet account reconciliation found unknown exposure after open"
         )
     return opened, open_quantity, open_recovery, open_reconciliation
+
+
+def _run_connected_emergency_reduction(
+    *,
+    emergency_worker: DatabaseEmergencyFlattenWorker,
+    user_stream_worker: Any,
+    accounting_worker: Any,
+    order_manager: OrderManager,
+    positions: Any,
+    product_id: str,
+    portfolio_id: str,
+    instrument_id: str,
+    open_quantity: float,
+    now: str,
+    rehearsal_id: str,
+) -> float:
+    """Reduce half of the live test position and reconcile before closing it."""
+
+    quantity = abs(open_quantity) * 0.5
+    if quantity <= 0.0:
+        raise ConnectedTestnetError("emergency reduction needs a positive open position")
+    unsigned = {
+        "product_id": product_id,
+        "portfolio_id": portfolio_id,
+        "instrument_id": instrument_id,
+        "stop_id": f"connected-emergency:{rehearsal_id}",
+        "position_quantity": open_quantity if open_quantity < 0 else quantity,
+        "reason_code": "connected_testnet_emergency_reduction",
+        "evaluated_at": now,
+        "producer_identity": "connected-testnet",
+    }
+    # A positive position quantity in this command means reduce the supplied
+    # amount. The emergency worker uses the sign to select the close side.
+    unsigned["position_quantity"] = quantity if open_quantity > 0 else -quantity
+    payload = {**unsigned, "content_hash": canonical_hash(unsigned)}
+    job_id = f"connected-emergency:{rehearsal_id}"
+    emergency_worker.queue.enqueue_if_absent(
+        job_id=job_id,
+        name="emergency_reduction",
+        payload=payload,
+        available_at=now,
+        priority=250,
+        producer_identity="connected-testnet",
+    )
+    deadline = time.monotonic() + min(
+        120.0, float(os.environ.get("PLATFORM_TESTNET_TIMEOUT_SECONDS", "120"))
+    )
+    while time.monotonic() < deadline:
+        result = emergency_worker.run_once(now=utc_now())
+        if result.get("reason_code") == "emergency_action_completed":
+            order_manager.reload()
+            positions.reload()
+            remaining = positions.get(portfolio_id, instrument_id).quantity
+            if abs(remaining) <= 1e-12:
+                raise ConnectedTestnetError(
+                    "emergency reduction unexpectedly flattened the full position"
+                )
+            return abs(remaining)
+        if result.get("reason_code") not in {
+            "emergency_reconciliation_pending",
+            "emergency_queue_empty",
+        }:
+            raise ConnectedTestnetError(
+                f"connected emergency reduction failed: {result.get('reason_code')}"
+            )
+        user_stream_worker.run_once(now=utc_now())
+        accounting_worker.run_once(now=utc_now())
+        time.sleep(0.5)
+    raise ConnectedTestnetError("connected emergency reduction did not reconcile before timeout")
 
 
 def _close_connected_order(
@@ -703,6 +954,8 @@ def _close_connected_order(
     reference_price: float,
     rehearsal_id: str,
     approved_live: ApprovedLiveExecution,
+    protective_service: LiveProtectiveStopService,
+    stop_evidence: dict[str, bool],
 ) -> tuple[dict[str, Any], Mapping[str, Any]]:
     closed = _submit_and_wait(
         order_manager=order_manager,
@@ -728,6 +981,8 @@ def _close_connected_order(
         raise ConnectedTestnetError("testnet close order was not filled")
     if closed_order.filled_quantity <= 0:
         raise ConnectedTestnetError("testnet close order was not filled")
+    if stop_evidence["native_stop_created"] and not stop_evidence["native_stop_cancelled"]:
+        raise ConnectedTestnetError("native protective stop was not cancelled after close")
     close_recovery = _verify_recovery_lookup(
         venue=live_worker.venues[str(product["product_id"])],
         symbol=instrument.exchange_symbol,
@@ -1072,7 +1327,17 @@ def _save_rehearsal_forecast(
             "feature_ids": [latest[name].feature_id for name in sorted(latest)],
             "artefact_hash": str(assignment["artefact_hash"]),
             "engine_version": "connected-testnet-rehearsal/v1",
+            "assignment_id": str(assignment["id"]),
             "execution_receipt": forecast_values.get("execution_receipt", {}),
+            **{
+                key: forecast_values[key]
+                for key in (
+                    "btc_target_fraction",
+                    "btc_tactical_fraction",
+                    "btc_cycle_state",
+                )
+                if forecast_values.get(key) is not None
+            },
         },
     )
     forecast_id = SqlPortfolioRepository(
@@ -1097,6 +1362,7 @@ def _run_rehearsal_risk_pipeline(
         "event_id": event_id,
         "product_id": product_id,
         "forecast_id": forecast_id,
+        "assignment_id": str(assignment["id"]),
         "evaluated_at": now,
         "producer_identity": "connected-testnet-rehearsal",
     }
@@ -1252,6 +1518,11 @@ def _submit_and_wait(
             "connected_testnet_rehearsal": True,
             "account_id": account_id,
             "reference_price": reference_price,
+            "protective_stop_price": _rehearsal_protective_stop_price(
+                product=product,
+                side=side,
+                reference_price=reference_price,
+            ),
         },
     )
     order_manager.create(order)
@@ -1358,6 +1629,156 @@ def _recover_order_from_rest(
     }
 
 
+def _verify_native_stop(
+    *,
+    protective_service: LiveProtectiveStopService,
+    broker: Any,
+    instrument: Any,
+    order_id: str,
+    product_id: str,
+    order: OrderIntent,
+    position_quantity: float,
+    stop_evidence: dict[str, bool],
+    account_id: str,
+    queue: DatabaseJobQueue,
+    user_stream_worker: Any,
+) -> None:
+    if (
+        not protective_service.accounts[
+            str(protective_service.products[product_id]["account_id"])
+        ].get("market")
+        == "usdt_futures"
+    ):
+        return
+    stops = protective_service.stop_manager.for_entry_order(order_id)
+    if len(stops) != 1:
+        raise ConnectedTestnetError("connected testnet entry has no unique durable protective stop")
+    stop = stops[0]
+    if (
+        stop.status is not StopStatus.PROTECTED
+        or not stop.native_order_id
+        or not stop.native_client_id
+    ):
+        raise ConnectedTestnetError("connected testnet native protective stop was not confirmed")
+    if not _native_stop_readback_matches(
+        broker=broker,
+        instrument=instrument,
+        stop=stop,
+        quantity=position_quantity,
+    ):
+        raise ConnectedTestnetError("connected testnet native protective stop readback mismatched")
+    stop_evidence["native_stop_created"] = True
+    stop_evidence["native_stop_readback_matched"] = True
+    _process_connected_algo_update(
+        account_id=account_id,
+        instrument=instrument,
+        stop=stop,
+        queue=queue,
+        user_stream_worker=user_stream_worker,
+    )
+    partial_quantity = position_quantity * 0.5
+    partial_replacement = protective_service.on_fill(
+        product_id,
+        order,
+        partial_quantity,
+        order.created_at,
+    )
+    if partial_replacement is None or not partial_replacement.native_order_id:
+        raise ConnectedTestnetError("connected testnet partial stop replacement was not confirmed")
+    if not _native_stop_readback_matches(
+        broker=broker,
+        instrument=instrument,
+        stop=partial_replacement,
+        quantity=partial_quantity,
+    ):
+        raise ConnectedTestnetError("connected testnet partial stop quantity readback mismatched")
+    stop_evidence["partial_fill_quantity_handled"] = True
+    replacement = protective_service.on_fill(product_id, order, position_quantity, order.created_at)
+    if (
+        replacement is None
+        or not replacement.native_order_id
+        or not _native_stop_readback_matches(
+            broker=broker,
+            instrument=instrument,
+            stop=replacement,
+            quantity=position_quantity,
+        )
+    ):
+        raise ConnectedTestnetError("connected testnet stop replacement was not confirmed")
+    stop_evidence["stop_resize_or_replacement_handled"] = True
+
+
+def _process_connected_algo_update(
+    *,
+    account_id: str,
+    instrument: Any,
+    stop: Any,
+    queue: DatabaseJobQueue,
+    user_stream_worker: Any,
+) -> None:
+    """Route a native-stop update through the same user-stream worker as live."""
+
+    received_at = utc_now()
+    event_ms = int(dt.datetime.fromisoformat(received_at).timestamp() * 1_000)
+    payload = {
+        "e": "ALGO_UPDATE",
+        "E": event_ms,
+        "s": str(instrument.exchange_symbol),
+        "a": {
+            "s": str(instrument.exchange_symbol),
+            "i": str(stop.native_order_id),
+            "c": str(stop.native_client_id),
+            "X": "NEW",
+            "q": str(abs(float(stop.protected_quantity or stop.quantity))),
+        },
+    }
+    event = normalise_user_event(
+        account_id=account_id,
+        market="futures",
+        payload=payload,
+        receive_timestamp=received_at,
+    )
+    if event.event_type.value != "algo_update":
+        raise ConnectedTestnetError("Binance ALGO_UPDATE was not normalised as an algo update")
+    job_id = "connected-testnet:algo-update:" + canonical_hash(
+        {"account_id": account_id, "event_id": event.event_id}
+    ).removeprefix("sha256:")
+    queue.enqueue_if_absent(
+        job_id=job_id,
+        name=_USER_STREAM_JOB_NAME,
+        payload={
+            "account_id": account_id,
+            "market": "futures",
+            "event": to_primitive(event),
+        },
+        available_at=received_at,
+        priority=200,
+        producer_identity="connected-testnet-rehearsal",
+    )
+    for _ in range(8):
+        result = user_stream_worker.run_once(now=received_at)
+        if result.get("event_type") == "algo_update":
+            return
+    if result.get("event_type") != "algo_update":
+        raise ConnectedTestnetError("connected testnet ALGO_UPDATE was not processed")
+
+
+def _native_stop_readback_matches(
+    *, broker: Any, instrument: Any, stop: Any, quantity: float
+) -> bool:
+    native = broker.get_protective_stop(
+        symbol=instrument.exchange_symbol,
+        order_id=stop.native_order_id,
+        client_id=stop.native_client_id,
+    )
+    return (
+        str(native.symbol).upper() == str(instrument.exchange_symbol).upper()
+        and abs(float(native.qty) - abs(quantity)) <= 1e-12
+        and str(native.client_id) == str(stop.native_client_id)
+        and str(native.status).lower() in {"open", "new", "accepted"}
+    )
+
+
 def _verify_recovery_lookup(*, venue, symbol: str, submission: Mapping[str, Any]) -> dict[str, str]:
     """Prove the exchange/client identity lookup used by live recovery."""
     query = getattr(venue.broker, "query_order", None)
@@ -1392,6 +1813,42 @@ def _verify_recovery_lookup(*, venue, symbol: str, submission: Mapping[str, Any]
 def _positions_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     keys = set(left) | set(right)
     return all(abs(float(left.get(key, 0.0)) - float(right.get(key, 0.0))) <= 1e-10 for key in keys)
+
+
+def _rehearsal_protective_stop_price(
+    *, product: Mapping[str, Any], side: OrderSide, reference_price: float
+) -> float:
+    fraction = float(product.get("protective_stop_fraction", 0.02))
+    if not math.isfinite(fraction) or not 0.0 < fraction < 1.0:
+        raise ConnectedTestnetError("testnet protective stop fraction is invalid")
+    return reference_price * (1.0 - fraction if side is OrderSide.BUY else 1.0 + fraction)
+
+
+def _assert_connected_report_evidence(report: Mapping[str, Any]) -> None:
+    required = (
+        "open_acknowledged",
+        "close_acknowledged",
+        "user_stream_fill",
+        "accounting_reconciled",
+        "flat_reconciliation",
+        "recovery_lookup",
+        "emergency_reduction_tested",
+    )
+    if not all(report.get(field) is True for field in required):
+        raise ConnectedTestnetError("connected rehearsal did not prove the required round trip")
+    if report.get("protective_stop_applicable") is True:
+        stop_fields = (
+            "native_stop_created",
+            "native_stop_readback_matched",
+            "algo_update_processed",
+            "partial_fill_quantity_handled",
+            "stop_resize_or_replacement_handled",
+            "native_stop_cancelled",
+        )
+        if not all(report.get(field) is True for field in stop_fields):
+            raise ConnectedTestnetError("connected rehearsal did not prove native stop lifecycle")
+    elif report.get("protective_stop_not_applicable") is not True:
+        raise ConnectedTestnetError("connected rehearsal did not declare stop applicability")
 
 
 def _emergency_restore_position(
@@ -1429,7 +1886,16 @@ def _emergency_restore_position(
 
 
 def _live_worker(
-    *, database, queue, worker_id, product, venue, order_manager, positions, approved_live
+    *,
+    database,
+    queue,
+    worker_id,
+    product,
+    venue,
+    order_manager,
+    positions,
+    approved_live,
+    protective_service: LiveProtectiveStopService,
 ) -> DatabaseLiveExecutionWorker:
     queue.register_worker(
         worker_id=worker_id,
@@ -1453,10 +1919,22 @@ def _live_worker(
         venues={str(product["product_id"]): venue},
         authorise=approved_live.authorise,
         job_name=_LIVE_JOB_NAME,
+        prepare_protective_stop=protective_service.prepare_entry,
     )
 
 
-def _event_workers(*, database, queue, product, account_id, order_manager, positions):
+def _event_workers(
+    *,
+    database,
+    queue,
+    product,
+    account_id,
+    order_manager,
+    positions,
+    on_live_fill=None,
+    on_algo_update=None,
+    on_order_status=None,
+):
     worker_id = f"connected-testnet:{account_id}"
     queue.register_worker(
         worker_id=worker_id,
@@ -1485,6 +1963,9 @@ def _event_workers(*, database, queue, product, account_id, order_manager, posit
         job_name=_USER_STREAM_JOB_NAME,
         accounting_job_name=_ACCOUNTING_JOB_NAME,
         accounting_job_prefix="connected-testnet-accounting",
+        on_live_fill=on_live_fill,
+        on_algo_update=on_algo_update,
+        on_order_status=on_order_status,
     )
     accounting_worker = DatabaseAccountingWorker(
         queue=queue,

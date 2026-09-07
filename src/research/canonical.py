@@ -16,6 +16,7 @@ from src.data.database import (
     active_strategy_assignment,
     alpha_forecast,
     dataset_snapshot,
+    exchange_order,
     experiment,
     experiment_run,
     fill,
@@ -515,7 +516,7 @@ class ForwardPaperSummary:
     strategy_decay: float
     observation_ids: tuple[str, ...]
     effective_trades: int = 0
-    fill_rate: float = 1.0
+    fill_rate: float = 0.0
     slippage: float = 0.0
     data_uptime: float = 0.0
     rejected_orders: int = 0
@@ -530,6 +531,15 @@ class ForwardPaperSummary:
     tail_loss: float = 0.0
     assignment_ids: tuple[str, ...] = ()
     instrument_ids: tuple[str, ...] = ()
+    valid_attempts: int = 0
+    completed_attempts: int = 0
+    expected_observations: int = 0
+    observed_observations: int = 0
+    fill_rate_applicable: bool = False
+    trading_dates: tuple[str, ...] = ()
+    order_ids: tuple[str, ...] = ()
+    fill_ids: tuple[str, ...] = ()
+    episode_ids: tuple[str, ...] = ()
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -568,6 +578,15 @@ class ForwardPaperSummary:
             "tail_loss": self.tail_loss,
             "assignment_ids": list(self.assignment_ids),
             "instrument_ids": list(self.instrument_ids),
+            "valid_attempts": self.valid_attempts,
+            "completed_attempts": self.completed_attempts,
+            "expected_observations": self.expected_observations,
+            "observed_observations": self.observed_observations,
+            "fill_rate_applicable": self.fill_rate_applicable,
+            "trading_dates": list(self.trading_dates),
+            "order_ids": list(self.order_ids),
+            "fill_ids": list(self.fill_ids),
+            "episode_ids": list(self.episode_ids),
         }
 
 
@@ -611,10 +630,82 @@ def _validated_observation_facts(row: object) -> tuple[str, ...]:
         "slippage",
         "data_uptime",
         "rejected_orders",
+        "valid_attempts",
+        "completed_attempts",
+        "expected_observations",
+        "observed_observations",
+        "fill_rate_applicable",
+        "trading_dates",
+        "order_ids",
+        "fill_ids",
+        "episode_ids",
     }
     if not required_metrics.issubset(metrics):
         raise CanonicalEvidenceError("forward evidence facts metrics are incomplete")
+    _validate_forward_fact_metrics(metrics)
     return tuple(str(source_id) for source_id in source_ids)
+
+
+def _validate_forward_fact_metrics(metrics: Mapping[str, Any]) -> None:
+    integers = _forward_fact_integers(metrics)
+    _validate_forward_fact_fill_rate(metrics, integers)
+    _validate_forward_fact_id_lists(metrics)
+
+
+def _forward_fact_integers(metrics: Mapping[str, Any]) -> dict[str, int]:
+    integer_fields = (
+        "valid_attempts",
+        "completed_attempts",
+        "expected_observations",
+        "observed_observations",
+    )
+    integers: dict[str, int] = {}
+    for field_name in integer_fields:
+        value = _finite_nonnegative(metrics[field_name], field=f"forward facts {field_name}")
+        if not value.is_integer():
+            raise CanonicalEvidenceError(f"forward facts {field_name} must be an integer")
+        integers[field_name] = int(value)
+    if integers["completed_attempts"] > integers["valid_attempts"]:
+        raise CanonicalEvidenceError("forward facts completed attempts exceed valid attempts")
+    if integers["observed_observations"] > integers["expected_observations"]:
+        raise CanonicalEvidenceError(
+            "forward facts observed observations exceed expected observations"
+        )
+    return integers
+
+
+def _validate_forward_fact_fill_rate(
+    metrics: Mapping[str, Any], integers: Mapping[str, int]
+) -> None:
+    applicable = metrics["fill_rate_applicable"]
+    if not isinstance(applicable, bool):
+        raise CanonicalEvidenceError("forward facts fill_rate_applicable must be a boolean")
+    fill_rate = _finite_nonnegative(metrics["fill_rate"], field="forward facts fill_rate")
+    if fill_rate > 1.0:
+        raise CanonicalEvidenceError("forward facts fill_rate must be at most one")
+    expected_rate = (
+        integers["completed_attempts"] / integers["valid_attempts"]
+        if integers["valid_attempts"]
+        else 0.0
+    )
+    if applicable is not (integers["valid_attempts"] > 0) or abs(fill_rate - expected_rate) > 1e-9:
+        raise CanonicalEvidenceError("forward facts fill rate is inconsistent with attempts")
+
+
+def _validate_forward_fact_id_lists(metrics: Mapping[str, Any]) -> None:
+    for field_name in ("trading_dates", "order_ids", "fill_ids", "episode_ids"):
+        values = metrics[field_name]
+        if (
+            not isinstance(values, list | tuple)
+            or len({str(value) for value in values}) != len(values)
+            or any(not str(value).strip() for value in values)
+        ):
+            raise CanonicalEvidenceError(f"forward facts {field_name} must be unique lists")
+    for day in metrics["trading_dates"]:
+        try:
+            dt.date.fromisoformat(str(day))
+        except ValueError as exc:
+            raise CanonicalEvidenceError("forward facts trading_dates must be UTC dates") from exc
 
 
 def _has_known_observation_source(connection, source_ids: tuple[str, ...], tables) -> bool:
@@ -682,6 +773,23 @@ def _normalise_summary_metrics(payload: dict[str, Any]) -> None:
             payload.get(field_name, 0), field=f"summary {field_name}"
         )
     payload["data_gaps"] = _summary_integer(payload.get("data_gaps", 0), field="summary data gaps")
+
+
+def _normalise_summary_evidence_accounting(payload: dict[str, Any]) -> None:
+    required = {
+        "valid_attempts",
+        "completed_attempts",
+        "expected_observations",
+        "observed_observations",
+        "fill_rate_applicable",
+        "trading_dates",
+        "order_ids",
+        "fill_ids",
+        "episode_ids",
+    }
+    if not required.issubset(payload):
+        raise CanonicalEvidenceError("forward summary accounting fields are incomplete")
+    _validate_forward_fact_metrics(payload)
 
 
 def _normalise_summary_scope(payload: dict[str, Any]) -> None:
@@ -769,6 +877,7 @@ def _prepare_summary_payload(
         raise CanonicalEvidenceError("forward summary interval is not chronological")
     _normalise_summary_objective(payload, product_id)
     _normalise_summary_metrics(payload)
+    _normalise_summary_evidence_accounting(payload)
     _normalise_summary_scope(payload)
     observation_ids = _summary_observation_ids(payload)
     identity = _hash(payload, field="forward summary")
@@ -1029,7 +1138,16 @@ class SqlForwardEvidenceRepository:
             metrics = facts["metrics"]
             for name in names:
                 if metrics.get(name) is not None:
-                    if name in {"net_pnl", "cost_adjusted_return", "pnl"}:
+                    if name in {
+                        "net_pnl",
+                        "cost_adjusted_return",
+                        "pnl",
+                        "benchmark_pnl",
+                        "benchmark_return",
+                        "excess_benchmark_pnl",
+                        "forecast_return",
+                        "realised_return",
+                    }:
                         return _finite_number(metrics[name], field=f"forward observation {name}")
                     return _finite_nonnegative(metrics[name], field=f"forward observation {name}")
             return default
@@ -1065,16 +1183,33 @@ class SqlForwardEvidenceRepository:
         benchmark_returns = [
             value(payload, "benchmark_pnl", "benchmark_return") for payload in payloads
         ]
+        latest_objective_payloads: dict[tuple[str, str], Mapping[str, Any]] = {}
+        for row, payload in zip(materialised, payloads, strict=True):
+            observation = payload.get("observation")
+            assignment_key = (
+                str(observation.get("assignment_id") or "")
+                if isinstance(observation, Mapping)
+                else ""
+            )
+            key = (assignment_key, str(row["instrument_id"]))
+            latest_objective_payloads[key] = payload
+        objective_payloads = tuple(latest_objective_payloads.values())
         objective_units = tuple(
             str(payload["observation"]["facts"]["metrics"].get("objective_unit"))
-            for payload in payloads
+            for payload in objective_payloads
             if payload["observation"]["facts"]["metrics"].get("objective_unit") is not None
         )
-        objective_values = [optional_value(payload, "objective_value") for payload in payloads]
-        benchmark_values = [optional_value(payload, "benchmark_value") for payload in payloads]
-        objective_excesses = [optional_value(payload, "objective_excess") for payload in payloads]
+        objective_values = [
+            optional_value(payload, "objective_value") for payload in objective_payloads
+        ]
+        benchmark_values = [
+            optional_value(payload, "benchmark_value") for payload in objective_payloads
+        ]
+        objective_excesses = [
+            optional_value(payload, "objective_excess") for payload in objective_payloads
+        ]
         objective_excess_fractions = [
-            optional_value(payload, "objective_excess_fraction") for payload in payloads
+            optional_value(payload, "objective_excess_fraction") for payload in objective_payloads
         ]
         complete_objective = (
             bool(objective_units)
@@ -1101,8 +1236,87 @@ class SqlForwardEvidenceRepository:
             )
         )
         instrument_ids = tuple(sorted({str(row["instrument_id"]) for row in materialised}))
+        metric_values = [
+            payload["observation"]["facts"]["metrics"]
+            for payload in payloads
+            if isinstance(payload.get("observation"), Mapping)
+            and isinstance(payload["observation"].get("facts"), Mapping)
+            and isinstance(payload["observation"]["facts"].get("metrics"), Mapping)
+        ]
+        order_ids = tuple(
+            sorted(
+                {
+                    str(order_id)
+                    for metrics in metric_values
+                    for order_id in metrics.get("order_ids", ())
+                    if str(order_id).strip()
+                }
+            )
+        )
+        fill_ids = tuple(
+            sorted(
+                {
+                    str(fill_id)
+                    for metrics in metric_values
+                    for fill_id in metrics.get("fill_ids", ())
+                    if str(fill_id).strip()
+                }
+            )
+        )
+        episode_ids = tuple(
+            sorted(
+                {
+                    str(episode_id)
+                    for metrics in metric_values
+                    for episode_id in metrics.get("episode_ids", ())
+                    if str(episode_id).strip()
+                }
+            )
+        )
+        trading_dates = tuple(
+            sorted(
+                {
+                    str(day)
+                    for metrics in metric_values
+                    for day in metrics.get("trading_dates", ())
+                    if str(day).strip()
+                }
+            )
+        )
+        valid_attempts = (
+            len(order_ids)
+            if order_ids
+            else int(sum(value(payload, "valid_attempts") for payload in payloads))
+        )
+        completed_attempts = (
+            sum(1 for order_id in order_ids if self._order_filled(order_id))
+            if order_ids
+            else int(sum(value(payload, "completed_attempts") for payload in payloads))
+        )
+        expected_observations = int(
+            sum(value(payload, "expected_observations") for payload in payloads)
+        )
+        observed_observations = int(
+            sum(value(payload, "observed_observations") for payload in payloads)
+        )
         first_return = returns[0] if returns else 0.0
         last_return = returns[-1] if returns else 0.0
+        if complete_objective:
+            base_values = [
+                float(benchmark) for benchmark in benchmark_values if benchmark is not None
+            ]
+            excess_values = [float(excess) for excess in objective_excesses if excess is not None]
+            objective_benchmark = sum(base_values)
+            objective_excess = sum(excess_values)
+            objective_value = objective_benchmark + objective_excess
+            objective_excess_fraction = (
+                objective_excess / objective_benchmark if objective_benchmark else None
+            )
+        else:
+            objective_benchmark = None
+            objective_value = None
+            objective_excess = None
+            objective_excess_fraction = None
         summary = ForwardPaperSummary(
             strategy_version_id=strategy_version_id,
             product_id=product_id,
@@ -1120,50 +1334,75 @@ class SqlForwardEvidenceRepository:
             drawdown=max(value(payload, "drawdown") for payload in payloads),
             execution_drift=max(value(payload, "execution_drift") for payload in payloads),
             model_drift=max(value(payload, "model_drift") for payload in payloads),
-            portfolio_capacity=max(value(payload, "portfolio_capacity") for payload in payloads),
+            portfolio_capacity=min(value(payload, "portfolio_capacity") for payload in payloads),
             risk_budget_available=min(
                 value(payload, "risk_budget_available", default=0.0) for payload in payloads
             ),
-            data_gaps=int(
-                sum(value(payload, "data_gaps", "missing_data_count") for payload in payloads)
+            data_gaps=max(
+                int(sum(value(payload, "data_gaps", "missing_data_count") for payload in payloads)),
+                max(0, expected_observations - observed_observations),
             ),
             strategy_decay=max(0.0, first_return - last_return),
             observation_ids=tuple(str(row["id"]) for row in materialised),
-            effective_trades=int(sum(value(payload, "effective_trades") for payload in payloads)),
-            fill_rate=(
-                sum(value(payload, "fill_rate") for payload in payloads) / len(payloads)
-                if payloads
-                else 0.0
-            ),
+            effective_trades=len(episode_ids)
+            if episode_ids
+            else int(sum(value(payload, "effective_trades") for payload in payloads)),
+            fill_rate=(completed_attempts / valid_attempts if valid_attempts else 0.0),
             slippage=max(value(payload, "slippage") for payload in payloads),
             data_uptime=(
-                sum(value(payload, "data_uptime") for payload in payloads) / len(payloads)
-                if payloads
-                else 0.0
+                observed_observations / expected_observations if expected_observations else 0.0
             ),
             rejected_orders=int(sum(value(payload, "rejected_orders") for payload in payloads)),
-            trading_days=int(sum(value(payload, "trading_days") for payload in payloads)),
-            cycles=int(sum(value(payload, "cycles") for payload in payloads)),
-            effective_independent_episodes=int(
-                sum(value(payload, "effective_independent_episodes") for payload in payloads)
+            trading_days=len(trading_dates)
+            if trading_dates
+            else int(sum(value(payload, "trading_days") for payload in payloads)),
+            cycles=(
+                len(episode_ids)
+                if episode_ids
+                else int(sum(value(payload, "cycles") for payload in payloads))
             ),
+            effective_independent_episodes=len(episode_ids)
+            if episode_ids
+            else int(sum(value(payload, "effective_independent_episodes") for payload in payloads)),
             tail_loss=max(value(payload, "tail_loss") for payload in payloads),
             objective_unit=objective_units[-1] if objective_units and complete_objective else None,
-            objective_value=objective_values[-1] if complete_objective else None,
-            benchmark_value=benchmark_values[-1] if complete_objective else None,
-            objective_excess=objective_excesses[-1] if complete_objective else None,
-            objective_excess_fraction=(
-                objective_excess_fractions[-1] if complete_objective else None
-            ),
+            objective_value=objective_value,
+            benchmark_value=objective_benchmark,
+            objective_excess=objective_excess,
+            objective_excess_fraction=objective_excess_fraction,
             assignment_ids=assignment_ids,
             instrument_ids=instrument_ids,
+            valid_attempts=valid_attempts,
+            completed_attempts=completed_attempts,
+            expected_observations=expected_observations,
+            observed_observations=observed_observations,
+            fill_rate_applicable=valid_attempts > 0,
+            trading_dates=trading_dates,
+            order_ids=order_ids,
+            fill_ids=fill_ids,
+            episode_ids=episode_ids,
+        )
+        summary_payload = summary.to_payload()
+        summary_payload.update(
+            {
+                "valid_attempts": valid_attempts,
+                "completed_attempts": completed_attempts,
+                "expected_observations": expected_observations,
+                "observed_observations": observed_observations,
+                "trading_dates": list(trading_dates),
+                "order_ids": list(order_ids),
+                "fill_ids": list(fill_ids),
+                "episode_ids": list(episode_ids),
+                "fill_rate_applicable": valid_attempts > 0,
+                "model_drift": max(value(payload, "model_drift") for payload in payloads),
+            }
         )
         summary_id = self.append_summary(
             strategy_version_id=strategy_version_id,
             product_id=product_id,
             observed_at=observed_at,
             artefact_hash=artefact_hash,
-            evidence=summary.to_payload(),
+            evidence=summary_payload,
         )
         return summary_id, summary
 
@@ -1188,6 +1427,16 @@ class SqlForwardEvidenceRepository:
             source_ids = _validated_observation_facts(row)
             if not _has_known_observation_source(connection, source_ids, known_tables):
                 raise CanonicalEvidenceError("forward evidence facts reference no canonical source")
+
+    def _order_filled(self, order_id: str) -> bool:
+        with self.engine.connect() as connection:
+            status = connection.execute(
+                select(exchange_order.c.status)
+                .where(exchange_order.c.order_id == order_id)
+                .order_by(exchange_order.c.sequence.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        return str(status or "").casefold() in {"filled", "reconciled"}
 
     def append_decision(
         self,
@@ -1472,8 +1721,14 @@ def _forward_decision_checks(
             "forward_effective_trades_insufficient",
         ),
         (
-            float(payload.get("fill_rate", 0.0)) < limits.minimum_fill_rate,
-            "forward_fill_rate_insufficient",
+            (limits.minimum_fill_rate > 0.0 and payload.get("fill_rate_applicable") is not True)
+            or float(payload.get("fill_rate", 0.0)) < limits.minimum_fill_rate,
+            (
+                "forward_fill_rate_not_applicable"
+                if limits.minimum_fill_rate > 0.0
+                and payload.get("fill_rate_applicable") is not True
+                else "forward_fill_rate_insufficient"
+            ),
         ),
         (
             float(payload.get("slippage", 0.0)) > limits.maximum_slippage,
@@ -2162,9 +2417,33 @@ class SqlActiveStrategyAssignmentRepository:
             assignment_reason=assignment_reason,
             payload=payload,
         )
-        identity = _hash(record, field="active assignment")
         with self.engine.begin() as connection:
-            return self._persist(connection, record, identity)
+            return self.assign_in_connection(connection, **record)
+
+    def assign_in_connection(self, connection, **record: Any) -> str:
+        """Persist an assignment in a caller-owned transaction."""
+
+        if "assignment_scope_id" not in record:
+            record = _assignment_record(
+                product_id=record["product_id"],
+                portfolio_id=record["portfolio_id"],
+                strategy_version_id=record["strategy_version_id"],
+                artefact_hash=record["artefact_hash"],
+                lifecycle_state=record["lifecycle_state"],
+                execution_mode=record["execution_mode"],
+                capital_limit=record["capital_limit"],
+                assigned_at=record["assigned_at"],
+                assigned_by=record["assigned_by"],
+                sleeve_id=record.get("sleeve_id", "default"),
+                instrument_id=record.get("instrument_id"),
+                universe_id=record.get("universe_id"),
+                risk_budget=record.get("risk_budget", 0.0),
+                active_until=record.get("active_until"),
+                assignment_reason=record.get("assignment_reason", "unspecified"),
+                payload=record.get("payload"),
+            )
+        identity = _hash(record, field="active assignment")
+        return self._persist(connection, record, identity)
 
     def active(
         self,
@@ -2267,6 +2546,7 @@ class SqlActiveStrategyAssignmentRepository:
         portfolio_id: str | None = None,
         strategy_version_id: str | None = None,
         artefact_hash: str | None = None,
+        execution_mode: str | None = None,
         sleeve_id: str | None = None,
         instrument_id: str | None = None,
         universe_id: str | None = None,
@@ -2277,7 +2557,61 @@ class SqlActiveStrategyAssignmentRepository:
             if at is not None
             else dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
         )
-        active = self.active_assignments(product_id, at=deactivated_at)
+        with self.engine.begin() as connection:
+            self.deactivate_in_connection(
+                connection,
+                product_id,
+                at=deactivated_at,
+                assignment_reason=assignment_reason,
+                portfolio_id=portfolio_id,
+                strategy_version_id=strategy_version_id,
+                artefact_hash=artefact_hash,
+                execution_mode=execution_mode,
+                sleeve_id=sleeve_id,
+                instrument_id=instrument_id,
+                universe_id=universe_id,
+            )
+
+    def deactivate_in_connection(
+        self,
+        connection,
+        product_id: str,
+        *,
+        at: str | None = None,
+        assignment_reason: str = "deactivated",
+        portfolio_id: str | None = None,
+        strategy_version_id: str | None = None,
+        artefact_hash: str | None = None,
+        execution_mode: str | None = None,
+        sleeve_id: str | None = None,
+        instrument_id: str | None = None,
+        universe_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Deactivate matching assignments without opening a nested transaction."""
+
+        deactivated_at = (
+            timestamp(at, field="deactivation timestamp")
+            if at is not None
+            else dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+        )
+        rows = (
+            connection.execute(
+                select(active_strategy_assignment)
+                .where(
+                    active_strategy_assignment.c.product_id == product_id,
+                    active_strategy_assignment.c.assigned_at <= deactivated_at,
+                )
+                .order_by(active_strategy_assignment.c.assigned_at, active_strategy_assignment.c.id)
+            )
+            .mappings()
+            .all()
+        )
+        active = tuple(
+            row
+            for row in self._current_assignment_rows(rows)
+            if row["active"]
+            and (row["active_until"] is None or row["active_until"] > deactivated_at)
+        )
         if strategy_version_id is not None:
             active = tuple(
                 row for row in active if row["strategy_version_id"] == strategy_version_id
@@ -2286,37 +2620,41 @@ class SqlActiveStrategyAssignmentRepository:
             active = tuple(row for row in active if row["portfolio_id"] == portfolio_id)
         if artefact_hash is not None:
             active = tuple(row for row in active if row["artefact_hash"] == artefact_hash)
+        if execution_mode is not None:
+            active = tuple(row for row in active if row["execution_mode"] == execution_mode)
         if sleeve_id is not None:
             active = tuple(row for row in active if row["sleeve_id"] == sleeve_id)
         if instrument_id is not None:
             active = tuple(row for row in active if row["instrument_id"] == instrument_id)
         if universe_id is not None:
             active = tuple(row for row in active if row["universe_id"] == universe_id)
-        with self.engine.begin() as connection:
-            for row in active:
-                existing_payload = (
-                    dict(row["payload"]) if isinstance(row.get("payload"), Mapping) else {}
-                )
-                existing_payload.update(
-                    {
-                        "supersedes_assignment_id": str(row["id"]),
-                        "deactivation_timestamp": deactivated_at,
-                    }
-                )
-                event = {
-                    **{key: value for key, value in row.items() if key != "id"},
-                    "active": False,
-                    "assigned_at": deactivated_at,
-                    "active_until": deactivated_at,
-                    "assignment_reason": non_empty(assignment_reason, field="assignment_reason"),
-                    "payload": existing_payload,
+        identities: list[str] = []
+        for row in active:
+            existing_payload = (
+                dict(row["payload"]) if isinstance(row.get("payload"), Mapping) else {}
+            )
+            existing_payload.update(
+                {
+                    "supersedes_assignment_id": str(row["id"]),
+                    "deactivation_timestamp": deactivated_at,
                 }
-                identity = _hash(event, field="assignment deactivation")
-                _immutable_insert(
-                    connection,
-                    active_strategy_assignment,
-                    {"id": identity, **event},
-                )
+            )
+            event = {
+                **{key: value for key, value in row.items() if key != "id"},
+                "active": False,
+                "assigned_at": deactivated_at,
+                "active_until": deactivated_at,
+                "assignment_reason": non_empty(assignment_reason, field="assignment_reason"),
+                "payload": existing_payload,
+            }
+            identity = _hash(event, field="assignment deactivation")
+            _immutable_insert(
+                connection,
+                active_strategy_assignment,
+                {"id": identity, **event},
+            )
+            identities.append(identity)
+        return tuple(identities)
 
     def assert_binding(
         self,

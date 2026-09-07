@@ -117,6 +117,18 @@ class DatabaseMetricsProvider:
             value = slis.get(group)
             value = value.get("count", 0) if isinstance(value, Mapping) else 0
             registry.set_gauge(metric, _numeric(value))
+        storage = operations.get("storage_health")
+        if isinstance(storage, Mapping):
+            for field_name in (
+                "active_inode_count",
+                "spool_inode_count",
+                "spool_bytes",
+                "stale_spool_files",
+            ):
+                registry.set_gauge(
+                    f"platform_storage_{field_name}",
+                    _numeric(storage.get(field_name)),
+                )
 
 
 def build_metrics_server(
