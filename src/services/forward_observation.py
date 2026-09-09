@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from src.data.assignment_scope import financial_assignment_ids
 from src.data.database import (
     alpha_forecast,
     position,
@@ -114,15 +115,24 @@ class DatabaseForwardObservationWorker:
             ):
                 raise ValueError("forward observation assignment binding is invalid")
             artefact = self.artefacts.get(str(payload["artefact_hash"]))
-            artefact_created_at = timestamp(
-                str(artefact["created_at"]), field="artefact.created_at"
+            window = self._current_window(payload, now=now)
+            if evaluation_time <= window["opened_at"]:
+                self.queue.complete(claimed, completed_at=now)
+                return {
+                    "reason_code": "forward_observation_before_current_window",
+                    "job_id": claimed.job_id,
+                }
+            evidence_started_at = max(
+                timestamp(str(artefact["created_at"]), field="artefact.created_at"),
+                timestamp(str(assignment["assigned_at"]), field="assignment.assigned_at"),
+                window["opened_at"],
             )
             forecast = self._latest_payload(
                 alpha_forecast,
                 product_id=str(payload["product_id"]),
                 strategy_version_id=str(payload["strategy_version_id"]),
                 instrument_id=str(payload["instrument_id"]),
-                after=artefact_created_at,
+                after=evidence_started_at,
                 at=evaluation_time,
             )
             if forecast is None:
@@ -131,23 +141,28 @@ class DatabaseForwardObservationWorker:
             target = self._latest_payload(
                 target_position,
                 product_id=str(payload["product_id"]),
-                after=artefact_created_at,
+                after=evidence_started_at,
                 at=evaluation_time,
                 strategy_version_id=str(payload["strategy_version_id"]),
                 instrument_id=str(payload["instrument_id"]),
+            )
+            ownership_ids = financial_assignment_ids(
+                self.engine, str(payload["assignment_id"]), at=evaluation_time
             )
             current_position = self._latest_position(
                 portfolio_id=str(assignment["portfolio_id"]),
                 instrument_id=str(payload["instrument_id"]),
                 at=evaluation_time,
-                assignment_id=str(payload["assignment_id"]),
+                assignment_id=ownership_ids,
             )
-            previous_observed_at = self.metrics.latest_observed_at(
+            previous_observed_at = self.metrics.latest_evaluation_time(
                 strategy_version_id=str(payload["strategy_version_id"]),
                 product_id=str(payload["product_id"]),
                 instrument_id=str(payload["instrument_id"]),
                 artefact_hash=str(payload["artefact_hash"]),
                 assignment_id=str(payload["assignment_id"]),
+                before=evaluation_time,
+                qualification_window_id=window["window_id"],
             )
             forecast_fact = {**forecast_payload, "forecast_id": forecast_id}
             target_fact = (
@@ -157,13 +172,13 @@ class DatabaseForwardObservationWorker:
                 assignment=_metrics_assignment(assignment, artefact),
                 product_id=str(payload["product_id"]),
                 instrument_id=str(payload["instrument_id"]),
-                artefact_created_at=artefact_created_at,
+                artefact_created_at=evidence_started_at,
                 evaluation_time=evaluation_time,
                 forecast=forecast_fact,
                 target=target_fact,
                 previous_observed_at=previous_observed_at,
                 strategy_version_id=str(payload["strategy_version_id"]),
-                assignment_id=str(payload["assignment_id"]),
+                assignment_id=ownership_ids,
             )
             observation_id = self.evidence.append(
                 strategy_version_id=str(payload["strategy_version_id"]),
@@ -175,6 +190,7 @@ class DatabaseForwardObservationWorker:
                 observation={
                     "schema": "platform.forward_paper_observation/v1",
                     "assignment_id": str(payload["assignment_id"]),
+                    "qualification_window_id": window["window_id"],
                     "forecast_id": forecast_id,
                     "forecast_content": forecast_payload,
                     "target_position_id": target[0] if target is not None else None,
@@ -214,6 +230,21 @@ class DatabaseForwardObservationWorker:
             and row["artefact_hash"] == assignment["artefact_hash"]
             for row in self.assignments.active_assignments(product_id, at=at)
         )
+
+    def _current_window(self, payload: Mapping[str, Any], *, now: str) -> dict[str, Any]:
+        from src.services.forward_windows import current_window
+
+        with self.engine.connect() as connection:
+            window = current_window(
+                connection,
+                strategy_version_id=str(payload["strategy_version_id"]),
+                product_id=str(payload["product_id"]),
+                artefact_hash=str(payload["artefact_hash"]),
+                at=now,
+            )
+        if window is None:
+            raise LookupError("forward qualification window is unavailable")
+        return window
 
     def _latest_payload(
         self,
@@ -258,7 +289,7 @@ class DatabaseForwardObservationWorker:
         portfolio_id: str,
         instrument_id: str,
         at: str,
-        assignment_id: str | None = None,
+        assignment_id: str | tuple[str, ...] | None = None,
     ) -> Mapping[str, Any] | None:
         with self.engine.connect() as connection:
             table = position_event if assignment_id is not None else position
@@ -275,9 +306,13 @@ class DatabaseForwardObservationWorker:
                 ):
                     if assignment_id is not None:
                         metadata = payload.get("metadata")
-                        if not isinstance(metadata, Mapping) or str(
-                            metadata.get("assignment_id") or ""
-                        ) != str(assignment_id):
+                        allowed = (
+                            (assignment_id,) if isinstance(assignment_id, str) else assignment_id
+                        )
+                        if (
+                            not isinstance(metadata, Mapping)
+                            or str(metadata.get("assignment_id") or "") not in allowed
+                        ):
                             continue
                     return dict(payload)
         return None
@@ -351,6 +386,7 @@ class DatabaseForwardSummaryWorker:
         engine,
         queue: DatabaseJobQueue,
         worker_id: str,
+        research_configuration_hash: str | None = None,
         minimum_days_by_product: Mapping[str, int] | None = None,
         minimum_decisions: int = 1,
         policies_by_product: Mapping[str, Mapping[str, Any]] | None = None,
@@ -372,7 +408,9 @@ class DatabaseForwardSummaryWorker:
             for key, value in (policies_by_product_family or {}).items()
         }
         self.lease_seconds = lease_seconds
-        self.evidence = SqlForwardEvidenceRepository(engine)
+        self.evidence = SqlForwardEvidenceRepository(
+            engine, research_configuration_hash=research_configuration_hash
+        )
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         now = timestamp(now, field="now")
@@ -402,15 +440,18 @@ class DatabaseForwardSummaryWorker:
                 product_id=product_id,
                 artefact_hash=str(claimed.payload["artefact_hash"]),
                 observed_at=evaluated_at,
+                published_at=now,
             )
             policy = self._policy_for(
                 product_id=product_id,
                 strategy_version_id=str(claimed.payload["strategy_version_id"]),
                 artefact_hash=str(claimed.payload["artefact_hash"]),
+                window_id=summary.qualification_window_id,
+                at=now,
             )
             decision_id, accepted, reason_code = self.evidence.decide_summary(
                 summary_id,
-                decided_at=evaluated_at,
+                decided_at=now,
                 minimum_days=int(
                     policy.get(
                         "required_forward_evidence_days",
@@ -435,7 +476,7 @@ class DatabaseForwardSummaryWorker:
                 maximum_rejected_orders=int(policy.get("maximum_forward_rejected_orders", 0)),
                 minimum_trading_days=int(policy.get("minimum_forward_trading_days", 0)),
                 minimum_cycles=int(policy.get("minimum_forward_cycles", 0)),
-                minimum_effective_episodes=int(policy.get("minimum_forward_effective_episodes", 0)),
+                minimum_completed_episodes=int(policy.get("minimum_forward_completed_episodes", 0)),
                 maximum_tail_loss=float(policy.get("maximum_forward_tail_loss", 1.0)),
             )
         except Exception as exc:
@@ -463,8 +504,27 @@ class DatabaseForwardSummaryWorker:
         }
 
     def _policy_for(
-        self, *, product_id: str, strategy_version_id: str, artefact_hash: str
+        self,
+        *,
+        product_id: str,
+        strategy_version_id: str,
+        artefact_hash: str,
+        window_id: str | None = None,
+        at: str | None = None,
     ) -> dict[str, Any]:
+        if window_id is not None:
+            from src.services.forward_windows import require_current_window
+
+            with self.engine.connect() as connection:
+                window = require_current_window(
+                    connection,
+                    window_id=window_id,
+                    strategy_version_id=strategy_version_id,
+                    product_id=product_id,
+                    artefact_hash=artefact_hash,
+                    at=str(at),
+                )
+            return dict(window["policy"])
         base = dict(self.policies_by_product.get(product_id, {}))
         with self.engine.connect() as connection:
             payload = connection.execute(

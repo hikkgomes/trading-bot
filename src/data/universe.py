@@ -145,20 +145,67 @@ class SqlUniverseStore:
                 for item in materialised
             ],
         }
+        return self._persist_snapshot(
+            snapshot_payload, tuple(item.instrument for item in materialised)
+        )
+
+    def record_btc_research_scope(
+        self,
+        *,
+        universe_id: str,
+        product_id: str,
+        instrument: Instrument,
+        selected_at: str,
+        specification_hash: str,
+    ) -> str:
+        expected = {
+            "btc_accumulation": "binance:spot:BTCUSDT",
+            "active_income": "binance:futures:BTCUSDT:USDT",
+        }.get(product_id)
+        if instrument.instrument_id != expected:
+            raise ValueError("fixed BTC research scope must match its configured product")
+        if len(specification_hash) != 71 or not specification_hash.startswith("sha256:"):
+            raise ValueError("fixed research scope requires a specification hash")
+        int(specification_hash[7:], 16)
+        payload = {
+            "schema": "fixed_btc_research_scope/v1",
+            "universe_id": universe_id,
+            "product_id": product_id,
+            "observed_at": timestamp(selected_at, field="selected_at"),
+            "specification_hash": specification_hash,
+            "historical_liquidity_eligibility": "not_asserted",
+            "observations": [
+                {
+                    "instrument": to_primitive(instrument),
+                    "metrics": {},
+                    "strategy_eligibility": [],
+                    "reason_code": "fixed_research_scope",
+                }
+            ],
+        }
+        return self._persist_snapshot(payload, (instrument,))
+
+    def _persist_snapshot(self, snapshot_payload, instruments: tuple[Instrument, ...]) -> str:
+        universe_id = snapshot_payload["universe_id"]
+        observed_at = snapshot_payload["observed_at"]
+        fixed = snapshot_payload.get("schema") == "fixed_btc_research_scope/v1"
         content_hash = canonical_hash(snapshot_payload)
         snapshot_id = canonical_hash({"universe_id": universe_id, "content_hash": content_hash})
         with self.engine.begin() as connection:
+            existing_universe = connection.execute(
+                select(universe.c.payload).where(universe.c.id == universe_id)
+            ).scalar_one_or_none()
             if (
-                connection.execute(
-                    select(universe.c.id).where(universe.c.id == universe_id)
-                ).first()
-                is None
+                existing_universe is not None
+                and bool(existing_universe.get("dynamic", True)) == fixed
             ):
+                raise ValueError("fixed research scopes cannot replace dynamic universes")
+            if existing_universe is None:
                 connection.execute(
                     insert(universe).values(
                         id=universe_id,
                         created_at=observed_at,
-                        payload={"dynamic": True, "fixed_maximum": None},
+                        payload={"dynamic": not fixed, "fixed_maximum": 1 if fixed else None},
                     )
                 )
             existing = connection.execute(
@@ -175,20 +222,22 @@ class SqlUniverseStore:
                     payload=snapshot_payload,
                 )
             )
-            for item in materialised:
-                self._record_instrument(connection, item.instrument, observed_at=observed_at)
-                reason = eligibility_reason(item, policy)
+            for item, observation in zip(
+                instruments, snapshot_payload["observations"], strict=True
+            ):
+                self._record_instrument(connection, item, observed_at=observed_at)
+                reason = observation["reason_code"]
                 connection.execute(
                     insert(universe_member).values(
-                        id=f"{snapshot_id}:{item.instrument.instrument_id}",
+                        id=f"{snapshot_id}:{item.instrument_id}",
                         snapshot_id=snapshot_id,
-                        instrument_id=item.instrument.instrument_id,
-                        eligible=reason == "eligible",
+                        instrument_id=item.instrument_id,
+                        eligible=reason in {"eligible", "fixed_research_scope"},
                         reason_code=reason,
                         payload={
-                            "instrument": to_primitive(item.instrument),
-                            "metrics": item.metrics,
-                            "strategy_eligibility": list(item.strategy_eligibility),
+                            "instrument": to_primitive(item),
+                            "metrics": observation["metrics"],
+                            "strategy_eligibility": observation["strategy_eligibility"],
                         },
                     )
                 )

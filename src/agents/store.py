@@ -6,6 +6,7 @@ from typing import Any
 
 from sqlalchemy import insert, select
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 
 from src.agents.proposals import AgentAction, AgentProposal, AgentRole
 from src.agents.thesis import parse_openclaw_thesis
@@ -49,6 +50,58 @@ class SqlAgentStore:
         self, *, proposal_id: str, created_at: str, payload: dict[str, Any]
     ) -> str:
         return self._content_record(agent_disposition, proposal_id, created_at, payload)
+
+    def dataset_binding(self, proposal_id: str) -> dict[str, Any] | None:
+        identity = canonical_hash({"kind": "agent_dataset_binding", "proposal_id": proposal_id})
+        with self.engine.connect() as connection:
+            payload = connection.execute(
+                select(agent_review.c.payload).where(agent_review.c.id == identity)
+            ).scalar_one_or_none()
+        if payload is None:
+            return None
+        if (
+            payload.get("proposal_id") != proposal_id
+            or payload.get("kind") != "agent_dataset_binding"
+        ):
+            raise ValueError("agent dataset binding belongs to another proposal or record type")
+        return dict(payload)
+
+    def bind_review_response(
+        self, *, review_id: str, created_at: str, payload: dict[str, Any]
+    ) -> None:
+        """Seal one reply before intake; replay may finish interrupted queue writes."""
+        identity = canonical_hash({"kind": "agent_review_response", "review_id": review_id})
+        try:
+            self._append(agent_review, record_id=identity, created_at=created_at, payload=payload)
+        except (IntegrityError, ValueError):
+            # A concurrent reply won the unique key. Accept only an identical replay.
+            with self.engine.connect() as connection:
+                existing = connection.execute(
+                    select(agent_review.c.payload).where(agent_review.c.id == identity)
+                ).scalar_one_or_none()
+            if existing is None or {
+                name: value for name, value in existing.items() if name != "accepted_at"
+            } != {name: value for name, value in payload.items() if name != "accepted_at"}:
+                raise ValueError("agent review already has a different response") from None
+
+    def review_response(self, review_id: str) -> dict[str, Any] | None:
+        identity = canonical_hash({"kind": "agent_review_response", "review_id": review_id})
+        with self.engine.connect() as connection:
+            payload = connection.execute(
+                select(agent_review.c.payload).where(agent_review.c.id == identity)
+            ).scalar_one_or_none()
+        return dict(payload) if payload is not None else None
+
+    def bind_dataset(self, *, proposal_id: str, bundle_id: str, resolved_at: str) -> dict[str, Any]:
+        payload = {
+            "proposal_id": proposal_id,
+            "kind": "agent_dataset_binding",
+            "bundle_id": bundle_id,
+            "resolved_at": timestamp(resolved_at, field="resolved_at"),
+        }
+        identity = canonical_hash({"kind": "agent_dataset_binding", "proposal_id": proposal_id})
+        self._append(agent_review, record_id=identity, created_at=resolved_at, payload=payload)
+        return payload
 
     def _content_record(
         self, table, proposal_id: str, created_at: str, payload: dict[str, Any]

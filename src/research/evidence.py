@@ -9,6 +9,35 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.domain._codec import canonical_hash
+from src.research.stress import RETURN_BLOCK_METHOD
+
+
+@dataclass(frozen=True)
+class EvidenceApplicability:
+    instrument_count: int | None = None
+    tunable_parameter_count: int | None = None
+    active_strategy_count: int | None = None
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.instrument_count,
+            self.tunable_parameter_count,
+            self.active_strategy_count,
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError("evidence applicability counts must be non-negative integers")
+
+    def permits(self, name: str) -> bool:
+        return {
+            "parameter_stability": self.tunable_parameter_count == 0,
+            "probability_backtest_overfitting": self.tunable_parameter_count == 0,
+            "cross_symbol_stability": self.instrument_count == 1,
+            "cross_instrument": self.instrument_count == 1,
+            "predeclared_universe_holdout": self.instrument_count == 1,
+            "portfolio_overlap": self.active_strategy_count == 0,
+        }.get(name, False)
 
 
 def _finite(value: object) -> float | None:
@@ -39,13 +68,12 @@ _PROFILE_FINITE_FIELDS = (
     "minimum_cross_symbol_pooled_return",
     "minimum_cross_symbol_lower_quantile_return",
     "allowed_holdout_degradation",
-    "minimum_evidence_score",
 )
 _PROFILE_INTEGER_FIELDS = (
     "minimum_walk_forward_windows",
     "minimum_bootstrap_observations",
     "minimum_closed_trades",
-    "minimum_effective_episodes",
+    "minimum_completed_episodes",
     "minimum_trading_days",
     "minimum_cycles",
 )
@@ -55,7 +83,6 @@ _PROFILE_UNIT_FIELDS = (
     "minimum_positive_symbol_fraction",
     "maximum_parameter_degradation",
     "allowed_holdout_degradation",
-    "minimum_evidence_score",
 )
 
 
@@ -135,7 +162,7 @@ class EvidenceProfile:
     maximum_backtest_overfitting_probability: float | None = None
     minimum_bootstrap_observations: int | None = None
     minimum_closed_trades: int = 0
-    minimum_effective_episodes: int = 0
+    minimum_completed_episodes: int = 0
     minimum_trading_days: int = 0
     minimum_cycles: int = 0
     minimum_calendar_days: float = 0.0
@@ -147,7 +174,6 @@ class EvidenceProfile:
     minimum_cross_symbol_pooled_return: float = 0.0
     minimum_cross_symbol_lower_quantile_return: float | None = None
     allowed_holdout_degradation: float = 0.5
-    minimum_evidence_score: float = 0.5
 
     def __post_init__(self) -> None:
         _normalise_profile_dimensions(self)
@@ -204,7 +230,7 @@ def initial_forward_profile(evidence_type: str | None) -> EvidenceProfile:
         family=str(evidence_type or "*"),
         minimum_calendar_days=days,
         minimum_closed_trades=trades,
-        minimum_effective_episodes=episodes,
+        minimum_completed_episodes=episodes,
         minimum_trading_days=10 if evidence_type == "scalping" else 0,
         minimum_cycles=cycles,
     )
@@ -234,12 +260,8 @@ def sample_evidence_passes(value: object, profile: EvidenceProfile) -> bool:
     if not isinstance(value, Mapping) or value.get("passed") is not True:
         return False
     observations = _integer(value.get("observations"))
-    closed_trades = _integer(
-        value.get("closed_trades", value.get("trades", value.get("effective_trades", observations)))
-    )
-    episodes = _integer(
-        value.get("effective_independent_episodes", value.get("episodes", closed_trades))
-    )
+    closed_trades = _integer(value.get("closed_trades"))
+    episodes = _integer(value.get("completed_episodes"))
     trading_days = _integer(value.get("trading_days", value.get("evidence_days", 0)))
     return (
         observations is not None
@@ -247,7 +269,7 @@ def sample_evidence_passes(value: object, profile: EvidenceProfile) -> bool:
         and closed_trades is not None
         and closed_trades >= profile.minimum_closed_trades
         and episodes is not None
-        and episodes >= profile.minimum_effective_episodes
+        and episodes >= profile.minimum_completed_episodes
         and trading_days is not None
         and trading_days >= profile.minimum_trading_days
     )
@@ -256,8 +278,6 @@ def sample_evidence_passes(value: object, profile: EvidenceProfile) -> bool:
 def parameter_stability_passes(value: object, profile: EvidenceProfile) -> bool:
     if not isinstance(value, Mapping):
         return False
-    if value.get("status") == "not_applicable":
-        return True
     if value.get("cliff_detected") is True or value.get("degradation_shape") == "cliff":
         return False
     parameter_data = _parameter_data(value)
@@ -319,8 +339,6 @@ def _parameter_data(
 def cross_symbol_stability_passes(value: object, profile: EvidenceProfile) -> bool:
     if not isinstance(value, Mapping):
         return False
-    if value.get("status") == "not_applicable":
-        return True
     returns = _cross_symbol_returns(value)
     if returns is None:
         return False
@@ -391,6 +409,9 @@ def drawdown_passes(value: object, profile: EvidenceProfile) -> bool:
 
 def monte_carlo_passes(value: object, profile: EvidenceProfile) -> bool:
     if not isinstance(value, Mapping) or value.get("passed") is not True:
+        return False
+    block_length = _integer(value.get("block_length"))
+    if value.get("method") != RETURN_BLOCK_METHOD or block_length is None or block_length < 2:
         return False
     iterations = _integer(value.get("iterations"))
     maximum = _finite(value.get("maximum_drawdown"))

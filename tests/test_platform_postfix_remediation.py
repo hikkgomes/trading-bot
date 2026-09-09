@@ -43,7 +43,7 @@ from src.research.backtest.event_engine import (
     SimulatedOrderSide,
 )
 from src.research.evidence import regime_breakdown_passes
-from src.research.generation import CAMPAIGNS, build_hypothesis
+from src.research.generation import CAMPAIGNS, GenerationError, build_hypothesis
 from src.research.returns import PositionReturnLedger
 from src.services.alerting import AlertSeverity, SqlAlertService
 from src.services.config import load_split_configuration
@@ -56,7 +56,6 @@ from src.services.platform_upgrade import quarantine_legacy_research_jobs
 from src.services.promotion import PromotionPolicy, overlay_family_policy
 from src.services.research_worker import ResearchWorker
 from src.services.scheduler import DatabaseJobQueue, PlatformScheduler
-from src.strategies.semantic import semantic_input_from_features
 
 NOW = "2026-09-01T00:00:00+00:00"
 
@@ -168,31 +167,38 @@ def _candle(index: int = 0):
     )
 
 
-def test_legacy_research_jobs_are_quarantined_once(tmp_path: Path) -> None:
+@pytest.mark.parametrize("count", [1, 401])
+def test_legacy_research_jobs_are_quarantined_once(tmp_path: Path, count: int) -> None:
     database = _database(tmp_path)
     try:
         with database.engine.begin() as connection:
             connection.execute(
-                insert(job).values(
-                    id="legacy-job",
-                    name="bounded_backtest",
-                    state="pending",
-                    priority=1,
-                    available_at=NOW,
-                    attempts=0,
-                    max_attempts=3,
-                    producer_identity="legacy-autopilot",
-                    content_hash="sha256:" + "1" * 64,
-                    payload={"legacy": True},
-                )
+                insert(job),
+                [
+                    {
+                        "id": f"legacy-job-{index}",
+                        "name": "bounded_backtest",
+                        "state": "pending",
+                        "priority": 1,
+                        "available_at": NOW,
+                        "attempts": 0,
+                        "max_attempts": 3,
+                        "producer_identity": "legacy-autopilot",
+                        "content_hash": "sha256:" + "1" * 64,
+                        "payload": {"legacy": True},
+                    }
+                    for index in range(count)
+                ],
             )
         first = quarantine_legacy_research_jobs(database.engine, now=NOW)
         second = quarantine_legacy_research_jobs(database.engine, now=NOW)
-        assert first["count"] == 1
+        assert first["count"] == count
         assert second["already_applied"] is True
         with database.engine.connect() as connection:
-            assert connection.execute(select(job.c.state)).scalar_one() == "quarantined"
-            assert connection.execute(select(job_quarantine.c.job_id)).scalar_one() == "legacy-job"
+            assert set(connection.execute(select(job.c.state)).scalars()) == {"quarantined"}
+            assert set(connection.execute(select(job_quarantine.c.job_id)).scalars()) == {
+                f"legacy-job-{index}" for index in range(count)
+            }
     finally:
         database.dispose()
 
@@ -498,6 +504,16 @@ def test_generated_campaigns_emit_family_specific_executable_contracts() -> None
     }
     for campaign in CAMPAIGNS:
         symbols = ("BTCUSDT",) if campaign.product == "btc_accumulation" else ("BTCUSDT", "ETHUSDT")
+        if campaign.unavailable_reason is not None:
+            with pytest.raises(GenerationError, match="unsupported campaign"):
+                build_hypothesis(
+                    campaign,
+                    variant=0,
+                    instrument_universe=symbols,
+                    dataset_snapshot_hashes=(canonical_hash({"campaign": campaign.name}),),
+                    submitted_at=NOW,
+                )
+            continue
         hypothesis = build_hypothesis(
             campaign,
             variant=0,
@@ -515,34 +531,19 @@ def test_generated_campaigns_emit_family_specific_executable_contracts() -> None
         assert model["parameters"]["threshold_unit"]
 
 
-def test_generated_campaign_feature_graphs_and_linked_contracts_are_executable() -> None:
+def test_feature_graph_availability_does_not_enable_unimplemented_pair_campaigns() -> None:
     registry = FeatureGraphRegistry.default()
     for campaign in CAMPAIGNS:
         registry.graph(tuple(campaign.permitted_features))
         if campaign.family == "relative_value":
-            hypothesis = build_hypothesis(
-                campaign,
-                variant=0,
-                instrument_universe=("BTCUSDT", "ETHUSDT"),
-                dataset_snapshot_hashes=(canonical_hash({"campaign": campaign.name}),),
-                submitted_at=NOW,
-            )
-            model = hypothesis.candidate.definition.signal_model
-            assert all(
-                str(leg["instrument_id"]).startswith("binance:futures:")
-                for leg in model["paired_legs"]
-            )
-    value = semantic_input_from_features(
-        "beta_neutral_spreads",
-        {
-            "information_time": NOW,
-            "market_frame": [
-                {"instrument_id": "binance:futures:BTCUSDT:USDT", "close": 100.0},
-                {"instrument_id": "binance:futures:ETHUSDT:USDT", "close": 50.0},
-            ],
-        },
-    )
-    assert len(value.legs) == 2
+            with pytest.raises(GenerationError, match="unsupported campaign"):
+                build_hypothesis(
+                    campaign,
+                    variant=0,
+                    instrument_universe=("BTCUSDT", "ETHUSDT"),
+                    dataset_snapshot_hashes=(canonical_hash({"campaign": campaign.name}),),
+                    submitted_at=NOW,
+                )
 
 
 def test_forward_policy_is_selected_by_exact_product_and_family() -> None:
@@ -631,9 +632,54 @@ def test_paper_account_state_survives_reinstantiation_and_reconciliation(tmp_pat
         starting_balances={"USDT": 1_000.0},
     )
     assert restarted.state() is not None
-    assert restarted.state().balances["USDT"] == pytest.approx(999.7)
+    assert restarted.state().balances["USDT"] == pytest.approx(999.9)
     assert restarted.state().positions[order.instrument_id] == pytest.approx(0.1)
     database.dispose()
+
+
+@pytest.mark.parametrize(
+    "initial,events,expected",
+    [
+        (
+            {},
+            [("a1", "a", "buy", 1, 0), ("b1", "b", "sell", 1, 0), ("a2", "a", "buy", 1, 0)],
+            ("b1",),
+        ),
+        (
+            {"BTC": 1},
+            [("s1", "s", "sell", 1, 0), ("b1", "b", "buy", 1, 0), ("s2", "s", "sell", 1, 0)],
+            ("s1", "s2"),
+        ),
+        ({}, [("a1", "a", "buy", 1, 0.001), ("b1", "b", "sell", 0.999, 0)], ("b1",)),
+    ],
+)
+def test_forward_episodes_follow_incremental_fills_not_order_groups(initial, events, expected):
+    rows = tuple(
+        {
+            "id": identity,
+            "created_at": NOW,
+            "payload": {
+                "order_id": order,
+                "instrument_id": "BTC",
+                "side": side,
+                "quantity": quantity,
+                "occurred_at": f"2026-08-30T10:00:00.{index + 1:03d}+00:00",
+                "metadata": {"base_fee_quantity": fee},
+            },
+        }
+        for index, (identity, order, side, quantity, fee) in enumerate(events)
+    )
+    assert (
+        ForwardEvidenceCollector._closed_episode_ids(
+            tuple(reversed(rows)) + rows[:1], initial_positions=initial
+        )
+        == expected
+    )
+    conflicting = {**rows[0], "payload": {**rows[0]["payload"], "quantity": 99}}
+    with pytest.raises(ValueError, match="conflicting content"):
+        ForwardEvidenceCollector._closed_episode_ids(
+            (*rows, conflicting), initial_positions=initial
+        )
 
 
 def test_forward_facts_count_closed_episodes_and_do_not_invent_fill_rate() -> None:
@@ -669,7 +715,7 @@ def test_forward_facts_count_closed_episodes_and_do_not_invent_fill_rate() -> No
             },
         },
     )
-    assert ForwardEvidenceCollector._closed_episode_ids(rows) == ("close-a",)
+    assert ForwardEvidenceCollector._closed_episode_ids(rows) == ("fill-close-a",)
     assert ForwardEvidenceCollector._data_uptime(0, expected_observations=8) == 0.0
     facts = ForwardEvidenceMetrics(
         net_pnl=0.0,
@@ -864,7 +910,13 @@ def test_resource_deferral_does_not_consume_a_research_attempt(tmp_path: Path, m
     database.dispose()
 
 
-def test_openclaw_scheduled_review_round_trip_is_bound_to_request(tmp_path: Path) -> None:
+def test_openclaw_scheduled_review_round_trip_is_bound_to_request(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from src.agents.context import AgentContext
+    from src.agents.transport import sign_review_response
+    from src.services.agent_transport import AgentReviewTransport
+
     database = _database(tmp_path)
     queue = DatabaseJobQueue(database.engine)
     bridge = OpenClawAgentBridge(store=SqlAgentStore(database.engine), queue=queue)
@@ -873,11 +925,14 @@ def test_openclaw_scheduled_review_round_trip_is_bound_to_request(tmp_path: Path
         "schema": "platform.agent_review_request/v1",
         "review_id": review_id,
         "context": {"failure_reasons": {"capacity": 1}, "product_id": "active_income"},
-        "context_hash": canonical_hash(
-            {"failure_reasons": {"capacity": 1}, "product_id": "active_income"}
-        ),
+        "context_hash": AgentContext(
+            created_at=NOW,
+            values={"failure_reasons": {"capacity": 1}, "product_id": "active_income"},
+        ).content_hash,
         "transport": "postgresql_agent_review",
         "response_required": True,
+        "requested_at": NOW,
+        "expires_at": "2026-09-01T01:00:00+00:00",
     }
     SqlAgentStore(database.engine).save_review(
         proposal_id=review_id,
@@ -895,8 +950,41 @@ def test_openclaw_scheduled_review_round_trip_is_bound_to_request(tmp_path: Path
         "thesis": "A bounded market hypothesis must explain a causal return mechanism.",
         "provenance": {"review_id": review_id},
     }
-    proposal = bridge.ingest_review_response(response)
+    key = b"test-review-transport-secret-only" * 2
+    request = bridge.review_request(review_id)
+    bridge.enqueue_review_delivery(review_id, available_at=NOW)
+    transport = AgentReviewTransport(queue, key=key)
+    transport.bridge = bridge
+    assert transport.next_request(now=NOW)["request"] == request
+    envelope = sign_review_response(request, response, key=key)
+    with pytest.raises(PermissionError, match="signature"):
+        bridge.ingest_review_response(envelope, key=b"wrong-key" * 8, now=NOW)
+    with pytest.raises(PermissionError, match="expired"):
+        bridge.ingest_review_response(envelope, key=key, now=request["expires_at"])
+    future_dated = sign_review_response(
+        request, {**response, "created_at": request["expires_at"]}, key=key
+    )
+    with pytest.raises(ValueError, match="timestamp is outside"):
+        bridge.ingest_review_response(future_dated, key=key, now=NOW)
+    assert not SqlAgentStore(database.engine).records("proposal")
+
+    def interrupted_intake(_payload):
+        raise RuntimeError("crash after response acceptance")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(bridge, "ingest", interrupted_intake)
+        with pytest.raises(RuntimeError, match="crash after response"):
+            bridge.ingest_review_response(envelope, key=key, now=NOW)
+    assert not SqlAgentStore(database.engine).records("proposal")
+    assert transport.next_request(now=request["expires_at"])["request"] is None
+    assert queue.state(f"agent-delivery:{review_id}") == "completed"
+    proposal = bridge.ingest_review_response(envelope, key=key, now=request["expires_at"])
     assert proposal.proposal_id == "proposal-1"
+    assert bridge.ingest_review_response(envelope, key=key, now=NOW) == proposal
+    conflicting = sign_review_response(request, {**response, "proposal_id": "other"}, key=key)
+    with pytest.raises(ValueError, match="different response"):
+        bridge.ingest_review_response(conflicting, key=key, now=NOW)
+    assert len(SqlAgentStore(database.engine).records("proposal")) == 1
     assert any(
         item.get("schema") == "platform.agent_review_response/v1"
         and item.get("review_id") == review_id

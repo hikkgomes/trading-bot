@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-import statistics
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from src.accounting.nav import NavSnapshot, btc_nav, usdt_nav
+from src.accounting.spot_allocation import target_trade_quantity
 from src.data.database import (
     account_snapshot,
     balance_snapshot,
@@ -21,12 +21,37 @@ from src.data.database import (
     risk_snapshot,
     service_heartbeat,
 )
-from src.domain._codec import canonical_hash, timestamp
+from src.domain._codec import canonical_hash, timeframe_seconds, timestamp
 from src.risk.engine import SqlRiskSnapshotStore
+from src.risk.policy import risk_policy_identity
 from src.services.accounting_service import AccountingService
 from src.services.portfolio_engine import _canonical_portfolio_state
 from src.services.risk_state import PortfolioRiskCalculator
 from src.services.scheduler import DatabaseJobQueue
+
+
+def _marked_equity_amount(nav: NavSnapshot | None) -> float | None:
+    if nav is None:
+        return None
+    return (
+        nav.nav * float(nav.components["stablecoin_per_btc"])
+        if nav.accounting_asset == "BTC"
+        else nav.nav
+    )
+
+
+def _initial_btc_benchmark(
+    btc: float, quote: float, price: float, product: Mapping[str, Any]
+) -> float:
+    costs = product.get("execution_costs", {})
+    return btc + target_trade_quantity(
+        base=btc,
+        quote=quote,
+        mark=price,
+        fraction=1.0,
+        fee_rate=float(costs.get("fee_bps", 0)) / 10000,
+        slippage_rate=float(costs.get("slippage_bps", 0)) / 10000,
+    )
 
 
 def _live_balance_ready(payload: Mapping[str, Any] | None) -> bool:
@@ -151,6 +176,8 @@ class DatabasePortfolioSourceService:
             at=now,
         )
         account_values = {
+            "marked_equity": _marked_equity_amount(nav),
+            "marked_equity_currency": "USDT",
             "used_margin_fraction": float(balance_payload.get("used_margin_fraction", 0.0)),
             "liquidation_buffer_fraction": float(
                 balance_payload.get("liquidation_buffer_fraction", 1.0)
@@ -207,6 +234,7 @@ class DatabasePortfolioSourceService:
             values={
                 "market": market,
                 "correlations": measurements.correlations,
+                "factor_estimates": measurements.factor_estimates,
                 "beta": measurements.beta,
                 "risk_data_available": measurements.risk_data_available,
                 "risk_data_missing": list(measurements.risk_data_missing),
@@ -267,7 +295,11 @@ class DatabasePortfolioSourceService:
                 stablecoin_per_btc=price,
             )
             previous = self.accounting.latest_nav(product_id=product_id, at=observed_at)
-            passive = nav if previous is None else self._passive_benchmark(previous, price)
+            passive = (
+                _initial_btc_benchmark(btc_balance, stablecoin_balance, price, product)
+                if previous is None
+                else self._passive_benchmark(previous)
+            )
             return NavSnapshot(
                 product_id=product_id,
                 accounting_asset="BTC",
@@ -332,15 +364,18 @@ class DatabasePortfolioSourceService:
         return result
 
     @staticmethod
-    def _passive_benchmark(previous: NavSnapshot, price: float) -> float:
-        old_price = float(previous.components.get("stablecoin_per_btc", 0.0))
-        if old_price <= 0 or previous.passive_benchmark_nav is None:
-            return float(previous.passive_benchmark_nav or previous.nav)
-        return float(previous.passive_benchmark_nav) * price / old_price
+    def _passive_benchmark(previous: NavSnapshot) -> float:
+        return float(
+            previous.passive_benchmark_nav
+            if previous.passive_benchmark_nav is not None
+            else previous.nav
+        )
 
     def _previous_observed_at(self, *, kind: str, product_id: str, at: str) -> str | None:
         try:
-            _identity, snapshot = self.store.latest(kind=kind, product_id=product_id, at=at)
+            _identity, snapshot = self.store.latest(
+                kind=kind, product_id=product_id, at=at, require_source_envelope=True
+            )
         except KeyError:
             return None
         value = snapshot.get("observed_at", snapshot.get("created_at"))
@@ -356,7 +391,9 @@ class DatabasePortfolioSourceService:
         at: str,
     ) -> str:
         try:
-            _identity, snapshot = self.store.latest(kind=kind, product_id=product_id, at=at)
+            _identity, snapshot = self.store.latest(
+                kind=kind, product_id=product_id, at=at, require_source_envelope=True
+            )
         except KeyError:
             return timestamp(candidate, field=f"{kind}.observed_at")
         previous_values = snapshot.get("values")
@@ -420,28 +457,31 @@ class DatabasePortfolioSourceService:
     ) -> tuple[tuple[dict[str, Any], ...], str | None]:
         with self.engine.connect() as connection:
             rows = connection.execute(
-                select(order_intent.c.payload, exchange_order.c.status, exchange_order.c.created_at)
+                select(
+                    exchange_order.c.payload, exchange_order.c.status, exchange_order.c.created_at
+                )
                 .select_from(
                     order_intent.join(
                         exchange_order, order_intent.c.id == exchange_order.c.order_id
                     )
                 )
                 .where(exchange_order.c.created_at <= at)
-                .order_by(exchange_order.c.created_at.desc(), exchange_order.c.sequence.desc())
+                .where(order_intent.c.payload["portfolio_id"].as_string() == portfolio_id)
+                .order_by(exchange_order.c.order_id, exchange_order.c.sequence.desc())
             ).mappings()
         terminal = {"cancelled", "rejected", "expired", "reconciled", "filled"}
         latest: dict[str, dict[str, Any]] = {}
         seen: set[str] = set()
         latest_at: str | None = None
         for row in rows:
-            payload = row["payload"]
+            payload = row["payload"].get("intent")
             if not isinstance(payload, dict) or str(payload.get("portfolio_id")) != portfolio_id:
-                continue
+                raise ValueError("portfolio order journal has no matching intent")
             order_id = str(payload["order_id"])
             if order_id in seen:
                 continue
             seen.add(order_id)
-            latest_at = latest_at or str(row["created_at"])
+            latest_at = max(latest_at or "", str(row["created_at"]))
             if str(row["status"]) not in terminal:
                 latest[order_id] = {**payload, "status": str(row["status"])}
         return tuple(latest[key] for key in sorted(latest)), latest_at
@@ -450,11 +490,11 @@ class DatabasePortfolioSourceService:
         product = self.products.get(product_id, {})
         account = self.accounts.get(str(product.get("account_id")), {})
         market_type = "spot" if account.get("market") == "spot" else "futures"
-        rows = self._market_rows(at)
+        rows = self._market_rows(product_id, at)
         latest_values: dict[str, dict[str, Any]] = {}
         latest_times: dict[str, str] = {}
         field_times: dict[str, dict[str, str]] = {}
-        close_history: dict[str, list[float]] = {}
+
         for row in rows:
             self._capture_market_row(
                 row,
@@ -462,23 +502,43 @@ class DatabasePortfolioSourceService:
                 latest_values=latest_values,
                 latest_times=latest_times,
                 field_times=field_times,
-                close_history=close_history,
             )
+        _correlations, _beta, _missing, estimates = self.risk_calculator._factor_measurements(
+            product_id=product_id,
+            at=at,
+            instrument_ids=tuple(latest_values),
+            timeframe=str(product.get("dataset_timeframe") or "1m"),
+        )
         return self._complete_market(
             latest_values=latest_values,
             latest_times=latest_times,
             field_times=field_times,
-            close_history=close_history,
+            estimates=estimates["estimates"],
             market_type=market_type,
             product=product,
             at=at,
         )
 
-    def _market_rows(self, at: str):
+    def _market_rows(self, product_id: str, at: str):
+        product = self.products.get(product_id, {})
+        horizon = max(
+            float(product.get("maximum_funding_age_seconds", 28800)),
+            2 * timeframe_seconds(str(product.get("dataset_timeframe") or "1m")),
+        )
+        oldest = (dt.datetime.fromisoformat(at) - dt.timedelta(seconds=horizon)).isoformat()
         with self.engine.connect() as connection:
             return connection.execute(
-                select(risk_snapshot.c.payload, risk_snapshot.c.created_at)
-                .where(risk_snapshot.c.created_at <= at)
+                select(risk_snapshot.c.id, risk_snapshot.c.payload, risk_snapshot.c.created_at)
+                .where(
+                    risk_snapshot.c.created_at <= at,
+                    risk_snapshot.c.created_at >= oldest,
+                    or_(
+                        risk_snapshot.c.payload["availability_time"].as_string().is_(None),
+                        risk_snapshot.c.payload["availability_time"].as_string() <= at,
+                    ),
+                    risk_snapshot.c.payload["kind"].as_string() == "market_data_input",
+                    risk_snapshot.c.payload["product_id"].as_string() == product_id,
+                )
                 .order_by(risk_snapshot.c.created_at.desc(), risk_snapshot.c.id.desc())
             ).mappings()
 
@@ -490,21 +550,19 @@ class DatabasePortfolioSourceService:
         latest_values: dict[str, dict[str, Any]],
         latest_times: dict[str, str],
         field_times: dict[str, dict[str, str]],
-        close_history: dict[str, list[float]],
     ) -> None:
         payload = row["payload"]
         if not isinstance(payload, dict) or payload.get("kind") != "market_data_input":
             return
         if str(payload.get("product_id")) != product_id:
             return
+        if canonical_hash(payload) != str(row["id"]):
+            raise ValueError("market source content hash does not match its identity")
         instrument_id = str(payload.get("instrument_id") or "")
         raw = payload.get("values")
         if not instrument_id or not isinstance(raw, Mapping):
             return
         values = latest_values.setdefault(instrument_id, {})
-        close = _number(raw.get("close", raw.get("price")))
-        if close > 0:
-            close_history.setdefault(instrument_id, []).append(close)
         for source_name, target_name in {
             "close": "price",
             "price": "price",
@@ -520,6 +578,7 @@ class DatabasePortfolioSourceService:
             if not math.isfinite(value):
                 continue
             values[target_name] = value
+            values.setdefault("source_snapshot_ids", {})[target_name] = str(row["id"])
             field_times.setdefault(instrument_id, {})[target_name] = str(row["created_at"])
             latest_times.setdefault(instrument_id, str(row["created_at"]))
 
@@ -529,7 +588,7 @@ class DatabasePortfolioSourceService:
         latest_values: dict[str, dict[str, Any]],
         latest_times: Mapping[str, str],
         field_times: Mapping[str, Mapping[str, str]],
-        close_history: Mapping[str, list[float]],
+        estimates: Mapping[str, Any],
         market_type: str,
         product: Mapping[str, Any],
         at: str,
@@ -538,7 +597,14 @@ class DatabasePortfolioSourceService:
         market: dict[str, dict[str, Any]] = {}
         latest_at: str | None = None
         for instrument_id, values in latest_values.items():
-            _fill_market_volatility(values, close_history.get(instrument_id, ()))
+            _fill_market_volatility(
+                values,
+                estimates.get(f"volatility:{instrument_id}"),
+                field_times.get(instrument_id, {}).get("volatility"),
+                at=at,
+                maximum_age_seconds=2
+                * timeframe_seconds(str(product.get("dataset_timeframe") or "1m")),
+            )
             if not _funding_is_current(
                 values,
                 field_times.get(instrument_id, {}),
@@ -744,7 +810,7 @@ class DatabasePortfolioStateWorker:
             try:
                 for source in sorted(self.REQUIRED_SOURCES):
                     identity, snapshot = self.store.latest(
-                        kind=source, product_id=product_id, at=now
+                        kind=source, product_id=product_id, at=now, require_source_envelope=True
                     )
                     source_ids[source] = identity
                     observed_at = snapshot.get("observed_at", snapshot.get("created_at"))
@@ -841,6 +907,7 @@ class DatabasePortfolioStateWorker:
                 "global_drawdown_fraction",
                 "trades_today",
                 "correlations",
+                "factor_estimates",
                 "beta",
                 "clusters",
                 "cluster_fraction_caps",
@@ -938,7 +1005,9 @@ def portfolio_state_policies(
                 float(global_limits["maximum_market_data_staleness_seconds"]),
                 float(global_limits["maximum_database_staleness_seconds"]),
             ),
-            "risk_policy_ids": [risk_policy_id],
+            "risk_policy_ids": [
+                risk_policy_identity(risk_policy_id, risk, account_id=str(product["account_id"]))
+            ],
             "portfolio_risk_budget": float(
                 limits.get("maximum_exposure", limits.get("maximum_gross", 1.0))
             ),
@@ -962,17 +1031,31 @@ def _number(value: object) -> float:
     return result if math.isfinite(result) else 0.0
 
 
-def _fill_market_volatility(values: dict[str, Any], history: Iterable[float]) -> None:
-    if "volatility" in values:
+def _fill_market_volatility(
+    values: dict[str, Any],
+    estimate: Mapping[str, Any] | None,
+    supplied_at: str | None,
+    *,
+    at: str,
+    maximum_age_seconds: int,
+) -> None:
+    if estimate is not None:
+        values["volatility"] = estimate["value"]
+        values["volatility_estimate"] = dict(estimate)
         return
-    closes = list(reversed(tuple(history)))
-    returns = [
-        closes[index] / closes[index - 1] - 1.0
-        for index in range(1, len(closes))
-        if closes[index - 1] > 0
-    ]
-    if len(returns) >= 2:
-        values["volatility"] = statistics.pstdev(returns)
+    if "volatility" not in values or supplied_at is None:
+        return
+    age = (dt.datetime.fromisoformat(at) - dt.datetime.fromisoformat(supplied_at)).total_seconds()
+    if not 0 <= age <= maximum_age_seconds:
+        values.pop("volatility", None)
+        return
+    values["volatility_estimate"] = {
+        "method": "source supplied volatility",
+        "unit": "return_volatility_ratio",
+        "value": values["volatility"],
+        "available_at": supplied_at,
+        "source_snapshot_ids": [values["source_snapshot_ids"]["volatility"]],
+    }
 
 
 def _funding_is_current(

@@ -557,13 +557,12 @@ def semantic_forecast_from_output(
     limits = position_limits if isinstance(position_limits, Mapping) else {}
     maximum = _bounded_float(limits.get("maximum_position", limits.get("maximum_fraction", 0.1)))
     target_volatility = _bounded_float(limits.get("target_volatility", 0.1))
-    return_scale = _finite_float(limits.get("return_scale", 0.01), field="return_scale")
     direction = "long" if signed > 0.0 else "short" if signed < 0.0 else "flat"
     return {
         "direction": direction,
         "score": abs(signed),
-        "expected_return": signed * return_scale,
-        "confidence": _bounded_float(limits.get("confidence", 0.7)),
+        "expected_return": None,
+        "confidence": None,
         "target_volatility": target_volatility,
         "maximum_position": maximum if direction != "flat" else 0.0,
         "semantic_signal": signed,

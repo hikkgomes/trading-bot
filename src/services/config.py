@@ -32,9 +32,11 @@ LINUX_SERVICES = frozenset(
         "universe-service",
         "platform-scheduler",
         "research-worker",
+        "evaluation-worker",
         "ml-worker",
         "event-replay-worker",
         "agent-sandbox",
+        "agent-coordinator",
         "feature-build-worker",
         "migration-service",
     }
@@ -67,7 +69,9 @@ PLATFORM_PROCESS_SERVICES: dict[str, tuple[str, ...]] = {
         "ml-worker",
         "event-replay-worker",
         "feature-build-worker",
+        "agent-coordinator",
     ),
+    "evaluation-runtime": ("evaluation-worker",),
     "agent-runtime": ("agent-sandbox",),
     "control-api": ("control-api",),
     "migration-service": ("migration-service",),
@@ -155,9 +159,10 @@ def _platform_security_domains(data: Mapping[str, Any]) -> dict[str, tuple[str, 
         "trading-research",
         "trading-agent",
         "trading-migration",
+        "trading-evaluator",
     }
     if set(domains) != expected_domains:
-        raise ValueError("platform.security_domains must define the four Linux security domains")
+        raise ValueError("platform.security_domains must define the five Linux security domains")
     services = [service for values in domains.values() for service in values]
     if set(services) != LINUX_SERVICES or len(services) != len(LINUX_SERVICES):
         raise ValueError("each service must belong to exactly one security domain")
@@ -194,10 +199,13 @@ def _platform_alerting(data: Mapping[str, Any]) -> dict[str, Any]:
 
 def _platform_backup(data: Mapping[str, Any]) -> dict[str, Any]:
     backup = _mapping(data.get("backup"), field="platform.backup")
-    for field_name in ("maximum_age_seconds", "retention_days"):
+    backup.setdefault("hourly_retention_hours", 24)
+    for field_name in ("maximum_age_seconds", "retention_days", "hourly_retention_hours"):
         value = backup.get(field_name)
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"platform.backup.{field_name} must be a positive integer")
+    if backup["hourly_retention_hours"] > backup["retention_days"] * 24:
+        raise ValueError("hourly backup retention must fit within the daily retention window")
     minimum_free_bytes = backup.get("minimum_free_bytes", 0)
     if (
         not isinstance(minimum_free_bytes, int)
@@ -367,7 +375,16 @@ def _unique_records(
 
 
 def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> None:
+    from src.risk.policy import validate_risk_policy
+
     accounts, products, portfolios, policies, risk_products = _split_records(configuration)
+    validate_risk_policy(configuration["risk"])
+    risk_accounts = configuration["risk"]["accounts"]
+    required_accounts = {str(product["account_id"]) for product in products.values()}
+    if not required_accounts.issubset(risk_accounts) or set(risk_accounts) - set(accounts):
+        raise ValueError(
+            "risk account policies must cover product accounts and reference configured accounts"
+        )
     _validate_promotion_policies(policies)
     _validate_forward_profiles(configuration["promotion"])
     _validate_products(products, accounts, portfolios, policies, risk_products)
@@ -424,7 +441,7 @@ def _validate_forward_profiles(promotion: Mapping[str, Any]) -> None:
             "required_forward_evidence_days",
             "minimum_forward_independent_decisions",
             "minimum_forward_effective_trades",
-            "minimum_forward_effective_episodes",
+            "minimum_forward_completed_episodes",
             "minimum_forward_trading_days",
         ):
             value = profile.get(field_name, 0)
@@ -494,7 +511,7 @@ def _validate_promotion_counts(policy_id: str, policy: Mapping[str, Any]) -> Non
         "maximum_forward_rejected_orders",
         "minimum_forward_trading_days",
         "minimum_forward_cycles",
-        "minimum_forward_effective_episodes",
+        "minimum_forward_completed_episodes",
         "maximum_forward_data_gaps",
     ):
         value = policy.get(field, 0)

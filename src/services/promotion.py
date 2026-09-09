@@ -5,14 +5,17 @@ from __future__ import annotations
 import datetime as dt
 import math
 from collections.abc import Mapping
-from dataclasses import MISSING, dataclass
+from dataclasses import MISSING, dataclass, replace
 from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import insert, select
 from sqlalchemy.engine import Engine
 
+from src.accounting.paper_account import PaperAccountLedger
 from src.data.database import (
+    active_strategy_assignment,
+    evidence_invalidation,
     experiment,
     forward_paper_decision,
     forward_paper_summary,
@@ -25,7 +28,7 @@ from src.data.database import (
     strategy_artefact,
     validation_stage,
 )
-from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
+from src.domain._codec import canonical_hash, json_value, non_empty, timestamp, to_primitive
 from src.research.canonical import (
     SqlActiveStrategyAssignmentRepository,
     _identity,
@@ -56,6 +59,7 @@ class PromotionRequest:
     evaluated_at: str
     instrument_id: str | None = None
     forward_summary_id: str | None = None
+    artefact_hash: str | None = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> PromotionRequest:
@@ -68,6 +72,7 @@ class PromotionRequest:
             "evaluated_at",
             "instrument_id",
             "forward_summary_id",
+            "artefact_hash",
         }
         forbidden = sorted(
             set(payload)
@@ -120,6 +125,11 @@ class PromotionRequest:
                 if payload.get("forward_summary_id") is not None
                 else None
             ),
+            artefact_hash=(
+                _identity(str(payload["artefact_hash"]), field="artefact_hash")
+                if payload.get("artefact_hash") is not None
+                else None
+            ),
         )
 
 
@@ -145,7 +155,7 @@ class PromotionPolicy:
     maximum_forward_rejected_orders: int = 0
     minimum_forward_trading_days: int = 0
     minimum_forward_cycles: int = 0
-    minimum_forward_effective_episodes: int = 0
+    minimum_forward_completed_episodes: int = 0
     maximum_forward_tail_loss: float = 1.0
 
 
@@ -181,7 +191,7 @@ class PromotionEvidence:
     forward_evidence_accepted: bool
     drawdown: float
     execution_drift: float
-    model_drift: float
+    model_drift: float | None
     portfolio_capacity: float
     requested_capital: float
     risk_budget_available: float
@@ -212,15 +222,16 @@ class PromotionEvidence:
     forward_effective_trades: int = 0
     forward_fill_rate: float = 0.0
     forward_fill_rate_applicable: bool = False
-    forward_slippage: float = 0.0
+    forward_slippage: float | None = None
     forward_data_uptime: float = 0.0
     forward_rejected_orders: int = 0
     forward_trading_days: int = 0
     forward_cycles: int = 0
-    forward_effective_episodes: int = 0
+    forward_completed_episodes: int = 0
     forward_tail_loss: float = 0.0
     supported_instruments: tuple[str, ...] = ()
     sleeve_id: str | None = None
+    paper_only_history: bool = False
 
 
 @dataclass(frozen=True)
@@ -265,7 +276,7 @@ class SqlPromotionPolicyStore:
                 "maximum_forward_rejected_orders": policy.maximum_forward_rejected_orders,
                 "minimum_forward_trading_days": policy.minimum_forward_trading_days,
                 "minimum_forward_cycles": policy.minimum_forward_cycles,
-                "minimum_forward_effective_episodes": policy.minimum_forward_effective_episodes,
+                "minimum_forward_completed_episodes": policy.minimum_forward_completed_episodes,
                 "maximum_forward_tail_loss": policy.maximum_forward_tail_loss,
             },
             field="promotion policy",
@@ -295,6 +306,8 @@ class SqlPromotionPolicyStore:
             ).scalar_one_or_none()
         if payload is None:
             raise KeyError(f"promotion policy does not exist: {policy_id}")
+        if "minimum_forward_completed_episodes" not in payload:
+            raise ValueError("promotion policy predates the completed-episode contract")
         fields = PromotionPolicy.__dataclass_fields__
         values = {
             key: payload[key]
@@ -307,7 +320,14 @@ class SqlPromotionPolicyStore:
     def first(self) -> PromotionPolicy:
         with self.engine.connect() as connection:
             payload = connection.execute(
-                select(promotion_policy.c.payload).order_by(promotion_policy.c.created_at).limit(1)
+                select(promotion_policy.c.payload)
+                .where(
+                    promotion_policy.c.payload["minimum_forward_completed_episodes"]
+                    .as_integer()
+                    .is_not(None)
+                )
+                .order_by(promotion_policy.c.created_at)
+                .limit(1)
             ).scalar_one_or_none()
         if payload is None:
             raise KeyError("no authoritative promotion policy exists")
@@ -330,8 +350,11 @@ class SqlCanonicalPromotionEvidence:
         engine: Engine,
         policy_store: SqlPromotionPolicyStore | None = None,
         policies_by_product_family: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+        *,
+        research_configuration_hash: str | None = None,
     ):
         self.engine = engine
+        self.research_configuration_hash = research_configuration_hash
         self.policy_store = policy_store or SqlPromotionPolicyStore(engine)
         self.policies_by_product_family = {
             (str(key[0]), str(key[1])): dict(value)
@@ -415,8 +438,23 @@ class SqlCanonicalPromotionEvidence:
         )
         protected_accepted = bool(holdout_rows) and all(row["accepted"] for row in holdout_rows)
         forward_accepted = bool(
-            forward_decision is not None and forward_decision["accepted"] is True
+            forward_decision is not None
+            and forward_decision["accepted"] is True
+            and (forward_decision["payload"].get("research_qualification") or {}).get("qualified")
+            is True
         )
+        if forward_accepted:
+            from src.research.policy_approval import research_qualification
+
+            with self.engine.connect() as connection:
+                forward_accepted = research_qualification(
+                    connection,
+                    artefact_hash=artefact_hash,
+                    strategy_version_id=request.strategy_version_id,
+                    product_id=product_id,
+                    configuration_hash=self.research_configuration_hash,
+                    at=request.evaluated_at,
+                )["qualified"]
         fresh_preflight = bool(
             latest_preflight
             and latest_preflight["accepted"]
@@ -452,7 +490,7 @@ class SqlCanonicalPromotionEvidence:
             forward_evidence_accepted=forward_accepted,
             drawdown=max(observation_values.get("drawdown") or [0.0]),
             execution_drift=max(observation_values.get("execution_drift") or [0.0]),
-            model_drift=max(observation_values.get("model_drift") or [0.0]),
+            model_drift=max(observation_values.get("model_drift") or [], default=None),
             portfolio_capacity=min(observation_values.get("portfolio_capacity") or [0.0]),
             requested_capital=request.requested_capital,
             risk_budget_available=min(observation_values.get("risk_budget_available") or [0.0]),
@@ -506,14 +544,16 @@ class SqlCanonicalPromotionEvidence:
             forward_effective_trades=int(summary_payload.get("effective_trades", 0)),
             forward_fill_rate=float(summary_payload.get("fill_rate", 0.0)),
             forward_fill_rate_applicable=summary_payload.get("fill_rate_applicable") is True,
-            forward_slippage=float(summary_payload.get("slippage", 0.0)),
+            forward_slippage=(
+                float(summary_payload["slippage"])
+                if summary_payload.get("slippage") is not None
+                else None
+            ),
             forward_data_uptime=float(summary_payload.get("data_uptime", 0.0)),
             forward_rejected_orders=int(summary_payload.get("rejected_orders", 0)),
             forward_trading_days=int(summary_payload.get("trading_days", 0)),
             forward_cycles=int(summary_payload.get("cycles", 0)),
-            forward_effective_episodes=int(
-                summary_payload.get("effective_independent_episodes", 0)
-            ),
+            forward_completed_episodes=int(summary_payload.get("completed_episodes", 0)),
             forward_tail_loss=float(summary_payload.get("tail_loss", 0.0)),
             supported_instruments=tuple(
                 sorted(
@@ -523,6 +563,7 @@ class SqlCanonicalPromotionEvidence:
                 )
             ),
             sleeve_id=sleeve_id,
+            paper_only_history=self._paper_only_history(request, product_id),
         )
         policy_id = str(artefact.get("promotion_policy_id") or "")
         policy = self.policy_store.get(policy_id) if policy_id else self.policy_store.first()
@@ -537,13 +578,29 @@ class SqlCanonicalPromotionEvidence:
         )
         return current_state, evidence, policy
 
+    def _paper_only_history(self, request: PromotionRequest, product_id: str) -> bool:
+        statement = select(active_strategy_assignment.c.execution_mode).where(
+            active_strategy_assignment.c.product_id == product_id,
+            active_strategy_assignment.c.strategy_version_id == request.strategy_version_id,
+            active_strategy_assignment.c.assigned_at <= request.evaluated_at,
+        )
+        if request.artefact_hash is not None:
+            statement = statement.where(
+                active_strategy_assignment.c.artefact_hash == request.artefact_hash
+            )
+        with self.engine.connect() as connection:
+            return set(connection.execute(statement).scalars()) == {"paper"}
+
 
 def _promotion_artefact_row(connection: Any, request: PromotionRequest) -> Mapping[str, Any]:
+    invalidated = set(connection.execute(select(evidence_invalidation.c.id)).scalars())
     rows = [
         row
         for row in connection.execute(select(strategy_artefact)).mappings()
         if isinstance(row["payload"], dict)
         and row["payload"].get("strategy_version_id") == request.strategy_version_id
+        and (request.artefact_hash is None or row["id"] == request.artefact_hash)
+        and f"artefact:{row['id']}" not in invalidated
         and _at_or_before(row["created_at"], request.evaluated_at)
     ]
     if len(rows) != 1:
@@ -944,6 +1001,18 @@ def _resume_decision(
             0.0,
             evidence,
         )
+    if evidence.paper_only_history:
+        ready = evidence.validation_accepted and evidence.protected_holdout_accepted
+        return _decision(
+            strategy_version_id,
+            current_state,
+            LifecycleState.FORWARD_PAPER if ready else current_state,
+            ready,
+            "resumed_to_forward_paper" if ready else "resume_research_evidence_missing",
+            evaluated_at,
+            policy.paper_capital_limit if ready else 0.0,
+            evidence,
+        )
     if not evidence.forward_evidence_accepted:
         return _decision(
             strategy_version_id,
@@ -951,6 +1020,17 @@ def _resume_decision(
             current_state,
             False,
             "resume_forward_evidence_missing",
+            evaluated_at,
+            0.0,
+            evidence,
+        )
+    if not evidence.fresh_preflight or not evidence.live_approval:
+        return _decision(
+            strategy_version_id,
+            current_state,
+            current_state,
+            False,
+            "resume_live_authority_missing",
             evaluated_at,
             0.0,
             evidence,
@@ -978,7 +1058,10 @@ def _drift_decision(
     checks = (
         (evidence.drawdown > policy.maximum_drawdown, "drawdown_limit"),
         (evidence.execution_drift > policy.maximum_execution_drift, "execution_drift_limit"),
-        (evidence.model_drift > policy.maximum_model_drift, "model_drift_limit"),
+        (
+            evidence.model_drift is not None and evidence.model_drift > policy.maximum_model_drift,
+            "model_drift_limit",
+        ),
     )
     reason = next((value for failed, value in checks if failed), None)
     if reason is None:
@@ -1102,7 +1185,7 @@ def _forward_state_decision(
         return _live_canary_decision(
             strategy_version_id, current_state, evidence, policy, evaluated_at
         )
-    if current_state is LifecycleState.LIVE_READY:
+    if current_state is LifecycleState.LIVE_READY and evidence.fresh_preflight:
         return _decision(
             strategy_version_id,
             current_state,
@@ -1113,11 +1196,16 @@ def _forward_state_decision(
             policy.paper_capital_limit,
             evidence,
         )
-    if policy.automatic_live_ready_promotion and requested_transition in {
-        None,
-        "forward_paper",
-        "live_ready",
-    }:
+    if (
+        policy.automatic_live_ready_promotion
+        and evidence.fresh_preflight
+        and requested_transition
+        in {
+            None,
+            "forward_paper",
+            "live_ready",
+        }
+    ):
         return _decision(
             strategy_version_id,
             current_state,
@@ -1131,9 +1219,9 @@ def _forward_state_decision(
     return _decision(
         strategy_version_id,
         current_state,
-        current_state,
+        LifecycleState.FORWARD_PAPER,
         True,
-        "forward_paper_maintained",
+        "research_qualified",
         evaluated_at,
         policy.paper_capital_limit,
         evidence,
@@ -1249,8 +1337,8 @@ def _forward_evidence_failures(
             "forward_cycles_insufficient",
         ),
         (
-            evidence.forward_effective_episodes < policy.minimum_forward_effective_episodes,
-            "forward_independent_episodes_insufficient",
+            evidence.forward_completed_episodes < policy.minimum_forward_completed_episodes,
+            "forward_completed_episodes_insufficient",
         ),
         (
             objective_failure
@@ -1282,7 +1370,8 @@ def _forward_evidence_failures(
             ),
         ),
         (
-            evidence.forward_slippage > policy.maximum_forward_slippage,
+            evidence.forward_slippage is not None
+            and evidence.forward_slippage > policy.maximum_forward_slippage,
             "forward_slippage_limit",
         ),
         (
@@ -1444,6 +1533,8 @@ class DatabasePromotionWorker:
         policy_store: SqlPromotionPolicyStore | None = None,
         policies_by_product_family: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
         strict_identity_contract: bool | None = None,
+        paper_accounts: Mapping[str, PaperAccountLedger] | None = None,
+        research_configuration_hash: str | None = None,
         lease_seconds: int = 60,
     ) -> None:
         self.queue = queue
@@ -1460,6 +1551,8 @@ class DatabasePromotionWorker:
             else strict_identity_contract
         )
         self.lease_seconds = lease_seconds
+        self.paper_accounts = dict(paper_accounts or {})
+        self.research_configuration_hash = research_configuration_hash
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
@@ -1498,6 +1591,7 @@ class DatabasePromotionWorker:
                     decision=decision,
                     evidence=evidence,
                     current_state=current_state,
+                    policy=policy,
                 )
             else:
                 identity = self.store.append(decision)
@@ -1536,6 +1630,7 @@ class DatabasePromotionWorker:
         decision: PromotionDecision,
         evidence: PromotionEvidence,
         current_state: LifecycleState,
+        policy: PromotionPolicy,
     ) -> str:
         payload = {
             "strategy_version_id": decision.strategy_version_id,
@@ -1564,22 +1659,44 @@ class DatabasePromotionWorker:
                 current_state=current_state,
                 identity=identity,
             )
+            if decision.accepted and decision.next_state is LifecycleState.FORWARD_PAPER:
+                from src.services.forward_windows import current_window, open_window
+
+                previous = current_window(
+                    connection,
+                    strategy_version_id=decision.strategy_version_id,
+                    product_id=str(evidence.product_id),
+                    artefact_hash=evidence.strategy_artefact_hash,
+                    at=decision.evaluated_at,
+                )
+
+                open_window(
+                    connection,
+                    strategy_version_id=decision.strategy_version_id,
+                    product_id=str(evidence.product_id),
+                    artefact_hash=evidence.strategy_artefact_hash,
+                    opened_at=decision.evaluated_at,
+                    source_event_id=identity,
+                    policy=to_primitive(policy),
+                    reason=decision.reason_code,
+                    previous_window_id=(
+                        previous["window_id"]
+                        if previous is not None and current_state is LifecycleState.SUSPENDED
+                        else None
+                    ),
+                )
         return identity
 
     def _load_promotion_context(
         self, payload: Mapping[str, Any], *, now: str
     ) -> tuple[LifecycleState, PromotionEvidence, PromotionPolicy, str, str]:
-        if self.strict_identity_contract:
-            request = PromotionRequest.from_payload(payload)
-            state, evidence, policy = SqlCanonicalPromotionEvidence(
-                self.store.engine,
-                self.policy_store,
-                self.policies_by_product_family,
-            ).build(request)
-            return state, evidence, policy, request.strategy_version_id, request.evaluated_at
         raw_evidence = payload.get("evidence")
         raw_policy = payload.get("policy")
-        if isinstance(raw_evidence, dict) and isinstance(raw_policy, dict):
+        if (
+            not self.strict_identity_contract
+            and isinstance(raw_evidence, dict)
+            and isinstance(raw_policy, dict)
+        ):
             return (
                 LifecycleState(str(payload["current_state"])),
                 PromotionEvidence(**raw_evidence),
@@ -1588,10 +1705,15 @@ class DatabasePromotionWorker:
                 str(payload.get("evaluated_at") or now),
             )
         request = PromotionRequest.from_payload(payload)
+        evaluated_at = timestamp(now, field="promotion execution time")
+        if request.evaluated_at > evaluated_at:
+            raise ValueError("promotion request cannot be evaluated before its requested time")
+        request = replace(request, evaluated_at=evaluated_at)
         state, evidence, policy = SqlCanonicalPromotionEvidence(
             self.store.engine,
             self.policy_store,
             self.policies_by_product_family,
+            research_configuration_hash=self.research_configuration_hash,
         ).build(request)
         return state, evidence, policy, request.strategy_version_id, request.evaluated_at
 
@@ -1718,6 +1840,9 @@ class DatabasePromotionWorker:
                     strategy_version_id=decision.strategy_version_id,
                     artefact_hash=evidence.strategy_artefact_hash,
                 )
+        risk_budget = self._assignment_budget(
+            connection, execution_mode, current_state, decision, evidence
+        )
         for instrument_id in evidence.supported_instruments or (None,):
             assign_kwargs: dict[str, Any] = {
                 "product_id": evidence.product_id,
@@ -1731,17 +1856,58 @@ class DatabasePromotionWorker:
                 "assigned_by": self.worker_id,
                 "instrument_id": instrument_id,
                 "sleeve_id": evidence.sleeve_id or "default",
-                "risk_budget": min(decision.capital_limit, evidence.risk_budget_available),
+                "risk_budget": risk_budget,
                 "assignment_reason": f"canonical promotion: {decision.reason_code}",
                 "payload": {
                     "promotion_event_id": identity,
                     "source": "canonical_promotion_worker",
+                    "risk_budget_unit": "equity_fraction"
+                    if execution_mode == "paper"
+                    else "quote_notional",
+                    "capital_limit_currency": "USDT",
                 },
             }
             if connection is None:
                 assignments.assign(**assign_kwargs)
             else:
                 assignments.assign_in_connection(connection, **assign_kwargs)
+
+    def _assignment_budget(
+        self, connection, execution_mode, current_state, decision, evidence
+    ) -> float:
+        if execution_mode != "paper" or connection is None:
+            return min(decision.capital_limit, evidence.risk_budget_available)
+        self._initialise_paper_account(connection, decision, evidence)
+        if current_state in {LifecycleState.REGISTERED, LifecycleState.DEVELOPMENT}:
+            return self._paper_entry_budget(connection, evidence)
+        return min(decision.capital_limit, evidence.risk_budget_available)
+
+    def _initialise_paper_account(self, connection, decision, evidence) -> None:
+        template = self.paper_accounts.get(str(evidence.product_id))
+        if template is None or template.account_id != evidence.account_id:
+            raise ValueError("paper entry requires its configured account and starting resources")
+        account = PaperAccountLedger(
+            engine=self.store.engine,
+            account_id=template.account_id,
+            product_id=template.product_id,
+            accounting_asset=template.ledger.accounting_asset,
+            starting_balances=template.starting_balances,
+            starting_positions=template.starting_positions,
+            connection=connection,
+        )
+        account.ensure_seed(observed_at=decision.evaluated_at)
+
+    @staticmethod
+    def _paper_entry_budget(connection, evidence) -> float:
+        artefact = connection.execute(
+            select(strategy_artefact.c.payload).where(
+                strategy_artefact.c.id == evidence.strategy_artefact_hash
+            )
+        ).scalar_one()
+        fraction = float(artefact["position_limits"]["maximum_fraction"])
+        if not math.isfinite(fraction) or not 0 < fraction <= 1:
+            raise ValueError("paper entry requires an explicit strategy allocation fraction")
+        return fraction
 
 
 def _retry_at(value: str, seconds: int) -> str:

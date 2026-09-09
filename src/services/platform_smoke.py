@@ -39,6 +39,8 @@ from src.research.canonical import (
     SqlStrategyArtefactRepository,
 )
 from src.risk.engine import SqlRiskDecisionStore, SqlRiskPolicyStore, SqlRiskSnapshotStore
+from src.risk.policies import install_product_risk_policies
+from src.risk.policy import RISK_LIMIT_UNITS
 from src.services.account_reconciliation import AccountReconciliationService
 from src.services.accounting_service import AccountingService, DatabaseAccountingWorker
 from src.services.config import load_split_configuration
@@ -98,17 +100,24 @@ def run_smoke(
             observed = dt.datetime.now(dt.UTC).replace(microsecond=0)
             for index, product in enumerate(split["products"]["products"]):
                 configured_product_id = str(product["product_id"])
+                account_id = f"{product['account_id']}:smoke:{run_id}"
                 smoke_product = {
                     **dict(product),
                     "product_id": f"{configured_product_id}:smoke:{run_id}",
                     "product_family": configured_product_id,
+                    "account_id": account_id,
                     "portfolio_id": f"{product['portfolio_id']}:smoke:{run_id}",
                 }
                 results.append(
                     _product_fixture(
                         database,
                         smoke_product,
-                        accounts,
+                        {
+                            account_id: {
+                                **accounts[str(product["account_id"])],
+                                "account_id": account_id,
+                            }
+                        },
                         Path(directory),
                         index,
                         run_id=run_id,
@@ -154,7 +163,9 @@ def _product_fixture(
     product_id = str(product["product_id"])
     product = {
         **product,
-        "risk_policy_id": f"platform-smoke:{product_id}:risk-v1",
+        "risk_policy_id": _install_risk_policy(
+            database, f"platform-smoke:{product_id}:risk-v2", str(product["account_id"])
+        ),
     }
     observed = observed or dt.datetime(2026, 8, 23, tzinfo=dt.UTC)
     now = observed.isoformat()
@@ -225,14 +236,11 @@ def _product_fixture(
         universe_snapshot_id,
         now,
         prefix,
-        # The smoke has one closed candle.  Use a registered rule whose
-        # behaviour is meaningful with that minimum frame while still
-        # exercising the shared research/runtime dispatcher.
+        # The current candle exercises the shared research/runtime dispatcher.
         strategy_name="condition_grid",
     )
     assignments = SqlActiveStrategyAssignmentRepository(database.engine)
     snapshots = SqlRiskSnapshotStore(database.engine)
-    _install_risk_policy(database, str(product["risk_policy_id"]))
     health_node_id = f"platform-smoke:{run_id}"
 
     close_ms = int(observed.timestamp() * 1_000) - 1
@@ -340,6 +348,14 @@ def _product_fixture(
         products={product_id: product},
         accounts=accounts,
     ).reconcile_once(now=now)
+    for instrument_id, quantity in account_reconciliation["accounts"][0]["positions"].items():
+        positions.reconcile_position(
+            portfolio_id=str(product["portfolio_id"]),
+            instrument_id=instrument_id,
+            quantity=float(quantity),
+            average_entry_price=0.0,
+            updated_at=now,
+        )
     queue.enqueue(
         job_id=prefix + ":initial-balance",
         name="accounting_event",
@@ -441,6 +457,25 @@ def _product_fixture(
         trace_store=traces,
         order_groups=order_groups,
     )
+    # Synthetic closed-bar warmup is separate from the current event's full service chain.
+    candle = event.payload["data"]
+    for offset, historical_close in ((2, "100000"), (1, "101000")):
+        historical = normalise_public_event(
+            market=market,
+            stream="btcusdt@kline_1m",
+            receive_timestamp=now,
+            payload={
+                **candle,
+                "E": close_ms + 1 - offset * 60000,
+                "k": {
+                    **candle["k"],
+                    "t": close_ms - 59999 - offset * 60000,
+                    "T": close_ms - offset * 60000,
+                    "c": historical_close,
+                },
+            },
+        )
+        data_worker._publish_market_snapshots(event=historical, market=market)
     data_results = [data_worker.run_once(now=now) for _ in market_events]
     data_result = data_results[-1]
     feature_result = feature_worker.run_once(now=now)
@@ -487,7 +522,11 @@ def _product_fixture(
         "partial": paper_worker.run_once(now=now),
         "complete": paper_worker.run_once(now=now),
     }
-    fills = order_manager.all_fills()
+    fills = tuple(
+        fill
+        for fill in order_manager.all_fills()
+        if order_manager.get(fill.order_id).portfolio_id == product["portfolio_id"]
+    )
     if not fills:
         raise RuntimeError(f"{product_id} smoke produced no fills: {results}")
     final_fill = fills[-1]
@@ -497,7 +536,7 @@ def _product_fixture(
         payload={
             "kind": "fee_evidence",
             "product_id": product_id,
-            "entry_id": prefix + ":fee:" + final_fill.fill_id,
+            "entry_id": canonical_hash({"scope": prefix, "fee": final_fill.fill_id}),
             "amount": str(final_fill.fee),
             "occurred_at": final_fill.occurred_at,
             "attribution": {
@@ -743,57 +782,65 @@ def _stamp_smoke_event(event, run_id: str):
     )
 
 
-def _install_risk_policy(database: PlatformDatabase, policy_id: str) -> None:
-    store = SqlRiskPolicyStore(database.engine)
-    try:
-        store.resolve((policy_id,))
-        return
-    except KeyError:
-        pass
-    store.save(
-        policy_id,
-        {
-            "strategy": {
-                "max_position_fraction": 1.0,
-                "max_turnover_fraction": 2.0,
-                "max_trades_per_day": 100,
-                "max_slippage_bps": 50.0,
-                "max_funding_cost_fraction": 0.1,
-            },
-            "instrument": {
-                "max_position_notional": 100000.0,
-                "max_order_notional": 100000.0,
-                "max_visible_depth_fraction": 0.5,
-                "max_spread_bps": 50.0,
-                "max_volatility": 3.0,
-                "max_concentration_fraction": 1.0,
-            },
-            "sleeve": {
-                "max_capital_fraction": 1.0,
-                "max_drawdown_fraction": 0.2,
-                "max_correlation": 1.0,
-                "max_abs_beta": 2.0,
-                "max_turnover_fraction": 2.0,
-            },
-            "product": {
-                "max_gross_fraction": 2.0,
-                "max_net_fraction": 1.0,
-                "max_drawdown_fraction": 0.2,
-                "max_margin_fraction": 1.0,
-                "max_daily_loss_fraction": 0.1,
-            },
-            "account": {
-                "max_used_margin_fraction": 1.0,
-                "min_liquidation_buffer_fraction": 0.2,
-                "reject_unknown_exposure": True,
-            },
-            "global": {
-                "max_drawdown_fraction": 0.2,
-                "max_data_age_seconds": 5.0,
-                "max_clock_skew_seconds": 1.0,
-            },
+def _install_risk_policy(database: PlatformDatabase, policy_id: str, account_id: str) -> str:
+    # Diagnostic limits are explicit and isolated from operational policy records.
+    configuration = {
+        "schema": "risk/v2",
+        "notional_currency": "USDT",
+        "units": RISK_LIMIT_UNITS,
+        "strategy": {
+            "maximum_fraction": 1.0,
+            "maximum_drawdown": 0.2,
+            "maximum_turnover_fraction": 2.0,
+            "maximum_trades_per_day": 100,
+            "maximum_slippage_bps": 50.0,
+            "maximum_funding_cost_fraction": 0.1,
         },
-    )
+        "instrument": {
+            "maximum_position_notional": 100000.0,
+            "maximum_order_notional": 100000.0,
+            "maximum_visible_depth_fraction": 0.5,
+            "maximum_slippage_bps": 50.0,
+            "maximum_volatility": 3.0,
+            "maximum_fraction": 1.0,
+            "minimum_daily_quote_volume": 10000000.0,
+        },
+        "sleeve": {
+            "maximum_fraction": 1.0,
+            "maximum_drawdown": 0.2,
+            "maximum_correlation": 1.0,
+            "maximum_abs_beta": 2.0,
+            "maximum_turnover_fraction": 2.0,
+        },
+        "products": {
+            policy_id: {
+                "maximum_gross": 2.0,
+                "maximum_net": 1.0,
+                "maximum_drawdown": 0.2,
+                "maximum_margin_fraction": 1.0,
+                "maximum_daily_loss": 0.1,
+            }
+        },
+        "accounts": {
+            account_id: {
+                "maximum_drawdown": 0.2,
+                "maximum_margin_fraction": 1.0,
+                "minimum_liquidation_buffer": 0.2,
+                "reject_unknown_exposure": True,
+            }
+        },
+        "global": {
+            "maximum_drawdown": 0.2,
+            "maximum_market_data_staleness_seconds": 5.0,
+            "maximum_database_staleness_seconds": 30.0,
+            "maximum_clock_skew_seconds": 1.0,
+        },
+    }
+    return install_product_risk_policies(
+        SqlRiskPolicyStore(database.engine),
+        risk_configuration=configuration,
+        products={policy_id: {"risk_policy_id": policy_id, "account_id": account_id}},
+    )[policy_id]
 
 
 def _smoke_state_policy(product: dict[str, Any], instrument: Instrument) -> dict[str, Any]:

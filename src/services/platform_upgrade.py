@@ -65,65 +65,19 @@ def quarantine_legacy_research_jobs(
         if marker is not None:
             payload = dict(marker) if isinstance(marker, Mapping) else {}
             return {"schema": "platform.upgrade/v1", "already_applied": True, **payload}
-        rows = (
-            connection.execute(
-                select(job).where(
-                    job.c.state.in_(("pending", "running", "dead_letter")),
-                    job.c.name.in_(LEGACY_RESEARCH_JOB_NAMES),
-                )
+        statement = (
+            select(job)
+            .where(
+                job.c.state.in_(("pending", "running", "dead_letter")),
+                job.c.name.in_(LEGACY_RESEARCH_JOB_NAMES),
             )
-            .mappings()
-            .all()
+            .order_by(job.c.id)
+            .execution_options(yield_per=200)
         )
         quarantined: list[str] = []
-        for row in rows:
-            job_id = str(row["id"])
-            payload = {
-                "job_id": job_id,
-                "name": str(row["name"]),
-                "state": str(row["state"]),
-                "content_hash": str(row["content_hash"]),
-                "payload": row["payload"],
-                "reason": "legacy_research_queue_excluded_from_platform_v2",
-                "quarantined_at": observed_at,
-            }
-            quarantine_id = canonical_hash(payload)
-            existing_quarantine = connection.execute(
-                select(job_quarantine.c.id).where(job_quarantine.c.job_id == job_id)
-            ).scalar_one_or_none()
-            if existing_quarantine is None:
-                connection.execute(
-                    insert(job_quarantine).values(
-                        id=quarantine_id,
-                        job_id=job_id,
-                        quarantined_at=observed_at,
-                        original_state=str(row["state"]),
-                        reason=payload["reason"],
-                        content_hash=str(row["content_hash"]),
-                        payload=json_value(payload, field="quarantined job"),
-                    )
-                )
-            connection.execute(
-                update(job)
-                .where(job.c.id == job_id)
-                .values(
-                    state="quarantined",
-                    lease_owner=None,
-                    lease_expires_at=None,
-                    terminal_reason=payload["reason"],
-                )
-            )
-            connection.execute(
-                update(job_attempt)
-                .where(job_attempt.c.job_id == job_id, job_attempt.c.status == "running")
-                .values(status="quarantined", completed_at=observed_at, error=payload["reason"])
-            )
-            connection.execute(
-                update(worker_lease)
-                .where(worker_lease.c.job_id == job_id, worker_lease.c.status == "active")
-                .values(status="quarantined")
-            )
-            quarantined.append(job_id)
+        rows = connection.execute(statement).mappings()
+        for batch in rows.partitions(200):
+            quarantined.extend(_quarantine_batch(connection, batch, observed_at))
         marker_payload = {
             "schema": "platform.upgrade/v1",
             "marker_id": marker_id,
@@ -139,6 +93,69 @@ def quarantine_legacy_research_jobs(
             )
         )
     return {"schema": "platform.upgrade/v1", "already_applied": False, **marker_payload}
+
+
+def _quarantine_batch(connection, rows, observed_at: str) -> list[str]:
+    ids = [str(row["id"]) for row in rows]
+    reason = "legacy_research_queue_excluded_from_platform_v2"
+    existing = set(
+        connection.execute(
+            select(job_quarantine.c.job_id).where(job_quarantine.c.job_id.in_(ids))
+        ).scalars()
+    )
+    values = []
+    for row in rows:
+        if row["id"] in existing:
+            continue
+        payload = {
+            "job_id": str(row["id"]),
+            "name": str(row["name"]),
+            "state": str(row["state"]),
+            "content_hash": str(row["content_hash"]),
+            "payload": row["payload"],
+            "reason": reason,
+            "quarantined_at": observed_at,
+        }
+        values.append(
+            {
+                "id": canonical_hash(payload),
+                "job_id": payload["job_id"],
+                "quarantined_at": observed_at,
+                "original_state": payload["state"],
+                "reason": reason,
+                "content_hash": payload["content_hash"],
+                "payload": json_value(payload, field="quarantined job"),
+            }
+        )
+    if values:
+        connection.execute(insert(job_quarantine), values)
+    connection.execute(
+        update(job)
+        .where(job.c.id.in_(ids))
+        .values(
+            state="quarantined",
+            lease_owner=None,
+            lease_expires_at=None,
+            terminal_reason=reason,
+        )
+    )
+    connection.execute(
+        update(job_attempt)
+        .where(
+            job_attempt.c.job_id.in_(ids),
+            job_attempt.c.status == "running",
+        )
+        .values(status="quarantined", completed_at=observed_at, error=reason)
+    )
+    connection.execute(
+        update(worker_lease)
+        .where(
+            worker_lease.c.job_id.in_(ids),
+            worker_lease.c.status == "active",
+        )
+        .values(status="quarantined")
+    )
+    return ids
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -157,6 +174,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         database.migrate()
         result = quarantine_legacy_research_jobs(database.engine)
+    result.pop("quarantined_jobs", None)
     print(json.dumps(result, sort_keys=True))
     database.dispose()
 

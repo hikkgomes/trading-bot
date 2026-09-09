@@ -11,6 +11,7 @@ from sqlalchemy.engine import Engine
 
 from src.data.database import service_heartbeat
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
+from src.services.alerting import AlertRecord, AlertSeverity, AlertSink
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,48 @@ class ServiceHealth:
     observed_at: str
     healthy: bool
     payload: dict[str, Any]
+
+
+def publish_external_heartbeat(
+    store: DatabaseHeartbeatStore,
+    *,
+    sink: AlertSink | None,
+    node_id: str,
+    required_services: tuple[str, ...],
+    now: str,
+    maximum_age_seconds: int = 60,
+) -> str:
+    """Send only current health; an off-host monitor detects missing pings."""
+    if sink is None:
+        return "not_configured"
+    if not required_services or maximum_age_seconds <= 0:
+        raise ValueError("external health requires services and a positive freshness limit")
+    current = dt.datetime.fromisoformat(timestamp(now, field="now"))
+    healthy = {
+        item.service_name
+        for item in store.latest()
+        if item.node_id == node_id
+        and item.healthy
+        and 0
+        <= (current - dt.datetime.fromisoformat(item.observed_at)).total_seconds()
+        <= maximum_age_seconds
+    }
+    if not set(required_services).issubset(healthy):
+        return "withheld_unhealthy"
+    record = AlertRecord(
+        alert_id=canonical_hash({"node": node_id, "observed_at": now}),
+        event_type="platform_heartbeat",
+        severity=AlertSeverity.INFO,
+        dedupe_key=node_id,
+        target=node_id,
+        message="Critical platform services are reachable",
+        emitted_at=now,
+    )
+    try:
+        sink.send(record)
+    except (OSError, RuntimeError):
+        return "delivery_failed"
+    return "delivered"
 
 
 class DatabaseHeartbeatStore:

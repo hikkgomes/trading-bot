@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
@@ -43,8 +44,14 @@ class ProtectiveStop:
     native_client_id: str | None = None
     protected_quantity: float = 0.0
     failure_reason: str | None = None
+    previous_native_order_id: str | None = None
+    previous_native_client_id: str | None = None
+    replacement_version: int = 0
+    submission_attempted: bool = False
+    entry_quantity: float | None = None
 
     def __post_init__(self) -> None:
+        _validate_stop_quantities(self)
         object.__setattr__(self, "exit_side", OrderSide(self.exit_side))
         object.__setattr__(self, "status", StopStatus(self.status))
         for field_name in ("stop_id", "portfolio_id", "instrument_id"):
@@ -221,6 +228,19 @@ class StopManager:
             }
         )
 
+    def all(self) -> tuple[ProtectiveStop, ...]:
+        return tuple(self._stops[key] for key in sorted(self._stops))
+
+    def native_plan(self, native_order_id: str) -> ProtectiveStop | None:
+        return next(
+            (
+                stop
+                for stop in reversed(self.store.read())
+                if stop.native_order_id == native_order_id
+            ),
+            None,
+        )
+
     def mark_protected(
         self,
         stop_id: str,
@@ -255,15 +275,38 @@ class StopManager:
 
     def resize(self, stop_id: str, *, quantity: float) -> ProtectiveStop:
         current = self._stops[stop_id]
-        if quantity <= 0:
+        if not math.isfinite(quantity) or quantity <= 0:
             raise ValueError("resized stop quantity must be positive")
+        if current.previous_native_order_id:
+            raise ValueError("previous protection replacement must be reconciled first")
+        version = current.replacement_version + 1
         updated = replace(
             current,
             quantity=quantity,
             protected_quantity=0.0,
+            previous_native_order_id=current.native_order_id,
+            previous_native_client_id=current.native_client_id if current.native_order_id else None,
             native_order_id=None,
+            native_client_id="s" + canonical_hash({"stop": stop_id, "version": version})[7:42],
+            replacement_version=version,
+            submission_attempted=False,
             status=StopStatus.REPLACE_PENDING,
         )
+        self.store.append(updated)
+        self._stops[stop_id] = updated
+        return updated
+
+    def submission_started(self, stop_id: str) -> ProtectiveStop:
+        updated = replace(self._stops[stop_id], submission_attempted=True)
+        self.store.append(updated)
+        self._stops[stop_id] = updated
+        return updated
+
+    def replacement_complete(self, stop_id: str) -> ProtectiveStop:
+        current = self._stops[stop_id]
+        if current.status is not StopStatus.PROTECTED:
+            raise ValueError("replacement must be confirmed before retiring old protection")
+        updated = replace(current, previous_native_order_id=None, previous_native_client_id=None)
         self.store.append(updated)
         self._stops[stop_id] = updated
         return updated
@@ -282,6 +325,15 @@ class StopManager:
             status=StopStatus.TRIGGERED,
             triggered_at=timestamp(triggered_at, field="triggered_at"),
         )
+        self.store.append(updated)
+        self._stops[stop_id] = updated
+        return updated
+
+    def reconciled(self, stop_id: str) -> ProtectiveStop:
+        current = self._stops[stop_id]
+        if current.status is not StopStatus.TRIGGERED:
+            raise ValueError("only triggered protection can be financially reconciled")
+        updated = replace(current, status=StopStatus.RECONCILED, protected_quantity=0.0)
         self.store.append(updated)
         self._stops[stop_id] = updated
         return updated
@@ -311,3 +363,21 @@ class StopManager:
             if price is not None and stop.is_triggered_by(float(price)):
                 triggered.append(self.triggered(stop.stop_id, triggered_at=triggered_at))
         return tuple(triggered)
+
+
+def _validate_stop_quantities(stop: ProtectiveStop) -> None:
+    if not all(
+        math.isfinite(value)
+        for value in (
+            stop.quantity,
+            stop.trigger_price,
+            stop.protected_quantity,
+        )
+    ):
+        raise ValueError("stop quantities and prices must be finite")
+    if stop.entry_quantity is not None and (
+        not math.isfinite(stop.entry_quantity) or stop.entry_quantity <= 0
+    ):
+        raise ValueError("stop entry quantity must be finite and positive")
+    if (stop.previous_native_order_id is None) != (stop.previous_native_client_id is None):
+        raise ValueError("previous native protection requires both exchange and client identities")

@@ -59,6 +59,49 @@ against actual exchange exposure. `ALGO_UPDATE` and ordinary order updates are
 both processed. A missing, cancelled, expired, rejected, or undersized stop
 creates a recovery incident and blocks further exposure.
 
+Stop quantities cover the position once across its entries. A scale-in receives
+only the uncovered quantity. Replacement persists a new client ID and retains
+the previous exchange identity. It confirms the new reduce-only stop, reads
+the exchange position again, and then cancels the previous stop. Both identities
+remain available until cancellation is confirmed. A changed position or trigger
+during replacement requires reconciliation and blocks new entries. Temporary
+overlap is restricted to reduce-only protection during that replacement.
+
+An attempted submission is durable before the API call. After an ambiguous
+response, recovery queries that client ID and never blindly repeats placement.
+Failure to confirm protection immediately queues risk reduction; there is no
+grace period in which another entry may add risk.
+
+`ALGO_UPDATE` identifies the conditional order separately from its matching-engine
+child. A trigger does not prove a fill. The child is read back by its exact
+exchange ID and adopted as a reduce-only order with the original strategy and
+account attribution. User-stream trades and REST recovery then use the same
+financial transaction as ordinary fills. Partial children stay active; duplicate
+trade IDs have one economic effect. Unknown child identity remains a recovery
+dependency, and a terminal child with uncovered residual exposure queues reduction.
+
+REST income recovery compares commissions and realised PnL with their exact
+account, instrument and trade records. These comparisons create audit receipts,
+not second cash postings. Signed funding is recorded once by scoped income ID.
+Changed amounts, unmatched trades and unclassified income types block recovery.
+Previously recorded unscoped REST income needs explicit reconciliation.
+
+Income history advances in bounded daily windows. A durable ledger checkpoint is
+written only after every returned record reconciles. Restart resumes that window
+with a one-minute overlap; replayed records cannot change PnL. Pending windows
+remain deferred work rather than a completed account-history check.
+
+Each order also records a REST trade checkpoint after its returned quantities
+match the exchange order and all financial effects are committed. A restart
+uses that checkpoint and the existing fills together; websocket arrival order
+alone cannot advance the REST checkpoint.
+
+Emergency reconciliation never replaces financial positions with a balance
+snapshot. It recovers the actual closing fills and verifies the resulting
+position and PnL. Connected rehearsal evidence uses real fills and received
+algo events; it cannot claim a partial fill by passing a smaller invented
+position to the protection service.
+
 ## Controls and recovery
 
 The database control plane supports run, block-new-risk, management-only,
@@ -84,6 +127,6 @@ The connected command requires a dedicated flat testnet account and explicit
 confirmation. It must never receive production credentials. A testnet report
 does not approve live capital.
 
-The legacy `src.autopilot` and `src/run_bot.py` paths are retained only as
-offline migration or research libraries. They are not used by the production
-execution path.
+The obsolete file-based trading controller and search entry points have been
+removed. `src.research.legacy_codec` is a frozen, read-only decoder for migration
+archives; it cannot schedule research or authorise execution.

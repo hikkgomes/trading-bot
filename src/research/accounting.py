@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.accounting.spot_allocation import target_trade_quantity
 from src.domain._codec import canonical_hash, timestamp
 
 
@@ -39,7 +40,7 @@ def _event_time(event: Mapping[str, Any], *, index: int) -> str:
     value = event.get("occurred_at", event.get("timestamp", event.get("time")))
     if value is None:
         raise ProductAccountingError(f"event {index} has no timestamp")
-    return timestamp(str(value), field=f"events[{index}].timestamp")
+    return timestamp(str(value), field=f"events[{index}].timestamp", preserve_subseconds=True)
 
 
 def _event_kind(event: Mapping[str, Any]) -> str:
@@ -164,6 +165,8 @@ class BtcAccountingReport:
     failed_reentries: int = 0
     external_deposits_btc: float = 0.0
     external_withdrawals_btc: float = 0.0
+    core_btc_quantity: float = 0.0
+    initial_benchmark_btc_nav: float = 0.0
 
     @property
     def btc_vs_passive_hold(self) -> float:
@@ -183,6 +186,7 @@ class _BtcEvaluationState:
     btc: float
     stable: float
     passive: float
+    initial_benchmark: float
     current_price: float
     current_regime: str
     core_btc: float
@@ -199,7 +203,9 @@ class _BtcEvaluationState:
     seconds_total: float = 0.0
     seconds_outside: float = 0.0
     cycles: int = 0
-    saw_sell: bool = False
+    cycle_quote_anchor: float | None = None
+    cycle_btc_anchor: float = 0.0
+    cycle_gain_anchor: float = 0.0
     previous_snapshot: BtcAccountingSnapshot | None = None
     maximum_drawdown: float = 0.0
     peak_nav: float = 0.0
@@ -232,6 +238,8 @@ def _prepare_btc_evaluation(
     reserve_fraction: float | None,
     max_tactical_fraction: float | None,
     external_events: Iterable[Mapping[str, Any]],
+    benchmark_fee_rate: float,
+    benchmark_slippage_rate: float,
     normalise_marks: Callable[
         [Iterable[Mapping[str, Any]] | Mapping[str, Any]],
         tuple[tuple[str, float, Mapping[str, Any]], ...],
@@ -258,6 +266,14 @@ def _prepare_btc_evaluation(
     reserve = _bounded_fraction(reserve_fraction, field_name="reserve_fraction")
     tactical = _bounded_fraction(max_tactical_fraction, field_name="max_tactical_fraction")
     initial_nav = btc + stable / first_price
+    benchmark = btc + target_trade_quantity(
+        base=btc,
+        quote=stable,
+        mark=first_price,
+        fraction=1.0,
+        fee_rate=benchmark_fee_rate,
+        slippage_rate=benchmark_slippage_rate,
+    )
     all_times = tuple(
         sorted(
             {time for time, _ in trades}
@@ -268,7 +284,8 @@ def _prepare_btc_evaluation(
     state = _BtcEvaluationState(
         btc=btc,
         stable=stable,
-        passive=initial_nav,
+        passive=benchmark,
+        initial_benchmark=benchmark,
         current_price=first_price,
         current_regime="unclassified",
         core_btc=initial_nav * (reserve or 0.0),
@@ -332,8 +349,12 @@ def _apply_btc_external_events(
         direction = 1.0 if kind == "deposit" else -1.0
         if balance_name == "btc":
             state.btc += direction * amount
+            if state.cycle_quote_anchor is not None:
+                state.cycle_btc_anchor += direction * amount
         else:
             state.stable += direction * amount
+            if state.cycle_quote_anchor is not None:
+                state.cycle_quote_anchor += direction * amount
         if state.btc < -1e-12 or state.stable < -1e-12:
             raise ProductAccountingError("external BTC balance flow exceeds available balance")
         state.passive += direction * value_btc
@@ -349,6 +370,8 @@ def _apply_btc_external_events(
                 "asset": asset,
                 "amount": amount,
                 "amount_btc": value_btc,
+                "btc_balance": state.btc,
+                "stablecoin_balance": state.stable,
             }
         )
         state.flow_index += 1
@@ -371,9 +394,6 @@ def _apply_btc_buy(
         state.stable -= quantity * price + fee_quote
     if state.btc < -1e-12 or state.stable < -1e-12:
         raise ProductAccountingError("BTC buy exceeds available balance")
-    if state.saw_sell:
-        state.cycles += 1
-        state.saw_sell = False
     remaining_buy = quantity
     buy_fee_per_btc = converted_fee_btc / quantity if quantity > 0 else 0.0
     while remaining_buy > 1e-12 and state.pending_sells:
@@ -399,6 +419,24 @@ def _apply_btc_buy(
                 sell_fee_quote * (remaining_sell / sold_quantity),
             )
 
+    if quantity > 0:
+        _complete_btc_cycle(state, price)
+
+
+def _complete_btc_cycle(state: _BtcEvaluationState, price: float) -> None:
+    anchor = state.cycle_quote_anchor
+    if anchor is None or (state.pending_sells and state.stable > anchor + 1e-12):
+        return
+    state.cycles += 1
+    state.round_trip_gain = (
+        state.cycle_gain_anchor
+        + state.btc
+        + (state.stable - anchor) / price
+        - state.cycle_btc_anchor
+    )
+    state.cycle_quote_anchor = None
+    state.pending_sells.clear()
+
 
 def _apply_btc_sell(
     state: _BtcEvaluationState,
@@ -409,6 +447,10 @@ def _apply_btc_sell(
     converted_fee_btc: float,
     fee_quote: float,
 ) -> None:
+    if state.cycle_quote_anchor is None and quantity > 0:
+        state.cycle_quote_anchor = state.stable
+        state.cycle_btc_anchor = state.btc
+        state.cycle_gain_anchor = state.round_trip_gain
     if fee_asset == "BTC":
         state.btc -= quantity + converted_fee_btc
         state.stable += quantity * price
@@ -419,7 +461,7 @@ def _apply_btc_sell(
         raise ProductAccountingError("BTC sell path breached core BTC reserve")
     if state.btc < -1e-12 or state.stable < -1e-12:
         raise ProductAccountingError("BTC sell exceeds available balance")
-    state.saw_sell = True
+    _assert_btc_tactical_trade(state, state.current_price)
     state.pending_sells.append(
         (
             quantity,
@@ -481,6 +523,8 @@ def _apply_btc_trade(
             "fee_quote": fee_quote,
             "fee_conversion": fee_conversion,
             "fee_asset": fee_asset,
+            "btc_balance": state.btc,
+            "stablecoin_balance": state.stable,
         }
     )
 
@@ -494,6 +538,13 @@ def _apply_btc_trades(
         _, event = trades[state.trade_index]
         _apply_btc_trade(state, event, observed_at)
         state.trade_index += 1
+
+
+def _assert_btc_tactical_trade(state: _BtcEvaluationState, price: float) -> None:
+    nav = state.btc + state.stable / price
+    tactical = state.stable / price / nav if nav > 0 else 0.0
+    if state.max_tactical_fraction is not None and tactical > state.max_tactical_fraction + 1e-12:
+        raise ProductAccountingError("BTC tactical allocation exceeded configured limit")
 
 
 def _record_btc_snapshot(state: _BtcEvaluationState, observed_at: str) -> None:
@@ -536,8 +587,6 @@ def _record_btc_snapshot(state: _BtcEvaluationState, observed_at: str) -> None:
             state.maximum_drawdown, (state.peak_nav - nav) / state.peak_nav
         )
     tactical = state.stable / state.current_price / nav if nav > 0 else 0.0
-    if state.max_tactical_fraction is not None and tactical > state.max_tactical_fraction + 1e-12:
-        raise ProductAccountingError("BTC tactical allocation exceeded configured limit")
     state.maximum_tactical_allocation = max(state.maximum_tactical_allocation, tactical)
 
 
@@ -560,16 +609,29 @@ def _build_btc_report(
         )
     latest = state.snapshots[-1]
     regime_pnl: dict[str, float] = {}
-    for previous, current in zip(state.snapshots, state.snapshots[1:], strict=False):
-        regime_pnl[previous.regime] = regime_pnl.get(previous.regime, 0.0) + (
-            current.btc_nav - previous.btc_nav
+    previous_nav, previous_benchmark = initial_nav, state.initial_benchmark
+    for current in state.snapshots:
+        flow = current.passive_btc_nav - previous_benchmark
+        regime_pnl[current.regime] = (
+            regime_pnl.get(current.regime, 0.0) + current.btc_nav - previous_nav - flow
         )
+        previous_nav, previous_benchmark = current.btc_nav, current.passive_btc_nav
     return BtcAccountingReport(
         initial_btc_nav=initial_nav,
         final_btc_nav=latest.btc_nav,
         passive_btc_nav=state.passive,
         excess_btc=latest.btc_nav - state.passive,
-        return_fraction=(latest.btc_nav / initial_nav - 1.0 if initial_nav > 0 else 0.0),
+        return_fraction=(
+            (
+                latest.btc_nav
+                - initial_nav
+                - state.external_deposits_btc
+                + state.external_withdrawals_btc
+            )
+            / initial_nav
+            if initial_nav > 0
+            else 0.0
+        ),
         fees_btc=state.fee_btc_total,
         time_outside_btc_fraction=(
             state.seconds_outside / state.seconds_total if state.seconds_total > 0 else 0.0
@@ -595,6 +657,8 @@ def _build_btc_report(
         failed_reentries=state.failed_reentries,
         external_deposits_btc=state.external_deposits_btc,
         external_withdrawals_btc=state.external_withdrawals_btc,
+        core_btc_quantity=state.core_btc,
+        initial_benchmark_btc_nav=state.initial_benchmark,
     )
 
 
@@ -612,6 +676,8 @@ class BtcAccumulationAccounting:
         reserve_fraction: float | None = None,
         max_tactical_fraction: float | None = None,
         external_events: Iterable[Mapping[str, Any]] = (),
+        benchmark_fee_rate: float = 0.0,
+        benchmark_slippage_rate: float = 0.0,
     ) -> BtcAccountingReport:
         prepared = _prepare_btc_evaluation(
             trade_events=trade_events,
@@ -622,6 +688,8 @@ class BtcAccumulationAccounting:
             reserve_fraction=reserve_fraction,
             max_tactical_fraction=max_tactical_fraction,
             external_events=external_events,
+            benchmark_fee_rate=benchmark_fee_rate,
+            benchmark_slippage_rate=benchmark_slippage_rate,
             normalise_marks=self._normalise_marks,
         )
         for observed_at in prepared.all_times:
@@ -730,6 +798,7 @@ class _FuturesEvaluationState:
     observations: int = 0
     turnover_notional: float = 0.0
     receipts: list[Mapping[str, Any]] = field(default_factory=list)
+    funding_events: dict[tuple[str, str], str] = field(default_factory=dict)
 
 
 def _prepare_futures_evaluation(
@@ -806,7 +875,10 @@ def _funding_schedule(values: Iterable[str] | None) -> frozenset[str] | None:
         return None
     if isinstance(values, str):
         raise ProductAccountingError("funding_timestamps must be an iterable of timestamps")
-    return frozenset(timestamp(str(value), field="funding_timestamps[]") for value in values)
+    return frozenset(
+        timestamp(str(value), field="funding_timestamps[]", preserve_subseconds=True)
+        for value in values
+    )
 
 
 def _target_notionals(
@@ -854,7 +926,13 @@ def _apply_futures_fill(
     )
     state.spread += spread_delta
     state.slippage += slippage_delta
-    state.cash -= spread_delta + slippage_delta
+    # Execution-price differences already affect realised and marked PnL.
+    # Only a separately specified cash charge is deducted from the wallet.
+    state.cash -= sum(
+        _number(event[key], field_name=key, minimum=0.0)
+        for key in ("spread_cost", "slippage_cost")
+        if event.get(key) is not None
+    )
     state.fills += 1
     requested = event.get("requested_quantity", event.get("order_quantity"))
     if requested is not None and quantity + 1e-12 < _number(
@@ -883,6 +961,8 @@ def _apply_futures_funding(
     if not applied:
         state.observations += 1
         return False, 0.0
+    if not _claim_funding_event(state, symbol, observed_at, event):
+        return False, 0.0
     amount = -quantity * mark * rate
     if event.get("funding_pnl") is not None:
         amount = _number(event["funding_pnl"], field_name="funding_pnl")
@@ -890,6 +970,18 @@ def _apply_futures_funding(
     state.cash += amount
     state.observations += 1
     return True, amount
+
+
+def _claim_funding_event(
+    state: _FuturesEvaluationState, symbol: str, observed_at: str, event: Mapping[str, Any]
+) -> bool:
+    key = (symbol, observed_at)
+    identity = canonical_hash(dict(event))
+    previous = state.funding_events.get(key)
+    if previous is not None and previous != identity:
+        raise ProductAccountingError("conflicting funding event for instrument and timestamp")
+    state.funding_events[key] = identity
+    return previous is None
 
 
 def _apply_futures_event(
@@ -959,6 +1051,14 @@ def _record_futures_event(
         "occurred_at": observed_at,
         "event_type": kind,
         "equity": equity,
+        "cash": state.cash,
+        "positions": {
+            key: {"quantity": value[0], "entry_price": value[1], "mark": state.marks[key]}
+            for key, value in state.positions.items()
+        },
+        "fees": state.fees,
+        "cumulative_funding_pnl": state.funding_pnl,
+        "realised_pnl": state.realised,
         "unrealised_pnl": unrealised,
         "notional": notional,
         "margin": margin,
@@ -1091,7 +1191,8 @@ class FuturesIncomeAccounting:
         close = min(abs(old_quantity), abs(signed_quantity))
         realised = close * (price - old_entry) * (1.0 if old_quantity > 0 else -1.0)
         remaining = old_quantity + signed_quantity
-        return realised, remaining, (0.0 if abs(remaining) <= 1e-12 else price)
+        entry = old_entry if remaining * old_quantity > 0 else price
+        return realised, remaining, (0.0 if abs(remaining) <= 1e-12 else entry)
 
     @staticmethod
     def _cost(

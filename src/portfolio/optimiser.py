@@ -110,7 +110,7 @@ def _eligible_forecasts(
         forecast
         for forecast in forecasts
         if forecast.direction is not ForecastDirection.FLAT
-        and forecast.confidence >= constraints.min_confidence
+        and _confidence_eligible(forecast, constraints.min_confidence)
         and forecast.score >= constraints.min_score
         and forecast.maximum_position > 0
         and float(prices.get(forecast.instrument_id, 0.0)) > 0
@@ -119,7 +119,8 @@ def _eligible_forecasts(
         and product_drawdown_fraction <= constraints.max_drawdown_fraction
     ]
     candidates.sort(
-        key=lambda item: (item.utility, item.confidence, item.strategy_version_id), reverse=True
+        key=lambda item: (item.utility, item.allocation_weight, item.strategy_version_id),
+        reverse=True,
     )
     return candidates
 
@@ -145,22 +146,15 @@ def _sized_forecast(
     leverage: float,
 ) -> tuple[float, float, str, str] | None:
     funding_rate = float(funding_rates.get(forecast.instrument_id, 0.0))
-    direction_sign = 1.0 if forecast.direction is ForecastDirection.LONG else -1.0
-    gross_expected_return = forecast.expected_strategy_return
-    effective_funding_rate = _effective_funding_rate(forecast, funding_rate)
-    net_expected_return = gross_expected_return - direction_sign * effective_funding_rate
-    if net_expected_return <= 0:
+    scales = _forecast_scales(forecast, funding_rate)
+    if scales is None:
         return None
-    signal_scale = forecast.score * forecast.confidence
+    signal_scale, funding_scale = scales
     volatility = float(observed_volatility.get(forecast.instrument_id, 0.0))
     volatility_scale = (
         min(1.0, forecast.target_volatility / volatility)
         if volatility > 0 and forecast.target_volatility > 0
         else 1.0
-    )
-    funding_scale = min(
-        1.0,
-        net_expected_return / gross_expected_return if gross_expected_return > 0 else 0.0,
     )
     semantic_target = forecast.metadata.get("semantic_target_fraction")
     if semantic_target is not None:
@@ -182,7 +176,7 @@ def _sized_forecast(
             / semantic_target_max_abs
             * min(constraints.max_symbol_fraction, forecast.maximum_position)
         )
-        fraction = target_fraction * forecast.confidence * volatility_scale * funding_scale
+        fraction = target_fraction * forecast.allocation_weight * volatility_scale * funding_scale
     else:
         fraction = (
             min(constraints.max_symbol_fraction, forecast.maximum_position)
@@ -190,16 +184,21 @@ def _sized_forecast(
             * volatility_scale
             * funding_scale
         )
+    current_fraction = (
+        float(current_quantities.get(forecast.instrument_id, 0.0))
+        * float(prices[forecast.instrument_id])
+        / constraints.equity
+    )
+    if (
+        forecast.metadata.get("preserve_entry_quantity") is True
+        and current_fraction * forecast.signed_strength > 0
+    ):
+        fraction = min(abs(current_fraction), constraints.max_symbol_fraction)
     fraction = min(
         fraction,
         max(0.0, float(liquidity_fraction_caps.get(forecast.instrument_id, 1.0))),
         max(0.0, gross_limit - gross),
         max(0.0, margin_limit - margin) * leverage,
-    )
-    current_fraction = (
-        float(current_quantities.get(forecast.instrument_id, 0.0))
-        * float(prices[forecast.instrument_id])
-        / constraints.equity
     )
     sleeve = str(forecast.metadata.get("sleeve") or "directional")
     sleeve_limit = max(0.0, float(sleeve_budgets.get(sleeve, 1.0)))
@@ -330,7 +329,11 @@ def _target_metadata(
     direction_sign = 1.0 if forecast.direction is ForecastDirection.LONG else -1.0
     gross_expected_return = forecast.expected_strategy_return
     effective_funding_rate = _effective_funding_rate(forecast, funding_rate)
-    net_expected_return = gross_expected_return - direction_sign * effective_funding_rate
+    net_expected_return = (
+        gross_expected_return - direction_sign * effective_funding_rate
+        if gross_expected_return is not None
+        else None
+    )
     metadata: dict[str, object] = {
         "expected_return": forecast.expected_return,
         "expected_asset_return": forecast.expected_asset_return,
@@ -338,6 +341,7 @@ def _target_metadata(
         "directional_expected_return": gross_expected_return,
         "net_expected_return": net_expected_return,
         "confidence": forecast.confidence,
+        "position_rules": forecast.metadata.get("position_rules"),
         "score": forecast.score,
         "observed_volatility": observed_volatility.get(forecast.instrument_id),
         "funding_rate": funding_rate,
@@ -492,8 +496,9 @@ def _build_open_targets(
                 "product_drawdown_fraction": product_drawdown_fraction,
             }
         )
-        if protective_stop_fraction is not None:
-            metadata.update(_protective_stop_metadata(price, fraction, protective_stop_fraction))
+        stop_fraction = _strategy_stop_fraction(forecast, protective_stop_fraction)
+        if stop_fraction is not None:
+            metadata.update(_protective_stop_metadata(price, fraction, stop_fraction))
         targets.append(
             TargetPosition(
                 portfolio_id=constraints.portfolio_id,
@@ -679,3 +684,29 @@ def _protective_stop_metadata(
         "protective_stop_price": trigger,
         "protective_stop_fraction": stop_fraction,
     }
+
+
+def _strategy_stop_fraction(forecast: AlphaForecast, product_stop: float | None) -> float | None:
+    rules = forecast.metadata.get("position_rules")
+    if not isinstance(rules, Mapping):
+        return product_stop
+    stop = float(rules["stop_loss"])
+    if not math.isfinite(stop) or not 0 < stop < 1:
+        raise ValueError("strategy stop loss must be in (0, 1)")
+    return stop
+
+
+def _confidence_eligible(forecast: AlphaForecast, minimum: float) -> bool:
+    return minimum == 0 or (forecast.confidence is not None and forecast.confidence >= minimum)
+
+
+def _forecast_scales(forecast: AlphaForecast, funding_rate: float) -> tuple[float, float] | None:
+    gross = forecast.expected_strategy_return
+    strength = forecast.score * forecast.allocation_weight
+    if gross is None:
+        return strength, 1.0
+    direction = 1.0 if forecast.direction is ForecastDirection.LONG else -1.0
+    net = gross - direction * _effective_funding_rate(forecast, funding_rate)
+    if net <= 0:
+        return None
+    return strength, min(1.0, net / gross if gross > 0 else 0.0)

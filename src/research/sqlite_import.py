@@ -23,13 +23,6 @@ from urllib.parse import quote
 from sqlalchemy import insert, inspect, select
 from sqlalchemy.engine import Engine
 
-from src.autopilot.experiment_memory import (
-    MEMORY_FORMAT,
-    SCHEMA_VERSION,
-    _stored_json,
-    canonical_strategy_hash,
-    canonical_test_hash,
-)
 from src.data.database import (
     PlatformDatabase,
     experiment,
@@ -37,6 +30,7 @@ from src.data.database import (
     holdout_claim,
     holdout_outcome,
     import_provenance,
+    legacy_research_archive,
     strategy_definition,
     strategy_identity,
     strategy_lineage,
@@ -46,6 +40,13 @@ from src.data.database import (
 )
 from src.domain._codec import canonical_hash
 from src.domain.strategies import StrategySourceType
+from src.research.legacy_codec import (
+    MEMORY_FORMAT,
+    SCHEMA_VERSION,
+    _stored_json,
+    canonical_strategy_hash,
+    canonical_test_hash,
+)
 
 REQUIRED_TABLES = frozenset(
     {
@@ -55,6 +56,12 @@ REQUIRED_TABLES = frozenset(
         "lineage_edges",
         "evaluations",
     }
+)
+EXPOSURE_TABLES = (
+    "holdout_claim_scopes",
+    "holdout_cohorts",
+    "protected_intervals",
+    "evaluation_engine_scopes",
 )
 
 
@@ -133,10 +140,67 @@ def _validate_source_structure(connection: sqlite3.Connection, path: Path) -> No
 
 
 def _source_rows(connection: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
+    available = {
+        str(row[0])
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
     return {
         table: list(connection.execute(f"SELECT * FROM {table}"))
-        for table in ("strategies", "strategy_identities", "lineage_edges", "evaluations")
+        for table in (
+            "strategies",
+            "strategy_identities",
+            "lineage_edges",
+            "evaluations",
+            *EXPOSURE_TABLES,
+        )
+        if table in available
     }
+
+
+def _archive_exposure(target, rows, *, source: Path, source_hash: str, imported_at: str) -> None:
+    """Preserve source exposure and retirement facts without granting authority."""
+    payload = {
+        "schema": "research.legacy_exposure_archive/v1",
+        "source_path": str(source),
+        "qualification_authority": False,
+        "source_tables": {
+            name: [dict(row) for row in rows.get(name, ())] for name in EXPOSURE_TABLES
+        },
+        "missing_source_tables": [name for name in EXPOSURE_TABLES if name not in rows],
+        "strategy_dispositions": [
+            {
+                key: row[key]
+                for key in (
+                    "behavior_hash",
+                    "primary_strategy_id",
+                    "product",
+                    "holdout_exposed_at",
+                    "retired_at",
+                    "retirement_reason",
+                )
+            }
+            for row in rows["strategies"]
+        ],
+    }
+    identity = f"sqlite-exposure:{source_hash}"
+    existing = (
+        target.execute(
+            select(legacy_research_archive).where(legacy_research_archive.c.id == identity)
+        )
+        .mappings()
+        .first()
+    )
+    _insert_immutable(
+        target,
+        legacy_research_archive,
+        {
+            "id": identity,
+            "source_hash": source_hash,
+            "content_hash": canonical_hash(payload),
+            "payload": payload,
+            "created_at": existing["created_at"] if existing else imported_at,
+        },
+    )
 
 
 def _validate_strategy_rows(rows: Mapping[str, list[sqlite3.Row]]) -> set[str]:
@@ -175,7 +239,11 @@ def _validate_evaluation_rows(
         dataset = _decode(row["dataset_json"], label="evaluation dataset JSON")
         window = _decode(row["window_json"], label="evaluation window JSON")
         protocol = _decode(row["protocol_json"], label="evaluation protocol JSON")
-        if not all(isinstance(item, Mapping) for item in (dataset, window, protocol)):
+        if (
+            not isinstance(dataset, Mapping)
+            or not isinstance(window, Mapping)
+            or not isinstance(protocol, Mapping)
+        ):
             raise SqliteImportError(f"evaluation context is not an object: {row['evaluation_key']}")
         expected_key = canonical_test_hash(
             behavior_hash,
@@ -534,6 +602,8 @@ def _insert_holdout_records(
             "payload": claim_payload,
         },
     )
+    if row["status"] != "completed" or row["outcome"] is None:
+        return
     outcome_payload = {
         "legacy_import": True,
         "evaluation_key": evaluation_key,
@@ -578,6 +648,10 @@ def _import_evaluation_row(
         },
     )
     accepted = str(row["outcome"] or "").lower() in {"accept", "accepted", "pass", "passed"}
+    if str(row["phase"]) in {"holdout", "final_holdout", "final"}:
+        _insert_holdout_records(target, row, run_payload, strategy_version_id, accepted)
+    if row["status"] != "completed" or row["outcome"] is None:
+        return
     reason_code = _evaluation_reason_code(run_payload)
     _insert_immutable(
         target,
@@ -592,8 +666,6 @@ def _import_evaluation_row(
         },
     )
     _insert_evaluation_stage(target, row, run_payload, accepted, reason_code, imported_stages)
-    if str(row["phase"]) in {"holdout", "final_holdout", "final"}:
-        _insert_holdout_records(target, row, run_payload, strategy_version_id, accepted)
 
 
 def _import_evaluation_rows(
@@ -630,6 +702,11 @@ def _import_provenance(
     rows: Mapping[str, list[sqlite3.Row]],
 ) -> None:
     provenance_id = f"sqlite-import:{source_hash}"
+    existing = (
+        target.execute(select(import_provenance).where(import_provenance.c.id == provenance_id))
+        .mappings()
+        .first()
+    )
     provenance_payload = {
         "schema": "platform.sqlite_import/v1",
         "source_counts": {
@@ -648,8 +725,8 @@ def _import_provenance(
             "source_path": str(source),
             "source_hash": source_hash,
             "destination_hash": destination_hash,
-            "imported_at": imported_at,
-            "archived_path": archived_path,
+            "imported_at": existing["imported_at"] if existing else imported_at,
+            "archived_path": existing["archived_path"] if existing else archived_path,
             "payload": provenance_payload,
         },
     )
@@ -747,6 +824,9 @@ def import_sqlite_memory(
     archived_path = _archive_if_requested(source, archive_to)
     with engine.begin() as target:
         _import_canonical_rows(target, rows)
+        _archive_exposure(
+            target, rows, source=source, source_hash=source_hash, imported_at=imported_at
+        )
         _import_provenance(
             target,
             source,

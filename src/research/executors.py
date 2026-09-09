@@ -10,24 +10,38 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-import random
 import statistics
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from src.accounting.spot_allocation import target_trade_quantity
 from src.domain._codec import canonical_hash, json_value
 from src.domain.strategies import StrategySourceType
-from src.research.controls import control_identity, derive_control_returns
+from src.research.controls import control_identity, derive_control_signals
 from src.research.coordinator import Candidate, CandidateEvaluationView
+from src.research.economic_series import (
+    ECONOMIC_ENGINE_VERSION,
+    account_return_series,
+    btc_nav_series,
+    completed_campaigns,
+    futures_nav_series,
+)
+from src.research.funding import row_settlements
+from src.research.outcomes import OutcomeCategory
+from src.research.position_execution import managed_futures_events
+from src.research.providers import DIRECTIONAL_DSL_DIRECTIONS, DIRECTIONAL_DSL_FAMILIES
 from src.strategies.behaviour import (
     BtcTargetAllocationBehaviour,
     RegisteredStrategyBehaviour,
     StrategyBehaviourError,
     TypedRuleBehaviour,
     behaviour_hash_for_definition,
+    economic_parity_receipt,
 )
+from src.strategies.causality import prefix_invariant
+from src.strategies.position_state import PositionAction, position_path
 from src.strategies.semantic import (
     SEMANTIC_STRATEGIES,
     SemanticEvaluationError,
@@ -41,6 +55,20 @@ from src.strategies.semantic import (
 
 class ExecutorError(RuntimeError):
     """A candidate could not be compiled or evaluated from canonical inputs."""
+
+    outcome_category = OutcomeCategory.BLOCKED_INFRASTRUCTURE
+
+
+class DataUnavailableError(ExecutorError):
+    """Required measurements are unavailable, not a negative alpha outcome."""
+
+    outcome_category = OutcomeCategory.BLOCKED_DATA
+
+
+class UnsupportedExecutorError(ExecutorError):
+    """The source family has no qualified economic execution contract."""
+
+    outcome_category = OutcomeCategory.UNSUPPORTED
 
 
 @dataclass(frozen=True)
@@ -135,6 +163,13 @@ class ProviderExecutorRegistry:
             raise ExecutorError(f"no executor registered for {source_type.value}") from exc
 
     def execute(self, candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
+        diagnostic = any(
+            metadata.get("diagnostic") is True or metadata.get("promotable") is False
+            for metadata in (candidate.metadata, candidate.definition.metadata)
+        )
+        reason = _unsupported_economic_contract(candidate)
+        if reason is not None and not diagnostic:
+            raise UnsupportedExecutorError(reason)
         return self.executor_for(candidate.definition.source_type)(candidate, context)
 
     @classmethod
@@ -152,6 +187,31 @@ class ProviderExecutorRegistry:
         registry.register(StrategySourceType.ENSEMBLE, execute_ensemble)
         registry.register(StrategySourceType.AGENT_GENERATED_PYTHON, execute_agent_generated_python)
         return registry
+
+
+def _unsupported_economic_contract(candidate: Candidate) -> str | None:
+    source = candidate.definition.source_type
+    if source is StrategySourceType.GENERATED_DSL:
+        if candidate.definition.family not in DIRECTIONAL_DSL_FAMILIES:
+            return f"directional DSL cannot implement the {candidate.definition.family} family"
+        rule = candidate.definition.signal_model.get("rule")
+        if (
+            isinstance(rule, Mapping)
+            and str(rule.get("direction") or "long") not in DIRECTIONAL_DSL_DIRECTIONS
+        ):
+            return "directional DSL cannot implement hedged or market-neutral exposure"
+    unavailable = {
+        StrategySourceType.RELATIVE_VALUE: "relative-value qualification needs proven inventory and frozen hedge estimates",
+        StrategySourceType.MICROSTRUCTURE: "microstructure qualification needs historical book and latency execution",
+        StrategySourceType.ENSEMBLE: "portfolio allocation is not an independent alpha hypothesis",
+    }
+    if source is StrategySourceType.CROSS_SECTIONAL:
+        name = candidate.definition.signal_model.get(
+            "semantic_strategy", candidate.definition.identity
+        )
+        if name == "funding_adjusted_ranking":
+            return "funding-aware multi-leg settlement accounting is not implemented"
+    return unavailable.get(source)
 
 
 def _pbo_measurements(
@@ -244,54 +304,46 @@ def _measured_result(
     returns = _market_returns(context, len(signals))
     if not signals:
         signals = [float(_direction(output))]
+    context = {
+        **context,
+        "signals": signals,
+        "btc_target_states": candidate.definition.signal_model.get("target_states"),
+        "maximum_position": candidate.definition.position_model.get(
+            "maximum_position", context.get("maximum_position", 0.1)
+        ),
+        "behaviour_hash": behaviour_hash_for_definition(candidate.definition),
+    }
+    if isinstance(context.get("parity_receipt"), Mapping):
+        context["parity_receipt"] = economic_parity_receipt(
+            candidate.definition, context["parity_receipt"]
+        )
     observations = len(signals)
     changes = [abs(signals[index] - signals[index - 1]) for index in range(1, observations)]
     turnover = sum(changes) / max(1, observations - 1)
     active = sum(1 for value in signals if abs(value) > 1e-12)
-    from src.research.returns import PositionReturnLedger, ReturnLedgerError
-
-    try:
-        fee_rate = _nonnegative_rate(context.get("fee_bps", 1.0), field="fee_bps") / 10_000.0
-        slippage_rate = (
-            _nonnegative_rate(context.get("slippage_bps", 1.0), field="slippage_bps") / 10_000.0
-        )
-        funding_rate = _finite_rate(context.get("funding_rate", 0.0), field="funding_rate")
-        funding_rates = context.get("funding_period_rates", context.get("funding_rates"))
-        return_ledger = PositionReturnLedger(
-            fee_rate=fee_rate,
-            slippage_rate=slippage_rate,
-            funding_rate=funding_rate,
-        )
-        return_report = return_ledger.measure(
-            signals,
-            returns,
-            funding_rates=funding_rates,
-            initial_position=0.0,
-            liquidate_terminal=True,
-        )
-    except (ReturnLedgerError, TypeError, ValueError) as exc:
-        raise ExecutorError(f"position return ledger input is invalid: {exc}") from exc
+    accounting = _product_accounting(context)
+    return_report = (
+        account_return_series(accounting)
+        if accounting is not None
+        else _position_return_report(context, signals, returns)
+    )
     aligned = return_report.effective_observations
     gross = list(return_report.gross_returns)
     net = list(return_report.net_returns)
     analysis_returns = net or gross
-    independent_values = _independent_return_observations(signals, analysis_returns)
-    bootstrap_values = independent_values
+    bootstrap_values = analysis_returns
+    completed = completed_campaigns(accounting)
     fees = return_report.fees
     slippage = return_report.slippage
     funding_pnl = return_report.funding_pnl
     funding = return_report.funding_cost
     turnover = return_report.turnover
     net_return = return_report.net_pnl
-    accounting = _product_accounting(context, fallback_return=return_report)
-    if accounting is not None:
-        net_return = float(accounting["return_fraction"])
-    window_returns = _window_sums(analysis_returns, _evaluation_window_count(context))
+    window_returns = _window_returns(analysis_returns, _evaluation_window_count(context))
     negative_controls = _negative_control_evidence(
-        signals=signals[:aligned],
-        returns=returns[:aligned],
+        observations=aligned,
         candidate_return=net_return,
-        control_returns=context.get("negative_control_returns"),
+        control_returns=_economic_control_returns(candidate, context, signals),
         controls=_negative_control_names(candidate, context),
         instrument_scope=tuple(str(item) for item in context.get("instrument_scope", ())),
         seed_material={
@@ -299,40 +351,13 @@ def _measured_result(
             "dataset_snapshot_ids": snapshots,
         },
     )
-    delayed_report = (
-        return_ledger.measure([0.0, *signals[:-1]], returns, funding_rates=funding_rates)
-        if aligned > 1
-        else None
-    )
-    delayed_net = list(delayed_report.net_returns) if delayed_report is not None else []
-    cost_stress = _stress_report(
-        signals,
-        returns,
-        fee_rate=fee_rate * 2.0,
-        slippage_rate=slippage_rate * 2.0,
-        funding_rate=funding_rate,
-        funding_rates=funding_rates,
-    )
-    adverse_fill_stress = _stress_report(
-        signals,
-        returns,
-        fee_rate=fee_rate,
-        slippage_rate=slippage_rate * 2.0,
-        funding_rate=funding_rate,
-        funding_rates=funding_rates,
-    )
-    funding_stress = _stress_report(
-        signals,
-        returns,
-        fee_rate=fee_rate,
-        slippage_rate=slippage_rate,
-        funding_rate=funding_rate * 2.0,
-        funding_rates=_scaled_rates(funding_rates, 2.0),
-    )
-    missing_data_returns = [
-        value for index, value in enumerate(analysis_returns) if (index + 1) % 20 != 0
-    ]
+    delay_stress = _temporal_stress(candidate, context, signals, net_return, delay=True)
+    cost_stress = _stress_report(context, signals, returns, fee=2, slippage=2)
+    adverse_fill_stress = _stress_report(context, signals, returns, slippage=2)
+    funding_stress = _stress_report(context, signals, returns, funding=2)
+    missing_data_stress = _temporal_stress(candidate, context, signals, net_return, delay=False)
     parameter_stability = _parameter_stability(candidate, context, bootstrap_values)
+    _bind_parameter_control(negative_controls, parameter_stability, bootstrap_values)
     cross_symbol_stability = _cross_symbol_stability(context, bootstrap_values)
     portfolio_overlap = _portfolio_overlap(context, analysis_returns)
     walk_forward = _purged_walk_forward(analysis_returns, context, candidate)
@@ -397,20 +422,8 @@ def _measured_result(
         "evidence_type": evidence_type,
         "instrument_scope": list(context.get("instrument_scope", ())),
     }
-    cycles = int(
-        context.get(
-            "cycles",
-            accounting.get("cycles", 0) if accounting is not None else 0,
-        )
-    )
-    randomiser = random.Random(int(candidate.candidate_id[7:23], 16))
-    monte_carlo_drawdowns = []
-    monte_carlo_tail_losses = []
-    for _ in range(250):
-        permuted = list(bootstrap_values)
-        randomiser.shuffle(permuted)
-        monte_carlo_drawdowns.append(_maximum_drawdown(permuted))
-        monte_carlo_tail_losses.append(_tail_loss(permuted))
+    cycles = completed
+    monte_carlo = _monte_carlo_blocks(candidate, context, bootstrap_values)
     declared_symbols = candidate.definition.universe.get("symbols")
     declared_instrument_ids = candidate.definition.universe.get("instrument_ids")
     declared_values = tuple(
@@ -477,17 +490,11 @@ def _measured_result(
         "parameter_stability": parameter_stability,
         "sample_evidence": {
             "passed": aligned >= 3,
+            "status": "measured" if completed is not None else "unavailable",
             "observations": aligned,
-            "closed_trades": int(
-                context.get(
-                    "closed_trades",
-                    len(independent_values),
-                )
-            ),
-            "effective_independent_episodes": int(
-                context.get("effective_independent_episodes", len(independent_values))
-            ),
-            "independent_observations": len(independent_values),
+            "closed_trades": completed,
+            "completed_episodes": completed,
+            "independence_estimated": False,
             "trading_days": int(context.get("trading_days", context.get("evidence_days", 0))),
             "calendar_days": float(context.get("calendar_days", 0.0)),
             "run_id": canonical_hash(
@@ -523,43 +530,21 @@ def _measured_result(
             "cost_adjusted_return": cost_stress.net_pnl,
             "degradation_fraction": _degradation(net_return, cost_stress.net_pnl),
         },
-        "delay_stress": {
-            "passed": bool(delayed_net) and _stress_passes(sum(delayed_net), net_return, context),
-            "delay_bars": 1,
-            "cost_adjusted_return": sum(delayed_net),
-            "degradation_fraction": _degradation(net_return, sum(delayed_net)),
-        },
+        "delay_stress": delay_stress,
         "adverse_fill_stress": {
             "passed": _stress_passes(adverse_fill_stress.net_pnl, net_return, context),
             "multiplier": 2.0,
             "cost_adjusted_return": adverse_fill_stress.net_pnl,
             "degradation_fraction": _degradation(net_return, adverse_fill_stress.net_pnl),
         },
-        "missing_data_stress": {
-            "passed": bool(missing_data_returns)
-            and _stress_passes(sum(missing_data_returns), net_return, context),
-            "removed_fraction": 1.0 - len(missing_data_returns) / max(1, len(analysis_returns)),
-            "cost_adjusted_return": sum(missing_data_returns),
-            "degradation_fraction": _degradation(net_return, sum(missing_data_returns)),
-        },
+        "missing_data_stress": missing_data_stress,
         "funding_stress": {
             "passed": _stress_passes(funding_stress.net_pnl, net_return, context),
             "multiplier": 2.0,
             "cost_adjusted_return": funding_stress.net_pnl,
             "degradation_fraction": _degradation(net_return, funding_stress.net_pnl),
         },
-        "monte_carlo_trade_order": {
-            "passed": bool(monte_carlo_drawdowns)
-            and net_return >= 0
-            and max(monte_carlo_drawdowns, default=0.0)
-            <= float(context.get("maximum_monte_carlo_drawdown", 1.0))
-            and max(monte_carlo_tail_losses, default=0.0)
-            <= float(context.get("maximum_monte_carlo_tail_loss", 1.0)),
-            "iterations": len(monte_carlo_drawdowns),
-            "maximum_drawdown": max(monte_carlo_drawdowns, default=0.0),
-            "tail_loss": max(monte_carlo_tail_losses, default=0.0),
-            "tail_quantile": 0.05,
-        },
+        "monte_carlo_return_blocks": monte_carlo,
         "bootstrap_confidence": {
             "passed": len(bootstrap_values)
             >= int(context.get("minimum_bootstrap_observations", 30))
@@ -619,10 +604,6 @@ def _measured_result(
             "maximum_drawdown": return_report.maximum_drawdown,
             "tail_loss": _tail_loss(bootstrap_values),
             "tail_quantile": 0.05,
-        },
-        "null_results": {
-            "passed": all(item["passed"] for item in negative_controls.values()),
-            "tests": len(negative_controls),
         },
         "negative_control_results": negative_controls,
         "production_equivalent": {
@@ -721,7 +702,7 @@ def _measured_result(
         receipt=execution_receipt(
             candidate=candidate,
             dataset_snapshot_ids=snapshots,
-            executor_version="provider-executors/v3",
+            executor_version=ECONOMIC_ENGINE_VERSION,
             evidence_policy_hash=(
                 str(context["evidence_policy_hash"])
                 if context.get("evidence_policy_hash") is not None
@@ -738,8 +719,6 @@ def _measured_result(
 
 def _product_accounting(
     context: Mapping[str, Any],
-    *,
-    fallback_return: Any | None = None,
 ) -> dict[str, Any] | None:
     """Evaluate explicit product event evidence when a dataset supplies it."""
 
@@ -747,7 +726,7 @@ def _product_accounting(
     if product_id == "btc_accumulation":
         return _btc_product_accounting(context)
     if product_id == "active_income":
-        return _futures_product_accounting(context, fallback_return=fallback_return)
+        return _futures_product_accounting(context)
     return None
 
 
@@ -780,6 +759,12 @@ def _btc_product_accounting(context: Mapping[str, Any]) -> dict[str, Any] | None
             reserve_fraction=reserve_fraction,
             max_tactical_fraction=tactical_fraction,
             external_events=context.get("btc_external_events", ()),
+            benchmark_fee_rate=_nonnegative_rate(context.get("fee_bps", 0.0), field="fee_bps")
+            / 10_000,
+            benchmark_slippage_rate=_nonnegative_rate(
+                context.get("slippage_bps", 0.0), field="slippage_bps"
+            )
+            / 10_000,
         )
     except (ProductAccountingError, TypeError, ValueError) as exc:
         raise ExecutorError(f"BTC accounting evidence is invalid: {exc}") from exc
@@ -808,6 +793,8 @@ def _btc_fraction_inputs(
 def _btc_accounting_payload(report: Any) -> dict[str, Any]:
     return {
         "schema": "platform.btc_accounting/v1",
+        "nav_series": btc_nav_series(report),
+        "core_btc_quantity": report.core_btc_quantity,
         "objective_unit": report.objective_unit,
         "initial_value": report.initial_btc_nav,
         "objective_value": report.final_btc_nav,
@@ -836,14 +823,14 @@ def _btc_accounting_payload(report: Any) -> dict[str, Any]:
     }
 
 
-def _futures_product_accounting(
-    context: Mapping[str, Any], *, fallback_return: Any | None
-) -> dict[str, Any] | None:
+def _futures_product_accounting(context: Mapping[str, Any]) -> dict[str, Any] | None:
+    if context.get("funding_available") is False:
+        raise DataUnavailableError("futures funding history is unavailable")
     events = context.get("futures_events", context.get("trade_events"))
     if events is None:
         events = _derived_futures_accounting_inputs(context)
     if events is None:
-        return _futures_return_ledger(context, fallback_return)
+        return None
     from src.research.accounting import FuturesResearchAccounting, ProductAccountingError
 
     try:
@@ -870,63 +857,10 @@ def _futures_product_accounting(
     return _futures_accounting_payload(report)
 
 
-def _futures_return_ledger(
-    context: Mapping[str, Any], fallback_return: Any | None
-) -> dict[str, Any] | None:
-    if fallback_return is None:
-        return None
-    initial_equity = float(context.get("initial_cash", context.get("initial_equity", 1.0)))
-    if not math.isfinite(initial_equity) or initial_equity <= 0.0:
-        raise ExecutorError(
-            "active-income return-ledger accounting requires positive initial equity"
-        )
-    net_pnl = float(fallback_return.net_pnl) * initial_equity
-    observations = int(fallback_return.effective_observations)
-    fees = float(fallback_return.fees) * initial_equity
-    funding_pnl = float(fallback_return.funding_pnl) * initial_equity
-    slippage = float(fallback_return.slippage) * initial_equity
-    turnover_notional = float(fallback_return.turnover) * initial_equity
-    return {
-        "schema": "platform.futures_accounting/return_ledger_v1",
-        "objective_unit": "USDT",
-        "initial_value": initial_equity,
-        "objective_value": initial_equity + net_pnl,
-        "benchmark_value": initial_equity,
-        "objective_excess": net_pnl,
-        "objective_excess_fraction": net_pnl / initial_equity,
-        "return_fraction": net_pnl / initial_equity,
-        "realised_pnl": net_pnl,
-        "unrealised_pnl": 0.0,
-        "fees": fees,
-        "funding_pnl": funding_pnl,
-        "spread_cost": 0.0,
-        "slippage_cost": slippage,
-        "fills": observations,
-        "partial_fills": 0,
-        "capacity_violations": 0,
-        "capacity_passed": True,
-        "max_leverage": 1.0,
-        "max_margin_fraction": 0.0,
-        "liquidation": False,
-        "effective_observations": observations,
-        "turnover_notional": turnover_notional,
-        "implementation_shortfall": fees + slippage,
-        "capital_efficiency": (net_pnl / turnover_notional if turnover_notional > 0.0 else 0.0),
-        "funding_adjusted_expectancy": net_pnl / observations if observations > 0 else 0.0,
-        "margin_mode": "isolated",
-        "target_notional": None,
-        "liquidation_buffer_fraction": 0.0,
-        "terminal_liquidation_cost": float(fallback_return.terminal_liquidation_cost)
-        * initial_equity,
-        "terminal_exposure": float(fallback_return.terminal_exposure) * initial_equity,
-        "event_receipts": (),
-        "source": "canonical_return_ledger",
-    }
-
-
 def _futures_accounting_payload(report: Any) -> dict[str, Any]:
     return {
         "schema": "platform.futures_accounting/v1",
+        "nav_series": futures_nav_series(report),
         "objective_unit": report.objective_unit,
         "initial_value": report.initial_equity,
         "objective_value": report.final_equity,
@@ -1062,13 +996,24 @@ def _derived_btc_accounting_inputs(
         for observed_at, price, row in zip(times, prices, rows, strict=True)
     ]
     target_fractions = _btc_target_fractions(context, len(signals))
+    reserve, _ = _btc_fraction_inputs(context, derived=True)
+    core = (btc + stable / prices[0]) * (reserve or 0.0)
+    unavailable = set(context.get("unavailable_decision_indices", ()))
     for index, (observed_at, price, signal) in enumerate(zip(times, prices, signals, strict=True)):
+        if index in unavailable:
+            continue
         desired_fraction = _btc_desired_fraction(
             target_fractions, index=index, signal=signal, tactical=tactical
         )
-        nav = btc + stable / price
-        desired_btc = nav * desired_fraction
-        quantity = desired_btc - btc
+        quantity = target_trade_quantity(
+            base=btc,
+            quote=max(0.0, stable),
+            mark=price,
+            fraction=desired_fraction,
+            fee_rate=fee_rate,
+            slippage_rate=slippage_rate,
+        )
+        quantity = max(quantity, min(0.0, core - btc))
         trade = _btc_trade(
             observed_at=observed_at,
             price=price,
@@ -1151,9 +1096,24 @@ def _derived_futures_accounting_inputs(
         _nonnegative_rate(context.get("slippage_bps", 2.0), field="slippage_bps") / 10_000.0
     )
     target_notional = _derived_futures_target_notional(context)
+    if context.get("position_actions") is not None:
+        if isinstance(target_notional, Mapping):
+            raise ExecutorError("single-instrument position actions require a scalar notional")
+        return managed_futures_events(
+            rows,
+            times,
+            tuple(PositionAction(**item) for item in context["position_actions"]),
+            notional=target_notional,
+            fee_rate=fee_rate,
+            slippage_rate=slippage_rate,
+        )
     events: list[dict[str, Any]] = []
     previous_targets: dict[str, float] = {}
-    for observed_at, raw_price, row, raw_signal in zip(times, prices, rows, signals, strict=True):
+    unavailable = set(context.get("unavailable_decision_indices", ()))
+    for index, (observed_at, raw_price, row, raw_signal) in enumerate(
+        zip(times, prices, rows, signals, strict=True)
+    ):
+        events.extend(row_settlements(row))
         price = float(raw_price)
         symbol = _futures_symbol(row)
         symbol_target_notional = (
@@ -1161,7 +1121,11 @@ def _derived_futures_accounting_inputs(
             if isinstance(target_notional, Mapping)
             else target_notional
         )
-        target = _futures_target_notional(raw_signal, symbol_target_notional, price)
+        target = (
+            previous_targets.get(symbol, 0.0)
+            if index in unavailable
+            else _futures_target_notional(raw_signal, symbol_target_notional, price)
+        )
         delta = target - previous_targets.get(symbol, 0.0)
         fill = _futures_fill_event(
             observed_at,
@@ -1175,9 +1139,6 @@ def _derived_futures_accounting_inputs(
             events.append(fill)
             previous_targets[symbol] = target
         events.append(_futures_mark_event(observed_at, row, price))
-        funding = _futures_funding_event(observed_at, row, price)
-        if funding is not None:
-            events.append(funding)
     if not events:
         return None
     return tuple(events)
@@ -1230,7 +1191,7 @@ def _derived_futures_target_notional(context: Mapping[str, Any]) -> float | dict
         target_notional = float(
             raw_target_notional
             if raw_target_notional is not None
-            else initial_cash * maximum_position * leverage
+            else initial_cash * maximum_position
         )
     if not math.isfinite(target_notional) or target_notional <= 0.0:
         raise ExecutorError("futures target notional is invalid")
@@ -1280,22 +1241,6 @@ def _futures_mark_event(observed_at: str, row: Mapping[str, Any], price: float) 
     }
 
 
-def _futures_funding_event(
-    observed_at: str, row: Mapping[str, Any], price: float
-) -> dict[str, Any] | None:
-    if row.get("funding_event") is not True:
-        return None
-    if row.get("funding_rate") is None and row.get("funding") is None:
-        return None
-    return {
-        "type": "funding",
-        "timestamp": str(row.get("funding_timestamp") or observed_at),
-        "symbol": _futures_symbol(row),
-        "mark_price": price,
-        "funding_rate": row.get("funding_rate", row.get("funding", 0.0)),
-    }
-
-
 def _finite_rate(value: Any, *, field: str) -> float:
     if isinstance(value, bool):
         raise ExecutorError(f"{field} must be numeric")
@@ -1315,38 +1260,120 @@ def _nonnegative_rate(value: Any, *, field: str) -> float:
     return result
 
 
-def _scaled_rates(value: Any, multiplier: float) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, int | float) and not isinstance(value, bool):
-        return float(value) * multiplier
-    if isinstance(value, list | tuple):
-        return [float(item) * multiplier for item in value]
-    return value
-
-
-def _stress_report(
-    signals: list[float],
-    returns: list[float],
-    *,
-    fee_rate: float,
-    slippage_rate: float,
-    funding_rate: float,
-    funding_rates: Any,
-):
-    from src.research.returns import PositionReturnLedger
-
-    return PositionReturnLedger(
-        fee_rate=fee_rate,
-        slippage_rate=slippage_rate,
-        funding_rate=funding_rate,
-    ).measure(
-        signals,
-        returns,
-        funding_rates=funding_rates,
-        initial_position=0.0,
-        liquidate_terminal=True,
+def _temporal_decisions(candidate, context, signals, rows, unavailable, delay):
+    registered = candidate.definition.signal_model.get("registered_strategy")
+    if not registered:
+        return ([0.0, *signals[:-1]] if delay else signals), None
+    behaviour = RegisteredStrategyBehaviour.from_definition(candidate.definition)
+    warmup = _frame_rows({"market_frame": context.get("warmup_market_frame")}) or ()
+    entries = list(behaviour.generate_signals((*warmup, *rows))[len(warmup) :])
+    entries = (
+        [0, *entries[:-1]]
+        if delay
+        else [0 if index in unavailable else value for index, value in enumerate(entries)]
     )
+    path = position_path(rows, entries, behaviour.position_rules())
+    return list(path.decisions), [action.__dict__ for action in path.actions]
+
+
+def _temporal_stress(candidate, context, signals, baseline, *, delay):
+    from src.research.position_execution import PositionTimingUnavailable
+
+    rows = _frame_rows(context)
+    if rows is None or len(rows) != len(signals) or len(rows) < 2:
+        return {"status": "unavailable", "reason": "temporal_stress_requires_aligned_market_frame"}
+    unavailable = (0,) if delay else (tuple(range(19, len(rows), 20)) or (len(rows) - 1,))
+    values, actions = _temporal_decisions(
+        candidate, context, signals, rows, frozenset(unavailable), delay
+    )
+    prepared = {**context, "unavailable_decision_indices": unavailable}
+    fractions = _numeric_series(context.get("btc_target_fractions"))
+    if delay and fractions:
+        prepared["btc_target_fractions"] = [0.0, *fractions[:-1]]
+    try:
+        returns = _decision_returns(prepared, values, actions=actions)
+    except (DataUnavailableError, PositionTimingUnavailable) as exc:
+        return {"status": "unavailable", "reason": str(exc)}
+    net = math.prod(1.0 + value for value in returns) - 1.0
+    return {
+        "passed": bool(returns) and _stress_passes(net, baseline, context),
+        "scenario": "entry_decision_delay" if delay else "decision_feed_outage_with_backfill",
+        "delay_bars": 1 if delay else 0,
+        "unavailable_decision_indices": list(unavailable),
+        "missing_decision_fraction": 0.0 if delay else len(unavailable) / len(rows),
+        "market_observations": len(rows),
+        "cost_adjusted_return": net,
+        "degradation_fraction": _degradation(baseline, net),
+        "input_hash": canonical_hash(
+            {
+                "candidate_id": candidate.candidate_id,
+                "dataset_snapshot_ids": context.get("dataset_snapshot_ids"),
+                "market_frame": rows,
+                "timestamps": _frame_times(context, rows),
+                "decisions": values,
+                "actions": actions,
+                "target_fractions": prepared.get("btc_target_fractions"),
+                "target_states": prepared.get("btc_target_states"),
+                "unavailable_decision_indices": unavailable,
+                "accounting_inputs": {
+                    key: context.get(key)
+                    for key in (
+                        "product_id",
+                        "cost_model_id",
+                        "fee_bps",
+                        "slippage_bps",
+                        "funding_rate",
+                        "initial_cash",
+                        "initial_equity",
+                        "initial_btc",
+                        "initial_stablecoin",
+                        "initial_price",
+                        "reserve_fraction",
+                        "max_tactical_fraction",
+                        "leverage",
+                        "maximum_position",
+                        "target_notional",
+                        "maintenance_margin_fraction",
+                        "max_participation_fraction",
+                        "max_margin_fraction",
+                        "margin_mode",
+                        "liquidation_buffer_fraction",
+                        "btc_external_events",
+                    )
+                },
+            }
+        ),
+    }
+
+
+def _stress_report(context, signals, returns, *, fee=1, slippage=1, funding=1):
+    from src.research.stress import cost_stress_context
+
+    stressed = cost_stress_context(context, fee=fee, slippage=slippage, funding=funding)
+    accounting = _product_accounting(stressed)
+    if accounting is not None:
+        return account_return_series(accounting)
+    return _position_return_report(stressed, signals, returns)
+
+
+def _position_return_report(context, signals, returns):
+    from src.research.returns import PositionReturnLedger, ReturnLedgerError
+
+    try:
+        return PositionReturnLedger(
+            fee_rate=_nonnegative_rate(context.get("fee_bps", 1.0), field="fee_bps") / 10000,
+            slippage_rate=_nonnegative_rate(context.get("slippage_bps", 1.0), field="slippage_bps")
+            / 10000,
+            funding_rate=_finite_rate(context.get("funding_rate", 0.0), field="funding_rate"),
+        ).measure(
+            signals,
+            returns,
+            funding_rates=context.get("funding_period_rates", context.get("funding_rates")),
+            initial_position=0.0,
+            liquidate_terminal=True,
+        )
+    except (ReturnLedgerError, TypeError, ValueError) as exc:
+        raise ExecutorError(f"position return ledger input is invalid: {exc}") from exc
 
 
 def _stress_passes(stressed: float, base: float, context: Mapping[str, Any]) -> bool:
@@ -1420,11 +1447,19 @@ def _market_price_returns(context: Mapping[str, Any], signal_count: int) -> list
     return returns[: max(0, signal_count - 1)]
 
 
-def _window_sums(values: list[float], windows: int) -> list[float]:
+def _window_returns(values: list[float], windows: int) -> list[float]:
     if len(values) < windows:
         return []
-    size = max(1, len(values) // windows)
-    return [sum(values[index * size : (index + 1) * size]) for index in range(windows)]
+    return [
+        math.prod(
+            1 + value
+            for value in values[
+                index * len(values) // windows : (index + 1) * len(values) // windows
+            ]
+        )
+        - 1
+        for index in range(windows)
+    ]
 
 
 def _evaluation_window_count(context: Mapping[str, Any]) -> int:
@@ -1503,14 +1538,12 @@ def _generated_parameter_neighbours(
                     name=strategy_name,
                     parameters=varied,
                     source_hash=candidate.definition.source_hash,
+                    position_model=candidate.definition.position_model,
                 )
-                signals = varied_behaviour.generate_signals(frame)
-                numeric_signals = _numeric_series(signals)
-                returns = _market_price_returns(context, len(numeric_signals))
-                aligned = min(len(returns), max(0, len(numeric_signals) - 1))
-                neighbours[f"{name}:{direction:+d}"] = [
-                    numeric_signals[index] * returns[index] for index in range(aligned)
-                ]
+                path = varied_behaviour.decision_path(frame, context.get("warmup_market_frame", ()))
+                neighbours[f"{name}:{direction:+d}"] = _decision_returns(
+                    context, list(path.decisions), actions=[item.__dict__ for item in path.actions]
+                )
     except (ExecutorError, KeyError, TypeError, ValueError, StrategyBehaviourError):
         return {}
     return neighbours
@@ -1530,17 +1563,36 @@ def _generated_dsl_parameter_neighbours(
     if not feature or operator not in {"gt", "ge", "lt", "le"}:
         return {}
     threshold = float(parameters.get("threshold", rule.get("threshold", 0.0)))
-    step = max(abs(threshold) * 0.1, 0.1)
+    step = max(abs(threshold) * 0.1, 1e-8)
     neighbours: dict[str, list[float]] = {}
     for direction in (-1, 1):
         varied_rule = {**dict(rule), "threshold": threshold + direction * step}
         signals = _dsl_signals(rows, varied_rule)
-        returns = _market_price_returns(context, len(signals))
-        aligned = min(len(returns), max(0, len(signals) - 1))
-        neighbours[f"threshold:{direction:+d}"] = [
-            signals[index] * returns[index] for index in range(aligned)
-        ]
+        neighbours[f"threshold:{direction:+d}"] = _decision_returns(context, list(signals))
     return neighbours
+
+
+def _decision_returns(context, signals, *, actions=None) -> list[float]:
+    prepared = {**context, "signals": signals}
+    for key in ("futures_events", "trade_events", "btc_trade_events", "marks", "btc_marks"):
+        if prepared.pop(key, None) is not None and _frame_rows(context) is None:
+            raise DataUnavailableError("decision replay requires its underlying market frame")
+    states = context.get("btc_target_states")
+    if isinstance(states, Mapping):
+        prepared["btc_target_fractions"] = [
+            states["risk_on" if value > 0 else "risk_off" if value < 0 else "reentry"][
+                "btc_fraction"
+            ]
+            for value in signals
+        ]
+    prepared.pop("position_actions", None)
+    if actions is not None:
+        prepared["position_actions"] = actions
+    accounting = _product_accounting(prepared)
+    if accounting is not None:
+        return list(account_return_series(accounting).net_returns)
+    report = _position_return_report(context, signals, _market_price_returns(context, len(signals)))
+    return list(report.net_returns)
 
 
 def _parameter_neighbours(
@@ -1562,10 +1614,12 @@ def _parameter_stability_results(
     neighbours: Mapping[str, list[float]],
 ) -> list[dict[str, Any]]:
     results = []
-    base_total = sum(base_returns)
+    base_total = math.prod(1 + value for value in base_returns) - 1
     snapshots = list(context.get("dataset_snapshot_ids", ()))
     for name, values in sorted(neighbours.items()):
-        comparable = values[: len(base_returns)]
+        comparable = values
+        if len(comparable) != len(base_returns):
+            raise ExecutorError("parameter comparison has unequal calendar observations")
         results.append(
             {
                 "name": name,
@@ -1579,9 +1633,10 @@ def _parameter_stability_results(
                     }
                 ),
                 "observations": len(comparable),
-                "return": sum(comparable),
-                "passed": bool(comparable) and sum(comparable) >= base_total * 0.5,
-                "window_returns": _window_sums(comparable, _evaluation_window_count(context)),
+                "return": math.prod(1 + value for value in comparable) - 1,
+                "passed": len(comparable) == len(base_returns)
+                and math.prod(1 + value for value in comparable) - 1 >= base_total * 0.5,
+                "window_returns": _window_returns(comparable, _evaluation_window_count(context)),
                 "input_hash": canonical_hash(
                     {
                         "candidate_id": candidate.candidate_id,
@@ -1606,11 +1661,11 @@ def _parameter_stability(
             "reason": "no_tunable_parameters",
             "neighbours_tested": 0,
             "results": [],
-            "base_window_returns": _window_sums(base_returns, _evaluation_window_count(context)),
+            "base_window_returns": _window_returns(base_returns, _evaluation_window_count(context)),
         }
     neighbours = _parameter_neighbours(candidate, context)
     results = _parameter_stability_results(candidate, context, base_returns, neighbours)
-    base_total = sum(base_returns)
+    base_total = math.prod(1 + value for value in base_returns) - 1
     neighbour_returns = [float(item["return"]) for item in results]
     median_return = statistics.median(neighbour_returns) if neighbour_returns else None
     worst_return = min(neighbour_returns) if neighbour_returns else None
@@ -1630,7 +1685,7 @@ def _parameter_stability(
         and (median_return or 0.0) >= base_total * (1.0 - allowed_degradation)
     )
     return {
-        "status": "pass" if passed else "fail",
+        "status": "unavailable" if not results else "pass" if passed else "fail",
         "passed": passed,
         "neighbours_tested": len(results),
         "results": results,
@@ -1641,7 +1696,20 @@ def _parameter_stability(
         "degradation_fraction": degradation,
         "degradation_shape": "cliff" if cliff_detected else "smooth",
         "cliff_detected": cliff_detected,
-        "base_window_returns": _window_sums(base_returns, _evaluation_window_count(context)),
+        "base_window_returns": _window_returns(base_returns, _evaluation_window_count(context)),
+    }
+
+
+def _bind_parameter_control(controls, stability, returns) -> None:
+    if "parameter_neighbourhood" not in controls:
+        return
+    controls["parameter_neighbourhood"] = {
+        "status": stability["status"],
+        "passed": stability["passed"],
+        "observations": len(returns),
+        "control_return": stability.get("worst_return"),
+        "method": "executed_parameter_surface/v1",
+        "input_hash": canonical_hash(stability),
     }
 
 
@@ -1820,33 +1888,33 @@ def _purged_walk_forward(
             "window": index,
             "start": test_start,
             "end": test_end,
-            "train_start": train_start,
-            "train_end": train_end,
+            "reference_start": train_start,
+            "reference_end": train_end,
             "test_start": test_start,
             "test_end": test_end,
             "purge_rows": purge,
             "embargo_rows": embargo,
-            "train_values": train_values,
+            "reference_values": train_values,
             "test_values": test_values,
-            "parameter_selection": "training_only_fit_then_freeze",
+            "parameter_selection": "predeclared_fixed_parameters_no_refit",
         }
         per_window.append(
             {
                 "window": index,
-                "return": sum(test_values),
-                "train_return": sum(train_values),
+                "return": math.prod(1 + value for value in test_values) - 1,
+                "reference_return": math.prod(1 + value for value in train_values) - 1,
                 "observations": len(test_values),
                 "test_observations": len(test_values),
                 "passed": bool(train_values) and bool(test_values) and sum(test_values) >= 0.0,
-                "train_observations": len(train_values),
+                "reference_observations": len(train_values),
                 "purged_observations": purge + embargo,
-                "fit_input_hash": canonical_hash(
+                "reference_input_hash": canonical_hash(
                     {
                         "candidate_id": context.get("candidate_id"),
                         "window": index,
-                        "train_start": train_start,
-                        "train_end": train_end,
-                        "train_values": train_values,
+                        "reference_start": train_start,
+                        "reference_end": train_end,
+                        "reference_values": train_values,
                     }
                 ),
                 "test_input_hash": canonical_hash(
@@ -1860,7 +1928,7 @@ def _purged_walk_forward(
                 ),
                 "frozen_parameters": frozen_parameters,
                 "test_uses_frozen_parameters": True,
-                "train_fit_summary": {
+                "reference_window_summary": {
                     "mean_return": train_mean,
                     "return_volatility": train_deviation,
                 },
@@ -1884,8 +1952,8 @@ def _purged_walk_forward(
                     {
                         "candidate_id": context.get("candidate_id"),
                         "window": index,
-                        "train_start": train_start,
-                        "train_end": train_end,
+                        "reference_start": train_start,
+                        "reference_end": train_end,
                         "parameters": frozen_parameters,
                     }
                 ),
@@ -1899,6 +1967,8 @@ def _purged_walk_forward(
         field="minimum_walk_forward_pass_fraction",
     )
     return {
+        "method": "fixed_parameter_temporal_validation/v1",
+        "model_fits_performed": 0,
         "passed": len(per_window) >= windows and passed / len(per_window) >= minimum_fraction,
         "window_count": len(per_window),
         "pass_fraction": passed / len(per_window) if per_window else 0.0,
@@ -2025,53 +2095,6 @@ def _derived_regime_labels(rows: list[Any] | tuple[Any, ...]) -> list[str]:
     return labels
 
 
-def _closed_signal_episodes(signals: Sequence[float]) -> int:
-    episodes = 0
-    previous = 0.0
-    for current in signals:
-        if abs(previous) > 1e-12 and (abs(current) <= 1e-12 or (previous > 0.0) != (current > 0.0)):
-            episodes += 1
-        previous = current
-    if abs(previous) > 1e-12:
-        episodes += 1
-    return episodes
-
-
-def _independent_return_observations(
-    signals: Sequence[float], returns: Sequence[float]
-) -> list[float]:
-    """Aggregate marked returns into independent holding episodes.
-
-    A bar return is not an independent trade observation. Returns stay in one
-    episode until the position goes flat or changes direction. A terminal
-    liquidation-cost return is assigned to the open episode so the evidence
-    cannot omit the cost of closing terminal exposure.
-    """
-
-    if not signals or not returns:
-        return []
-    episodes: list[float] = []
-    current_direction = 0
-    current_return = 0.0
-    for index, value in enumerate(returns):
-        signal = float(signals[min(index, len(signals) - 1)])
-        direction = 1 if signal > 1e-12 else -1 if signal < -1e-12 else 0
-        if direction == 0:
-            if current_direction:
-                episodes.append(current_return)
-                current_direction = 0
-                current_return = 0.0
-            continue
-        if current_direction and direction != current_direction:
-            episodes.append(current_return)
-            current_return = 0.0
-        current_direction = direction
-        current_return += float(value)
-    if current_direction:
-        episodes.append(current_return)
-    return episodes
-
-
 def _correlation(left: list[float], right: list[float]) -> float | None:
     pairs = tuple(zip(left, right, strict=False))
     if len(pairs) < 2:
@@ -2135,6 +2158,37 @@ def _drift_checks(context: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _monte_carlo_blocks(candidate, context, values):
+    from src.research.stress import RETURN_BLOCK_METHOD, return_block_permutations
+
+    if len(values) < 4:
+        return {"status": "unavailable", "reason": "insufficient_return_blocks"}
+    block_length = min(len(values) // 2, max(2, math.ceil(len(values) ** (1 / 3))))
+    seed = int(candidate.candidate_id[7:23], 16)
+    drawdowns = [
+        _maximum_drawdown(path)
+        for path in return_block_permutations(values, block_length=block_length, seed=seed)
+    ]
+    maximum = max(drawdowns)
+    tail = _tail_loss(values)
+    return {
+        "method": RETURN_BLOCK_METHOD,
+        "sample_unit": "economic_return_interval",
+        "block_length": block_length,
+        "block_length_rule": "capped_ceiling_cube_root_observations",
+        "seed": seed,
+        "iterations": len(drawdowns),
+        "maximum_drawdown": maximum,
+        "tail_loss": tail,
+        "tail_quantile": 0.05,
+        "tail_loss_basis": "unchanged_interval_distribution",
+        "input_hash": canonical_hash(values),
+        "qualification_authority": False,
+        "passed": maximum <= float(context.get("maximum_monte_carlo_drawdown", 1.0))
+        and tail <= float(context.get("maximum_monte_carlo_tail_loss", 1.0)),
+    }
+
+
 def _maximum_drawdown(values: list[float]) -> float:
     equity = peak = 1.0
     maximum = 0.0
@@ -2167,21 +2221,16 @@ def _quantile(values: list[float], probability: float) -> float:
 
 def _negative_control_evidence(
     *,
-    signals: list[float],
-    returns: list[float],
+    observations: int,
     candidate_return: float,
     control_returns: Any = None,
     controls: tuple[str, ...] = (),
     instrument_scope: tuple[str, ...] = (),
     seed_material: object = "negative-control",
-) -> dict[str, dict[str, float | int | bool | str | None]]:
-    aligned = min(len(signals), len(returns))
-    signals, returns = signals[:aligned], returns[:aligned]
+) -> dict[str, dict[str, Any]]:
     supplied = control_returns if isinstance(control_returns, Mapping) else {}
-    results: dict[str, dict[str, float | int | bool | str | None]] = {}
+    results: dict[str, dict[str, Any]] = {}
     for name in controls:
-        numeric = _numeric_series(supplied.get(name))
-        comparable = numeric[:aligned]
         if (
             name in {"cross_instrument", "predeclared_universe_holdout"}
             and len(set(instrument_scope)) < 2
@@ -2194,46 +2243,81 @@ def _negative_control_evidence(
                 "reason": "single_instrument_scope",
             }
             continue
-        method = "dataset"
-        if not comparable:
-            derived = derive_control_returns(
-                name,
-                signals,
-                returns,
-                seed_material=seed_material,
-                instrument_scope=instrument_scope,
-            )
-            if derived is not None:
-                comparable, method = derived
-                comparable = comparable[:aligned]
-        if not comparable:
+        comparable = _numeric_series(supplied.get(name))
+        if not comparable or len(comparable) != observations:
             results[name] = {
                 "status": "unavailable",
                 "passed": False,
-                "observations": 0,
+                "observations": len(comparable),
                 "control_return": None,
-                "source": "dataset",
-                "input_hash": None,
-                "reason": "control_dataset_unavailable",
+                "reason": "aligned_economic_control_unavailable",
             }
             continue
-        control_return = sum(comparable) if comparable else None
+        control_return = math.prod(1 + value for value in comparable) - 1
+        method = "shared_execution_decision_control/v1"
         results[name] = {
-            "passed": bool(comparable)
-            and control_return is not None
-            and candidate_return >= control_return,
+            "passed": candidate_return >= control_return,
             "observations": len(comparable),
             "control_return": control_return,
-            "source": "dataset" if method == "dataset" else "derived_immutable_inputs",
+            "source": "canonical_economic_path",
             "method": method,
             "input_hash": control_identity(
-                name,
-                comparable,
-                seed_material=seed_material,
-                method=method,
+                name, comparable, seed_material=seed_material, method=method
             ),
         }
     return results
+
+
+def _economic_control_returns(candidate, context, signals) -> dict[str, list[float]]:
+    model = candidate.definition.signal_model
+    registered = model.get("registered_strategy")
+    seed = {"candidate": candidate.candidate_id, "datasets": context.get("dataset_snapshot_ids")}
+    if isinstance(registered, str) and context.get("market_frame") is not None:
+        return _registered_control_returns(candidate, context, registered, seed)
+    rows = context.get("feature_rows")
+    rule = model.get("rule")
+    if not isinstance(rows, list | tuple) or not isinstance(rule, Mapping):
+        return {}
+    controls = derive_control_signals(signals, seed_material=seed)
+    ablated = [{**row, **dict.fromkeys(_rule_features(rule), 0.0)} for row in rows]
+    controls["feature_ablation"] = list(TypedRuleBehaviour(rule).generate_signals(ablated))
+    prepared = {**context, "btc_target_states": model.get("target_states")}
+    return {name: _decision_returns(prepared, values) for name, values in controls.items()}
+
+
+def _rule_features(rule) -> set[str]:
+    if isinstance(rule, Mapping):
+        names = {rule["feature"]} if isinstance(rule.get("feature"), str) else set()
+        return names.union(*(_rule_features(value) for value in rule.values()))
+    if isinstance(rule, list | tuple):
+        return set().union(*(_rule_features(value) for value in rule))
+    return set()
+
+
+def _registered_control_returns(candidate, context, registered, seed):
+    behaviour = RegisteredStrategyBehaviour(
+        name=registered,
+        parameters=candidate.definition.signal_model.get("parameters", {}),
+        source_hash=candidate.definition.source_hash,
+        position_model=candidate.definition.position_model,
+    )
+    rows = behaviour.frame_payload(context["market_frame"])
+    warmup = context.get("warmup_market_frame", ())
+    history = (*warmup, *rows)
+    signals = behaviour.generate_signals(history)[len(warmup) :]
+    controls = derive_control_signals(signals, seed_material=seed)
+    anchor = float(history[0]["close"])
+    ablated = [
+        {**row, **dict.fromkeys(("open", "high", "low", "close"), anchor)} for row in history
+    ]
+    controls["feature_ablation"] = list(behaviour.generate_signals(ablated)[len(warmup) :])
+    result = {}
+    for name, values in controls.items():
+        path = position_path(rows, [int(value) for value in values], behaviour.position_rules())
+        result[name] = _decision_returns(
+            context, list(path.decisions), actions=[item.__dict__ for item in path.actions]
+        )
+    return result
 
 
 def _negative_control_names(candidate: Candidate, context: Mapping[str, Any]) -> tuple[str, ...]:
@@ -2374,8 +2458,8 @@ def execute_registered_python(candidate: Candidate, context: Mapping[str, Any]) 
         raise ExecutorError("registered Python execution requires a canonical market_frame")
     try:
         behaviour = RegisteredStrategyBehaviour.from_definition(candidate.definition)
-        signals = behaviour.generate_signals(frame)
-        parity = behaviour.parity_receipt(frame)
+        parity = behaviour.parity_receipt(frame, warmup=context.get("warmup_market_frame", ()))
+        signals = parity["signals"]
     except StrategyBehaviourError as exc:
         raise ExecutorError(str(exc)) from exc
     return _measured_result(
@@ -2385,6 +2469,10 @@ def execute_registered_python(candidate: Candidate, context: Mapping[str, Any]) 
             "behaviour_hash": behaviour.behaviour_hash,
             "behaviour_input_hash": parity["input_hash"],
             "parity_receipt": parity,
+            "position_actions": parity["position_actions"],
+            "causality_valid": prefix_invariant(
+                behaviour.generate_signals, behaviour.frame_payload(frame)
+            ),
         },
         signals,
     )
@@ -2416,6 +2504,7 @@ def execute_generated_dsl(candidate: Candidate, context: Mapping[str, Any]) -> E
             **context,
             "behaviour_hash": behaviour.behaviour_hash,
             "parity_receipt": parity,
+            "causality_valid": prefix_invariant(behaviour.generate_signals, rows),
             **(
                 {
                     "btc_target_fractions": target_fractions,
@@ -2449,19 +2538,22 @@ def execute_machine_learning(candidate: Candidate, context: Mapping[str, Any]) -
         or not isinstance(features, Mapping)
     ):
         raise ExecutorError("machine-learning execution needs loaded frozen model inputs")
-    output = model.evaluate(features)
+    vectors = _ml_feature_vectors(context, model, features)
+    outputs = tuple(model.evaluate(vector) for vector in vectors)
+    output = outputs[-1]
     behaviour_hash = behaviour_hash_for_definition(candidate.definition)
     parity_payload = {
         "schema": "machine_learning_parity/v1",
         "behaviour_hash": behaviour_hash,
-        "input_hash": output.feature_vector_hash,
-        "output_hash": canonical_hash(output),
-        "signal": output.score,
+        "input_hash": canonical_hash([item.feature_vector_hash for item in outputs]),
+        "output_hash": canonical_hash(outputs),
+        "signals": [item.score for item in outputs],
     }
     return _measured_result(
         candidate,
         {
             **context,
+            "signals": [item.score for item in outputs],
             "behaviour_hash": behaviour_hash,
             "parity_receipt": {
                 **parity_payload,
@@ -2470,6 +2562,22 @@ def execute_machine_learning(candidate: Candidate, context: Mapping[str, Any]) -
         },
         output,
     )
+
+
+def _ml_feature_vectors(
+    context: Mapping[str, Any], model: Any, latest: Mapping[str, Any]
+) -> tuple[Mapping[str, Any], ...]:
+    rows = context.get("feature_rows")
+    if rows is None:
+        rows = _frame_rows(context)
+    if not isinstance(rows, list | tuple) or not rows:
+        if len(_numeric_series(context.get("returns"))) > 1:
+            raise ExecutorError("historical ML evaluation requires per-timestamp feature vectors")
+        return (latest,)
+    names = tuple(model.feature_names)
+    if not all(isinstance(row, Mapping) and all(name in row for name in names) for row in rows):
+        raise ExecutorError("historical ML rows do not satisfy the frozen feature manifest")
+    return tuple({name: row[name] for name in names} for row in rows)
 
 
 def execute_cross_sectional(candidate: Candidate, context: Mapping[str, Any]) -> ExecutionResult:
@@ -2535,6 +2643,11 @@ def _execute_semantic(candidate: Candidate, context: Mapping[str, Any]) -> Execu
         instrument_id=instrument_id,
     )
     measured_context = {**context, **series_context}
+    if series_context.get("futures_events"):
+        measured_context["initial_cash"] = _semantic_initial_cash(context)
+        measured_context["futures_events"] = _semantic_execution_costs(
+            series_context["futures_events"], context
+        )
     if series_outputs:
         parity_payload["series_output_hashes"] = [canonical_hash(item) for item in series_outputs]
         history_payload = context.get(
@@ -2683,45 +2796,16 @@ def _semantic_series_result(
     *,
     signals: list[float],
 ) -> tuple[dict[str, Any], tuple[Any, ...]]:
-    if not returns:
+    if not events:
         return {}, tuple(outputs)
     return {
         "signals": [*signals, signals[-1] if signals else 0.0],
         "returns": returns,
         "futures_events": events,
-        "closed_trades": _closed_semantic_episodes(outputs),
-        "effective_independent_episodes": len(returns),
         "trading_days": len(
             {str(item["information_time"])[:10] for item in inputs if item.get("information_time")}
         ),
     }, tuple(outputs)
-
-
-def _closed_semantic_episodes(outputs: Sequence[Any]) -> int:
-    positions: dict[str, float] = {}
-    closed = 0
-    for output in outputs:
-        targets = getattr(output, "target_fractions", None) or getattr(
-            output, "target_notionals", None
-        )
-        if not isinstance(targets, Mapping):
-            continue
-        seen = set()
-        for instrument_id, raw_target in targets.items():
-            instrument = str(instrument_id)
-            target = float(raw_target)
-            previous = positions.get(instrument, 0.0)
-            if abs(previous) > 1e-12 and (
-                abs(target) <= 1e-12 or (previous > 0.0) != (target > 0.0)
-            ):
-                closed += 1
-            positions[instrument] = target
-            seen.add(instrument)
-        for instrument in set(positions) - seen:
-            if abs(positions[instrument]) > 1e-12:
-                closed += 1
-                positions[instrument] = 0.0
-    return closed
 
 
 def _semantic_initial_cash(context: Mapping[str, Any]) -> float:
@@ -2766,9 +2850,11 @@ def _append_semantic_marks(
     prices: Mapping[str, Any],
     timestamp_value: str,
 ) -> None:
-    for instrument in positions:
+    for instrument, quantity in positions.items():
         price = _semantic_price(prices.get(instrument))
         if price is None:
+            if abs(quantity) > 1e-12:
+                raise ExecutorError(f"missing mark for held semantic instrument: {instrument}")
             continue
         events.append(
             {
@@ -2789,10 +2875,11 @@ def _append_semantic_targets(
     *,
     initial_cash: float,
 ) -> None:
-    for instrument, raw_target in targets.items():
+    for instrument in sorted(set(targets) | set(positions)):
+        raw_target = targets.get(instrument, 0.0)
         price = _semantic_price(prices.get(instrument))
         if price is None:
-            continue
+            raise ExecutorError(f"missing execution price for semantic instrument: {instrument}")
         target_quantity = float(raw_target) * initial_cash / price
         instrument_id = str(instrument)
         delta = target_quantity - positions.get(instrument_id, 0.0)
@@ -2810,6 +2897,23 @@ def _append_semantic_targets(
                 }
             )
         positions[instrument_id] = target_quantity
+
+
+def _semantic_execution_costs(
+    events: Sequence[Mapping[str, Any]], context: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    fee = _nonnegative_rate(context.get("fee_bps", 0.0), field="fee_bps") / 10_000
+    slip = _nonnegative_rate(context.get("slippage_bps", 0.0), field="slippage_bps") / 10_000
+    result = []
+    for event in events:
+        row = dict(event)
+        if row["type"] == "fill":
+            direction = 1 if row["side"] == "buy" else -1
+            row["price"] *= 1 + direction * slip
+            row["fee"] = row["quantity"] * row["price"] * fee
+            row["fee_asset"] = "USDT"
+        result.append(row)
+    return result
 
 
 def _semantic_price(value: Any) -> float | None:

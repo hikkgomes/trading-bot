@@ -1,4 +1,5 @@
 [Unit]
+RequiresMountsFor=/opt/trading-bot/data /opt/trading-bot/runtime/backups
 Description=Trading platform %i backup
 After=network-online.target postgresql.service
 Wants=network-online.target
@@ -8,6 +9,7 @@ Requires=postgresql.service
 Type=oneshot
 User=trading-runtime
 Group=trading-runtime
+Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/numba-cache
 WorkingDirectory=/opt/trading-bot
 EnvironmentFile=/etc/trading-platform/backup.env
 ExecStart=/opt/trading-bot/.venv-runtime/bin/python -m src.services.backup_service --config /opt/trading-bot/config/platform.json --mode %i
@@ -15,4 +17,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/trading-bot/runtime/backups
+ReadWritePaths=/opt/trading-bot/runtime/backups /opt/trading-bot/runtime/numba-cache
+Slice=trading-platform-background.slice
+Nice=10
+IOSchedulingClass=idle

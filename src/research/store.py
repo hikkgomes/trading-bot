@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import column, insert, select, table, update
 from sqlalchemy.engine import Engine
 
 from src.data.database import (
@@ -17,12 +17,18 @@ from src.data.database import (
     strategy_version,
     thesis_trial,
     validation_result,
+    validation_stage,
 )
 from src.domain._codec import canonical_hash, json_value, timestamp, to_primitive
 from src.domain.strategies import StrategyDefinition, StrategySourceType
 from src.research.coordinator import Candidate, CandidateState, ResearchResult
 from src.research.datasets import CandidateDatasetPlan
+from src.research.economic_series import ECONOMIC_ENGINE_VERSION
 from src.strategies.behaviour import behaviour_hash_for_definition
+
+_ADAPTIVE_CANDIDATE = table(
+    "adaptive_candidate", *(column(item.name, item.type) for item in experiment.columns)
+)
 
 
 def _mapping(value: object, *, field: str) -> Mapping[str, Any]:
@@ -56,6 +62,7 @@ def _definition_from_dict(payload: dict[str, object]) -> StrategyDefinition:
 class SqlResearchStore:
     def __init__(self, engine: Engine):
         self.engine = engine
+        self.candidates = _ADAPTIVE_CANDIDATE if engine.dialect.name == "postgresql" else experiment
 
     def save_candidate(self, candidate: Candidate) -> None:
         definition_id = candidate.definition.definition_hash
@@ -113,13 +120,15 @@ class SqlResearchStore:
 
     def _existing_candidate_matches(self, connection, candidate: Candidate) -> bool:
         existing = (
-            connection.execute(select(experiment).where(experiment.c.id == candidate.candidate_id))
+            connection.execute(
+                select(self.candidates).where(self.candidates.c.id == candidate.candidate_id)
+            )
             .mappings()
             .first()
         )
         if existing is None:
             return False
-        if self._candidate_from_row(connection, existing) != candidate:
+        if self._candidate_from_row(connection, existing).candidate_id != candidate.candidate_id:
             raise ValueError("persisted research candidate does not match candidate hash")
         return True
 
@@ -168,9 +177,12 @@ class SqlResearchStore:
             "product_id": candidate.definition.product,
             "source_type": candidate.definition.source_type.value,
             "source_hash": candidate.definition.source_hash,
-            "definition": definition_payload,
         }
-        if any(existing_definition[field] != value for field, value in expected_definition.items()):
+        if (
+            any(existing_definition[field] != value for field, value in expected_definition.items())
+            or _definition_from_dict(existing_definition["definition"]).definition_hash
+            != definition_id
+        ):
             raise ValueError("persisted strategy definition does not match definition hash")
         existing_version = (
             connection.execute(
@@ -189,11 +201,9 @@ class SqlResearchStore:
                     payload={"definition_hash": definition_id},
                 )
             )
-        elif (
-            existing_version["definition_id"] != definition_id
-            or existing_version["version"] != candidate.definition.version
-            or existing_version["payload"] != {"definition_hash": definition_id}
-        ):
+        elif existing_version["definition_id"] != definition_id or existing_version["payload"] != {
+            "definition_hash": definition_id
+        }:
             raise ValueError("persisted strategy version does not match version hash")
 
     @staticmethod
@@ -251,19 +261,39 @@ class SqlResearchStore:
             "metadata": metadata_payload,
         }
 
+    def development_parents(self, *, limit: int = 20) -> tuple[Candidate, ...]:
+        if limit < 1:
+            raise ValueError("parent selection limit must be positive")
+        net_return = validation_stage.c.payload["evidence"]["cost_adjusted_return"].as_float()
+        statement = (
+            select(validation_stage.c.experiment_id)
+            .where(
+                validation_stage.c.stage == "development",
+                validation_stage.c.accepted.is_(True),
+                validation_stage.c.engine_version == ECONOMIC_ENGINE_VERSION,
+            )
+            .order_by(net_return.desc().nulls_last(), validation_stage.c.experiment_id)
+            .limit(limit)
+        )
+        with self.engine.connect() as connection:
+            ids = tuple(connection.execute(statement).scalars())
+        return tuple(self.get_candidate(candidate_id) for candidate_id in dict.fromkeys(ids))
+
     def load_candidates(self) -> tuple[Candidate, ...]:
         with self.engine.connect() as connection:
             rows = connection.execute(
-                select(experiment)
-                .where(experiment.c.state != "legacy_import")
-                .order_by(experiment.c.id)
+                select(self.candidates)
+                .where(self.candidates.c.state != "legacy_import")
+                .order_by(self.candidates.c.id)
             ).mappings()
             return tuple(self._candidate_from_row(connection, row) for row in rows)
 
     def get_candidate(self, candidate_id: str) -> Candidate:
         with self.engine.connect() as connection:
             row = (
-                connection.execute(select(experiment).where(experiment.c.id == candidate_id))
+                connection.execute(
+                    select(self.candidates).where(self.candidates.c.id == candidate_id)
+                )
                 .mappings()
                 .first()
             )

@@ -250,6 +250,7 @@ class PlatformLiveAuthority:
             product_id=product_id,
             artefact_hash=artefact_hash,
             at=approved_at,
+            research_configuration_hash=canonical_hash(self.configuration["research"]),
         )
         if forward is None:
             raise PlatformLiveAuthorityError(
@@ -419,6 +420,8 @@ class PlatformLiveAuthority:
                 assigned_by=assigned_by.strip(),
                 assignment_reason="explicit operator-approved live canary",
                 payload={
+                    "capital_limit_currency": "USDT",
+                    "risk_budget_unit": "quote_notional",
                     "instrument_ids": [instrument_id],
                     "sleeve_id": sleeve_id,
                     "approval_id": expected_approval_id,
@@ -604,6 +607,8 @@ class PlatformLiveAuthority:
                 assigned_by=assigned_by.strip(),
                 assignment_reason="explicit operator-approved full live",
                 payload={
+                    "capital_limit_currency": "USDT",
+                    "risk_budget_unit": "quote_notional",
                     "instrument_ids": [instrument_id],
                     "sleeve_id": sleeve_id,
                     "approval_id": expected_approval_id,
@@ -1069,6 +1074,7 @@ class PlatformLiveAuthority:
             product_id=str(product["product_id"]),
             artefact_hash=str(artefact["artefact_hash"]),
             at=at,
+            research_configuration_hash=canonical_hash(self.configuration["research"]),
         )
         if (
             row is None

@@ -14,42 +14,29 @@ class NegativeControlError(ValueError):
     """A negative-control input cannot be evaluated safely."""
 
 
-def derive_control_returns(
-    name: str,
-    signals: Sequence[float],
-    returns: Sequence[float],
-    *,
-    seed_material: object,
-    instrument_scope: Sequence[str] = (),
-) -> tuple[list[float], str] | None:
-    """Return a control PnL series and method, or ``None`` when inapplicable.
-
-    Controls are calculated from the same immutable signal and market-return
-    rows as the candidate.  They are not fabricated zero series, and their
-    deterministic seed is part of the evidence identity.
-    """
-
-    values = _aligned_values(signals, returns)
-    if values is None:
-        return None
-    signal_values, return_values = values
-    if name in {"cross_instrument", "predeclared_universe_holdout"}:
-        return None
-    if name == "feature_ablation":
-        return [0.0] * len(return_values), "feature_ablation_v1"
-    if name == "parameter_neighbourhood":
-        shifted = _rotate(signal_values, 1)
-        return _pnl(shifted, return_values), "parameter_neighbourhood_shift_v1"
-    if name == "placebo_event_times":
-        shifted = _rotate(signal_values, max(1, len(signal_values) // 3))
-        return _pnl(shifted, return_values), "placebo_event_times_v1"
-    if name == "block_permutation":
-        permuted = _block_permutation(return_values, seed_material=seed_material)
-        return _pnl(signal_values, permuted), "block_permutation_v1"
-    if name == "synthetic_autocorrelated_null":
-        synthetic = _synthetic_autocorrelated(return_values, seed_material=seed_material)
-        return _pnl(signal_values, synthetic), "synthetic_autocorrelated_null_v1"
-    return None
+def derive_control_signals(
+    signals: Sequence[float], *, seed_material: object
+) -> dict[str, list[float]]:
+    """Perturb entry timing while preserving execution costs and holding rules."""
+    values = [float(value) for value in signals]
+    if len(values) < 3:
+        return {}
+    if not all(math.isfinite(value) for value in values):
+        raise NegativeControlError("control entry pulses must be finite")
+    noise = _synthetic_autocorrelated(values, seed_material=seed_material)
+    order = sorted(range(len(noise)), key=lambda index: noise[index])
+    null = [0.0] * len(values)
+    shorts = sum(value < 0 for value in values)
+    longs = sum(value > 0 for value in values)
+    for index in order[:shorts]:
+        null[index] = -1.0
+    for index in order[len(order) - longs :]:
+        null[index] = 1.0
+    return {
+        "placebo_event_times": _rotate(values, max(1, len(values) // 3)),
+        "block_permutation": _block_permutation(values, seed_material=seed_material),
+        "synthetic_autocorrelated_null": null,
+    }
 
 
 def control_identity(
@@ -69,23 +56,6 @@ def control_identity(
             "returns": list(values),
         }
     )
-
-
-def _aligned_values(
-    signals: Sequence[float], returns: Sequence[float]
-) -> tuple[list[float], list[float]] | None:
-    aligned = min(len(signals), len(returns))
-    if aligned < 3:
-        return None
-    signal_values = [float(value) for value in signals[:aligned]]
-    return_values = [float(value) for value in returns[:aligned]]
-    if not all(math.isfinite(value) for value in (*signal_values, *return_values)):
-        raise NegativeControlError("negative-control inputs must be finite")
-    return signal_values, return_values
-
-
-def _pnl(signals: Sequence[float], returns: Sequence[float]) -> list[float]:
-    return [float(signal) * float(value) for signal, value in zip(signals, returns, strict=True)]
 
 
 def _rotate(values: Sequence[float], offset: int) -> list[float]:

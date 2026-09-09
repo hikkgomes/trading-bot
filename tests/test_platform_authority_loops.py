@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
 from sqlalchemy import func, select
 
 from src.data.binance_market import normalise_public_event
@@ -219,6 +220,14 @@ def test_portfolio_market_source_derives_realised_volatility_from_closes(tmp_pat
                 "kind": "market_data_input",
                 "product_id": "active_income",
                 "instrument_id": "binance:futures:BTCUSDT",
+                "source_event_type": "candle",
+                "source_candle_closed": True,
+                "source_timeframe": "1m",
+                "source_close_time_ms": int(
+                    dt.datetime.fromisoformat(observed_at).timestamp() * 1000
+                )
+                - 1,
+                "availability_time": observed_at,
                 "values": {
                     "close": close,
                     "spread_bps": 1.0,
@@ -238,7 +247,9 @@ def test_portfolio_market_source_derives_realised_volatility_from_closes(tmp_pat
     market, market_at = source._market("active_income", "2026-08-24T00:02:00+00:00")
 
     assert market_at == "2026-08-24T00:02:00+00:00"
-    assert market["binance:futures:BTCUSDT"]["volatility"] > 0.0
+    assert market["binance:futures:BTCUSDT"]["volatility"] == pytest.approx(
+        abs((103 / 101 - 1) - 0.01) / 2
+    )
 
 
 def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path) -> None:
@@ -313,6 +324,26 @@ def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path
             },
         ),
     )
+    candle = market_events[0].payload["data"]
+    history = tuple(
+        normalise_public_event(
+            market="futures",
+            stream="btcusdt@kline_1m",
+            receive_timestamp=NOW,
+            payload={
+                **candle,
+                "E": event_time_ms - offset * 60000,
+                "k": {
+                    **candle["k"],
+                    "t": event_time_ms - offset * 60000 - 59999,
+                    "T": event_time_ms - offset * 60000,
+                    "c": close,
+                },
+            },
+        )
+        for offset, close in ((2, "100"), (1, "101"))
+    )
+    market_events = (*history, *market_events)
     for index, event in enumerate(market_events):
         queue.enqueue(
             job_id=f"normal-market-event-{index}",
@@ -332,9 +363,8 @@ def test_normal_market_and_account_events_publish_all_portfolio_sources(tmp_path
         snapshot_store=SqlRiskSnapshotStore(database.engine),
         product_ids_by_market={"futures": ("active_income",)},
     )
-    assert writer.run_once(now=NOW)["reason_code"] == "market_event_written"
-    assert writer.run_once(now=NOW)["reason_code"] == "market_event_written"
-    assert writer.run_once(now=NOW)["reason_code"] == "market_event_written"
+    for _event in market_events:
+        assert writer.run_once(now=NOW)["reason_code"] == "market_event_written"
     queue.enqueue(
         job_id="normal-account-event",
         name="accounting_event",

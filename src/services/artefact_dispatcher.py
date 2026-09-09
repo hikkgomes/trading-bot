@@ -14,6 +14,7 @@ from src.strategies.behaviour import (
     StrategyBehaviourError,
     TypedRuleBehaviour,
     behaviour_hash_for_definition,
+    economic_parity_receipt,
 )
 from src.strategies.semantic import (
     SEMANTIC_STRATEGIES,
@@ -73,6 +74,9 @@ class ArtefactDispatcher:
                 f"no production evaluator is registered for source type {source_type!r}"
             )
         values = dict(evaluator(features, artefact))
+        values["behaviour_hash"] = behaviour_hash_for_definition(definition)
+        if isinstance(values.get("parity_receipt"), Mapping):
+            values["parity_receipt"] = economic_parity_receipt(definition, values["parity_receipt"])
         required = {
             "direction",
             "score",
@@ -124,7 +128,7 @@ def _verify_artefact(artefact: Mapping[str, Any]) -> None:
 
 
 def _forecast(
-    score: float, artefact: Mapping[str, Any], *, confidence: float = 0.7
+    score: float, artefact: Mapping[str, Any], *, confidence: float | None = None
 ) -> Mapping[str, Any]:
     if not math.isfinite(score):
         raise ArtefactDispatchError("strategy score is not finite")
@@ -132,13 +136,18 @@ def _forecast(
     limits = artefact.get("position_limits")
     limits = limits if isinstance(limits, Mapping) else {}
     maximum = float(limits.get("maximum_position", limits.get("maximum_fraction", 0.1)))
+    position_model = _definition(artefact).get("position_model", {})
+    declared = float(position_model.get("maximum_position", maximum))
+    if not math.isfinite(declared) or not 0 <= declared <= 1:
+        raise ArtefactDispatchError("strategy maximum position must be an equity fraction")
+    maximum = min(maximum, declared)
     maximum = max(0.0, min(1.0, maximum))
     direction = "long" if signed > 0 else "short" if signed < 0 else "flat"
     return {
         "direction": direction,
         "score": abs(signed),
-        "expected_return": signed * float(limits.get("return_scale", 0.01)),
-        "confidence": max(0.0, min(1.0, confidence)),
+        "expected_return": None,
+        "confidence": confidence,
         "target_volatility": max(0.0, float(limits.get("target_volatility", 0.1))),
         "maximum_position": maximum if direction != "flat" else 0.0,
     }
@@ -191,7 +200,7 @@ def _registered_strategy_behaviour(
         behaviour = RegisteredStrategyBehaviour.from_definition(_definition(artefact))
         frame = features.get("market_frame")
         if frame is not None:
-            parity = behaviour.parity_receipt(frame)
+            parity = behaviour.parity_receipt(frame, features.get("prior_strategy_state"))
             signal = int(parity["signals"][-1]) if parity["signals"] else 0
             input_hash = behaviour.frame_input_hash(frame)
             input_status = "market_frame"
@@ -207,12 +216,14 @@ def _registered_strategy_behaviour(
     except (StrategyBehaviourError, KeyError, TypeError, ValueError) as exc:
         raise ArtefactDispatchError(str(exc)) from exc
     forecast = dict(_forecast(float(signal), artefact))
-    forecast["expected_return"] = float(signal) * float(forecast["target_volatility"])
     forecast["behaviour_hash"] = behaviour.behaviour_hash
     forecast["behaviour_input_hash"] = input_hash
     forecast["behaviour_input_status"] = input_status
     if frame is not None:
         forecast["parity_receipt"] = parity
+        forecast["position_rules"] = parity["position_rules"]
+        forecast["position_state"] = parity["position_state"]
+        forecast["entry_signal"] = parity["entry_signal"]
     return forecast
 
 
@@ -270,8 +281,8 @@ def _generated_dsl(features: Mapping[str, float], artefact: Mapping[str, Any]) -
             result = {
                 "direction": "long",
                 "score": 1.0,
-                "expected_return": signal * float(limits.get("return_scale", target_volatility)),
-                "confidence": 1.0,
+                "expected_return": None,
+                "confidence": None,
                 "target_volatility": target_volatility,
                 "maximum_position": target,
                 "btc_target_fraction": target,
@@ -308,7 +319,7 @@ def _machine_learning(
         float(weight) * _feature(features, str(name))
         for name, weight in zip(names, weights, strict=True)
     )
-    return _forecast(score, artefact, confidence=float(model.get("calibration", 0.7)))
+    return {**_forecast(score, artefact), "expected_return": score}
 
 
 def _semantic(features: Mapping[str, Any], artefact: Mapping[str, Any]) -> Mapping[str, Any]:

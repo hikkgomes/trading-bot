@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Protocol
 
-from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
+from src.domain._codec import canonical_hash, json_value, non_empty, timeframe_seconds, timestamp
 from src.domain.strategies import StrategyDefinition
 from src.research.datasets import CandidateDatasetPlan
 
@@ -46,6 +46,19 @@ def _validate_dataset_plan(candidate: Candidate) -> None:
         raise ValueError("candidate dataset plan product does not match definition")
     if set(candidate.dataset_snapshot_hashes) != set(candidate.dataset_plan.all_snapshot_ids):
         raise ValueError("candidate dataset identities do not match its typed plan")
+    timeframe = candidate.dataset_plan.timeframe
+    if timeframe is not None:
+        declared = candidate.definition.data_requirements.get("bars", timeframe)
+        if timeframe_seconds(str(declared)) != timeframe_seconds(timeframe):
+            raise ValueError("candidate timeframe differs from its frozen dataset plan")
+        object.__setattr__(
+            candidate,
+            "definition",
+            replace(
+                candidate.definition,
+                data_requirements={**candidate.definition.data_requirements, "bars": timeframe},
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -180,8 +193,9 @@ class ResearchCoordinator:
     def submit(self, candidate: Candidate) -> str:
         candidate_id = candidate.candidate_id
         existing = self._queue.get(candidate_id)
-        if existing is not None and existing != candidate:
-            raise ValueError("candidate hash collision")
+        if existing is not None:
+            # Retain the first registration's provenance for this executable/data identity.
+            return candidate_id
         if self.store is not None:
             claim_trial = getattr(self.store, "claim_trial", None)
             if claim_trial is not None:

@@ -1,4 +1,5 @@
 [Unit]
+RequiresMountsFor=/opt/trading-bot/data /opt/trading-bot/runtime/backups
 Description=Trading platform research process
 After=network-online.target postgresql.service trading-platform-migration.service
 Wants=network-online.target
@@ -11,6 +12,10 @@ Group=trading-research
 WorkingDirectory=/opt/trading-bot
 EnvironmentFile=/etc/trading-platform/research.env
 Environment=PYTHONUNBUFFERED=1
+Environment=TRADING_PLATFORM_AGENT_WORKTREE_ROOT=/opt/trading-bot/runtime/research/agent-worktrees
+Environment=GIT_CONFIG_COUNT=1
+Environment=GIT_CONFIG_KEY_0=safe.directory
+Environment=GIT_CONFIG_VALUE_0=/opt/trading-bot
 Environment=OMP_NUM_THREADS=2
 Environment=OPENBLAS_NUM_THREADS=2
 Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/research/numba-cache
@@ -24,7 +29,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/trading-bot/data/research /opt/trading-bot/data/artefacts /opt/trading-bot/runtime/research
+ReadWritePaths=/opt/trading-bot/data/research /opt/trading-bot/runtime/research
 ReadOnlyPaths=/opt/trading-bot/data/raw /opt/trading-bot/data/bars /opt/trading-bot/data/features
 Slice=trading-platform-background.slice
 

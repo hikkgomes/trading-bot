@@ -84,42 +84,6 @@ def test_rule_strategy_signals_and_backtest(name):
 
 
 # --------------------------------------------------------------------------- engine correctness
-def test_backtester_matches_search_engine():
-    """The framework engine must reproduce strategy_search.simulate_trades."""
-    from src.strategy_search import simulate_trades
-
-    df = _synth(2000, seed=11)
-    # Build a tf_15m_-prefixed frame for the search engine + a plain frame for ours.
-    tf = df.rename(columns={c: f"tf_15m_{c}" for c in ["open", "high", "low", "close"]})
-    tf = tf.reset_index()  # timestamp column
-
-    rng = np.random.default_rng(0)
-    mask = pd.Series(rng.random(len(df)) < 0.05, index=df.index)
-
-    cfg = BacktestConfig(
-        fee_bps=10, slippage_bps=2, take_profit=0.05, stop_loss=0.03, horizon_bars=96
-    )
-    search_trades = simulate_trades(
-        tf,
-        mask.reset_index(drop=True),
-        direction="long",
-        horizon_bars=96,
-        fee_bps=10,
-        slippage_bps=2,
-        take_profit=0.05,
-        stop_loss=0.03,
-        pnl_unit="usdt",
-    )
-
-    o = extract_ohlcv(df)
-    direction = np.where(mask.to_numpy(), 1, 0).astype(int)
-    ours = _simulate(o.open, o.high, o.low, o.close, direction, df.index, cfg)
-
-    assert len(ours) == len(search_trades)
-    ours_net = np.array([t["net_return"] for t in ours])
-    np.testing.assert_allclose(
-        ours_net, search_trades["net_return"].to_numpy(), rtol=1e-9, atol=1e-12
-    )
 
 
 def test_btc_pnl_unit_only_shorts_realise():

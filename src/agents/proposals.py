@@ -48,7 +48,8 @@ ALLOWED_FILE_ROOTS = (
 )
 FORBIDDEN_CODE_MARKERS = (
     "src.execution",
-    "src.run_bot",
+    "src.services.live_execution",
+    "src.services.platform_live_authority",
     "ccxt",
     "CcxtBroker",
     "BrokerExecutionVenue",

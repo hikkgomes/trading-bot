@@ -1,4 +1,5 @@
 [Unit]
+RequiresMountsFor=/opt/trading-bot/data /opt/trading-bot/runtime/backups
 Description=Trading platform PostgreSQL migration service
 After=network-online.target postgresql.service
 Wants=network-online.target
@@ -9,6 +10,7 @@ Type=oneshot
 RemainAfterExit=yes
 User=trading-platform-owner
 Group=trading-platform-owner
+Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/migration/numba-cache
 WorkingDirectory=/opt/trading-bot
 EnvironmentFile=/etc/trading-platform/migration.env
 Environment=PYTHONUNBUFFERED=1

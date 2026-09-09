@@ -16,6 +16,21 @@ from src.domain.orders import Fill, OrderIntent, OrderSide
 from src.domain.positions import Position
 
 
+def configured_paper_accounts(engine, configuration) -> dict[str, PaperAccountLedger]:
+    accounts = {row["account_id"]: row for row in configuration["accounts"]["accounts"]}
+    return {
+        product["product_id"]: PaperAccountLedger(
+            engine=engine,
+            account_id=product["account_id"],
+            product_id=product["product_id"],
+            accounting_asset=product["base_accounting_asset"],
+            starting_balances=accounts[product["account_id"]]["paper_starting_balances"],
+            starting_positions=accounts[product["account_id"]].get("paper_starting_positions", {}),
+        )
+        for product in configuration["products"]["products"]
+    }
+
+
 @dataclass(frozen=True)
 class PaperAccountState:
     account_id: str
@@ -50,6 +65,7 @@ class PaperAccountLedger:
         accounting_asset: str,
         starting_balances: Mapping[str, Any],
         starting_positions: Mapping[str, Any] | None = None,
+        connection=None,
     ) -> None:
         if not account_id or not product_id:
             raise ValueError("paper account identity is required")
@@ -66,7 +82,7 @@ class PaperAccountLedger:
         self.ledger = Ledger(
             product_id=product_id,
             accounting_asset=accounting_asset,
-            store=SqlLedgerStore(engine, product_id=product_id),
+            store=SqlLedgerStore(engine, product_id=product_id, connection=connection),
         )
 
     def _reload(self) -> None:
@@ -109,6 +125,7 @@ class PaperAccountLedger:
         return result
 
     def state(self) -> PaperAccountState | None:
+        self.ledger.reload()
         entries = self.ledger.entries
         for entry in reversed(entries):
             metadata = entry.metadata
@@ -245,15 +262,11 @@ class PaperAccountLedger:
         realised = 0.0
         if closing:
             quantity = min(abs(previous_position.quantity), abs(signed))
-            entry_price = float(
-                previous_position.metadata.get("reference_entry_price")
-                or previous_position.average_entry_price
-            )
-            reference_price = float(fill.metadata.get("reference_price") or fill.price)
+            entry_price = previous_position.average_entry_price
+            reference_price = fill.price
             direction = 1.0 if previous_position.quantity > 0 else -1.0
             realised = quantity * (reference_price - entry_price) * direction
-        slippage = float(fill.metadata.get("slippage_cost") or 0.0)
-        balances[quote] = balances.get(quote, 0.0) + realised - float(fill.fee) - slippage
+        balances[quote] = balances.get(quote, 0.0) + realised - float(fill.fee)
         _assert_nonnegative(balances)
 
 

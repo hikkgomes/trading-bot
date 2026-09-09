@@ -650,7 +650,10 @@ def test_live_recovery_worker_verifies_a_user_stream_reconnect_without_differenc
     database.dispose()
 
 
-def test_live_recovery_worker_runs_periodic_account_backfill_without_difference(tmp_path: Path):
+@pytest.mark.parametrize("history_complete", [True, False])
+def test_live_recovery_worker_runs_periodic_account_backfill_without_difference(
+    tmp_path: Path, history_complete
+):
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'account-backfill.sqlite3'}")
     database.create_schema()
     queue = DatabaseJobQueue(database.engine)
@@ -678,13 +681,22 @@ def test_live_recovery_worker_runs_periodic_account_backfill_without_difference(
             exchange_open_order_ids=set(),
         ),
         account_products={},
-        backfill_account=lambda _product_id, _at: {"recorded": 2},
+        backfill_account=lambda _product_id, _at: {
+            "recorded": 2,
+            "history_complete": history_complete,
+        },
     )
 
     result = worker.run_once(now=NOW)
 
-    assert result["reason_code"] == "live_account_backfill_completed"
-    assert result["backfill"] == {"recorded": 2}
+    assert result["reason_code"] == (
+        "live_account_backfill_completed" if history_complete else "income_history_pending"
+    )
+    assert result["backfill"] == {"recorded": 2, "history_complete": history_complete}
+    if not history_complete:
+        worker.backfill_account = lambda _product_id, _at: {"recorded": 0, "history_complete": True}
+        later = (dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=2)).isoformat()
+        assert worker.run_once(now=later)["reason_code"] == "live_account_backfill_completed"
     database.dispose()
 
 
@@ -1016,7 +1028,25 @@ def test_database_workers_claim_by_priority_and_resume_after_lease_expiry(tmp_pa
     assert recovered.attempt == 2
 
 
-def test_database_risk_worker_persists_all_six_scopes_and_aggregate(tmp_path: Path):
+@pytest.mark.parametrize(
+    "account_patch, expected_error",
+    [
+        ({}, None),
+        ({"account_id": "binance-spot-main"}, "assessed account"),
+        ({"account_id": None}, "no account identity"),
+        ({"product_id": "btc_accumulation"}, "another product"),
+        ({"canonical_state_id": "another-state"}, "one canonical state"),
+        ({"kind": "balances_risk_input"}, "wrong kind"),
+    ],
+)
+def test_database_risk_worker_persists_all_six_scopes_and_aggregate(
+    tmp_path: Path, account_patch, expected_error, monkeypatch
+):
+    from src.risk.engine import SqlRiskPolicyStore, SqlRiskSnapshotStore
+    from src.risk.policies import install_product_risk_policies
+    from src.services.config import load_split_configuration
+    from src.services.job_schemas import build_content_hash
+
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'platform.sqlite3'}")
     database.create_schema()
     queue = DatabaseJobQueue(database.engine)
@@ -1027,36 +1057,108 @@ def test_database_risk_worker_persists_all_six_scopes_and_aggregate(tmp_path: Pa
         capabilities=("risk_assessment",),
         observed_at=NOW,
     )
+    configuration = load_split_configuration(Path(__file__).resolve().parents[1] / "config")
+    policies = install_product_risk_policies(
+        SqlRiskPolicyStore(database.engine),
+        risk_configuration=configuration["risk"],
+        products={item["product_id"]: item for item in configuration["products"]["products"]},
+    )
     blueprint = accepted_risk_assessment()
-    queue.enqueue(
-        job_id="risk-job-1",
-        name="risk_assessment",
-        payload={
+    scopes = {
+        item.scope: {"decision_id": f"risk-job-1:{item.scope}", "inputs": dict(item.input_snapshot)}
+        for item in blueprint.decisions
+    }
+    snapshots = SqlRiskSnapshotStore(database.engine)
+    state_id = snapshots.save(
+        {
+            "kind": "canonical_portfolio_risk_state",
             "product_id": "active_income",
-            "assessment_id": "risk-assessment-1",
-            **{
-                item.scope: {
-                    "decision_id": f"risk-job-1:{item.scope}",
-                    "inputs": dict(item.input_snapshot),
-                    "limits": dict(item.limits),
-                }
-                for item in blueprint.decisions
-            },
+            "risk_policy_ids": [policies["active_income"]],
         },
-        available_at=NOW,
+        created_at=NOW,
     )
+    snapshot_ids = {}
+    for field, kind, selected_scopes in (
+        (
+            "target_position_snapshot_id",
+            "target_position",
+            ("strategy", "instrument", "sleeve", "product"),
+        ),
+        ("account_snapshot_id", "account_risk_input", ("account",)),
+        ("positions_snapshot_id", "positions_risk_input", ()),
+        ("balances_snapshot_id", "balances_risk_input", ()),
+        ("market_data_snapshot_id", "global_risk_input", ("global",)),
+    ):
+        record = {
+            "kind": kind,
+            "product_id": "active_income",
+            "account_id": "binance-futures-main",
+            "canonical_state_id": state_id,
+            "scopes": {scope: scopes[scope] for scope in selected_scopes},
+        }
+        if len(selected_scopes) == 1:
+            scope = selected_scopes[0]
+            record.pop("scopes")
+            record.update(scope=scope, **scopes[scope])
+        if field == "account_snapshot_id":
+            record.update(account_patch)
+        snapshot_ids[field] = snapshots.save(record, created_at=NOW)
+    payload = {
+        "product_id": "active_income",
+        "assessment_id": "risk-assessment-1",
+        "event_id": "risk-event-1",
+        "evaluated_at": NOW,
+        "producer_identity": "linux-risk",
+        "risk_policy_ids": [policies["active_income"]],
+        **snapshot_ids,
+    }
+    payload["content_hash"] = build_content_hash(payload)
+    queue.enqueue(job_id="risk-job-1", name="risk_assessment", payload=payload, available_at=NOW)
     store = SqlRiskDecisionStore(database.engine)
-    worker = DatabaseRiskWorker(
-        queue=queue,
-        worker_id="linux-risk",
-        store=store,
-    )
+    worker = DatabaseRiskWorker(queue=queue, worker_id="linux-risk", store=store)
+    if expected_error is None:
+        append = store.append
+        interrupted = False
 
-    result = worker.run_once(now=NOW)
+        def interrupt_append(decision):
+            nonlocal interrupted
+            append(decision)
+            if len(store.read()) == 3 and not interrupted:
+                interrupted = True
+                raise RuntimeError("injected interruption after persisted risk component")
 
-    assert result["reason_code"] == "risk_assessment_accepted"
-    assert store.assessment("risk-assessment-1").accepted is True
-    assert len(store.read()) == 7
+        monkeypatch.setattr(store, "append", interrupt_append)
+        failed = worker.run_once(now=NOW)
+        assert failed["reason_code"] == "risk_assessment_failed"
+        assert "injected interruption" in failed["error"]
+        assert len(store.read()) == 3
+        original_components = store.read()
+        monkeypatch.setattr(store, "append", append)
+        from types import SimpleNamespace
+
+        from src.risk import _common
+
+        class LaterClock(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return dt.datetime(2099, 1, 1, tzinfo=dt.UTC)
+
+        monkeypatch.setattr(_common, "dt", SimpleNamespace(datetime=LaterClock, UTC=dt.UTC))
+        retry_at = (dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=61)).isoformat()
+        result = worker.run_once(now=retry_at)
+    else:
+        result = worker.run_once(now=NOW)
+    if expected_error:
+        assert result["reason_code"] == "risk_assessment_failed"
+        assert expected_error in result["error"]
+        assert store.read() == ()
+    else:
+        assert result["reason_code"] == "risk_assessment_accepted", result
+        assert store.assessment("risk-assessment-1").accepted is True
+        assert len(store.read()) == 7
+        assert all(item in store.read() for item in original_components)
+        assert {item.evaluated_at for item in store.read()} == {NOW}
+    database.dispose()
 
 
 def test_decision_trace_requires_reason_for_first_blocked_stage():
@@ -1344,8 +1446,11 @@ def test_realised_pnl_and_slippage_reconcile_without_double_counting(tmp_path: P
     )
 
     effects = {entry.metadata["kind"]: entry for entry in ledger.entries[1:]}
-    assert effects["realised_pnl"].metadata["pnl_effect"] == "10.00"
-    assert ledger.nav() == Decimal("10007.9")
+    assert float(effects["realised_pnl"].metadata["pnl_effect"]) == pytest.approx(7.9)
+    assert float(ledger.nav()) == pytest.approx(10007.9)
+    slippage = [entry for entry in ledger.entries if entry.metadata.get("kind") == "slippage"]
+    assert sum(float(entry.metadata["cost"]) for entry in slippage) == pytest.approx(2.1)
+    assert all(entry.metadata["pnl_effect"] == "0" for entry in slippage)
 
 
 def test_active_income_supervisor_records_exact_no_forecast_cause(tmp_path: Path):
@@ -2319,6 +2424,7 @@ def test_user_stream_recovers_live_partial_fills_into_orders_positions_and_accou
         ledgers={"active_income": ledger},
         trace_store=SqlDecisionTraceStore(database.engine),
         account_products={"binance-futures-main": "active_income"},
+        account_environments={"binance-futures-main": "testnet"},
     )
 
     first = worker.run_once(now=NOW)
@@ -3544,7 +3650,9 @@ def test_portfolio_source_builds_continuous_btc_nav_and_passive_benchmark(tmp_pa
 
     assert second is not None
     assert second.nav == pytest.approx(50 / 120 + 0.5)
-    assert second.passive_benchmark_nav == pytest.approx(1.2)
+    assert first.passive_benchmark_nav == pytest.approx(1.0)
+    assert second.passive_benchmark_nav == pytest.approx(1.0)
+    assert second.nav - second.passive_benchmark_nav == pytest.approx(-1 / 12)
 
 
 def test_observability_reports_all_domains_metrics_and_exact_health_causes(tmp_path: Path):

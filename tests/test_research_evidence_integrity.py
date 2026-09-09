@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 from sqlalchemy import insert
 
@@ -27,6 +25,7 @@ from src.research.datasets import (
 )
 from src.research.evaluation import EvaluationRequest
 from src.research.executors import ExecutorError, ProviderExecutorRegistry
+from src.research.providers import provider_candidate
 from src.services.forward_observation import DatabaseForwardObservationWorker
 from src.services.job_schemas import JobSchemaError
 from src.services.scheduler import DatabaseJobQueue
@@ -223,6 +222,7 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
         "product_id": "active_income",
         "instrument_id": "BTCUSDT",
         "direction": "long",
+        "horizon_seconds": 60,
     }
     forecast_id = canonical_hash(forecast_payload)
     with database.engine.begin() as connection:
@@ -233,41 +233,6 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
                 payload=forecast_payload,
             )
         )
-
-    def facts(*, net_pnl: float, benchmark_pnl: float = 0.0) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "schema": "platform.forward_evidence_facts/v1",
-            "window_start": "2026-08-23T00:00:00+00:00",
-            "source_event_ids": [artefact.artefact_hash],
-            "metrics": {
-                "net_pnl": net_pnl,
-                "benchmark_pnl": benchmark_pnl,
-                "drawdown": 0.0,
-                "execution_drift": 0.0,
-                "model_drift": 0.0,
-                "portfolio_capacity": 100.0,
-                "risk_budget_available": 10.0,
-                "data_gaps": 0,
-                "effective_trades": 1,
-                "fill_rate": 1.0,
-                "slippage": 0.0,
-                "data_uptime": 1.0,
-                "rejected_orders": 0,
-                "valid_attempts": 1,
-                "completed_attempts": 1,
-                "expected_observations": 1,
-                "observed_observations": 1,
-                "fill_rate_applicable": True,
-                "trading_dates": ["2026-08-24"],
-                "order_ids": ["test-order"],
-                "fill_ids": ["test-fill"],
-                "episode_ids": ["test-episode"],
-            },
-            "forecast_hash": canonical_hash(forecast_payload),
-            "target_hash": None,
-        }
-        payload["facts_hash"] = canonical_hash(payload)
-        return payload
 
     with pytest.raises(CanonicalEvidenceError, match="after artefact creation"):
         repository.append(
@@ -291,16 +256,6 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
             assigned_by="test",
             instrument_id="BTCUSDT",
         )
-    observation_id = repository.append(
-        strategy_version_id=definition.strategy_version_id,
-        product_id="active_income",
-        instrument_id="BTCUSDT",
-        observed_at="2026-08-24T00:00:00+00:00",
-        artefact_hash=artefact.artefact_hash,
-        observation={"decision_id": "decision-1", "facts": facts(net_pnl=0.0)},
-    )
-    assert observation_id.startswith("sha256:")
-
     assignment_id = SqlActiveStrategyAssignmentRepository(database.engine).assign(
         product_id="active_income",
         portfolio_id="portfolio-active-income",
@@ -314,6 +269,30 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
         instrument_id="BTCUSDT",
         risk_budget=100.0,
     )
+    from src.services.forward_windows import open_window
+    from src.services.promotion import PromotionPolicy
+
+    with database.engine.begin() as connection:
+        open_window(
+            connection,
+            strategy_version_id=definition.strategy_version_id,
+            product_id="active_income",
+            artefact_hash=artefact.artefact_hash,
+            opened_at="2026-08-24T01:00:00+00:00",
+            source_event_id="fixture-paper-window",
+            reason="fixture_paper_activation",
+            policy=to_primitive(
+                PromotionPolicy(
+                    automatic_paper_promotion=True,
+                    automatic_live_canary_promotion=False,
+                    canary_capital_limit=0.01,
+                    required_forward_evidence_days=1,
+                    maximum_drawdown=1,
+                    maximum_execution_drift=1,
+                    maximum_model_drift=1,
+                )
+            ),
+        )
     queue = DatabaseJobQueue(database.engine)
     queue.register_worker(
         worker_id="test:forward-observer",
@@ -343,35 +322,23 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
 
     assert recorded["reason_code"] == "forward_observation_recorded"
     assert recorded["observed_at"] == "2026-08-25T00:00:00+00:00"
-    second_observation_id = repository.append(
-        strategy_version_id=definition.strategy_version_id,
-        product_id="active_income",
-        instrument_id="BTCUSDT",
-        observed_at="2026-08-26T00:00:00+00:00",
-        artefact_hash=artefact.artefact_hash,
-        observation={
-            "decision_id": "decision-2",
-            "facts": facts(net_pnl=1.0, benchmark_pnl=0.25),
-        },
-    )
     summary_id, summary = repository.build_summary(
         strategy_version_id=definition.strategy_version_id,
         product_id="active_income",
         artefact_hash=artefact.artefact_hash,
         observed_at="2026-08-26T00:00:00+00:00",
     )
-    assert summary.independent_decisions == 3
-    assert summary.net_pnl == pytest.approx(1.0)
-    assert summary.benchmark_pnl == pytest.approx(0.25)
-    assert summary.excess_benchmark_pnl == pytest.approx(0.75)
-    assert second_observation_id in summary.observation_ids
+    assert summary.independent_decisions == 1
+    assert summary.net_pnl == pytest.approx(0.0)
+    assert summary.benchmark_pnl == pytest.approx(0.0)
+    assert summary.excess_benchmark_pnl == pytest.approx(0.0)
     assert summary.assignment_ids == (assignment_id,)
     assert summary.instrument_ids == ("BTCUSDT",)
     decision_id, accepted, reason_code = repository.decide_summary(
         summary_id,
         decided_at="2026-08-26T00:00:01+00:00",
         minimum_days=1,
-        minimum_decisions=2,
+        minimum_decisions=1,
     )
     assert decision_id.startswith("sha256:")
     assert accepted is False
@@ -408,11 +375,22 @@ def test_forward_observation_must_follow_artefact_creation(tmp_path) -> None:
 
 def test_default_executor_does_not_turn_missing_execution_into_evidence() -> None:
     registry = ProviderExecutorRegistry.default()
-    candidate = SimpleNamespace(
-        definition=SimpleNamespace(source_type=StrategySourceType.REGISTERED_PYTHON)
+    identity = canonical_hash("missing-market-frame-fixture")
+    candidate = provider_candidate(
+        identity="sma_cross",
+        version="1",
+        family="time_series",
+        product="active_income",
+        thesis_id=identity,
+        lineage_id=identity,
+        provider="registered_strategy_catalogue",
+        source_type=StrategySourceType.REGISTERED_PYTHON,
+        source_payload={"registered_strategy": "sma_cross", "parameters": {"fast": 2, "slow": 4}},
+        dataset_snapshot_hashes=(identity,),
+        submitted_at="2026-09-07T00:00:00+00:00",
     )
     with pytest.raises(ExecutorError, match="canonical market_frame"):
-        registry.execute(candidate, {})  # type: ignore[arg-type]
+        registry.execute(candidate, {})
 
 
 def test_result_fields_are_not_accepted_as_a_research_command() -> None:

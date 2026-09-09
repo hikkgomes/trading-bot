@@ -39,7 +39,7 @@ lint-complexity:  ## Enforce maximum cyclomatic complexity of 10
 
 typecheck-platform:  ## Type-check the PostgreSQL platform boundary
 	$(PY) -m mypy --ignore-missing-imports --follow-imports=skip \
-		src/data src/domain src/observability src/research src/services src/strategies
+		src/data src/domain src/observability src/research src/risk src/services src/strategies
 
 format:  ## Apply Ruff formatting and safe fixes
 	$(PY) -m ruff format .
@@ -171,14 +171,3 @@ platform-ci:  ## Run the complete platform quality gate
 	$(MAKE) platform-smoke
 	$(MAKE) platform-testnet-rehearsal
 	$(MAKE) test
-
-# Compatibility names retained only as PostgreSQL command aliases. They do not
-# invoke the archived file or SQLite authority.
-.PHONY: autopilot-validate lint-autopilot readiness autopilot-once report artifact-hygiene
-autopilot-validate: platform-validate
-lint-autopilot: lint
-readiness: platform-readiness
-autopilot-once:  ## Alias for one canonical trading-runtime process cycle
-	$(MAKE) platform-process-once PROCESS=trading-runtime
-report: platform-report
-artifact-hygiene: platform-readiness

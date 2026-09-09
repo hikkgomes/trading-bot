@@ -45,7 +45,7 @@ make test
 ```
 
 For the Linux platform, follow [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
-The installer uses separate runtime, research, agent, and migration users and
+The installer uses separate runtime, research, evaluator, agent, and migration users and
 installs the grouped units:
 
 - `trading-platform-runtime.service`
@@ -53,6 +53,7 @@ installs the grouped units:
 - `trading-platform-data-writer.service`
 - `trading-platform-operations.service`
 - `trading-platform-research.service`
+- `trading-platform-evaluator.service`
 - `trading-platform-agent.service`
 - `trading-platform-control.service`
 - `trading-platform-migration.service`

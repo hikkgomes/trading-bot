@@ -8,7 +8,7 @@ from typing import Any
 
 from sqlalchemy import select
 
-from src.data.database import validation_stage
+from src.data.database import paper_eligibility_event, validation_stage
 from src.data.parquet_store import PartitionedBacktestStore
 from src.domain._codec import canonical_hash
 from src.domain.strategies import StrategySourceType
@@ -22,6 +22,7 @@ from src.research.backtest.event_engine import (
 )
 from src.research.canonical import SqlStrategyArtefactRepository, SqlValidationRepository
 from src.research.catalogue import registered_strategy_candidates, registered_strategy_theses
+from src.research.cohorts import CohortPending, complete_cohort, prepare_cohort, selection_stream
 from src.research.coordinator import Candidate, CandidateEvaluationView, ResearchCoordinator
 from src.research.dataset_service import DatabaseDatasetBundleService
 from src.research.datasets import (
@@ -31,6 +32,7 @@ from src.research.datasets import (
     DatasetLifecycleState,
     SqlDatasetBundleRepository,
 )
+from src.research.economic_series import ECONOMIC_ENGINE_VERSION
 from src.research.evaluation import (
     CanonicalResearchEvaluator,
     EvaluationRequest,
@@ -39,6 +41,7 @@ from src.research.evaluation import (
 )
 from src.research.evidence import holdout_degradation_passes
 from src.research.executors import (
+    DataUnavailableError,
     ExecutorError,
     ProviderContextBuilderRegistry,
     ProviderExecutorRegistry,
@@ -84,7 +87,7 @@ _REQUIRED_EVIDENCE: dict[str, frozenset[str]] = {
             "delay_stress",
             "missing_data_stress",
             "funding_stress",
-            "monte_carlo_trade_order",
+            "monte_carlo_return_blocks",
             "bootstrap_confidence",
             "probability_backtest_overfitting",
             "deflated_sharpe",
@@ -623,7 +626,7 @@ class DatabaseResearchJobHandlers:
             memory=SqlHypothesisMemory(self.store.engine),
             feedback_store=feedback_store,
         )
-        parent_candidates = SqlResearchStore(self.store.engine).load_candidates()
+        parent_candidates = self.store.development_parents()
         hypotheses = generator.generate(
             dataset_snapshot_hashes=snapshot_ids,
             submitted_at=str(payload["submitted_at"]),
@@ -660,26 +663,22 @@ class DatabaseResearchJobHandlers:
         bundle_id = _optional_text(payload.get("dataset_bundle_id"))
         if snapshot_ids or self.dataset_bundle_service is None or bundle_id is not None:
             return resolved
-        built = self.dataset_bundle_service.run(
-            product_id=str(payload["product_id"]),
-            universe_id=str(payload.get("universe_id") or ""),
-            market_type=str(payload.get("market_type") or "futures"),
-            created_at=_runtime_data_timestamp(payload, "submitted_at", "available_at"),
-            timeframe=_optional_text(payload.get("dataset_timeframe")),
+        observed_at = _runtime_data_timestamp(payload, "submitted_at", "available_at")
+        bundle = SqlDatasetBundleRepository(self.store.engine).latest_ready(
+            str(payload["product_id"]), at=observed_at
         )
-        if built.state != "ready" or built.bundle_id is None:
+        if bundle is None:
+            return resolved
+        requested_universe = payload.get("universe_snapshot_id")
+        if requested_universe and bundle.universe_snapshot_id != requested_universe:
             return resolved
         return {
             **resolved,
-            "submitted_at": _runtime_data_timestamp(payload, "submitted_at", "available_at"),
-            "dataset_snapshot_hashes": list(built.snapshot_ids),
-            "dataset_bundle_id": built.bundle_id,
-            "universe_snapshot_id": self._bundle_universe_snapshot(built.bundle_id),
+            "submitted_at": observed_at,
+            "dataset_snapshot_hashes": list(bundle.stage_snapshot_ids.values()),
+            "dataset_bundle_id": bundle.bundle_id,
+            "universe_snapshot_id": bundle.universe_snapshot_id,
         }
-
-    def _bundle_universe_snapshot(self, bundle_id: str) -> str:
-        bundle = SqlDatasetBundleRepository(self.store.engine).get(bundle_id)
-        return bundle.universe_snapshot_id
 
     @staticmethod
     def _generation_inputs(
@@ -784,7 +783,7 @@ class DatabaseResearchJobHandlers:
             feedback_store.append(
                 GenerationFeedback(
                     campaign=hypothesis.campaign.name,
-                    outcome="accepted",
+                    outcome="generated",
                     observed_at=observed_at,
                     candidate_id=candidate_id,
                     semantic_signature=hypothesis.semantic_signature,
@@ -849,12 +848,52 @@ class DatabaseResearchJobHandlers:
             raise JobSchemaError("candidate evaluation requires a canonical dataset resolver")
         resolver = self.dataset_resolver
         candidate = self.store.get_candidate(request.candidate_id)
+        cohort = None
+        if request.requested_stage == "protected":
+            execution_time = utc_now()
+            research_configuration = (
+                self.configuration.get("research") if self.configuration else None
+            )
+            try:
+                cohort = prepare_cohort(
+                    self.store.engine,
+                    candidate,
+                    now=execution_time,
+                    policy_hash=self.evidence_policy.policy_hash,
+                    configuration_hash=canonical_hash(research_configuration)
+                    if isinstance(research_configuration, Mapping)
+                    else None,
+                )
+            except (CohortPending, DataUnavailableError) as exc:
+                return {
+                    "candidate_id": candidate.candidate_id,
+                    "stage": "protected",
+                    "accepted": False,
+                    "deferred": True,
+                    "_defer": True,
+                    "_defer_reason": str(exc),
+                    "reason_code": "cohort_pending"
+                    if isinstance(exc, CohortPending)
+                    else "cohort_data_unavailable",
+                    "outcome_category": "blocked_infrastructure"
+                    if isinstance(exc, CohortPending)
+                    else "blocked_data",
+                }
+            executed = {
+                key: value for key, value in claimed.payload.items() if key != "content_hash"
+            }
+            executed["evaluated_at"] = execution_time
+            request = EvaluationRequest.from_payload(
+                {**executed, "content_hash": canonical_hash(executed)}
+            )
         context = self._resolve_evaluation_context(
             candidate=candidate,
             request=request,
             payload=claimed.payload,
             resolver=resolver,
         )
+        if cohort is not None:
+            context["protected_cohort_id"] = cohort["cohort_id"]
 
         def evaluate_protected(claim: Mapping[str, Any]) -> tuple[bool, Mapping[str, Any]]:
             protected_context = claim.get("protected_context")
@@ -865,6 +904,7 @@ class DatabaseResearchJobHandlers:
                 candidate,
                 {
                     **frozen_context,
+                    **self._product_accounting_context(candidate.definition.product),
                     "product_id": candidate.definition.product,
                     "requested_stage": "protected",
                     "evaluated_at": request.evaluated_at,
@@ -942,6 +982,7 @@ class DatabaseResearchJobHandlers:
                 "evidence_hash": canonical_hash(measured),
                 "metrics": dict(execution.metrics),
                 "execution_receipt": dict(execution.receipt),
+                "selection_stream": selection_stream(measured),
             }
             return accepted, {
                 "passed": accepted,
@@ -963,7 +1004,29 @@ class DatabaseResearchJobHandlers:
             ),
             evidence_policy=self.evidence_policy,
         ).evaluate(request)
+        if cohort is not None and not result.deferred:
+            complete_cohort(self.store.engine, cohort, now=utc_now())
+        self._record_agent_evaluation(candidate, result)
         return self._finalise_evaluation(candidate, request, result)
+
+    def _record_agent_evaluation(self, candidate: Candidate, result: Any) -> None:
+        from src.agents.store import SqlAgentStore
+
+        proposal_id = candidate.definition.metadata.get("openclaw_proposal_id")
+        if (
+            candidate.provider == "openclaw_trusted_compiler"
+            and proposal_id
+            and not result.deferred
+        ):
+            SqlAgentStore(self.store.engine).save_review(
+                proposal_id=str(proposal_id),
+                created_at=utc_now(),
+                payload={
+                    "schema": "platform.agent_evaluation_progress/v1",
+                    "state": "evaluated",
+                    "candidate_id": candidate.candidate_id,
+                },
+            )
 
     def _resolve_evaluation_context(
         self,
@@ -1068,7 +1131,14 @@ class DatabaseResearchJobHandlers:
             "reason_code": result.reason_code,
             "run_id": result.run_id,
             "evidence_hash": result.evidence_hash,
+            "outcome_category": result.evidence.get("evaluation_decision", {}).get(
+                "outcome_category"
+            ),
         }
+        if result.deferred and response["outcome_category"] == "blocked_data":
+            response.update({"_defer": True, "_defer_reason": result.reason_code})
+        if result.deferred and response["outcome_category"] == "blocked_infrastructure":
+            raise ExecutorError(f"evaluation infrastructure failure: {result.reason_code}")
         if result.stage == "protected" and result.accepted:
             response["artefact_hash"] = self._publish_strategy_artefact(
                 candidate=candidate,
@@ -1088,9 +1158,7 @@ class DatabaseResearchJobHandlers:
         *,
         campaign: str,
     ) -> None:
-        if result.deferred:
-            return
-        if result.accepted and result.stage != "protected":
+        if result.deferred or result.stage != "development":
             return
         SqlGenerationFeedbackStore(self.store.engine).append(
             GenerationFeedback(
@@ -1100,7 +1168,13 @@ class DatabaseResearchJobHandlers:
                 candidate_id=candidate.candidate_id,
                 reason_code=result.reason_code,
                 semantic_signature=hypothesis_signature(candidate.definition),
-                metadata={"stage": result.stage},
+                metadata={
+                    "stage": result.stage,
+                    "economic_engine": ECONOMIC_ENGINE_VERSION,
+                    "net_return": result.evidence.get("cost_adjusted_return"),
+                    "observations": result.evidence.get("observations"),
+                    "costs": result.evidence.get("fees"),
+                },
             )
         )
 
@@ -1113,6 +1187,16 @@ class DatabaseResearchJobHandlers:
     ) -> str:
         if self.configuration is None or self.dataset_resolver is None:
             raise JobSchemaError("accepted protected research requires platform configuration")
+        with self.store.engine.connect() as connection:
+            existing = connection.execute(
+                select(paper_eligibility_event.c.id).where(
+                    paper_eligibility_event.c.candidate_id == candidate.candidate_id,
+                    paper_eligibility_event.c.engine_version == ECONOMIC_ENGINE_VERSION,
+                )
+            ).scalar_one_or_none()
+        if existing is not None:
+            return SqlStrategyArtefactRepository(self.store.engine).get(existing)["artefact_hash"]
+        sealed_at = utc_now()
         if (
             candidate.metadata.get("diagnostic") is True
             or candidate.definition.metadata.get("diagnostic") is True
@@ -1215,7 +1299,7 @@ class DatabaseResearchJobHandlers:
             ),
             supported_products=(candidate.definition.product,),
             supported_instruments=supported_instruments,
-            created_at=request.evaluated_at,
+            created_at=sealed_at,
             validation_evidence={
                 "stage_ids": [stages_by_name[name] for name in required_stages],
                 "protected_evidence_hash": canonical_hash(dict(evidence)),
@@ -1231,17 +1315,18 @@ class DatabaseResearchJobHandlers:
                 "diagnostic": False,
                 "promotable": True,
                 "assignment_scope": list(supported_instruments),
+                "selection_cohort_id": evidence.get("frozen_cohort"),
             },
             product_id=candidate.definition.product,
             portfolio_id=str(product["portfolio_id"]),
             account_id=str(product["account_id"]),
             promotion_policy_id=policy_id,
-            engine_version=request.evaluator_version,
+            engine_version=ECONOMIC_ENGINE_VERSION,
         )
         return SqlStrategyArtefactRepository(self.store.engine).put(
             artefact.artefact_hash,
             artefact.to_dict(),
-            created_at=request.evaluated_at,
+            created_at=sealed_at,
         )
 
     def bounded_backtest(

@@ -10,7 +10,7 @@ from sqlalchemy import insert
 
 from src.data.database import PlatformDatabase, platform_rehearsal_report
 from src.data.universe import InstrumentObservation, SqlUniverseStore, UniverseEligibilityPolicy
-from src.domain._codec import canonical_hash
+from src.domain._codec import canonical_hash, to_primitive
 from src.domain.instruments import Instrument, MarketType
 from src.execution.config import ExchangeConfig
 from src.research.canonical import (
@@ -69,6 +69,15 @@ class _Broker:
 
 
 def _fixture(tmp_path: Path, monkeypatch) -> tuple[PlatformDatabase, PlatformLiveAuthority, dict]:
+    # Live authority tests start from qualified research; cohort inference is tested separately.
+    monkeypatch.setattr(
+        "src.research.policy_approval.research_qualification",
+        lambda *_args, **_kwargs: {
+            "qualified": True,
+            "reason_code": None,
+            "approval_id": "research-fixture",
+        },
+    )
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'authority.db'}")
     database.migrate()
     configuration = load_split_configuration(ROOT / "config")
@@ -143,6 +152,30 @@ def _fixture(tmp_path: Path, monkeypatch) -> tuple[PlatformDatabase, PlatformLiv
 
     paper_assignment = SqlActiveStrategyAssignmentRepository(database.engine).by_id(assignment_id)
     assert paper_assignment is not None
+    from src.services.forward_windows import open_window
+    from src.services.promotion import PromotionPolicy
+
+    with database.engine.begin() as connection:
+        window = open_window(
+            connection,
+            strategy_version_id=str(paper_assignment["strategy_version_id"]),
+            product_id="active_income",
+            artefact_hash=str(paper_assignment["artefact_hash"]),
+            opened_at=NOW,
+            source_event_id="authority-fixture-window",
+            reason="isolated_live_authority_fixture",
+            policy=to_primitive(
+                PromotionPolicy(
+                    automatic_paper_promotion=True,
+                    automatic_live_canary_promotion=False,
+                    canary_capital_limit=0.01,
+                    required_forward_evidence_days=0,
+                    maximum_drawdown=1,
+                    maximum_execution_drift=1,
+                    maximum_model_drift=1,
+                )
+            ),
+        )
     forward = SqlForwardEvidenceRepository(database.engine)
     observation_at = "2026-08-29T10:00:01+00:00"
     facts = {
@@ -151,6 +184,11 @@ def _fixture(tmp_path: Path, monkeypatch) -> tuple[PlatformDatabase, PlatformLiv
         "source_event_ids": [str(paper_assignment["artefact_hash"])],
         "metrics": {
             "net_pnl": 1.0,
+            "objective_unit": "USDT",
+            "objective_value": 1.0,
+            "benchmark_value": 0.0,
+            "objective_excess": 1.0,
+            "objective_excess_fraction": 0.0001,
             "benchmark_pnl": 0.0,
             "drawdown": 0.0,
             "execution_drift": 0.0,
@@ -183,7 +221,11 @@ def _fixture(tmp_path: Path, monkeypatch) -> tuple[PlatformDatabase, PlatformLiv
         instrument_id=instrument.instrument_id,
         observed_at=observation_at,
         artefact_hash=str(paper_assignment["artefact_hash"]),
-        observation={"decision_id": "authority-test-decision", "facts": facts},
+        observation={
+            "decision_id": "authority-test-decision",
+            "facts": facts,
+            "qualification_window_id": window["window_id"],
+        },
     )
     summary_id = forward.append_summary(
         strategy_version_id=str(paper_assignment["strategy_version_id"]),
@@ -193,9 +235,15 @@ def _fixture(tmp_path: Path, monkeypatch) -> tuple[PlatformDatabase, PlatformLiv
         evidence={
             "observed_from": observation_at,
             "observed_until": observation_at,
-            "elapsed_days": 1.0,
+            "elapsed_days": 1 / 86400,
+            "qualification_window_id": window["window_id"],
             "independent_decisions": 1,
             "net_pnl": 1.0,
+            "objective_unit": "USDT",
+            "objective_value": 1.0,
+            "benchmark_value": 0.0,
+            "objective_excess": 1.0,
+            "objective_excess_fraction": 0.0001,
             "benchmark_pnl": 0.0,
             "excess_benchmark_pnl": 1.0,
             "drawdown": 0.0,

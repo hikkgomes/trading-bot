@@ -14,7 +14,7 @@ from typing import Any
 from sqlalchemy import select
 
 from src.accounting.ledger import Ledger, SqlLedgerStore
-from src.accounting.paper_account import PaperAccountLedger
+from src.accounting.paper_account import PaperAccountLedger, configured_paper_accounts
 from src.agents.code_worker import AgentCodeWorkflow
 from src.agents.sandbox import SandboxPolicy
 from src.agents.store import SqlAgentStore
@@ -23,7 +23,7 @@ from src.data.event_capture import load_event_capture_config
 from src.data.feature_store import SqlFeatureStore
 from src.data.parquet_store import PartitionedBacktestStore
 from src.data.universe import SqlUniverseStore
-from src.domain._codec import timestamp
+from src.domain._codec import canonical_hash, timestamp
 from src.execution.order_groups import OrderGroupManager, SqlOrderGroupStore
 from src.execution.order_manager import OrderManager, SqlOrderStore
 from src.execution.position_manager import PositionManager, SqlPositionStore
@@ -43,18 +43,23 @@ from src.risk.policies import install_product_risk_policies
 from src.services.account_reconciliation import AccountReconciliationService
 from src.services.accounting_service import AccountingService, DatabaseAccountingWorker
 from src.services.agent_worker import DatabaseAgentJobHandlers
-from src.services.alerting import SqlAlertService, configured_alert_service
+from src.services.alerting import SqlAlertService, WebhookAlertSink, configured_alert_service
 from src.services.artefact_dispatcher import ArtefactDispatcher
-from src.services.config import load_platform_config, load_split_configuration
+from src.services.config import (
+    PLATFORM_PROCESS_SERVICES,
+    load_platform_config,
+    load_split_configuration,
+)
 from src.services.control_api import DatabaseControlPlane, build_control_server
 from src.services.data_writer import DatabaseMarketDataWriter
 from src.services.emergency import DatabaseEmergencyFlattenWorker
 from src.services.feature_worker import DatabaseFeatureWorker
+from src.services.financial_followup import FinancialFollowupWorker
 from src.services.forward_observation import (
     DatabaseForwardObservationWorker,
     DatabaseForwardSummaryWorker,
 )
-from src.services.health import DatabaseHeartbeatStore
+from src.services.health import DatabaseHeartbeatStore, publish_external_heartbeat
 from src.services.heavy_compute import HeavyComputeLeaseStore
 from src.services.historical_bootstrap import HistoricalBootstrapService
 from src.services.live_execution import ApprovedLiveExecution
@@ -274,6 +279,7 @@ def _execution_cycle(
             "live_order_recovery",
             "live_account_backfill",
             "user_stream_event",
+            "financial_live_followup",
         ),
         observed_at=utc_now(),
     )
@@ -371,6 +377,10 @@ def _execution_cycle(
         ledgers=execution_ledgers,
         trace_store=traces,
         account_products=account_products,
+        account_environments={
+            str(account["account_id"]): str(account["environment"])
+            for account in configuration["accounts"]["accounts"]
+        },
         order_groups=order_groups,
         on_live_fill=on_live_fill if protective_service is not None else None,
         on_algo_update=on_algo_update if protective_service is not None else None,
@@ -387,6 +397,9 @@ def _execution_cycle(
             recovery_worker=recovery_worker,
             protective_service=protective_service,
             approved_live=approved_live,
+            financial_followup_worker=FinancialFollowupWorker(
+                queue, worker_id, on_live_fill if protective_service else None
+            ),
         )
 
     return run_once
@@ -462,6 +475,7 @@ def _live_execution_components(
         products=products,
         alerts=alerts,
         reconcile_product=approved_live.reconcile,
+        recover_action=approved_live.recover_action,
     )
     recovery_worker = DatabaseLiveRecoveryWorker(
         queue=queue,
@@ -491,15 +505,17 @@ def _execution_run_once(
     recovery_worker: Any,
     protective_service: Any,
     approved_live: Any,
+    financial_followup_worker: Any = None,
 ) -> dict[str, Any]:
     now = utc_now()
     result = {"reason_code": "execution_queue_empty"}
     for candidate, empty_reason in (
         (emergency_worker, "emergency_queue_empty"),
-        (worker, "execution_queue_empty"),
-        (live_worker, "live_order_queue_empty"),
+        (financial_followup_worker, "financial_followup_queue_empty"),
         (user_stream_worker, "user_stream_queue_empty"),
         (recovery_worker, "live_recovery_queue_empty"),
+        (worker, "execution_queue_empty"),
+        (live_worker, "live_order_queue_empty"),
     ):
         result = _run_worker_or_empty(candidate, now=now, empty_reason=empty_reason)
         if result["reason_code"] != empty_reason:
@@ -554,22 +570,7 @@ def _paper_cycle(
         )
         for product_id, product in products.items()
     }
-    accounts = _by_id(configuration["accounts"], collection="accounts", identity="account_id")
-    paper_accounts = {
-        product_id: PaperAccountLedger(
-            engine=database.engine,
-            account_id=str(accounts[str(product["account_id"])]["account_id"]),
-            product_id=product_id,
-            accounting_asset=str(product["base_accounting_asset"]),
-            starting_balances=accounts[str(product["account_id"])].get(
-                "paper_starting_balances", {}
-            ),
-            starting_positions=accounts[str(product["account_id"])].get(
-                "paper_starting_positions", {}
-            ),
-        )
-        for product_id, product in products.items()
-    }
+    paper_accounts = configured_paper_accounts(database.engine, configuration)
     _seed_paper_positions(positions, paper_accounts, observed_at=utc_now())
     diagnostic_worker = DatabaseDiagnosticPaperWorker(
         queue=queue,
@@ -847,9 +848,9 @@ def _artefact_feature_graph(engine) -> Callable[[Mapping[str, Any]], Mapping[str
             raise ValueError("active assignment artefact is missing")
         definition = payload.get("definition")
         graph = definition.get("feature_graph") if isinstance(definition, Mapping) else None
-        if not isinstance(graph, Mapping):
+        if not isinstance(definition, Mapping) or not isinstance(graph, Mapping):
             raise ValueError("active artefact has no feature graph")
-        return graph
+        return {**graph, "timeframe": definition.get("data_requirements", {}).get("bars")}
 
     return load
 
@@ -907,7 +908,23 @@ def _platform_scheduler_cycle(
             node_id=node_id,
         ),
     )
-    return lambda: scheduler.run_once(now=utc_now())
+    health_url = os.environ.get("TRADING_PLATFORM_HEALTHCHECK_URL", "").strip()
+    health_sink = WebhookAlertSink(health_url, timeout_seconds=2) if health_url else None
+
+    def run_once() -> dict[str, Any]:
+        now = utc_now()
+        result = scheduler.run_once(now=now)
+        result["external_health"] = publish_external_heartbeat(
+            DatabaseHeartbeatStore(database.engine),
+            sink=health_sink,
+            node_id=node_id,
+            required_services=("market-gateway", "data-writer")
+            + PLATFORM_PROCESS_SERVICES["trading-runtime"],
+            now=now,
+        )
+        return result
+
+    return run_once
 
 
 def _promotion_cycle(
@@ -969,6 +986,7 @@ def _promotion_cycle(
         engine=database.engine,
         queue=queue,
         worker_id=worker_id,
+        research_configuration_hash=canonical_hash(configuration["research"]),
         minimum_days_by_product=minimum_forward_days,
         policies_by_product=policies_by_product,
         policies_by_product_family=policies_by_product_family,
@@ -979,6 +997,8 @@ def _promotion_cycle(
         store=SqlPromotionStore(database.engine),
         policy_store=policy_store,
         policies_by_product_family=policies_by_product_family,
+        paper_accounts=configured_paper_accounts(database.engine, configuration),
+        research_configuration_hash=canonical_hash(configuration["research"]),
     )
 
     def run_once() -> dict[str, Any]:
@@ -1078,19 +1098,17 @@ def _research_cycle(
 ) -> Callable[[], dict[str, Any]]:
     job_names_by_service = {
         "research-worker": (
-            "dataset_snapshot_validate",
-            "register_strategy_catalogue",
             "generate_hypotheses",
             "register_candidate",
-            "evaluate_candidate",
-            "bounded_backtest",
-        ),
-        "ml-worker": (
             "register_ml_candidate",
-            "train_ml_experiment",
-            "evaluate_candidate",
             "bounded_backtest",
         ),
+        "evaluation-worker": (
+            "dataset_snapshot_validate",
+            "register_strategy_catalogue",
+            "evaluate_candidate",
+        ),
+        "ml-worker": ("train_ml_experiment",),
         "event-replay-worker": ("event_replay",),
     }
     job_names = job_names_by_service[service_name]
@@ -1161,9 +1179,13 @@ def _research_cycle(
 
     all_handlers = DatabaseResearchJobHandlers(
         SqlResearchStore(database.engine),
-        artefact_store=PartitionedBacktestStore(parquet_root / "research"),
+        artefact_store=PartitionedBacktestStore(
+            artefact_root / "evidence"
+            if service_name == "evaluation-worker"
+            else parquet_root / "research"
+        ),
         ml_runner=MlExperimentRunner(
-            artefact_store=ModelArtefactStore(artefact_root / "models"),
+            artefact_store=ModelArtefactStore(parquet_root / "research" / "models"),
             metadata_store=SqlModelArtefactStore(database.engine),
         ),
         dataset_resolver=dataset_resolver,
@@ -1209,12 +1231,12 @@ def _agent_cycle(
     budgets = dict(research_configuration["search_budgets"])
     maximum_runtime_seconds = int(limits["maximum_runtime_seconds"])
     queue = DatabaseJobQueue(database.engine)
-    worker_id = f"{node_id}:agent-sandbox"
+    worker_id = f"{node_id}:agent-coordinator"
     job_names = ("agent_research", "agent_code_workflow", "agent_review")
     queue.register_worker(
         worker_id=worker_id,
         node_id=node_id,
-        role="agent-sandbox",
+        role="agent-coordinator",
         capabilities=job_names,
         observed_at=utc_now(),
     )
@@ -1265,6 +1287,10 @@ def _initialise_service(
         ).ensure(now=utc_now())
     else:
         database.assert_migrated()
+    if args.service != "migration-service":
+        from src.services.database_roles import check_service_roles
+
+        check_service_roles(database.engine, config, (args.service,))
     heartbeat_store = DatabaseHeartbeatStore(database.engine)
     alerts = configured_alert_service(database.engine, configuration=config.alerting)
     control_plane = DatabaseControlPlane(
@@ -1354,7 +1380,7 @@ def _service_work(args: argparse.Namespace, context: Mapping[str, Any]) -> Calla
             service_name=args.service,
             parquet_root=Path(config.paths["parquet"]),
         )
-    if args.service in {"research-worker", "ml-worker", "event-replay-worker"}:
+    if args.service in {"research-worker", "evaluation-worker", "ml-worker", "event-replay-worker"}:
         return _research_cycle(
             database=database,
             node_id=args.node,
@@ -1368,7 +1394,7 @@ def _service_work(args: argparse.Namespace, context: Mapping[str, Any]) -> Calla
             research_configuration=split["research"],
             configuration=split,
         )
-    if args.service == "agent-sandbox":
+    if args.service == "agent-coordinator":
         return _agent_service_work(args, context)
     builder = builders.get(args.service)
     if builder is None:
@@ -1380,7 +1406,7 @@ def _agent_service_work(args: argparse.Namespace, context: Mapping[str, Any]) ->
     worktree_root = os.environ.get("TRADING_PLATFORM_AGENT_WORKTREE_ROOT")
     if not worktree_root:
         raise RuntimeError(
-            "TRADING_PLATFORM_AGENT_WORKTREE_ROOT must be configured for agent-sandbox"
+            "TRADING_PLATFORM_AGENT_WORKTREE_ROOT must be configured for agent-coordinator"
         )
     return _agent_cycle(
         database=context["database"],
@@ -1425,6 +1451,7 @@ def _serve_service(
 def _serve_control_api(args: argparse.Namespace, context: Mapping[str, Any]) -> int:
     database = context["database"]
     config = context["config"]
+    agent_key = os.environ.get("TRADING_PLATFORM_AGENT_TRANSPORT_KEY")
     server = build_control_server(
         bind=_parse_bind(args.control_bind),
         control_plane=DatabaseControlPlane(
@@ -1434,6 +1461,8 @@ def _serve_control_api(args: argparse.Namespace, context: Mapping[str, Any]) -> 
             alerts=context["alerts"],
         ),
         bearer_token=os.environ.get(args.control_token_env, ""),
+        agent_transport_key=bytes.fromhex(agent_key) if agent_key else None,
+        node_id=args.node,
     )
     metrics_provider = DatabaseMetricsProvider(
         lambda: DatabasePlatformReport(
@@ -1534,6 +1563,10 @@ def run(args: argparse.Namespace) -> int:
     config.assert_service_assignment(node_id=args.node, service=args.service)
     if args.validate:
         return 0
+    if args.service == "agent-sandbox":
+        from src.services.process import _run_agent_transport
+
+        return _run_agent_transport(args, configuration=split_configuration)
     context = _initialise_service(args, config=config, split=split_configuration)
     work = _service_work(args, context)
     return _serve_service(args, context, work)

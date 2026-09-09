@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
@@ -20,9 +19,9 @@ from src.data.database import (
     nav_snapshot,
     order_intent,
     position,
-    risk_snapshot,
 )
 from src.domain._codec import timestamp
+from src.risk.factors import estimate_factors, is_btc_benchmark
 
 
 @dataclass(frozen=True)
@@ -41,6 +40,7 @@ class PortfolioRiskMeasurements:
     cluster_fraction_caps: dict[str, float]
     open_exposure_fraction: float
     pending_exposure_fraction: float
+    factor_estimates: dict[str, Any]
 
 
 class PortfolioRiskCalculator:
@@ -63,6 +63,7 @@ class PortfolioRiskCalculator:
         at: str,
     ) -> PortfolioRiskMeasurements:
         at = timestamp(at, field="risk measurement time")
+        product_family = str(product.get("product_family") or product_id)
         product_ids = tuple(sorted(str(value) for value in self._products_for_account(account_id)))
         if product_id not in product_ids:
             product_ids = tuple(sorted((*product_ids, product_id)))
@@ -84,13 +85,19 @@ class PortfolioRiskCalculator:
             for instrument_id, quantity in sorted(positions.items())
             if abs(_finite_number(quantity, "position quantity")) > 1e-12
             and instrument_id not in position_terms
+            and product_family != "btc_accumulation"
         )
         current_equity = self._current_equity(
-            product_id=product_id,
+            product_id=product_family,
             balances=balances,
             positions=positions,
             position_terms=position_terms,
             market=market,
+        )
+        quote_equity = (
+            current_equity * _btc_mark(market)
+            if product_family == "btc_accumulation"
+            else current_equity
         )
         nav_points = self._nav_values(product_id=product_id, at=at)
         nav_values = [value for _observed_at, value in nav_points]
@@ -104,13 +111,15 @@ class PortfolioRiskCalculator:
             daily_pnl = _daily_pnl_fraction(product_effects, initial, at)
         clusters = self._clusters(tuple(str(key) for key in market))
         cluster_limit = _positive_number(product.get("maximum_cluster_fraction")) or 1.0
-        correlations, beta, risk_data_missing = self._factor_measurements(
+        correlations, beta, risk_data_missing, factor_estimates = self._factor_measurements(
             product_id=product_id,
             at=at,
             instrument_ids=tuple(str(key) for key in market),
+            timeframe=str(product.get("dataset_timeframe") or "1m"),
         )
         return PortfolioRiskMeasurements(
             product_drawdown_fraction=product_drawdown,
+            factor_estimates=factor_estimates,
             daily_pnl_fraction=daily_pnl,
             global_drawdown_fraction=_drawdown(
                 global_effects,
@@ -132,7 +141,7 @@ class PortfolioRiskCalculator:
             ),
             correlations=correlations,
             beta=beta,
-            risk_data_available=not risk_data_missing,
+            risk_data_available=not (risk_data_missing or missing_position_entries),
             risk_data_missing=tuple(sorted((*risk_data_missing, *missing_position_entries))),
             clusters=clusters,
             cluster_fraction_caps={
@@ -141,12 +150,12 @@ class PortfolioRiskCalculator:
             open_exposure_fraction=_exposure_fraction(
                 positions,
                 market,
-                current_equity,
+                quote_equity,
             ),
             pending_exposure_fraction=_order_exposure_fraction(
                 open_orders,
                 market,
-                current_equity,
+                quote_equity,
             ),
         )
 
@@ -218,11 +227,12 @@ class PortfolioRiskCalculator:
         balances = payload.get("balances")
         if not isinstance(balances, Mapping):
             balances = {}
-        equity = _equity(product_id, balances, market)
+        product_family = str(product.get("product_family") or product_id)
+        equity = _equity(product_family, balances, market)
         if equity > 0:
             return equity
         starting = account.get("paper_starting_balances")
-        return _equity(product_id, starting if isinstance(starting, Mapping) else {}, market)
+        return _equity(product_family, starting if isinstance(starting, Mapping) else {}, market)
 
     def _current_equity(
         self,
@@ -239,7 +249,7 @@ class PortfolioRiskCalculator:
                 raise ValueError("risk measurement has no mark for: " + ", ".join(missing_market))
             missing = set(positions) - set(position_terms)
             if not any(
-                abs(_finite_number(value, "position quantity")) > 1e-12 for value in missing
+                abs(_finite_number(positions[key], "position quantity")) > 1e-12 for key in missing
             ):
                 equity = usdt_nav(
                     cash_balance=_positive_number(balances.get("USDT")),
@@ -323,75 +333,16 @@ class PortfolioRiskCalculator:
             and (not portfolio_id or str(row["payload"].get("portfolio_id")) == portfolio_id)
         )
 
-    def _market_history(self, *, product_id: str, at: str) -> dict[str, list[float]]:
-        with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(risk_snapshot.c.payload, risk_snapshot.c.created_at)
-                .where(risk_snapshot.c.created_at <= at)
-                .order_by(risk_snapshot.c.created_at, risk_snapshot.c.id)
-            ).mappings()
-        history: dict[str, list[float]] = {}
-        for row in rows:
-            payload = row["payload"]
-            if (
-                not isinstance(payload, Mapping)
-                or payload.get("kind") != "market_data_input"
-                or str(payload.get("product_id")) != product_id
-            ):
-                continue
-            values = payload.get("values")
-            if not isinstance(values, Mapping):
-                continue
-            price = _positive_number(values.get("close", values.get("price")))
-            if price:
-                history.setdefault(str(payload.get("instrument_id")), []).append(price)
-        return history
-
-    def _correlations(self, *, product_id: str, at: str) -> dict[str, dict[str, float]]:
-        history = self._market_history(product_id=product_id, at=at)
-        returns = {key: _returns(values) for key, values in history.items()}
-        return _correlations_from_returns(returns)
-
     def _factor_measurements(
-        self,
-        *,
-        product_id: str,
-        at: str,
-        instrument_ids: tuple[str, ...],
-    ) -> tuple[dict[str, dict[str, float]], dict[str, float], tuple[str, ...]]:
-        history = self._market_history(product_id=product_id, at=at)
-        returns = {key: _returns(history.get(key, [])) for key in instrument_ids}
-        correlations = _correlations_from_returns(returns)
-        benchmark_key = next((key for key in returns if _is_btc_benchmark(key)), None)
-        benchmark = returns.get(benchmark_key, []) if benchmark_key is not None else []
-        beta = {
-            key: 1.0 if _is_btc_benchmark(key) else _beta(values, benchmark)
-            for key, values in sorted(returns.items())
-            if _is_btc_benchmark(key) or (len(values) >= 2 and len(benchmark) >= 2)
-        }
-        missing: set[str] = set()
-        for instrument_id, values in sorted(returns.items()):
-            if _is_btc_benchmark(instrument_id):
-                continue
-            if len(values) < 2 or len(benchmark) < 2:
-                missing.add(f"beta:{instrument_id}")
-        keys = sorted(returns)
-        for index, left in enumerate(keys):
-            for right in keys[index + 1 :]:
-                if len(returns[left]) < 2 or len(returns[right]) < 2:
-                    missing.add(f"correlation:{left}:{right}")
-        return correlations, beta, tuple(sorted(missing))
-
-    def _beta(self, *, product_id: str, at: str) -> dict[str, float]:
-        history = self._market_history(product_id=product_id, at=at)
-        returns = {key: _returns(values) for key, values in history.items()}
-        benchmark_key = next((key for key in returns if _is_btc_benchmark(key)), None)
-        benchmark = returns.get(benchmark_key, []) if benchmark_key is not None else []
-        return {
-            key: 1.0 if _is_btc_benchmark(key) else _beta(values, benchmark)
-            for key, values in sorted(returns.items())
-            if _is_btc_benchmark(key) or (len(values) >= 2 and len(benchmark) >= 2)
-        }
+        self, *, product_id: str, at: str, instrument_ids: tuple[str, ...], timeframe: str = "1m"
+    ):
+        return estimate_factors(
+            self.engine,
+            product_id=product_id,
+            at=at,
+            instrument_ids=instrument_ids,
+            timeframe=timeframe,
+        )
 
     def _clusters(self, instrument_ids: tuple[str, ...]) -> dict[str, str]:
         with self.engine.connect() as connection:
@@ -471,16 +422,19 @@ def _equity(
     if product_id == "btc_accumulation":
         btc = _positive_number(balances.get("BTC"))
         usdt = _positive_number(balances.get("USDT"))
-        price = next(
-            (
-                _positive_number(values.get("price"))
-                for values in market.values()
-                if _positive_number(values.get("price"))
-            ),
-            0.0,
-        )
-        return btc + usdt / price if price else btc
+        return btc + usdt / _btc_mark(market)
     return _positive_number(balances.get("USDT"))
+
+
+def _btc_mark(market: Mapping[str, Mapping[str, object]]) -> float:
+    marks = [
+        _positive_number(values.get("price"))
+        for key, values in market.items()
+        if is_btc_benchmark(key)
+    ]
+    if len(marks) != 1 or marks[0] <= 0:
+        raise ValueError("BTC equity requires one unambiguous positive BTC/USDT mark")
+    return marks[0]
 
 
 def _exposure_fraction(
@@ -528,64 +482,6 @@ def _order_exposure_fraction(
         )
         / equity
     )
-
-
-def _returns(values: list[float]) -> list[float]:
-    return [values[index] / values[index - 1] - 1.0 for index in range(1, len(values))]
-
-
-def _correlations_from_returns(
-    returns: Mapping[str, list[float]],
-) -> dict[str, dict[str, float]]:
-    result = {key: {key: 1.0} for key, values in returns.items() if len(values) >= 2}
-    keys = sorted(returns)
-    for index, left in enumerate(keys):
-        for right in keys[index + 1 :]:
-            if len(returns[left]) < 2 or len(returns[right]) < 2:
-                continue
-            value = _correlation(returns[left], returns[right])
-            result.setdefault(left, {})[right] = value
-            result.setdefault(right, {})[left] = value
-    return result
-
-
-def _is_btc_benchmark(instrument_id: str) -> bool:
-    return bool(re.search(r"(?:^|[:/ -])BTC/?USDT(?:$|[:/ -])", instrument_id.upper()))
-
-
-def _correlation(left: list[float], right: list[float]) -> float:
-    size = min(len(left), len(right))
-    if size < 2:
-        return 0.0
-    left = left[-size:]
-    right = right[-size:]
-    left_mean = sum(left) / size
-    right_mean = sum(right) / size
-    covariance = sum((a - left_mean) * (b - right_mean) for a, b in zip(left, right, strict=False))
-    left_variance = sum((value - left_mean) ** 2 for value in left)
-    right_variance = sum((value - right_mean) ** 2 for value in right)
-    denominator = math.sqrt(left_variance * right_variance)
-    return covariance / denominator if denominator else 0.0
-
-
-def _beta(values: list[float], benchmark: list[float] | None) -> float:
-    if benchmark is None:
-        return 0.0
-    size = min(len(values), len(benchmark))
-    if size < 2:
-        return 0.0
-    values = values[-size:]
-    benchmark = benchmark[-size:]
-    benchmark_mean = sum(benchmark) / size
-    variance = sum((value - benchmark_mean) ** 2 for value in benchmark)
-    if variance == 0:
-        return 0.0
-    value_mean = sum(values) / size
-    covariance = sum(
-        (value - value_mean) * (reference - benchmark_mean)
-        for value, reference in zip(values, benchmark, strict=False)
-    )
-    return covariance / variance
 
 
 def _base_asset(payload: object, instrument_id: str) -> str:

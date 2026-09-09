@@ -179,12 +179,6 @@ def registered_feature_contract(name: str) -> tuple[tuple[str, ...], dict[str, o
     return nodes, {"kind": "registered_strategy/v1", "registered_strategy": name}
 
 
-def registered_live_contract(name: str) -> tuple[tuple[str, ...], dict[str, object]]:
-    """Compatibility name for the feature contract, without a second rule engine."""
-
-    return registered_feature_contract(name)
-
-
 def strategy_manifest() -> tuple[StrategyManifestEntry, ...]:
     return tuple(
         StrategyManifestEntry(name, family, _EVIDENCE[family])

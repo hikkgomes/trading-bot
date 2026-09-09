@@ -16,6 +16,7 @@ Read-only routes:
 - `GET /configuration`
 - `GET /reports`
 - `GET /agent/reviews`
+- `GET /paper/windows`
 
 Audited routes:
 
@@ -24,6 +25,7 @@ Audited routes:
 - `POST /cancel-all-entry-orders`
 - `POST /emergency-flatten`
 - `POST /agent/proposals`
+- `POST /paper/restart-forward-window`
 
 Requests must include the target, reason, requesting actor, and timestamp when
 the route requires them. Live approval, live assignment, credential changes,
@@ -50,7 +52,12 @@ OpenClaw has no order, approval, credential, or live-risk access. Scheduled
 reviews receive only a sanitised PostgreSQL research context. Proposals enter
 an untrusted proposal record, pass schema and security validation, and are
 compiled into the normal typed research queue. Protected holdout results are
-not exposed before final disposition.
+never exposed to adaptive agents.
+
+The isolated consumer polls `POST /agent/requests/next` and submits signed
+responses to `POST /agent/responses`. Its scoped transport credential is
+distinct from the operator token and cannot access operator routes. Delivery,
+response, compilation and evaluation remain durable, separate states.
 
 Agents may request bounded research, revise a thesis, or retire a lineage.
 They cannot grant `live_ready`, create a live assignment, or alter execution
@@ -59,12 +66,11 @@ controls.
 ## Verification
 
 ```bash
-curl --fail http://127.0.0.1:8088/status
+make control ARGS="status"
 curl --fail http://127.0.0.1:9108/metrics
 make platform-report
 make platform-readiness
 ```
 
 Use [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for service installation and
-incident recovery. The old file-based Telegram and autopilot bridges are
-offline migration or research code only.
+incident recovery. The obsolete file-based Telegram and autopilot bridges have been removed.

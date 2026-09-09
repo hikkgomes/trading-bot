@@ -1,6 +1,6 @@
 """Live/testnet broker over ccxt (spot or futures).
 
-ccxt is pinned in ``requirements-bot.txt`` because live Binance conditional
+ccxt is pinned in ``requirements-runtime.txt`` because live Binance conditional
 order routing is version-sensitive.
 
 Safety rails — a live order is only sent when **all** of these hold:
@@ -48,6 +48,7 @@ from src.execution.broker import (
     ProtectiveOrderStatus,
 )
 from src.execution.config import ExchangeConfig
+from src.execution.history import income_history, trade_history
 from src.execution.rate_limit import RateLimitedExchangeClient, shared_exchange_rate_limiter
 
 LOGGER = logging.getLogger(__name__)
@@ -56,8 +57,6 @@ CLIENT_ORDER_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,36}$")
 NATIVE_STOP_CCXT_VERSION = "4.5.64"
 BINANCE_MARGIN_MODE_ALREADY_SET_CODE = -4046
 BINANCE_MARGIN_MODE_ALREADY_SET_MESSAGE = "No need to change margin type."
-BINANCE_POSITION_MODE_ALREADY_SET_CODE = -4059
-BINANCE_POSITION_MODE_ALREADY_SET_MESSAGE = "No need to change position side."
 
 
 class CcxtBroker(Broker):
@@ -171,15 +170,14 @@ class CcxtBroker(Broker):
         )
 
     def query_order_fills(
-        self, *, symbol: str, exchange_order_id: str, client_order_id: str
+        self, *, symbol: str, exchange_order_id: str, client_order_id: str, from_trade_id: str = "0"
     ) -> tuple[BrokerFill, ...]:
         fetch = getattr(self._client, "fetch_my_trades", None)
         if not callable(fetch):
             raise RuntimeError("ccxt client cannot fetch account trades")
         params = {"orderId": exchange_order_id} if exchange_order_id else {}
-        payload = fetch(self._ccxt_symbol(symbol), None, None, params)
-        if not isinstance(payload, list):
-            raise RuntimeError("exchange trade history response is not a list")
+        params["fromId"] = from_trade_id
+        payload = trade_history(fetch, self._ccxt_symbol(symbol), params)
         fills: list[BrokerFill] = []
         for item in payload:
             if not isinstance(item, dict):
@@ -229,14 +227,22 @@ class CcxtBroker(Broker):
             )
         return tuple(sorted(fills, key=lambda item: (item.occurred_at, item.trade_id)))
 
-    def query_income(self, *, since: float | None = None) -> tuple[BrokerIncome, ...]:
+    def query_income(
+        self, *, since: float | None = None, until: float | None = None
+    ) -> tuple[BrokerIncome, ...]:
         fetch = getattr(self._client, "fapiPrivateGetIncome", None)
         if not callable(fetch):
             raise RuntimeError("ccxt client cannot fetch futures income history")
         params = {"startTime": int(since * 1_000)} if since is not None else {}
-        payload = fetch(params)
-        if not isinstance(payload, list):
-            raise RuntimeError("exchange income history response is not a list")
+        end = time.time() if until is None else until
+        if (
+            not math.isfinite(end)
+            or end < 0
+            or (since is not None and (not math.isfinite(since) or since < 0 or since > end))
+        ):
+            raise ValueError("income history interval must be finite, non-negative and ordered")
+        params["endTime"] = int(end * 1_000)
+        payload = income_history(fetch, params)
         result: list[BrokerIncome] = []
         for item in payload:
             if not isinstance(item, dict):
@@ -836,22 +842,6 @@ class CcxtBroker(Broker):
             or str(self.config.exchange).lower() != "binanceusdm"
         ):
             return
-        client_symbol = self._ccxt_symbol(symbol)
-        if not callable(getattr(self._client, "set_position_mode", None)):
-            raise RuntimeError(
-                "Refusing Binance USD-M entry: ccxt client cannot set one-way position mode."
-            )
-        try:
-            self._client.set_position_mode(False, client_symbol)
-        except Exception as exc:
-            if not self._is_exact_binance_already_set_error(
-                exc,
-                code=BINANCE_POSITION_MODE_ALREADY_SET_CODE,
-                message=BINANCE_POSITION_MODE_ALREADY_SET_MESSAGE,
-            ):
-                raise RuntimeError(
-                    f"Refusing Binance USD-M entry: could not set one-way position mode: {exc}"
-                ) from exc
         if not self.verify_one_way_position_mode(symbol):
             raise RuntimeError(
                 "Refusing Binance USD-M entry: exchange did not confirm one-way position mode."
@@ -1565,6 +1555,10 @@ class CcxtBroker(Broker):
             client_id=client_id,
             status=status,
             conditional=conditional,
+            reduce_only=self._response_bool(
+                self._payload_value(payload, info, "reduceOnly") or False,
+                label="open order reduceOnly",
+            ),
         )
 
     def _assert_no_open_orders_before_entry(self, symbol: str) -> None:
@@ -1825,9 +1819,16 @@ class CcxtBroker(Broker):
     @staticmethod
     def _normalized_protective_status(value) -> ProtectiveOrderStatus:
         normalized = str(value or "").strip().lower()
-        if normalized in {"open", "new", "accepted", "partially_filled", "triggering"}:
+        if normalized in {"open", "new", "accepted"}:
             return ProtectiveOrderStatus.OPEN
-        if normalized in {"closed", "filled", "triggered", "finished"}:
+        if normalized in {
+            "closed",
+            "filled",
+            "triggered",
+            "finished",
+            "triggering",
+            "partially_filled",
+        }:
             return ProtectiveOrderStatus.TRIGGERED
         if normalized in {"canceled", "cancelled"}:
             return ProtectiveOrderStatus.CANCELED
@@ -1885,7 +1886,16 @@ class CcxtBroker(Broker):
             filled_qty=filled_qty,
             average_price=average_price,
             fee=fee,
+            child_order_id=self._protective_child_id(payload, info),
         )
+
+    def _protective_child_id(self, payload: dict, info: dict) -> str | None:
+        value = self._payload_value(payload, info, "actualOrderId", "ai")
+        if value in (None, "", "0", 0):
+            return None
+        if isinstance(value, bool) or not isinstance(value, str | int):
+            raise ValueError("protective child order identity must be an exact string or integer")
+        return str(value)
 
     def _protective_identity(
         self, payload: dict, info: dict, *, requested_symbol: str
@@ -1961,16 +1971,12 @@ class CcxtBroker(Broker):
     def _assert_triggered_protective_fill(
         qty: float, filled_qty: float, average_price: float | None
     ) -> None:
-        if filled_qty <= 0:
-            raise ValueError(
-                "Triggered protective stop has no positive fill quantity. Refusing adoption."
-            )
-        if average_price is None:
+        if filled_qty > 0 and average_price is None:
             raise ValueError(
                 "Triggered protective stop average fill price is missing. Refusing adoption."
             )
-        if abs(filled_qty - qty) > max(qty * 1e-9, 1e-12):
-            raise ValueError("Triggered protective stop is not fully filled. Refusing adoption.")
+        if filled_qty > qty + max(qty * 1e-9, 1e-12):
+            raise ValueError("Triggered protective stop fill exceeds its quantity")
 
     def _protective_fee(self, payload: dict, info: dict) -> float:
         fee_value = (

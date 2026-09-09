@@ -3,16 +3,28 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from datetime import datetime, timedelta
 from typing import Any
+
+from sqlalchemy import func, select
 
 from src.agents.code_worker import AgentCodeWorkflow
 from src.agents.compiler import AgentCompilationError, compile_openclaw_candidate_payload
 from src.agents.context import AgentContext
+from src.agents.openclaw_bridge import OpenClawAgentBridge
 from src.agents.store import SqlAgentStore
+from src.data.database import (
+    dataset_bundle,
+    research_thesis,
+    strategy_definition,
+    strategy_identity,
+    thesis_trial,
+    validation_stage,
+)
 from src.domain._codec import canonical_hash
-from src.observability.reports import DatabasePlatformReport
 from src.research.coordinator import ResearchCoordinator
 from src.research.datasets import SqlDatasetBundleRepository
+from src.research.economic_series import ECONOMIC_ENGINE_VERSION
 from src.research.store import SqlResearchStore
 from src.research.theses import SqlThesisRegistry, ThesisError
 from src.services.job_schemas import JobSchemaError, ResearchJobRequest
@@ -57,28 +69,44 @@ class DatabaseAgentJobHandlers:
 
     def agent_review(self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]) -> dict[str, Any]:
         renew()
-        now = str(claimed.payload.get("available_at") or utc_now())
-        report = DatabasePlatformReport(self.queue.engine).build(now=now)
+        review_id = "scheduled-agent-review:" + canonical_hash(
+            {"job_id": claimed.job_id}
+        ).removeprefix("sha256:")
+        bridge = OpenClawAgentBridge(store=self.store, queue=self.queue)
+        try:
+            existing = bridge.review_request(review_id)
+        except KeyError:
+            existing = None
+        if existing is not None:
+            bridge.enqueue_review_delivery(review_id, available_at=existing["requested_at"])
+            return {
+                "review_id": review_id,
+                "context_hash": existing["context_hash"],
+                "reason_code": "sanitised_agent_review_recorded",
+            }
+        now = utc_now()
+        report = adaptive_research_report(self.queue.engine)
         context = build_agent_review_context(
             report,
             created_at=now,
             product_id=str(claimed.payload.get("product_id") or ""),
-        )
-        review_id = (
-            f"scheduled-agent-review:{canonical_hash(context.values).removeprefix('sha256:')}"
         )
         self.store.save_review(
             proposal_id=review_id,
             created_at=context.created_at,
             payload={
                 "schema": "platform.agent_review_request/v1",
+                "state": "requested",
                 "review_id": review_id,
                 "context": dict(context.values),
                 "context_hash": context.content_hash,
                 "transport": "postgresql_agent_review",
                 "response_required": True,
+                "requested_at": now,
+                "expires_at": (datetime.fromisoformat(now) + timedelta(hours=1)).isoformat(),
             },
         )
+        bridge.enqueue_review_delivery(review_id, available_at=now)
         return {
             "review_id": review_id,
             "context_hash": context.content_hash,
@@ -88,12 +116,17 @@ class DatabaseAgentJobHandlers:
     def agent_research(
         self, claimed: ClaimedJob, renew: Callable[[], ClaimedJob]
     ) -> dict[str, Any]:
+        renew()
+        now = utc_now()
         proposal = self.store.proposal(str(claimed.payload["proposal_id"]))
         compiled_candidate_id = None
         if proposal.economic_thesis is not None:
-            bundle = SqlDatasetBundleRepository(self.queue.engine).latest_ready(
-                proposal.product_id,
-                at=proposal.created_at,
+            datasets = SqlDatasetBundleRepository(self.queue.engine)
+            binding = self.store.dataset_binding(proposal.proposal_id)
+            bundle = (
+                datasets.get(binding["bundle_id"])
+                if binding
+                else datasets.latest_ready(proposal.product_id, at=now)
             )
             if bundle is None:
                 self.store.save_disposition(
@@ -108,12 +141,19 @@ class DatabaseAgentJobHandlers:
                 return {
                     "proposal_id": proposal.proposal_id,
                     "state": "waiting_for_dataset",
+                    "outcome_category": "blocked_data",
+                    "_defer": True,
+                    "_defer_reason": "canonical_dataset_bundle_unavailable",
                 }
+            if binding is None:
+                binding = self.store.bind_dataset(
+                    proposal_id=proposal.proposal_id, bundle_id=bundle.bundle_id, resolved_at=now
+                )
             try:
                 candidate = compile_openclaw_candidate_payload(
                     proposal,
                     bundle=bundle,
-                    submitted_at=proposal.created_at,
+                    submitted_at=binding["resolved_at"],
                 )
                 SqlThesisRegistry(self.queue.engine).register(proposal.economic_thesis)
                 compiled_candidate_id = ResearchCoordinator(
@@ -126,6 +166,7 @@ class DatabaseAgentJobHandlers:
                     payload={
                         "accepted": False,
                         "reason_code": "openclaw_candidate_compilation_rejected",
+                        "state": "rejected",
                         "detail": str(exc),
                         "live_eligible": False,
                     },
@@ -166,6 +207,7 @@ class DatabaseAgentJobHandlers:
                 "reason_code": "bounded_research_jobs_enqueued",
                 "job_ids": queued,
                 "candidate_id": compiled_candidate_id,
+                "state": "compiled" if compiled_candidate_id else "dispatched",
                 "live_eligible": False,
             },
         )
@@ -183,7 +225,7 @@ class DatabaseAgentJobHandlers:
         result = self.code_workflow.execute(
             proposal,
             base_ref=str(claimed.payload.get("base_ref") or "HEAD"),
-            publish=bool(claimed.payload.get("publish", True)),
+            publish=bool(claimed.payload.get("publish", False)),
         )
         return {
             "proposal_id": proposal.proposal_id,
@@ -228,3 +270,76 @@ def build_agent_review_context(
     if product_id:
         values["product_id"] = product_id
     return AgentContext(created_at=created_at, values=values)
+
+
+def adaptive_research_report(engine) -> dict[str, Any]:
+    """Read only public development tables; never build an operator report for an agent."""
+    public = validation_stage.c.stage.in_(("screening", "development", "robustness"))
+    current = validation_stage.c.engine_version == ECONOMIC_ENGINE_VERSION
+    family = strategy_definition.c.definition["family"].as_string()
+    candidates = SqlResearchStore(engine).candidates
+    with engine.connect() as connection:
+        counts = {
+            table.name: int(
+                connection.execute(select(func.count()).select_from(table)).scalar_one()
+            )
+            for table in (research_thesis, thesis_trial, strategy_identity)
+        }
+        counts["experiment"] = int(
+            connection.execute(
+                select(func.count())
+                .select_from(candidates)
+                .where(candidates.c.state != "legacy_import")
+            ).scalar_one()
+        )
+        reasons = dict(
+            connection.execute(
+                select(validation_stage.c.reason_code, func.count())
+                .where(public, current, validation_stage.c.accepted.is_(False))
+                .group_by(validation_stage.c.reason_code)
+            ).all()
+        )
+        rejected = dict(
+            connection.execute(
+                select(validation_stage.c.stage, func.count())
+                .where(public, current, validation_stage.c.accepted.is_(False))
+                .group_by(validation_stage.c.stage)
+            ).all()
+        )
+        families = dict(connection.execute(select(family, func.count()).group_by(family)).all())
+        evaluated = int(
+            connection.execute(
+                select(func.count(func.distinct(validation_stage.c.experiment_id))).where(
+                    public, current
+                )
+            ).scalar_one()
+        )
+        duplicates = int(
+            connection.execute(
+                select(func.count())
+                .select_from(strategy_identity)
+                .where(strategy_identity.c.is_duplicate.is_(True))
+            ).scalar_one()
+        )
+        bundles = set(connection.execute(select(dataset_bundle.c.product_id)).scalars())
+    return {
+        "research": {
+            "funnel": {
+                "top_rejection_reasons": {str(key): count for key, count in reasons.items() if key},
+                "candidates_rejected_by_stage": rejected,
+                "feature_family_concentration": {
+                    str(key or "unclassified"): value for key, value in families.items()
+                },
+                "candidates_generated": counts["experiment"],
+                "candidates_evaluated": evaluated,
+                "theses_generated": counts["research_thesis"],
+                "cumulative_trial_count": counts["thesis_trial"],
+                "exact_duplicate_rate": duplicates / max(1, counts["strategy_identity"]),
+                "missing_stage_datasets": {
+                    product: "no_canonical_bundle"
+                    for product in ("btc_accumulation", "active_income")
+                    if product not in bundles
+                },
+            }
+        }
+    }

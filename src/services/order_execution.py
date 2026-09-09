@@ -24,7 +24,7 @@ from src.execution.order_groups import (
 )
 from src.execution.order_manager import OrderManager
 from src.execution.order_planner import plan_orders
-from src.execution.paper_exchange import PaperExchange
+from src.execution.paper_exchange import paper_fill
 from src.execution.position_manager import PositionManager
 from src.observability.decision_trace import (
     DecisionTrace,
@@ -34,7 +34,7 @@ from src.observability.decision_trace import (
 from src.products.btc_accumulation import assert_btc_spot_instrument
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.risk.engine import SqlRiskDecisionStore, SqlRiskSnapshotStore
-from src.services.execution_service import ExecutionService
+from src.services.financial_application import FinancialApplication, FinancialScope
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -172,7 +172,7 @@ class DatabaseExecutionWorker:
                 "orders": 0,
                 "first_blocked_stage": DecisionTraceStage.RISK_ACCEPTED.value,
             }
-        self._reconcile_positions(inputs, targets, evaluated_at=str(payload["evaluated_at"]))
+        self._assert_reconciled_positions(inputs, targets)
         current = self.positions.current_quantities(targets[0].portfolio_id)
         prices = {str(key): float(value) for key, value in inputs["prices"].items()}
         orders = self._plan_orders(
@@ -181,7 +181,7 @@ class DatabaseExecutionWorker:
             decided_at=str(payload["evaluated_at"]),
             prices=prices,
         )
-        if product_id == "btc_accumulation" and "balances" in inputs:
+        if configuration["base_accounting_asset"] == "BTC" and "balances" in inputs:
             _validate_btc_spot_orders(
                 orders,
                 current=current,
@@ -263,24 +263,18 @@ class DatabaseExecutionWorker:
                 _risk_rejected_trace(event_id=event_id, target=target, reason_code=reason_code)
             )
 
-    def _reconcile_positions(
+    def _assert_reconciled_positions(
         self,
         inputs: Mapping[str, Any],
         targets: tuple[TargetPosition, ...],
-        *,
-        evaluated_at: str,
     ) -> None:
         for instrument_id, quantity in inputs["reconciled_positions"].items():
             target = next((item for item in targets if item.instrument_id == instrument_id), None)
             if target is None:
                 raise ValueError(f"reconciled position is outside target scope: {instrument_id}")
-            self.positions.reconcile_position(
-                portfolio_id=target.portfolio_id,
-                instrument_id=str(instrument_id),
-                quantity=float(quantity),
-                average_entry_price=float(inputs["prices"][instrument_id]),
-                updated_at=evaluated_at,
-            )
+            current = self.positions.get(target.portfolio_id, str(instrument_id))
+            if current.quantity != float(quantity):
+                raise ValueError("target position differs from the reconciled financial position")
 
     def _enqueue_order(
         self,
@@ -362,7 +356,7 @@ class DatabaseExecutionWorker:
             "quantity": order.quantity,
             "execution_costs": configuration["execution_costs"],
             "accounting_asset": configuration["base_accounting_asset"],
-            "fee_in_base": product_id == "btc_accumulation",
+            "fee_in_base": configuration["base_accounting_asset"] == "BTC",
             "order_group_id": order.group_id,
             "strategy_version_ids": sorted(order.strategy_contributions),
             "strategy_version_id": (
@@ -792,41 +786,12 @@ class DatabasePaperExecutionWorker:
                 "order_id": order.order_id,
                 "valid_until": order.valid_until,
             }
-        previous_position = self.positions.get(order.portfolio_id, order.instrument_id)
-        costs = dict(payload["execution_costs"])
-        venue = PaperExchange(
-            order_manager=self.order_manager,
-            position_manager=self.positions,
-            price_source=lambda _instrument_id: float(payload["price"]),
-            fee_bps=float(costs["fee_bps"]),
-            slippage_bps=float(costs["slippage_bps"]),
-            fill_fraction=float(payload.get("fill_fraction", 1.0)),
-            fee_asset=str(payload["accounting_asset"]),
-            fee_in_base=bool(payload["fee_in_base"]),
-        )
         _before_group_submission(self.order_groups, order)
-        fill = (
-            venue.fill_remaining(order.order_id, fill_fraction=1.0)
-            if order.status is OrderStatus.PARTIALLY_FILLED
-            else venue.submit(order)
-        )
-        recorder = ExecutionService(
-            paper_exchange=venue,
-            positions=self.positions,
-            ledger=self.ledgers[str(payload["product_id"])],
-            trace_store=self.trace_store,
-        )
-        recorder.record_execution_costs(order, fill, previous_position=previous_position)
-        updated = self.order_manager.get(order.order_id)
-        position = self.positions.get(order.portfolio_id, order.instrument_id)
-        paper_account = self.paper_accounts.get(str(payload["product_id"]))
-        if paper_account is not None:
-            paper_account.record_fill(
-                order=order,
-                fill=fill,
-                position=position,
-                previous_position=previous_position,
-            )
+        applied, application = self._apply_paper_fill(claimed, order, payload, now)
+        fill, updated, position = applied.fill, applied.order, applied.position
+        self.order_manager.reload()
+        self.positions.reload()
+        self.ledgers[str(payload["product_id"])].reload()
         trace = _filled_trace(
             event_id=str(payload["event_id"]),
             order_id=order.order_id,
@@ -837,22 +802,8 @@ class DatabasePaperExecutionWorker:
         )
         self.trace_store.append(trace)
         _after_group_fill(self.order_groups, self.order_manager, updated)
-        continuation_job_id = None
-        if updated.status is OrderStatus.PARTIALLY_FILLED:
-            continuation_payload = {**payload, "fill_fraction": 1.0}
-            continuation_job_id = "paper-order-continue:" + canonical_hash(
-                {
-                    "order_id": order.order_id,
-                    "filled_quantity": updated.filled_quantity,
-                }
-            ).removeprefix("sha256:")
-            self.queue.enqueue_if_absent(
-                job_id=continuation_job_id,
-                name="paper_order_continue",
-                payload=continuation_payload,
-                available_at=now,
-                priority=32,
-            )
+        continuation_job_id = applied.continuation_job_id
+        application.acknowledge(applied.application_id, at=now)
         self.queue.complete(claimed, completed_at=now)
         return {
             "reason_code": (
@@ -879,6 +830,56 @@ class DatabasePaperExecutionWorker:
             "fill_id": fill_id,
         }
 
+    def _apply_paper_fill(self, claimed, order, payload, now):
+        product_id = str(payload["product_id"])
+        account = self.paper_accounts.get(product_id)
+        account_id = (
+            account.account_id
+            if account is not None
+            else str(
+                order.metadata.get("target_metadata", {}).get("account_id") or order.portfolio_id
+            )
+        )
+        application = FinancialApplication(
+            self.queue.engine,
+            FinancialScope(
+                product_id,
+                account_id,
+                "paper",
+                "paper",
+                str(payload["accounting_asset"]),
+            ),
+            queue_scope=self.queue.claim_scope,
+        )
+        costs = payload["execution_costs"]
+
+        def build(current):
+            return paper_fill(
+                current,
+                price=float(payload["price"]),
+                fee_bps=float(costs["fee_bps"]),
+                slippage_bps=float(costs["slippage_bps"]),
+                fill_fraction=1.0
+                if current.status is OrderStatus.PARTIALLY_FILLED
+                else float(payload.get("fill_fraction", 1.0)),
+                fee_asset=str(payload["accounting_asset"]),
+                fee_in_base=bool(payload["fee_in_base"]),
+                now=now,
+            )
+
+        result = application.apply_paper(
+            order_id=order.order_id,
+            instrument_id=order.instrument_id,
+            request_id=claimed.job_id,
+            request_hash=canonical_hash(dict(payload)),
+            build_fill=build,
+            account=account,
+            request_payload=payload,
+        )
+        if account is not None:
+            account.ensure_seed(observed_at=now)
+        return result, application
+
 
 class DatabaseUserStreamWorker:
     """Persist account events and route balance updates to accounting."""
@@ -894,6 +895,7 @@ class DatabaseUserStreamWorker:
         ledgers: Mapping[str, Ledger] | None = None,
         trace_store: SqlDecisionTraceStore | None = None,
         account_products: Mapping[str, str] | None = None,
+        account_environments: Mapping[str, str] | None = None,
         order_groups: OrderGroupManager | None = None,
         lease_seconds: int = 60,
         job_name: str = "user_stream_event",
@@ -912,6 +914,7 @@ class DatabaseUserStreamWorker:
         self.ledgers = dict(ledgers or {})
         self.trace_store = trace_store
         self.account_products = dict(account_products or {})
+        self.account_environments = dict(account_environments or {})
         self.order_groups = order_groups
         self.lease_seconds = lease_seconds
         self.job_name = job_name
@@ -1042,8 +1045,13 @@ class DatabaseUserStreamWorker:
         matches = tuple(
             order
             for order in self.order_manager.all()
-            if order.metadata.get("client_order_id") == client_order_id
-            or order.order_id[:36] == client_order_id
+            if (
+                order.metadata.get("client_order_id") == client_order_id
+                or order.order_id[:36] == client_order_id
+            )
+            and order.metadata.get("target_metadata", order.metadata).get("account_id")
+            in {None, account_id}
+            and order.instrument_id == event.instrument_id
         )
         if len(matches) != 1:
             recovery_payload = {
@@ -1109,8 +1117,6 @@ class DatabaseUserStreamWorker:
                 "trade_id": trade_id,
             }
         )
-        if any(fill.fill_id == fill_id for fill in order_manager.fills_for(order.order_id)):
-            return self._duplicate_fill_result(order, fill_id, product_id, event.receive_timestamp)
         product_id = self.account_products.get(account_id)
         ledger = self.ledgers.get(product_id) if product_id is not None else None
         if fee and ledger is not None and fee_asset != ledger.accounting_asset:
@@ -1140,7 +1146,6 @@ class DatabaseUserStreamWorker:
             order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
         elif order.status is OrderStatus.SUBMITTED:
             order_manager.acknowledged(order.order_id, event_at=event.exchange_timestamp)
-        previous_position = positions.get(order.portfolio_id, order.instrument_id)
         fill = Fill(
             fill_id=fill_id,
             order_id=order.order_id,
@@ -1152,29 +1157,31 @@ class DatabaseUserStreamWorker:
             occurred_at=event.exchange_timestamp,
             fee_asset=fee_asset,
             metadata={
-                "reference_price": price,
-                "slippage_cost": 0.0,
                 "user_stream": True,
                 "exchange_order_id": str(values.get("i") or "") or None,
                 "trade_id": trade_id,
                 **conversion,
             },
         )
-        updated = order_manager.apply_fill(fill)
-        position = positions.apply_fill(
-            order.portfolio_id,
-            fill,
-            contributions=dict(order.strategy_contributions),
-            assignment_id=_order_assignment_id(order),
+        if product_id is None or ledger is None:
+            raise RuntimeError("financial fill has no configured product ledger")
+        application = FinancialApplication(
+            self.engine,
+            FinancialScope(
+                product_id,
+                account_id,
+                self.account_environments.get(account_id, "unknown"),
+                "binance",
+                ledger.accounting_asset,
+            ),
+            queue_scope=self.queue.claim_scope,
         )
-        if product_id is not None and product_id in self.ledgers:
-            recorder = ExecutionService(
-                paper_exchange=_RecordedVenue(order_manager),
-                positions=positions,
-                ledger=self.ledgers[product_id],
-                trace_store=trace_store,
-            )
-            recorder.record_execution_costs(order, fill, previous_position=previous_position)
+        applied = application.apply_fill(fill)
+        fill, updated, position = applied.fill, applied.order, applied.position
+        order_manager.reload()
+        positions.reload()
+        ledger.reload()
+        position = positions.get(order.portfolio_id, order.instrument_id)
         trace_store.append(
             _filled_trace(
                 event_id=event.event_id,
@@ -1188,6 +1195,7 @@ class DatabaseUserStreamWorker:
         _after_group_fill(self.order_groups, order_manager, updated)
         if self.on_live_fill is not None and product_id is not None:
             self.on_live_fill(product_id, order, position.quantity, event.receive_timestamp)
+            application.acknowledge(applied.application_id, at=event.receive_timestamp)
         return {
             "reason_code": (
                 "exchange_order_partially_filled"
@@ -1302,14 +1310,6 @@ class DatabaseUserStreamWorker:
             "reason_code": f"exchange_order_{order.status.value}",
             "order_id": order.order_id,
         }
-
-
-class _RecordedVenue:
-    def __init__(self, order_manager: OrderManager):
-        self.order_manager = order_manager
-
-    def submit(self, _intent: OrderIntent) -> Fill:
-        raise RuntimeError("recorded user-stream venues cannot submit orders")
 
 
 def _before_group_submission(

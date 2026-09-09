@@ -41,16 +41,22 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
     assert "common.env" not in runtime + research + agent + migration
     assert 'install -d -m 0750 -o root -g trading-platform "$REPO/data"' in installer
     assert (
-        'setfacl -m u:trading-runtime:rwx,u:trading-research:rx,u:trading-agent:--x "$REPO/data"'
+        'setfacl -m u:trading-runtime:rwx,u:trading-research:rx,u:trading-evaluator:rx,u:trading-agent:--x "$REPO/data"'
         in installer
     )
-    assert 'setfacl -m u:trading-research:rx "$REPO/data/$directory"' in installer
-    assert 'setfacl -R -m u:trading-research:r-X "$REPO/data/$directory"' in installer
     assert (
-        'setfacl -m u:trading-runtime:rwx,u:trading-research:rx,u:trading-agent:--x "$REPO/runtime"'
+        'setfacl -m u:trading-research:rx,u:trading-evaluator:rx "$REPO/data/$directory"'
         in installer
     )
-    assert "/opt/trading-bot/data/artefacts" in research
+    assert (
+        'setfacl -R -m u:trading-research:r-X,u:trading-evaluator:r-X "$REPO/data/$directory"'
+        in installer
+    )
+    assert (
+        'setfacl -m u:trading-runtime:rwx,u:trading-research:rx,u:trading-evaluator:rx,u:trading-agent:--x "$REPO/runtime"'
+        in installer
+    )
+    assert "/opt/trading-bot/data/artefacts" not in research
     assert "/opt/trading-bot/data/reports" not in research
     assert "/opt/trading-bot/runtime/research" in research
     assert "NUMBA_CACHE_DIR=/opt/trading-bot/runtime/research/numba-cache" in research
@@ -62,10 +68,6 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
         "ReadOnlyPaths=/opt/trading-bot/data/raw /opt/trading-bot/data/bars "
         "/opt/trading-bot/data/features"
     ) in research
-    assert "TRADING_PLATFORM_AGENT_WORKTREE_ROOT=/opt/trading-bot/runtime/agent-worktrees" in agent
-    assert "NUMBA_CACHE_DIR=/opt/trading-bot/runtime/agent-worktrees/numba-cache" in agent
-    assert "GIT_CONFIG_KEY_0=safe.directory" in agent
-    assert "GIT_CONFIG_VALUE_0=/opt/trading-bot" in agent
     assert (
         "install -d -m 2770 -o trading-agent -g trading-agent \\\n"
         '    "$REPO/runtime/agent-worktrees/numba-cache"'
@@ -79,7 +81,10 @@ def test_linux_deployment_declares_shared_traversal_and_exact_writable_paths() -
         'setfacl -R -m g:trading-platform:r-X "$REPO/src" "$REPO/config" "$REPO/alembic"'
         in installer
     )
-    assert 'setfacl -R -m u:trading-agent:r-X "$REPO/.git"' in installer
+    assert (
+        'setfacl -R -m u:trading-research:r-X,u:trading-evaluator:r-X,u:trading-agent:--- "$REPO/.git"'
+        in installer
+    )
     assert '"$REPO/.venv-runtime"' in installer
     assert '"$REPO/.venv-research"' in installer
     assert '"$REPO/.venv-agent"' in installer
@@ -131,11 +136,15 @@ def test_installed_service_users_can_traverse_and_write_their_real_paths() -> No
             str(INSTALLED_ROOT / "data/bars"),
             str(INSTALLED_ROOT / "data/features"),
             str(INSTALLED_ROOT / "runtime"),
+            str(INSTALLED_ROOT / "runtime/numba-cache"),
         ),
         "trading-research": (
             str(INSTALLED_ROOT / "data/research"),
-            str(INSTALLED_ROOT / "data/artefacts"),
             str(INSTALLED_ROOT / "runtime/research"),
+        ),
+        "trading-evaluator": (
+            str(INSTALLED_ROOT / "data/artefacts"),
+            str(INSTALLED_ROOT / "runtime/evaluation"),
         ),
         "trading-agent": (str(INSTALLED_ROOT / "runtime/agent-worktrees"),),
     }
@@ -159,54 +168,93 @@ def test_installed_service_users_can_traverse_and_write_their_real_paths() -> No
                 text=True,
             )
             assert result.returncode == 0, f"{user} cannot write {path}: {result.stderr}"
+    private_paths = {
+        "trading-agent": (
+            INSTALLED_ROOT / ".git/config",
+            INSTALLED_ROOT / "runtime/research",
+            INSTALLED_ROOT / "runtime/backups",
+            Path("/etc/trading-platform/runtime.env"),
+            Path("/etc/trading-platform/research.env"),
+            Path("/etc/trading-platform/evaluator.env"),
+        ),
+        "trading-research": (
+            INSTALLED_ROOT / "data/artefacts",
+            INSTALLED_ROOT / "runtime/backups",
+            Path("/etc/trading-platform/runtime.env"),
+            Path("/etc/trading-platform/evaluator.env"),
+        ),
+        "trading-evaluator": (
+            INSTALLED_ROOT / "runtime/backups",
+            Path("/etc/trading-platform/runtime.env"),
+        ),
+    }
+    for user, paths in private_paths.items():
+        for path in paths:
+            result = subprocess.run(
+                ["runuser", "-u", user, "--", "test", "-r", str(path)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 1, f"{user} can read protected path: {path}"
 
 
 @pytest.mark.skipif(
     os.geteuid() != 0
     or not INSTALLED_ROOT.is_dir()
-    or not os.environ.get("TRADING_PLATFORM_DATABASE_URL", "").startswith("postgresql")
+    or not all(
+        os.environ.get(f"TRADING_PLATFORM_INSTALLED_{domain}_DATABASE_URL", "").startswith(
+            "postgresql"
+        )
+        for domain in ("RUNTIME", "RESEARCH", "EVALUATOR")
+    )
     or not all(
         Path(path).is_file()
         for path in (
             INSTALLED_ROOT / ".venv-runtime/bin/python",
             INSTALLED_ROOT / ".venv-research/bin/python",
-            INSTALLED_ROOT / ".venv-agent/bin/python",
         )
     ),
     reason="requires the installed Linux platform, service runtimes, and PostgreSQL",
 )
-def test_installed_service_users_can_run_one_real_service_cycle() -> None:
-    services = {
-        "trading-runtime": (
-            str(INSTALLED_ROOT / ".venv-runtime/bin/python"),
-            "product-supervisor",
-        ),
-        "trading-research": (
-            str(INSTALLED_ROOT / ".venv-research/bin/python"),
-            "research-worker",
-        ),
-        "trading-agent": (
-            str(INSTALLED_ROOT / ".venv-agent/bin/python"),
-            "agent-sandbox",
-        ),
-    }
-    for user, (python, service) in services.items():
-        environment = [
-            f"TRADING_PLATFORM_DATABASE_URL={os.environ['TRADING_PLATFORM_DATABASE_URL']}",
-        ]
-        if user == "trading-agent":
-            environment.append(
-                f"TRADING_PLATFORM_AGENT_WORKTREE_ROOT={INSTALLED_ROOT}/runtime/agent-worktrees"
-            )
+def test_installed_database_service_users_can_run_one_real_service_cycle() -> None:
+    from sqlalchemy.engine import make_url
+
+    services = (
+        ("trading-runtime", ".venv-runtime", "product-supervisor", "RUNTIME"),
+        ("trading-research", ".venv-research", "research-worker", "RESEARCH"),
+        ("trading-research", ".venv-research", "agent-coordinator", "RESEARCH"),
+        ("trading-evaluator", ".venv-research", "evaluation-worker", "EVALUATOR"),
+    )
+    for user, environment_name, service, domain in services:
+        database_url = os.environ[f"TRADING_PLATFORM_INSTALLED_{domain}_DATABASE_URL"]
+        assert make_url(database_url).database != "trading_platform", (
+            "use an isolated test database"
+        )
+        environment = {
+            "PATH": os.environ.get("PATH", os.defpath),
+            "TRADING_PLATFORM_DATABASE_URL": database_url,
+            "TRADING_LIVE": "0",
+            "EXCHANGE_TESTNET": "1",
+            "NUMBA_CACHE_DIR": str(
+                INSTALLED_ROOT
+                / {
+                    "RUNTIME": "runtime/numba-cache",
+                    "RESEARCH": "runtime/research/numba-cache",
+                    "EVALUATOR": "runtime/evaluation/numba-cache",
+                }[domain]
+            ),
+            "TRADING_PLATFORM_AGENT_WORKTREE_ROOT": str(
+                INSTALLED_ROOT / "runtime/research/agent-worktrees"
+            ),
+        }
         result = subprocess.run(
             [
                 "runuser",
                 "-u",
                 user,
                 "--",
-                "env",
-                *environment,
-                python,
+                str(INSTALLED_ROOT / environment_name / "bin/python"),
                 "-m",
                 "src.services.supervisor",
                 "--config",
@@ -218,6 +266,7 @@ def test_installed_service_users_can_run_one_real_service_cycle() -> None:
                 "--once",
             ],
             check=False,
+            env=environment,
             capture_output=True,
             text=True,
         )

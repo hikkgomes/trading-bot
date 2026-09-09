@@ -23,8 +23,10 @@ from src.data.database import (
     balance_snapshot,
     dataset_bundle,
     dataset_snapshot,
+    evidence_invalidation,
     exchange_order,
     experiment,
+    experiment_run,
     fill,
     forward_evidence,
     forward_paper_decision,
@@ -58,7 +60,14 @@ from src.data.database import (
 )
 from src.domain._codec import timestamp, to_primitive
 from src.observability.decision_trace import SqlDecisionTraceStore
+from src.observability.research_progress import current_stages, eligible_work, measured_progress
 from src.services.health import DatabaseHeartbeatStore
+
+
+def _reported_cost(metric: str, metadata: Mapping[str, Any], effect: float) -> float:
+    if metric == "slippage" and metadata.get("included_in_fill_price") is True:
+        return float(metadata["cost"])
+    return -effect
 
 
 class DatabasePlatformReport:
@@ -170,7 +179,7 @@ class DatabasePlatformReport:
         *,
         now: str,
     ) -> dict[str, Any]:
-        stages = list(research["validation_stages"])
+        stages = current_stages(research["validation_stages"], self._rows(evidence_invalidation))
         identities = list(research["strategy_identities"])
         jobs = self._rows(job)
         attempts = self._rows(job_attempt)
@@ -251,12 +260,15 @@ class DatabasePlatformReport:
             if isinstance(row.get("metadata"), dict)
         )
         return {
+            **measured_progress(self._rows(experiment_run), attempts),
+            **eligible_work(jobs, now=now),
             "theses_generated": self._count(research_thesis),
             "candidates_generated": len(experiments),
             "candidates_compiled": sum(
                 row["stage"] == "screening" and row["accepted"] for row in stages
             ),
             "candidates_evaluated": len(evaluated_ids),
+            "historical_validation_stage_count": len(research["validation_stages"]) - len(stages),
             "candidates_rejected_by_stage": rejection_by_stage,
             "candidates_deferred_by_stage": deferred_by_stage,
             "top_rejection_reasons": dict(
@@ -345,7 +357,11 @@ class DatabasePlatformReport:
             effect = float(metadata.get("pnl_effect") or 0.0)
             metric = "fees" if kind == "fee" else kind
             if metric in product:
-                product[metric] += effect if metric in {"funding", "realised_pnl"} else -effect
+                product[metric] += (
+                    effect
+                    if metric in {"funding", "realised_pnl"}
+                    else _reported_cost(metric, metadata, effect)
+                )
             for dimension in product["attribution"]:
                 key = str(metadata.get(dimension) or "unattributed")
                 current = product["attribution"][dimension].get(key, 0.0)

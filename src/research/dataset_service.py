@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,22 +13,23 @@ from typing import Any
 import pyarrow.parquet as pq
 from sqlalchemy import select
 
+from src.data.bar_window import RecentBarWindow
 from src.data.database import (
     cost_model_manifest,
     feature_manifest,
     funding_entry,
-    risk_snapshot,
     universe_member,
     universe_snapshot,
 )
 from src.data.universe import SqlUniverseStore
-from src.domain._codec import canonical_hash, timestamp
+from src.domain._codec import canonical_hash, timeframe_seconds, timestamp
 from src.products.btc_accumulation import BTC_SPOT_INSTRUMENT_ID
 from src.research.datasets import (
     CORE_RESEARCH_BUNDLE_ROLES,
     CanonicalResearchDatasetBuilder,
     DatasetLifecycleState,
     DatasetResolutionError,
+    _prior_bars,
 )
 
 
@@ -66,6 +67,7 @@ class _ResolvedUniverse:
     instruments: tuple[tuple[str, str, str], ...]
     memberships: tuple[tuple[str, frozenset[str]], ...]
     snapshot_ids: tuple[str, ...]
+    selection_mode: str = "point_in_time"
 
 
 class DatabaseDatasetBundleService:
@@ -98,6 +100,7 @@ class DatabaseDatasetBundleService:
         market_type: str,
         created_at: str,
         timeframe: str | None = None,
+        intervals: Mapping[str, Mapping[str, str]] | None = None,
     ) -> DatasetBundleBuildResult:
         created = timestamp(created_at, field="created_at")
         resolved_universe = self._universe(
@@ -153,13 +156,14 @@ class DatabaseDatasetBundleService:
                 detail=str(exc),
             )
         try:
-            intervals = _stage_intervals(bars)
+            intervals = _stage_intervals(bars) if intervals is None else intervals
             payload_by_role = self._role_payloads(
                 bars,
                 intervals=intervals,
                 memberships=resolved_universe.memberships,
                 snapshot_ids=resolved_universe.snapshot_ids,
                 timeframe=timeframe or self.timeframe,
+                selection_mode=resolved_universe.selection_mode,
             )
             bundle = CanonicalResearchDatasetBuilder(self.engine).build(
                 product_id,
@@ -311,8 +315,8 @@ class DatabaseDatasetBundleService:
         product_id: str,
     ) -> tuple[tuple[dict[str, Any], ...], tuple[str, ...]] | DatasetBundleBuildResult:
         try:
-            interval_seconds = _timeframe_seconds(timeframe)
-        except DatasetBundleBuildError as exc:
+            interval_seconds = timeframe_seconds(timeframe)
+        except ValueError as exc:
             return DatasetBundleBuildResult(
                 state="blocked_dataset",
                 reason_code="unsupported_timeframe",
@@ -324,13 +328,20 @@ class DatabaseDatasetBundleService:
             if self.minimum_history_days
             else 0
         )
+        if minimum_rows * len(instruments) > self.maximum_rows:
+            return DatasetBundleBuildResult(
+                state="blocked_dataset",
+                reason_code="history_exceeds_resource_budget",
+                product_id=product_id,
+                detail="Select an explicit family timeframe or increase the approved row budget.",
+            )
         try:
             bars, source_hashes = self._load_bars(
                 instruments,
                 market_type=market_type,
                 timeframe=timeframe,
                 created=created,
-                maximum_rows=max(self.maximum_rows, minimum_rows * len(instruments)),
+                maximum_rows=self.maximum_rows,
             )
         except DatasetBundleBuildError as exc:
             if str(exc).startswith("historical bars are missing"):
@@ -374,6 +385,22 @@ class DatabaseDatasetBundleService:
         }
         if not current_instruments:
             return None
+        with self.engine.connect() as connection:
+            selection = connection.execute(
+                select(universe_snapshot.c.payload).where(
+                    universe_snapshot.c.id == memberships[0].snapshot_id
+                )
+            ).scalar_one()
+        if selection.get("schema") == "fixed_btc_research_scope/v1":
+            if selection.get("product_id") != product_id:
+                raise DatasetBundleBuildError("fixed research scope belongs to another product")
+            return _ResolvedUniverse(
+                latest_snapshot_id=memberships[0].snapshot_id,
+                instruments=tuple(sorted(current_instruments.values())),
+                memberships=(),
+                snapshot_ids=(memberships[0].snapshot_id,),
+                selection_mode="fixed_btc_research_scope",
+            )
         if not include_history:
             return _ResolvedUniverse(
                 latest_snapshot_id=memberships[0].snapshot_id,
@@ -481,23 +508,39 @@ class DatabaseDatasetBundleService:
         memberships: tuple[tuple[str, frozenset[str]], ...],
         snapshot_ids: tuple[str, ...],
         timeframe: str | None = None,
+        selection_mode: str = "point_in_time",
     ) -> dict[str, dict[str, Any]]:
+        if selection_mode not in {"point_in_time", "fixed_btc_research_scope"}:
+            raise DatasetBundleBuildError("unknown research universe selection mode")
         payloads: dict[str, dict[str, Any]] = {}
         for role, interval in intervals.items():
             selected = [
                 row
                 for row in bars
                 if interval["start"] <= str(row["close_timestamp"]) < interval["end"]
-                and DatabaseDatasetBundleService._eligible_at(
-                    str(row["instrument_id"]), str(row["close_timestamp"]), memberships
+                and (
+                    selection_mode == "fixed_btc_research_scope"
+                    or DatabaseDatasetBundleService._eligible_at(
+                        str(row["instrument_id"]), str(row["close_timestamp"]), memberships
+                    )
                 )
             ]
             if not selected:
                 raise DatasetResolutionError(
                     f"dataset data_pending: no available bars for role {role}"
                 )
-            payload = CanonicalResearchDatasetBuilder._bar_payload(selected, timeframe=timeframe)
-            payload["point_in_time_universe"] = True
+            warmup = _prior_bars(
+                bars,
+                before=interval["start"],
+                scope={str(row["instrument_id"]) for row in selected},
+                limit=200,
+                created=max(str(row["availability_time"]) for row in bars),
+            )
+            payload = CanonicalResearchDatasetBuilder._bar_payload(
+                selected, timeframe=timeframe, warmup=warmup
+            )
+            payload["point_in_time_universe"] = selection_mode == "point_in_time"
+            payload["universe_selection_mode"] = selection_mode
             payload["universe_snapshot_ids"] = list(snapshot_ids)
             payloads[role] = payload
         return payloads
@@ -508,7 +551,7 @@ class DatabaseDatasetBundleService:
         observed_at: str,
         memberships: tuple[tuple[str, frozenset[str]], ...],
     ) -> bool:
-        eligible: frozenset[str] = memberships[0][1] if memberships else frozenset()
+        eligible: frozenset[str] = frozenset()
         for snapshot_at, snapshot_members in memberships:
             if snapshot_at > observed_at:
                 break
@@ -543,7 +586,10 @@ class DatabaseDatasetBundleService:
         created: str,
         maximum_rows: int | None = None,
     ) -> tuple[tuple[dict[str, Any], ...], tuple[str, ...]]:
-        rows_by_instrument: dict[str, list[dict[str, Any]]] = {}
+        limit = maximum_rows if maximum_rows is not None else self.maximum_rows
+        windows = {
+            key: RecentBarWindow(max(1, limit // len(instruments))) for key, _, _ in instruments
+        }
         source_hashes: set[str] = set()
         for instrument_id, symbol, venue in instruments:
             root = self.parquet_root / "bars" / venue.lower() / market_type.lower() / symbol.upper()
@@ -552,18 +598,21 @@ class DatabaseDatasetBundleService:
                 if path.is_symlink() or not path.is_file():
                     continue
                 try:
-                    file_rows = pq.ParquetFile(path).read().to_pylist()
+                    file_rows = (
+                        row
+                        for batch in pq.ParquetFile(path).iter_batches(batch_size=4096)
+                        for row in batch.to_pylist()
+                    )
+                    added = _ingest_bar_rows(
+                        file_rows, windows[instrument_id], instrument_id, created
+                    )
                 except Exception as exc:
                     raise DatasetBundleBuildError(f"cannot read bar partition {path}") from exc
-                accepted = [
-                    normalised
-                    for raw in file_rows
-                    if isinstance(raw, Mapping)
-                    and (normalised := _normalise_bar(raw, instrument_id, created)) is not None
-                ]
-                if accepted:
-                    rows_by_instrument.setdefault(instrument_id, []).extend(accepted)
+                if added:
                     source_hashes.add(_file_identity(path))
+        rows_by_instrument = {
+            key: window.rows() for key, window in windows.items() if window.rows()
+        }
         missing = sorted({item[0] for item in instruments} - set(rows_by_instrument))
         if missing:
             raise DatasetBundleBuildError(
@@ -571,7 +620,7 @@ class DatabaseDatasetBundleService:
             )
         rows = _bounded_instrument_rows(
             rows_by_instrument,
-            maximum_rows=maximum_rows if maximum_rows is not None else self.maximum_rows,
+            maximum_rows=limit,
         )
         return tuple(rows), tuple(sorted(source_hashes))
 
@@ -583,129 +632,47 @@ class DatabaseDatasetBundleService:
         instrument_scope: tuple[str, ...],
         created: str,
     ) -> tuple[dict[str, Any], ...]:
-        funding = self._funding_events(product_id, created)
+        try:
+            funding = self._funding_events(product_id, created)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise DatasetBundleBuildError(f"native funding data invalid: {exc}") from exc
         missing = sorted(set(instrument_scope) - set(funding))
         if missing:
             raise DatasetBundleBuildError(
                 "futures funding history is missing for: " + ", ".join(missing)
             )
-        enriched: list[dict[str, Any]] = []
-        cursors: dict[str, str | None] = {}
-        for row in bars:
-            instrument_id = str(row["instrument_id"])
-            close = str(row["close_timestamp"])
-            values = dict(row)
-            previous_funding_time = cursors.get(instrument_id)
-            available = tuple(
-                event_time
-                for event_time in sorted(funding[instrument_id])
-                if (previous_funding_time is None or event_time > previous_funding_time)
-                and event_time <= close
-            )
-            funding_time = available[-1] if available else None
-            values["funding_rate"] = (
-                funding[instrument_id][funding_time] if funding_time is not None else 0.0
-            )
-            values["funding_event"] = funding_time is not None
-            values["funding_timestamp"] = funding_time
-            if funding_time is not None:
-                cursors[instrument_id] = funding_time
-            enriched.append(values)
-        return tuple(enriched)
+        from src.research.funding import attach_settlements
 
-    def _funding_events(self, product_id: str, created: str) -> dict[str, dict[str, float]]:
+        return attach_settlements(bars, funding)
+
+    def _funding_events(
+        self, product_id: str, created: str
+    ) -> dict[str, dict[str, dict[str, Any]]]:
+        from src.research.funding import settlement_index
+
         with self.engine.connect() as connection:
-            market_rows = connection.execute(
-                select(risk_snapshot.c.payload, risk_snapshot.c.created_at)
-                .where(risk_snapshot.c.created_at <= created)
-                .order_by(risk_snapshot.c.created_at, risk_snapshot.c.id)
-            ).mappings()
-            funding_rows = connection.execute(
-                select(funding_entry.c.payload, funding_entry.c.created_at)
-                .where(funding_entry.c.created_at <= created)
-                .order_by(funding_entry.c.created_at, funding_entry.c.id)
-            ).mappings()
-        result = _market_funding_events(market_rows, product_id=product_id, created=created)
-        for instrument_id, values in _historical_funding_events(
-            funding_rows, product_id=product_id, created=created
-        ).items():
-            result.setdefault(instrument_id, {}).update(values)
-        return result
+            rows = (
+                connection.execute(
+                    select(funding_entry.c.id, funding_entry.c.payload, funding_entry.c.created_at)
+                    .where(funding_entry.c.created_at <= created)
+                    .order_by(funding_entry.c.created_at, funding_entry.c.id)
+                )
+                .mappings()
+                .all()
+            )
+        return settlement_index(rows, product_id=product_id, created=created)
 
 
-def _market_funding_events(
-    rows: Iterable[Mapping[str, Any]], *, product_id: str, created: str
-) -> dict[str, dict[str, float]]:
-    result: dict[str, dict[str, float]] = {}
-    for row in rows:
-        payload = row["payload"]
-        if not isinstance(payload, Mapping) or payload.get("kind") != "market_data_input":
+def _ingest_bar_rows(rows, window: RecentBarWindow, instrument_id: str, created: str) -> bool:
+    added = False
+    for raw in rows:
+        if not isinstance(raw, Mapping):
             continue
-        if payload.get("product_id") != product_id:
-            continue
-        values = payload.get("values")
-        if not isinstance(values, Mapping) or values.get("funding") is None:
-            continue
-        available_at = payload.get("availability_time")
-        if (
-            available_at is not None
-            and _bar_time(available_at, field="funding availability_time") > created
-        ):
-            continue
-        instrument_id = str(payload.get("instrument_id") or "")
-        source_time = payload.get("source_event_time", row["created_at"])
-        if not instrument_id or source_time is None:
-            continue
-        _store_funding_event(
-            result,
-            instrument_id=instrument_id,
-            source_time=source_time,
-            value=values["funding"],
-            field="funding",
-        )
-    return result
-
-
-def _historical_funding_events(
-    rows: Iterable[Mapping[str, Any]], *, product_id: str, created: str
-) -> dict[str, dict[str, float]]:
-    result: dict[str, dict[str, float]] = {}
-    for row in rows:
-        payload = row["payload"]
-        if not isinstance(payload, Mapping) or payload.get("kind") != "historical_funding":
-            continue
-        if payload.get("product_id") != product_id:
-            continue
-        available_at = payload.get("availability_time")
-        if (
-            available_at is not None
-            and _bar_time(available_at, field="funding availability_time") > created
-        ):
-            continue
-        instrument_id = str(payload.get("instrument_id") or "")
-        source_time = payload.get("funding_time")
-        if not instrument_id or source_time is None:
-            continue
-        _store_funding_event(
-            result,
-            instrument_id=instrument_id,
-            source_time=source_time,
-            value=payload.get("funding_rate"),
-            field="funding_rate",
-        )
-    return result
-
-
-def _store_funding_event(
-    result: dict[str, dict[str, float]],
-    *,
-    instrument_id: str,
-    source_time: Any,
-    value: Any,
-    field: str,
-) -> None:
-    timestamp_value = _bar_time(source_time, field="funding_time")
-    result.setdefault(instrument_id, {})[timestamp_value] = _signed_number(value, field=field)
+        normalised = _normalise_bar(raw, instrument_id, created)
+        if normalised is not None:
+            window.add(normalised)
+            added = True
+    return added
 
 
 def _normalise_bar(
@@ -807,7 +774,7 @@ def _bounded_instrument_rows(
 def _validate_market_bars(
     rows: tuple[dict[str, Any], ...], *, market_type: str, timeframe: str | None = None
 ) -> None:
-    interval = _timeframe_seconds(timeframe) if timeframe is not None else None
+    interval = timeframe_seconds(timeframe) if timeframe is not None else None
     strict_cadence = interval is not None and any(
         row.get("timeframe") is not None or row.get("open_time_ms") is not None for row in rows
     )
@@ -883,20 +850,6 @@ def _bar_time(value: Any, *, field: str) -> str:
         return timestamp(str(value), field=field)
     except ValueError as exc:
         raise DatasetBundleBuildError(f"{field} is invalid") from exc
-
-
-def _timeframe_seconds(timeframe: str) -> int:
-    units = {"m": 60, "h": 3_600, "d": 86_400}
-    value = str(timeframe).strip().lower()
-    if len(value) < 2 or value[-1] not in units:
-        raise DatasetBundleBuildError(f"unsupported declared timeframe: {timeframe}")
-    try:
-        count = int(value[:-1])
-    except ValueError as exc:
-        raise DatasetBundleBuildError(f"unsupported declared timeframe: {timeframe}") from exc
-    if count <= 0:
-        raise DatasetBundleBuildError(f"unsupported declared timeframe: {timeframe}")
-    return count * units[value[-1]]
 
 
 def _stage_intervals(rows: tuple[dict[str, Any], ...]) -> dict[str, dict[str, str]]:

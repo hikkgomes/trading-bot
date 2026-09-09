@@ -37,27 +37,37 @@ stop_active_units() {
     trading-platform-data-writer.service
     trading-platform-operations.service
     trading-platform-research.service
+    trading-platform-evaluator.service
     trading-platform-agent.service
     trading-platform-control.service
     trading-platform-migration.service
   )
+  local inventory state
+  inventory="$(systemctl list-units --all --no-legend --plain)" || {
+    echo "Cannot inspect trading services before upgrade." >&2
+    exit 1
+  }
   while read -r unit _rest; do
     [[ -n "$unit" ]] && units+=("$unit")
-  done < <(
-    systemctl list-units --all --no-legend --plain 2>/dev/null |
-      awk '$1 ~ /^(trading-platform(@|-research@|-bot-)|trading-bot-)/ && $1 ~ /\.(service|timer)$/ {print $1}'
-  )
+  done < <(awk '$1 ~ /^(trading-platform|trading-bot-)/ && $1 ~ /\.(service|timer)$/ {print $1}' <<< "$inventory")
+  # One systemd transaction also stops timers which could restart a writer.
+  systemctl stop "${units[@]}" >/dev/null 2>&1 || true
   for unit in "${units[@]}"; do
-    systemctl stop "$unit" >/dev/null 2>&1 || true
-    if systemctl is-active --quiet "$unit"; then
-      echo "platform unit did not stop: $unit" >&2
+    state="$(systemctl show "$unit" --property=ActiveState --value)" || {
+      echo "Cannot verify stopped trading unit: $unit" >&2
       exit 1
-    fi
+    }
+    case "$state" in
+      inactive|failed) ;;
+      *) echo "platform unit did not stop: $unit ($state)" >&2; exit 1 ;;
+    esac
   done
 }
 
 cd "$REPO"
 stop_active_units
 "$PYTHON" -m src.services.backup_service --config "$CONFIG" --mode postgresql
+"$PYTHON" -m src.services.backup_service --config "$CONFIG" --mode parquet
+"$PYTHON" -m src.services.backup_service --config "$CONFIG" --mode verify
 "$PYTHON" -m src.services.platform_upgrade
 REPO="$REPO" SKIP_SYSTEMD="${SKIP_SYSTEMD:-0}" bash "$REPO/scripts/install_platform_services.sh"

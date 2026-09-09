@@ -95,8 +95,16 @@ class AgentCodeWorkflow:
         proposal: AgentProposal,
         *,
         base_ref: str,
-        publish: bool = True,
+        publish: bool = False,
     ) -> CodeWorkflowResult:
+        if (
+            publish
+            and subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=normal"],
+                cwd=self.repository,
+            ).strip()
+        ):
+            raise ValueError("publishing requires a committed review base")
         self.store.save_proposal(proposal)
         with IsolatedGitWorktree(
             repository=self.repository,
@@ -116,8 +124,7 @@ class AgentCodeWorkflow:
             )
             runner = SandboxRunner(
                 workspace=workspace,
-                repository=self.repository,
-                agent_venv=self.repository / ".venv-agent",
+                agent_venv=self.repository / ".venv-research",
                 policy=self.sandbox_policy,
             )
             review = self.reviewer.review(

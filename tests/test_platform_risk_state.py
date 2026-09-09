@@ -47,12 +47,17 @@ def test_risk_measurements_use_ledger_marks_and_pending_orders(tmp_path) -> None
         )
     snapshots = SqlRiskSnapshotStore(database.engine)
     for index, price in enumerate((100.0, 110.0, 99.0)):
-        observed_at = f"2026-08-30T00:00:0{index}+00:00"
+        observed_at = f"2026-08-30T00:0{index + 1}:00+00:00"
         snapshots.save(
             {
                 "kind": "market_data_input",
                 "product_id": "active_income",
                 "instrument_id": "BTCUSDT",
+                "source_event_type": "candle",
+                "source_candle_closed": True,
+                "source_timeframe": "1m",
+                "source_close_time_ms": 1788048000000 + (index + 1) * 60000 - 1,
+                "availability_time": observed_at,
                 "values": {
                     "close": price,
                     "spread_bps": 1.0,
@@ -101,7 +106,7 @@ def test_risk_measurements_use_ledger_marks_and_pending_orders(tmp_path) -> None
                 "funding": 0.0,
             }
         },
-        at="2026-08-30T00:00:03+00:00",
+        at="2026-08-30T00:03:00+00:00",
     )
 
     assert measurements.product_drawdown_fraction > 0.0
@@ -109,6 +114,8 @@ def test_risk_measurements_use_ledger_marks_and_pending_orders(tmp_path) -> None
     assert measurements.global_drawdown_fraction > 0.0
     assert measurements.open_exposure_fraction > 0.0
     assert measurements.pending_exposure_fraction > 0.0
+    assert not measurements.risk_data_available
+    assert "position_entry:BTCUSDT" in measurements.risk_data_missing
     assert measurements.correlations == {"BTCUSDT": {"BTCUSDT": 1.0}}
     assert measurements.beta == {"BTCUSDT": 1.0}
     assert measurements.clusters == {"BTCUSDT": "base:BTC"}
@@ -135,7 +142,7 @@ def test_risk_measurements_use_ledger_marks_and_pending_orders(tmp_path) -> None
                 "funding": 0.0,
             }
         },
-        at="2026-08-30T00:00:03+00:00",
+        at="2026-08-30T00:03:00+00:00",
     )
     assert reduced.pending_exposure_fraction == 0.0
     database.dispose()
@@ -146,7 +153,7 @@ def test_risk_measurements_resolve_prefixed_btc_benchmark(tmp_path) -> None:
     database.create_schema()
     snapshots = SqlRiskSnapshotStore(database.engine)
     for index, (btc, eth) in enumerate(((100.0, 10.0), (110.0, 11.0), (99.0, 9.9))):
-        observed_at = f"2026-08-30T00:00:0{index}+00:00"
+        observed_at = f"2026-08-30T00:0{index + 1}:00+00:00"
         for instrument_id, close in (
             ("binance:futures:BTCUSDT:USDT", btc),
             ("binance:futures:ETHUSDT:USDT", eth),
@@ -156,6 +163,11 @@ def test_risk_measurements_resolve_prefixed_btc_benchmark(tmp_path) -> None:
                     "kind": "market_data_input",
                     "product_id": "active_income",
                     "instrument_id": instrument_id,
+                    "source_event_type": "candle",
+                    "source_candle_closed": True,
+                    "source_timeframe": "1m",
+                    "source_close_time_ms": 1788048000000 + (index + 1) * 60000 - 1,
+                    "availability_time": observed_at,
                     "values": {"close": close},
                 },
                 created_at=observed_at,
@@ -163,7 +175,13 @@ def test_risk_measurements_resolve_prefixed_btc_benchmark(tmp_path) -> None:
 
     calculator = PortfolioRiskCalculator(database.engine)
 
-    beta = calculator._beta(product_id="active_income", at="2026-08-30T00:00:03+00:00")
+    _correlations, beta, missing, receipt = calculator._factor_measurements(
+        product_id="active_income",
+        at="2026-08-30T00:03:00+00:00",
+        instrument_ids=("binance:futures:BTCUSDT:USDT", "binance:futures:ETHUSDT:USDT"),
+    )
+    assert missing == ()
+    assert receipt["estimates"]["beta:binance:futures:ETHUSDT:USDT"]["sample_count"] == 2
 
     assert beta["binance:futures:BTCUSDT:USDT"] == 1.0
     assert beta["binance:futures:ETHUSDT:USDT"] == pytest.approx(1.0)
@@ -175,9 +193,9 @@ def test_risk_measurements_mark_missing_factor_history_unavailable(tmp_path) -> 
     database.create_schema()
     calculator = PortfolioRiskCalculator(database.engine)
 
-    _correlations, _beta_values, missing = calculator._factor_measurements(
+    _correlations, _beta_values, missing, _receipt = calculator._factor_measurements(
         product_id="active_income",
-        at="2026-08-30T00:00:03+00:00",
+        at="2026-08-30T00:03:00+00:00",
         instrument_ids=(
             "binance:futures:BTCUSDT:USDT",
             "binance:futures:ETHUSDT:USDT",
@@ -274,4 +292,205 @@ def test_latest_flat_position_does_not_reuse_an_older_entry_price(tmp_path) -> N
         )
         == {}
     )
+    database.dispose()
+
+
+@pytest.mark.parametrize("product_id", ["btc_accumulation", "btc-diagnostic"])
+def test_btc_risk_exposure_uses_quote_equity_for_quote_notionals(tmp_path, product_id) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'btc-risk-units.sqlite3'}")
+    database.create_schema()
+    measurements = PortfolioRiskCalculator(database.engine).calculate(
+        product_id=product_id,
+        account_id="spot-account",
+        product={"portfolio_id": "btc-portfolio", "product_family": "btc_accumulation"},
+        account={"paper_starting_balances": {"BTC": 0.5, "USDT": 50}},
+        balances={"BTC": 0.5, "USDT": 50},
+        positions={"binance:spot:BTCUSDT": 0.5},
+        open_orders=({"instrument_id": "binance:spot:BTCUSDT", "remaining_quantity": 0.1},),
+        market={"binance:spot:BTCUSDT": {"price": 100}},
+        at="2026-08-30T00:00:00+00:00",
+    )
+    # 0.5 BTC + 50 USDT = 100 USDT; exposure is 50 USDT and the order is 10 USDT.
+    assert measurements.open_exposure_fraction == pytest.approx(0.5)
+    assert measurements.pending_exposure_fraction == pytest.approx(0.1)
+    assert measurements.risk_data_available
+    database.dispose()
+
+
+def test_flat_instrument_without_entry_basis_does_not_break_marked_equity(tmp_path) -> None:
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'flat-risk.sqlite3'}")
+    calculator = PortfolioRiskCalculator(database.engine)
+    assert (
+        calculator._current_equity(
+            product_id="active_income",
+            balances={"USDT": 1000},
+            positions={"BTCUSDT": 1, "ETHUSDT": 0},
+            position_terms={"BTCUSDT": (1, 100)},
+            market={"BTCUSDT": {"price": 90}},
+        )
+        == 990
+    )
+    database.dispose()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "aligned",
+        "shifted",
+        "stale",
+        "late",
+        "wrong_timeframe",
+        "duplicate",
+        "flat",
+        "conflict",
+        "late_subsecond",
+    ],
+)
+def test_factor_estimates_require_matching_available_candle_intervals(tmp_path, case):
+    import datetime as dt
+
+    from src.risk.factors import estimate_factors
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'factor-intervals.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    start = dt.datetime(2026, 8, 30, tzinfo=dt.UTC)
+    source_ids = set()
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        for index, price in enumerate((100, 110, 99), 1):
+            minute = index + (case == "shifted" and symbol == "ETHUSDT")
+            close_at = start + dt.timedelta(minutes=minute)
+            availability = close_at + dt.timedelta(
+                minutes=10 if case == "late" and symbol == "ETHUSDT" else 0
+            )
+            if case == "late_subsecond" and symbol == "ETHUSDT" and index == 3:
+                availability = start + dt.timedelta(minutes=4, milliseconds=500)
+            payload = {
+                "kind": "market_data_input",
+                "product_id": "income",
+                "instrument_id": symbol,
+                "source_event_type": "candle",
+                "source_candle_closed": True,
+                "source_timeframe": "5m"
+                if case == "wrong_timeframe" and symbol == "ETHUSDT"
+                else "1m",
+                "source_close_time_ms": int(close_at.timestamp() * 1000) - 1,
+                "availability_time": availability.isoformat(),
+                "values": {"close": 100 if case == "flat" else price},
+            }
+            source_ids.add(store.save(payload, created_at=close_at.isoformat()))
+            if case in {"duplicate", "conflict"}:
+                store.save(
+                    {
+                        **payload,
+                        "source_event_id": "duplicate",
+                        "values": {"close": price + (case == "conflict")},
+                    },
+                    created_at=(close_at + dt.timedelta(seconds=1)).isoformat(),
+                )
+        # An unrelated trade must never replace a candle or create another return.
+        store.save(
+            {
+                "kind": "market_data_input",
+                "product_id": "income",
+                "instrument_id": symbol,
+                "source_event_type": "trade",
+                "values": {"close": 10000},
+            },
+            created_at=start.isoformat(),
+        )
+    at = start + dt.timedelta(
+        minutes=10 if case == "stale" else 4, milliseconds=250 if case == "late_subsecond" else 0
+    )
+    if case == "conflict":
+        with pytest.raises(ValueError, match="conflicting risk candle"):
+            estimate_factors(
+                database.engine,
+                product_id="income",
+                instrument_ids=("BTCUSDT", "ETHUSDT"),
+                timeframe="1m",
+                at=at.isoformat(),
+            )
+        database.dispose()
+        return
+    correlations, beta, missing, receipt = estimate_factors(
+        database.engine,
+        product_id="income",
+        instrument_ids=("BTCUSDT", "ETHUSDT"),
+        timeframe="1m",
+        at=at.isoformat(),
+    )
+    assert beta["BTCUSDT"] == 1
+    if case in {"aligned", "duplicate"}:
+        assert missing == ()
+        assert beta["ETHUSDT"] == pytest.approx(1)
+        assert correlations["BTCUSDT"]["ETHUSDT"] == pytest.approx(1)
+        measured = receipt["estimates"]["correlation:BTCUSDT:ETHUSDT"]
+        assert measured["sample_count"] == 2
+        assert set(measured["source_snapshot_ids"]) == source_ids
+        assert receipt["estimates"]["volatility:BTCUSDT"]["value"] == pytest.approx(0.1)
+    else:
+        assert "beta:ETHUSDT" in missing
+        assert "correlation:BTCUSDT:ETHUSDT" in missing
+        assert "ETHUSDT" not in beta
+    if case == "stale":
+        assert "volatility:BTCUSDT" not in receipt["estimates"]
+    database.dispose()
+
+
+def test_market_volatility_uses_closed_bars_and_does_not_refresh_old_estimate(tmp_path):
+    import datetime as dt
+
+    from src.services.portfolio_state import DatabasePortfolioSourceService
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'volatility-source.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    start = dt.datetime(2026, 8, 30, tzinfo=dt.UTC)
+    instrument_id = "binance:spot:BTCUSDT"
+    quote = {
+        "kind": "market_data_input",
+        "product_id": "btc",
+        "instrument_id": instrument_id,
+        "values": {"price": 100, "spread_bps": 1, "visible_depth": 1000, "volatility": 0.2},
+    }
+    supplied_id = store.save(quote, created_at=start.isoformat())
+    source = DatabasePortfolioSourceService(
+        engine=database.engine,
+        store=store,
+        products={"btc": {"account_id": "spot", "dataset_timeframe": "1m"}},
+        accounts={"spot": {"market": "spot"}},
+    )
+    market, _ = source._market("btc", start.isoformat())
+    assert market[instrument_id]["volatility"] == 0.2
+    assert market[instrument_id]["volatility_estimate"]["source_snapshot_ids"] == [supplied_id]
+    later = start + dt.timedelta(minutes=3)
+    store.save(
+        {**quote, "values": {"price": 120, "spread_bps": 1, "visible_depth": 1000}},
+        created_at=later.isoformat(),
+    )
+    assert source._market("btc", later.isoformat())[0] == {}
+    bar_ids = set()
+    for index, price in enumerate((100, 110, 99), 1):
+        available = start + dt.timedelta(minutes=index)
+        bar_ids.add(
+            store.save(
+                {
+                    "kind": "market_data_input",
+                    "product_id": "btc",
+                    "instrument_id": instrument_id,
+                    "source_event_type": "candle",
+                    "source_candle_closed": True,
+                    "source_timeframe": "1m",
+                    "source_close_time_ms": int(available.timestamp() * 1000) - 1,
+                    "availability_time": available.isoformat(),
+                    "values": {"close": price},
+                },
+                created_at=available.isoformat(),
+            )
+        )
+    market, _ = source._market("btc", later.isoformat())
+    assert market[instrument_id]["volatility"] == pytest.approx(0.1)
+    assert set(market[instrument_id]["volatility_estimate"]["source_snapshot_ids"]) == bar_ids
     database.dispose()

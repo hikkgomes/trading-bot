@@ -1,6 +1,8 @@
 # Canonical research workflow
 
-Research runs on the Linux research service. PostgreSQL is the lifecycle
+Adaptive research runs on the Linux research service. The separate evaluator
+seals datasets and runs frozen evaluations, including protected holdouts.
+PostgreSQL is the lifecycle
 authority. Parquet is immutable input. Queue payloads contain identities and
 commands, not results or raw datasets.
 
@@ -15,8 +17,14 @@ commands, not results or raw datasets.
 
 The four pre-artefact roles are `screening`, `development`, `robustness`, and
 `protected_holdout`. Their information intervals cannot overlap. Forward data
-is created only after an artefact is sealed and is never available to adaptive
-research.
+is created only after an artefact is sealed. Adaptive feedback uses development
+evidence. Protected outcomes are hidden from research and agent database roles.
+Candidate definitions are read through `adaptive_candidate`; protected status
+and mutable deferral details remain available only to trusted operational readers.
+
+Fixed BTC studies use `SqlUniverseStore.record_btc_research_scope`. These record
+the selection time and specification hash without asserting historical liquidity
+eligibility. Dynamic universe studies still require historical membership.
 
 ## Candidate lifecycle
 
@@ -30,7 +38,8 @@ typed thesis
   -> sealed artefact
   -> forward paper
   -> forward summary and decision
-  -> live_ready
+  -> research_qualified (approved confidence policy)
+  -> live_ready (fresh technical preflight)
 ```
 
 Every candidate carries a `CandidateDatasetPlan` with the exact stage
@@ -62,17 +71,204 @@ are schema-checked and compiled to a typed thesis, then use the same queue and
 evidence path. Agents cannot read credentials, protected data, approvals, or
 live state, and cannot submit orders or grant authority.
 
+The directional DSL supports time-series, mean-reversion and advanced directional
+feature rules. Cross-sectional, relative-value, microstructure, ML, execution and
+allocation contracts require their specialised executors. A scalar rule cannot
+claim hedged or market-neutral exposure. `typed_rule/v2` honours the declared
+comparison: `gt`/`ge` follow deviations and `lt`/`le` reverse them, with mirrored
+thresholds. The corrected contract does not reuse v1 behaviour fingerprints.
+
+Scheduled reviews have a sealed context, a one-hour response deadline and a
+leased `agent_delivery` job. The scoped transport polls `POST /agent/requests/next`
+and submits HMAC-authenticated envelopes to `POST /agent/responses`. Configure
+`TRADING_PLATFORM_AGENT_TRANSPORT_KEY` as the same private hex-encoded key of at
+least 32 random bytes in the control service and transport process. It must differ
+from the operator API token. Keep it out of the OpenClaw configuration and prompt.
+The transport credential cannot use operator routes. An accepted reply is stored
+before compilation intake; retries and expired-lease recovery finish that same
+reply without creating another proposal. New replies after the deadline fail.
+
+The bounded consumer is `python -m src.agents.consumer --api-url
+http://127.0.0.1:8088 --executable /absolute/path/to/openclaw --config
+/private/research-openclaw/openclaw.json --agent research --prompt
+config/openclaw_daily_review_prompt.md`. It performs one leased review per call.
+Its dedicated OpenClaw 2026.6 configuration requires an `agents.list` entry with
+that ID, a separate workspace, `tools.deny: ["*"]`, and sandbox mode `all` with
+workspace access `none`. The child receives a fresh local session and a minimal
+environment, with no transport, database or exchange credentials. The server's
+OpenClaw profile, provider access and service handover must be verified before
+enabling this consumer; the old bridge must be retired after that proof.
+
+The `agent-runtime` process runs this consumer repeatedly and never opens a
+database. Its `agent.env` must contain the scoped transport key and
+`TRADING_PLATFORM_OPENCLAW_EXECUTABLE`; the unit supplies the private configuration
+path, agent ID and loopback API URL. Database and configured exchange credentials
+cause startup to fail. Authenticated polling records its heartbeat through the
+control service. Trusted review creation, compilation and code checks run as
+`agent-coordinator` in the research process. Code checks use research-owned
+workspaces and do not commit by default. The agent user has no Git metadata access.
+Installed service-cycle checks require a separate
+`TRADING_PLATFORM_INSTALLED_TEST_DATABASE_URL`; the production database URL is
+not used for those checks. The installed agent ACL check verifies that the agent
+cannot read research state, Git metadata or other service environment files.
+
 ## Forward paper and promotion
+
+Promotion reads current evidence at worker execution time. Forward observation
+starts after the later of artefact creation and actual paper activation; queue
+waiting time is not paper history. Restarting reuses the existing paper-entry
+outbox job instead of creating another command for the same artefact.
+
+Each paper activation opens an immutable operational qualification window with
+its policy, family evidence schema and engine hash. Observations, summaries and
+decisions carry that window ID. Summaries cannot combine windows, and an old
+window cannot supply current qualification after a repair. Window creation does
+not grant statistical confidence; the approved independent research gate remains.
+
+A suspended paper-only strategy resumes into provisional paper observation after
+its research artefact remains valid. It does not require an already accepted
+forward window or become live-ready on resume. A new window starts at execution
+time. Financial ownership follows verified assignment revisions with matching
+product, portfolio, sleeve, strategy version, artefact, instrument scope and mode.
+Cash, entry basis and carried positions are preserved. Window PnL subtracts the
+opening unrealised value, so closing an old position cannot rebook prior gains.
+Resuming a strategy with live history additionally requires accepted forward
+evidence, current preflight and human live approval.
+
+Assignment admission declares `capital_limit_currency: USDT` and a
+`risk_budget_unit` of `quote_notional` or `equity_fraction`. Operator live
+assignments retain their existing USDT amount semantics; canonical paper
+allocations declare their equity fraction. The exposure guard converts only the
+declared unit and rejects missing or unsupported units for new risk. Verified
+reductions remain possible when this metadata is absent. Existing numeric caps
+have not been increased or inferred from their magnitude.
+
+`config/risk.json` uses `risk/v2`: each scope declares its limit units and the
+notional currency is USDT. Allocation, drawdown, margin and depth fractions are
+bounded by one; gross/net exposure and turnover multiples are not. Invalid
+units, non-finite values, fractional trade counts, unknown limits and conflicting
+gross-exposure aliases fail configuration validation. The explicit migration
+helper `src.risk.policy.convert_legacy_risk_policy` preserves values and requires
+the operator to supply the notional currency. The changed contract is part of the
+live-authority configuration hash, so old approvals cannot carry over.
+
+Installed risk-policy records use content-based IDs bound to the logical policy,
+account and complete risk/v2 configuration. Portfolio-state requests reference
+those IDs. The stored contract retains the original configuration and units;
+reading or writing a compiled record checks that its limits match the canonical
+compiler. Configuration changes create new records and preserve old policy
+history, rather than overwriting an existing policy ID.
+Execution rejects legacy records without the verified unit contract. Legacy
+limits remain readable only through an explicit historical lookup; diagnostic
+smokes also install and use canonical, account-bound policy records.
+Risk requests must use the snapshot kinds, product, canonical state and policy
+IDs that belong together. Decisions retain the request's evaluation time, so a
+retry after partial persistence produces the same records instead of a wall-clock
+identity collision.
+
+Risk-input exposure is marked quantity times price divided by equity. Order
+notional and depth participation use the proposed quantity change. Projected
+funding expense sums paying legs using signed notional and funding rate; funding
+credits do not cancel that expense limit. These are separate from allocation
+fractions and from the realised funding entries in the accounting ledger.
+The final pre-trade guard also applies the configured absolute instrument and
+order notional limits. Instrument exposure includes its pending orders; other
+symbols do not consume that instrument's cap. The proposed order's gross
+reservation uses the largest of its reference, current mark and limit price.
+Signed net exposure and account equity use current marks. Non-positive marks
+cannot hide an existing position's exposure.
+Unfilled opposite orders do not offset reserved net risk: the cap uses the
+largest absolute exposure if either side fills first, including the proposed
+order. The projected signed net remains a separate reported value.
+
+Risk beta, correlation and derived volatility use up to 256 consecutive closed
+candles at the product's dataset timeframe. Pairwise estimates match the exact
+start and end of each return interval; trades, other timeframes and unavailable
+bars cannot supply samples. At least two matching returns are needed to compute
+an estimate. This is an operational point estimate, not statistical confidence.
+Each estimate retains its sample count, interval bounds, source snapshot IDs and
+availability time. Estimates expire after two candle intervals; conflicting
+closes require resolution. The selected BTC benchmark's beta of one is labelled
+as an identity, not an empirical estimate. Supplied volatility retains its own
+source identity and expires independently of later price updates.
+
+Operators can inspect the latest 100 window records with `GET /paper/windows`.
+`POST /paper/restart-forward-window` accepts request_id, strategy_version_id,
+product_id, artefact_hash, previous_window_id, requested_by, repair_reference and
+reason_code. Supported reasons are market_data_repaired,
+forecast_dependency_repaired and execution_reconciliation_repaired. This records
+an operator repair attestation and starts a prospective paper-only window using
+the frozen policy. It does not change cash, positions or risk controls, or remove
+old observations and incidents. Request replay returns the original window;
+conflicting requests and stale predecessor IDs fail. The agent credential cannot
+use this route. Engine changes require a new compatible research artefact.
 
 Raw forward observations contain facts only. A summary worker aggregates
 elapsed time, independent decisions, net PnL, drawdown, drift, capacity,
 risk-budget availability, data gaps, fill quality, benchmark results, and
 strategy decay. One immutable decision consumes that summary.
 
-Research may advance to `forward_paper` and `live_ready` automatically when
-configured evidence passes. Live capital requires an explicit human approval,
+Paper admission requires each applicable data, economic and risk control to
+pass. Confidence diagnostics cannot be combined into an admission score.
+Research qualification requires a sealed cohort result and a matching operator
+policy approval recorded before protected access. Later approval cannot change
+an existing cohort opening. Code changes, configuration changes and revocation
+invalidate use of the approval.
+
+Live capital requires a separate explicit human approval,
 fresh preflight, current account authority, and a manual live assignment.
 Automatic live-canary promotion is disabled.
+
+## Evidence units and configuration migration
+
+Return observations, completed episodes and statistical effective sample size
+are different quantities. Research completion counts come from accounting.
+Marks and partial futures reductions do not close a campaign. A BTC cycle closes
+when its sold quantity is restored or its quote proceeds are spent; external
+transfers are excluded from cycle profit. Completion counts do not assert
+statistical independence. The sealed inference receipt reports effective sample
+diagnostics separately.
+
+Promotion configuration uses `promotion/v2` and
+`minimum_forward_completed_episodes`. Rename the previous
+`minimum_forward_effective_episodes` key while preserving its numeric value.
+The checked-in policy revisions are `btc-accumulation-v3` and `active-income-v3`;
+update product references with the corresponding policy revision. Existing
+immutable policy records remain stored, and records with the previous count
+contract are rejected for current use.
+
+## Historical execution study
+
+Keep source exports and study outputs outside the checkout. Import the Google
+Sheets values snapshot and native ID-cell metadata with:
+
+```bash
+python -m src.research.historical.study \
+  --source /private/research/study-values.json \
+  --id-cells /private/research/study-id-cells.json \
+  --output /private/research/reconstruction
+```
+
+Supply `--timezone` only after confirming the export timezone. Numeric IDs
+whose precision was lost remain unresolved. Campaign reconstruction retains
+missing inventory and separates spot from swaps; no strategy or assignment is
+created by the import.
+
+`src.data.okx_history.download_history` acquires bounded native trade, mark and
+index candles. `download_funding_history` reads the official daily funding
+archives, with at most 93 archive days per invocation. It retains source URLs,
+checksums and signed funding rates, resumes completed downloads and reports
+missing instruments. Complete archive coverage does not certify the historical
+funding schedule or replace private account bills.
+
+Run `study_entry_structure` separately for each market and trade direction.
+Pass closed-bar availability timestamps and an as-of exposure state for every
+bar: `flat`, `long`, `short`, `hedged`, or `None` when unresolved. Pseudo-entries
+match time, trend, volatility and exposure; unknown exposure cannot supply a
+control. Persist every specification with `write_study`. These are descriptive
+price-response studies, not fee-adjusted strategy returns. Stop counterfactuals
+require intraperiod execution data and an explicit stop rule. A later candidate
+still needs a complete frozen strategy specification and independent validation.
 
 ## Commands
 
@@ -85,5 +281,11 @@ make platform-ci
 
 Use `make sqlite-import SOURCE=...` only for one-time migration of legacy
 research memory. Imported rows retain provenance and cannot create active
-assignments. Legacy modules are offline migration or research libraries, not
-part of the production research workflow.
+assignments. Deployment uses the platform supervisor.
+
+Before Linux handover, back up the existing installation and inventory both
+system and user service managers. The installer refuses enabled or active
+legacy user units before changing system services. Retire those user units only
+after the backup and replacement checks; a system-only unit listing is not
+sufficient. The local install dry run checks paths and shell syntax, not remote
+host authority or readiness.

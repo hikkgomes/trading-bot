@@ -10,6 +10,7 @@ from sqlalchemy.engine import Engine
 
 from src.data.database import position as position_table
 from src.data.database import position_event
+from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.orders import Fill, OrderIntent, OrderSide
 from src.domain.positions import Position, PositionStatus
@@ -25,8 +26,9 @@ class PositionStore(Protocol):
 
 
 class SqlPositionStore:
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: Engine, *, connection=None):
         self.engine = engine
+        self.connection = connection
 
     @staticmethod
     def _position_id(item: Position) -> str:
@@ -38,7 +40,7 @@ class SqlPositionStore:
         payload = to_primitive(position)
         position_id = self._position_id(position)
         event_id = canonical_hash(payload)
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, self.connection, write=True) as connection:
             exists = connection.execute(
                 select(position_table.c.id).where(position_table.c.id == position_id)
             ).first()
@@ -71,7 +73,7 @@ class SqlPositionStore:
                 )
 
     def load(self) -> tuple[Position, ...]:
-        with self.engine.connect() as connection:
+        with connection_scope(self.engine, self.connection, write=False) as connection:
             payloads = connection.execute(
                 select(position_table.c.payload).order_by(position_table.c.id)
             ).scalars()
@@ -131,6 +133,10 @@ class PositionManager:
         contributions: dict[str, float] | None = None,
     ) -> Position:
         """Replace one local position with an authoritative reconciled balance."""
+        current = self.get(portfolio_id, instrument_id)
+        matched = (
+            current.quantity == quantity and current.average_entry_price == average_entry_price
+        )
         status = PositionStatus.OPEN if quantity != 0 else PositionStatus.FLAT_CONFIRMED
         position = Position(
             portfolio_id=portfolio_id,
@@ -139,10 +145,23 @@ class PositionManager:
             average_entry_price=average_entry_price if quantity != 0 else 0.0,
             status=status,
             updated_at=updated_at,
-            strategy_contributions=contributions or {},
+            strategy_contributions=(
+                contributions
+                if contributions is not None
+                else dict(current.strategy_contributions)
+                if matched
+                else {}
+            ),
             metadata={
+                **(dict(current.metadata) if matched else {}),
                 "source": "authoritative_reconciliation",
-                "reference_entry_price": average_entry_price if quantity != 0 else 0.0,
+                "reference_entry_price": (
+                    current.metadata.get("reference_entry_price", average_entry_price)
+                    if matched
+                    else average_entry_price
+                    if quantity != 0
+                    else 0.0
+                ),
             },
         )
         self._positions[(portfolio_id, instrument_id)] = position
@@ -207,6 +226,13 @@ class PositionManager:
             metadata={
                 **dict(current.metadata),
                 "reference_entry_price": reference_average,
+                "opened_at": (
+                    fill.occurred_at
+                    if quantity and current.quantity * quantity <= 0
+                    else current.metadata.get("opened_at")
+                    if quantity
+                    else None
+                ),
                 **({"assignment_id": assignment_id} if assignment_id else {}),
             },
         )

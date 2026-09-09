@@ -1,4 +1,5 @@
 [Unit]
+RequiresMountsFor=/opt/trading-bot/data /opt/trading-bot/runtime/backups
 Description=Trading platform scheduler and operations process
 After=network-online.target postgresql.service trading-platform-migration.service
 Wants=network-online.target
@@ -6,13 +7,14 @@ Requires=postgresql.service trading-platform-migration.service
 
 [Service]
 Type=simple
-User=trading-research
-Group=trading-research
+User=trading-runtime
+Group=trading-runtime
+Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/numba-cache
 WorkingDirectory=/opt/trading-bot
-EnvironmentFile=/etc/trading-platform/research.env
+EnvironmentFile=/etc/trading-platform/runtime.env
 Environment=PYTHONUNBUFFERED=1
-ExecStartPre=/opt/trading-bot/.venv-research/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process scheduler-operations --validate
-ExecStart=/opt/trading-bot/.venv-research/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process scheduler-operations
+ExecStartPre=/opt/trading-bot/.venv-runtime/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process scheduler-operations --validate
+ExecStart=/opt/trading-bot/.venv-runtime/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process scheduler-operations
 Restart=always
 RestartSec=5
 TimeoutStopSec=45

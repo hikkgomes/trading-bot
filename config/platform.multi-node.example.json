@@ -18,7 +18,7 @@
       "production_authority": false,
       "services": [
         "research-worker", "ml-worker", "event-replay-worker",
-        "feature-build-worker", "agent-sandbox"
+        "feature-build-worker", "agent-coordinator", "evaluation-worker", "agent-sandbox"
       ]
     }
   ],
@@ -41,8 +41,9 @@
   "backup": {"postgresql_schedule": "hourly", "parquet_schedule": "daily", "retention_days": 30, "restore_test_schedule": "weekly", "maximum_age_seconds": 172800, "minimum_free_bytes": 536870912},
   "resource_limits": {"memory_mb": 8192, "heavy_compute_slots": 1, "research_job_memory_mb": 3072, "numerical_threads": 2, "maximum_queue_age_seconds": 86400},
   "security_domains": {
-    "trading-runtime": ["market-gateway", "data-writer", "feature-service", "strategy-evaluator", "portfolio-engine", "portfolio-state-service", "risk-engine", "execution-engine", "paper-engine", "product-supervisor", "accounting-service", "account-reconciliation", "control-api"],
-    "trading-research": ["universe-service", "platform-scheduler", "promotion-engine", "research-worker", "ml-worker", "event-replay-worker", "feature-build-worker"],
+    "trading-runtime": ["market-gateway", "data-writer", "feature-service", "strategy-evaluator", "portfolio-engine", "portfolio-state-service", "risk-engine", "execution-engine", "paper-engine", "product-supervisor", "accounting-service", "account-reconciliation", "control-api", "universe-service", "platform-scheduler", "promotion-engine"],
+    "trading-research": ["research-worker", "ml-worker", "event-replay-worker", "feature-build-worker", "agent-coordinator"],
+    "trading-evaluator": ["evaluation-worker"],
     "trading-agent": ["agent-sandbox"],
     "trading-migration": ["migration-service"]
   },
@@ -51,7 +52,8 @@
     "data-writer": ["data-writer"],
     "trading-runtime": ["feature-service", "strategy-evaluator", "portfolio-engine", "portfolio-state-service", "risk-engine", "execution-engine", "paper-engine", "product-supervisor", "accounting-service", "account-reconciliation"],
     "scheduler-operations": ["universe-service", "platform-scheduler", "promotion-engine"],
-    "research-runtime": ["research-worker", "ml-worker", "event-replay-worker", "feature-build-worker"],
+    "research-runtime": ["research-worker", "ml-worker", "event-replay-worker", "feature-build-worker", "agent-coordinator"],
+    "evaluation-runtime": ["evaluation-worker"],
     "agent-runtime": ["agent-sandbox"],
     "control-api": ["control-api"],
     "migration-service": ["migration-service"]

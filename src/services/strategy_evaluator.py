@@ -213,6 +213,17 @@ class DatabaseStrategyEvaluator:
         artefact = self._load_artefact(artefact_hash)
         evaluation_features = dict(features)
         definition = artefact.get("definition")
+        if isinstance(definition, Mapping) and definition.get("signal_model", {}).get(
+            "registered_strategy"
+        ):
+            evaluation_features["prior_strategy_state"] = self.portfolio.prior_strategy_state(
+                assignment_id=str(assignment["id"]),
+                version_id=str(assignment["strategy_version_id"]),
+                portfolio_id=str(assignment["portfolio_id"]),
+                instrument_id=str(payload["instrument_id"]),
+                before=str(features.get("information_time", at)),
+                interval_seconds=payload.get("observation_interval_seconds"),
+            )
         source_type = definition.get("source_type") if isinstance(definition, Mapping) else None
         if str(source_type) == "ensemble":
             assignment_id = str(assignment["id"])
@@ -250,8 +261,8 @@ class DatabaseStrategyEvaluator:
             instrument_id=payload["instrument_id"],
             direction=ForecastDirection(str(forecast_values["direction"])),
             score=float(forecast_values["score"]),
-            expected_return=float(forecast_values["expected_return"]),
-            confidence=float(forecast_values["confidence"]),
+            expected_return=forecast_values["expected_return"],
+            confidence=forecast_values["confidence"],
             horizon_seconds=int(payload["horizon_seconds"]),
             valid_from=at,
             valid_until=valid_until,
@@ -262,6 +273,7 @@ class DatabaseStrategyEvaluator:
                 "feature_ids": list(feature_ids),
                 "artefact_hash": artefact_hash,
                 "engine_version": self.engine_version,
+                "observation_interval_seconds": payload.get("observation_interval_seconds"),
                 "assignment_id": assignment["id"],
                 "execution_receipt": forecast_values.get("execution_receipt", {}),
                 "parity_receipt": forecast_values.get("parity_receipt"),
@@ -278,6 +290,9 @@ class DatabaseStrategyEvaluator:
                         "btc_target_fraction",
                         "btc_tactical_fraction",
                         "btc_cycle_state",
+                        "position_rules",
+                        "position_state",
+                        "entry_signal",
                         "funding_rate",
                         "funding_interval_seconds",
                         "expected_funding_events",

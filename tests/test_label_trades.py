@@ -3,7 +3,6 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from src.day_trade_search import DayTradeConfig, simulate_day_trades
 from src.label_trades import build_trade_labels, compute_tp_sl_labels
 
 
@@ -33,28 +32,6 @@ def test_build_trade_labels_column_naming():
     assert "label_long_tp50_sl30_h8" in out.columns
     assert "mfe_long_h8_full" in out.columns
     assert "mae_long_tp50_sl30_h8_exit" in out.columns
-
-
-def test_label_matches_simulation_on_simple_path():
-    n = 30
-    data = pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC"),
-            "tf_5m_open": [100.0] * n,
-            "tf_5m_high": [100.0, 101.0] + [100.0] * (n - 2),
-            "tf_5m_low": [100.0] * n,
-            "tf_5m_close": [100.0] * n,
-        }
-    )
-    labels = build_trade_labels(data, [(0.01, 0.01)], [4], ["long"], "tf_5m_")
-    signal = pd.Series([True] + [False] * (n - 1))
-    config = DayTradeConfig(
-        take_profit=0.01, stop_loss=0.01, fee_bps=0, slippage_bps=0, horizon_bars=4
-    )
-    trades = simulate_day_trades(data, signal, "long", config)
-    assert bool(labels["label_long_tp100_sl100_h4"].iloc[0]) == (
-        trades["exit_reason"].iloc[0] == "take_profit"
-    )
 
 
 def test_mfe_mae_values_long_and_short():

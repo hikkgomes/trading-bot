@@ -19,9 +19,11 @@ def _order_id(
     reduce_only: bool,
     phase: str,
     decided_at: str,
+    account_id: str,
+    environment: str,
 ) -> str:
     material = (
-        f"{portfolio_id}|{instrument_id}|{side.value}|{quantity:.12f}|"
+        f"{account_id}|{environment}|{portfolio_id}|{instrument_id}|{side.value}|{quantity:.12f}|"
         f"{int(reduce_only)}|{phase}|{decided_at}"
     )
     return "ord_" + hashlib.sha256(material.encode()).hexdigest()[:24]
@@ -50,6 +52,8 @@ def _intent(
             reduce_only=reduce_only,
             phase=phase,
             decided_at=decided_at,
+            account_id=str(target.metadata.get("account_id") or "unassigned"),
+            environment=str(target.metadata.get("execution_environment") or "paper"),
         ),
         portfolio_id=target.portfolio_id,
         instrument_id=target.instrument_id,

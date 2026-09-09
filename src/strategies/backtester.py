@@ -1,8 +1,8 @@
 """Vectorized event backtester for the strategy framework.
 
-The trade model is intentionally identical to ``src.strategy_search.simulate_trades``
-so that a strategy run through this engine is directly comparable to a
-condition-grid candidate from the search:
+This diagnostic simulator is not a research-qualification or execution authority.
+Canonical research uses the shared economic ledger through src.research.executors.
+The diagnostic model uses these assumptions:
 
 * an entry signal at bar ``i`` opens at the **open of bar i+1**;
 * exits are taken intrabar on TP/SL (stop checked before take-profit — the

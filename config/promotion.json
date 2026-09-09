@@ -1,5 +1,5 @@
 {
-  "schema": "promotion/v1",
+  "schema": "promotion/v2",
   "forward_profiles": [
     {
       "product_id": "btc_accumulation",
@@ -7,7 +7,7 @@
       "required_forward_evidence_days": 90,
       "minimum_forward_independent_decisions": 8,
       "minimum_forward_effective_trades": 8,
-      "minimum_forward_effective_episodes": 8,
+      "minimum_forward_completed_episodes": 8,
       "minimum_forward_cycles": 8,
       "minimum_forward_trading_days": 0
     },
@@ -17,7 +17,7 @@
       "required_forward_evidence_days": 14,
       "minimum_forward_independent_decisions": 200,
       "minimum_forward_effective_trades": 200,
-      "minimum_forward_effective_episodes": 200,
+      "minimum_forward_completed_episodes": 200,
       "minimum_forward_trading_days": 10
     },
     {
@@ -26,7 +26,7 @@
       "required_forward_evidence_days": 30,
       "minimum_forward_independent_decisions": 60,
       "minimum_forward_effective_trades": 60,
-      "minimum_forward_effective_episodes": 60,
+      "minimum_forward_completed_episodes": 60,
       "minimum_forward_trading_days": 0
     },
     {
@@ -35,7 +35,7 @@
       "required_forward_evidence_days": 30,
       "minimum_forward_independent_decisions": 60,
       "minimum_forward_effective_trades": 60,
-      "minimum_forward_effective_episodes": 60,
+      "minimum_forward_completed_episodes": 60,
       "minimum_forward_trading_days": 10
     },
     {
@@ -44,7 +44,7 @@
       "required_forward_evidence_days": 60,
       "minimum_forward_independent_decisions": 20,
       "minimum_forward_effective_trades": 20,
-      "minimum_forward_effective_episodes": 20,
+      "minimum_forward_completed_episodes": 20,
       "minimum_forward_trading_days": 10
     },
     {
@@ -53,13 +53,13 @@
       "required_forward_evidence_days": 60,
       "minimum_forward_independent_decisions": 20,
       "minimum_forward_effective_trades": 20,
-      "minimum_forward_effective_episodes": 20,
+      "minimum_forward_completed_episodes": 20,
       "minimum_forward_trading_days": 0
     }
   ],
   "policies": [
     {
-      "policy_id": "btc-accumulation-v2",
+      "policy_id": "btc-accumulation-v3",
       "automatic_paper_promotion": true,
       "automatic_live_canary_promotion": false,
       "canary_capital_limit": 0.02,
@@ -80,13 +80,13 @@
       "maximum_forward_rejected_orders": 0,
       "minimum_forward_trading_days": 0,
       "minimum_forward_cycles": 8,
-      "minimum_forward_effective_episodes": 8,
+      "minimum_forward_completed_episodes": 8,
       "maximum_forward_tail_loss": 0.05,
       "retirement_conditions": ["evidence_expired", "risk_breach", "persistent_drift"],
       "capital_increase_policy": "manual_approval_required"
     },
     {
-      "policy_id": "active-income-v2",
+      "policy_id": "active-income-v3",
       "automatic_paper_promotion": true,
       "automatic_live_canary_promotion": false,
       "canary_capital_limit": 0.01,
@@ -107,7 +107,7 @@
       "maximum_forward_rejected_orders": 0,
       "minimum_forward_trading_days": 0,
       "minimum_forward_cycles": 0,
-      "minimum_forward_effective_episodes": 60,
+      "minimum_forward_completed_episodes": 60,
       "maximum_forward_tail_loss": 0.05,
       "retirement_conditions": ["evidence_expired", "risk_breach", "persistent_drift"],
       "capital_increase_policy": "manual_approval_required"

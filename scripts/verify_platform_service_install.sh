@@ -2,15 +2,10 @@
 set -euo pipefail
 
 REPO="${REPO:-/home/alfred/trading-bot}"
-DATABASE_URL="${TRADING_PLATFORM_DATABASE_URL:-}"
 PLATFORM_CONFIG="${TRADING_PLATFORM_CONFIG:-$REPO/config/platform.json}"
 
 if [[ "$(id -u)" != "0" ]]; then
   echo "platform service verification requires root" >&2
-  exit 1
-fi
-if [[ -z "$DATABASE_URL" ]]; then
-  echo "TRADING_PLATFORM_DATABASE_URL is required" >&2
   exit 1
 fi
 command -v runuser >/dev/null 2>&1 || {
@@ -44,7 +39,7 @@ probe_parquet() {
     "$probe"
 }
 
-for user in trading-runtime trading-research trading-agent; do
+for user in trading-runtime trading-research trading-evaluator trading-agent; do
   id "$user" >/dev/null 2>&1 || {
     echo "missing service user: $user" >&2
     exit 1
@@ -55,52 +50,62 @@ for path in \
   "$REPO/data/raw" \
   "$REPO/data/bars" \
   "$REPO/data/features" \
-  "$REPO/runtime"; do
+  "$REPO/runtime" \
+  "$REPO/runtime/numba-cache"; do
   probe_write trading-runtime "$path"
 done
 probe_parquet trading-runtime "$REPO/.venv-runtime/bin/python" "$REPO/data/bars"
 probe_json trading-runtime "$REPO/runtime"
 for path in \
   "$REPO/data/research" \
-  "$REPO/data/artefacts" \
   "$REPO/runtime/research"; do
   probe_write trading-research "$path"
 done
 probe_parquet trading-research "$REPO/.venv-research/bin/python" "$REPO/data/research"
-probe_json trading-research "$REPO/data/artefacts"
+probe_json trading-evaluator "$REPO/data/artefacts"
+probe_write trading-evaluator "$REPO/runtime/evaluation"
 probe_json trading-research "$REPO/runtime/research"
 probe_write trading-agent "$REPO/runtime/agent-worktrees"
 probe_json trading-agent "$REPO/runtime/agent-worktrees"
-runuser -u trading-agent -- env \
-  GIT_CONFIG_COUNT=1 \
-  GIT_CONFIG_KEY_0=safe.directory \
-  GIT_CONFIG_VALUE_0="$REPO" \
-  git -C "$REPO" cat-file -e 'HEAD^{commit}'
+if runuser -u trading-agent -- test -r "$REPO/.git/config"; then
+  echo "agent can read source Git metadata" >&2
+  exit 1
+fi
+if probe_write trading-research "$REPO/data/artefacts" 2>/dev/null; then
+  echo "adaptive research can write sealed artefacts" >&2
+  exit 1
+fi
+for user in trading-research trading-evaluator trading-agent; do
+  if runuser -u "$user" -- test -r "$REPO/runtime/backups"; then
+    echo "$user can read private backups" >&2
+    exit 1
+  fi
+done
 
 run_cycle() {
   local user="$1"
   local python="$2"
   local service="$3"
-  shift 3
+  local environment="$4"
+  shift 4
   [[ -x "$python" ]] || {
     echo "missing service interpreter: $python" >&2
     exit 1
   }
-  runuser -u "$user" -- sh -c 'cd "$1" && shift && exec "$@"' \
-    platform-service-cycle "$REPO" env \
-    TRADING_PLATFORM_DATABASE_URL="$DATABASE_URL" \
+  runuser -u "$user" -- sh -c 'set -a; . "$1"; set +a; cd "$2"; shift 2; exec "$@"' \
+    platform-service-cycle "$environment" "$REPO" env \
     "$@" \
     "$python" -m src.services.supervisor \
-    --config "$PLATFORM_CONFIG" \
-    --node linux-optiplex \
-    --service "$service" \
-    --once
+    --config "$PLATFORM_CONFIG" --node linux-optiplex --service "$service" --once
 }
 
-run_cycle trading-runtime "$REPO/.venv-runtime/bin/python" product-supervisor
-run_cycle trading-research "$REPO/.venv-research/bin/python" research-worker \
+run_cycle trading-runtime "$REPO/.venv-runtime/bin/python" product-supervisor /etc/trading-platform/runtime.env \
+  NUMBA_CACHE_DIR="$REPO/runtime/numba-cache"
+run_cycle trading-research "$REPO/.venv-research/bin/python" research-worker /etc/trading-platform/research.env \
   NUMBA_CACHE_DIR="$REPO/runtime/research/numba-cache"
-run_cycle trading-agent "$REPO/.venv-agent/bin/python" agent-sandbox \
+run_cycle trading-evaluator "$REPO/.venv-research/bin/python" evaluation-worker /etc/trading-platform/evaluator.env \
+  NUMBA_CACHE_DIR="$REPO/runtime/evaluation/numba-cache"
+run_cycle trading-agent "$REPO/.venv-agent/bin/python" agent-sandbox /etc/trading-platform/agent.env \
   TRADING_PLATFORM_AGENT_WORKTREE_ROOT="$REPO/runtime/agent-worktrees" \
   NUMBA_CACHE_DIR="$REPO/runtime/agent-worktrees/numba-cache"
 

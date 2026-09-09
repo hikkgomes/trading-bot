@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 from src.domain.orders import OrderIntent, OrderSide
 from src.domain.positions import Position
+from src.risk.exposure import ExposureLimit, ExposureScope, assert_exposure_limits
 
 
 class ExposureBudgetError(PermissionError):
@@ -28,7 +29,7 @@ class ExposureBudgetAssessment:
     product_id: str
     portfolio_id: str
     instrument_id: str
-    equity: float
+    equity: float | None
     reference_price: float
     current_gross_notional: float
     pending_gross_notional: float
@@ -36,6 +37,7 @@ class ExposureBudgetAssessment:
     gross_notional: float
     net_notional: float
     limits: Mapping[str, float]
+    scoped_exposure: Mapping[str, float] = field(default_factory=dict)
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -50,6 +52,7 @@ class ExposureBudgetAssessment:
             "gross_notional": self.gross_notional,
             "net_notional": self.net_notional,
             "limits": dict(self.limits),
+            "scoped_exposure": dict(self.scoped_exposure),
         }
 
 
@@ -74,22 +77,36 @@ class ExposureBudgetGuard:
         position_rows = tuple(item for item in positions if item.portfolio_id == order.portfolio_id)
         order_rows = tuple(orders)
         price = _order_reference_price(order)
+        if order.reduce_only:
+            return _reduction_assessment(product_id, order, position_rows, price)
+        price_by_instrument = _known_prices(
+            order=order, account_payload=account_payload, orders=order_rows
+        )
         equity = _account_equity(
             product_id=product_id,
             account=account,
             account_payload=account_payload,
-            price=price,
-        )
-        price_by_instrument = _known_prices(
-            order=order, account_payload=account_payload, orders=order_rows
+            price=price_by_instrument[order.instrument_id],
+            positions=position_rows,
+            prices=price_by_instrument,
         )
         current_notional, current_signed = _position_exposure(position_rows, price_by_instrument)
-        pending_gross, pending_net = _pending_exposure(order, order_rows, price_by_instrument)
+        pending_gross, pending_net, pending_low, pending_high = _pending_exposure(
+            order, order_rows, price_by_instrument
+        )
 
-        proposed = 0.0 if order.reduce_only else order.quantity * price
-        proposed_net = 0.0 if order.reduce_only else _signed_notional(order.side, proposed)
+        price = _order_valuation_price(order, price_by_instrument[order.instrument_id])
+        proposed = order.quantity * price
+        proposed_net = _signed_notional(
+            order.side, order.quantity * price_by_instrument[order.instrument_id]
+        )
         gross = sum(current_notional.values()) + pending_gross + proposed
-        net = sum(current_signed.values()) + pending_net + proposed_net
+        current_net = sum(current_signed.values())
+        net = current_net + pending_net + proposed_net
+        reserved_net = max(
+            abs(current_net + pending_low + min(0.0, proposed_net)),
+            abs(current_net + pending_high + max(0.0, proposed_net)),
+        )
         limits = _limits(
             product_id=product_id,
             product=product,
@@ -97,6 +114,16 @@ class ExposureBudgetGuard:
             assignment=assignment,
             risk_configuration=risk_configuration,
             equity=equity,
+        )
+        values = _scoped_values(
+            order,
+            position_rows,
+            order_rows,
+            price_by_instrument,
+            assignment,
+            gross,
+            reserved_net,
+            proposed,
         )
         assessment = ExposureBudgetAssessment(
             product_id=product_id,
@@ -109,12 +136,13 @@ class ExposureBudgetGuard:
             proposed_notional=proposed,
             gross_notional=gross,
             net_notional=net,
-            limits=limits,
+            limits={limit.name: limit.maximum for limit in limits},
+            scoped_exposure={scope.value: value for scope, value in values.items()},
         )
-        if order.reduce_only:
-            _assert_reduce_only(order, current_signed.get(order.instrument_id, 0.0), price)
-            return assessment
-        _assert_limits(gross, net, limits)
+        try:
+            assert_exposure_limits(values, limits)
+        except ValueError as exc:
+            raise ExposureBudgetError(str(exc)) from exc
         return assessment
 
     def enforce(self, **kwargs: Any) -> ExposureBudgetAssessment:
@@ -148,8 +176,8 @@ def _pending_exposure(
     order: OrderIntent,
     orders: Iterable[OrderIntent],
     prices: Mapping[str, float],
-) -> tuple[float, float]:
-    gross = net = 0.0
+) -> tuple[float, float, float, float]:
+    gross = net = lower = upper = 0.0
     for existing in orders:
         if _skip_pending_order(order, existing):
             continue
@@ -158,10 +186,12 @@ def _pending_exposure(
             raise ExposureBudgetError(
                 f"pending live exposure has no current price for {existing.instrument_id}"
             )
-        notional = existing.remaining_quantity * mark
-        gross += notional
-        net += _signed_notional(existing.side, notional)
-    return gross, net
+        gross += existing.remaining_quantity * _order_valuation_price(existing, mark)
+        signed = _signed_notional(existing.side, existing.remaining_quantity * mark)
+        net += signed
+        lower += min(0.0, signed)
+        upper += max(0.0, signed)
+    return gross, net, lower, upper
 
 
 def _skip_pending_order(order: OrderIntent, existing: OrderIntent) -> bool:
@@ -173,11 +203,65 @@ def _skip_pending_order(order: OrderIntent, existing: OrderIntent) -> bool:
     )
 
 
-def _assert_limits(gross: float, net: float, limits: Mapping[str, float]) -> None:
-    for name, limit in limits.items():
-        value = abs(net) if name == "net_notional" else gross
-        if value > limit + max(1e-9, abs(limit) * 1e-12):
-            raise ExposureBudgetError(f"live order exceeds {name}: {value:g} > {limit:g}")
+def _reduction_assessment(product_id: str, order: OrderIntent, positions, price: float):
+    quantity = sum(item.quantity for item in positions if item.instrument_id == order.instrument_id)
+    _assert_reduce_only(order, quantity * price, price)
+    notional = abs(quantity * price)
+    return ExposureBudgetAssessment(
+        product_id,
+        order.portfolio_id,
+        order.instrument_id,
+        None,
+        price,
+        notional,
+        0.0,
+        0.0,
+        notional,
+        quantity * price,
+        {},
+    )
+
+
+def _scoped_values(
+    order, positions, orders, prices, assignment, gross: float, reserved_net: float, proposed: float
+):
+    values = {
+        scope: 0.0
+        for scope in (ExposureScope.INSTRUMENT, ExposureScope.ASSIGNMENT, ExposureScope.SLEEVE)
+    }
+    for item in positions:
+        _add_scoped(
+            values, item, abs(item.quantity) * prices[item.instrument_id], order, assignment
+        )
+    for item in orders:
+        if not _skip_pending_order(order, item):
+            _add_scoped(
+                values,
+                item,
+                item.remaining_quantity * _order_valuation_price(item, prices[item.instrument_id]),
+                order,
+                assignment,
+            )
+    _add_scoped(values, order, proposed, order, assignment)
+    return {
+        **values,
+        ExposureScope.PRODUCT_GROSS: gross,
+        ExposureScope.PRODUCT_NET: reserved_net,
+        ExposureScope.ACCOUNT: gross,
+        ExposureScope.ORDER: proposed,
+    }
+
+
+def _add_scoped(values, item, notional: float, order, assignment) -> None:
+    if item.instrument_id == order.instrument_id:
+        values[ExposureScope.INSTRUMENT] += notional
+    metadata = item.metadata.get("target_metadata", item.metadata)
+    owner = metadata.get("assignment_id")
+    sleeve = metadata.get("sleeve")
+    if owner is None or owner == assignment.get("id"):
+        values[ExposureScope.ASSIGNMENT] += notional
+    if sleeve is None or sleeve == assignment.get("sleeve_id"):
+        values[ExposureScope.SLEEVE] += notional
 
 
 def _account_equity(
@@ -186,6 +270,8 @@ def _account_equity(
     account: Mapping[str, Any],
     account_payload: Mapping[str, Any],
     price: float,
+    positions: Iterable[Position],
+    prices: Mapping[str, float],
 ) -> float:
     balances = account_payload.get("balances")
     if not isinstance(balances, Mapping):
@@ -196,10 +282,25 @@ def _account_equity(
     if product_id == "btc_accumulation" or str(account.get("market")) == "spot":
         equity = clean.get("USDT", 0.0) + clean.get("BTC", 0.0) * price
     else:
-        equity = clean.get("USDT", 0.0)
+        equity = _marked_futures_equity(account_payload, clean, positions, prices)
     if equity <= 0:
         raise ExposureBudgetError("live account equity must be positive")
     return equity
+
+
+def _marked_futures_equity(payload, balances, positions, prices) -> float:
+    reported = payload.get("marked_equity", payload.get("equity"))
+    if reported is not None:
+        return _finite(reported, field="marked account equity", positive=True)
+    unrealised = 0.0
+    for position in positions:
+        if abs(position.quantity) > 1e-12:
+            if position.instrument_id not in prices:
+                raise ExposureBudgetError("marked account equity has an unpriced position")
+            unrealised += position.quantity * (
+                prices[position.instrument_id] - position.average_entry_price
+            )
+    return float(balances.get("USDT", 0.0)) + unrealised
 
 
 def _known_prices(
@@ -220,7 +321,7 @@ def _account_market_prices(account_payload: Mapping[str, Any]) -> dict[str, floa
     if not isinstance(raw_prices, Mapping):
         return {}
     return {
-        str(instrument_id): _finite(raw_price, field=f"market price {instrument_id}")
+        str(instrument_id): _finite(raw_price, field=f"market price {instrument_id}", positive=True)
         for instrument_id, raw_price in raw_prices.items()
     }
 
@@ -238,7 +339,7 @@ def _account_position_prices(
         for key in ("mark_price", "price", "reference_price"):
             if raw_position.get(key) is not None:
                 prices[str(instrument_id)] = _finite(
-                    raw_position[key], field=f"position {instrument_id} price"
+                    raw_position[key], field=f"position {instrument_id} price", positive=True
                 )
                 break
     return prices
@@ -254,6 +355,10 @@ def _order_prices(orders: Iterable[OrderIntent], existing: Mapping[str, float]) 
         except ExposureBudgetError:
             continue
     return prices
+
+
+def _order_valuation_price(order: OrderIntent, mark: float) -> float:
+    return max(_order_reference_price(order), mark, float(order.limit_price or 0))
 
 
 def _order_reference_price(order: OrderIntent) -> float:
@@ -280,7 +385,7 @@ def _limits(
     assignment: Mapping[str, Any],
     risk_configuration: Mapping[str, Any],
     equity: float,
-) -> dict[str, float]:
+) -> tuple[ExposureLimit, ...]:
     risk_id = str(product.get("risk_policy_id") or "")
     product_limits = _mapping(risk_configuration.get("products"), f"risk products {risk_id}").get(
         risk_id
@@ -293,13 +398,12 @@ def _limits(
     if not isinstance(account_limits, Mapping):
         raise ExposureBudgetError("risk policy is missing for the live account")
     sleeve_limits = _mapping(risk_configuration.get("sleeve"), "risk sleeve")
-    assignment_cap = _positive_cap(assignment.get("capital_limit"), "assignment capital_limit")
-    assignment_risk = _positive_cap(assignment.get("risk_budget"), "assignment risk_budget")
+    assignment_cap, assignment_risk = _assignment_limits(assignment, equity=equity)
     sleeve_cap = equity * _fraction_cap(
         sleeve_limits.get("maximum_fraction"), "sleeve maximum_fraction"
     )
     product_gross_raw = product_limits.get("maximum_gross", product_limits.get("maximum_exposure"))
-    product_gross = equity * _fraction_cap(product_gross_raw, "product gross exposure")
+    product_gross = equity * _positive_cap(product_gross_raw, "product gross exposure multiple")
     product_net_raw = product_limits.get("maximum_net")
     instrument_limits = _mapping(risk_configuration.get("instrument"), "risk instrument")
     instrument_cap = equity * _fraction_cap(
@@ -310,19 +414,46 @@ def _limits(
         account_limits.get("maximum_margin_fraction"), "account maximum_margin_fraction"
     )
     account_cap = equity * leverage * account_margin_fraction
-    limits = {
-        "assignment_capital_notional": assignment_cap,
-        "assignment_risk_notional": assignment_risk,
-        "sleeve_notional": sleeve_cap,
-        "product_gross_notional": product_gross,
-        "instrument_notional": instrument_cap,
-        "account_margin_notional": account_cap,
-    }
+    limits = [
+        ExposureLimit("assignment_capital_notional", ExposureScope.ASSIGNMENT, assignment_cap),
+        ExposureLimit("assignment_risk_notional", ExposureScope.ASSIGNMENT, assignment_risk),
+        ExposureLimit("sleeve_notional", ExposureScope.SLEEVE, sleeve_cap),
+        ExposureLimit("product_gross_notional", ExposureScope.PRODUCT_GROSS, product_gross),
+        ExposureLimit("instrument_notional", ExposureScope.INSTRUMENT, instrument_cap),
+        ExposureLimit("account_margin_notional", ExposureScope.ACCOUNT, account_cap),
+    ]
     if product_net_raw is not None:
-        limits["product_net_notional"] = equity * _fraction_cap(
-            product_net_raw, "product net exposure"
+        limits.append(
+            ExposureLimit(
+                "product_net_notional",
+                ExposureScope.PRODUCT_NET,
+                equity * _positive_cap(product_net_raw, "product net exposure multiple"),
+            )
         )
-    return limits
+    for config_key, scope, name in (
+        ("maximum_position_notional", ExposureScope.INSTRUMENT, "instrument_absolute_notional"),
+        ("maximum_order_notional", ExposureScope.ORDER, "order_notional"),
+    ):
+        if instrument_limits.get(config_key) is not None:
+            limits.append(
+                ExposureLimit(name, scope, _positive_cap(instrument_limits[config_key], config_key))
+            )
+    return tuple(limits)
+
+
+def _assignment_limits(assignment: Mapping[str, Any], *, equity: float) -> tuple[float, float]:
+    units = assignment.get("payload")
+    if not isinstance(units, Mapping) or units.get("capital_limit_currency") != "USDT":
+        raise ExposureBudgetError("assignment capital limit requires an explicit USDT currency")
+    capital = _positive_cap(assignment.get("capital_limit"), "assignment capital_limit")
+    unit = units.get("risk_budget_unit")
+    if unit == "equity_fraction":
+        risk = equity * _fraction_cap(assignment.get("risk_budget"), "assignment risk fraction")
+    elif unit == "quote_notional":
+        risk = _positive_cap(assignment.get("risk_budget"), "assignment risk notional")
+    else:
+        raise ExposureBudgetError("assignment risk budget unit is missing or unsupported")
+    return capital, risk
 
 
 def _assert_reduce_only(order: OrderIntent, current_signed_notional: float, price: float) -> None:

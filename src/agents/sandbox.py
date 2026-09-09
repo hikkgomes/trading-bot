@@ -10,6 +10,24 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+REVIEW_INPUTS = (
+    "src",
+    "tests",
+    "config",
+    "scripts",
+    "alembic",
+    "pyproject.toml",
+    "pytest.ini",
+    "conftest.py",
+    "alembic.ini",
+    "Makefile",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "requirements-runtime.txt",
+    "requirements-research-linux.txt",
+    "requirements-agent.txt",
+)
+
 
 @dataclass(frozen=True)
 class SandboxPolicy:
@@ -48,14 +66,12 @@ class SandboxRunner:
         self,
         *,
         workspace: Path,
-        repository: Path | None = None,
         agent_venv: Path | None = None,
         policy: SandboxPolicy = SandboxPolicy(),
         require_network_isolation: bool = True,
     ) -> None:
         self.workspace = workspace.resolve()
-        self.repository = (repository or workspace).resolve()
-        self.agent_venv = (agent_venv or self.repository / ".venv-agent").resolve()
+        self.agent_venv = (agent_venv or self.workspace / ".venv-agent").resolve()
         self.policy = policy
         self.require_network_isolation = require_network_isolation
         self.bwrap = shutil.which("bwrap")
@@ -80,6 +96,9 @@ class SandboxRunner:
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
             "PYTHONHASHSEED": "0",
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
         }
         if not self.require_network_isolation:
             command = [*command]
@@ -101,7 +120,7 @@ class SandboxRunner:
         )
 
     def _bubblewrap_command(self, command: list[str]) -> list[str]:
-        """Mount the proposed worktree, baseline source, and exact agent runtime."""
+        """Expose review inputs and dependencies, without operational data or Git history."""
 
         interpreter = self.agent_venv / "bin" / "python"
         if not interpreter.is_file():
@@ -121,12 +140,10 @@ class SandboxRunner:
             "--ro-bind",
             "/lib",
             "/lib",
-            "--ro-bind",
-            str(self.repository),
-            "/repository",
-            "--bind",
-            str(self.workspace),
+            *(["--ro-bind", "/lib64", "/lib64"] if Path("/lib64").is_dir() else []),
+            "--tmpfs",
             "/worktree",
+            *self._review_input_mounts(),
             "--ro-bind",
             str(self.agent_venv),
             "/venv-agent",
@@ -151,9 +168,35 @@ class SandboxRunner:
             "--setenv",
             "PYTHONHASHSEED",
             "0",
+            "--setenv",
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+            "1",
+            "--setenv",
+            "OPENBLAS_NUM_THREADS",
+            "1",
+            "--setenv",
+            "OMP_NUM_THREADS",
+            "1",
             "--",
             *command,
         ]
+
+    def _review_input_mounts(self) -> list[str]:
+        mounts: list[str] = []
+        for name in REVIEW_INPUTS:
+            source = self.workspace / name
+            if not source.exists():
+                continue
+            if source.is_symlink() or not source.resolve().is_relative_to(self.workspace):
+                raise PermissionError("sandbox review inputs must remain inside the worktree")
+            mounts.extend(
+                (
+                    "--bind" if name in {"src", "tests"} else "--ro-bind",
+                    str(source),
+                    f"/worktree/{name}",
+                )
+            )
+        return mounts
 
     def _limit_resources(self) -> None:
         memory = self.policy.maximum_memory_mb * 1024 * 1024
@@ -182,30 +225,76 @@ class IsolatedGitWorktree:
         self.path: Path | None = None
 
     def __enter__(self) -> Path:
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "--verify", "--end-of-options", f"{self.base_ref}^{{commit}}"],
+            cwd=self.repository,
+            text=True,
+        ).strip()
         self.worktree_root.mkdir(parents=True, exist_ok=True)
         self.path = Path(tempfile.mkdtemp(prefix="agent-worktree-", dir=self.worktree_root))
-        subprocess.run(
-            [
-                "git",
-                "clone",
-                "--no-local",
-                "--no-hardlinks",
-                str(self.repository),
-                str(self.path),
-            ],
-            cwd=self.worktree_root,
-            check=True,
-            capture_output=True,
-            text=True,
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--no-local",
+                    "--no-hardlinks",
+                    str(self.repository),
+                    str(self.path),
+                ],
+                cwd=self.worktree_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "checkout", "--detach", revision],
+                cwd=self.path,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self._current_source(revision)
+            return self.path
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def _current_source(self, revision: str) -> None:
+        if self.path is None:
+            raise RuntimeError("review worktree has not been created")
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repository, text=True
+        ).strip()
+        if head != revision:
+            return
+        patch = subprocess.check_output(
+            ["git", "diff", "--binary", "HEAD", "--", *REVIEW_INPUTS],
+            cwd=self.repository,
         )
-        subprocess.run(
-            ["git", "checkout", "--detach", self.base_ref],
-            cwd=self.path,
-            check=True,
-            capture_output=True,
-            text=True,
+        if patch:
+            subprocess.run(["git", "apply", "--binary"], cwd=self.path, input=patch, check=True)
+        untracked = (
+            subprocess.check_output(
+                ["git", "ls-files", "-z", "--others", "--exclude-standard", "--", *REVIEW_INPUTS],
+                cwd=self.repository,
+            )
+            .decode()
+            .split("\0")
         )
-        return self.path
+        for name in filter(None, untracked):
+            source = self.repository / name
+            if (
+                source.is_symlink()
+                or not source.resolve().is_relative_to(self.repository)
+                or source.suffix == ".env"
+            ):
+                raise PermissionError(
+                    "untracked review input is not an allowed regular source file"
+                )
+            target = self.path / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         if self.path is None:

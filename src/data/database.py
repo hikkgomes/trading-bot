@@ -212,6 +212,71 @@ holdout_claim = _id_payload_table("holdout_claim")
 model_artifact = _id_payload_table("model_artifact")
 strategy_artefact = _id_payload_table("strategy_artefact")
 forward_evidence = _id_payload_table("forward_evidence")
+capital_baseline = _id_payload_table("capital_baseline")
+evidence_invalidation = _id_payload_table("evidence_invalidation")
+financial_application = Table(
+    "financial_application",
+    metadata,
+    Column("id", ForeignKey("fill.id"), primary_key=True),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("account_id", String(160), nullable=False),
+    Column("environment", String(40), nullable=False),
+    Column("venue", String(40), nullable=False),
+    Column("instrument_id", String(160), nullable=False),
+    Column("exchange_trade_id", String(240), nullable=False),
+    Column("payload", JSON, nullable=False),
+    UniqueConstraint(
+        "account_id",
+        "environment",
+        "venue",
+        "instrument_id",
+        "exchange_trade_id",
+        name="uq_financial_scoped_fill",
+    ),
+)
+financial_outbox = Table(
+    "financial_outbox",
+    metadata,
+    Column("id", ForeignKey("financial_application.id"), primary_key=True),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("processed_at", UtcTimestamp()),
+    Column("payload", JSON, nullable=False),
+)
+
+paper_eligibility_event = Table(
+    "paper_eligibility_event",
+    metadata,
+    Column("id", ForeignKey("strategy_artefact.id"), primary_key=True),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("candidate_id", ForeignKey("experiment.id"), nullable=False),
+    Column("engine_version", String(160), nullable=False),
+    Column("payload", JSON, nullable=False),
+    UniqueConstraint(
+        "candidate_id", "engine_version", name="uq_paper_eligibility_candidate_engine"
+    ),
+)
+selection_cohort = Table(
+    "selection_cohort",
+    metadata,
+    Column("id", String(160), primary_key=True),
+    Column("scope_id", String(160), nullable=False, unique=True),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("payload", JSON, nullable=False),
+)
+selection_cohort_result = Table(
+    "selection_cohort_result",
+    metadata,
+    Column("id", ForeignKey("selection_cohort.id"), primary_key=True),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("payload", JSON, nullable=False),
+)
+selection_cohort_open = Table(
+    "selection_cohort_open",
+    metadata,
+    Column("id", ForeignKey("selection_cohort.id"), primary_key=True),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("payload", JSON, nullable=False),
+)
 
 validation_stage = Table(
     "validation_stage",
@@ -225,8 +290,10 @@ validation_stage = Table(
     Column("accepted", Boolean, nullable=False),
     Column("reason_code", String(160)),
     Column("evidence_hash", String(80), nullable=False),
+    Column("evaluation_identity", String(80), unique=True, index=True),
+    Column("engine_version", String(160)),
+    Column("outcome_category", String(40)),
     Column("payload", JSON, nullable=False),
-    UniqueConstraint("experiment_id", "stage", name="uq_validation_stage_experiment_stage"),
     CheckConstraint(
         "accepted IS TRUE OR reason_code IS NOT NULL",
         name="ck_validation_stage_rejection_reason",
@@ -242,6 +309,28 @@ holdout_outcome = Table(
     Column("accepted", Boolean, nullable=False),
     Column("outcome_hash", String(80), nullable=False, unique=True),
     Column("payload", JSON, nullable=False),
+)
+
+forward_qualification_window = Table(
+    "forward_qualification_window",
+    metadata,
+    Column("id", String(80), primary_key=True),
+    Column("strategy_version_id", ForeignKey("strategy_version.id"), nullable=False, index=True),
+    Column("product_id", String(80), nullable=False, index=True),
+    Column("artefact_hash", String(80), nullable=False, index=True),
+    Column("opened_at", UtcTimestamp(), nullable=False, index=True),
+    Column("previous_window_id", ForeignKey("forward_qualification_window.id"), unique=True),
+    Column("source_event_id", String(160), nullable=False, unique=True),
+    Column("payload", JSON, nullable=False),
+)
+Index(
+    "uq_forward_window_initial_scope",
+    forward_qualification_window.c.strategy_version_id,
+    forward_qualification_window.c.product_id,
+    forward_qualification_window.c.artefact_hash,
+    unique=True,
+    postgresql_where=forward_qualification_window.c.previous_window_id.is_(None),
+    sqlite_where=forward_qualification_window.c.previous_window_id.is_(None),
 )
 
 forward_paper_observation = Table(
@@ -381,6 +470,19 @@ Index(
     active_strategy_assignment.c.assignment_scope_id,
     active_strategy_assignment.c.execution_mode,
     unique=False,
+)
+
+research_calibration = _id_payload_table("research_calibration")
+research_policy_approval = _id_payload_table("research_policy_approval")
+
+legacy_research_archive = Table(
+    "legacy_research_archive",
+    metadata,
+    Column("id", String(160), primary_key=True),
+    Column("source_hash", String(80), nullable=False, unique=True),
+    Column("content_hash", String(80), nullable=False),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("payload", JSON, nullable=False),
 )
 
 import_provenance = Table(
@@ -523,6 +625,7 @@ job_attempt = Table(
     Column("status", String(40), nullable=False),
     Column("error", Text),
     Column("payload", JSON, nullable=False),
+    Index("ix_job_attempt_status_started", "status", "started_at"),
 )
 worker = Table(
     "worker",
@@ -733,6 +836,12 @@ class PlatformDatabase:
                 "014_operational_durability.py",
                 "015_legacy_job_quarantine.py",
                 "016_emergency_action_state.py",
+                "017_evaluation_identity.py",
+                "018_capital_baseline.py",
+                "019_economic_evidence_invalidation.py",
+                "020_strategy_state_index.py",
+                "021_paper_eligibility.py",
+                "022_financial_application.py",
             )
             applied: list[str] = []
             with self.engine.begin() as connection:
@@ -766,12 +875,15 @@ class PlatformDatabase:
         from alembic.config import Config
 
         config = Config(str(Path(__file__).resolve().parents[2] / "alembic.ini"))
+        config.attributes["database_url"] = self.url
         config.set_main_option("sqlalchemy.url", self.url.replace("%", "%%"))
         command.upgrade(config, target or "head")
         return (target or "head",)
 
     def assert_migrated(self) -> None:
         """Fail closed when a production database has not run migrations."""
+
+        from pathlib import Path
 
         from sqlalchemy import inspect, text
 
@@ -780,9 +892,14 @@ class PlatformDatabase:
         if missing:
             raise RuntimeError(f"database migrations are incomplete; missing tables: {missing}")
         if self.is_postgresql:
+            from alembic.config import Config
+            from alembic.script import ScriptDirectory
+
+            config = Config(str(Path(__file__).resolve().parents[2] / "alembic.ini"))
+            expected_revision = ScriptDirectory.from_config(config).get_current_head()
             with self.engine.connect() as connection:
                 revision = connection.execute(text("SELECT version_num FROM alembic_version"))
-                if revision.scalar_one_or_none() != "platform_v2_0016":
+                if revision.scalar_one_or_none() != expected_revision:
                     raise RuntimeError("database is not at the current Alembic revision")
 
     def dispose(self) -> None:

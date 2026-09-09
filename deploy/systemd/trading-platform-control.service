@@ -1,4 +1,5 @@
 [Unit]
+RequiresMountsFor=/opt/trading-bot/data /opt/trading-bot/runtime/backups
 Description=Trading platform control and metrics API
 After=network-online.target postgresql.service trading-platform-migration.service
 Wants=network-online.target
@@ -8,6 +9,7 @@ Requires=postgresql.service trading-platform-migration.service
 Type=simple
 User=trading-runtime
 Group=trading-runtime
+Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/numba-cache
 WorkingDirectory=/opt/trading-bot
 EnvironmentFile=/etc/trading-platform/runtime.env
 Environment=PYTHONUNBUFFERED=1

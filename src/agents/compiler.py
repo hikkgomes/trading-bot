@@ -11,28 +11,15 @@ from src.domain.instruments import MarketType, canonical_instrument_id
 from src.domain.strategies import ResearchThesis, StrategyDefinition, StrategySourceType
 from src.products.btc_accumulation import BTC_SPOT_INSTRUMENT_ID
 from src.research.datasets import CandidateDatasetPlan, DatasetBundle
-from src.research.providers import provider_candidate
+from src.research.providers import (
+    DIRECTIONAL_DSL_DIRECTIONS,
+    DIRECTIONAL_DSL_FAMILIES,
+    provider_candidate,
+)
 
 
 class AgentCompilationError(ValueError):
     """An untrusted proposal cannot be compiled into a safe candidate."""
-
-
-_ALLOWED_FAMILIES = frozenset(
-    {
-        "time_series",
-        "mean_reversion",
-        "cross_sectional",
-        "relative_value",
-        "microstructure",
-        "machine_learning",
-        "advanced_alpha",
-        "meta_strategy",
-        "execution",
-        "market_making",
-    }
-)
-_ALLOWED_DIRECTIONS = frozenset({"long", "short", "signed", "market_neutral", "hedged"})
 
 
 def _validated_proposal(
@@ -52,8 +39,12 @@ def _validated_proposal(
     ):
         raise AgentCompilationError("BTC accumulation proposals are restricted to BTCUSDT spot")
     family = str(thesis.generalisation_scope.get("family") or "")
-    if family not in _ALLOWED_FAMILIES:
-        raise AgentCompilationError("OpenClaw thesis family is not allowlisted")
+    if family not in DIRECTIONAL_DSL_FAMILIES:
+        raise AgentCompilationError(f"directional DSL cannot implement the {family} family")
+    if thesis.expected_direction not in DIRECTIONAL_DSL_DIRECTIONS:
+        raise AgentCompilationError(
+            "directional DSL cannot implement a hedged or market-neutral thesis"
+        )
     rule = proposal.provenance.get("rule")
     if not isinstance(rule, Mapping):
         raise AgentCompilationError("OpenClaw DSL proposals require a typed rule")
@@ -79,8 +70,10 @@ def _validated_rule(
     threshold = float(raw_threshold)
     if not math.isfinite(threshold):
         raise AgentCompilationError("OpenClaw rule threshold must be finite")
-    if direction not in _ALLOWED_DIRECTIONS:
-        raise AgentCompilationError("OpenClaw rule direction is unsupported")
+    if direction not in DIRECTIONAL_DSL_DIRECTIONS:
+        raise AgentCompilationError(
+            "directional DSL cannot implement hedged or market-neutral exposure"
+        )
     return thesis, family, feature, operator, threshold, direction
 
 

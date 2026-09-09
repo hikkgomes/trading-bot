@@ -353,7 +353,11 @@ def test_market_data_writer_publishes_partial_book_snapshot(tmp_path) -> None:
     }
 
 
-def test_live_sma_chain_uses_100_bars_and_produces_active_and_flat_forecasts(tmp_path) -> None:
+def test_live_sma_chain_holds_entry_until_configured_horizon(tmp_path) -> None:
+    from src.domain.orders import Fill, OrderIntent, OrderSide, OrderType
+    from src.execution.order_manager import OrderManager, SqlOrderStore
+    from src.services.financial_application import FinancialApplication, FinancialScope
+
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'platform.sqlite3'}")
     database.create_schema()
     queue = DatabaseJobQueue(database.engine)
@@ -433,8 +437,13 @@ def test_live_sma_chain_uses_100_bars_and_produces_active_and_flat_forecasts(tmp
         snapshot_store=snapshots,
     )
     forecasts = []
+    orders = OrderManager(SqlOrderStore(database.engine))
+    application = FinancialApplication(
+        database.engine, FinancialScope("active_income", "futures", "paper", "binance", "USDT")
+    )
+    held = False
     last_time = start
-    for index in range(150):
+    for index in range(300):
         last_time = start + dt.timedelta(minutes=index + 1)
         close = 120.0 - index * 0.1 if index < 99 else 200.0
         close_ms = int(last_time.timestamp() * 1_000)
@@ -481,6 +490,42 @@ def test_live_sma_chain_uses_100_bars_and_produces_active_and_flat_forecasts(tmp
             forecasts.append(
                 SqlPortfolioRepository(database.engine).forecast(evaluated["forecast_id"])
             )
+            forecast = forecasts[-1]
+            if len(forecasts) == 1 or (held and forecast.direction.value == "flat"):
+                side = OrderSide.SELL if held else OrderSide.BUY
+                order = OrderIntent(
+                    f"sma-order-{index}",
+                    product["portfolio_id"],
+                    instrument.instrument_id,
+                    side,
+                    1,
+                    OrderType.MARKET,
+                    created_at=last_time.isoformat(),
+                    strategy_contributions={forecast.strategy_version_id: 1},
+                    metadata={
+                        "reference_price": close,
+                        "target_metadata": {
+                            "assignment_id": forecast.metadata["assignment_id"],
+                            "account_id": "futures",
+                            "execution_environment": "paper",
+                        },
+                    },
+                )
+                orders.create(order)
+                application.apply_fill(
+                    Fill(
+                        f"sma-fill-{index}",
+                        order.order_id,
+                        instrument.instrument_id,
+                        side,
+                        1,
+                        close,
+                        0,
+                        (last_time + dt.timedelta(milliseconds=1)).isoformat(),
+                        fee_asset="USDT",
+                    )
+                )
+                held = not held
 
     assert (
         len(
@@ -493,6 +538,12 @@ def test_live_sma_chain_uses_100_bars_and_produces_active_and_flat_forecasts(tmp
         >= 150
     )
     assert forecasts[0].direction.value == "long"
+    assert forecasts[0].metadata["parity_receipt"]["prior_position_event_id"] is None
+    assert forecasts[1].metadata["parity_receipt"]["prior_position_event_id"]
+    assert forecasts[50].direction.value == "long"
+    horizon = forecasts[0].metadata["position_rules"]["horizon_bars"]
+    assert forecasts[horizon - 1].direction.value == "long"
+    assert forecasts[horizon].direction.value == "flat"
     assert forecasts[-1].direction.value == "flat"
     feature_values = feature_store.available(
         instrument_id=instrument.instrument_id,

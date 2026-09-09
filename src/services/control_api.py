@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import insert, select
 from sqlalchemy.engine import Engine
@@ -20,6 +21,9 @@ from src.observability.reports import DatabasePlatformReport
 from src.services.alerting import AlertSeverity, SqlAlertService
 from src.services.health import DatabaseHeartbeatStore
 from src.services.scheduler import DatabaseJobQueue
+
+if TYPE_CHECKING:
+    from src.services.agent_transport import AgentReviewTransport
 
 
 @dataclass(frozen=True)
@@ -306,6 +310,36 @@ class DatabaseControlPlane:
             "content_hash": proposal.content_hash,
         }
 
+    def restart_forward_window(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from src.services.forward_windows import restart_operator_window
+        from src.services.runtime import utc_now
+
+        window = restart_operator_window(self.engine, payload, now=utc_now())
+        return {"window_id": window["window_id"], "opened_at": window["opened_at"]}
+
+    def forward_windows(self) -> dict[str, Any]:
+        from src.data.database import forward_qualification_window
+
+        with self.engine.connect() as connection:
+            rows = (
+                connection.execute(
+                    select(
+                        forward_qualification_window.c.id, forward_qualification_window.c.payload
+                    )
+                    .order_by(
+                        forward_qualification_window.c.opened_at.desc(),
+                        forward_qualification_window.c.id.desc(),
+                    )
+                    .limit(100)
+                )
+                .mappings()
+                .all()
+            )
+        return {
+            "schema": "platform.forward_windows/v1",
+            "windows": [{"window_id": row["id"], "payload": row["payload"]} for row in rows],
+        }
+
 
 _CRITICAL_SERVICES = frozenset(
     {
@@ -339,6 +373,7 @@ def _control_target(target: str) -> str:
 class ControlHTTPServer(ThreadingHTTPServer):
     control_plane: DatabaseControlPlane
     bearer_token: str
+    agent_transport: AgentReviewTransport | None = None
 
 
 class ControlRequestHandler(BaseHTTPRequestHandler):
@@ -346,7 +381,33 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
 
     def _authorised(self) -> bool:
         server = cast(ControlHTTPServer, self.server)
-        return self.headers.get("Authorization") == f"Bearer {server.bearer_token}"
+        return hmac.compare_digest(
+            self.headers.get("Authorization", ""), f"Bearer {server.bearer_token}"
+        )
+
+    def _agent_post(self) -> None:
+        from src.services.runtime import utc_now
+
+        transport = cast(ControlHTTPServer, self.server).agent_transport
+        if transport is None or not hmac.compare_digest(
+            self.headers.get("Authorization", ""), f"Bearer {transport.key.hex()}"
+        ):
+            self._reply(HTTPStatus.UNAUTHORIZED, {"reason_code": "unauthorised"})
+            return
+        try:
+            payload = _request_payload(self)
+            if self.path == "/agent/requests/next":
+                if payload:
+                    raise ValueError("request polling takes no arguments")
+                response = transport.next_request(now=utc_now())
+            else:
+                response = transport.respond(payload, now=utc_now())
+        except (UnicodeDecodeError, PermissionError, ValueError, KeyError) as exc:
+            self._reply(
+                HTTPStatus.BAD_REQUEST, {"reason_code": "invalid_request", "error": str(exc)}
+            )
+            return
+        self._reply(HTTPStatus.OK, response)
 
     def _reply(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, sort_keys=True).encode()
@@ -367,6 +428,9 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         self._reply(HTTPStatus.OK, response)
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path in {"/agent/requests/next", "/agent/responses"}:
+            self._agent_post()
+            return
         if not self._authorised():
             self._reply(HTTPStatus.UNAUTHORIZED, {"reason_code": "unauthorised"})
             return
@@ -396,12 +460,24 @@ def build_control_server(
     bind: tuple[str, int],
     control_plane: DatabaseControlPlane,
     bearer_token: str,
+    agent_transport_key: bytes | None = None,
+    node_id: str = "agent-transport",
 ) -> ControlHTTPServer:
     if not bearer_token:
         raise ValueError("control API bearer token cannot be empty")
+    transport = None
+    if agent_transport_key is not None:
+        from src.services.agent_transport import AgentReviewTransport
+
+        if hmac.compare_digest(bearer_token, agent_transport_key.hex()):
+            raise ValueError("agent and operator credentials must be distinct")
+        transport = AgentReviewTransport(
+            DatabaseJobQueue(control_plane.engine), key=agent_transport_key, node_id=node_id
+        )
     server = ControlHTTPServer(bind, ControlRequestHandler)
     server.control_plane = control_plane
     server.bearer_token = bearer_token
+    server.agent_transport = transport
     return server
 
 
@@ -415,6 +491,7 @@ _POST_ROUTES = frozenset(
         "/emergency-flatten",
         "/cancel-all-entry-orders",
         "/agent/proposals",
+        "/paper/restart-forward-window",
     }
 )
 
@@ -426,6 +503,7 @@ def _get_route(control_plane: DatabaseControlPlane, path: str) -> dict[str, Any]
         "/configuration": control_plane.configuration_view,
         "/reports": control_plane.report,
         "/agent/reviews": control_plane.agent_reviews,
+        "/paper/windows": control_plane.forward_windows,
     }
     handler = routes.get(path)
     return handler() if handler is not None else None
@@ -446,6 +524,8 @@ def _post_route(
 ) -> dict[str, Any]:
     if path == "/agent/proposals":
         return control_plane.ingest_agent_proposal(payload)
+    if path == "/paper/restart-forward-window":
+        return control_plane.restart_forward_window(payload)
     target = _post_target(path, payload)
     if path == "/cancel-all-entry-orders":
         return control_plane.cancel_all_entry_orders(

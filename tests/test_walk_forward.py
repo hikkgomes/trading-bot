@@ -1,8 +1,9 @@
+from collections import namedtuple
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.day_trade_search import StrategyCandidate
 from src.discover_patterns import Condition, build_all_conditions
 from src.walk_forward import (
     WalkForwardConfig,
@@ -12,6 +13,8 @@ from src.walk_forward import (
     refit_conditions,
     walk_forward_score_candidate,
 )
+
+StrategyCandidate = namedtuple("StrategyCandidate", "direction horizon_bars conditions")
 
 
 def test_generate_windows_no_overlap():

@@ -65,6 +65,7 @@ def _configuration(
         "capital_limit": assignment_cap,
         "risk_budget": risk_budget,
         "sleeve_id": "directional",
+        "payload": {"capital_limit_currency": "USDT", "risk_budget_unit": "quote_notional"},
     }
     risk = {
         "products": {"active-income": {"maximum_gross": product_gross, "maximum_net": 1.0}},

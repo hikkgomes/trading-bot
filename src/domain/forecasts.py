@@ -23,8 +23,8 @@ class AlphaForecast:
     instrument_id: str
     direction: ForecastDirection
     score: float
-    expected_return: float
-    confidence: float
+    expected_return: float | None
+    confidence: float | None
     horizon_seconds: int
     valid_from: str
     valid_until: str
@@ -37,14 +37,7 @@ class AlphaForecast:
             object.__setattr__(
                 self, attribute, non_empty(getattr(self, attribute), field=attribute)
             )
-        for attribute in ("score", "confidence"):
-            value = finite(getattr(self, attribute), field=attribute, minimum=0.0)
-            if value > 1:
-                raise ValueError(f"{attribute} must be at most 1")
-            object.__setattr__(self, attribute, value)
-        object.__setattr__(
-            self, "expected_return", finite(self.expected_return, field="expected_return")
-        )
+        self._validate_economic_fields()
         object.__setattr__(
             self,
             "target_volatility",
@@ -70,6 +63,19 @@ class AlphaForecast:
             raise ValueError("metadata must be an object")
         object.__setattr__(self, "metadata", json_value(dict(self.metadata), field="metadata"))
 
+    def _validate_economic_fields(self) -> None:
+        for attribute in ("score", "confidence"):
+            if attribute == "confidence" and self.confidence is None:
+                continue
+            value = finite(getattr(self, attribute), field=attribute, minimum=0.0)
+            if value > 1:
+                raise ValueError(f"{attribute} must be at most 1")
+            object.__setattr__(self, attribute, value)
+        if self.expected_return is not None:
+            object.__setattr__(
+                self, "expected_return", finite(self.expected_return, field="expected_return")
+            )
+
     @property
     def signed_strength(self) -> float:
         sign = 1.0 if self.direction is ForecastDirection.LONG else -1.0
@@ -83,22 +89,31 @@ class AlphaForecast:
         negative expected return in price space, but it is still actionable
         alpha and must not be discarded by the allocator's ranking step.
         """
-        return abs(self.expected_return) * self.score * self.confidence
+        if self.expected_return is None:
+            return self.score
+        return abs(self.expected_return) * self.score * self.allocation_weight
 
     @property
-    def directional_expected_return(self) -> float:
+    def allocation_weight(self) -> float:
+        """Uncalibrated target directives receive equal allocation weight."""
+        return self.confidence if self.confidence is not None else 1.0
+
+    @property
+    def directional_expected_return(self) -> float | None:
         """Return expected return in the forecast's profitable direction."""
         if self.direction is ForecastDirection.FLAT:
             return 0.0
+        if self.expected_return is None:
+            return None
         sign = 1.0 if self.direction is ForecastDirection.LONG else -1.0
         return sign * self.expected_return
 
     @property
-    def expected_asset_return(self) -> float:
+    def expected_asset_return(self) -> float | None:
         """Expected return of the underlying asset, signed in price space."""
         return self.expected_return
 
     @property
-    def expected_strategy_return(self) -> float:
+    def expected_strategy_return(self) -> float | None:
         """Expected return after applying the forecast direction."""
         return self.directional_expected_return

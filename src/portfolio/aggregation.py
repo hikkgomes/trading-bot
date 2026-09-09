@@ -34,7 +34,7 @@ def aggregate_forecasts(forecasts: Iterable[AlphaForecast]) -> tuple[AlphaForeca
                 )
             )
             continue
-        weights = [item.confidence * item.score for item in items]
+        weights = [item.allocation_weight * item.score for item in items]
         signed = [
             weight * item.signed_strength for item, weight in zip(items, weights, strict=True)
         ]
@@ -49,17 +49,16 @@ def aggregate_forecasts(forecasts: Iterable[AlphaForecast]) -> tuple[AlphaForeca
         )
         agreement = abs(net) / total_weight if total_weight else 0.0
         score = min(1.0, agreement)
-        confidence = min(1.0, sum(item.confidence for item in items) / len(items) * agreement)
-        weighted_return = (
-            sum(item.expected_return * weight for item, weight in zip(items, weights, strict=True))
-            / total_weight
-            if total_weight
-            else 0.0
+        confidence = (
+            min(1.0, sum(item.allocation_weight for item in items) / len(items) * agreement)
+            if all(item.confidence is not None for item in items)
+            else None
         )
-        confidence_total = sum(item.confidence for item in items)
+        weighted_return = _weighted_expected_return(items, weights)
+        confidence_total = sum(item.allocation_weight for item in items)
         maximum_position = min(
             1.0,
-            sum(item.maximum_position * item.confidence for item in items) / confidence_total
+            sum(item.maximum_position * item.allocation_weight for item in items) / confidence_total
             if confidence_total
             else 0.0,
         )
@@ -116,3 +115,19 @@ def aggregate_forecasts(forecasts: Iterable[AlphaForecast]) -> tuple[AlphaForeca
             )
         )
     return tuple(result)
+
+
+def _weighted_expected_return(items: list[AlphaForecast], weights: list[float]) -> float | None:
+    if any(item.expected_return is None for item in items):
+        return None
+    total = sum(weights)
+    return (
+        sum(
+            float(item.expected_return) * weight
+            for item, weight in zip(items, weights, strict=True)
+            if item.expected_return is not None
+        )
+        / total
+        if total
+        else 0.0
+    )

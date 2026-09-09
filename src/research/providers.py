@@ -10,6 +10,9 @@ from src.domain.strategies import StrategyDefinition, StrategySourceType
 from src.research.coordinator import Candidate
 from src.research.datasets import CandidateDatasetPlan
 
+DIRECTIONAL_DSL_FAMILIES = frozenset({"time_series", "mean_reversion", "advanced_alpha"})
+DIRECTIONAL_DSL_DIRECTIONS = frozenset({"long", "short", "signed"})
+
 
 def provider_candidate(
     *,

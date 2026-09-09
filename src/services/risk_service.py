@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
-from src.domain._codec import canonical_hash
+from src.domain._codec import canonical_hash, non_empty
 from src.domain.risk import RiskDecision
 from src.risk.account import AccountRiskLimits, assess_account_risk
 from src.risk.engine import (
@@ -20,7 +21,7 @@ from src.risk.instrument import InstrumentRiskLimits, assess_instrument_risk
 from src.risk.product import ProductRiskLimits, assess_product_risk
 from src.risk.sleeve import SleeveRiskLimits, assess_sleeve_risk
 from src.risk.strategy import StrategyRiskLimits, assess_strategy_risk
-from src.services.job_schemas import JobSchemaError, RiskAssessmentRequest
+from src.services.job_schemas import RiskAssessmentRequest
 from src.services.scheduler import DatabaseJobQueue
 
 Evaluator = Callable[..., RiskDecision]
@@ -45,8 +46,6 @@ class DatabaseRiskWorker:
         worker_id: str,
         store: SqlRiskDecisionStore,
         snapshot_store: SqlRiskSnapshotStore | None = None,
-        snapshot_loader: Callable[[RiskAssessmentRequest], Mapping[str, Mapping[str, Any]]]
-        | None = None,
         execution_modes: Mapping[str, str] | None = None,
         lease_seconds: int = 60,
         job_name: str = "risk_assessment",
@@ -57,7 +56,6 @@ class DatabaseRiskWorker:
         self.worker_id = worker_id
         self.store = store
         self.snapshot_store = snapshot_store
-        self.snapshot_loader = snapshot_loader
         self.execution_modes = dict(execution_modes or {})
         self.lease_seconds = lease_seconds
         self.job_name = job_name
@@ -72,33 +70,21 @@ class DatabaseRiskWorker:
         if claimed is None:
             return {"reason_code": "risk_queue_empty"}
         try:
-            try:
-                request = RiskAssessmentRequest.from_mapping(claimed.payload)
-            except JobSchemaError:
-                if self.store.engine.dialect.name != "sqlite" or not _legacy_risk_fixture(
-                    claimed.payload
-                ):
-                    raise
-                request = None
-            if request is None:
-                product_id = str(claimed.payload["product_id"])
-                assessment_id = str(claimed.payload["assessment_id"])
-                snapshot_inputs = claimed.payload
-            else:
-                product_id = request.product_id
-                assessment_id = request.assessment_id
-                loaded_inputs = self._load_snapshot_inputs(request)
-                policy_limits = SqlRiskPolicyStore(self.store.engine).resolve(
-                    request.risk_policy_ids
-                )
-                if set(policy_limits) != {scope for scope, _, _ in _SCOPES}:
-                    raise ValueError("risk policies must define all six risk scopes")
-                snapshot_inputs = {
-                    scope: {**dict(values), "limits": policy_limits[scope]}
-                    for scope, values in loaded_inputs.items()
-                }
+            request = RiskAssessmentRequest.from_mapping(claimed.payload)
+            product_id = request.product_id
+            assessment_id = request.assessment_id
+            loaded_inputs = self._load_snapshot_inputs(request)
+            policy_limits = self._policy_limits(request)
+            if set(policy_limits) != {scope for scope, _, _ in _SCOPES}:
+                raise ValueError("risk policies must define all six risk scopes")
+            snapshot_inputs = {
+                scope: {**dict(values), "limits": policy_limits[scope]}
+                for scope, values in loaded_inputs.items()
+            }
             decisions = tuple(
-                self._evaluate_scope(snapshot_inputs, scope, evaluator, limits_type)
+                self._evaluate_scope(
+                    snapshot_inputs, scope, evaluator, limits_type, request.evaluated_at
+                )
                 for scope, evaluator, limits_type in _SCOPES
             )
             assessment = combine_risk_decisions(
@@ -107,7 +93,7 @@ class DatabaseRiskWorker:
                 product_id=product_id,
                 store=self.store,
             )
-            if request is not None and product_id in self.execution_modes:
+            if product_id in self.execution_modes:
                 execution_payload = {
                     "product_id": product_id,
                     "event_id": request.event_id,
@@ -150,11 +136,22 @@ class DatabaseRiskWorker:
             "accepted": assessment.accepted,
             "first_rejected_scope": assessment.aggregate.input_snapshot["first_rejected_scope"],
             **(
-                {"execution_job_id": execution_job_id}
-                if request is not None and product_id in self.execution_modes
-                else {}
+                {"execution_job_id": execution_job_id} if product_id in self.execution_modes else {}
             ),
         }
+
+    def _policy_limits(self, request: RiskAssessmentRequest) -> dict[str, dict]:
+        snapshots = self.snapshot_store or SqlRiskSnapshotStore(self.store.engine)
+        account = snapshots.get(request.account_snapshot_id)
+        if account.get("product_id") != request.product_id:
+            raise ValueError("risk account snapshot belongs to another product")
+        raw_account_id = account.get("account_id")
+        if not isinstance(raw_account_id, str):
+            raise ValueError("risk snapshot has no account identity")
+        account_id = non_empty(raw_account_id, field="risk snapshot account id")
+        return SqlRiskPolicyStore(self.store.engine).resolve(
+            request.risk_policy_ids, account_id=account_id
+        )
 
     @staticmethod
     def _evaluate_scope(
@@ -162,6 +159,7 @@ class DatabaseRiskWorker:
         scope: str,
         evaluator: Evaluator,
         limits_type: type,
+        evaluated_at: str,
     ) -> RiskDecision:
         raw = payload.get(scope)
         if not isinstance(raw, Mapping):
@@ -171,20 +169,18 @@ class DatabaseRiskWorker:
         if not isinstance(inputs, Mapping) or not isinstance(limits, Mapping):
             raise ValueError(f"risk job {scope} inputs and limits must be objects")
         decision_id = str(raw.get("decision_id") or "")
-        return evaluator(
-            decision_id=decision_id,
-            **dict(inputs),
-            limits=limits_type(**dict(limits)),
+        return replace(
+            evaluator(
+                decision_id=decision_id,
+                **dict(inputs),
+                limits=limits_type(**dict(limits)),
+            ),
+            evaluated_at=evaluated_at,
         )
 
     def _load_snapshot_inputs(
         self, request: RiskAssessmentRequest
     ) -> Mapping[str, Mapping[str, Any]]:
-        if self.snapshot_loader is not None:
-            loaded = self.snapshot_loader(request)
-            if set(loaded) != {scope for scope, _, _ in _SCOPES}:
-                raise ValueError("risk snapshot loader must return all six risk scopes")
-            return loaded
         if self.snapshot_store is None:
             self.snapshot_store = SqlRiskSnapshotStore(self.store.engine)
         snapshot_ids = (
@@ -195,29 +191,52 @@ class DatabaseRiskWorker:
             request.market_data_snapshot_id,
         )
         records = [self.snapshot_store.get(snapshot_id) for snapshot_id in snapshot_ids]
-        scopes: dict[str, Mapping[str, Any]] = {}
-        for record in records:
-            raw_scopes = record.get("scopes")
-            if isinstance(raw_scopes, Mapping):
-                for scope, value in raw_scopes.items():
-                    if isinstance(value, Mapping):
-                        scopes[str(scope)] = value
-            scope = record.get("scope")
-            if isinstance(scope, str) and isinstance(record.get("inputs"), Mapping):
-                scopes[scope] = record
-        expected = {scope for scope, _, _ in _SCOPES}
-        if set(scopes) != expected:
-            raise ValueError("canonical risk snapshots do not contain all six risk scopes")
+        self._validate_sources(request, records)
+        targets = records[0].get("scopes")
+        if not isinstance(targets, Mapping) or set(targets) != {
+            "strategy",
+            "instrument",
+            "sleeve",
+            "product",
+        }:
+            raise ValueError("target snapshot must contain exactly its four risk scopes")
+        scopes = {**targets, "account": records[1], "global": records[4]}
+        if any(not isinstance(value, Mapping) for value in scopes.values()):
+            raise ValueError("canonical risk scopes must be objects")
         return scopes
+
+    def _validate_sources(
+        self, request: RiskAssessmentRequest, records: list[dict[str, object]]
+    ) -> None:
+        kinds = (
+            "target_position",
+            "account_risk_input",
+            "positions_risk_input",
+            "balances_risk_input",
+            "global_risk_input",
+        )
+        for kind, record in zip(kinds, records, strict=True):
+            if record.get("kind") != kind:
+                raise ValueError("risk source snapshot has the wrong kind")
+            if record.get("product_id") != request.product_id:
+                raise ValueError("risk source snapshot belongs to another product")
+        state_id = records[0].get("canonical_state_id")
+        if (
+            not isinstance(state_id, str)
+            or not state_id
+            or any(record.get("canonical_state_id") != state_id for record in records)
+        ):
+            raise ValueError("risk source snapshots must share one canonical state")
+        state = SqlRiskSnapshotStore(self.store.engine).get(state_id)
+        if (
+            state.get("kind") != "canonical_portfolio_risk_state"
+            or state.get("product_id") != request.product_id
+        ):
+            raise ValueError("risk source state has the wrong identity")
+        if state.get("risk_policy_ids") != list(request.risk_policy_ids):
+            raise ValueError("risk request policies differ from its canonical state")
 
 
 def _retry_at(value: str, seconds: int) -> str:
     parsed = dt.datetime.fromisoformat(value)
     return (parsed + dt.timedelta(seconds=seconds)).replace(microsecond=0).isoformat()
-
-
-def _legacy_risk_fixture(payload: object) -> bool:
-    if not isinstance(payload, Mapping):
-        return False
-    scopes = {"strategy", "instrument", "sleeve", "product", "account", "global"}
-    return set(payload) == scopes | {"product_id", "assessment_id"}

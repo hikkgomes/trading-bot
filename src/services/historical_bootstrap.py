@@ -755,6 +755,9 @@ class HistoricalBootstrapService:
                 "close_time_ms": close_time,
                 "close_timestamp": _millis_timestamp(close_time),
                 "availability_time": downloaded_at,
+                "received_at": downloaded_at,
+                "source_availability_time": _millis_timestamp(close_time),
+                "availability_source": "native_closed_candle",
                 "open": _finite_positive(item[1], "open"),
                 "high": _finite_positive(item[2], "high"),
                 "low": _finite_positive(item[3], "low"),
@@ -900,6 +903,8 @@ class HistoricalBootstrapService:
         return destination
 
     def _record_funding_entries(self, rows: Iterable[Mapping[str, Any]]) -> None:
+        from src.research.funding import legacy_settlement_id
+
         with self.engine.begin() as connection:
             for row in rows:
                 payload = {
@@ -907,11 +912,15 @@ class HistoricalBootstrapService:
                     "product_id": row["product_id"],
                     "instrument_id": row["instrument_id"],
                     "symbol": row["symbol"],
-                    "funding_time": row["funding_timestamp"],
+                    "funding_time": dt.datetime.fromtimestamp(
+                        int(row["funding_time_ms"]) / 1000, dt.UTC
+                    ).isoformat(),
                     "funding_rate": row["funding_rate"],
                     "mark_price": row["mark_price"],
                     "source": "binance_public_funding_rate",
+                    "source_event_id": row["event_id"],
                 }
+                payload["supersedes_record_id"] = legacy_settlement_id(payload)
                 identity = canonical_hash(payload)
                 existing = connection.execute(
                     select(funding_entry.c.payload).where(funding_entry.c.id == identity)

@@ -15,6 +15,7 @@ from sqlalchemy import func, insert, select, text
 from sqlalchemy.engine import Engine
 
 from src.data.database import accounting_entry
+from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 
 
@@ -128,19 +129,30 @@ class LedgerStore(Protocol):
 class SqlLedgerStore:
     """Product-isolated immutable accounting entries in PostgreSQL."""
 
-    def __init__(self, engine: Engine, *, product_id: str):
+    def __init__(self, engine: Engine, *, product_id: str, connection=None):
         self.engine = engine
+        self.connection = connection
         self.product_id = non_empty(product_id, field="product_id")
 
     def append(self, entry: LedgerEntry) -> None:
         if entry.product_id != self.product_id:
             raise ValueError("ledger entry product does not match SQL store")
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, self.connection, write=True) as connection:
             if self.engine.dialect.name == "postgresql":
                 connection.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext(:product_id))"),
                     {"product_id": self.product_id},
                 )
+            head = connection.execute(
+                select(accounting_entry.c.entry_hash)
+                .where(
+                    accounting_entry.c.product_id == self.product_id,
+                )
+                .order_by(accounting_entry.c.sequence.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if entry.previous_hash != (head or "0" * 64):
+                raise ValueError("ledger head changed during append; reload and retry")
             sequence = (
                 int(
                     connection.execute(
@@ -163,7 +175,7 @@ class SqlLedgerStore:
             )
 
     def read(self) -> tuple[LedgerEntry, ...]:
-        with self.engine.connect() as connection:
+        with connection_scope(self.engine, self.connection, write=False) as connection:
             payloads = connection.execute(
                 select(accounting_entry.c.payload)
                 .where(accounting_entry.c.product_id == self.product_id)
@@ -208,6 +220,10 @@ class Ledger:
     @property
     def entries(self) -> tuple[LedgerEntry, ...]:
         return tuple(self._entries)
+
+    def reload(self) -> None:
+        if self.store is not None:
+            self._entries = list(self.store.read())
 
     def append(
         self,

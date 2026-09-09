@@ -7,20 +7,19 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import replace
-from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
-from src.accounting.fees import FeeConversion, FeeConversionError, convert_fee, instrument_asset
+from src.accounting.fees import FeeConversionError, convert_fee, instrument_asset
 from src.data.database import account_snapshot, universe_member, universe_snapshot
 from src.data.database import instrument as instrument_table
 from src.domain._codec import canonical_hash, timestamp, to_primitive
 from src.domain.instruments import Instrument, MarketType
 from src.domain.orders import Fill, OrderIntent, OrderSide, OrderStatus, OrderType
-from src.execution.broker import BrokerFill, BrokerIncome
+from src.execution.broker import BrokerFill
 from src.execution.ccxt_broker import CcxtBroker
 from src.execution.config import ExchangeConfig
 from src.execution.live_exchange import BrokerExecutionVenue
@@ -28,6 +27,7 @@ from src.execution.order_manager import OrderManager
 from src.execution.position_manager import PositionManager
 from src.execution.reconciler import ReconciliationResult, reconcile_account
 from src.execution.recovery import RecoveryAction, RecoveryActionType
+from src.execution.stops import SqlStopStore, StopManager
 from src.research.canonical import (
     SqlActiveStrategyAssignmentRepository,
     SqlApprovalRepository,
@@ -35,11 +35,36 @@ from src.research.canonical import (
     SqlStrategyArtefactRepository,
     preflight_is_fresh,
 )
-from src.services.execution_service import ExecutionService
 from src.services.exposure_budget import ExposureBudgetGuard
+from src.services.financial_application import FinancialApplication, FinancialScope
+from src.services.income_recovery import checkpoint_income, income_window, reconcile_income
 from src.services.runtime import utc_now
 
 _EXECUTION_IDENTITY_FILES = (
+    Path("src/services/financial_application.py"),
+    Path("src/services/financial_followup.py"),
+    Path("src/accounting/execution.py"),
+    Path("src/accounting/ledger.py"),
+    Path("src/data/transactions.py"),
+    Path("src/execution/order_manager.py"),
+    Path("src/execution/position_manager.py"),
+    Path("src/execution/paper_exchange.py"),
+    Path("src/risk/exposure.py"),
+    Path("src/accounting/spot_allocation.py"),
+    Path("src/accounting/capital.py"),
+    Path("src/accounting/paper_account.py"),
+    Path("src/research/accounting.py"),
+    Path("src/research/economic_series.py"),
+    Path("src/research/executors.py"),
+    Path("src/research/returns.py"),
+    Path("src/strategies/behaviour.py"),
+    Path("src/strategies/position_state.py"),
+    Path("src/strategies/semantic.py"),
+    Path("src/domain/forecasts.py"),
+    Path("src/portfolio/optimiser.py"),
+    Path("src/portfolio/aggregation.py"),
+    Path("src/services/artefact_dispatcher.py"),
+    Path("src/services/portfolio_engine.py"),
     Path("requirements-runtime.txt"),
     Path("src/data/binance_user_stream.py"),
     Path("src/execution/ccxt_broker.py"),
@@ -50,6 +75,15 @@ _EXECUTION_IDENTITY_FILES = (
     Path("src/services/live_execution.py"),
     Path("src/services/exposure_budget.py"),
     Path("src/services/protective_stops.py"),
+    Path("src/services/protective_orders.py"),
+    Path("src/services/order_recovery.py"),
+    Path("src/execution/broker.py"),
+    Path("src/execution/history.py"),
+    Path("src/services/income_recovery.py"),
+    Path("src/services/emergency.py"),
+    Path("src/services/platform_testnet_connected.py"),
+    Path("src/services/account_reconciliation.py"),
+    Path("src/domain/orders.py"),
     Path("src/execution/stops.py"),
 )
 
@@ -98,6 +132,7 @@ class ApprovedLiveExecution:
         order_manager: OrderManager,
         positions: PositionManager,
         ledgers: Mapping[str, Any] | None = None,
+        queue_scope: str | None = None,
     ) -> None:
         products = _records(configuration["products"], "products", "product_id")
         accounts = _records(configuration["accounts"], "accounts", "account_id")
@@ -110,6 +145,8 @@ class ApprovedLiveExecution:
         self.positions = positions
         self.ledgers = dict(ledgers or {})
         self.engine = engine
+        self.queue_scope = queue_scope
+        self.loaded_execution_identity = execution_engine_identity()
         self.products = products
         self.accounts = accounts
         self.promotion_policies = _records(configuration["promotion"], "policies", "policy_id")
@@ -196,6 +233,7 @@ class ApprovedLiveExecution:
                 )
             )
         if broker.config.market_type == "futures":
+            local_orders.update(self._protection_order_ids(portfolio_id))
             exchange_positions = {
                 symbol_to_instrument.get(
                     item.symbol,
@@ -229,6 +267,18 @@ class ApprovedLiveExecution:
             local_open_order_ids=local_orders,
             exchange_open_order_ids=exchange_orders,
         )
+
+    def _protection_order_ids(self, portfolio_id: str) -> set[str]:
+        return {
+            str(client_id)
+            for stop in StopManager(SqlStopStore(self.engine)).active()
+            if stop.portfolio_id == portfolio_id
+            for order_id, client_id in (
+                (stop.native_order_id, stop.native_client_id),
+                (stop.previous_native_order_id, stop.previous_native_client_id),
+            )
+            if order_id and client_id
+        }
 
     def recover_action(self, product_id: str, action: RecoveryAction) -> Mapping[str, Any]:
         """Execute one bounded, idempotent recovery action on the approved venue."""
@@ -291,11 +341,18 @@ class ApprovedLiveExecution:
         )
         recovered_count = self._apply_recovered_fills(product_id, order, recovered)
         self._finish_recovered_order(order.order_id, state.status.casefold())
+        numeric_ids = [int(fill.trade_id) for fill in recovered if fill.trade_id.isdigit()]
+        next_id = (
+            str(max(numeric_ids) + 1)
+            if numeric_ids and len(numeric_ids) == len(recovered)
+            else str(order.metadata.get("rest_checkpoint", {}).get("next_trade_id", "0"))
+        )
+        self.order_manager.checkpoint_rest(order.order_id, next_id)
         return {
             "action": "reconcile_order",
             "target": target,
             "order_id": order.order_id,
-            "status": "reconciled",
+            "status": self.order_manager.get(order.order_id).status.value,
             "recovered_fills": recovered_count,
         }
 
@@ -335,10 +392,15 @@ class ApprovedLiveExecution:
                 symbol=symbol,
                 exchange_order_id=state.exchange_order_id or exchange_id,
                 client_order_id=state.client_order_id or client_id,
+                from_trade_id=str(
+                    order.metadata.get("rest_checkpoint", {}).get("next_trade_id", "0")
+                ),
             )
         )
 
     def _finish_recovered_order(self, order_id: str, state_status: str) -> None:
+        if state_status in {"open", "new", "accepted", "partially_filled"}:
+            return
         current = self.order_manager.get(order_id)
         if current.status is OrderStatus.RECONCILED:
             return
@@ -363,8 +425,23 @@ class ApprovedLiveExecution:
     def _apply_recovered_fills(
         self, product_id: str, order: OrderIntent, fills: tuple[BrokerFill, ...]
     ) -> int:
-        existing = {item.fill_id for item in self.order_manager.fills_for(order.order_id)}
         existing_fills = self.order_manager.fills_for(order.order_id)
+        account_id = str(self.products[product_id]["account_id"])
+        ledger = self.ledgers.get(product_id)
+        if ledger is None:
+            raise RuntimeError("recovered fills require a product ledger")
+        application = FinancialApplication(
+            self.engine,
+            FinancialScope(
+                product_id,
+                account_id,
+                str(self.accounts[account_id]["environment"]),
+                "binance",
+                ledger.accounting_asset,
+            ),
+            queue_scope=self.queue_scope,
+        )
+        application.assert_order_reconciled(order.order_id)
         recovered = 0
         for broker_fill in fills:
             if _matches_existing_recovered_fill(existing_fills, broker_fill):
@@ -376,45 +453,12 @@ class ApprovedLiveExecution:
                 broker_fill.fee,
                 broker_fill.price,
             )
-            fill = _domain_fill(order, broker_fill, metadata=conversion)
-            current = self.order_manager.get(order.order_id)
-            if fill.fill_id in existing:
-                continue
-            if current.status is OrderStatus.RECOVERY_REQUIRED:
-                pass
-            elif current.status is OrderStatus.PERSISTED:
-                self.order_manager.submitted(order.order_id)
-                current = self.order_manager.get(order.order_id)
-            if current.status is OrderStatus.SUBMITTED:
-                self.order_manager.acknowledged(order.order_id, event_at=fill.occurred_at)
-            current = self.order_manager.get(order.order_id)
-            if current.status not in {
-                OrderStatus.RECOVERY_REQUIRED,
-                OrderStatus.ACKNOWLEDGED,
-                OrderStatus.PARTIALLY_FILLED,
-            }:
-                raise RuntimeError(
-                    f"recovered fill cannot be applied from order state {current.status.value}"
-                )
-            previous = self.positions.get(current.portfolio_id, current.instrument_id)
-            self.order_manager.apply_fill(fill)
-            self.positions.apply_fill(
-                current.portfolio_id,
-                fill,
-                contributions=dict(current.strategy_contributions),
-            )
-            ledger = self.ledgers.get(product_id)
-            if ledger is not None:
-                if fill.fee_asset not in {None, ledger.accounting_asset}:
-                    raise RuntimeError("recovered commission needs deterministic fee conversion")
-                ExecutionService(
-                    paper_exchange=_RecoveryVenue(self.order_manager),
-                    positions=self.positions,
-                    ledger=ledger,
-                ).record_execution_costs(current, fill, previous_position=previous)
-            existing.add(fill.fill_id)
-            existing_fills = (*existing_fills, fill)
-            recovered += 1
+            result = application.apply_fill(_domain_fill(order, broker_fill, metadata=conversion))
+            recovered += int(result.applied)
+            existing_fills = (*existing_fills, result.fill)
+        self.order_manager.reload()
+        self.positions.reload()
+        ledger.reload()
         return recovered
 
     def backfill_account(self, product_id: str, at: str) -> Mapping[str, Any]:
@@ -425,91 +469,47 @@ class ApprovedLiveExecution:
         ledger = self.ledgers.get(product_id)
         if not callable(query) or ledger is None:
             raise RuntimeError("account backfill requires a broker income reader and ledger")
-        incomes = tuple(query(since=_backfill_since(at)))
+        ledger.reload()
+        account_id = str(self.products[product_id]["account_id"])
+        scope = FinancialScope(
+            product_id,
+            account_id,
+            str(self.accounts[account_id]["environment"]),
+            "binance",
+            ledger.accounting_asset,
+        )
+        self.order_manager.reload()
+        created_at = [
+            order.created_at
+            for order in self.order_manager.all()
+            if order.portfolio_id == self.product_portfolios[product_id]
+        ]
+        since, until = income_window(ledger, scope, created_at, at)
+        incomes = tuple(query(since=since, until=until))
+        ledger.reload()
         recorded = 0
-        existing_ids = {entry.entry_id for entry in ledger.entries}
         for income in incomes:
-            income_type = income.income_type.casefold()
-            if income_type not in {
+            if not since <= income.occurred_at <= until:
+                raise ValueError("exchange income is outside the requested recovery window")
+            if income.income_type.casefold() not in {
                 "funding_fee",
                 "commission",
                 "commission_fee",
                 "realized_pnl",
                 "realised_pnl",
             }:
-                continue
-            entry_id = f"rest:{income.income_id}"
-            if entry_id in existing_ids:
-                continue
-            attribution = {
-                "product": product_id,
-                "symbol": income.symbol,
-                "income_id": income.income_id,
-                "recovered_from_rest": True,
-            }
-            if income_type == "funding_fee":
-                if income.asset != ledger.accounting_asset:
-                    raise RuntimeError("funding income must use the accounting asset")
-                ledger.record_funding(
-                    entry_id=entry_id,
-                    amount=Decimal(str(income.amount)),
-                    occurred_at=_epoch_time(income.occurred_at),
-                    attribution=attribution,
+                raise ValueError(
+                    f"exchange income type requires explicit reconciliation: {income.income_type}"
                 )
-            elif income_type in {"commission", "commission_fee"}:
-                conversion = self._income_fee_conversion(product_id, income)
-                ledger.record_fee(
-                    entry_id=entry_id,
-                    amount=Decimal(str(conversion.accounting_amount)),
-                    occurred_at=_epoch_time(income.occurred_at),
-                    attribution={**attribution, **conversion.to_payload()},
-                )
-            elif income_type in {"realized_pnl", "realised_pnl"}:
-                if income.asset != ledger.accounting_asset:
-                    raise RuntimeError("realised PnL income must use the accounting asset")
-                ledger.record_realised_pnl(
-                    entry_id=entry_id,
-                    amount=Decimal(str(income.amount)),
-                    occurred_at=_epoch_time(income.occurred_at),
-                    attribution=attribution,
-                )
-            else:
-                continue
-            existing_ids.add(entry_id)
-            recorded += 1
-        return {"product_id": product_id, "income_records": len(incomes), "recorded": recorded}
-
-    def _income_fee_conversion(self, product_id: str, income: BrokerIncome) -> FeeConversion:
-        ledger = self.ledgers[product_id]
-        asset = str(income.asset or "").upper()
-        symbol = str(income.symbol or "").strip()
-        if asset in {"USDT", "USDC", "BUSD"} and ledger.accounting_asset in {
-            "USDT",
-            "USDC",
-            "BUSD",
-        }:
-            price = 1.0
-            metadata: Mapping[str, Any] = {}
-        elif asset in {"USDT", "USDC", "BUSD", "BTC", "ETH"} and symbol:
-            price = float(self.venues[product_id].broker.get_price(symbol))
-            metadata = {}
-        else:
-            price = float(
-                self.venues[product_id].broker.get_price(f"{asset}{ledger.accounting_asset}")
-            )
-            metadata = {"fee_conversion_rate": price}
-        try:
-            return convert_fee(
-                amount=abs(income.amount),
-                fee_asset=asset,
-                accounting_asset=ledger.accounting_asset,
-                trade_price=price,
-                base_asset=_instrument_asset(symbol, "base"),
-                quote_asset=_instrument_asset(symbol, "quote"),
-                metadata=metadata,
-            )
-        except FeeConversionError as exc:
-            raise RuntimeError(f"income fee conversion failed: {exc}") from exc
+            recorded += int(reconcile_income(self.engine, ledger, scope, income))
+        checkpoint_income(ledger, scope, until, at)
+        return {
+            "product_id": product_id,
+            "income_records": len(incomes),
+            "recorded": recorded,
+            "through": until,
+            "history_complete": until == dt.datetime.fromisoformat(at).timestamp(),
+        }
 
     def fee_conversion_metadata(
         self,
@@ -571,22 +571,22 @@ class ApprovedLiveExecution:
             )
             if len(matches) > 1:
                 raise RuntimeError(f"recovery position identity is ambiguous: {instrument_id}")
-            if matches:
-                observed_quantity = matches[0].qty
-                average_price = matches[0].avg_price
+            observed_quantity = matches[0].qty if matches else 0.0
+            average_price = matches[0].avg_price if matches else 0.0
         else:
             position = broker.get_position(instrument.exchange_symbol)
             observed_quantity = position.qty
             average_price = position.avg_price
         if observed_quantity is None:
             raise RuntimeError(f"recovery position quantity is missing: {instrument_id}")
-        self.positions.reconcile_position(
-            portfolio_id=self.product_portfolios[product_id],
-            instrument_id=instrument_id,
-            quantity=float(observed_quantity),
-            average_entry_price=float(average_price),
-            updated_at=utc_now(),
-        )
+        self.positions.reload()
+        local = self.positions.get(self.product_portfolios[product_id], instrument_id)
+        if abs(local.quantity - float(observed_quantity)) > 1e-12:
+            raise RuntimeError("position mismatch requires exact fill-history reconciliation")
+        if local.quantity and abs(local.average_entry_price - average_price) > max(
+            1e-8, average_price * 1e-9
+        ):
+            raise RuntimeError("position cost basis differs from the financial ledger")
         return {
             "action": "reconcile_position",
             "instrument_id": instrument_id,
@@ -694,7 +694,11 @@ class ApprovedLiveExecution:
             return False
 
     def authorise(self, payload: Mapping[str, Any], order: OrderIntent) -> None:
+        if execution_engine_identity() != self.loaded_execution_identity:
+            raise PermissionError("execution code changed after process startup")
         product_id, product, account_id, authority_at = self._order_context(payload, order)
+        if not order.reduce_only:
+            self._assert_financial_followups_complete(account_id)
         account_payload, actual_fingerprint = self._validated_account_authority(
             product_id=product_id,
             account_id=account_id,
@@ -732,6 +736,26 @@ class ApprovedLiveExecution:
             positions=self.positions.all(),
             orders=self.order_manager.all(),
         )
+
+    def _assert_financial_followups_complete(self, account_id: str) -> None:
+        from src.data.database import financial_application, financial_outbox
+
+        with self.engine.connect() as connection:
+            pending = connection.execute(
+                select(financial_outbox.c.id)
+                .join(
+                    financial_application,
+                    financial_application.c.id == financial_outbox.c.id,
+                )
+                .where(
+                    financial_application.c.account_id == account_id,
+                    financial_application.c.environment == self.accounts[account_id]["environment"],
+                    financial_outbox.c.processed_at.is_(None),
+                )
+                .limit(1)
+            ).first()
+        if pending is not None:
+            raise PermissionError("committed financial follow-up is incomplete")
 
     def _order_context(
         self, payload: Mapping[str, Any], order: OrderIntent
@@ -1131,14 +1155,6 @@ class ApprovedLiveExecution:
             raise PermissionError("live order instrument is not bound to the canonical artefact")
 
 
-class _RecoveryVenue:
-    def __init__(self, order_manager: OrderManager) -> None:
-        self.order_manager = order_manager
-
-    def submit(self, _intent: OrderIntent) -> Fill:
-        raise RuntimeError("recovery accounting cannot submit orders")
-
-
 def _domain_fill(
     order: OrderIntent,
     recovered: BrokerFill,
@@ -1166,8 +1182,6 @@ def _domain_fill(
         occurred_at=_epoch_time(recovered.occurred_at),
         fee_asset=recovered.fee_asset,
         metadata={
-            "reference_price": recovered.price,
-            "slippage_cost": 0.0,
             "rest_recovery": True,
             "exchange_order_id": recovered.exchange_order_id,
             "trade_id": recovered.trade_id,
@@ -1183,15 +1197,7 @@ def _instrument_matches_symbol(instrument_id: str, symbol: str) -> bool:
 
 
 def _matches_existing_recovered_fill(existing: tuple[Fill, ...], recovered: BrokerFill) -> bool:
-    return any(
-        str(item.metadata.get("trade_id") or "") == recovered.trade_id
-        or (
-            str(item.metadata.get("exchange_order_id") or "") == recovered.exchange_order_id
-            and abs(item.quantity - recovered.quantity) <= max(item.quantity * 1e-9, 1e-12)
-            and abs(item.price - recovered.price) <= max(item.price * 1e-9, 1e-12)
-        )
-        for item in existing
-    )
+    return any(str(item.metadata.get("trade_id") or "") == recovered.trade_id for item in existing)
 
 
 def _validate_recovered_fills(
@@ -1212,10 +1218,19 @@ def _validate_recovered_fills(
 
 def _validate_exchange_recovery_state(state: Any, *, target: str) -> None:
     status = str(state.status).casefold()
-    if status in {"open", "new", "accepted", "partially_filled"}:
-        raise RuntimeError(f"exchange order remains active during recovery: {target}")
-    if status not in {"closed", "filled", "canceled", "cancelled", "rejected", "expired"}:
-        raise RuntimeError(f"exchange order has an unsupported terminal state: {state.status}")
+    if status not in {
+        "open",
+        "new",
+        "accepted",
+        "partially_filled",
+        "closed",
+        "filled",
+        "canceled",
+        "cancelled",
+        "rejected",
+        "expired",
+    }:
+        raise RuntimeError(f"exchange order {target} has an unsupported state: {state.status}")
     if not math.isfinite(state.filled_quantity) or state.filled_quantity < 0:
         raise RuntimeError("exchange order state has an invalid filled quantity")
     if state.average_price is not None and (
@@ -1278,11 +1293,6 @@ def _epoch_time(value: float) -> str:
     if not math.isfinite(value) or value <= 0:
         raise RuntimeError("recovered exchange timestamp is invalid")
     return dt.datetime.fromtimestamp(value, dt.UTC).replace(microsecond=0).isoformat()
-
-
-def _backfill_since(at: str) -> float:
-    observed = dt.datetime.fromisoformat(timestamp(at, field="backfill time"))
-    return max(0.0, observed.timestamp() - 90 * 86_400)
 
 
 def _records(

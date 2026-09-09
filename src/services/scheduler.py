@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
-from sqlalchemy import and_, delete, func, insert, or_, select, update
+from sqlalchemy import and_, delete, func, insert, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
@@ -18,6 +20,7 @@ from src.data.database import (
     forward_paper_observation,
     job,
     job_attempt,
+    paper_eligibility_event,
     platform_schedule,
     strategy_artefact,
     universe_member,
@@ -25,9 +28,11 @@ from src.data.database import (
     worker,
     worker_lease,
 )
+from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
 from src.research.datasets import SqlDatasetBundleRepository
+from src.research.outcomes import OutcomeCategory
 from src.research.store import SqlResearchStore
 from src.services.alerting import AlertSeverity, SqlAlertService, configured_alert_service
 from src.services.job_schemas import JobSchemaError, validate_job_payload
@@ -258,7 +263,7 @@ class PlatformScheduler:
         now: str,
         due_at: str,
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
-        if schedule_name in {"agent_review", "maintenance"} and product_id != min(self.products):
+        if schedule_name == "maintenance" and product_id != min(self.products):
             return ()
         if schedule_name == "historical_bootstrap":
             symbols = (
@@ -353,6 +358,7 @@ class PlatformScheduler:
                 "development_deferred": "development",
                 "robustness": "protected",
                 "robustness_deferred": "robustness",
+                "protected_deferred": "protected",
             }.get(state_value)
             if requested_stage is None and state_value.startswith("waiting_for_dataset:"):
                 requested_stage = state_value.removeprefix("waiting_for_dataset:")
@@ -718,6 +724,9 @@ class PlatformScheduler:
             # Promotion is evidence-driven. Do not create a timestamped error
             # job for an artefact which has not produced a forward summary.
             if latest_summary is None:
+                entry = self._paper_entry_job(artefact, active_assignments, now)
+                if entry is not None:
+                    jobs.append(entry)
                 continue
             summary_id = str(latest_summary["id"])
             evaluated_at = str(latest_summary["created_at"])
@@ -738,10 +747,43 @@ class PlatformScheduler:
                         "requested_capital": 0.0,
                         "evaluated_at": evaluated_at,
                         "forward_summary_id": summary_id,
+                        "artefact_hash": str(artefact["artefact_hash"]),
                     },
                 )
             )
         return tuple(jobs)
+
+    def _paper_entry_job(self, artefact, assignments, now: str):
+        identity = str(artefact.get("artefact_hash") or "")
+        job_id = f"paper-entry:{identity}"
+        if self.queue.state(job_id) is not None:
+            return None
+        if any(row["artefact_hash"] == identity for row in assignments):
+            return None
+        with self.engine.connect() as connection:
+            eligibility = (
+                connection.execute(
+                    select(paper_eligibility_event).where(
+                        paper_eligibility_event.c.id == identity,
+                        paper_eligibility_event.c.created_at <= now,
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        if eligibility is None:
+            return None
+        return (
+            job_id,
+            "promotion_evaluation",
+            {
+                "strategy_version_id": artefact["strategy_version_id"],
+                "artefact_hash": identity,
+                "requested_transition": "forward_paper",
+                "requested_capital": 0.0,
+                "evaluated_at": now,
+            },
+        )
 
     def _latest_forward_summary(
         self,
@@ -1117,6 +1159,11 @@ class DatabaseJobQueue:
             "payload": json_value(clean_payload, field="payload"),
         }
         with self.engine.begin() as connection:
+            restricted = _restricted_job_insert(connection, values)
+            if restricted is not None:
+                if not restricted:
+                    raise ValueError(f"duplicate job_id: {job_id}")
+                return
             if connection.execute(select(job.c.id).where(job.c.id == job_id)).first():
                 raise ValueError(f"duplicate job_id: {job_id}")
             connection.execute(insert(job).values(**values))
@@ -1131,6 +1178,7 @@ class DatabaseJobQueue:
         priority: int = 0,
         producer_identity: str | None = None,
         max_attempts: int = 3,
+        connection=None,
     ) -> bool:
         if isinstance(max_attempts, bool) or max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
@@ -1173,7 +1221,10 @@ class DatabaseJobQueue:
                 .on_conflict_do_nothing(index_elements=[job.c.id])
             )
         statement = statement.returning(job.c.id)
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, connection, write=True) as connection:
+            restricted = _restricted_job_insert(connection, values)
+            if restricted is not None:
+                return restricted
             result = connection.execute(statement)
             inserted = result.scalar_one_or_none() is not None
             if inserted:
@@ -1404,8 +1455,12 @@ class DatabaseJobQueue:
             lease_expires_at=expires_at,
         )
 
-    def complete(self, claimed: ClaimedJob, *, completed_at: str) -> None:
-        self._finish(claimed, completed_at=completed_at, status="completed", error=None)
+    def complete(
+        self, claimed: ClaimedJob, *, completed_at: str, outcome: Mapping[str, Any] | None = None
+    ) -> None:
+        self._finish(
+            claimed, completed_at=completed_at, status="completed", error=None, outcome=outcome
+        )
 
     def fail(
         self,
@@ -1429,11 +1484,12 @@ class DatabaseJobQueue:
         *,
         available_at: str,
         reason: str,
+        outcome_category: OutcomeCategory = OutcomeCategory.BLOCKED_INFRASTRUCTURE,
     ) -> None:
         """Return a claimed job to the queue without consuming a retry.
 
-        Resource admission is not work failure. The claim record is removed so
-        the next real attempt can reuse the job's stable attempt identity.
+        Resource admission is not work failure. Preserve the admission receipt
+        under a separate identity so the next execution can reuse its retry.
         """
 
         available_at = timestamp(available_at, field="available_at")
@@ -1463,7 +1519,21 @@ class DatabaseJobQueue:
                     terminal_reason=None,
                 )
             )
-            connection.execute(delete(job_attempt).where(job_attempt.c.id == attempt_id))
+            connection.execute(
+                update(job_attempt)
+                .where(job_attempt.c.id == attempt_id)
+                .values(
+                    id=f"deferred:{uuid4()}",
+                    status="deferred",
+                    completed_at=timestamp(dt.datetime.now(dt.UTC), field="deferred_at"),
+                    error=reason,
+                    payload={
+                        "outcome_category": outcome_category.value,
+                        "available_at": available_at,
+                        "retry_consumed": False,
+                    },
+                )
+            )
             connection.execute(delete(worker_lease).where(worker_lease.c.id == attempt_id))
             connection.execute(
                 update(worker).where(worker.c.id == claimed.worker_id).values(status="ready")
@@ -1477,6 +1547,7 @@ class DatabaseJobQueue:
         status: str,
         error: str | None,
         retry_at: str | None = None,
+        outcome: Mapping[str, Any] | None = None,
     ) -> None:
         completed_at = timestamp(completed_at, field="completed_at")
         attempt_id = f"{claimed.job_id}:{claimed.attempt}"
@@ -1515,7 +1586,12 @@ class DatabaseJobQueue:
             connection.execute(
                 update(job_attempt)
                 .where(job_attempt.c.id == attempt_id)
-                .values(completed_at=completed_at, status=status, error=error)
+                .values(
+                    completed_at=completed_at,
+                    status=status,
+                    error=error,
+                    payload=json_value(dict(outcome or {}), field="attempt outcome"),
+                )
             )
             connection.execute(
                 update(worker_lease)
@@ -1627,3 +1703,18 @@ class DatabaseJobQueue:
                 observed_at=now,
             )
         return len(expired)
+
+
+def _restricted_job_insert(connection, values) -> bool | None:
+    if connection.dialect.name != "postgresql":
+        return None
+    if connection.execute(
+        text("SELECT has_table_privilege(current_user, 'job', 'INSERT')")
+    ).scalar_one():
+        return None
+    return bool(
+        connection.execute(
+            text("SELECT submit_typed_research_job(CAST(:request AS jsonb))"),
+            {"request": json.dumps(values)},
+        ).scalar_one()
+    )

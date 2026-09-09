@@ -66,8 +66,14 @@ def test_campaign_allocator_keeps_exploration_and_reduces_failed_family(tmp_path
             outcome="rejected",
             reason_code="negative_control_failed",
             observed_at=NOW,
+            candidate_id=f"candidate-{index}",
+            metadata={
+                "stage": "development",
+                "economic_engine": "economic-engine/v4",
+                "net_return": -0.1,
+            },
         )
-        for _ in range(4)
+        for index in range(4)
     )
     allocations = GenerationAllocator(minimum_exploration_fraction=0.3).allocate(
         campaigns,
@@ -134,7 +140,7 @@ def test_hypothesis_memory_detects_exact_and_near_duplicates(tmp_path) -> None:
 
 def test_generated_thesis_and_candidate_are_product_and_universe_bound() -> None:
     hypothesis = build_hypothesis(
-        CAMPAIGNS[-1],
+        next(campaign for campaign in CAMPAIGNS if campaign.name == "cross_sectional_momentum"),
         variant=2,
         instrument_universe=("ETHUSDT", "BTCUSDT"),
         dataset_snapshot_hashes=(canonical_hash({"snapshot": "event"}),),
@@ -143,12 +149,11 @@ def test_generated_thesis_and_candidate_are_product_and_universe_bound() -> None
     )
     assert hypothesis.thesis.generalisation_scope["product"] == "active_income"
     assert hypothesis.candidate.definition.universe["type"] == "point_in_time"
-    assert hypothesis.candidate.definition.signal_model["kind"] == "forecast_ensemble"
-    assert hypothesis.candidate.definition.signal_model["aggregation"] in {
-        "confidence_weighted",
-        "risk_weighted",
-        "correlation_aware",
-    }
+    assert hypothesis.candidate.definition.signal_model["kind"] == "ranked_long_short_panel"
+    assert hypothesis.candidate.definition.signal_model["instrument_scope"] == [
+        "binance:futures:ETHUSDT:USDT",
+        "binance:futures:BTCUSDT:USDT",
+    ]
     assert hypothesis.semantic_signature == hypothesis_signature(hypothesis.candidate.definition)
 
 
@@ -175,8 +180,13 @@ def test_hypothesis_generator_records_and_skips_an_exact_duplicate(tmp_path) -> 
         total_budget=1,
         campaigns=(CAMPAIGNS[0],),
     )
-    assert generated == ()
-    assert feedback_store.load(campaign=CAMPAIGNS[0].name)[0].outcome == "duplicate_exact"
+    assert len(generated) == 1
+    assert generated[0].candidate.candidate_id != first.candidate.candidate_id
+    assert any(
+        item.outcome == "duplicate_exact" and item.candidate_id == first.candidate.candidate_id
+        for item in feedback_store.load(campaign=CAMPAIGNS[0].name)
+    )
+    assert SqlThesisRegistry(database.engine).lineage_trial_count(first.thesis.thesis_id) == 1
 
 
 def test_hypothesis_generator_derives_a_bounded_mutation_from_a_duplicate(tmp_path) -> None:

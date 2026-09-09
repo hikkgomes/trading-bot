@@ -22,7 +22,9 @@ from src.data.database import (
     reconciliation_event,
     risk_snapshot,
 )
-from src.domain._codec import canonical_hash, timestamp
+from src.domain._codec import canonical_hash, timeframe_seconds, timestamp
+
+AssignmentFilter = str | tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -37,13 +39,13 @@ class ForwardEvidenceMetrics:
     benchmark_pnl: float
     drawdown: float
     execution_drift: float
-    model_drift: float
+    model_drift: float | None
     portfolio_capacity: float
     risk_budget_available: float
     data_gaps: int
     effective_trades: int
     fill_rate: float
-    slippage: float
+    slippage: float | None
     data_uptime: float
     rejected_orders: int
     source_event_ids: tuple[str, ...]
@@ -56,7 +58,7 @@ class ForwardEvidenceMetrics:
     objective_excess_fraction: float | None = None
     trading_days: int = 0
     cycles: int = 0
-    effective_independent_episodes: int = 0
+    completed_episodes: int = 0
     tail_loss: float = 0.0
     evidence_days: float = 0.0
     valid_attempts: int = 0
@@ -64,13 +66,16 @@ class ForwardEvidenceMetrics:
     expected_observations: int = 0
     observed_observations: int = 0
     capacity_remaining: float = 0.0
-    forecast_return: float = 0.0
+    forecast_return: float | None = None
     realised_return: float = 0.0
     fill_rate_applicable: bool = False
     trading_dates: tuple[str, ...] = ()
     order_ids: tuple[str, ...] = ()
     fill_ids: tuple[str, ...] = ()
     episode_ids: tuple[str, ...] = ()
+    market_interval_ids: tuple[str, ...] = ()
+    realised_net_pnl: float | None = None
+    unrealised_pnl_change: float | None = None
 
     def to_payload(
         self, *, forecast: Mapping[str, Any], target: Mapping[str, Any] | None
@@ -81,10 +86,13 @@ class ForwardEvidenceMetrics:
             "source_event_ids": list(self.source_event_ids),
             "metrics": {
                 "net_pnl": self.net_pnl,
+                "realised_net_pnl": self.realised_net_pnl,
+                "unrealised_pnl_change": self.unrealised_pnl_change,
                 "benchmark_pnl": self.benchmark_pnl,
                 "drawdown": self.drawdown,
                 "execution_drift": self.execution_drift,
                 "model_drift": self.model_drift,
+                "model_drift_applicable": self.model_drift is not None,
                 "portfolio_capacity": self.portfolio_capacity,
                 "risk_budget_available": self.risk_budget_available,
                 "data_gaps": self.data_gaps,
@@ -101,7 +109,7 @@ class ForwardEvidenceMetrics:
                 "objective_excess_fraction": self.objective_excess_fraction,
                 "trading_days": self.trading_days,
                 "cycles": self.cycles,
-                "effective_independent_episodes": self.effective_independent_episodes,
+                "completed_episodes": self.completed_episodes,
                 "tail_loss": self.tail_loss,
                 "evidence_days": self.evidence_days,
                 "valid_attempts": self.valid_attempts,
@@ -116,6 +124,7 @@ class ForwardEvidenceMetrics:
                 "order_ids": list(self.order_ids),
                 "fill_ids": list(self.fill_ids),
                 "episode_ids": list(self.episode_ids),
+                "market_interval_ids": list(self.market_interval_ids),
             },
             "forecast_hash": canonical_hash(dict(forecast)),
             "target_hash": canonical_hash(dict(target)) if target is not None else None,
@@ -142,7 +151,7 @@ class ForwardEvidenceCollector:
         target: Mapping[str, Any] | None,
         previous_observed_at: str | None,
         strategy_version_id: str | None = None,
-        assignment_id: str | None = None,
+        assignment_id: AssignmentFilter | None = None,
     ) -> ForwardEvidenceMetrics:
         created_at = timestamp(artefact_created_at, field="artefact_created_at")
         evaluated_at = timestamp(evaluation_time, field="evaluation_time")
@@ -272,6 +281,26 @@ class ForwardEvidenceCollector:
             assignment_id=assignment_id,
             fill_rows=all_fills,
         )
+        realised_net_pnl = net_pnl
+        if product_id == "active_income":
+            previous = self._active_income_objective(
+                assignment=assignment,
+                artefact_created_at=created_at,
+                ledger_rows=tuple(
+                    row for row in all_ledger_rows if row["created_at"] <= window_start
+                ),
+                market_rows=tuple(
+                    row for row in all_market_rows if row["created_at"] <= window_start
+                ),
+                fill_rows=tuple(row for row in all_fills if row["created_at"] <= window_start),
+                assignment_id=assignment_id,
+            )
+            if objective[1] is None or previous[1] is None:
+                raise ValueError("forward income NAV is unavailable")
+            net_pnl = objective[1] - previous[1]
+            model_drift = self._model_drift(
+                net_pnl, forecast, bool(fills), initial_equity=initial_equity
+            )
         attempted = len(orders)
         completed = sum(1 for row in orders if self._order_filled(row["id"]))
         rejected = sum(1 for row in orders if self._order_rejected(row["id"]))
@@ -332,26 +361,15 @@ class ForwardEvidenceCollector:
         ledger_returns = tuple(
             value / initial_equity for value in self._ledger_returns(ledger_rows)
         )
-        independent_episodes = cycles
+        completed_episodes = cycles
         expected_observations = self._expected_observations(
             window_start=window_start,
             evaluated_at=evaluated_at,
             forecast=forecast,
             instrument_count=instrument_count,
         )
-        observed_observations = len(
-            {
-                (
-                    str(
-                        row["payload"].get("instrument_id")
-                        if isinstance(row.get("payload"), Mapping)
-                        else ""
-                    ),
-                    str(row.get("created_at") or row.get("observed_at")),
-                )
-                for row in market_rows
-            }
-        )
+        market_interval_ids = _market_interval_ids(market_rows, forecast)
+        observed_observations = len(market_interval_ids)
         if expected_observations > observed_observations and observed_observations == 0:
             data_gap_ids = tuple(
                 sorted(
@@ -369,6 +387,10 @@ class ForwardEvidenceCollector:
         realised_return = net_pnl / initial_equity if initial_equity > 0 else 0.0
         return ForwardEvidenceMetrics(
             net_pnl=net_pnl,
+            realised_net_pnl=realised_net_pnl if product_id == "active_income" else None,
+            unrealised_pnl_change=net_pnl - realised_net_pnl
+            if product_id == "active_income"
+            else None,
             benchmark_pnl=benchmark_pnl,
             drawdown=drawdown,
             execution_drift=execution_drift,
@@ -391,7 +413,7 @@ class ForwardEvidenceCollector:
             objective_excess_fraction=objective[4],
             trading_days=len(trading_dates),
             cycles=cycles,
-            effective_independent_episodes=independent_episodes,
+            completed_episodes=completed_episodes,
             tail_loss=self._tail_loss(ledger_returns),
             evidence_days=max(
                 0.0,
@@ -412,30 +434,38 @@ class ForwardEvidenceCollector:
             order_ids=order_ids,
             fill_ids=tuple(str(row["id"]) for row in fills),
             episode_ids=episode_ids,
+            market_interval_ids=market_interval_ids,
         )
 
-    def latest_observed_at(
+    def latest_evaluation_time(
         self,
         *,
         strategy_version_id: str,
         product_id: str,
         instrument_id: str,
         artefact_hash: str,
-        assignment_id: str | None = None,
+        before: str,
+        assignment_id: AssignmentFilter | None = None,
+        qualification_window_id: str | None = None,
     ) -> str | None:
         from src.data.database import forward_paper_observation
 
         with self.engine.connect() as connection:
             rows = connection.execute(
-                select(forward_paper_observation.c.observed_at, forward_paper_observation.c.payload)
+                select(forward_paper_observation.c.payload)
                 .where(
                     forward_paper_observation.c.strategy_version_id == strategy_version_id,
                     forward_paper_observation.c.product_id == product_id,
                     forward_paper_observation.c.instrument_id == instrument_id,
                     forward_paper_observation.c.artefact_hash == artefact_hash,
+                    forward_paper_observation.c.payload["evaluation_time"].as_string() < before,
+                    forward_paper_observation.c.payload["observation"][
+                        "qualification_window_id"
+                    ].as_string()
+                    == qualification_window_id,
                 )
                 .order_by(
-                    forward_paper_observation.c.observed_at.desc(),
+                    forward_paper_observation.c.payload["evaluation_time"].as_string().desc(),
                     forward_paper_observation.c.id.desc(),
                 )
             ).mappings()
@@ -444,14 +474,16 @@ class ForwardEvidenceCollector:
                     candidate
                     for candidate in rows
                     if assignment_id is None
-                    or _payload_assignment_id(candidate.get("payload")) == str(assignment_id)
+                    or _assignment_matches(
+                        _payload_assignment_id(candidate.get("payload")), assignment_id
+                    )
                 ),
                 None,
             )
         return (
             None
             if row is None
-            else timestamp(str(row["observed_at"]), field="previous_observed_at")
+            else timestamp(str(row["payload"]["evaluation_time"]), field="previous_evaluation_time")
         )
 
     def _orders(
@@ -462,7 +494,7 @@ class ForwardEvidenceCollector:
         start: str,
         at: str,
         strategy_version_id: str | None = None,
-        assignment_id: str | None = None,
+        assignment_id: AssignmentFilter | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -510,7 +542,7 @@ class ForwardEvidenceCollector:
         start: str,
         at: str,
         strategy_version_id: str | None = None,
-        assignment_id: str | None = None,
+        assignment_id: AssignmentFilter | None = None,
         instrument_id: str | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         with self.engine.connect() as connection:
@@ -564,7 +596,7 @@ class ForwardEvidenceCollector:
         product_id: str,
         portfolio_id: str,
         at: str,
-        assignment_id: str | None = None,
+        assignment_id: AssignmentFilter | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -614,12 +646,11 @@ class ForwardEvidenceCollector:
         return tuple(str(value).casefold() for value in rows)
 
     def _order_filled(self, order_id: str) -> bool:
-        return (
-            bool(self._order_statuses(order_id)) and self._order_statuses(order_id)[-1] == "filled"
-        )
+        return "filled" in self._order_statuses(order_id)
 
     def _order_rejected(self, order_id: str) -> bool:
-        return bool(self._order_statuses(order_id)) and self._order_statuses(order_id)[-1] in {
+        statuses = self._order_statuses(order_id)
+        return bool(statuses) and statuses[-1] in {
             "rejected",
             "expired",
         }
@@ -645,73 +676,46 @@ class ForwardEvidenceCollector:
         return tuple(values)
 
     @staticmethod
-    def _cycles(rows: tuple[Mapping[str, Any], ...]) -> int:
-        previous: dict[str, str] = {}
-        cycles = 0
-        for row in rows:
-            payload = row.get("payload")
-            if not isinstance(payload, Mapping):
-                continue
-            symbol = str(payload.get("symbol") or payload.get("instrument_id") or "*")
-            side = str(payload.get("side") or "").casefold()
-            if side == "buy" and previous.get(symbol) == "sell":
-                cycles += 1
-            elif side == "sell" and previous.get(symbol) == "buy":
-                cycles += 1
-            if side in {"buy", "sell"}:
-                previous[symbol] = side
-        return cycles
-
-    @staticmethod
-    def _closed_episodes(rows: tuple[Mapping[str, Any], ...]) -> int:
-        return len(ForwardEvidenceCollector._closed_episode_ids(rows))
-
-    @staticmethod
     def _closed_episode_ids(
         rows: tuple[Mapping[str, Any], ...],
         *,
         initial_positions: Mapping[str, float] | None = None,
     ) -> tuple[str, ...]:
-        """Count position round trips, keeping all fills of one order together."""
+        """Replay incremental fills; an order can span more than one campaign."""
 
-        grouped: dict[str, dict[str, Any]] = {}
+        unique: dict[str, tuple[str, Mapping[str, Any]]] = {}
         for row in rows:
-            payload = row.get("payload")
-            if not isinstance(payload, Mapping):
-                continue
-            order_id = str(payload.get("order_id") or row.get("order_id") or row.get("id"))
-            item = grouped.setdefault(
-                order_id,
-                {
-                    "order_id": order_id,
-                    "instrument_id": str(
-                        payload.get("instrument_id") or payload.get("symbol") or "*"
-                    ),
-                    "side": str(payload.get("side") or "").casefold(),
-                    "quantity": 0.0,
-                    "created_at": str(row.get("created_at") or ""),
-                },
+            identity = str(row["id"])
+            payload = row["payload"]
+            occurred_at = timestamp(
+                str(payload.get("occurred_at") or row["created_at"]),
+                field="forward fill time",
+                preserve_subseconds=True,
             )
-            item["quantity"] += _positive_or_zero(
-                payload.get("quantity", payload.get("filled_quantity"))
-            )
-        positions: dict[str, float] = {
-            str(symbol): float(quantity)
-            for symbol, quantity in (initial_positions or {}).items()
-            if abs(float(quantity)) > 1e-12
-        }
-        episodes: list[str] = []
-        for item in sorted(grouped.values(), key=lambda value: value["created_at"]):
-            symbol = str(item["instrument_id"])
-            signed = item["quantity"] if item["side"] == "buy" else -item["quantity"]
-            previous = positions.get(symbol, 0.0)
-            current = previous + signed
-            if previous != 0.0 and (previous > 0) != (current > 0):
-                episodes.append(str(item.get("order_id") or symbol))
-            if previous != 0.0 and abs(current) <= 1e-12:
-                episodes.append(str(item.get("order_id") or symbol))
-            positions[symbol] = current
-        return tuple(dict.fromkeys(episodes))
+            record = (occurred_at, payload)
+            if identity in unique and unique[identity] != record:
+                raise ValueError("forward fill identity has conflicting content")
+            unique[identity] = record
+        positions = dict(initial_positions or {})
+        closures = []
+        for identity, (_, payload) in sorted(unique.items(), key=lambda item: item[1][0]):
+            side = str(payload["side"]).lower()
+            if side not in {"buy", "sell"}:
+                raise ValueError("forward fill side is invalid")
+            quantity = _number(payload["quantity"], "forward fill quantity")
+            if quantity <= 0:
+                raise ValueError("forward fill quantity must be positive")
+            metadata = payload.get("metadata") or {}
+            base_fee = _number(metadata.get("base_fee_quantity", 0), "base fee quantity")
+            symbol = str(payload.get("instrument_id") or payload.get("symbol") or "")
+            if not symbol:
+                raise ValueError("forward fill instrument is missing")
+            previous = float(positions.get(symbol, 0))
+            current = previous + (quantity if side == "buy" else -quantity) - base_fee
+            if abs(previous) > 1e-12 and (abs(current) <= 1e-12 or previous * current < 0):
+                closures.append(identity)
+            positions[symbol] = current if abs(current) > 1e-12 else 0.0
+        return tuple(closures)
 
     def _positions_at(
         self,
@@ -719,39 +723,59 @@ class ForwardEvidenceCollector:
         portfolio_id: str,
         instrument_id: str,
         at: str,
-        assignment_id: str | None = None,
+        assignment_id: AssignmentFilter | None = None,
     ) -> dict[str, float]:
-        """Return the last durable position state before a forward window."""
+        position = self._opening_position(
+            portfolio_id=portfolio_id,
+            instrument_id=instrument_id,
+            at=at,
+            assignment_id=assignment_id,
+        )
+        return {instrument_id: float(position["quantity"])} if position is not None else {}
 
+    def _opening_position(
+        self,
+        *,
+        portfolio_id: str,
+        instrument_id: str,
+        at: str,
+        assignment_id: AssignmentFilter | None,
+    ) -> dict[str, Any] | None:
         with self.engine.connect() as connection:
             rows = connection.execute(
-                select(position_event.c.created_at, position_event.c.payload)
-                .where(position_event.c.created_at <= at)
-                .order_by(position_event.c.created_at, position_event.c.id)
-            ).mappings()
-        latest: dict[str, tuple[str, float]] = {}
-        for row in rows:
-            payload = row.get("payload")
-            if not isinstance(payload, Mapping):
-                continue
-            if str(payload.get("portfolio_id")) != portfolio_id:
-                continue
-            symbol = str(payload.get("instrument_id") or "")
-            if symbol != instrument_id:
-                continue
-            if assignment_id is not None:
-                metadata = payload.get("metadata")
-                if not isinstance(metadata, Mapping) or str(
-                    metadata.get("assignment_id") or ""
-                ) != str(assignment_id):
-                    continue
-            try:
-                quantity = float(payload.get("quantity", 0.0))
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(quantity):
-                latest[symbol] = (str(row["created_at"]), quantity)
-        return {symbol: quantity for symbol, (_observed_at, quantity) in latest.items()}
+                select(position_event.c.payload)
+                .where(
+                    position_event.c.created_at <= at,
+                    position_event.c.payload["portfolio_id"].as_string() == portfolio_id,
+                    position_event.c.payload["instrument_id"].as_string() == instrument_id,
+                )
+                .order_by(position_event.c.created_at.desc(), position_event.c.id.desc())
+            ).scalars()
+            for payload in rows:
+                metadata = payload.get("metadata", {})
+                if _assignment_matches(metadata.get("assignment_id"), assignment_id):
+                    _number(payload["quantity"], "opening position quantity")
+                    return dict(payload)
+        return None
+
+    def _opening_market_price(self, product_id: str, instrument_id: str, at: str) -> float | None:
+        with self.engine.connect() as connection:
+            row = (
+                connection.execute(
+                    select(risk_snapshot.c.payload)
+                    .where(
+                        risk_snapshot.c.created_at <= at,
+                        risk_snapshot.c.payload["kind"].as_string() == "market_data_input",
+                        risk_snapshot.c.payload["product_id"].as_string() == product_id,
+                        risk_snapshot.c.payload["instrument_id"].as_string() == instrument_id,
+                    )
+                    .order_by(risk_snapshot.c.created_at.desc(), risk_snapshot.c.id.desc())
+                    .limit(1)
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return _latest_market_price((row,)) if row is not None else None
 
     def _capacity_and_budget(
         self,
@@ -832,14 +856,10 @@ class ForwardEvidenceCollector:
         forecast: Mapping[str, Any],
         instrument_count: int = 1,
     ) -> int:
-        duration = max(
-            0.0,
-            (
-                dt.datetime.fromisoformat(evaluated_at) - dt.datetime.fromisoformat(window_start)
-            ).total_seconds(),
-        )
-        cadence = _positive_or_zero(forecast.get("observation_interval_seconds")) or 300.0
-        return max(1, int(math.ceil(duration / cadence))) * max(1, instrument_count)
+        cadence = _forecast_cadence(forecast)
+        start = math.floor(dt.datetime.fromisoformat(window_start).timestamp() / cadence)
+        end = math.floor(dt.datetime.fromisoformat(evaluated_at).timestamp() / cadence)
+        return max(0, end - start) * max(1, instrument_count)
 
     @staticmethod
     def _tail_loss(values: tuple[float, ...]) -> float:
@@ -1017,7 +1037,7 @@ class ForwardEvidenceCollector:
         ledger_rows: tuple[Mapping[str, Any], ...],
         market_rows: tuple[Mapping[str, Any], ...],
         nav_rows: tuple[Mapping[str, Any], ...],
-        assignment_id: str | None = None,
+        assignment_id: AssignmentFilter | None = None,
         fill_rows: tuple[Mapping[str, Any], ...] = (),
     ) -> tuple[str, float | None, float | None, float | None, float | None, tuple[str, ...]]:
         nav_points = self._objective_nav_points(nav_rows, start=artefact_created_at)
@@ -1028,6 +1048,7 @@ class ForwardEvidenceCollector:
                 ledger_rows=ledger_rows,
                 market_rows=market_rows,
                 fill_rows=fill_rows,
+                assignment_id=assignment_id,
             )
         if product_id != "btc_accumulation":
             return (product_id, None, None, None, None, ())
@@ -1051,13 +1072,32 @@ class ForwardEvidenceCollector:
         ledger_rows: tuple[Mapping[str, Any], ...],
         market_rows: tuple[Mapping[str, Any], ...],
         fill_rows: tuple[Mapping[str, Any], ...],
+        assignment_id: AssignmentFilter | None = None,
     ) -> tuple[str, float | None, float | None, float | None, float | None, tuple[str, ...]]:
         initial = self._starting_equity("active_income", assignment, at=artefact_created_at)
+        instrument_id = str(assignment.get("instrument_id") or "")
+        opening = self._opening_position(
+            portfolio_id=str(assignment["portfolio_id"]),
+            instrument_id=instrument_id,
+            at=artefact_created_at,
+            assignment_id=assignment_id,
+        )
+        opening_quantity = float(opening["quantity"]) if opening else 0.0
+        opening_price = (
+            self._opening_market_price("active_income", instrument_id, artefact_created_at)
+            if opening_quantity
+            else None
+        )
         exact = _futures_assignment_equity(
             initial_equity=initial,
             ledger_pnl=self._ledger_pnl(ledger_rows),
             fills=fill_rows,
             market_rows=market_rows,
+            opening_quantity=opening_quantity,
+            opening_entry_price=float(opening["average_entry_price"])
+            if opening is not None
+            else 0.0,
+            opening_mark_price=opening_price,
         )
         if exact is not None:
             return (
@@ -1096,7 +1136,7 @@ class ForwardEvidenceCollector:
         market_rows: tuple[Mapping[str, Any], ...],
         nav_rows: tuple[Mapping[str, Any], ...],
         nav_points: tuple[float, float, tuple[str, ...]] | None,
-        assignment_id: str | None,
+        assignment_id: AssignmentFilter | None,
         fill_rows: tuple[Mapping[str, Any], ...],
     ) -> tuple[str, float | None, float | None, float | None, float | None, tuple[str, ...]]:
         all_prices = self._market_prices(market_rows)
@@ -1353,24 +1393,25 @@ class ForwardEvidenceCollector:
         return btc + stable / price
 
     @staticmethod
-    def _slippage(rows: tuple[Mapping[str, Any], ...]) -> float:
+    def _slippage(rows: tuple[Mapping[str, Any], ...]) -> float | None:
         total = 0.0
         notional = 0.0
         for row in rows:
             payload = row["payload"]
             if not isinstance(payload, Mapping):
-                continue
+                return None
             quantity = _positive_or_zero(payload.get("quantity"))
             price = _positive_or_zero(payload.get("price"))
             metadata = payload.get("metadata")
-            cost = (
-                _positive_or_zero(metadata.get("slippage_cost"))
-                if isinstance(metadata, Mapping)
-                else 0.0
+            reference = _positive_or_zero(
+                metadata.get("reference_price") if isinstance(metadata, Mapping) else None
             )
-            total += cost
-            notional += quantity * price
-        return total / notional if notional > 0 else 0.0
+            side = payload.get("side")
+            if min(quantity, price, reference) <= 0 or side not in {"buy", "sell"}:
+                return None
+            total += (1 if side == "buy" else -1) * (price - reference) * quantity
+            notional += quantity * reference
+        return total / notional if notional > 0 else None
 
     @staticmethod
     def _execution_drift(rows: tuple[Mapping[str, Any], ...]) -> float:
@@ -1395,10 +1436,10 @@ class ForwardEvidenceCollector:
         has_fills: bool,
         *,
         initial_equity: float,
-    ) -> float:
-        if not has_fills:
-            return 0.0
-        expected = _number(forecast.get("expected_return", 0.0), "forecast expected_return")
+    ) -> float | None:
+        expected = _forecast_return(forecast)
+        if not has_fills or expected is None:
+            return None
         realised = net_pnl / initial_equity if initial_equity > 0.0 else 0.0
         scale = max(abs(expected), 0.01)
         return min(1.0, abs(realised - expected) / scale)
@@ -1438,8 +1479,10 @@ def _utc_day(value: str) -> str:
         return value[:10]
 
 
-def _forecast_return(forecast: Mapping[str, Any]) -> float:
-    raw = forecast.get("expected_return", 0.0)
+def _forecast_return(forecast: Mapping[str, Any]) -> float | None:
+    raw = forecast.get("expected_return")
+    if raw is None:
+        return None
     try:
         value = float(raw)
     except (TypeError, ValueError) as exc:
@@ -1447,6 +1490,43 @@ def _forecast_return(forecast: Mapping[str, Any]) -> float:
     if not math.isfinite(value):
         raise ValueError("forecast expected_return must be finite")
     return value
+
+
+def _forecast_cadence(forecast: Mapping[str, Any]) -> float:
+    metadata = forecast.get("metadata") or {}
+    raw = (
+        metadata.get("observation_interval_seconds")
+        or forecast.get("observation_interval_seconds")
+        or forecast.get("horizon_seconds")
+    )
+    cadence = _number(raw, "market observation interval")
+    if cadence <= 0 or isinstance(raw, bool):
+        raise ValueError("market observation interval must be positive")
+    return cadence
+
+
+def _market_interval_ids(rows, forecast: Mapping[str, Any]) -> tuple[str, ...]:
+    cadence = _forecast_cadence(forecast)
+    identities = set()
+    for row in rows:
+        payload = row["payload"]
+        if (
+            payload.get("source_event_type") != "candle"
+            or payload.get("source_candle_closed") is not True
+        ):
+            continue
+        if timeframe_seconds(payload["source_timeframe"]) != cadence:
+            continue
+        identities.add(
+            canonical_hash(
+                {
+                    "instrument_id": payload["instrument_id"],
+                    "interval_seconds": cadence,
+                    "close_time_ms": int(payload["source_close_time_ms"]),
+                }
+            )
+        )
+    return tuple(sorted(identities))
 
 
 def _order_belongs_to_strategy(
@@ -1463,7 +1543,9 @@ def _order_belongs_to_strategy(
     }
 
 
-def _order_belongs_to_assignment(payload: Mapping[str, Any], *, assignment_id: str | None) -> bool:
+def _order_belongs_to_assignment(
+    payload: Mapping[str, Any], *, assignment_id: AssignmentFilter | None
+) -> bool:
     if assignment_id is None:
         return True
     declared = payload.get("assignment_id")
@@ -1473,17 +1555,26 @@ def _order_belongs_to_assignment(payload: Mapping[str, Any], *, assignment_id: s
         target_metadata = metadata.get("target_metadata")
         if declared is None and isinstance(target_metadata, Mapping):
             declared = target_metadata.get("assignment_id")
-    return declared is not None and str(declared) == assignment_id
+    return _assignment_matches(declared, assignment_id)
 
 
-def _nav_belongs_to_assignment(payload: Mapping[str, Any], *, assignment_id: str | None) -> bool:
+def _nav_belongs_to_assignment(
+    payload: Mapping[str, Any], *, assignment_id: AssignmentFilter | None
+) -> bool:
     if assignment_id is None:
         return True
     declared = payload.get("assignment_id")
     components = payload.get("components")
     if declared is None and isinstance(components, Mapping):
         declared = components.get("assignment_id")
-    return declared is not None and str(declared) == str(assignment_id)
+    return _assignment_matches(declared, assignment_id)
+
+
+def _assignment_matches(declared: Any, assignment_id: AssignmentFilter | None) -> bool:
+    if assignment_id is None:
+        return True
+    allowed = (assignment_id,) if isinstance(assignment_id, str) else assignment_id
+    return declared is not None and str(declared) in allowed
 
 
 def _payload_assignment_id(payload: Any) -> str | None:
@@ -1580,25 +1671,35 @@ def _futures_assignment_equity(
     ledger_pnl: float,
     fills: tuple[Mapping[str, Any], ...],
     market_rows: tuple[Mapping[str, Any], ...],
+    opening_quantity: float = 0.0,
+    opening_entry_price: float = 0.0,
+    opening_mark_price: float | None = None,
 ) -> float | None:
     """Value only one assignment's fills, excluding other paper strategies."""
 
-    if not fills:
+    if not fills and not opening_quantity:
         return None
-    quantity = 0.0
-    entry_price = 0.0
+    opening_unrealised = 0.0
+    if opening_quantity:
+        if opening_mark_price is None or opening_mark_price <= 0 or opening_entry_price <= 0:
+            raise ValueError("carried forward position requires its opening mark and entry price")
+        opening_unrealised = opening_quantity * (opening_mark_price - opening_entry_price)
+    quantity = opening_quantity
+    entry_price = opening_entry_price
     for row in fills:
         payload = row.get("payload")
         if not isinstance(payload, Mapping):
             continue
         quantity, entry_price = _apply_assignment_fill(quantity, entry_price, payload)
     if abs(quantity) <= 1e-12:
-        return initial_equity + ledger_pnl
-    latest_price = _latest_market_price(market_rows)
+        return initial_equity + ledger_pnl - opening_unrealised
+    latest_price = _latest_market_price(market_rows) or opening_mark_price
     if latest_price is None or entry_price <= 0.0:
         return None
-    result = initial_equity + ledger_pnl + quantity * (latest_price - entry_price)
-    return result if math.isfinite(result) and result >= 0.0 else None
+    result = (
+        initial_equity + ledger_pnl + quantity * (latest_price - entry_price) - opening_unrealised
+    )
+    return result if math.isfinite(result) else None
 
 
 def _apply_assignment_fill(
@@ -1633,7 +1734,7 @@ def _ledger_belongs_to_scope(
     payload: Mapping[str, Any],
     *,
     strategy_version_id: str | None,
-    assignment_id: str | None,
+    assignment_id: AssignmentFilter | None,
     instrument_id: str | None,
 ) -> bool:
     metadata = payload.get("metadata")
@@ -1641,7 +1742,7 @@ def _ledger_belongs_to_scope(
         return not any((strategy_version_id, assignment_id, instrument_id))
     if assignment_id is not None:
         declared_assignment = metadata.get("assignment_id")
-        if declared_assignment is None or str(declared_assignment) != assignment_id:
+        if not _assignment_matches(declared_assignment, assignment_id):
             return False
     if strategy_version_id is not None:
         declared_strategy = metadata.get("strategy_version_id", metadata.get("strategy"))

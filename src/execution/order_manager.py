@@ -14,6 +14,7 @@ from sqlalchemy.engine import Engine
 
 from src.data.database import exchange_order, order_intent
 from src.data.database import fill as fill_table
+from src.data.transactions import connection_scope
 from src.domain._codec import to_primitive
 from src.domain.orders import Fill, OrderIntent, OrderSide, OrderStatus, OrderType
 
@@ -60,9 +61,13 @@ _ALLOWED_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
             OrderStatus.RECOVERY_REQUIRED,
         }
     ),
-    OrderStatus.CANCELLED: frozenset({OrderStatus.RECONCILED}),
+    OrderStatus.CANCELLED: frozenset(
+        {OrderStatus.RECONCILED, OrderStatus.CANCELLED, OrderStatus.FILLED}
+    ),
     OrderStatus.REJECTED: frozenset({OrderStatus.RECONCILED}),
-    OrderStatus.EXPIRED: frozenset({OrderStatus.RECONCILED}),
+    OrderStatus.EXPIRED: frozenset(
+        {OrderStatus.RECONCILED, OrderStatus.EXPIRED, OrderStatus.FILLED}
+    ),
     OrderStatus.FILLED: frozenset({OrderStatus.RECONCILED}),
     OrderStatus.RECOVERY_REQUIRED: frozenset(
         {
@@ -146,8 +151,9 @@ class OrderEventStore(Protocol):
 class SqlOrderStore:
     """PostgreSQL-backed append-only order lifecycle."""
 
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: Engine, *, connection=None):
         self.engine = engine
+        self.connection = connection
 
     def append(
         self,
@@ -165,7 +171,7 @@ class SqlOrderStore:
         }
         if fill is not None:
             payload["fill"] = to_primitive(fill)
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, self.connection, write=True) as connection:
             if connection.dialect.name == "postgresql":
                 connection.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext(:order_id))"),
@@ -203,7 +209,7 @@ class SqlOrderStore:
                     order_id=intent.order_id,
                     sequence=sequence,
                     created_at=observed_at,
-                    status=event_type,
+                    status=intent.status.value,
                     payload=payload,
                 )
             )
@@ -218,7 +224,7 @@ class SqlOrderStore:
                 )
 
     def read(self) -> tuple[dict[str, Any], ...]:
-        with self.engine.connect() as connection:
+        with connection_scope(self.engine, self.connection, write=False) as connection:
             rows = connection.execute(
                 select(exchange_order.c.payload).order_by(
                     exchange_order.c.order_id,
@@ -263,6 +269,12 @@ def _validate_replay_event(
         if intent.status is not previous.status:
             raise ValueError(f"client binding changed order status at line {line_number}")
         return
+    if event_type == "rest_checkpoint":
+        metadata = dict(previous.metadata)
+        metadata["rest_checkpoint"] = intent.metadata.get("rest_checkpoint")
+        if replace(previous, metadata=metadata) != intent:
+            raise ValueError(f"REST checkpoint changed economic order state at line {line_number}")
+        return
     if intent.status not in _ALLOWED_TRANSITIONS[previous.status]:
         raise ValueError(
             f"invalid replayed order transition {previous.status.value}->{intent.status.value} "
@@ -277,6 +289,18 @@ def _validate_replay_start(event_type: object, intent: OrderIntent, line_number:
         raise ValueError(
             f"order journal starts {intent.order_id} without a created event at line {line_number}"
         )
+
+
+def _terminal_fill_forbidden(order: OrderIntent) -> bool:
+    return order.is_terminal and order.status not in {OrderStatus.CANCELLED, OrderStatus.EXPIRED}
+
+
+def _partial_fill_status(order: OrderIntent) -> OrderStatus:
+    return (
+        order.status
+        if order.status in {OrderStatus.CANCELLED, OrderStatus.EXPIRED}
+        else OrderStatus.PARTIALLY_FILLED
+    )
 
 
 class OrderManager:
@@ -382,6 +406,23 @@ class OrderManager:
         self._orders[order_id] = updated
         return updated
 
+    def checkpoint_rest(self, order_id: str, next_trade_id: str) -> OrderIntent:
+        current = self.get(order_id)
+        previous = current.metadata.get("rest_checkpoint", {})
+        if not next_trade_id.isdigit() or int(next_trade_id) < int(
+            previous.get("next_trade_id", "0")
+        ):
+            raise ValueError("REST trade checkpoint cannot move backwards")
+        checkpoint = {"next_trade_id": next_trade_id, "verified_quantity": current.filled_quantity}
+        if previous == checkpoint:
+            return current
+        updated = replace(
+            current, metadata={**dict(current.metadata), "rest_checkpoint": checkpoint}
+        )
+        self.store.append(event_type="rest_checkpoint", intent=updated)
+        self._orders[order_id] = updated
+        return updated
+
     def submitted(self, order_id: str) -> OrderIntent:
         return self.transition(order_id, OrderStatus.SUBMITTED)
 
@@ -416,7 +457,7 @@ class OrderManager:
             if existing != fill:
                 raise ValueError(f"fill identity collision: {fill.fill_id}")
             return current
-        if current.is_terminal:
+        if _terminal_fill_forbidden(current):
             raise ValueError(f"cannot fill terminal order {fill.order_id}")
         if fill.instrument_id != current.instrument_id or fill.side is not current.side:
             raise ValueError("fill identity does not match order")
@@ -432,7 +473,7 @@ class OrderManager:
         status = (
             OrderStatus.FILLED
             if abs(total_quantity - current.quantity) <= 1e-12
-            else OrderStatus.PARTIALLY_FILLED
+            else _partial_fill_status(current)
         )
         if current.status is OrderStatus.SUBMITTED:
             self.acknowledged(fill.order_id, event_at=fill.occurred_at)

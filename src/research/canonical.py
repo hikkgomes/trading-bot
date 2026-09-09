@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import insert, select, text
+from sqlalchemy import exists, insert, select, text
 from sqlalchemy.engine import Engine
 
 from src.data.database import (
@@ -16,6 +16,7 @@ from src.data.database import (
     active_strategy_assignment,
     alpha_forecast,
     dataset_snapshot,
+    evidence_invalidation,
     exchange_order,
     experiment,
     experiment_run,
@@ -38,10 +39,43 @@ from src.data.database import (
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.products.btc_accumulation import BTC_SPOT_INSTRUMENT_ID
 from src.research.objectives import objective_unit
+from src.research.outcomes import OutcomeCategory, forward_outcome
+from src.research.protected_exposure import legacy_exposure_conflicts
+
+
+def _stage_measurement_identity(
+    run: Mapping[str, Any], stage: str, accepted: bool
+) -> dict[str, Any]:
+    receipt = run.get("receipt") or {}
+    engine = receipt.get("executor_version")
+    datasets = receipt.get("dataset_snapshot_ids")
+    identity = None
+    if engine and datasets:
+        identity = canonical_hash(
+            {
+                "candidate_id": run["candidate_id"],
+                "datasets": sorted(datasets),
+                "engine_version": engine,
+                "stage": stage,
+            }
+        )
+    return {
+        "evaluation_identity": identity,
+        "engine_version": engine,
+        "outcome_category": (
+            OutcomeCategory.ACCEPTED.value if accepted else OutcomeCategory.REJECTED.value
+        ),
+    }
 
 
 class CanonicalEvidenceError(RuntimeError):
     """Canonical evidence is invalid, missing, or conflicts with history."""
+
+
+class ProtectedDataExposureError(CanonicalEvidenceError):
+    """The selected interval cannot supply independent qualification evidence."""
+
+    outcome_category = OutcomeCategory.BLOCKED_DATA
 
 
 _VALIDATION_STAGES = frozenset({"screening", "development", "robustness", "protected", "forward"})
@@ -100,6 +134,7 @@ def latest_accepted_forward_summary(
     product_id: str,
     artefact_hash: str,
     at: str | None = None,
+    research_configuration_hash: str | None = None,
 ) -> dict[str, Any] | None:
     """Return the latest summary only when its latest decision is accepted."""
 
@@ -144,6 +179,38 @@ def latest_accepted_forward_summary(
         )
     if decision is None or decision["accepted"] is not True:
         return None
+    qualification = decision["payload"].get("research_qualification") or {}
+    if qualification.get("qualified") is not True:
+        return None
+    if not summary["payload"].get("qualification_window_id"):
+        return None
+    try:
+        with engine.connect() as connection:
+            _assert_forward_window_binding(
+                connection,
+                window_id=str(summary["payload"]["qualification_window_id"]),
+                strategy_version_id=strategy_version_id,
+                product_id=product_id,
+                artefact_hash=artefact_hash,
+                start=str(summary["observed_from"]),
+                end=at or timestamp(dt.datetime.now(dt.UTC), field="qualification time"),
+            )
+    except ValueError:
+        return None
+    if research_configuration_hash is not None:
+        from src.research.policy_approval import research_qualification
+
+        with engine.connect() as connection:
+            current = research_qualification(
+                connection,
+                artefact_hash=artefact_hash,
+                strategy_version_id=strategy_version_id,
+                product_id=product_id,
+                configuration_hash=research_configuration_hash,
+                at=at or timestamp(dt.datetime.now(dt.UTC), field="qualification time"),
+            )
+        if current["qualified"] is not True:
+            return None
     return {"summary": dict(summary), "decision": dict(decision)}
 
 
@@ -209,6 +276,13 @@ def _immutable_insert(connection, table, values: dict[str, Any]) -> str:
 
 
 def _assert_canonical_artifact(connection, artefact_hash: str) -> dict[str, Any]:
+    invalidated = connection.execute(
+        select(evidence_invalidation.c.id).where(
+            evidence_invalidation.c.id == f"artefact:{artefact_hash}"
+        )
+    ).first()
+    if invalidated is not None:
+        raise CanonicalEvidenceError("strategy artefact economic evidence was invalidated")
     row = (
         connection.execute(
             select(strategy_artefact.c.payload, strategy_artefact.c.created_at).where(
@@ -324,6 +398,11 @@ class SqlValidationRepository:
                     .where(
                         validation_stage.c.experiment_id == experiment_id,
                         validation_stage.c.stage == stage,
+                        ~exists(
+                            select(evidence_invalidation.c.id).where(
+                                evidence_invalidation.c.id == "stage:" + validation_stage.c.id
+                            )
+                        ),
                     )
                     .limit(1)
                 )
@@ -340,6 +419,7 @@ class SqlValidationRepository:
                 "accepted": accepted,
                 "reason_code": reason_code,
                 "evidence_hash": evidence_hash,
+                **_stage_measurement_identity(source_run["payload"], stage, accepted),
                 "payload": payload,
             }
             if existing is not None:
@@ -357,6 +437,13 @@ class SqlValidationRepository:
                 for row in connection.execute(
                     select(validation_stage)
                     .where(validation_stage.c.experiment_id == experiment_id)
+                    .where(
+                        ~exists(
+                            select(evidence_invalidation.c.id).where(
+                                evidence_invalidation.c.id == "stage:" + validation_stage.c.id
+                            )
+                        )
+                    )
                     .order_by(validation_stage.c.evaluated_at, validation_stage.c.stage)
                 ).mappings()
             )
@@ -416,16 +503,31 @@ class SqlHoldoutRepository:
                 is None
             ):
                 raise CanonicalEvidenceError(f"dataset snapshot does not exist: {data_snapshot_id}")
-            existing_claims = connection.execute(select(holdout_claim.c.payload)).scalars()
-            for existing_payload in existing_claims:
-                if (
-                    isinstance(existing_payload, Mapping)
-                    and existing_payload.get("strategy_version_id") == strategy_version_id
-                    and canonical_hash(existing_payload) != identity
+            existing_claims = connection.execute(select(holdout_claim)).mappings()
+            snapshot = connection.execute(
+                select(dataset_snapshot.c.payload).where(dataset_snapshot.c.id == data_snapshot_id)
+            ).scalar_one()
+            if legacy_exposure_conflicts(connection, snapshot):
+                raise ProtectedDataExposureError(
+                    "protected dataset overlaps a legacy exposed interval"
+                )
+            for existing in existing_claims:
+                existing_payload = existing["payload"]
+                if existing_payload.get("strategy_version_id") != strategy_version_id:
+                    continue
+                if any(
+                    existing_payload.get(key) != payload[key]
+                    for key in (
+                        "strategy_version_id",
+                        "data_snapshot_id",
+                        "cohort_id",
+                        "source_hashes",
+                    )
                 ):
                     raise CanonicalEvidenceError(
                         "a strategy version may have only one protected holdout claim"
                     )
+                return str(existing["id"])
             return _immutable_insert(
                 connection,
                 holdout_claim,
@@ -509,7 +611,7 @@ class ForwardPaperSummary:
     excess_benchmark_pnl: float
     drawdown: float
     execution_drift: float
-    model_drift: float
+    model_drift: float | None
     portfolio_capacity: float
     risk_budget_available: float
     data_gaps: int
@@ -518,7 +620,7 @@ class ForwardPaperSummary:
     data_gap_ids: tuple[str, ...] = ()
     effective_trades: int = 0
     fill_rate: float = 0.0
-    slippage: float = 0.0
+    slippage: float | None = None
     data_uptime: float = 0.0
     rejected_orders: int = 0
     objective_unit: str | None = None
@@ -528,7 +630,7 @@ class ForwardPaperSummary:
     objective_excess_fraction: float | None = None
     trading_days: int = 0
     cycles: int = 0
-    effective_independent_episodes: int = 0
+    completed_episodes: int = 0
     tail_loss: float = 0.0
     assignment_ids: tuple[str, ...] = ()
     instrument_ids: tuple[str, ...] = ()
@@ -541,6 +643,8 @@ class ForwardPaperSummary:
     order_ids: tuple[str, ...] = ()
     fill_ids: tuple[str, ...] = ()
     episode_ids: tuple[str, ...] = ()
+    market_interval_ids: tuple[str, ...] = ()
+    qualification_window_id: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -548,6 +652,7 @@ class ForwardPaperSummary:
             "strategy_version_id": self.strategy_version_id,
             "product_id": self.product_id,
             "artefact_hash": self.artefact_hash,
+            "qualification_window_id": self.qualification_window_id,
             "observed_from": self.observed_from,
             "observed_until": self.observed_until,
             "elapsed_days": self.elapsed_days,
@@ -558,6 +663,8 @@ class ForwardPaperSummary:
             "drawdown": self.drawdown,
             "execution_drift": self.execution_drift,
             "model_drift": self.model_drift,
+            "model_drift_applicable": self.model_drift is not None,
+            "market_interval_ids": list(self.market_interval_ids),
             "portfolio_capacity": self.portfolio_capacity,
             "risk_budget_available": self.risk_budget_available,
             "data_gaps": self.data_gaps,
@@ -576,7 +683,7 @@ class ForwardPaperSummary:
             "objective_excess_fraction": self.objective_excess_fraction,
             "trading_days": self.trading_days,
             "cycles": self.cycles,
-            "effective_independent_episodes": self.effective_independent_episodes,
+            "completed_episodes": self.completed_episodes,
             "tail_loss": self.tail_loss,
             "assignment_ids": list(self.assignment_ids),
             "instrument_ids": list(self.instrument_ids),
@@ -741,7 +848,6 @@ _SUMMARY_NONNEGATIVE_FIELDS = (
     "portfolio_capacity",
     "risk_budget_available",
     "strategy_decay",
-    "slippage",
     "tail_loss",
 )
 _SUMMARY_FRACTION_FIELDS = ("fill_rate", "data_uptime")
@@ -750,7 +856,7 @@ _SUMMARY_INTEGER_FIELDS = (
     "rejected_orders",
     "trading_days",
     "cycles",
-    "effective_independent_episodes",
+    "completed_episodes",
 )
 
 
@@ -769,7 +875,11 @@ def _normalise_summary_objective(payload: dict[str, Any], product_id: str) -> No
 
 
 def _normalise_summary_metrics(payload: dict[str, Any]) -> None:
+    if payload.get("slippage") is not None:
+        payload["slippage"] = _finite_number(payload["slippage"], field="summary slippage")
     for field_name in _SUMMARY_NONNEGATIVE_FIELDS:
+        if field_name == "model_drift" and payload.get(field_name) is None:
+            continue
         payload[field_name] = _finite_nonnegative(
             payload.get(field_name, 0.0), field=f"summary {field_name}"
         )
@@ -902,6 +1012,43 @@ def _prepare_summary_payload(
     return strategy_version_id, product_id, observed_at, payload, observation_ids, identity
 
 
+def _forward_slippage(metrics: list[Mapping[str, Any]]) -> float | None:
+    if any(row.get("fill_ids") and row.get("slippage") is None for row in metrics):
+        return None
+    return max(
+        (
+            _finite_number(row["slippage"], field="forward slippage")
+            for row in metrics
+            if row.get("slippage") is not None
+        ),
+        default=None,
+    )
+
+
+def _forward_market_coverage(rows) -> tuple[int, tuple[str, ...]]:
+    from src.services.forward_metrics import ForwardEvidenceCollector, _forecast_cadence
+
+    groups: dict[str, list[Mapping[str, Any]]] = {}
+    market_ids: set[str] = set()
+    for row in rows:
+        payload = row["payload"]
+        groups.setdefault(str(row["instrument_id"]), []).append(payload)
+        market_ids.update(payload["observation"]["facts"]["metrics"].get("market_interval_ids", ()))
+    expected = 0
+    for payloads in groups.values():
+        forecasts = [payload["observation"]["forecast_content"] for payload in payloads]
+        if len({_forecast_cadence(forecast) for forecast in forecasts}) != 1:
+            raise CanonicalEvidenceError("market cadence changed inside the qualification window")
+        expected += ForwardEvidenceCollector._expected_observations(
+            window_start=min(
+                payload["observation"]["facts"]["window_start"] for payload in payloads
+            ),
+            evaluated_at=max(payload["evaluation_time"] for payload in payloads),
+            forecast=forecasts[0],
+        )
+    return expected, tuple(sorted(market_ids))
+
+
 def _deduplicate_forward_observations(
     rows: tuple[Mapping[str, Any], ...],
 ) -> tuple[Mapping[str, Any], ...]:
@@ -931,6 +1078,32 @@ def _deduplicate_forward_observations(
             key=lambda row: (str(row["observed_at"]), str(row["id"])),
         )
     )
+
+
+def _assert_forward_window_binding(
+    connection,
+    *,
+    window_id: str | None,
+    strategy_version_id: str,
+    product_id: str,
+    artefact_hash: str,
+    start: str,
+    end: str,
+) -> None:
+    if window_id is None:
+        return
+    from src.services.forward_windows import require_current_window
+
+    window = require_current_window(
+        connection,
+        window_id=window_id,
+        strategy_version_id=strategy_version_id,
+        product_id=product_id,
+        artefact_hash=artefact_hash,
+        at=end,
+    )
+    if start <= window["opened_at"]:
+        raise CanonicalEvidenceError("forward evidence precedes its qualification window")
 
 
 def _assert_summary_bindings(
@@ -976,11 +1149,22 @@ def _assert_summary_bindings(
     )
     if len(observations) != len(observation_ids):
         raise CanonicalEvidenceError("forward summary references an unknown observation identity")
+    _assert_forward_window_binding(
+        connection,
+        window_id=payload.get("qualification_window_id"),
+        strategy_version_id=strategy_version_id,
+        product_id=product_id,
+        artefact_hash=artefact,
+        start=str(payload["observed_from"]),
+        end=str(payload["observed_until"]),
+    )
     for observation_row in observations:
         if (
             str(observation_row["strategy_version_id"]) != strategy_version_id
             or str(observation_row["product_id"]) != product_id
             or str(observation_row["artefact_hash"]) != artefact
+            or observation_row["payload"]["observation"].get("qualification_window_id")
+            != payload.get("qualification_window_id")
             or not payload["observed_from"]
             <= str(observation_row["observed_at"])
             <= payload["observed_until"]
@@ -1005,8 +1189,9 @@ def _assert_summary_bindings(
 
 
 class SqlForwardEvidenceRepository:
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: Engine, *, research_configuration_hash: str | None = None):
         self.engine = engine
+        self.research_configuration_hash = research_configuration_hash
 
     def append(
         self,
@@ -1082,6 +1267,15 @@ class SqlForwardEvidenceRepository:
             supported_instruments = set(artefact.get("supported_instruments") or [])
             if product_id not in supported_products or instrument_id not in supported_instruments:
                 raise CanonicalEvidenceError("forward observation is outside artefact support")
+            _assert_forward_window_binding(
+                connection,
+                window_id=payload.get("qualification_window_id"),
+                strategy_version_id=strategy_version_id,
+                product_id=product_id,
+                artefact_hash=artefact_hash,
+                start=observed_at,
+                end=evaluation_at or observed_at,
+            )
             return _immutable_insert(
                 connection,
                 forward_paper_observation,
@@ -1131,6 +1325,11 @@ class SqlForwardEvidenceRepository:
                 observation_ids=normalised_observation_ids,
             )
             self._assert_observation_facts(connection, normalised_observation_ids)
+            published_at = connection.execute(
+                select(forward_paper_summary.c.created_at).where(
+                    forward_paper_summary.c.id == identity
+                )
+            ).scalar_one_or_none()
             return _immutable_insert(
                 connection,
                 forward_paper_summary,
@@ -1141,7 +1340,7 @@ class SqlForwardEvidenceRepository:
                     "artefact_hash": artefact,
                     "observed_from": payload["observed_from"],
                     "observed_until": payload["observed_until"],
-                    "created_at": observed_at,
+                    "created_at": published_at or observed_at,
                     "content_hash": identity,
                     "payload": payload,
                 },
@@ -1154,10 +1353,20 @@ class SqlForwardEvidenceRepository:
         product_id: str,
         artefact_hash: str,
         observed_at: str,
+        published_at: str | None = None,
     ) -> tuple[str, ForwardPaperSummary]:
         observed_at = timestamp(observed_at, field="summary.observed_at")
         artefact_hash = _identity(artefact_hash, field="artefact_hash")
+        from src.services.forward_windows import current_window
+
         with self.engine.connect() as connection:
+            window = current_window(
+                connection,
+                strategy_version_id=strategy_version_id,
+                product_id=product_id,
+                artefact_hash=artefact_hash,
+                at=observed_at,
+            )
             rows = connection.execute(
                 select(
                     forward_paper_observation.c.id,
@@ -1170,6 +1379,10 @@ class SqlForwardEvidenceRepository:
                     forward_paper_observation.c.product_id == product_id,
                     forward_paper_observation.c.artefact_hash == artefact_hash,
                     forward_paper_observation.c.observed_at <= observed_at,
+                    forward_paper_observation.c.payload["observation"][
+                        "qualification_window_id"
+                    ].as_string()
+                    == (window["window_id"] if window else None),
                 )
                 .order_by(forward_paper_observation.c.observed_at, forward_paper_observation.c.id)
             ).mappings()
@@ -1343,17 +1556,8 @@ class SqlForwardEvidenceRepository:
             if order_ids
             else int(sum(value(payload, "completed_attempts") for payload in payloads))
         )
-        expected_by_instrument: dict[str, int] = {}
-        for row, payload in zip(materialised, payloads, strict=True):
-            instrument = str(row["instrument_id"])
-            expected_by_instrument[instrument] = max(
-                expected_by_instrument.get(instrument, 0),
-                int(value(payload, "expected_observations")),
-            )
-        expected_observations = sum(expected_by_instrument.values())
-        observed_observations = len(
-            {(str(row["instrument_id"]), str(row["observed_at"])) for row in materialised}
-        )
+        expected_observations, market_interval_ids = _forward_market_coverage(materialised)
+        observed_observations = len(market_interval_ids)
         data_gap_ids = tuple(
             sorted(
                 {
@@ -1387,10 +1591,19 @@ class SqlForwardEvidenceRepository:
             objective_value = None
             objective_excess = None
             objective_excess_fraction = None
+        model_drift = max(
+            (
+                drift_value
+                for payload in payloads
+                if (drift_value := optional_value(payload, "model_drift")) is not None
+            ),
+            default=None,
+        )
         summary = ForwardPaperSummary(
             strategy_version_id=strategy_version_id,
             product_id=product_id,
             artefact_hash=artefact_hash,
+            qualification_window_id=window["window_id"] if window else None,
             observed_from=observed_from,
             observed_until=observed_until,
             elapsed_days=max(
@@ -1403,7 +1616,8 @@ class SqlForwardEvidenceRepository:
             excess_benchmark_pnl=sum(returns) - sum(benchmark_returns),
             drawdown=max(value(payload, "drawdown") for payload in payloads),
             execution_drift=max(value(payload, "execution_drift") for payload in payloads),
-            model_drift=max(value(payload, "model_drift") for payload in payloads),
+            model_drift=model_drift,
+            market_interval_ids=market_interval_ids,
             portfolio_capacity=min(value(payload, "portfolio_capacity") for payload in payloads),
             risk_budget_available=min(
                 value(payload, "risk_budget_available", default=0.0) for payload in payloads
@@ -1416,7 +1630,7 @@ class SqlForwardEvidenceRepository:
             if episode_ids
             else int(sum(value(payload, "effective_trades") for payload in payloads)),
             fill_rate=(completed_attempts / valid_attempts if valid_attempts else 0.0),
-            slippage=max(value(payload, "slippage") for payload in payloads),
+            slippage=_forward_slippage(metric_values),
             data_uptime=(
                 min(1.0, observed_observations / expected_observations)
                 if expected_observations
@@ -1431,9 +1645,9 @@ class SqlForwardEvidenceRepository:
                 if episode_ids
                 else int(sum(value(payload, "cycles") for payload in payloads))
             ),
-            effective_independent_episodes=len(episode_ids)
+            completed_episodes=len(episode_ids)
             if episode_ids
-            else int(sum(value(payload, "effective_independent_episodes") for payload in payloads)),
+            else int(sum(value(payload, "completed_episodes") for payload in payloads)),
             tail_loss=max(value(payload, "tail_loss") for payload in payloads),
             objective_unit=objective_units[-1] if objective_units and complete_objective else None,
             objective_value=objective_value,
@@ -1465,13 +1679,13 @@ class SqlForwardEvidenceRepository:
                 "fill_ids": list(fill_ids),
                 "episode_ids": list(episode_ids),
                 "fill_rate_applicable": valid_attempts > 0,
-                "model_drift": max(value(payload, "model_drift") for payload in payloads),
+                "model_drift": model_drift,
             }
         )
         summary_id = self.append_summary(
             strategy_version_id=strategy_version_id,
             product_id=product_id,
-            observed_at=observed_at,
+            observed_at=published_at or observed_at,
             artefact_hash=artefact_hash,
             evidence=summary_payload,
         )
@@ -1501,13 +1715,13 @@ class SqlForwardEvidenceRepository:
 
     def _order_filled(self, order_id: str) -> bool:
         with self.engine.connect() as connection:
-            status = connection.execute(
-                select(exchange_order.c.status)
+            filled = connection.execute(
+                select(exchange_order.c.id)
                 .where(exchange_order.c.order_id == order_id)
-                .order_by(exchange_order.c.sequence.desc())
+                .where(exchange_order.c.status == "filled")
                 .limit(1)
-            ).scalar_one_or_none()
-        return str(status or "").casefold() in {"filled", "reconciled"}
+            ).first()
+        return filled is not None
 
     def append_decision(
         self,
@@ -1532,8 +1746,23 @@ class SqlForwardEvidenceRepository:
             )
         if row is None or not isinstance(row["payload"], Mapping):
             raise CanonicalEvidenceError("forward summary does not exist")
+        if decided_at < str(row["created_at"]):
+            raise CanonicalEvidenceError("forward decision precedes summary publication")
+        qualification = None
+        if accepted:
+            qualification = self._summary_qualification(row, at=decided_at)
+            accepted = qualification["qualified"]
+            reason_code = qualification["reason_code"]
+        category = forward_outcome(accepted, reason_code)
         payload = {
             "schema": "platform.forward_paper_decision/v1",
+            "qualification_window_id": row["payload"].get("qualification_window_id"),
+            "outcome_category": category.value,
+            "research_state": {
+                OutcomeCategory.ACCEPTED: "research_qualified",
+                OutcomeCategory.INCONCLUSIVE: "economically_inconclusive",
+                OutcomeCategory.REJECTED: "research_rejected",
+            }.get(category, category.value),
             "summary_id": summary_id,
             "strategy_version_id": str(row["strategy_version_id"]),
             "product_id": str(row["product_id"]),
@@ -1541,6 +1770,7 @@ class SqlForwardEvidenceRepository:
             "decided_at": decided_at,
             "accepted": accepted,
             "reason_code": reason_code,
+            "research_qualification": qualification,
         }
         identity = _hash(payload, field="forward paper decision")
         with self.engine.begin() as connection:
@@ -1561,6 +1791,45 @@ class SqlForwardEvidenceRepository:
                 },
             )
 
+    def _summary_qualification(self, row: Mapping[str, Any], *, at: str) -> dict[str, Any]:
+        from src.research.policy_approval import research_qualification
+        from src.services.forward_windows import ForwardWindowError, require_current_window
+
+        window_id = row["payload"].get("qualification_window_id")
+        if not window_id:
+            return {"qualified": False, "reason_code": "forward_window_missing"}
+        with self.engine.connect() as connection:
+            try:
+                window = require_current_window(
+                    connection,
+                    window_id=str(window_id),
+                    artefact_hash=str(row["artefact_hash"]),
+                    strategy_version_id=str(row["strategy_version_id"]),
+                    product_id=str(row["product_id"]),
+                    at=at,
+                )
+            except ForwardWindowError as exc:
+                return {"qualified": False, "reason_code": exc.reason_code}
+            limits = _window_decision_limits(window["policy"])
+            reason = next(
+                (
+                    reason
+                    for failed, reason in _forward_decision_checks(row["payload"], limits)
+                    if failed
+                ),
+                None,
+            )
+            if reason is not None:
+                return {"qualified": False, "reason_code": reason}
+            return research_qualification(
+                connection,
+                artefact_hash=str(row["artefact_hash"]),
+                strategy_version_id=str(row["strategy_version_id"]),
+                product_id=str(row["product_id"]),
+                configuration_hash=self.research_configuration_hash,
+                at=at,
+            )
+
     def decide_summary(
         self,
         summary_id: str,
@@ -1579,7 +1848,7 @@ class SqlForwardEvidenceRepository:
         maximum_rejected_orders: int = 0,
         minimum_trading_days: int = 0,
         minimum_cycles: int = 0,
-        minimum_effective_episodes: int = 0,
+        minimum_completed_episodes: int = 0,
         maximum_tail_loss: float = 1.0,
     ) -> tuple[str, bool, str | None]:
         limits = _normalise_decision_limits(
@@ -1596,7 +1865,7 @@ class SqlForwardEvidenceRepository:
             maximum_rejected_orders=maximum_rejected_orders,
             minimum_trading_days=minimum_trading_days,
             minimum_cycles=minimum_cycles,
-            minimum_effective_episodes=minimum_effective_episodes,
+            minimum_completed_episodes=minimum_completed_episodes,
             maximum_tail_loss=maximum_tail_loss,
         )
         decided_at = timestamp(decided_at, field="forward decision timestamp")
@@ -1616,7 +1885,13 @@ class SqlForwardEvidenceRepository:
             accepted=reason is None,
             reason_code=reason,
         )
-        return decision_id, reason is None, reason
+        with self.engine.connect() as connection:
+            decision = connection.execute(
+                select(forward_paper_decision.c.payload).where(
+                    forward_paper_decision.c.id == decision_id
+                )
+            ).scalar_one()
+        return decision_id, bool(decision["accepted"]), decision["reason_code"]
 
 
 @dataclass(frozen=True)
@@ -1634,8 +1909,29 @@ class _ForwardDecisionLimits:
     maximum_rejected_orders: int
     minimum_trading_days: int
     minimum_cycles: int
-    minimum_effective_episodes: int
+    minimum_completed_episodes: int
     maximum_tail_loss: float
+
+
+def _window_decision_limits(policy: Mapping[str, Any]) -> _ForwardDecisionLimits:
+    fields = {
+        "minimum_days": "required_forward_evidence_days",
+        "minimum_decisions": "minimum_forward_independent_decisions",
+        "minimum_net_pnl": "minimum_forward_net_pnl",
+        "minimum_objective_excess_fraction": "minimum_forward_objective_excess_fraction",
+        "maximum_drawdown": "maximum_drawdown",
+        "maximum_data_gaps": "maximum_forward_data_gaps",
+        "minimum_effective_trades": "minimum_forward_effective_trades",
+        "minimum_fill_rate": "minimum_forward_fill_rate",
+        "maximum_slippage": "maximum_forward_slippage",
+        "minimum_data_uptime": "minimum_forward_data_uptime",
+        "maximum_rejected_orders": "maximum_forward_rejected_orders",
+        "minimum_trading_days": "minimum_forward_trading_days",
+        "minimum_cycles": "minimum_forward_cycles",
+        "minimum_completed_episodes": "minimum_forward_completed_episodes",
+        "maximum_tail_loss": "maximum_forward_tail_loss",
+    }
+    return _normalise_decision_limits(**{field: policy[source] for field, source in fields.items()})
 
 
 def _decision_integer(value: int, *, message: str) -> int:
@@ -1666,7 +1962,7 @@ def _normalise_decision_limits(
     maximum_rejected_orders: int,
     minimum_trading_days: int,
     minimum_cycles: int,
-    minimum_effective_episodes: int,
+    minimum_completed_episodes: int,
     maximum_tail_loss: float,
 ) -> _ForwardDecisionLimits:
     objective = (
@@ -1713,8 +2009,8 @@ def _normalise_decision_limits(
             minimum_cycles,
             message="minimum forward cycles must be a non-negative integer",
         ),
-        minimum_effective_episodes=_decision_integer(
-            minimum_effective_episodes,
+        minimum_completed_episodes=_decision_integer(
+            minimum_completed_episodes,
             message="minimum forward independent episodes must be a non-negative integer",
         ),
         maximum_tail_loss=_finite_nonnegative(maximum_tail_loss, field="maximum forward tail loss"),
@@ -1748,6 +2044,15 @@ def _forward_decision_checks(
     objective_failed = _objective_decision_failed(payload, limits.minimum_objective_excess_fraction)
     return (
         (
+            payload.get("slippage") is None and bool(payload.get("fill_ids")),
+            "forward_execution_reference_missing",
+        ),
+        (int(payload.get("data_gaps", 0)) > limits.maximum_data_gaps, "forward_data_gaps"),
+        (
+            float(payload.get("data_uptime", 0.0)) < limits.minimum_data_uptime,
+            "forward_data_uptime_insufficient",
+        ),
+        (
             float(payload.get("elapsed_days", 0.0)) < limits.minimum_days,
             "forward_evidence_duration_insufficient",
         ),
@@ -1764,9 +2069,12 @@ def _forward_decision_checks(
             "forward_cycles_insufficient",
         ),
         (
-            int(payload.get("effective_independent_episodes", 0))
-            < limits.minimum_effective_episodes,
-            "forward_independent_episodes_insufficient",
+            int(payload.get("completed_episodes", 0)) < limits.minimum_completed_episodes,
+            "forward_completed_episodes_insufficient",
+        ),
+        (
+            int(payload.get("effective_trades", 0)) < limits.minimum_effective_trades,
+            "forward_effective_trades_insufficient",
         ),
         (
             objective_failed
@@ -1786,11 +2094,6 @@ def _forward_decision_checks(
             float(payload.get("tail_loss", 0.0)) > limits.maximum_tail_loss,
             "forward_tail_loss_limit",
         ),
-        (int(payload.get("data_gaps", 0)) > limits.maximum_data_gaps, "forward_data_gaps"),
-        (
-            int(payload.get("effective_trades", 0)) < limits.minimum_effective_trades,
-            "forward_effective_trades_insufficient",
-        ),
         (
             (limits.minimum_fill_rate > 0.0 and payload.get("fill_rate_applicable") is not True)
             or float(payload.get("fill_rate", 0.0)) < limits.minimum_fill_rate,
@@ -1802,12 +2105,9 @@ def _forward_decision_checks(
             ),
         ),
         (
-            float(payload.get("slippage", 0.0)) > limits.maximum_slippage,
+            payload.get("slippage") is not None
+            and float(payload["slippage"]) > limits.maximum_slippage,
             "forward_slippage_limit",
-        ),
-        (
-            float(payload.get("data_uptime", 0.0)) < limits.minimum_data_uptime,
-            "forward_data_uptime_insufficient",
         ),
         (
             int(payload.get("rejected_orders", 0)) > limits.maximum_rejected_orders,
@@ -1888,11 +2188,15 @@ class SqlStrategyArtefactRepository:
                 raise CanonicalEvidenceError(
                     "canonical artefact product does not match its version"
                 )
-            return _immutable_insert(
+            identity = _immutable_insert(
                 connection,
                 strategy_artefact,
                 {"id": artefact_hash, "created_at": created_at, "payload": payload},
             )
+            from src.research.paper_eligibility import publish_paper_eligibility
+
+            publish_paper_eligibility(connection, payload, created_at=created_at)
+            return identity
 
     def get(self, artefact_hash: str) -> dict[str, Any]:
         with self.engine.connect() as connection:

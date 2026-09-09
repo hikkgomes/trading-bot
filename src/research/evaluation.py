@@ -9,18 +9,19 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from typing import Any, cast
 
 from sqlalchemy import select, update
 from sqlalchemy.engine import Engine
 
-from src.data.database import experiment, holdout_claim
+from src.data.database import experiment, holdout_claim, holdout_outcome
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlHoldoutRepository, SqlValidationRepository
 from src.research.datasets import CanonicalDatasetResolver
 from src.research.evidence import (
+    EvidenceApplicability,
     EvidenceProfile,
     cross_symbol_stability_passes,
     data_integrity_passes,
@@ -34,8 +35,14 @@ from src.research.evidence import (
     select_profile,
     semantic_parity_passes,
 )
-from src.research.executors import ExecutionResult, ExecutorError, ProviderExecutorRegistry
+from src.research.executors import (
+    ExecutionResult,
+    ExecutorError,
+    ProviderExecutorRegistry,
+    _tunable_parameter_names,
+)
 from src.research.objectives import objective_is_available, objective_passes
+from src.research.outcomes import OutcomeCategory
 from src.research.store import SqlResearchStore
 from src.research.theses import SqlThesisRegistry, ThesisError
 
@@ -83,6 +90,7 @@ class EvaluationContractError(ValueError):
 class _ExecutionAttempt:
     result: ExecutionResult | None
     error: str | None = None
+    outcome_category: OutcomeCategory = OutcomeCategory.BLOCKED_INFRASTRUCTURE
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,7 @@ class _ProtectedClaim:
     outcome_id: str | None
     accepted: bool
     error: str | None = None
+    outcome_category: OutcomeCategory = OutcomeCategory.BLOCKED_INFRASTRUCTURE
 
 
 _REQUIRED_STAGE_FIELDS: dict[str, tuple[str, ...]] = {
@@ -120,12 +129,11 @@ _REQUIRED_STAGE_FIELDS: dict[str, tuple[str, ...]] = {
         "adverse_fill_stress",
         "missing_data_stress",
         "funding_stress",
-        "monte_carlo_trade_order",
+        "monte_carlo_return_blocks",
         "bootstrap_confidence",
         "probability_backtest_overfitting",
         "deflated_sharpe",
         "drawdown_stability",
-        "null_results",
         "negative_control_results",
     ),
     "forward": (
@@ -403,7 +411,6 @@ class EvaluationDecision:
 
     accepted: bool
     fatal_failures: tuple[str, ...] = ()
-    evidence_score: float = 0.0
     diagnostics: tuple[str, ...] = ()
     next_stage: str | None = None
     deferred: bool = False
@@ -411,10 +418,6 @@ class EvaluationDecision:
     def __post_init__(self) -> None:
         if not isinstance(self.accepted, bool) or not isinstance(self.deferred, bool):
             raise EvaluationContractError("evaluation decision flags must be boolean")
-        score = float(self.evidence_score)
-        if not math.isfinite(score) or not 0.0 <= score <= 1.0:
-            raise EvaluationContractError("evaluation evidence_score must be between zero and one")
-        object.__setattr__(self, "evidence_score", score)
         failures = tuple(dict.fromkeys(str(value) for value in self.fatal_failures if str(value)))
         diagnostics = tuple(dict.fromkeys(str(value) for value in self.diagnostics if str(value)))
         object.__setattr__(self, "fatal_failures", failures)
@@ -435,8 +438,14 @@ class EvaluationDecision:
     def to_payload(self) -> dict[str, Any]:
         return {
             "accepted": self.accepted,
+            "outcome_category": (
+                OutcomeCategory.ACCEPTED.value
+                if self.accepted
+                else OutcomeCategory.INCONCLUSIVE.value
+                if self.deferred
+                else OutcomeCategory.REJECTED.value
+            ),
             "fatal_failures": list(self.fatal_failures),
-            "evidence_score": self.evidence_score,
             "diagnostics": list(self.diagnostics),
             "next_stage": self.next_stage,
             "deferred": self.deferred,
@@ -580,6 +589,7 @@ class EvidencePolicy:
         family: str | None = None,
         horizon: str | None = None,
         evidence_type: str | None = None,
+        applicability: EvidenceApplicability | None = None,
     ) -> bool:
         return self.decide(
             stage,
@@ -589,6 +599,7 @@ class EvidencePolicy:
             family=family,
             horizon=horizon,
             evidence_type=evidence_type,
+            applicability=applicability,
         ).accepted
 
     def decide(
@@ -601,6 +612,7 @@ class EvidencePolicy:
         family: str | None = None,
         horizon: str | None = None,
         evidence_type: str | None = None,
+        applicability: EvidenceApplicability | None = None,
     ) -> EvaluationDecision:
         if stage not in STAGES:
             raise EvaluationContractError(f"unsupported evidence stage: {stage}")
@@ -612,48 +624,27 @@ class EvidencePolicy:
             family=family,
             horizon=horizon,
             evidence_type=evidence_type,
+            applicability=applicability,
         )
         optional = self._optional_evidence_names(stage)
         required_statuses = {
             name: status for name, status in statuses.items() if name not in optional
         }
-        fatal_fields = _FATAL_EVIDENCE_FIELDS.get(stage, frozenset())
         unavailable = [
             name
             for name, status in required_statuses.items()
             if status is EvidenceStatus.UNAVAILABLE
         ]
         failures = [
-            name
-            for name, status in required_statuses.items()
-            if status is EvidenceStatus.FAIL and name in fatal_fields
+            name for name, status in required_statuses.items() if status is EvidenceStatus.FAIL
         ]
         failures.extend(unavailable)
         if evidence.get("evidence_policy_hash") != self.policy_hash:
             failures.insert(0, "evidence_policy_hash")
-        scoreable = {
-            name: status
-            for name, status in required_statuses.items()
-            if name not in fatal_fields and status is not EvidenceStatus.UNAVAILABLE
-        }
-        passed = sum(
-            status in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
-            for status in scoreable.values()
-        )
-        score = passed / len(scoreable) if scoreable else (1.0 if not unavailable else 0.0)
-        profile = self.profile_for(
-            stage,
-            product_id=product_id,
-            family=family,
-            horizon=horizon,
-            evidence_type=evidence_type,
-        )
-        if not failures and scoreable and score < profile.minimum_evidence_score:
-            failures.append("evidence_score_below_threshold")
         diagnostics = [
             f"{name}:{status.value}"
             for name, status in statuses.items()
-            if (name in optional or name in scoreable)
+            if name in optional
             and status not in {EvidenceStatus.PASS, EvidenceStatus.NOT_APPLICABLE}
         ]
         accepted = bool(required_statuses) and not failures
@@ -666,7 +657,6 @@ class EvidencePolicy:
         return EvaluationDecision(
             accepted=accepted,
             fatal_failures=tuple(failures),
-            evidence_score=score,
             diagnostics=tuple(diagnostics),
             next_stage={
                 "screening": "development",
@@ -682,10 +672,8 @@ class EvidencePolicy:
     def _optional_evidence_names(self, stage: str) -> frozenset[str]:
         optional = set(_OPTIONAL_EVIDENCE_VALIDATORS.get(stage, {}))
         if stage == "robustness":
-            optional.add(
-                "deflated_sharpe"
-                if self.confidence_method == "bootstrap"
-                else "bootstrap_confidence"
+            optional.update(
+                {"deflated_sharpe", "bootstrap_confidence", "probability_backtest_overfitting"}
             )
         return frozenset(optional)
 
@@ -699,7 +687,9 @@ class EvidencePolicy:
         family: str | None = None,
         horizon: str | None = None,
         evidence_type: str | None = None,
+        applicability: EvidenceApplicability | None = None,
     ) -> dict[str, EvidenceStatus]:
+        applicability = applicability or EvidenceApplicability()
         validators = _STAGE_EVIDENCE_VALIDATORS.get(stage, {})
         optional = _OPTIONAL_EVIDENCE_VALIDATORS.get(stage, {})
         profile = self.profile_for(
@@ -713,9 +703,13 @@ class EvidencePolicy:
         for name, validator in {**validators, **optional}.items():
             value = evidence.get(name)
             if name == "negative_control_results" and stage == "robustness":
-                statuses[name] = _negative_control_status(value, controls)
+                statuses[name] = _negative_control_status(value, controls, applicability)
             elif _is_not_applicable(value):
-                statuses[name] = EvidenceStatus.NOT_APPLICABLE
+                statuses[name] = (
+                    EvidenceStatus.NOT_APPLICABLE
+                    if applicability.permits(name)
+                    else EvidenceStatus.UNAVAILABLE
+                )
             elif _is_unavailable(value):
                 statuses[name] = EvidenceStatus.UNAVAILABLE
             elif stage == "forward" and _forward_evidence_pending(name, value, profile):
@@ -794,7 +788,7 @@ def _forward_evidence_pending(name: str, value: object, profile: EvidenceProfile
     if name != "sample_evidence":
         return False
     closed_trades = value.get("closed_trades", value.get("trades"))
-    episodes = value.get("effective_independent_episodes", value.get("episodes"))
+    episodes = value.get("completed_episodes", value.get("episodes"))
     trading_days = value.get("trading_days", value.get("evidence_days"))
     return any(
         isinstance(measured, int)
@@ -803,22 +797,24 @@ def _forward_evidence_pending(name: str, value: object, profile: EvidenceProfile
         and measured < minimum
         for measured, minimum in (
             (closed_trades, profile.minimum_closed_trades),
-            (episodes, profile.minimum_effective_episodes),
+            (episodes, profile.minimum_completed_episodes),
             (trading_days, profile.minimum_trading_days),
         )
     )
 
 
-def _negative_control_status(value: object, controls: tuple[str, ...]) -> EvidenceStatus:
+def _negative_control_status(
+    value: object, controls: tuple[str, ...], applicability: EvidenceApplicability
+) -> EvidenceStatus:
     if not controls:
         return EvidenceStatus.NOT_APPLICABLE
     if not isinstance(value, Mapping):
         return EvidenceStatus.UNAVAILABLE
     statuses = [
         EvidenceStatus.NOT_APPLICABLE
-        if _is_not_applicable(value.get(control))
+        if _is_not_applicable(value.get(control)) and applicability.permits(control)
         else EvidenceStatus.UNAVAILABLE
-        if _is_unavailable(value.get(control))
+        if _is_unavailable(value.get(control)) or _is_not_applicable(value.get(control))
         else EvidenceStatus.PASS
         if _passed_mapping(value.get(control))
         else EvidenceStatus.FAIL
@@ -885,8 +881,6 @@ def _deflated_sharpe_passes(
 def _pbo_passes(
     value: object, policy: EvidencePolicy, profile: EvidenceProfile | None = None
 ) -> bool:
-    if _is_not_applicable(value):
-        return True
     measured = _finite(value)
     maximum = (
         profile.maximum_backtest_overfitting_probability
@@ -1005,8 +999,6 @@ def _cross_symbol_stability_passes(
 def _portfolio_overlap_passes(
     value: object, policy: EvidencePolicy, _profile: EvidenceProfile | None = None
 ) -> bool:
-    if _is_not_applicable(value):
-        return True
     if not isinstance(value, Mapping) or value.get("passed") is not True:
         return False
     comparisons = value.get("comparisons")
@@ -1158,13 +1150,12 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
         "adverse_fill_stress": _mapping_passes,
         "missing_data_stress": _mapping_passes,
         "funding_stress": _mapping_passes,
-        "monte_carlo_trade_order": _monte_carlo_passes,
+        "monte_carlo_return_blocks": _monte_carlo_passes,
         "bootstrap_confidence": _bootstrap_passes,
         "probability_backtest_overfitting": _pbo_passes,
         "deflated_sharpe": _deflated_sharpe_passes,
         "statistical_procedures": _statistical_procedures_pass,
         "drawdown_stability": _drawdown_passes,
-        "null_results": _mapping_passes,
         "negative_control_results": _negative_control_results_pass,
     },
     "forward": {
@@ -1198,70 +1189,6 @@ _STAGE_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
 
 _OPTIONAL_EVIDENCE_VALIDATORS: dict[str, dict[str, EvidenceValidator]] = {
     "development": {"portfolio_overlap": _portfolio_overlap_passes},
-}
-
-
-_FATAL_EVIDENCE_FIELDS: dict[str, frozenset[str]] = {
-    "screening": frozenset(_STAGE_EVIDENCE_VALIDATORS["screening"]),
-    "development": frozenset(
-        {
-            "chronological",
-            "data_integrity",
-            "semantic_parity",
-            "realistic_costs",
-            "family_evidence",
-            "cost_adjusted_return",
-            "objective_excess_fraction",
-            "fees",
-            "slippage",
-            "funding",
-            "regime_breakdown",
-            "sample_evidence",
-            "universe_evidence",
-        }
-    ),
-    "robustness": frozenset(
-        {
-            "data_integrity",
-            "semantic_parity",
-            "realistic_costs",
-            "family_evidence",
-            "objective_excess_fraction",
-            "purged",
-            "embargo",
-            "walk_forward",
-            "drawdown_stability",
-            "negative_control_results",
-        }
-    ),
-    "forward": frozenset(
-        {
-            "data_integrity",
-            "semantic_parity",
-            "realistic_costs",
-            "family_evidence",
-            "production_equivalent",
-            "exact_strategy_identity",
-            "exact_artefact_hash",
-            "exact_engine_hash",
-            "exact_cost_model",
-            "drift_checks",
-            "objective_excess_fraction",
-        }
-    ),
-    "protected": frozenset(
-        {
-            "chronological",
-            "data_integrity",
-            "semantic_parity",
-            "realistic_costs",
-            "family_evidence",
-            "cost_adjusted_return",
-            "objective_excess_fraction",
-            "sample_evidence",
-            "drawdown_stability",
-        }
-    ),
 }
 
 
@@ -1384,6 +1311,16 @@ class ProtectedHoldoutWorker:
         return claim_id, outcome_id, accepted, {"passed": accepted, "outcome_id": outcome_id}
 
 
+def _candidate_applicability(candidate, context: Mapping[str, Any]) -> EvidenceApplicability:
+    scope = context.get("instrument_scope", candidate.definition.universe.get("symbols", ()))
+    active = context.get("active_strategy_returns")
+    return EvidenceApplicability(
+        instrument_count=len(set(scope)) if isinstance(scope, list | tuple) and scope else None,
+        tunable_parameter_count=len(_tunable_parameter_names(candidate, context)),
+        active_strategy_count=len(active) if isinstance(active, Mapping) else None,
+    )
+
+
 class CanonicalResearchEvaluator:
     def __init__(
         self,
@@ -1431,12 +1368,17 @@ class CanonicalResearchEvaluator:
             stage_snapshot_ids=stage_snapshot_ids,
             thesis_id=candidate.thesis_id,
         )
+        if request.requested_stage in existing_stages:
+            return _cached_stage_evaluation(
+                existing_stages[request.requested_stage], request, context
+            )
         evidence, accepted, reason_code, receipt, metrics = self._calculate_stage(
             request.requested_stage,
             candidate,
             context,
             protected_snapshot_id=protected_snapshot_id,
         )
+        evidence["evaluation_context"] = context
         run_id = self.store.save_run(
             candidate_id=request.candidate_id,
             run_name=f"canonical:{request.requested_stage}",
@@ -1472,6 +1414,9 @@ class CanonicalResearchEvaluator:
                     "reason_code": reason_code,
                     "run_id": run_id,
                     "observed_at": request.evaluated_at,
+                    "outcome_category": evidence.get("evaluation_decision", {}).get(
+                        "outcome_category"
+                    ),
                 }
             else:
                 metadata.pop("evaluation_deferred", None)
@@ -1479,12 +1424,8 @@ class CanonicalResearchEvaluator:
                 update(experiment)
                 .where(experiment.c.id == request.candidate_id)
                 .values(
-                    state=(
-                        request.requested_stage
-                        if accepted
-                        else f"{request.requested_stage}_deferred"
-                        if deferred
-                        else f"{request.requested_stage}_rejected"
+                    state=_candidate_evaluation_state(
+                        request.requested_stage, accepted, deferred, evidence
                     ),
                     metadata=json_value(metadata, field="metadata"),
                 )
@@ -1613,7 +1554,11 @@ class CanonicalResearchEvaluator:
                 self.executors.execute(candidate, {**self.provider_context, **context})
             )
         except (ExecutorError, KeyError, ValueError, TypeError) as exc:
-            return _ExecutionAttempt(None, f"{type(exc).__name__}: {exc}")
+            return _ExecutionAttempt(
+                None,
+                f"{type(exc).__name__}: {exc}",
+                getattr(exc, "outcome_category", OutcomeCategory.BLOCKED_INFRASTRUCTURE),
+            )
 
     def _screening_stage(
         self,
@@ -1647,13 +1592,12 @@ class CanonicalResearchEvaluator:
                 "validation_policy",
             )
         )
-        causality_valid = not any(
-            token in json_value(definition.feature_graph, field="feature_graph").__repr__().lower()
-            for token in ("future", "lookahead", "leak")
-        )
+        causality_valid = measured.get("causality_valid") is True
+        applicability = _candidate_applicability(candidate, context)
         evidence = {
             "identity": identity,
             **measured,
+            "applicability": asdict(applicability),
             "features_contract_valid": fields_valid,
             "causality_contract_valid": causality_valid,
             "context": dict(context),
@@ -1667,6 +1611,7 @@ class CanonicalResearchEvaluator:
             family=family,
             horizon=horizon,
             evidence_type=evidence_type,
+            applicability=applicability,
         )
         additional_failures = tuple(
             name
@@ -1719,6 +1664,11 @@ class CanonicalResearchEvaluator:
                     "identity": identity,
                     "context": dict(context),
                     "holdout_claim_error": claim.error,
+                    "evaluation_decision": {
+                        "accepted": False,
+                        "deferred": True,
+                        "outcome_category": claim.outcome_category.value,
+                    },
                 },
                 False,
                 "protected_holdout_claim_failed",
@@ -1726,9 +1676,13 @@ class CanonicalResearchEvaluator:
                 {},
             )
         claims = self.protected.claim_for(definition.strategy_version_id)
+        receipt = self._protected_receipt(
+            claim.outcome_id, candidate.candidate_id, protected_snapshot_id
+        )
         evidence = {
             "identity": identity,
-            "frozen_cohort": bool(claims),
+            "holdout_exposure_recorded": bool(claims),
+            "frozen_cohort": self.provider_context.get("protected_cohort_id"),
             "holdout_claim": [row["id"] for row in claims],
             "data_commitment": canonical_hash(
                 {
@@ -1744,14 +1698,45 @@ class CanonicalResearchEvaluator:
             },
             "context": dict(context),
         }
-        accepted = bool(claims) and claim.accepted if self.protected_worker is not None else False
+        accepted = bool(claims) and claim.accepted and receipt is not None
+        evidence["evaluation_decision"] = {
+            "accepted": accepted,
+            "deferred": receipt is None,
+            "outcome_category": (
+                OutcomeCategory.ACCEPTED.value
+                if accepted
+                else OutcomeCategory.BLOCKED_INFRASTRUCTURE.value
+                if receipt is None
+                else OutcomeCategory.REJECTED.value
+            ),
+        }
         return (
             evidence,
             accepted,
             None if accepted else "protected_holdout_outcome_missing",
-            None,
+            receipt,
             {},
         )
+
+    def _protected_receipt(self, outcome_id, candidate_id, snapshot_id):
+        if outcome_id is None:
+            return None
+        with self.store.engine.connect() as connection:
+            payload = connection.execute(
+                select(holdout_outcome.c.payload).where(
+                    holdout_outcome.c.id == outcome_id,
+                )
+            ).scalar_one()
+        receipt = payload.get("execution_receipt")
+        if not isinstance(receipt, Mapping):
+            return None
+        if receipt.get("candidate_id") != candidate_id or receipt.get("dataset_snapshot_ids") != [
+            snapshot_id
+        ]:
+            raise EvaluationContractError(
+                "sealed execution receipt does not match protected inputs"
+            )
+        return dict(receipt)
 
     def _claim_protected_holdout(
         self,
@@ -1767,22 +1752,20 @@ class CanonicalResearchEvaluator:
                     self.protected_worker.claim_and_evaluate(
                         strategy_version_id=definition.strategy_version_id,
                         dataset_snapshot_id=str(protected_snapshot_id or ""),
-                        cohort_id=f"protected:{context['candidate_id']}",
+                        cohort_id=str(self.provider_context["protected_cohort_id"]),
                         source_hashes=source_hashes,
                         evaluated_at=str(context["evaluated_at"]),
                     )
                 )
                 return _ProtectedClaim(outcome_id, accepted)
-            SqlHoldoutRepository(self.store.engine).claim(
-                strategy_version_id=definition.strategy_version_id,
-                data_snapshot_id=str(protected_snapshot_id or ""),
-                cohort_id=f"protected:{context['candidate_id']}",
-                source_hashes=source_hashes,
-                claimed_at=str(context["evaluated_at"]),
-            )
-            return _ProtectedClaim(None, False)
+            raise EvaluationContractError("protected evaluation worker is not configured")
         except Exception as exc:
-            return _ProtectedClaim(None, False, f"{type(exc).__name__}: {exc}")
+            return _ProtectedClaim(
+                None,
+                False,
+                f"{type(exc).__name__}: {exc}",
+                getattr(exc, "outcome_category", OutcomeCategory.BLOCKED_INFRASTRUCTURE),
+            )
 
     def _authoritative_runs(
         self, context: Mapping[str, Any], execution: ExecutionResult | None
@@ -1907,6 +1890,8 @@ class CanonicalResearchEvaluator:
         controls = self._negative_controls(candidate.thesis_id)
         policy_fields = _STAGE_EVIDENCE_VALIDATORS[stage]
         product_id = candidate.definition.product if requires_objective else None
+        applicability = _candidate_applicability(candidate, context)
+        evidence["applicability"] = asdict(applicability)
         evidence_status = self.evidence_policy.statuses(
             stage,
             evidence,
@@ -1915,6 +1900,7 @@ class CanonicalResearchEvaluator:
             family=family,
             horizon=horizon,
             evidence_type=evidence_type,
+            applicability=applicability,
         )
         missing = [
             field
@@ -1931,6 +1917,7 @@ class CanonicalResearchEvaluator:
             family=family,
             horizon=horizon,
             evidence_type=evidence_type,
+            applicability=applicability,
         )
         decision = _with_fatal_failures(decision, tuple(missing))
         accepted = decision.accepted
@@ -1975,7 +1962,16 @@ class CanonicalResearchEvaluator:
         attempt = self._execute_stage(stage, candidate, context)
         if attempt.error is not None:
             return (
-                {"identity": identity, "context": dict(context), "executor_error": attempt.error},
+                {
+                    "identity": identity,
+                    "context": dict(context),
+                    "executor_error": attempt.error,
+                    "evaluation_decision": {
+                        "accepted": False,
+                        "deferred": True,
+                        "outcome_category": attempt.outcome_category.value,
+                    },
+                },
                 False,
                 "candidate_execution_failed",
                 None,
@@ -2021,7 +2017,6 @@ def _with_fatal_failures(
     return EvaluationDecision(
         accepted=not failures,
         fatal_failures=failures,
-        evidence_score=decision.evidence_score,
         diagnostics=decision.diagnostics,
         next_stage=decision.next_stage if not failures else None,
         deferred=decision.deferred and not additional,
@@ -2032,6 +2027,43 @@ def _decision_reason(decision: EvaluationDecision, rejected_reason: str) -> str 
     if decision.accepted:
         return None
     return "evidence_insufficient_defer" if decision.deferred else rejected_reason
+
+
+def _cached_stage_evaluation(
+    row: Mapping[str, Any], request: EvaluationRequest, context: Mapping[str, Any]
+) -> StageEvaluation:
+    evidence = dict(row["payload"]["evidence"])
+    previous_context = evidence.get("evaluation_context", {})
+    volatile = {"evaluated_at", "producer_identity", "content_hash"}
+    previous = {key: value for key, value in previous_context.items() if key not in volatile}
+    current = {key: value for key, value in context.items() if key not in volatile}
+    if canonical_hash(previous) != canonical_hash(current):
+        changed = sorted(
+            key
+            for key in set(previous) | set(current)
+            if canonical_hash(previous.get(key)) != canonical_hash(current.get(key))
+        )
+        raise EvaluationContractError(
+            "existing stage has different immutable evaluation inputs: " + ", ".join(changed)
+        )
+    return StageEvaluation(
+        candidate_id=request.candidate_id,
+        stage=request.requested_stage,
+        accepted=bool(row["accepted"]),
+        reason_code=row["reason_code"],
+        run_id=row["source_run_id"],
+        evidence_hash=row["evidence_hash"],
+        evidence={**evidence, "validation_stage_id": row["id"]},
+    )
+
+
+def _candidate_evaluation_state(stage, accepted, deferred, evidence) -> str:
+    category = evidence.get("evaluation_decision", {}).get("outcome_category")
+    if category == OutcomeCategory.UNSUPPORTED.value:
+        return "unsupported"
+    if accepted:
+        return stage
+    return f"{stage}_deferred" if deferred else f"{stage}_rejected"
 
 
 def _evaluation_is_deferred(evidence: Mapping[str, Any]) -> bool:

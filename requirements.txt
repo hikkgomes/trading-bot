@@ -6,7 +6,7 @@
 #
 # TA-Lib needs its C library installed separately (brew install ta-lib).
 # Dev tooling (ruff, pytest) lives in requirements-dev.txt; the lean
-# execution-only set for the server is in requirements-bot.txt.
+# execution-only set for the server is in requirements-runtime.txt.
 
 alembic==1.18.4
 aiohappyeyeballs==2.7.1

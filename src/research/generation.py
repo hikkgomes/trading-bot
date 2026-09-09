@@ -22,6 +22,7 @@ from src.domain.strategies import (
     StrategySourceType,
 )
 from src.research.coordinator import Candidate
+from src.research.economic_series import ECONOMIC_ENGINE_VERSION
 from src.research.theses import FAMILY_NEGATIVE_CONTROLS
 from src.strategies.behaviour import behaviour_hash_for_definition
 
@@ -47,6 +48,7 @@ class CampaignSpec:
     expected_horizon: str
     evidence_type: str
     enabled_by_default: bool = True
+    unavailable_reason: str | None = None
     failure_regimes: tuple[str, ...] = (
         "structural break",
         "insufficient liquidity",
@@ -115,6 +117,7 @@ def _campaign(
     evidence_type: str,
     *,
     enabled_by_default: bool = True,
+    unavailable_reason: str | None = None,
 ) -> CampaignSpec:
     return CampaignSpec(
         name=name,
@@ -129,7 +132,8 @@ def _campaign(
         expected_direction=direction,
         expected_horizon=horizon,
         evidence_type=evidence_type,
-        enabled_by_default=enabled_by_default,
+        enabled_by_default=enabled_by_default and unavailable_reason is None,
+        unavailable_reason=unavailable_reason,
     )
 
 
@@ -203,6 +207,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         "market_neutral",
         "4h to 7d",
         "cross_sectional",
+        unavailable_reason="funding-aware multi-leg settlement accounting is not implemented",
     ),
     _campaign(
         "basis_convergence",
@@ -217,6 +222,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         "hedged",
         "1h to 30d",
         "pairs",
+        unavailable_reason="spot inventory and a training-only hedge model are not implemented",
     ),
     _campaign(
         "liquidation_flow_reversion",
@@ -232,6 +238,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         "event-time to 5m",
         "scalping",
         enabled_by_default=False,
+        unavailable_reason="historical order-book replay and latency execution are unavailable",
     ),
     _campaign(
         "btc_risk_off_reentry",
@@ -288,6 +295,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         "market_neutral",
         "4h to 7d",
         "funding_carry",
+        unavailable_reason="funding-aware multi-leg settlement accounting is not implemented",
     ),
     _campaign(
         "pairs_mean_reversion",
@@ -302,6 +310,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         "hedged",
         "1h to 30d",
         "pairs",
+        unavailable_reason="training-only pair selection and frozen hedge estimates are not implemented",
     ),
     _campaign(
         "event_microstructure",
@@ -317,6 +326,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         "event-time to 5m",
         "scalping",
         enabled_by_default=False,
+        unavailable_reason="historical order-book replay and latency execution are unavailable",
     ),
     _campaign(
         "ensemble_regime",
@@ -332,6 +342,7 @@ CAMPAIGNS: tuple[CampaignSpec, ...] = (
         "15m to 3d",
         "intraday",
         enabled_by_default=False,
+        unavailable_reason="portfolio allocation is not an independent alpha hypothesis",
     ),
 )
 
@@ -457,25 +468,9 @@ class GenerationAllocator:
             campaign.name: self._score(feedback_by_campaign.get(campaign.name, ()))
             for campaign in campaigns
         }
-        count = len(campaigns)
-        floor_total = min(
-            total_budget, max(0, int(total_budget * self.minimum_exploration_fraction))
+        allocations = _deficit_allocations(
+            scores, feedback_by_campaign, total_budget, self.minimum_exploration_fraction
         )
-        floor_each = floor_total // count
-        allocations = {campaign.name: floor_each for campaign in campaigns}
-        remaining = total_budget - floor_each * count
-        if remaining > 0:
-            weights = {name: max(score, 0.05) for name, score in scores.items()}
-            weight_total = sum(weights.values())
-            raw = {name: remaining * weight / weight_total for name, weight in weights.items()}
-            for name, value in raw.items():
-                allocations[name] += int(value)
-            left = total_budget - sum(allocations.values())
-            order = sorted(
-                campaigns, key=lambda item: (-(raw[item.name] - int(raw[item.name])), item.name)
-            )
-            for campaign in order[:left]:
-                allocations[campaign.name] += 1
         return tuple(
             CampaignAllocation(campaign.name, allocations[campaign.name], scores[campaign.name])
             for campaign in sorted(campaigns, key=lambda item: item.name)
@@ -483,13 +478,71 @@ class GenerationAllocator:
 
     @staticmethod
     def _score(feedback: Sequence[GenerationFeedback]) -> float:
-        if not feedback:
+        measured = {item.candidate_id: item for item in feedback if _economic_feedback(item)}
+        if not measured:
             return 1.0
-        counts = Counter(item.outcome for item in feedback)
+        counts = Counter(item.outcome for item in measured.values())
         successes = counts["accepted"]
-        failures = counts["rejected"] + counts["data_unavailable"] + counts["retired"]
-        duplicates = counts["duplicate_exact"] + counts["duplicate_near"]
-        return max(0.05, (1.0 + successes) / (1.0 + failures + duplicates))
+        failures = counts["rejected"]
+        return max(0.05, (1.0 + successes) / (1.0 + failures))
+
+
+def _deficit_allocations(scores, feedback, budget: int, exploration: float) -> dict[str, int]:
+    counts = {
+        name: len(
+            {
+                item.candidate_id
+                for item in feedback.get(name, ())
+                if item.outcome == "generated" and item.candidate_id is not None
+            }
+        )
+        for name in scores
+    }
+    total = sum(counts.values())
+    weight_sum = sum(scores.values())
+    weights = {
+        name: exploration / len(scores) + (1 - exploration) * score / weight_sum
+        for name, score in scores.items()
+    }
+    allocations = dict.fromkeys(scores, 0)
+    for slot in range(budget):
+        chosen = min(
+            scores,
+            key=lambda name: (
+                -(weights[name] * (total + slot + 1) - counts[name] - allocations[name]),
+                name,
+            ),
+        )
+        allocations[chosen] += 1
+    return allocations
+
+
+def _allocated_variants(allocations, campaigns) -> tuple[tuple[CampaignSpec, int], ...]:
+    primary = [
+        (allocation.campaign, variant)
+        for allocation in allocations
+        for variant in range(min(allocation.trials, len(campaigns[allocation.campaign].thresholds)))
+    ]
+    remaining = [
+        (name, variant)
+        for name in sorted(campaigns)
+        for variant in range(len(campaigns[name].thresholds))
+        if (name, variant) not in primary
+    ]
+    return tuple((campaigns[name], variant) for name, variant in (*primary, *remaining))
+
+
+def _economic_feedback(item: GenerationFeedback) -> bool:
+    value = item.metadata.get("net_return")
+    return (
+        item.candidate_id is not None
+        and item.outcome in {"accepted", "rejected"}
+        and item.metadata.get("stage") == "development"
+        and item.metadata.get("economic_engine") == ECONOMIC_ENGINE_VERSION
+        and isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
 
 
 @dataclass(frozen=True)
@@ -661,6 +714,7 @@ class HypothesisGenerator:
             campaign
             for campaign in available_campaigns
             if campaign.product == self.product
+            and campaign.unavailable_reason is None
             and (campaigns is not None or campaign.enabled_by_default)
         )
         allocations = self.allocator.allocate(
@@ -670,51 +724,50 @@ class HypothesisGenerator:
         )
         by_name = {campaign.name: campaign for campaign in selected}
         generated: list[GeneratedHypothesis] = []
-        for allocation in allocations:
-            campaign = by_name[allocation.campaign]
-            variants = min(allocation.trials, len(campaign.thresholds))
-            for variant in range(variants):
-                try:
-                    hypothesis = build_hypothesis(
-                        campaign,
-                        variant=variant,
-                        instrument_universe=self.instrument_universe,
-                        dataset_snapshot_hashes=dataset_snapshot_hashes,
-                        submitted_at=submitted_at,
-                        dataset_bundle_id=dataset_bundle_id,
-                        universe_snapshot_id=universe_snapshot_id,
-                        parent_thesis_ids=parent_thesis_ids,
+        for campaign, variant in _allocated_variants(allocations, by_name):
+            if len(generated) >= total_budget:
+                break
+            try:
+                hypothesis = build_hypothesis(
+                    campaign,
+                    variant=variant,
+                    instrument_universe=self.instrument_universe,
+                    dataset_snapshot_hashes=dataset_snapshot_hashes,
+                    submitted_at=submitted_at,
+                    dataset_bundle_id=dataset_bundle_id,
+                    universe_snapshot_id=universe_snapshot_id,
+                    parent_thesis_ids=parent_thesis_ids,
+                )
+            except GenerationError as exc:
+                self._record_generation_failure(
+                    campaign,
+                    variant=variant,
+                    observed_at=submitted_at,
+                    reason_code=str(exc),
+                )
+                continue
+            match = self.memory.find(hypothesis.candidate) if self.memory is not None else None
+            if match is not None and match.kind == "exact":
+                derived = _derive_duplicate_hypothesis(
+                    hypothesis,
+                    match=match,
+                    parent_candidates=parent_candidates,
+                    submitted_at=submitted_at,
+                )
+                if derived is not None:
+                    derived_match = (
+                        self.memory.find(derived.candidate, maximum_distance=0.0)
+                        if self.memory is not None
+                        else None
                     )
-                except GenerationError as exc:
-                    self._record_generation_failure(
-                        campaign,
-                        variant=variant,
-                        observed_at=submitted_at,
-                        reason_code=str(exc),
-                    )
-                    continue
-                match = self.memory.find(hypothesis.candidate) if self.memory is not None else None
-                if match is not None:
-                    derived = _derive_duplicate_hypothesis(
-                        hypothesis,
-                        match=match,
-                        parent_candidates=parent_candidates,
-                        submitted_at=submitted_at,
-                    )
-                    if derived is not None:
-                        derived_match = (
-                            self.memory.find(derived.candidate, maximum_distance=0.0)
-                            if self.memory is not None
-                            else None
-                        )
-                        if derived_match is None:
-                            generated.append(derived)
-                            self._record_outcome(derived, "generated", submitted_at)
-                            continue
-                    self._record_duplicate(hypothesis, match, submitted_at)
-                    continue
-                generated.append(hypothesis)
-                self._record_outcome(hypothesis, "generated", submitted_at)
+                    if derived_match is None:
+                        generated.append(derived)
+                        self._record_outcome(derived, "generated", submitted_at)
+                        continue
+                self._record_duplicate(hypothesis, match, submitted_at)
+                continue
+            generated.append(hypothesis)
+            self._record_outcome(hypothesis, "generated", submitted_at)
         return tuple(generated)
 
     def _record_duplicate(
@@ -1252,6 +1305,10 @@ def build_hypothesis(
     universe_snapshot_id: str | None = None,
     parent_thesis_ids: tuple[str, ...] = (),
 ) -> GeneratedHypothesis:
+    if campaign.unavailable_reason is not None:
+        raise GenerationError(
+            f"unsupported campaign {campaign.name}: {campaign.unavailable_reason}"
+        )
     if variant < 0 or variant >= len(campaign.thresholds):
         raise GenerationError("campaign variant is outside the declared threshold set")
     if not dataset_snapshot_hashes:
@@ -1360,16 +1417,18 @@ def _campaign_source_payload(
 ) -> dict[str, Any]:
     if campaign.source_type is StrategySourceType.GENERATED_DSL:
         if campaign.product == "btc_accumulation":
-            risk_off = {
+            risk_off: dict[str, Any] = {
                 "feature": campaign.feature,
                 "operator": campaign.operator,
                 "threshold": threshold,
             }
-            risk_on = {
+            risk_on: dict[str, Any] = {
                 "feature": campaign.feature,
                 "operator": "le" if campaign.operator in {"gt", "ge"} else "ge",
                 "threshold": threshold,
             }
+            if campaign.name != "btc_risk_off_reentry":
+                risk_on, risk_off = risk_off, risk_on
             rule = {
                 "direction": "signed",
                 "positive_conditions": [risk_on],
@@ -1412,6 +1471,8 @@ def _campaign_source_payload(
             "threshold": threshold,
             "direction": campaign.expected_direction,
         }
+        if campaign.expected_direction == "signed":
+            directional_rule = _signed_campaign_rule(campaign, threshold)
         return {
             "kind": "signed_directional_forecast",
             "campaign": campaign.name,
@@ -1484,6 +1545,27 @@ def _campaign_source_payload(
         contract["forecast_inputs"] = ["directional", "cross_sectional", "relative_value"]
         contract["aggregation"] = "correlation_aware"
     return contract
+
+
+def _signed_campaign_rule(campaign: CampaignSpec, threshold: float) -> dict[str, Any]:
+    opposite = {"gt": "lt", "ge": "le", "lt": "gt", "le": "ge"}
+    return {
+        "direction": "signed",
+        "long_conditions": [
+            {
+                "feature": campaign.feature,
+                "operator": campaign.operator,
+                "threshold": threshold,
+            }
+        ],
+        "short_conditions": [
+            {
+                "feature": campaign.feature,
+                "operator": opposite[campaign.operator],
+                "threshold": -threshold,
+            }
+        ],
+    }
 
 
 def _campaign_position_model(campaign: CampaignSpec) -> dict[str, Any]:

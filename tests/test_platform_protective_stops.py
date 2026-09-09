@@ -6,7 +6,7 @@ import pytest
 
 from src.domain.market_events import MarketEvent
 from src.domain.orders import OrderIntent, OrderSide, OrderStatus, OrderType
-from src.execution.broker import ProtectiveOrder, ProtectiveOrderStatus
+from src.execution.broker import Position, ProtectiveOrder, ProtectiveOrderStatus
 from src.execution.stops import ProtectiveStop, StopManager, StopStatus
 from src.services.protective_stops import LiveProtectiveStopService, ProtectiveStopError
 
@@ -34,11 +34,20 @@ class _Broker:
     def __init__(self) -> None:
         self.placed: list[ProtectiveOrder] = []
         self.cancelled: list[str] = []
+        self.actions: list[str] = []
+        self.position_quantity = 1.0
 
     def supports_native_protective_stops(self) -> bool:
         return True
 
+    def get_protective_stop(self, *, symbol, order_id, client_id):
+        return next(item for item in self.placed if item.client_id == client_id)
+
+    def get_position(self, symbol):
+        return Position(symbol=symbol, qty=self.position_quantity)
+
     def place_protective_stop(self, *, symbol, side, qty, trigger_price, client_id):
+        self.actions.append("place")
         item = ProtectiveOrder(
             symbol=symbol,
             side=side,
@@ -52,6 +61,7 @@ class _Broker:
         return item
 
     def cancel_protective_stop(self, *, symbol, order_id, client_id):
+        self.actions.append("cancel")
         self.cancelled.append(order_id)
         return ProtectiveOrder(
             symbol=symbol,
@@ -123,6 +133,7 @@ def test_entry_stop_is_durable_before_native_side_effect_and_confirmed_after_fil
 
 def test_partial_fill_resizes_and_replaces_native_stop() -> None:
     service, broker, _manager = _service()
+    broker.position_quantity = 0.4
     order = _order()
     service.prepare_entry("active_income", order, NOW)
     service.on_fill("active_income", order, 1.0, NOW)
@@ -134,6 +145,125 @@ def test_partial_fill_resizes_and_replaces_native_stop() -> None:
     assert resized.protected_quantity == pytest.approx(0.4)
     assert broker.cancelled == ["native-1"]
     assert [item.qty for item in broker.placed] == [1.0, 0.4]
+    assert broker.actions == ["place", "place", "cancel"]
+
+
+def test_scale_in_protects_only_uncovered_position_quantity() -> None:
+    service, broker, manager = _service()
+    first = _order()
+    second = replace(first, order_id="entry-2")
+    service.prepare_entry("active_income", first, NOW)
+    service.on_fill("active_income", first, 1.0, NOW)
+    service.prepare_entry("active_income", second, NOW)
+    service.on_fill("active_income", second, 1.4, NOW)
+    assert [item.qty for item in broker.placed] == pytest.approx([1.0, 0.4])
+    assert sum(stop.protected_quantity for stop in manager.active()) == pytest.approx(1.4)
+
+
+def test_partial_close_preserves_old_stop_until_replacement_is_confirmed() -> None:
+    service, broker, manager = _service()
+    broker.position_quantity = 0.4
+    entry = _order()
+    service.prepare_entry("active_income", entry, NOW)
+    service.on_fill("active_income", entry, 1.0, NOW)
+    service.on_fill("active_income", _order(reduce_only=True), 0.4, NOW)
+    assert broker.actions == ["place", "place", "cancel"]
+    assert broker.placed[0].client_id != broker.placed[1].client_id
+    assert sum(stop.protected_quantity for stop in manager.active()) == pytest.approx(0.4)
+
+
+def test_accepted_stop_timeout_is_recovered_after_restart_without_resubmission() -> None:
+    service, broker, manager = _service()
+    order = _order()
+    service.prepare_entry("active_income", order, NOW)
+    place = broker.place_protective_stop
+
+    def accepted_timeout(**kwargs):
+        place(**kwargs)
+        raise TimeoutError("response lost after exchange acceptance")
+
+    broker.place_protective_stop = accepted_timeout
+    with pytest.raises(ProtectiveStopError):
+        service.on_fill("active_income", order, 1.0, NOW)
+    restarted, _, _ = _service(broker=broker, manager=StopManager(manager.store))
+    recovered = restarted.on_fill("active_income", order, 1.0, NOW)
+    assert recovered.status is StopStatus.PROTECTED
+    assert len(broker.placed) == 1
+
+
+def test_failed_replacement_retains_previous_exchange_identity() -> None:
+    service, broker, manager = _service()
+    order = _order()
+    service.prepare_entry("active_income", order, NOW)
+    service.on_fill("active_income", order, 1.0, NOW)
+
+    def unavailable(**kwargs):
+        raise TimeoutError("exchange unavailable")
+
+    broker.place_protective_stop = unavailable
+    with pytest.raises(ProtectiveStopError):
+        service.on_fill("active_income", order, 0.4, NOW)
+    pending = StopManager(manager.store).for_entry_order(order.order_id)[0]
+    assert pending.previous_native_order_id == "native-1"
+    assert pending.previous_native_client_id == broker.placed[0].client_id
+    assert pending.submission_attempted is True
+    assert broker.cancelled == []
+    with pytest.raises(ProtectiveStopError, match="blocks new entry risk"):
+        service.prepare_entry("active_income", replace(order, order_id="entry-2"), NOW)
+
+
+def test_trigger_during_replacement_does_not_certify_protection() -> None:
+    service, broker, manager = _service()
+    broker.position_quantity = 0.4
+    order = _order()
+    service.prepare_entry("active_income", order, NOW)
+    service.on_fill("active_income", order, 1.0, NOW)
+    cancel = broker.cancel_protective_stop
+
+    def triggered(**kwargs):
+        return replace(cancel(**kwargs), status=ProtectiveOrderStatus.TRIGGERED)
+
+    broker.cancel_protective_stop = triggered
+    with pytest.raises(ProtectiveStopError, match="trigger race"):
+        service.on_fill("active_income", order, 0.4, NOW)
+    unresolved = manager.for_entry_order(order.order_id)[0]
+    assert unresolved.status is StopStatus.CONFIRMATION_FAILED
+    assert unresolved.previous_native_order_id == "native-1"
+    assert unresolved.native_order_id == "native-2"
+    assert broker.actions == ["place", "place", "cancel"]
+
+
+def test_changed_exchange_position_keeps_previous_protection_and_blocks_entry() -> None:
+    service, broker, manager = _service()
+    order = _order()
+    service.prepare_entry("active_income", order, NOW)
+    service.on_fill("active_income", order, 1.0, NOW)
+    broker.position_quantity = 0.2
+    with pytest.raises(ProtectiveStopError, match="position changed"):
+        service.on_fill("active_income", order, 0.4, NOW)
+    assert broker.cancelled == []
+    assert manager.for_entry_order(order.order_id)[0].previous_native_order_id == "native-1"
+
+
+@pytest.mark.parametrize("field", ["quantity", "trigger_price", "protected_quantity"])
+def test_nonfinite_stop_values_cannot_certify_coverage(field) -> None:
+    service, _, _ = _service()
+    stop = service.prepare_entry("active_income", _order(), NOW)
+    with pytest.raises(ValueError, match="finite"):
+        replace(stop, **{field: float("nan")})
+
+
+def test_flat_recovery_cancels_both_orders_after_interrupted_replacement() -> None:
+    service, broker, manager = _service()
+    order = _order()
+    service.prepare_entry("active_income", order, NOW)
+    service.on_fill("active_income", order, 1.0, NOW)
+    with pytest.raises(ProtectiveStopError, match="position changed"):
+        service.on_fill("active_income", order, 0.4, NOW)
+    restarted, _, refreshed = _service(broker=broker, manager=StopManager(manager.store))
+    restarted.on_fill("active_income", _order(reduce_only=True), 0.0, NOW)
+    assert set(broker.cancelled) == {"native-1", "native-2"}
+    assert refreshed.active() == ()
 
 
 def test_futures_entry_without_trigger_fails_before_exchange_side_effect() -> None:
@@ -199,6 +329,10 @@ def test_unknown_algo_update_is_not_silently_ignored() -> None:
 
 def test_reconcile_cancels_orphaned_native_stop_after_position_is_flat() -> None:
     class Positions:
+        @staticmethod
+        def reload():
+            pass
+
         @staticmethod
         def get(_portfolio_id, _instrument_id):
             return type("Position", (), {"quantity": 0.0})()

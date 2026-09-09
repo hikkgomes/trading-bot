@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import json
+from dataclasses import replace
 
 import pandas as pd
 import pytest
@@ -724,13 +725,21 @@ def test_default_executor_registry_covers_every_promotable_source_type() -> None
         assert callable(builders.builder_for(source_type))
 
 
-def test_real_registered_candidate_completes_adaptive_canonical_stages(tmp_path) -> None:
+def test_real_registered_candidate_completes_adaptive_canonical_stages(
+    tmp_path, monkeypatch
+) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'research.sqlite3'}")
     database.create_schema()
     thesis = _thesis(budget=1)
     SqlThesisRegistry(database.engine).register(thesis)
     rows = [
         {
+            "timestamp": (
+                dt.datetime(2026, 1, 1, tzinfo=dt.UTC) + dt.timedelta(days=index)
+            ).isoformat(),
+            "instrument_id": "BTCUSDT",
+            "funding_events": [],
+            "funding_available": True,
             "open": (160.0 - index) if index < 60 else (40.0 + index),
             "high": (161.0 - index) if index < 60 else (41.0 + index),
             "low": (159.0 - index) if index < 60 else (39.0 + index),
@@ -753,6 +762,10 @@ def test_real_registered_candidate_completes_adaptive_canonical_stages(tmp_path)
     data = {
         "market_frame": rows,
         "returns": returns,
+        "initial_cash": 1000.0,
+        "maximum_position": 0.1,
+        "leverage": 1.0,
+        "funding_available": True,
         "fee_bps": 0.0,
         "slippage_bps": 0.0,
         "funding_rate": 0.0,
@@ -892,23 +905,36 @@ def test_real_registered_candidate_completes_adaptive_canonical_stages(tmp_path)
     )
     results = []
     for stage in ("screening", "development", "robustness"):
-        result = evaluator.evaluate(
-            EvaluationRequest(
-                candidate_id=candidate.candidate_id,
-                evaluation_policy_id="canonical",
-                dataset_snapshot_ids=(snapshot_id,),
-                requested_stage=stage,
-                evaluated_at=NOW,
-                code_hash=candidate.definition.source_hash,
-                feature_manifest_id=feature_id,
-                cost_model_id=cost_id,
-                parameter_set_id=parameter_id,
-                evaluator_version="research-engine/v1",
-                producer_identity="test:canonical-research",
-                content_hash=canonical_hash({"stage": stage}),
-            )
+        request = EvaluationRequest(
+            candidate_id=candidate.candidate_id,
+            evaluation_policy_id="canonical",
+            dataset_snapshot_ids=(snapshot_id,),
+            requested_stage=stage,
+            evaluated_at=NOW,
+            code_hash=candidate.definition.source_hash,
+            feature_manifest_id=feature_id,
+            cost_model_id=cost_id,
+            parameter_set_id=parameter_id,
+            evaluator_version="research-engine/v1",
+            producer_identity="test:canonical-research",
+            content_hash=canonical_hash({"stage": stage}),
         )
+        if stage == "screening":
+
+            def unavailable(*_args, **_kwargs):
+                raise ValueError("executor input unavailable")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(executors, "execute", unavailable)
+                blocked = evaluator.evaluate(request)
+            assert blocked.deferred and not blocked.accepted
+            assert evaluator.validation.stages(candidate.candidate_id) == ()
+        result = evaluator.evaluate(request)
         assert result.accepted, f"{result.reason_code}: {result.evidence}"
+        run_count = len(store.runs(candidate.candidate_id))
+        replay = evaluator.evaluate(replace(request, evaluated_at="2026-08-24T00:00:00+00:00"))
+        assert replay.run_id == result.run_id
+        assert len(store.runs(candidate.candidate_id)) == run_count
         results.append(result)
     assert [result.stage for result in results] == ["screening", "development", "robustness"]
     assert all(result.accepted for result in results)

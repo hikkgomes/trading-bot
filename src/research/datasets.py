@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -13,7 +14,7 @@ from sqlalchemy import insert, select
 from sqlalchemy.engine import Engine
 
 from src.data.database import dataset_bundle, dataset_snapshot, universe_snapshot
-from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
+from src.domain._codec import canonical_hash, json_value, non_empty, timeframe_seconds, timestamp
 from src.products.btc_accumulation import BTC_SPOT_INSTRUMENT_ID
 
 
@@ -159,6 +160,7 @@ class CandidateDatasetPlan:
     cost_model_id: str
     parameter_set_id: str
     forward_snapshot_ids: tuple[str, ...] = ()
+    timeframe: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "product_id", non_empty(self.product_id, field="product_id"))
@@ -219,6 +221,7 @@ class CandidateDatasetPlan:
 
     def to_payload(self) -> dict[str, Any]:
         return {
+            **({"timeframe": self.timeframe} if self.timeframe is not None else {}),
             "screening_snapshot_ids": list(self.screening_snapshot_ids),
             "development_snapshot_ids": list(self.development_snapshot_ids),
             "robustness_snapshot_ids": list(self.robustness_snapshot_ids),
@@ -254,6 +257,7 @@ class CandidateDatasetPlan:
             feature_manifest_id=bundle.feature_manifest_id,
             cost_model_id=bundle.cost_model_id,
             parameter_set_id=bundle.parameter_set_id,
+            timeframe=bundle.timeframe,
         )
 
     @classmethod
@@ -271,6 +275,7 @@ class CandidateDatasetPlan:
             feature_manifest_id=str(payload["feature_manifest_id"]),
             cost_model_id=str(payload["cost_model_id"]),
             parameter_set_id=str(payload["parameter_set_id"]),
+            timeframe=payload.get("timeframe"),
         )
 
 
@@ -290,6 +295,7 @@ class DatasetBundle:
     instrument_scope: tuple[str, ...]
     lifecycle_state: DatasetLifecycleState = DatasetLifecycleState.READY
     source_partition_hashes: tuple[str, ...] = ()
+    timeframe: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "bundle_id", _identity(self.bundle_id, field="bundle_id"))
@@ -339,6 +345,7 @@ class DatasetBundle:
     @property
     def content(self) -> dict[str, Any]:
         return {
+            **({"timeframe": self.timeframe} if self.timeframe is not None else {}),
             "schema": "platform.dataset_bundle/v1",
             "product_id": self.product_id,
             "stage_snapshot_ids": dict(self.stage_snapshot_ids),
@@ -359,6 +366,19 @@ class DatasetBundle:
 
     def to_payload(self) -> dict[str, Any]:
         return {"bundle_id": self.bundle_id, "content_hash": self.content_hash, **self.content}
+
+
+def _bundle_timing(payloads: Mapping[str, Any]) -> dict[str, Any]:
+    timeframes = {
+        data.get("timeframe") if isinstance(data, Mapping) else None for data in payloads.values()
+    }
+    if len(timeframes) != 1:
+        raise DatasetResolutionError("dataset bundle timeframes must agree")
+    timeframe = next(iter(timeframes))
+    if timeframe is None:
+        return {}
+    timeframe_seconds(timeframe)
+    return {"timeframe": timeframe}
 
 
 def _bar_timestamp(value: Any, *, field: str) -> str:
@@ -464,7 +484,7 @@ class CanonicalResearchDatasetBuilder:
             payload = {"snapshot_id": snapshot_id, **metadata, "payload": data}
             snapshots[role] = snapshot_id
             snapshot_payloads[role] = payload
-        bundle_payload = {
+        bundle_payload: dict[str, Any] = {
             "schema": "platform.dataset_bundle/v1",
             "product_id": product_id,
             "stage_snapshot_ids": snapshots,
@@ -478,6 +498,7 @@ class CanonicalResearchDatasetBuilder:
             "lifecycle_state": state.value,
             "source_partition_hashes": list(source_partition_hashes),
         }
+        bundle_payload.update(_bundle_timing(payload_by_role))
         bundle_id = canonical_hash(bundle_payload)
         bundle = DatasetBundle(
             bundle_id=bundle_id,
@@ -492,6 +513,7 @@ class CanonicalResearchDatasetBuilder:
             instrument_scope=scope,
             lifecycle_state=state,
             source_partition_hashes=tuple(source_partition_hashes),
+            timeframe=bundle_payload.get("timeframe"),
         )
         with self.engine.begin() as connection:
             for role in sorted(roles):
@@ -535,6 +557,7 @@ class CanonicalResearchDatasetBuilder:
         timeframe: str | None = None,
         engine_version: str | None = None,
         source_partition_hashes: tuple[str, ...] = (),
+        warmup_bars: int = 200,
     ) -> DatasetBundle:
         """Build stage snapshots from immutable, availability-stamped bar rows.
 
@@ -570,7 +593,14 @@ class CanonicalResearchDatasetBuilder:
                 raise DatasetResolutionError(
                     f"dataset data_pending: missing instruments for role {role}: {', '.join(missing)}"
                 )
-            payload_by_role[role] = self._bar_payload(selected, timeframe=timeframe)
+            warmup = _prior_bars(
+                materialised,
+                before=interval["start"],
+                scope=scope,
+                limit=warmup_bars,
+                created=created,
+            )
+            payload_by_role[role] = self._bar_payload(selected, timeframe=timeframe, warmup=warmup)
             availability[role] = created
         return self.build(
             product_id,
@@ -588,7 +618,12 @@ class CanonicalResearchDatasetBuilder:
         )
 
     @staticmethod
-    def _bar_payload(rows: list[dict[str, Any]], *, timeframe: str | None = None) -> dict[str, Any]:
+    def _bar_payload(
+        rows: list[dict[str, Any]],
+        *,
+        timeframe: str | None = None,
+        warmup: tuple[dict[str, Any], ...] = (),
+    ) -> dict[str, Any]:
         market_frame = sorted(
             (dict(row) for row in rows),
             key=lambda row: (
@@ -600,7 +635,7 @@ class CanonicalResearchDatasetBuilder:
         funding_period_rates: list[float] = []
         funding_timestamps: list[str] = []
         previous_by_instrument: dict[str, float] = {}
-        history_by_instrument: dict[str, list[float]] = {}
+        history_by_instrument = _warmup_prices(warmup)
         returns_by_instrument: dict[str, list[float]] = {}
         panels_by_time: dict[str, dict[str, dict[str, float]]] = {}
         feature_rows: list[dict[str, Any]] = []
@@ -616,15 +651,9 @@ class CanonicalResearchDatasetBuilder:
             funding_rate = _signed_numeric(row.get("funding_rate", row.get("funding")), default=0.0)
             funding_rates.append(funding_rate)
             funding_period_rates.append(funding_rate if row.get("funding_event") is True else 0.0)
-            if row.get("funding_event") is True:
-                funding_timestamps.append(
-                    str(
-                        row.get(
-                            "funding_timestamp",
-                            row.get("close_timestamp", row.get("timestamp")),
-                        )
-                    )
-                )
+            funding_timestamps.extend(
+                str(event["timestamp"]) for event in row.get("funding_events", ())
+            )
             feature_rows.append(
                 _bar_feature_row(
                     row,
@@ -652,7 +681,9 @@ class CanonicalResearchDatasetBuilder:
         single_instrument_returns = next(iter(returns_by_instrument.values()), [])
         return {
             "bars": market_frame,
+            "timeframe": timeframe,
             "market_frame": market_frame,
+            "warmup_market_frame": list(warmup),
             # Directional strategies consume a single instrument series. A
             # panel gets an equal-weight time series by timestamp, which keeps
             # cross-instrument rows from becoming false sequential returns.
@@ -661,8 +692,11 @@ class CanonicalResearchDatasetBuilder:
                 if len(returns_by_instrument) == 1
                 else _panel_returns(panels_by_time)
             ),
-            "funding_rates": funding_rates,
-            "funding_period_rates": funding_period_rates,
+            "funding_rates": funding_rates if _funding_available(market_frame) else None,
+            "funding_period_rates": funding_period_rates
+            if _funding_available(market_frame)
+            else None,
+            "funding_available": _funding_available(market_frame),
             "funding_timestamps": funding_timestamps,
             "symbol_returns": returns_by_instrument,
             "feature_rows": feature_rows,
@@ -672,7 +706,8 @@ class CanonicalResearchDatasetBuilder:
             "linked_instruments": linked,
             "cross_sectional_history": cross_sectional_history,
             "linked_instrument_history": linked_history,
-            "independent_units": len(market_frame),
+            "sample_unit": "calendar_interval",
+            "calendar_observations": len(panels_by_time),
             "data_quality": {
                 "rows": len(market_frame),
                 "instruments": sorted(
@@ -793,7 +828,17 @@ class CanonicalResearchDatasetBuilder:
             return False
         observed_at = _bar_timestamp(observed, field=f"{role}.bar_timestamp")
         available_at = _bar_timestamp(available, field=f"{role}.availability_time")
-        return interval["start"] <= observed_at < interval["end"] and available_at <= created
+        source_available = _bar_timestamp(
+            row.get("source_availability_time", available_at), field="source_availability_time"
+        )
+        decision_at = _bar_timestamp(
+            row.get("decision_timestamp", observed_at), field="decision_timestamp"
+        )
+        return (
+            interval["start"] <= observed_at < interval["end"]
+            and available_at <= created
+            and source_available <= decision_at
+        )
 
     @staticmethod
     def _bar_sort_key(row: Mapping[str, Any]) -> tuple[str, str]:
@@ -899,6 +944,47 @@ def _cadence_interval_seconds(value: str) -> int:
     return count * units[text[-1]]
 
 
+def _funding_available(rows: list[dict[str, Any]]) -> bool:
+    return bool(rows) and all(
+        row.get("funding_rate", row.get("funding")) is not None for row in rows
+    )
+
+
+def _prior_bars(
+    rows: tuple[dict[str, Any], ...], *, before: str, scope: set[str], limit: int, created: str
+) -> tuple[dict[str, Any], ...]:
+    if limit < 0:
+        raise DatasetResolutionError("warmup bar count cannot be negative")
+    grouped: dict[str, deque[dict[str, Any]]] = {}
+    for row in sorted(rows, key=CanonicalResearchDatasetBuilder._bar_sort_key):
+        instrument = str(row.get("instrument_id") or row.get("symbol") or "")
+        observed = str(row.get("close_timestamp", row.get("timestamp", "")))
+        available = str(
+            row.get(
+                "source_availability_time",
+                row.get("availability_time", row.get("available_at", observed)),
+            )
+        )
+        received = str(row.get("availability_time", row.get("available_at", observed)))
+        if (
+            instrument in scope
+            and observed < before
+            and available <= observed
+            and received <= created
+            and limit
+        ):
+            grouped.setdefault(instrument, deque(maxlen=limit)).append(row)
+    return tuple(row for values in grouped.values() for row in values)
+
+
+def _warmup_prices(rows: tuple[dict[str, Any], ...]) -> dict[str, list[float]]:
+    result: dict[str, list[float]] = {}
+    for row in rows:
+        symbol = str(row.get("instrument_id") or row.get("symbol") or "")
+        result.setdefault(symbol, []).append(_numeric_close(row["close"]))
+    return result
+
+
 def _bar_feature_row(
     row: Mapping[str, Any],
     close: float,
@@ -917,7 +1003,11 @@ def _bar_feature_row(
         "instrument_id": instrument_id,
         "timestamp": row.get("close_timestamp", row.get("timestamp")),
         "bar_return": row_return,
-        "trend": row_return,
+        "trend": close / recent[-1] - 1.0 if recent else row_return,
+        "availability_time": row.get(
+            "source_availability_time", row.get("availability_time", row.get("timestamp"))
+        ),
+        "warmup_observations": len(history),
         "breakout": close / prior_high - 1.0 if prior_high > 0.0 else 0.0,
         "normalised_price_deviation": deviation,
         "oscillator": deviation,
@@ -1132,6 +1222,7 @@ class SqlDatasetBundleRepository:
             instrument_scope=tuple(record["instrument_scope"]),
             lifecycle_state=DatasetLifecycleState(str(record.get("lifecycle_state", "ready"))),
             source_partition_hashes=tuple(record.get("source_partition_hashes", ())),
+            timeframe=record.get("timeframe"),
         )
         if bundle.bundle_id != bundle_id or bundle.content_hash != str(payload["content_hash"]):
             raise DatasetResolutionError("dataset bundle content hash is invalid")

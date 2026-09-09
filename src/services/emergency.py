@@ -15,6 +15,7 @@ from src.domain.orders import OrderIntent, OrderSide, OrderStatus, OrderType
 from src.execution.live_exchange import bounded_client_order_id
 from src.execution.order_manager import OrderManager
 from src.execution.position_manager import PositionManager
+from src.execution.recovery import RecoveryAction, RecoveryActionType
 from src.services.alerting import AlertSeverity, SqlAlertService
 from src.services.scheduler import DatabaseJobQueue
 
@@ -34,6 +35,7 @@ class DatabaseEmergencyFlattenWorker:
         lease_seconds: int = 60,
         alerts: SqlAlertService | None = None,
         reconcile_product: Callable[[str], Any] | None = None,
+        recover_action: Callable[[str, RecoveryAction], Mapping[str, Any]] | None = None,
     ) -> None:
         self.queue = queue
         self.worker_id = worker_id
@@ -44,6 +46,7 @@ class DatabaseEmergencyFlattenWorker:
         self.lease_seconds = lease_seconds
         self.alerts = alerts
         self.reconcile_product = reconcile_product
+        self.recover_action = recover_action
 
     def run_once(self, *, now: str) -> dict[str, Any]:
         claimed = self.queue.claim(
@@ -201,8 +204,9 @@ class DatabaseEmergencyFlattenWorker:
                     now=now,
                     payload={**action_context, "orders": flattened},
                 )
+        self._recover_reductions(flattened)
         post_exchange_states = self._refresh_exchange_state(product_ids)
-        self._sync_local_positions(post_exchange_states)
+        self.positions.reload()
         reconciled, reconciliation_detail = self._reconcile_action_state(
             name=name,
             product_ids=product_ids,
@@ -528,7 +532,7 @@ class DatabaseEmergencyFlattenWorker:
                     **exchange_detail,
                 }
             elif state is not None:
-                matched = exchange_ready
+                matched = exchange_ready and self._local_positions_match(product_id, state)
                 detail = {"matched": matched, **exchange_detail}
             else:
                 matched = False
@@ -635,7 +639,13 @@ class DatabaseEmergencyFlattenWorker:
             valid_positions = False
             flat = False
         no_open_orders = isinstance(orders, list | tuple) and not orders
-        no_conditionals = isinstance(conditionals, list | tuple) and not conditionals
+        no_conditionals = isinstance(conditionals, list | tuple) and (
+            not conditionals
+            or (
+                not require_flat
+                and all(_order_value(order, "reduce_only") is True for order in conditionals)
+            )
+        )
         no_unknown = state.get("unknown_exposure") == {}
         ready = (
             authenticated and valid_positions and no_open_orders and no_conditionals and no_unknown
@@ -874,7 +884,7 @@ class DatabaseEmergencyFlattenWorker:
             self.order_manager.create(intent)
             self.order_manager.persist_for_submission(intent.order_id)
             try:
-                acknowledgement = venue.submit(intent)
+                acknowledgement = venue.submit(self.order_manager.get(intent.order_id))
             except Exception as exc:
                 self.order_manager.recovery_required(intent.order_id)
                 self._enqueue_order_recovery(product_id=product_id, order=intent, now=now)
@@ -1050,32 +1060,32 @@ class DatabaseEmergencyFlattenWorker:
         del product_id
         return abs(quantity)
 
-    def _sync_local_positions(self, exchange_states: Mapping[str, Mapping[str, Any]]) -> None:
-        """Adopt the authenticated post-action inventory before declaring flat."""
+    def _recover_reductions(self, orders: Sequence[Mapping[str, Any]]) -> None:
+        if self.recover_action is None:
+            return
+        for order in orders:
+            self.recover_action(
+                str(order["product_id"]),
+                RecoveryAction(
+                    RecoveryActionType.RECONCILE_ORDER,
+                    str(order["order_id"]),
+                ),
+            )
+        self.order_manager.reload()
 
-        for product_id, state in exchange_states.items():
-            venue = self.venues.get(product_id)
-            product = self.products.get(product_id)
-            if venue is None or product is None or not isinstance(state.get("positions"), Mapping):
-                continue
-            raw_positions = state["positions"]
-            for instrument_id, instrument in venue.instruments.items():
-                quantity = raw_positions.get(
-                    instrument_id, raw_positions.get(instrument.exchange_symbol, 0.0)
-                )
-                try:
-                    quantity = float(quantity)
-                except (TypeError, ValueError):
-                    continue
-                if not math.isfinite(quantity):
-                    continue
-                self.positions.reconcile_position(
-                    portfolio_id=str(product.get("portfolio_id") or ""),
-                    instrument_id=instrument_id,
-                    quantity=quantity,
-                    average_entry_price=0.0,
-                    updated_at=dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
-                )
+    def _local_positions_match(self, product_id: str, state: Mapping[str, Any]) -> bool:
+        raw = state.get("positions")
+        if not isinstance(raw, Mapping):
+            return False
+        portfolio = str(self.products[product_id]["portfolio_id"])
+        return all(
+            abs(
+                self.positions.get(portfolio, identity).quantity
+                - float(raw.get(identity, raw.get(instrument.exchange_symbol, 0)))
+            )
+            <= 1e-12
+            for identity, instrument in self.venues[product_id].instruments.items()
+        )
 
     def _emit_alert(
         self,

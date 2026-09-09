@@ -6,8 +6,8 @@ Guidance for coding agents working in this repository.
 
 This repo is now an autonomous crypto trading framework for a light Linux
 server. The production authority is the PostgreSQL platform supervisor in
-`src.services.supervisor`, configured by `config/platform.json`. The legacy
-autopilot modules remain safety and research libraries used by that runtime.
+`src.services.supervisor`, configured by `config/platform.json`. The file-based
+autopilot and old search/execution entry points have been retired.
 
 Products:
 
@@ -20,22 +20,20 @@ Products:
   researches eligible altcoins into symbol-isolated candidate artifacts that
   cannot activate until the exact product/symbol is explicitly configured.
 
-The mandatory live gate is enforced in code: no new or changed strategy may run
-live unless its behavior fingerprint is explicitly approved in
-`runtime/approvals.json`. Approval is also bound to the artifact path and product
-identity, including symbol. Live products require a fresh matching preflight
-report by default.
+Live authority is held in PostgreSQL, with explicit human approval bound to the
+artefact, account, environment, instrument scope, capital, code and configuration.
+A current matching preflight is required. Research and paper progression never
+grant live approval.
 
 ## Safe Commands
 
 ```bash
 make test
-make lint-autopilot
-make autopilot-validate
-make readiness
-make autopilot-once
-make report
-make artifact-hygiene
+make lint
+make platform-validate
+make platform-readiness
+make platform-process-once
+make platform-report
 make control ARGS="status"
 ```
 
@@ -50,30 +48,21 @@ belong in `runtime/quarantine`, not beside active runtime files in `outputs`.
 
 ## Research Workflow
 
-Preferred research path is `research_exploration/`, documented in
-`docs/RESEARCH_WORKFLOW.md`. The autopilot can run cheap synthetic research
-smokes and bounded real-data research cycles. Exported candidates still remain
-paper-only until review and explicit approval.
-
-The legacy search modules (`src.strategy_search`, `src.day_trade_search`) remain
-available for manual experiments, but heavy searches, dataset rebuilds, and model
-training are expensive. Do not run them without explicit user approval.
+Use the canonical research workflow in `docs/RESEARCH_WORKFLOW.md`. Adaptive
+research and frozen evaluation run under separate restricted service roles. Historical
+imports are read-only evidence, not promotable strategies. Heavy searches,
+dataset rebuilds and model training require explicit user approval.
 
 ## Execution Notes
 
-`src/run_bot.py` is the closed-candle executor used by paper and live broker
-paths. It validates artifact risk and fee blocks at load time, enforces daily
-trade limits, one open position per product/symbol, daily loss stops,
-consecutive-loss cooldowns, drift checks, and product-aware spot/futures routing.
+`src.services.order_execution` routes approved intents to paper or live venues.
+`src.services.financial_application` applies fills, positions, fees and PnL as
+one transaction. Native protection and emergency recovery use these records.
 
-Runtime state, reports, approval ledgers, alerts, and quarantined files live
-under `runtime/`. Strategy artifacts, when present, are:
-
-- `outputs/active_strategies_position.json` for BTC accumulation.
-- `outputs/active_strategies_flow.json` for active income.
-
-Missing paper artifacts are a safe waiting state. Missing live artifacts are a
-hard failure.
+PostgreSQL owns assignments, approvals, orders, financial state and reports.
+Market and strategy files live in the configured `data/` stores. `runtime/`
+contains local operational state and quarantine. Missing paper artefacts are a
+safe waiting state; missing live authority is a hard failure.
 
 ## Constraints
 
@@ -81,5 +70,5 @@ hard failure.
 - Keep fees, slippage, TP/SL, risk, and holdout gates in all execution artifacts.
 - Keep generated data and old research outputs out of git.
 - Prefer small, tested changes. Run focused tests first, then `make
-  lint-autopilot`, `make platform-validate`, full `pytest`, and
+  lint`, `make platform-validate`, full `pytest`, and
   `make platform-smoke` for platform changes.

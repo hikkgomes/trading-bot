@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, cast
 
-from src.domain._codec import canonical_hash, json_value, non_empty
+from src.domain._codec import canonical_hash, json_value, non_empty, to_primitive
+from src.strategies.position_state import (
+    PositionPath,
+    PositionRules,
+    PositionState,
+    position_path,
+    position_step,
+)
 
 
 class StrategyBehaviourError(ValueError):
@@ -28,10 +35,10 @@ class TypedRuleBehaviour:
     """Immutable typed-rule behaviour shared by research and production."""
 
     rule: Mapping[str, Any]
-    contract_version: str = "typed_rule/v1"
+    contract_version: str = "typed_rule/v2"
 
     def __post_init__(self) -> None:
-        if self.contract_version != "typed_rule/v1":
+        if self.contract_version != "typed_rule/v2":
             raise StrategyBehaviourError("unsupported typed-rule behaviour contract")
         if not isinstance(self.rule, Mapping):
             raise StrategyBehaviourError("typed strategy rule must be an object")
@@ -97,10 +104,13 @@ class TypedRuleBehaviour:
             raise StrategyBehaviourError("typed strategy feature value is not finite")
         if direction in {"signed", "market_neutral", "hedged"}:
             magnitude = abs(threshold)
-            long_operator = str(self.rule.get("positive_operator") or "gt")
-            short_operator = str(self.rule.get("negative_operator") or "lt")
-            long_threshold = float(self.rule.get("positive_threshold", magnitude))
-            short_threshold = float(self.rule.get("negative_threshold", -magnitude))
+            operator = str(self.rule["operator"])
+            opposite = {"gt": "lt", "ge": "le", "lt": "gt", "le": "ge"}[operator]
+            boundary = -magnitude if operator in {"lt", "le"} else magnitude
+            long_operator = str(self.rule.get("positive_operator") or operator)
+            short_operator = str(self.rule.get("negative_operator") or opposite)
+            long_threshold = float(self.rule.get("positive_threshold", boundary))
+            short_threshold = float(self.rule.get("negative_threshold", -boundary))
             _validate_operator(long_operator, field="positive_operator")
             _validate_operator(short_operator, field="negative_operator")
             if not math.isfinite(long_threshold) or not math.isfinite(short_threshold):
@@ -262,6 +272,7 @@ class RegisteredStrategyBehaviour:
     source_hash: str
     contract_version: str = "registered_strategy/v1"
     verify_source_identity: bool = False
+    position_model: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", non_empty(self.name, field="strategy_name"))
@@ -303,6 +314,11 @@ class RegisteredStrategyBehaviour:
             name=name,
             parameters=parameters,
             source_hash=source_hash,
+            position_model=(
+                definition.get("position_model", {})
+                if isinstance(definition, Mapping)
+                else getattr(definition, "position_model", {})
+            ),
             verify_source_identity=(
                 isinstance(metadata, Mapping) and metadata.get("executable_registry_entry") is True
             ),
@@ -316,6 +332,7 @@ class RegisteredStrategyBehaviour:
                 "strategy_name": self.name,
                 "parameters": self.parameters,
                 "source_hash": self.source_hash,
+                "position_model": self.position_model,
             }
         )
 
@@ -352,8 +369,24 @@ class RegisteredStrategyBehaviour:
         return values
 
     def latest_signal(self, frame: Any) -> int:
-        values = self.generate_signals(frame)
+        values = self.decision_path(frame).decisions
         return values[-1] if values else 0
+
+    def position_rules(self) -> PositionRules:
+        from src.strategies.registry import get
+
+        defaults = cast(Any, get(self.name)).default_config()
+        return PositionRules(
+            stop_loss=float(self.position_model.get("stop_loss", defaults.stop_loss)),
+            take_profit=float(self.position_model.get("take_profit", defaults.take_profit)),
+            horizon_bars=int(self.position_model.get("horizon_bars", defaults.horizon_bars)),
+        )
+
+    def decision_path(self, frame: Any, warmup: Any = ()) -> PositionPath:
+        rows = self.frame_payload(frame)
+        history = self.frame_payload(warmup) if warmup else ()
+        signals = self.generate_signals((*history, *rows))[len(history) :]
+        return position_path(rows, signals, self.position_rules())
 
     def frame_payload(self, frame: Any) -> tuple[dict[str, Any], ...]:
         if hasattr(frame, "to_dict"):
@@ -386,17 +419,49 @@ class RegisteredStrategyBehaviour:
             }
         )
 
-    def parity_receipt(self, frame: Any) -> Mapping[str, Any]:
+    def parity_receipt(
+        self, frame: Any, prior_state: Mapping[str, Any] | None = None, *, warmup: Any = ()
+    ) -> Mapping[str, Any]:
         """Return a deterministic bar-by-bar receipt for runtime parity."""
 
-        signals = self.generate_signals(frame)
+        path = (
+            self.decision_path(frame, warmup)
+            if prior_state is None
+            else self._resume_path(frame, prior_state)
+        )
+        signals = path.decisions
         payload = {
             "schema": "registered_strategy_parity/v1",
             "behaviour_hash": self.behaviour_hash,
             "input_hash": self.frame_input_hash(frame),
             "signals": list(signals),
+            "position_actions": to_primitive(path.actions),
+            "position_state": to_primitive(path.state),
+            "position_rules": to_primitive(self.position_rules()),
+            "entry_signal": self.generate_signals(frame)[-1],
+            "prior_state_hash": canonical_hash(prior_state),
+            "prior_position_event_id": prior_state.get("position_event_id")
+            if prior_state
+            else None,
+            "warmup_input_hash": canonical_hash(warmup),
         }
         return {**payload, "receipt_hash": canonical_hash(payload)}
+
+    def _resume_path(self, frame: Any, prior: Mapping[str, Any]) -> PositionPath:
+        rows = self.frame_payload(frame)
+        state, actions = position_step(
+            PositionState(**prior["state"]),
+            entry_signal=int(prior["entry_signal"]),
+            bar=rows[-1],
+            index=len(rows) - 1,
+            rules=self.position_rules(),
+        )
+        decision = (
+            0
+            if any(action.kind == "exit" for action in actions)
+            else state.direction or self.generate_signals(frame)[-1]
+        )
+        return PositionPath((decision,), actions, state)
 
     @staticmethod
     def _signal(value: Any) -> int:
@@ -537,7 +602,31 @@ def _compare(value: float, operator: str, threshold: float) -> bool:
     }[operator]
 
 
+def economic_parity_receipt(definition: Any, receipt: Mapping[str, Any]) -> Mapping[str, Any]:
+    payload = {key: value for key, value in receipt.items() if key != "receipt_hash"}
+    payload["signal_contract_hash"] = payload.get("behaviour_hash")
+    payload["behaviour_hash"] = behaviour_hash_for_definition(definition)
+    return {**payload, "receipt_hash": canonical_hash(payload)}
+
+
 def behaviour_hash_for_definition(definition: Any) -> str:
+    fields = ("position_model", "execution_preferences", "risk_policy", "data_requirements")
+    contract = {
+        key: definition.get(key, {})
+        if isinstance(definition, Mapping)
+        else getattr(definition, key, {})
+        for key in fields
+    }
+    return canonical_hash(
+        {
+            "schema": "economic_behaviour/v2",
+            "signal": _signal_behaviour_hash(definition),
+            **contract,
+        }
+    )
+
+
+def _signal_behaviour_hash(definition: Any) -> str:
     """Return the behaviour identity without including deployment content."""
 
     signal_model = (

@@ -810,6 +810,13 @@ def _readiness_configuration(
         ),
     ]
     if live:
+        checks.append(
+            _check(
+                "independent_host_monitor_configured",
+                bool(os.environ.get("TRADING_PLATFORM_HEALTHCHECK_URL", "").strip()),
+                detail={"requires_external_missed_heartbeat_alert": True},
+            )
+        )
         alerting = config.alerting
         sink = str(alerting.get("sink") or "").strip().lower()
         webhook_configured = bool(os.environ.get("TRADING_PLATFORM_ALERT_WEBHOOK_URL", "").strip())
@@ -1796,7 +1803,9 @@ def _state_authority_detail(
     age = _record_age(current, observed_at)
     if age is None or age < 0:
         raise ValueError("canonical portfolio state timestamp is in the future")
-    maximum_age = float(state["maximum_state_age_seconds"])
+    if not _finite_number(state["maximum_state_age_seconds"]):
+        raise ValueError("canonical portfolio state age limit is not finite")
+    maximum_age = float(str(state["maximum_state_age_seconds"]))
     readiness_age = maximum_age if live else max(maximum_age, 600.0)
     source_ages = _state_source_ages(store, state, product_id, readiness_age, current)
     policy_ids = state.get("risk_policy_ids")

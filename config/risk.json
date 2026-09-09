@@ -1,5 +1,52 @@
 {
-  "schema": "risk/v1",
+  "schema": "risk/v2",
+  "notional_currency": "USDT",
+  "units": {
+    "global": {
+      "maximum_drawdown": "equity_fraction",
+      "maximum_database_staleness_seconds": "seconds",
+      "maximum_market_data_staleness_seconds": "seconds",
+      "maximum_clock_skew_seconds": "seconds"
+    },
+    "accounts": {
+      "maximum_drawdown": "equity_fraction",
+      "minimum_liquidation_buffer": "equity_fraction",
+      "maximum_margin_fraction": "equity_fraction",
+      "reject_unknown_exposure": "boolean"
+    },
+    "products": {
+      "maximum_daily_loss": "equity_fraction",
+      "maximum_exposure": "equity_fraction",
+      "maximum_gross": "equity_multiple",
+      "maximum_net": "equity_multiple",
+      "maximum_drawdown": "equity_fraction",
+      "maximum_margin_fraction": "equity_fraction"
+    },
+    "instrument": {
+      "maximum_fraction": "equity_fraction",
+      "maximum_slippage_bps": "basis_points",
+      "minimum_daily_quote_volume": "quote_notional_per_day",
+      "maximum_position_notional": "quote_notional",
+      "maximum_order_notional": "quote_notional",
+      "maximum_visible_depth_fraction": "visible_depth_fraction",
+      "maximum_volatility": "return_volatility_ratio"
+    },
+    "strategy": {
+      "maximum_fraction": "equity_fraction",
+      "maximum_drawdown": "equity_fraction",
+      "maximum_turnover_fraction": "equity_turnover_multiple_per_decision",
+      "maximum_trades_per_day": "count_per_day",
+      "maximum_slippage_bps": "basis_points",
+      "maximum_funding_cost_fraction": "equity_cost_fraction_per_settlement"
+    },
+    "sleeve": {
+      "maximum_fraction": "equity_fraction",
+      "maximum_correlation": "absolute_correlation",
+      "maximum_drawdown": "equity_fraction",
+      "maximum_abs_beta": "absolute_beta",
+      "maximum_turnover_fraction": "equity_turnover_multiple_per_decision"
+    }
+  },
   "global": {
     "maximum_drawdown": 0.2,
     "maximum_database_staleness_seconds": 30,

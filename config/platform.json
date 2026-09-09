@@ -26,8 +26,10 @@
         "ml-worker",
         "event-replay-worker",
         "agent-sandbox",
+        "agent-coordinator",
         "feature-build-worker",
-        "migration-service"
+        "migration-service",
+        "evaluation-worker"
       ]
     }
   ],
@@ -51,7 +53,8 @@
     "universe-service": 1,
     "platform-scheduler": 1,
     "account-reconciliation": 1,
-    "heavy-compute-slots": 1
+    "heavy-compute-slots": 1,
+    "evaluation-worker": 1
   },
   "network": {
     "transport": "local",
@@ -70,27 +73,84 @@
     "sql_pool_size": 2
   },
   "security_domains": {
-    "trading-runtime": ["market-gateway", "data-writer", "feature-service", "strategy-evaluator", "portfolio-engine", "portfolio-state-service", "risk-engine", "execution-engine", "paper-engine", "product-supervisor", "accounting-service", "account-reconciliation", "control-api"],
-    "trading-research": ["universe-service", "platform-scheduler", "promotion-engine", "research-worker", "ml-worker", "event-replay-worker", "feature-build-worker"],
-    "trading-agent": ["agent-sandbox"],
-    "trading-migration": ["migration-service"]
+    "trading-runtime": [
+      "market-gateway",
+      "data-writer",
+      "feature-service",
+      "strategy-evaluator",
+      "portfolio-engine",
+      "portfolio-state-service",
+      "risk-engine",
+      "execution-engine",
+      "paper-engine",
+      "product-supervisor",
+      "accounting-service",
+      "account-reconciliation",
+      "control-api",
+      "universe-service",
+      "platform-scheduler",
+      "promotion-engine"
+    ],
+    "trading-research": [
+      "research-worker",
+      "ml-worker",
+      "event-replay-worker",
+      "feature-build-worker",
+      "agent-coordinator"
+    ],
+    "trading-agent": [
+      "agent-sandbox"
+    ],
+    "trading-migration": [
+      "migration-service"
+    ],
+    "trading-evaluator": [
+      "evaluation-worker"
+    ]
   },
   "processes": {
-    "market-gateway": ["market-gateway"],
-    "data-writer": ["data-writer"],
+    "market-gateway": [
+      "market-gateway"
+    ],
+    "data-writer": [
+      "data-writer"
+    ],
     "trading-runtime": [
-      "feature-service", "strategy-evaluator", "product-supervisor",
-      "portfolio-engine", "portfolio-state-service", "risk-engine",
-      "execution-engine", "paper-engine", "accounting-service", "account-reconciliation"
+      "feature-service",
+      "strategy-evaluator",
+      "product-supervisor",
+      "portfolio-engine",
+      "portfolio-state-service",
+      "risk-engine",
+      "execution-engine",
+      "paper-engine",
+      "accounting-service",
+      "account-reconciliation"
     ],
-    "scheduler-operations": ["universe-service", "platform-scheduler", "promotion-engine"],
+    "scheduler-operations": [
+      "universe-service",
+      "platform-scheduler",
+      "promotion-engine"
+    ],
     "research-runtime": [
-      "research-worker", "ml-worker", "event-replay-worker",
-      "feature-build-worker"
+      "research-worker",
+      "ml-worker",
+      "event-replay-worker",
+      "feature-build-worker",
+      "agent-coordinator"
     ],
-    "agent-runtime": ["agent-sandbox"],
-    "control-api": ["control-api"],
-    "migration-service": ["migration-service"]
+    "agent-runtime": [
+      "agent-sandbox"
+    ],
+    "control-api": [
+      "control-api"
+    ],
+    "migration-service": [
+      "migration-service"
+    ],
+    "evaluation-runtime": [
+      "evaluation-worker"
+    ]
   },
   "logging": {
     "format": "json",
@@ -110,6 +170,7 @@
     "postgresql_schedule": "hourly",
     "parquet_schedule": "daily",
     "retention_days": 30,
+    "hourly_retention_hours": 24,
     "restore_test_schedule": "weekly",
     "maximum_age_seconds": 172800,
     "minimum_free_bytes": 536870912

@@ -27,13 +27,17 @@ class SqlRiskPolicyStore:
     def __init__(self, engine: Engine):
         self.engine = engine
 
-    def save(self, policy_id: str, limits_by_scope: dict) -> str:
+    def save(self, policy_id: str, limits_by_scope: dict, *, contract: dict | None = None) -> str:
         policy_id = non_empty(policy_id, field="risk_policy_id")
         payload = json_value(limits_by_scope, field="risk policy")
         unknown = set(payload) - set(REQUIRED_RISK_SCOPES)
         if unknown or not payload:
             raise ValueError("risk policy contains unknown or no scopes")
         record = {"policy_id": policy_id, "limits": payload}
+        if contract is not None or policy_id.startswith("sha256:"):
+            contract = json_value(contract, field="risk policy contract")
+            self._validate_contract(policy_id, contract, payload)
+            record["contract"] = contract
         with self.engine.begin() as connection:
             existing = connection.execute(
                 select(risk_policy_table.c.payload).where(risk_policy_table.c.id == policy_id)
@@ -50,7 +54,13 @@ class SqlRiskPolicyStore:
                 raise ValueError("risk policy records are immutable")
         return policy_id
 
-    def resolve(self, policy_ids: tuple[str, ...]) -> dict[str, dict]:
+    def resolve(
+        self,
+        policy_ids: tuple[str, ...],
+        *,
+        historical: bool = False,
+        account_id: str | None = None,
+    ) -> dict[str, dict]:
         merged: dict[str, dict] = {}
         with self.engine.connect() as connection:
             for policy_id in policy_ids:
@@ -59,11 +69,42 @@ class SqlRiskPolicyStore:
                 ).scalar_one_or_none()
                 if payload is None:
                     raise KeyError(f"risk policy does not exist: {policy_id}")
+                if not historical or "contract" in payload or policy_id.startswith("sha256:"):
+                    self._validate_contract(
+                        policy_id, payload.get("contract"), payload["limits"], account_id=account_id
+                    )
                 for scope, limits in dict(payload)["limits"].items():
                     if scope in merged:
                         raise ValueError(f"multiple risk policies define scope {scope}")
                     merged[scope] = dict(limits)
         return merged
+
+    @staticmethod
+    def _validate_contract(
+        policy_id: str, contract: object, limits: dict, *, account_id: str | None = None
+    ) -> None:
+        from src.risk.policies import compile_risk_limits
+        from src.risk.policy import risk_policy_identity
+
+        if not isinstance(contract, dict) or set(contract) != {
+            "schema",
+            "logical_policy_id",
+            "configuration",
+            "account_id",
+        }:
+            raise ValueError("risk policy unit contract is missing or malformed")
+        if contract["schema"] != "platform.risk_policy/v2" or policy_id != risk_policy_identity(
+            contract["logical_policy_id"],
+            contract["configuration"],
+            account_id=contract["account_id"],
+        ):
+            raise ValueError("risk policy identity does not match its unit contract")
+        if limits != compile_risk_limits(
+            contract["configuration"], contract["logical_policy_id"], contract["account_id"]
+        ):
+            raise ValueError("risk limits do not match their canonical configuration")
+        if account_id is not None and contract["account_id"] != account_id:
+            raise ValueError("risk policy account does not match the assessed account")
 
 
 class JsonlRiskDecisionStore:
@@ -194,7 +235,9 @@ class SqlRiskSnapshotStore:
             raise ValueError("risk snapshot content hash does not match its identity")
         return dict(payload)
 
-    def latest(self, *, kind: str, product_id: str, at: str) -> tuple[str, dict[str, object]]:
+    def latest(
+        self, *, kind: str, product_id: str, at: str, require_source_envelope: bool = False
+    ) -> tuple[str, dict[str, object]]:
         at = timestamp(at, field="at")
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -212,6 +255,11 @@ class SqlRiskSnapshotStore:
                     isinstance(payload, dict)
                     and payload.get("kind") == kind
                     and payload.get("product_id") == product_id
+                    and (
+                        not require_source_envelope
+                        or isinstance(payload.get("values"), dict)
+                        and isinstance(payload.get("observed_at"), str)
+                    )
                 ):
                     if canonical_hash(payload) != str(row["id"]):
                         raise ValueError("risk snapshot content hash does not match its identity")
@@ -246,7 +294,7 @@ def combine_risk_decisions(
         scope="portfolio",
         accepted=rejected is None,
         reason_code=rejected.reason_code if rejected else None,
-        evaluated_at=dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat(),
+        evaluated_at=max(item.evaluated_at for item in decisions),
         input_snapshot={
             "product_id": product_id,
             "decision_ids": [item.decision_id for item in decisions],

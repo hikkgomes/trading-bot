@@ -16,7 +16,6 @@ from src.services.backups import (
     verify_directory_archive,
 )
 from src.services.config import load_platform_config
-from src.services.storage_compaction import compact_data_root
 
 
 def _backup_id(kind: str, now: dt.datetime) -> str:
@@ -45,17 +44,13 @@ def create_parquet_backup(*, config_path: Path, now: dt.datetime | None = None) 
     now = now or dt.datetime.now(dt.UTC)
     backup_id = _backup_id("parquet", now)
     store = BackupStore(Path(config.paths["backups"]))
-    # The archive is of the immutable data tree only. Compact before the
-    # snapshot so consumed spool segments and superseded tiny partitions are
-    # never treated as backup content.
-    compact_data_root(Path(config.paths["parquet"]))
+    # Backup is read-only. Compaction must not change the data referenced by
+    # the matching database snapshot; quarantine also contains audit evidence.
     with tempfile.TemporaryDirectory(prefix="platform-parquet-backup-") as raw_directory:
         archive = create_directory_archive(
             Path(config.paths["parquet"]),
             Path(raw_directory) / "parquet.tar.gz",
-            exclude_prefixes=("quarantine",),
         )
-        verify_directory_archive(archive)
         store.create(
             backup_id=backup_id,
             created_at=now.replace(microsecond=0).isoformat(),
@@ -88,8 +83,14 @@ def verify_backups(*, config_path: Path) -> int:
 def prune_backups(*, config_path: Path) -> tuple[str, ...]:
     config = load_platform_config(config_path)
     retention_days = int(config.backup["retention_days"])
-    cutoff = time.time() - retention_days * 86_400
-    return BackupStore(Path(config.paths["backups"])).prune(older_than_timestamp=cutoff)
+    recent_hours = int(config.backup.get("hourly_retention_hours", 24))
+    if not 1 <= recent_hours <= retention_days * 24:
+        raise ValueError("hourly backup retention must fit within the daily retention window")
+    now = time.time()
+    return BackupStore(Path(config.paths["backups"])).prune(
+        older_than_timestamp=now - retention_days * 86_400,
+        thin_before_timestamp=now - recent_hours * 3_600,
+    )
 
 
 def restore_postgresql_backup(
@@ -105,17 +106,14 @@ def restore_postgresql_backup(
     return backup_id
 
 
-def restore_parquet_backup(
-    *, config_path: Path, backup_id: str, destination: Path
-) -> tuple[str, ...]:
+def restore_parquet_backup(*, config_path: Path, backup_id: str, destination: Path) -> int:
     config = load_platform_config(config_path)
     store = BackupStore(Path(config.paths["backups"]))
     bundle = store.verify(backup_id)
     archive = Path(config.paths["backups"]) / backup_id / "parquet.tar.gz"
     if "parquet.tar.gz" not in bundle.files:
         raise ValueError(f"backup does not contain a Parquet archive: {backup_id}")
-    restored = restore_directory_archive(archive, destination)
-    return tuple(str(path) for path in restored)
+    return restore_directory_archive(archive, destination)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

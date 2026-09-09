@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import gzip
 import hashlib
 import json
 import os
@@ -9,6 +11,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -103,7 +106,7 @@ class BackupStore:
             raise
         return bundle
 
-    def verify(self, backup_id: str) -> BackupBundle:
+    def _read_bundle(self, backup_id: str) -> BackupBundle:
         backup_id = _safe_backup_id(backup_id)
         directory = self.root / backup_id
         manifest = directory / "manifest.json"
@@ -138,8 +141,12 @@ class BackupStore:
         )
         if bundle.backup_id != backup_id:
             raise ValueError("backup manifest ID does not match its directory")
+        return bundle
+
+    def verify(self, backup_id: str) -> BackupBundle:
+        bundle = self._read_bundle(backup_id)
         for logical_name, expected_hash in bundle.files.items():
-            if file_hash(directory / logical_name) != expected_hash:
+            if file_hash(self.root / backup_id / logical_name) != expected_hash:
                 raise ValueError(f"backup content hash does not match: {logical_name}")
         return bundle
 
@@ -173,20 +180,53 @@ class BackupStore:
             restored.append(target)
         return tuple(restored)
 
-    def prune(self, *, older_than_timestamp: float) -> tuple[str, ...]:
-        removed: list[str] = []
+    def prune(
+        self, *, older_than_timestamp: float, thin_before_timestamp: float | None = None
+    ) -> tuple[str, ...]:
         if not self.root.exists():
             return ()
-        for directory in sorted(self.root.iterdir()):
-            if directory.is_symlink() or not directory.is_dir():
-                continue
-            manifest = directory / "manifest.json"
-            if not manifest.is_file() or manifest.stat().st_mtime >= older_than_timestamp:
-                continue
-            self.verify(directory.name)
-            shutil.rmtree(directory)
-            removed.append(directory.name)
-        return tuple(removed)
+        bundles = [
+            self._read_bundle(directory.name)
+            for directory in self.root.iterdir()
+            if directory.is_dir()
+            and not directory.is_symlink()
+            and (directory / "manifest.json").is_file()
+        ]
+        removed, latest = _retention_plan(bundles, older_than_timestamp, thin_before_timestamp)
+        # Never delete an earlier recovery point unless its replacement verifies.
+        for backup_id in latest:
+            self.verify(backup_id)
+        for backup_id in removed:
+            self.verify(backup_id)
+            shutil.rmtree(self.root / backup_id)
+        return removed
+
+
+def _backup_epoch(bundle: BackupBundle) -> float:
+    value = dt.datetime.fromisoformat(bundle.created_at)
+    if value.tzinfo is None or not bundle.files:
+        raise ValueError("backup retention requires a dated, non-empty manifest")
+    return value.timestamp()
+
+
+def _retention_plan(bundles, cutoff: float, recent: float | None):
+    ordered = sorted(
+        ((_backup_epoch(bundle), bundle) for bundle in bundles),
+        key=lambda item: (item[0], item[1].backup_id),
+        reverse=True,
+    )
+    latest = {}
+    days = set()
+    removed = []
+    for created, bundle in ordered:
+        kind = tuple(sorted(bundle.files))
+        day = (kind, dt.datetime.fromtimestamp(created, dt.UTC).date())
+        if kind not in latest:
+            latest[kind] = bundle.backup_id
+        elif created < cutoff or (recent is not None and created < recent and day in days):
+            removed.append(bundle.backup_id)
+        days.add(day)
+    return tuple(removed), tuple(latest.values())
 
 
 def postgresql_environment(database_url: str) -> dict[str, str]:
@@ -271,43 +311,23 @@ class PostgreSQLBackup:
         )
 
 
-def create_directory_archive(
-    source: Path,
-    destination: Path,
-    *,
-    exclude_prefixes: tuple[str, ...] = (),
-) -> Path:
+def create_directory_archive(source: Path, destination: Path) -> Path:
     if source.is_symlink() or not source.is_dir():
         raise ValueError(f"archive source must be a regular directory: {source}")
     source = source.resolve()
-    excluded: list[tuple[str, ...]] = []
-    for raw_prefix in exclude_prefixes:
-        if not str(raw_prefix).strip():
-            continue
-        prefix = Path(str(raw_prefix))
-        if prefix.is_absolute() or ".." in prefix.parts:
-            raise ValueError("archive exclusions must be safe relative paths")
-        excluded.append(prefix.parts)
+    if destination.resolve().is_relative_to(source):
+        raise ValueError("backup destination must be outside its source")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp")
     temporary.unlink(missing_ok=True)
     try:
-        with tarfile.open(temporary, "w:gz") as archive:
-
-            def include(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
-                parts = Path(member.name).parts
-                relative = parts[1:] if parts and parts[0] == source.name else parts
-                if any(relative[: len(prefix)] == prefix for prefix in excluded):
-                    return None
-                return member
-
-            archive.add(source, arcname=source.name, recursive=True, filter=include)
-        with tarfile.open(temporary, "r:gz") as archive:
-            for member in archive.getmembers():
-                if member.islnk() or member.issym() or member.name.startswith("/"):
-                    raise ValueError("backup archive contains an unsafe member")
-                if ".." in Path(member.name).parts:
-                    raise ValueError("backup archive escapes its restore root")
+        subprocess.run(
+            ["tar", "-czf", str(temporary), "-C", str(source.parent), "--", source.name],
+            check=True,
+            capture_output=True,
+            env={**os.environ, "COPYFILE_DISABLE": "1"},
+        )
+        verify_directory_archive(temporary)
         os.replace(temporary, destination)
         _fsync_directory(destination.parent)
     finally:
@@ -315,48 +335,81 @@ def create_directory_archive(
     return destination
 
 
-def verify_directory_archive(archive_path: Path) -> int:
-    if archive_path.is_symlink() or not archive_path.is_file():
+@contextmanager
+def _stream_archive(path: Path):
+    if path.is_symlink() or not path.is_file():
         raise ValueError("backup archive must be a regular file")
-    with tarfile.open(archive_path, "r:gz") as archive:
-        members = archive.getmembers()
-        for member in members:
-            if member.islnk() or member.issym() or member.name.startswith("/"):
-                raise ValueError("backup archive contains an unsafe member")
-            if ".." in Path(member.name).parts:
-                raise ValueError("backup archive escapes its restore root")
-            if not (member.isfile() or member.isdir()):
-                raise ValueError("backup archive contains a non-file member")
-        with tempfile.TemporaryDirectory(prefix="platform-restore-check-") as raw_directory:
-            archive.extractall(Path(raw_directory))  # noqa: S202 - members are validated above
-    return len(members)
+    with gzip.open(path, "rb") as compressed:
+        with tarfile.open(fileobj=compressed, mode="r|") as archive:
+            yield archive
+        # Consume the gzip trailer as well, so truncation and CRC failures fail verification.
+        while compressed.read(1024 * 1024):
+            pass
 
 
-def restore_directory_archive(archive_path: Path, destination: Path) -> tuple[Path, ...]:
-    """Extract a verified directory archive into a new, private directory."""
+def _archive_members(archive):
+    root = None
+    while (member := archive.next()) is not None:
+        # Python 3.11 retains headers even in pipe mode. No backwards lookup is needed here.
+        archive.members.clear()
+        parts = Path(member.name).parts
+        if (
+            not parts
+            or member.name.startswith("/")
+            or ".." in parts
+            or not (member.isfile() or member.isdir())
+        ):
+            raise ValueError("backup archive contains an unsafe member")
+        if root is None:
+            if len(parts) != 1 or not member.isdir():
+                raise ValueError("backup archive must start with its directory root")
+            root = parts[0]
+        if parts[0] != root:
+            raise ValueError("backup archive must contain one directory root")
+        yield member
+    if root is None:
+        raise ValueError("backup archive is empty")
 
+
+def verify_directory_archive(archive_path: Path) -> int:
+    count = 0
+    with _stream_archive(archive_path) as archive:
+        for member in _archive_members(archive):
+            count += 1
+            if member.isfile():
+                payload = archive.extractfile(member)
+                if payload is None:
+                    raise ValueError("backup file has no readable payload")
+                with payload:
+                    while payload.read(1024 * 1024):
+                        pass
+    return count
+
+
+def restore_directory_archive(archive_path: Path, destination: Path) -> int:
+    """Stream a verified archive into a private directory, returning its file count."""
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"restore destination already exists: {destination}")
-    verify_directory_archive(archive_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(
         tempfile.mkdtemp(prefix=f".{destination.name}.restore-", dir=destination.parent)
     )
+    count = 0
+    root_name = None
     try:
-        with tarfile.open(archive_path, "r:gz") as archive:
-            members = archive.getmembers()
-            root_names = {Path(member.name).parts[0] for member in members if member.name}
-            if len(root_names) != 1:
-                raise ValueError("backup archive must contain one directory root")
-            archive.extractall(temporary)  # noqa: S202 - verified immediately above
-        extracted_root = temporary / next(iter(root_names))
-        if extracted_root.is_symlink() or not extracted_root.is_dir():
-            raise ValueError("backup archive root is not a regular directory")
-        for path in (extracted_root, *extracted_root.rglob("*")):
-            if path.is_symlink():
-                raise ValueError("backup archive extracted an unsafe symlink")
-            path.chmod(0o700 if path.is_dir() else 0o600)
-        os.replace(extracted_root, destination)
-        return tuple(path for path in destination.rglob("*") if path.is_file())
+        with _stream_archive(archive_path) as archive:
+            for member in _archive_members(archive):
+                root_name = root_name or Path(member.name).parts[0]
+                target = temporary / member.name
+                if not target.parent.is_dir():
+                    raise ValueError("backup directory entries must precede their children")
+                archive.extract(member, temporary)  # noqa: S202 - only checked regular files/directories
+                target.chmod(0o700 if member.isdir() else 0o600)
+                count += int(member.isfile())
+        if root_name is None:
+            raise ValueError("backup archive has no directory root")
+        os.replace(temporary / root_name, destination)
+        _fsync_directory(destination.parent)
+        return count
     finally:
         shutil.rmtree(temporary, ignore_errors=True)

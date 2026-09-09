@@ -3,7 +3,7 @@
 Split out of ``evaluate.py`` so the execution bot can import the *exact* mask
 logic that validated a hypothesis without dragging in the research stack
 (``evaluate`` pulls ``src.metrics`` -> scipy, which is deliberately not part of
-``requirements-bot.txt``). This module depends on numpy/pandas only.
+``requirements-runtime.txt``). This module depends on numpy/pandas only.
 
 Research (``evaluate.py`` / ``validation.py``) and execution (``src.run_bot``)
 both call :func:`entry_mask`, so a strategy trades live with the same code path

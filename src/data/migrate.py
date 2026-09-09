@@ -27,11 +27,14 @@ def main(argv: list[str] | None = None) -> None:
         database.assert_migrated()
         report = {"ok": True, "mode": "check"}
     else:
+        applied = list(database.migrate())
+        legacy_queue = quarantine_legacy_research_jobs(database.engine)
+        legacy_queue.pop("quarantined_jobs", None)
         report = {
             "ok": True,
             "mode": "migrate",
-            "applied": list(database.migrate()),
-            "legacy_queue": quarantine_legacy_research_jobs(database.engine),
+            "applied": applied,
+            "legacy_queue": legacy_queue,
         }
     print(json.dumps(report, sort_keys=True))
     database.dispose()

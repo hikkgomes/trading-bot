@@ -286,6 +286,8 @@ def test_dead_lettered_stage_is_durably_blocked_from_recurring_resubmission(tmp_
 
 
 def test_evidence_policy_preserves_applicability_and_thesis_scoped_controls() -> None:
+    from src.research.evidence import EvidenceApplicability
+
     policy = EvidencePolicy()
     input_hash = "sha256:" + "a" * 64
     evidence = {
@@ -300,10 +302,13 @@ def test_evidence_policy_preserves_applicability_and_thesis_scoped_controls() ->
             }
         },
     }
+    unscoped = policy.statuses("development", evidence, ("placebo_event_times",))
+    assert unscoped["parameter_stability"] is EvidenceStatus.UNAVAILABLE
     statuses = policy.statuses(
         "development",
         evidence,
         ("placebo_event_times",),
+        applicability=EvidenceApplicability(1, 0, 0),
     )
     assert statuses["parameter_stability"] is EvidenceStatus.NOT_APPLICABLE
     assert statuses["cross_symbol_stability"] is EvidenceStatus.NOT_APPLICABLE
@@ -357,7 +362,6 @@ def test_evidence_policy_returns_a_structured_next_stage_decision() -> None:
     assert decision.accepted is True
     assert decision.fatal_failures == ()
     assert decision.next_stage == "development"
-    assert 0.0 < decision.evidence_score <= 1.0
     assert decision.to_payload()["next_stage"] == "development"
 
 
@@ -370,7 +374,7 @@ def test_forward_evidence_is_deferred_until_sample_is_sufficient() -> None:
                 family="swing",
                 minimum_calendar_days=60.0,
                 minimum_closed_trades=20,
-                minimum_effective_episodes=20,
+                minimum_completed_episodes=20,
             ),
         )
     )
@@ -412,7 +416,7 @@ def test_forward_evidence_is_deferred_until_sample_is_sufficient() -> None:
             "passed": False,
             "observations": 1,
             "closed_trades": 0,
-            "effective_independent_episodes": 0,
+            "completed_episodes": 0,
             "trading_days": 0,
         },
         "forward_duration": {
@@ -434,7 +438,18 @@ def test_forward_evidence_is_deferred_until_sample_is_sufficient() -> None:
     assert decision.to_payload()["deferred"] is True
 
 
-def test_robustness_uses_one_primary_confidence_gate() -> None:
+@pytest.mark.parametrize(
+    "stress",
+    [
+        "cost_stress",
+        "delay_stress",
+        "adverse_fill_stress",
+        "missing_data_stress",
+        "funding_stress",
+        "monte_carlo_return_blocks",
+    ],
+)
+def test_robustness_diagnostics_cannot_override_stress_limits(stress) -> None:
     policy = EvidencePolicy(
         minimum_deflated_sharpe=0.95,
         minimum_bootstrap_observations=30,
@@ -474,7 +489,9 @@ def test_robustness_uses_one_primary_confidence_gate() -> None:
         "adverse_fill_stress": {"passed": True, "return": 0.1},
         "missing_data_stress": {"passed": True, "return": 0.1},
         "funding_stress": {"passed": True, "return": 0.1},
-        "monte_carlo_trade_order": {
+        "monte_carlo_return_blocks": {
+            "method": "nonoverlapping_return_block_permutation/v1",
+            "block_length": 2,
             "passed": True,
             "iterations": 250,
             "maximum_drawdown": 0.1,
@@ -497,7 +514,6 @@ def test_robustness_uses_one_primary_confidence_gate() -> None:
             "maximum_drawdown": 0.1,
             "tail_loss": 0.01,
         },
-        "null_results": {"passed": True, "tests": 1},
         "negative_control_results": {},
     }
 
@@ -506,14 +522,32 @@ def test_robustness_uses_one_primary_confidence_gate() -> None:
     assert decision.accepted is True
     assert "deflated_sharpe" not in decision.fatal_failures
     assert "deflated_sharpe:fail" in decision.diagnostics
+    provisional = policy.decide(
+        "robustness",
+        {
+            key: value
+            for key, value in evidence.items()
+            if key
+            not in {"deflated_sharpe", "bootstrap_confidence", "probability_backtest_overfitting"}
+        },
+        (),
+    )
+    assert provisional.accepted is True
+    assert "bootstrap_confidence:unavailable" in provisional.diagnostics
+    assert "probability_backtest_overfitting:unavailable" in provisional.diagnostics
 
     degraded = dict(evidence)
-    degraded["delay_stress"] = {"passed": False, "return": -0.2}
+    degraded[stress] = {**evidence[stress], "passed": False, "return": -0.2}
     degraded_decision = policy.decide("robustness", degraded, ())
 
-    assert degraded_decision.accepted is True
-    assert degraded_decision.fatal_failures == ()
-    assert "delay_stress:fail" in degraded_decision.diagnostics
+    assert degraded_decision.accepted is False
+    assert degraded_decision.fatal_failures == (stress,)
+    assert degraded_decision.deferred is False
+    unavailable = {**evidence, stress: {"status": "unavailable"}}
+    pending = policy.decide("robustness", unavailable, ())
+    assert pending.accepted is False
+    assert pending.deferred is True
+    assert pending.fatal_failures == (stress,)
 
 
 def test_single_symbol_and_empty_portfolio_overlap_are_not_applicable() -> None:
@@ -531,8 +565,7 @@ def test_single_symbol_and_empty_portfolio_overlap_are_not_applicable() -> None:
 
 def test_missing_declared_negative_control_is_unavailable_not_a_fake_null() -> None:
     evidence = _negative_control_evidence(
-        signals=[1.0, 1.0],
-        returns=[0.01, 0.01],
+        observations=2,
         candidate_return=0.02,
         controls=("block_permutation",),
     )
@@ -541,21 +574,22 @@ def test_missing_declared_negative_control_is_unavailable_not_a_fake_null() -> N
     assert evidence["block_permutation"]["passed"] is False
 
 
-def test_negative_controls_are_deterministic_when_immutable_market_inputs_are_available() -> None:
+def test_negative_controls_compound_the_full_aligned_economic_series() -> None:
     kwargs = {
-        "signals": [1.0, -1.0, 1.0, 0.0, -1.0, 1.0],
-        "returns": [0.01, -0.02, 0.03, 0.0, -0.01, 0.02],
-        "candidate_return": 0.01,
-        "controls": ("block_permutation", "feature_ablation", "parameter_neighbourhood"),
+        "observations": 2,
+        "candidate_return": 0.0,
+        "control_returns": {"block_permutation": [0.1, -0.1]},
+        "controls": ("block_permutation", "feature_ablation"),
         "seed_material": {"candidate": "candidate-1", "dataset": "dataset-1"},
     }
     first = _negative_control_evidence(**kwargs)
     second = _negative_control_evidence(**kwargs)
 
     assert first == second
-    assert first["feature_ablation"]["control_return"] == 0.0
-    assert first["block_permutation"]["source"] == "derived_immutable_inputs"
-    assert first["parameter_neighbourhood"]["method"] == "parameter_neighbourhood_shift_v1"
+    assert first["feature_ablation"]["status"] == "unavailable"
+    assert first["block_permutation"]["control_return"] == pytest.approx(-0.01)
+    assert first["block_permutation"]["observations"] == 2
+    assert first["block_permutation"]["passed"] is True
 
 
 def test_active_income_registered_time_series_candidates_are_symbol_isolated() -> None:
@@ -713,7 +747,7 @@ def test_parameter_surface_rejects_a_cliff_but_accepts_smooth_degradation() -> N
 def test_profile_enforces_effective_sample_and_quantitative_tail_limits() -> None:
     profile = EvidenceProfile(
         minimum_closed_trades=20,
-        minimum_effective_episodes=8,
+        minimum_completed_episodes=8,
         maximum_drawdown=0.20,
         maximum_tail_loss=0.05,
     )
@@ -721,7 +755,7 @@ def test_profile_enforces_effective_sample_and_quantitative_tail_limits() -> Non
         "passed": True,
         "observations": 40,
         "closed_trades": 20,
-        "effective_independent_episodes": 8,
+        "completed_episodes": 8,
     }
     assert sample_evidence_passes(sample, profile) is True
     assert sample_evidence_passes({**sample, "closed_trades": 19}, profile) is False
@@ -789,7 +823,7 @@ def test_registered_strategy_behaviour_is_shared_by_research_and_dispatch() -> N
             "close": float(index) + 0.5,
             "volume": 100.0,
         }
-        for index in range(1, 40)
+        for index in range(101, 140)
     ]
     artefact = StrategyArtefact(
         definition=candidate.definition,
@@ -1079,6 +1113,16 @@ def test_executor_derives_signed_futures_events_with_mark_to_market() -> None:
             "close": 90.0,
             "funding_rate": 0.01,
             "funding_event": True,
+            "funding_events": [
+                {
+                    "type": "funding",
+                    "timestamp": "2026-08-30T10:01:00+00:00",
+                    "symbol": "BTCUSDT",
+                    "mark_price": 90.0,
+                    "funding_rate": 0.01,
+                    "mark_source": "native_test_fixture",
+                }
+            ],
         },
     ]
 
@@ -1097,9 +1141,9 @@ def test_executor_derives_signed_futures_events_with_mark_to_market() -> None:
 
     assert accounting is not None
     assert accounting["objective_unit"] == "USDT"
-    assert accounting["unrealised_pnl"] == pytest.approx(20.0)
-    assert accounting["funding_pnl"] == pytest.approx(2.0)
-    assert accounting["max_leverage"] == pytest.approx(0.2)
+    assert accounting["unrealised_pnl"] == pytest.approx(10.0)
+    assert accounting["funding_pnl"] == pytest.approx(0.9)
+    assert accounting["max_leverage"] == pytest.approx(0.1)
 
 
 def test_executor_does_not_charge_non_event_funding_quotes() -> None:
@@ -1476,24 +1520,11 @@ def test_position_return_ledger_can_charge_initial_flat_to_position_transition()
     assert report.fees == pytest.approx(0.01)
 
 
-def test_futures_return_ledger_scales_fractional_costs_into_usdt() -> None:
-    report = PositionReturnLedger(fee_rate=0.01, slippage_rate=0.005).measure(
-        positions=(0.0, 1.0, 1.0),
-        market_returns=(0.10, -0.10),
-        funding_rates=(0.02, -0.03),
-    )
-
+def test_futures_accounting_requires_executed_holdings() -> None:
     accounting = _product_accounting(
         {"product_id": "active_income", "initial_cash": 1_000.0},
-        fallback_return=report,
     )
-
-    assert accounting is not None
-    assert accounting["fees"] == pytest.approx(10.0)
-    assert accounting["slippage_cost"] == pytest.approx(5.0)
-    assert accounting["funding_pnl"] == pytest.approx(30.0)
-    assert accounting["turnover_notional"] == pytest.approx(1_000.0)
-    assert accounting["implementation_shortfall"] == pytest.approx(15.0)
+    assert accounting is None
 
 
 def test_forward_drawdown_includes_a_loss_in_the_first_interval(tmp_path) -> None:
@@ -1627,7 +1658,7 @@ def test_dataset_builder_selects_only_available_bars_for_every_stage(tmp_path) -
         {
             "instrument_id": "binance:futures:BTCUSDT:USDT",
             "close_timestamp": f"2026-08-{26 + index:02d}T12:00:00+00:00",
-            "availability_time": NOW,
+            "availability_time": f"2026-08-{26 + index:02d}T12:00:00+00:00",
             "close": 100.0 + index,
         }
         for index in range(len(roles))
@@ -1737,7 +1768,10 @@ def test_latest_ready_bundle_excludes_synthetic_diagnostic_data(tmp_path) -> Non
     assert SqlDatasetBundleRepository(database.engine).latest_ready("active_income", at=NOW) is None
 
 
-def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(tmp_path) -> None:
+@pytest.mark.parametrize("fixed_scope", [False, True])
+def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
+    tmp_path, fixed_scope
+) -> None:
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'dataset-service.sqlite3'}")
     database.create_schema()
     instrument = Instrument(
@@ -1755,7 +1789,7 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(tmp_path) 
     universe_id = "service-btc-universe"
     SqlUniverseStore(database.engine).record_snapshot(
         universe_id=universe_id,
-        observed_at=NOW,
+        observed_at="2026-08-20T00:00:00+00:00",
         observations=(
             InstrumentObservation(
                 instrument=instrument,
@@ -1773,6 +1807,21 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(tmp_path) 
         policy=UniverseEligibilityPolicy(),
     )
     feature_id = canonical_hash({"schema": "platform.feature_manifest/v1", "market_type": "spot"})
+    if fixed_scope:
+        store = SqlUniverseStore(database.engine)
+        arguments = {
+            "universe_id": universe_id,
+            "product_id": "btc_accumulation",
+            "instrument": instrument,
+            "selected_at": NOW,
+            "specification_hash": canonical_hash({"product": "btc_accumulation", "scope": "BTC"}),
+        }
+        with pytest.raises(ValueError, match="dynamic universes"):
+            store.record_btc_research_scope(**arguments)
+        universe_id = "explicit-btc-research"
+        arguments["universe_id"] = universe_id
+        snapshot_id = store.record_btc_research_scope(**arguments)
+        assert store.record_btc_research_scope(**arguments) == snapshot_id
     cost_id = canonical_hash({"schema": "platform.cost_model/v1", "product_id": "btc_accumulation"})
     with database.engine.begin() as connection:
         connection.execute(
@@ -1803,6 +1852,10 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(tmp_path) 
                 "instrument_id": [instrument.instrument_id] * 8,
                 "close_time_ms": timestamps,
                 "availability_time": [NOW] * 8,
+                "source_availability_time": [
+                    dt.datetime.fromtimestamp(value / 1000, dt.UTC).isoformat()
+                    for value in timestamps
+                ],
                 "open": [100.0 + index for index in range(8)],
                 "high": [101.0 + index for index in range(8)],
                 "low": [99.0 + index for index in range(8)],
@@ -1832,6 +1885,7 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(tmp_path) 
             )
         ).scalar_one()
     assert snapshot_payload["payload"]["market_frame"]
+    assert snapshot_payload["payload"]["point_in_time_universe"] is not fixed_scope
 
     forward = DatabaseDatasetBundleService(database.engine, root).run_forward(
         product_id="btc_accumulation",

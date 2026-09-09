@@ -8,7 +8,12 @@ from typing import Any
 
 from src.domain._codec import canonical_hash, timestamp
 from src.execution.reconciler import ReconciliationResult
-from src.execution.recovery import RecoveryAction, SqlRecoveryStore, plan_recovery
+from src.execution.recovery import (
+    RecoveryAction,
+    RecoveryActionType,
+    SqlRecoveryStore,
+    plan_recovery,
+)
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -49,18 +54,22 @@ class DatabaseLiveRecoveryWorker:
             product_id = str(claimed.payload.get("product_id") or "")
             if not product_id:
                 product_id = self.account_products[str(claimed.payload["account_id"])]
-            if claimed.name == "live_account_backfill" and self.backfill_account is None:
-                raise RuntimeError("periodic live backfill has no account backfill handler")
-            backfill = (
-                self.backfill_account(product_id, now)
-                if self.backfill_account is not None
-                else None
-            )
+            self._recover_protective_child(product_id, claimed.payload)
+            backfill = self._backfill(product_id, claimed.name, now)
+            if backfill is not None and backfill.get("history_complete") is False:
+                self.queue.defer(
+                    claimed, available_at=_retry_at(now, 1), reason="income_history_pending"
+                )
+                return {"reason_code": "income_history_pending", "backfill": dict(backfill)}
             reconciliation = self.reconcile_product(product_id)
             plan = plan_recovery(reconciliation, created_at=now, store=self.store)
             if plan is None:
                 recovery_kind = claimed.payload.get("recovery_kind")
-                if recovery_kind in {"user_stream_reconnect", "emergency_ambiguous_submission"}:
+                if recovery_kind in {
+                    "user_stream_reconnect",
+                    "emergency_ambiguous_submission",
+                    "protective_child",
+                }:
                     self.queue.complete(claimed, completed_at=now)
                     return {
                         "reason_code": "live_recovery_verified",
@@ -141,6 +150,25 @@ class DatabaseLiveRecoveryWorker:
             "resolution_id": resolution_id,
             **({"backfill": dict(backfill)} if backfill is not None else {}),
         }
+
+    def _recover_protective_child(self, product_id: str, payload: Mapping[str, Any]) -> None:
+        child_id = payload.get("protective_child_order_id")
+        if not child_id:
+            if payload.get("recovery_kind") == "protective_child":
+                raise RuntimeError("protective trigger is waiting for its exchange child identity")
+            return
+        if self.execute_action is None:
+            raise RuntimeError("protective child recovery requires an order reconciler")
+        self.execute_action(
+            product_id, RecoveryAction(RecoveryActionType.RECONCILE_ORDER, str(child_id))
+        )
+
+    def _backfill(self, product_id: str, name: str, now: str) -> Mapping[str, Any] | None:
+        if self.backfill_account is None:
+            if name == "live_account_backfill":
+                raise RuntimeError("periodic live backfill has no account backfill handler")
+            return None
+        return self.backfill_account(product_id, now)
 
 
 def _retry_at(value: str, seconds: int) -> str:

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import math
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from sqlalchemy import insert, select
 from sqlalchemy.engine import Engine
 
+from src.data.assignment_scope import financial_assignment_ids
 from src.data.database import alpha_forecast as alpha_forecast_table
+from src.data.database import position_event
 from src.data.database import target_position as target_position_table
 from src.domain._codec import canonical_hash, timestamp, to_primitive
 from src.domain.forecasts import AlphaForecast, ForecastDirection
@@ -33,6 +37,62 @@ class SqlPortfolioRepository:
     def __init__(self, engine: Engine, *, require_pipeline_identity: bool = False):
         self.engine = engine
         self.require_pipeline_identity = require_pipeline_identity
+
+    def prior_strategy_state(
+        self,
+        *,
+        assignment_id: str,
+        version_id: str,
+        portfolio_id: str,
+        instrument_id: str,
+        before: str,
+        interval_seconds: int | None,
+    ):
+        statement = (
+            select(position_event.c.id, position_event.c.payload)
+            .where(
+                position_event.c.payload["portfolio_id"].as_string() == portfolio_id,
+                position_event.c.payload["instrument_id"].as_string() == instrument_id,
+                position_event.c.created_at <= before,
+            )
+            .order_by(position_event.c.created_at.desc(), position_event.c.id.desc())
+            .limit(1)
+        )
+        with self.engine.connect() as connection:
+            row = connection.execute(statement).mappings().one_or_none()
+        state: dict[str, Any] = {"direction": 0, "entry_price": 0.0, "age": 0}
+        result: dict[str, Any] = {"state": state, "entry_signal": 0, "position_event_id": None}
+        if row is None:
+            return result
+        payload = row["payload"]
+        result["position_event_id"] = row["id"]
+        quantity = float(payload["quantity"])
+        if not quantity:
+            return result
+        metadata = payload.get("metadata", {})
+        if metadata.get("assignment_id") != assignment_id and metadata.get(
+            "assignment_id"
+        ) not in financial_assignment_ids(self.engine, assignment_id, at=before):
+            raise ValueError("strategy position ownership requires reconciliation")
+        if set(payload.get("strategy_contributions", {})) != {version_id}:
+            raise ValueError("strategy position attribution requires reconciliation")
+        opened_at = metadata.get("opened_at")
+        if not opened_at or not interval_seconds or interval_seconds <= 0:
+            raise ValueError("strategy position entry time and bar cadence are required")
+        elapsed = (
+            dt.datetime.fromisoformat(before) - dt.datetime.fromisoformat(opened_at)
+        ).total_seconds()
+        if elapsed < 0:
+            raise ValueError("strategy position entry is after its decision time")
+        entry_price = float(metadata.get("reference_entry_price") or payload["average_entry_price"])
+        if not math.isfinite(entry_price) or entry_price <= 0:
+            raise ValueError("strategy position entry price is unavailable")
+        state.update(
+            direction=1 if quantity > 0 else -1,
+            entry_price=entry_price,
+            age=max(0, math.ceil(elapsed / interval_seconds) - 1),
+        )
+        return result
 
     def save_forecast(self, forecast: AlphaForecast) -> str:
         required_metadata = {"market_event_id", "feature_ids", "artefact_hash", "engine_version"}
@@ -70,16 +130,26 @@ class SqlPortfolioRepository:
         at = timestamp(at, field="at")
         with self.engine.connect() as connection:
             payloads = connection.execute(
-                select(alpha_forecast_table.c.payload).order_by(alpha_forecast_table.c.id)
+                select(alpha_forecast_table.c.payload)
+                .where(
+                    alpha_forecast_table.c.payload["product_id"].as_string() == product_id,
+                    alpha_forecast_table.c.created_at <= at,
+                    alpha_forecast_table.c.payload["valid_until"].as_string() > at,
+                )
+                .order_by(
+                    alpha_forecast_table.c.created_at.desc(), alpha_forecast_table.c.id.desc()
+                )
             ).scalars()
             forecasts = tuple(_forecast_from_dict(payload) for payload in payloads)
-        return tuple(
-            forecast
-            for forecast in forecasts
-            if forecast.product_id == product_id
-            and forecast.valid_from <= at
-            and at < forecast.valid_until
-        )
+        latest: dict[tuple[Any, str, str], AlphaForecast] = {}
+        for forecast in forecasts:
+            key = (
+                forecast.metadata.get("assignment_id"),
+                forecast.strategy_version_id,
+                forecast.instrument_id,
+            )
+            latest.setdefault(key, forecast)
+        return tuple(latest.values())
 
     def forecast(self, forecast_id: str) -> AlphaForecast:
         with self.engine.connect() as connection:

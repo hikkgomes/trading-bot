@@ -107,7 +107,7 @@ def _strategy_executable_files(strategy: object, repository: Path) -> dict[str, 
 
 def _runtime_lock(repository: Path) -> dict[str, str]:
     lock_files: dict[str, str] = {}
-    for filename in ("requirements-bot.txt", "requirements-runtime.txt", "pyproject.toml"):
+    for filename in ("requirements-runtime.txt", "pyproject.toml"):
         path = repository / filename
         if path.is_file():
             lock_files[filename] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -271,7 +271,7 @@ def registered_strategy_candidates(
                     "parameters": parameters,
                     "behaviour_contract": "registered_strategy/v1",
                 },
-                position_model={"kind": "volatility_scaled"},
+                position_model=_registered_position_model(strategy_class),
                 execution_preferences={"policy": "market"},
                 risk_policy={"product_policy": product},
                 validation_policy={"evidence_type": evidence_type},
@@ -299,6 +299,20 @@ def registered_strategy_candidates(
                 )
             )
     return tuple(candidates)
+
+
+def _registered_position_model(strategy_class: Any) -> dict[str, Any]:
+    config = strategy_class.default_config()
+    return {
+        "kind": "entry_pulse",
+        "flat_action": "hold",
+        "decision_timing": "next_open",
+        "stop_loss": config.stop_loss,
+        "take_profit": config.take_profit,
+        "horizon_bars": config.horizon_bars,
+        "maximum_position": 0.1,
+        "reentry": "next_bar_after_exit",
+    }
 
 
 def canonical_manifest_payload(name: str) -> str:

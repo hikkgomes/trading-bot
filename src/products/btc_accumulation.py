@@ -125,7 +125,9 @@ def target_btc_allocation(
             contribution = 0.0
         else:
             sign = 1.0 if forecast.direction is ForecastDirection.LONG else -1.0
-            contribution = sign * forecast.score * forecast.confidence * forecast.maximum_position
+            contribution = (
+                sign * forecast.score * forecast.allocation_weight * forecast.maximum_position
+            )
         contributions[forecast.strategy_version_id] = contribution
     signal = sum(contributions.values())
     tactical = max(-policy.max_tactical_fraction, min(policy.max_tactical_fraction, signal))

@@ -21,6 +21,7 @@ def test_platform_processes_cover_each_service_once() -> None:
         "trading-runtime",
         "scheduler-operations",
         "research-runtime",
+        "evaluation-runtime",
         "agent-runtime",
         "control-api",
         "migration-service",

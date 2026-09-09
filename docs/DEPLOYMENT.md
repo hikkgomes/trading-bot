@@ -3,7 +3,7 @@
 This is the only production deployment path. PostgreSQL owns lifecycle state,
 strategy artefacts, assignments, approvals, orders, fills, positions, risk,
 accounting, controls, and reports. Parquet is immutable market and research
-data. The legacy autopilot is an offline migration source only.
+data. Legacy SQLite data is read only for one-time migration.
 
 ## 1. Install the host
 
@@ -12,7 +12,7 @@ or later.
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y acl git jq make postgresql postgresql-client python3 python3-venv rsync
+sudo apt-get install -y acl bubblewrap git jq make postgresql postgresql-client python3 python3-venv rsync
 sudo systemctl enable --now postgresql
 git clone "$REPOSITORY_URL" /home/alfred/trading-bot
 cd /home/alfred/trading-bot
@@ -30,6 +30,12 @@ sudo REPO=/home/alfred/trading-bot NODE=linux-optiplex bash scripts/install_plat
 The installer creates separate service users, private environment files,
 process-aligned units, exact writable paths, and backup timers. It disables
 known legacy trading and autopilot units. It does not enable live trading.
+Disabled legacy unit files remain available for recovery until the new services
+pass the permission checks, restart test and paper-mode soak. After that
+handover, archive the retired unit files and drop-ins outside the checkout,
+remove those exact retired files from `/etc/systemd/system`, and run
+`sudo systemctl daemon-reload`. Do not remove them before replacement startup
+has been verified.
 
 ## 2. Create and migrate PostgreSQL
 
@@ -75,13 +81,17 @@ TRADING_PLATFORM_DATABASE_URL=postgresql+psycopg://trading_runtime_service:<URL_
 TRADING_LIVE=0
 EXCHANGE_TESTNET=1
 TRADING_CONTROL_TOKEN=<RANDOM_64_HEX_CONTROL_TOKEN>
+TRADING_PLATFORM_HEALTHCHECK_URL=<PRIVATE_OFF_HOST_HEARTBEAT_URL>
 
 # research.env
 TRADING_PLATFORM_DATABASE_URL=postgresql+psycopg://trading_research_worker:<URL_ENCODED_PASSWORD>@127.0.0.1:5432/trading_platform?sslmode=require
 TRADING_LIVE=0
 
 # agent.env
-TRADING_PLATFORM_DATABASE_URL=postgresql+psycopg://trading_agent_worker:<URL_ENCODED_PASSWORD>@127.0.0.1:5432/trading_platform?sslmode=require
+TRADING_LIVE=0
+
+# evaluator.env
+TRADING_PLATFORM_DATABASE_URL=postgresql+psycopg://trading_evaluation_worker:<URL_ENCODED_PASSWORD>@127.0.0.1:5432/trading_platform?sslmode=require
 TRADING_LIVE=0
 
 # backup.env
@@ -91,6 +101,42 @@ TRADING_PLATFORM_DATABASE_URL=postgresql+psycopg://trading_backup_service:<URL_E
 Only the runtime environment may contain exchange credentials. Research and
 agent processes cannot submit exchange orders. Never include environment-file
 contents in an audit archive.
+
+Each database login must inherit only its service role. In particular, research
+must not inherit `trading_runtime`; startup rejects mixed service roles. The
+evaluator uses `trading_evaluator` to read protected samples and publish sealed
+evidence. The adaptive research worker cannot read those samples or write sealed
+artefacts. The agent sandbox has no database credential.
+
+Create missing service logins with `sudo -u postgres createuser --pwprompt NAME`,
+then apply the following as the PostgreSQL administrator. For an existing host,
+remove any other inherited service or owner roles before starting workers.
+
+```sql
+GRANT trading_runtime TO trading_runtime_service;
+REVOKE trading_runtime, trading_agent, trading_evaluator, trading_platform_owner
+    FROM trading_research_worker;
+GRANT trading_research TO trading_research_worker;
+GRANT trading_evaluator TO trading_evaluation_worker;
+ALTER ROLE trading_agent_worker NOLOGIN;
+REVOKE trading_runtime FROM trading_agent_worker, trading_backup_service;
+GRANT pg_read_all_data TO trading_backup_service;
+ALTER ROLE trading_backup_service BYPASSRLS;
+```
+
+The backup login has read access to all data, including protected evidence, but
+no trading writes. `BYPASSRLS` is needed because `pg_dump` refuses a partial
+row-security-filtered backup. Keep its credential out of research and agent
+environments; only the PostgreSQL administrator may grant this attribute.
+
+Configure an independent monitor to accept heartbeat POSTs and notify you when
+they stop. Put its private URL only in `runtime.env`. The scheduler sends a ping
+only while all critical runtime, gateway and data-writer heartbeats are healthy
+and at most 60 seconds old. Each request has a two-second timeout; failed pings
+are not replayed later. The scheduler heartbeat records delivery status. Choose
+a missed-ping deadline longer than the scheduler interval and freshness window,
+then prove an alert arrives by stopping pings during the paper-mode soak. This
+monitor receives no database, exchange or control token and has no order authority.
 
 Use separate API keys for the spot and futures production accounts. Connected
 testnet rehearsals must use dedicated testnet keys and a testnet account
@@ -106,6 +152,7 @@ sudo systemctl start trading-platform-market-gateway.service
 sudo systemctl start trading-platform-data-writer.service
 sudo systemctl start trading-platform-operations.service
 sudo systemctl start trading-platform-research.service
+sudo systemctl start trading-platform-evaluator.service
 sudo systemctl start trading-platform-agent.service
 sudo systemctl start trading-platform-control.service
 sudo systemctl enable --now trading-platform-backup-postgresql.timer
@@ -117,8 +164,9 @@ The market gateway owns persistent exchange streams and the durable spool. The
 data-writer process owns raw, bar, and feature persistence. The runtime process
 owns strategy evaluation, portfolio, risk, execution, paper execution,
 accounting, and reconciliation. The operations process owns scheduling,
-universe refresh, and promotion. The research process owns staged evaluation,
-forward summaries, and research workers. The control API and agent sandbox use
+universe refresh, promotion, and forward summaries. The research process owns
+adaptive generation and diagnostic research. The evaluator owns dataset sealing
+and frozen staged evaluation. The control API and agent sandbox use
 separate processes. `migration-service` is a one-shot process.
 
 Check the process and timer state:
@@ -205,6 +253,16 @@ account fingerprint, and execution-engine identity before any canary decision.
 
 ## 8. Backups and recovery
 
+Keep hourly backups for `hourly_retention_hours` (24 by default), then the newest
+backup of each type per UTC day for `retention_days` (30). The newest verified
+backup of each type is always retained, even when stale. A replacement must
+verify before older recovery points are removed. This preserves the recovery
+window without retaining hundreds of full database copies on the server.
+
+Archive creation uses native tar; verification streams headers and contents
+without extracting a second temporary data store. A restore publishes its
+private destination only after every member and the gzip checksum validate.
+
 Create and verify both PostgreSQL and Parquet backups:
 
 ```bash
@@ -245,6 +303,29 @@ The recovery worker queries ambiguous orders by exchange and client identity,
 adopts known state, applies missing fills, cancels confirmed open orders, and
 places deterministic emergency reductions. Unresolved state remains blocked
 and visible in the operator report.
+
+If the host or database is unavailable, use an independent device and the
+exchange's authenticated interface. Do not wait for the local control API:
+
+1. Verify the exact account, sub-account and production/testnet environment.
+2. Disable trading permission for the dedicated bot API key, or revoke that key,
+   so a recovering host cannot submit another entry.
+3. Inspect actual positions and both ordinary and conditional orders. Cancel
+   pending entries. Keep protective orders until the corresponding exposure
+   is closed or replacement protection is confirmed.
+4. For Active Income, close the actual futures exposure with reduce-only orders.
+   Verify fills and remaining quantity after each attempt; an accepted order is
+   not a flat position. Resolve rejected orders or residual quantities through
+   the exchange interface or exchange support. Do not switch position mode.
+5. Confirm that positions are flat and no ordinary or conditional orders remain.
+   BTC accumulation is a spot holding: do not liquidate its protected core as
+   part of a futures recovery action.
+6. Save fills, funding, fees and account statements privately. Keep the bot key
+   disabled until restored records reconcile and the operator explicitly
+   authorises recovery. New credentials or changed code require fresh authority.
+
+The exchange order contracts are documented in the
+[official Binance USD-M interface examples](https://github.com/binance/binance-cli/blob/master/examples/derivatives-trading-usds-futures.md).
 
 ## 10. Quality gate
 

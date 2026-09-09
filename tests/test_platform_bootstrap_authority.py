@@ -142,7 +142,7 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
     repeated = scheduler.run_once(now=NOW)
 
     assert scheduled["schedules"] == 14
-    assert scheduled["jobs_enqueued"] == 8
+    assert scheduled["jobs_enqueued"] == 9
     assert repeated["jobs_enqueued"] == 0
     assert scheduled["maintenance"]["reason_code"] == "platform_maintenance_completed"
     with database.engine.connect() as connection:
@@ -150,11 +150,16 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
             connection.execute(select(func.count()).select_from(platform_schedule)).scalar_one()
             == 14
         )
-        assert connection.execute(select(func.count()).select_from(job)).scalar_one() == 14
+        assert connection.execute(select(func.count()).select_from(job)).scalar_one() == 15
         assert "diagnostic_paper_open" in set(connection.execute(select(job.c.name)).scalars())
         assert "dataset_snapshot_validate" in set(connection.execute(select(job.c.name)).scalars())
         assert "universe_refresh" in set(connection.execute(select(job.c.name)).scalars())
-        assert "agent_review" in set(connection.execute(select(job.c.name)).scalars())
+        assert {
+            payload["product_id"]
+            for payload in connection.execute(
+                select(job.c.payload).where(job.c.name == "agent_review")
+            ).scalars()
+        } == {"active_income", "btc_accumulation"}
         assert "register_ml_candidate" not in set(connection.execute(select(job.c.name)).scalars())
 
     with database.engine.begin() as connection:
@@ -271,13 +276,13 @@ def test_scheduler_research_jobs_are_processed_automatically(
     runtime = ServiceRuntime(
         config=load_platform_config(ROOT / "config/platform.json"),
         node_id="linux-optiplex",
-        service_name="research-worker",
+        service_name="evaluation-worker",
         heartbeat_store=DatabaseHeartbeatStore(database.engine),
     )
     research = _research_cycle(
         database=database,
         node_id="linux-optiplex",
-        service_name="research-worker",
+        service_name="evaluation-worker",
         runtime=runtime,
         maximum_runtime_seconds=60,
         parquet_root=tmp_path / "parquet",
@@ -290,9 +295,23 @@ def test_scheduler_research_jobs_are_processed_automatically(
     assert sum(result["reason_code"] == "research_job_completed" for result in results) == 2
     assert all(
         result["reason_code"]
-        in {"research_job_completed", "research_job_deferred", "historical_bars_incomplete"}
+        in {
+            "research_job_completed",
+            "research_job_deferred",
+            "historical_bars_incomplete",
+            "research_queue_empty",
+        }
         for result in results
     )
+    with database.engine.connect() as connection:
+        completed = (
+            connection.execute(select(job.c.name).where(job.c.state == "completed")).scalars().all()
+        )
+    assert sorted(completed) == [
+        "dataset_snapshot_validate",
+        "dataset_snapshot_validate",
+        "maintenance",
+    ]
     assert SqlResearchStore(database.engine).load_candidates() == ()
 
 
@@ -1499,12 +1518,18 @@ def test_ccxt_rest_recovery_reads_exact_trades_and_signed_income() -> None:
     assert fills[0].quantity == pytest.approx(0.001)
     assert income[0].amount == pytest.approx(-0.25)
     assert income[0].income_type == "FUNDING_FEE"
-    assert Client.trade_calls == [("BTC/USDT:USDT", None, None, {"orderId": "exchange-order"})]
-    assert Client.income_calls == [{"startTime": 1_776_000_000_000}]
+    assert Client.trade_calls == [
+        ("BTC/USDT:USDT", None, 1000, {"orderId": "exchange-order", "fromId": 0})
+    ]
+    assert Client.income_calls[0]["startTime"] == 1_776_000_000_000
+    assert Client.income_calls[0]["endTime"] > Client.income_calls[0]["startTime"]
+    assert Client.income_calls[0]["page"] == 1
 
 
+@pytest.mark.parametrize("exchange_status", ["closed", "partially_filled"])
 def test_approved_live_recovery_applies_rest_trade_fills_to_position_and_ledger(
     tmp_path: Path,
+    exchange_status: str,
 ) -> None:
     database = _database(tmp_path)
     orders = OrderManager(SqlOrderStore(database.engine))
@@ -1515,7 +1540,7 @@ def test_approved_live_recovery_applies_rest_trade_fills_to_position_and_ledger(
         portfolio_id="active-income-portfolio",
         instrument_id="binance:futures:BTCUSDT:USDT",
         side=OrderSide.SELL,
-        quantity=0.01,
+        quantity=0.01 if exchange_status == "closed" else 0.02,
         order_type=OrderType.MARKET,
         created_at=NOW,
         metadata={
@@ -1532,7 +1557,7 @@ def test_approved_live_recovery_applies_rest_trade_fills_to_position_and_ledger(
 
     class Broker:
         def query_order(self, **_kwargs):
-            return BrokerOrderState("exchange-order", "client-order", "closed", 0.01, 90.0)
+            return BrokerOrderState("exchange-order", "client-order", exchange_status, 0.01, 90.0)
 
         def query_order_fills(self, **_kwargs):
             return (
@@ -1566,32 +1591,72 @@ def test_approved_live_recovery_applies_rest_trade_fills_to_position_and_ledger(
         broker=Broker(),
         instruments={"binance:futures:BTCUSDT:USDT": SimpleNamespace(exchange_symbol="BTCUSDT")},
     )
-    approved = ApprovedLiveExecution.__new__(ApprovedLiveExecution)
-    approved.order_manager = orders
-    approved.positions = positions
+    approved = ApprovedLiveExecution(
+        engine=database.engine,
+        configuration=load_split_configuration(ROOT / "config"),
+        order_manager=orders,
+        positions=positions,
+        ledgers={
+            "active_income": Ledger(
+                product_id="active_income",
+                accounting_asset="USDT",
+                store=SqlLedgerStore(database.engine, product_id="active_income"),
+            )
+        },
+    )
     approved.venues = {"active_income": venue}
-    approved.ledgers = {
-        "active_income": Ledger(
-            product_id="active_income",
-            accounting_asset="USDT",
-            store=SqlLedgerStore(database.engine, product_id="active_income"),
-        )
-    }
 
     result = approved._reconcile_missing_order("active_income", order_id)
 
-    assert result["status"] == "reconciled"
+    expected_status = "reconciled" if exchange_status == "closed" else "partially_filled"
+    assert result["status"] == expected_status
     assert result["recovered_fills"] == 1
-    assert orders.get(order_id).status.value == "reconciled"
+    assert orders.get(order_id).status.value == expected_status
     assert positions.get(
         "active-income-portfolio", "binance:futures:BTCUSDT:USDT"
     ).quantity == pytest.approx(-0.01)
-    assert len(approved.ledgers["active_income"].entries) == 1
+    entries = approved.ledgers["active_income"].entries
+    assert len(entries) == 2
+    shortfall = next(entry for entry in entries if entry.metadata.get("kind") == "slippage")
+    assert float(shortfall.metadata["cost"]) == pytest.approx(0.1)
+    assert all(value == 0 for value in shortfall.postings.values())
     first_backfill = approved.backfill_account("active_income", NOW)
     second_backfill = approved.backfill_account("active_income", NOW)
     assert first_backfill["recorded"] == 1
     assert second_backfill["recorded"] == 0
-    assert len(approved.ledgers["active_income"].entries) == 2
+    assert len(approved.ledgers["active_income"].entries) == 4
+    assert float(approved.ledgers["active_income"].nav()) == pytest.approx(-0.26)
+    through = first_backfill["through"]
+    later = (dt.datetime.fromisoformat(NOW) + dt.timedelta(days=1)).isoformat()
+    venue.broker.query_income = lambda **kwargs: (
+        BrokerIncome(
+            "unmatched",
+            "BTCUSDT",
+            "COMMISSION",
+            -1,
+            "USDT",
+            through + 1,
+            trade_id="missing",
+        ),
+    )
+    with pytest.raises(ValueError, match="no unique reconciled financial fill"):
+        approved.backfill_account("active_income", later)
+    approved.ledgers["active_income"] = Ledger(
+        product_id="active_income",
+        accounting_asset="USDT",
+        store=SqlLedgerStore(database.engine, product_id="active_income"),
+    )
+    cursors = [
+        entry.metadata["through"]
+        for entry in approved.ledgers["active_income"].entries
+        if entry.metadata.get("kind") == "income_recovery_cursor"
+    ]
+    assert cursors == [through]
+    calls = []
+    venue.broker.query_income = lambda **kwargs: calls.append(kwargs) or ()
+    resumed = approved.backfill_account("active_income", later)
+    assert calls == [{"since": through - 60, "until": through + 86400}]
+    assert resumed["history_complete"] is True
 
 
 def test_ccxt_futures_testnet_uses_binance_demo_routing(monkeypatch) -> None:

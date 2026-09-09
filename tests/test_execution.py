@@ -1735,10 +1735,7 @@ def test_ccxt_futures_entry_reapplies_and_reads_back_risk_settings_every_time():
         (2, "BTC/USDT:USDT"),
         (2, "BTC/USDT:USDT"),
     ]
-    assert broker._client.position_mode_calls == [
-        (False, "BTC/USDT:USDT"),
-        (False, "BTC/USDT:USDT"),
-    ]
+    assert broker._client.position_mode_calls == []
     assert broker._client.open_order_calls == [
         (None, {}),
         (None, {"trigger": True}),
@@ -1836,14 +1833,12 @@ def test_ccxt_futures_margin_mode_rejects_unrelated_already_message():
         broker._ensure_futures_margin_mode("BTCUSDT")
 
 
-def test_ccxt_futures_position_mode_accepts_exact_binance_already_set_code():
+def test_ccxt_futures_entry_never_mutates_verified_position_mode():
     from src.execution.ccxt_broker import CcxtBroker
 
     class FakeClient:
         def set_position_mode(self, hedged, symbol):
-            raise RuntimeError(
-                'binanceusdm {"code":-4059,"msg":"No need to change position side."}'
-            )
+            raise AssertionError("entry must not change account position mode")
 
         def fetch_position_mode(self, symbol):
             return {"hedged": False}
@@ -2613,7 +2608,7 @@ def test_ccxt_fetches_and_adopts_only_complete_trigger_stop_fill():
     assert client.fetch_args == ("987654321", "BTC/USDT:USDT", {"trigger": True})
 
 
-def test_ccxt_rejects_partial_triggered_stop_as_unsafe_to_adopt():
+def test_ccxt_reports_partial_trigger_without_inventing_a_complete_fill():
     client_id = "tb-sl-0123456789abcdef0123456789ab"
 
     class FakeClient:
@@ -2627,12 +2622,37 @@ def test_ccxt_rejects_partial_triggered_stop_as_unsafe_to_adopt():
 
     broker = _ccxt_protective_broker(FakeClient())
 
-    with pytest.raises(ValueError, match="not fully filled"):
-        broker.get_protective_stop(
-            symbol="BTCUSDT",
-            order_id="987654321",
-            client_id=client_id,
-        )
+    result = broker.get_protective_stop(
+        symbol="BTCUSDT",
+        order_id="987654321",
+        client_id=client_id,
+    )
+    assert result.status is ProtectiveOrderStatus.TRIGGERED
+    assert result.filled_qty == pytest.approx(0.5)
+    assert result.qty == pytest.approx(1.0)
+
+
+def test_ccxt_preserves_unfilled_matching_engine_child_identity():
+    client_id = "tb-sl-0123456789abcdef0123456789ab"
+    child_id = "900719925474099312345"
+
+    class FakeClient:
+        def fetch_order(self, *args):
+            return {
+                **_protective_payload(
+                    status="triggered", filled=0, average=None, client_id=client_id
+                ),
+                "actualOrderId": child_id,
+            }
+
+    result = _ccxt_protective_broker(FakeClient()).get_protective_stop(
+        symbol="BTCUSDT",
+        order_id="987654321",
+        client_id=client_id,
+    )
+    assert result.child_order_id == child_id
+    assert result.filled_qty == 0
+    assert result.average_price is None
 
 
 def test_ccxt_cancels_trigger_order_then_reads_back_terminal_status():

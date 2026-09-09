@@ -212,6 +212,7 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
     accounts = {
         account_id: {
             "account_id": account_id,
+            "environment": "testnet",
             "market": "usdt_futures",
             "margin_mode": "isolated",
             "maximum_leverage": 3.0,
@@ -264,7 +265,7 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
         ),
         policy=UniverseEligibilityPolicy(),
     )
-    _install_risk_policy(database, risk_policy_id)
+    product["risk_policy_id"] = _install_risk_policy(database, risk_policy_id, account_id)
     assignment_id = _seed_strategy(
         database,
         product,
@@ -490,6 +491,7 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
         ledgers={product_id: ledger},
         trace_store=traces,
         account_products={account_id: product_id},
+        account_environments={account_id: "testnet"},
         order_groups=order_groups,
     )
     recovery_worker = DatabaseLiveRecoveryWorker(

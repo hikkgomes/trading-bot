@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.autopilot.io import write_json_atomic
 from src.config import PROJECT_ROOT
+from src.data.atomic import write_json_atomic
 
 SCHEMA_VERSION = 1
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "outputs" / "active_strategies.json"

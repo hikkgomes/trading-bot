@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
+from src.accounting.capital import btc_capital_baseline
+from src.accounting.spot_allocation import target_trade_quantity
 from src.domain._codec import canonical_hash, timestamp, to_primitive
+from src.domain.forecasts import AlphaForecast, ForecastDirection
 from src.domain.portfolios import TargetPosition
 from src.execution.position_manager import PositionManager
 from src.observability.decision_trace import (
@@ -30,6 +34,37 @@ from src.services.portfolio_service import SqlPortfolioRepository
 from src.services.scheduler import DatabaseJobQueue
 
 
+def _marked_income_equity(clean, balances, positions) -> float:
+    value = clean.get("marked_equity")
+    if value is None:
+        if any(abs(float(quantity)) > 1e-12 for quantity in positions.values()):
+            raise ValueError("active-income marked equity is unavailable for open positions")
+        return float(balances.get("USDT", 0))
+    if clean.get("marked_equity_currency") != "USDT":
+        raise ValueError("active-income marked equity must be expressed in USDT")
+    return float(value)
+
+
+def _affordable_btc_target(
+    btc: float,
+    quote: float,
+    price: float,
+    fraction: float,
+    core: float,
+    costs: Mapping[str, Any],
+) -> float:
+    options = {
+        "base": btc,
+        "quote": quote,
+        "mark": price,
+        "fee_rate": float(costs.get("fee_bps", 0.0)) / 10_000,
+        "slippage_rate": float(costs.get("slippage_bps", 0.0)) / 10_000,
+    }
+    requested = btc + target_trade_quantity(**options, fraction=fraction)
+    affordable = btc + target_trade_quantity(**options, fraction=1.0)
+    return min(affordable, max(core, requested))
+
+
 @dataclass(frozen=True)
 class TargetRiskReferences:
     """Canonical IDs produced after a preliminary target has been persisted."""
@@ -40,6 +75,12 @@ class TargetRiskReferences:
     balances_snapshot_id: str
     market_data_snapshot_id: str
     risk_policy_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NoPortfolioTarget:
+    decision_id: str
+    reason_code: str
 
 
 class DatabasePortfolioTargetBuilder:
@@ -64,7 +105,7 @@ class DatabasePortfolioTargetBuilder:
             str(key): dict(value) for key, value in account_configuration.items()
         }
 
-    def __call__(self, payload: Mapping[str, Any]) -> TargetRiskReferences:
+    def __call__(self, payload: Mapping[str, Any]) -> TargetRiskReferences | NoPortfolioTarget:
         product_id, product, evaluated_at, seed, forecasts = self._forecast_context(payload)
         state_id, state = self.snapshot_store.latest(
             kind="canonical_portfolio_risk_state", product_id=product_id, at=evaluated_at
@@ -88,8 +129,25 @@ class DatabasePortfolioTargetBuilder:
             prices=prices,
             state_id=state_id,
         )
+        account_id = str(product["account_id"])
+        environment = (
+            str(self.account_configuration[account_id]["environment"])
+            if product.get("execution_mode") == "live"
+            else "paper"
+        )
+        targets = tuple(
+            replace(
+                target,
+                metadata={
+                    **target.metadata,
+                    "account_id": account_id,
+                    "execution_environment": environment,
+                },
+            )
+            for target in targets
+        )
         if not targets:
-            raise ValueError("portfolio optimiser produced no targets")
+            return self._record_no_target(payload, state_id, forecasts, evaluated_at)
 
         event_id = str(payload["event_id"])
         target_ids = self.repository.save_targets(
@@ -142,6 +200,30 @@ class DatabasePortfolioTargetBuilder:
             market_data_snapshot_id=market_data_snapshot_id,
             risk_policy_ids=tuple(str(item) for item in clean["risk_policy_ids"]),
         )
+
+    def _record_no_target(
+        self,
+        payload: Mapping[str, Any],
+        state_id: str,
+        forecasts: tuple[AlphaForecast, ...],
+        evaluated_at: str,
+    ) -> NoPortfolioTarget:
+        reason = (
+            "flat_forecast"
+            if all(item.direction is ForecastDirection.FLAT for item in forecasts)
+            else "portfolio_allocation_constrained"
+        )
+        decision = {
+            "kind": "portfolio_no_target",
+            "product_id": payload["product_id"],
+            "forecast_id": payload["forecast_id"],
+            "event_id": payload["event_id"],
+            "canonical_state_id": state_id,
+            "reason_code": reason,
+            "observed_at": evaluated_at,
+        }
+        identity = self.snapshot_store.save(decision, created_at=evaluated_at)
+        return NoPortfolioTarget(identity, reason)
 
     def _forecast_context(
         self, payload: Mapping[str, Any]
@@ -238,9 +320,28 @@ class DatabasePortfolioTargetBuilder:
         ):
             raise ValueError("BTC minimum allocation conflicts with the core and tactical limits")
         allocation = target_btc_allocation(forecasts, policy=policy)
-        quantity = max(0.0, allocation.target_btc_fraction * equity_btc)
         costs = product.get("execution_costs")
         costs = costs if isinstance(costs, Mapping) else {}
+        capital = btc_capital_baseline(
+            self.repository.engine,
+            product_id=product_id,
+            account_id=str(product["account_id"]),
+            mode=str(product.get("execution_mode", "paper")),
+            state_id=state_id,
+            observed_at=seed.valid_from,
+            btc=current_btc,
+            quote=float(balances.get("USDT", 0.0)),
+            price=price,
+            reserve_fraction=policy.minimum_btc_fraction,
+        )
+        quantity = _affordable_btc_target(
+            current_btc,
+            float(balances.get("USDT", 0.0)),
+            price,
+            allocation.target_btc_fraction,
+            float(capital["core_btc_quantity"]),
+            costs,
+        )
         cycle_metadata = btc_step_aside_metadata(
             instrument_id=instrument_id,
             current_btc=current_btc,
@@ -265,6 +366,7 @@ class DatabasePortfolioTargetBuilder:
                 "canonical_state_id": state_id,
                 "assignment_id": seed.metadata.get("assignment_id"),
                 "core_btc_fraction": allocation.core_btc_fraction,
+                "core_btc_quantity": capital["core_btc_quantity"],
                 "tactical_btc_fraction": allocation.tactical_btc_fraction,
                 "stablecoin_fraction": allocation.stablecoin_fraction,
                 "quote_currency": "USDT",
@@ -285,10 +387,13 @@ class DatabasePortfolioTargetBuilder:
         market: Mapping[str, Mapping[str, Any]],
         prices: Mapping[str, float],
     ) -> tuple[tuple[TargetPosition, ...], float, dict[str, float]]:
-        equity = balances.get("USDT", 0.0)
+        equity = _marked_income_equity(clean, balances, current_positions)
         if equity <= 0:
             raise ValueError("active-income USDT equity must be positive")
         account = self.account_configuration.get(str(product["account_id"]), {})
+        forecasts = self._holding_forecasts(
+            forecasts, str(product["portfolio_id"]), current_positions
+        )
         constraints = PortfolioConstraints(
             portfolio_id=str(product["portfolio_id"]),
             equity=equity,
@@ -338,6 +443,33 @@ class DatabasePortfolioTargetBuilder:
         )
         return tuple(targets), equity, dict(current_positions)
 
+    def _holding_forecasts(
+        self,
+        forecasts: tuple[AlphaForecast, ...],
+        portfolio_id: str,
+        current_positions: Mapping[str, float],
+    ) -> tuple[AlphaForecast, ...]:
+        self.positions.reload()
+        result = []
+        for forecast in forecasts:
+            position = self.positions.get(portfolio_id, forecast.instrument_id)
+            state = forecast.metadata.get("position_state") or {}
+            holding = (
+                bool(forecast.metadata.get("position_rules"))
+                and state.get("direction") in {-1, 1}
+                and position.metadata.get("assignment_id") == forecast.metadata.get("assignment_id")
+                and forecast.metadata.get("assignment_id") is not None
+                and position.quantity == current_positions.get(forecast.instrument_id)
+                and position.quantity * state["direction"] > 0
+                and position.updated_at <= forecast.valid_from
+            )
+            result.append(
+                replace(
+                    forecast, metadata={**forecast.metadata, "preserve_entry_quantity": holding}
+                )
+            )
+        return tuple(result)
+
     def _save_risk_inputs(
         self,
         *,
@@ -356,6 +488,7 @@ class DatabasePortfolioTargetBuilder:
                 "kind": "account_risk_input",
                 "scope": "account",
                 "product_id": product_id,
+                "account_id": account_id,
                 "inputs": {
                     "used_margin_fraction": float(clean["used_margin_fraction"]),
                     "liquidation_buffer_fraction": float(clean["liquidation_buffer_fraction"]),
@@ -368,7 +501,7 @@ class DatabasePortfolioTargetBuilder:
         )
         positions_snapshot_id = self.snapshot_store.save(
             {
-                "kind": "positions",
+                "kind": "positions_risk_input",
                 "product_id": product_id,
                 "portfolio_id": portfolio_id,
                 "positions": dict(current_positions),
@@ -379,7 +512,7 @@ class DatabasePortfolioTargetBuilder:
         )
         balances_snapshot_id = self.snapshot_store.save(
             {
-                "kind": "balances",
+                "kind": "balances_risk_input",
                 "product_id": product_id,
                 "account_id": account_id,
                 "balances": dict(balances),
@@ -445,22 +578,33 @@ def _target_risk_scopes(
     market: Mapping[str, Mapping[str, Any]],
     clean: Mapping[str, Any],
 ) -> dict[str, Any]:
-    gross = sum(abs(item.target_fraction) for item in targets)
-    net = sum(item.target_fraction for item in targets)
-    turnover = sum(
+    if not math.isfinite(equity) or equity <= 0:
+        raise ValueError("risk exposure requires positive marked equity")
+    notionals = tuple(
+        item.target_quantity * float(market[item.instrument_id]["price"]) for item in targets
+    )
+    order_notionals = tuple(
         abs(item.target_quantity - current_positions.get(item.instrument_id, 0.0))
         * float(market[item.instrument_id]["price"])
-        / equity
         for item in targets
     )
+    gross = sum(abs(value) for value in notionals) / equity
+    net = sum(notionals) / equity
+    turnover = sum(order_notionals) / equity
     worst_spread = max(float(market[item.instrument_id]["spread_bps"]) for item in targets)
     worst_volatility = max(float(market[item.instrument_id]["volatility"]) for item in targets)
     depth_fraction = max(
-        abs(item.target_notional) / max(float(market[item.instrument_id]["visible_depth"]), 1e-12)
-        for item in targets
+        amount / max(float(market[item.instrument_id]["visible_depth"]), 1e-12)
+        for item, amount in zip(targets, order_notionals, strict=True)
     )
-    maximum_position = max(abs(item.target_fraction) for item in targets)
-    maximum_funding = max(abs(float(market[item.instrument_id]["funding"])) for item in targets)
+    maximum_position = max(abs(value) for value in notionals) / equity
+    funding_cost = (
+        sum(
+            max(0.0, notional * float(market[item.instrument_id]["funding"]))
+            for item, notional in zip(targets, notionals, strict=True)
+        )
+        / equity
+    )
 
     def identity(scope: str) -> str:
         return canonical_hash({"scope": scope, "target_ids": target_ids})
@@ -472,14 +616,14 @@ def _target_risk_scopes(
                 "turnover_fraction": turnover,
                 "trades_today": int(clean["trades_today"]),
                 "expected_slippage_bps": worst_spread,
-                "expected_funding_cost_fraction": maximum_funding,
+                "expected_funding_cost_fraction": funding_cost,
             },
             "decision_id": identity("strategy"),
         },
         "instrument": {
             "inputs": {
-                "position_notional": max(abs(item.target_notional) for item in targets),
-                "order_notional": max(abs(item.target_notional) for item in targets),
+                "position_notional": max(abs(value) for value in notionals),
+                "order_notional": max(order_notionals),
                 "visible_depth_fraction": depth_fraction,
                 "spread_bps": worst_spread,
                 "volatility": worst_volatility,
@@ -493,8 +637,8 @@ def _target_risk_scopes(
                 "drawdown_fraction": float(clean["product_drawdown_fraction"]),
                 "maximum_correlation": _maximum_correlation(clean["correlations"]),
                 "beta": sum(
-                    item.target_fraction * float(clean["beta"].get(item.instrument_id, 0.0))
-                    for item in targets
+                    notional / equity * float(clean["beta"].get(item.instrument_id, 0.0))
+                    for item, notional in zip(targets, notionals, strict=True)
                 ),
                 "turnover_fraction": turnover,
             },
@@ -654,10 +798,10 @@ def _validate_state_health(clean: Mapping[str, Any]) -> None:
 def _maximum_correlation(values: Mapping[str, Any]) -> float:
     correlations = [
         abs(float(value))
-        for row in values.values()
+        for instrument_id, row in values.items()
         if isinstance(row, Mapping)
         for other, value in row.items()
-        if other not in {"self", ""} and abs(float(value)) < 1.0 - 1e-12
+        if other not in {instrument_id, "self", ""}
     ]
     return max(correlations, default=0.0)
 
@@ -670,7 +814,7 @@ class DatabasePortfolioTargetWorker:
         *,
         queue: DatabaseJobQueue,
         worker_id: str,
-        build_target: Callable[[Mapping[str, Any]], TargetRiskReferences],
+        build_target: Callable[[Mapping[str, Any]], TargetRiskReferences | NoPortfolioTarget],
         lease_seconds: int = 60,
         job_name: str = "portfolio_target_build",
         risk_job_name: str = "risk_assessment",
@@ -694,6 +838,14 @@ class DatabasePortfolioTargetWorker:
         try:
             payload = validate_job_payload("portfolio_target_build", claimed.payload)
             references = self.build_target(payload)
+            if isinstance(references, NoPortfolioTarget):
+                result = {
+                    "reason_code": references.reason_code,
+                    "decision_id": references.decision_id,
+                    "targets": 0,
+                }
+                self.queue.complete(claimed, completed_at=now, outcome=result)
+                return {**result, "job_id": claimed.job_id}
             risk_payload = {
                 "assessment_id": canonical_hash(
                     {

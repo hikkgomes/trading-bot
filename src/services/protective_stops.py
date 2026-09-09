@@ -14,6 +14,7 @@ from src.execution.order_manager import OrderManager
 from src.execution.position_manager import PositionManager
 from src.execution.stops import ProtectiveStop, StopManager, StopStatus
 from src.services.alerting import AlertSeverity, SqlAlertService
+from src.services.protective_orders import adopt_protective_child
 from src.services.scheduler import DatabaseJobQueue
 
 
@@ -55,6 +56,7 @@ class LiveProtectiveStopService:
         broker = venue.broker
         if not _is_futures(product, self.accounts):
             return None
+        self._assert_existing_protection(order)
         supports_stops = getattr(broker, "supports_native_protective_stops", None)
         if not callable(supports_stops) or not supports_stops():
             raise ProtectiveStopError("live futures entry requires native protective stops")
@@ -71,7 +73,7 @@ class LiveProtectiveStopService:
                 stop.instrument_id != order.instrument_id
                 or stop.exit_side is not _exit_side(order.side)
                 or abs(stop.trigger_price - trigger_price) > 1e-12
-                or abs(stop.quantity - order.quantity) > 1e-12
+                or stop.entry_quantity != order.quantity
             ):
                 raise ProtectiveStopError("durable protective stop does not match entry intent")
             return stop
@@ -84,9 +86,31 @@ class LiveProtectiveStopService:
             trigger_price=trigger_price,
             created_at=timestamp(at, field="stop.created_at"),
             entry_order_id=order.order_id,
+            entry_quantity=order.quantity,
             native_client_id=client_id,
         )
         return self.stop_manager.create(stop)
+
+    def _assert_existing_protection(self, order: OrderIntent) -> None:
+        stops = self._position_stops(order)
+        if any(
+            stop.status in {StopStatus.CONFIRMATION_FAILED, StopStatus.REPLACE_PENDING}
+            or stop.previous_native_order_id
+            for stop in stops
+        ):
+            raise ProtectiveStopError("unresolved position protection blocks new entry risk")
+        if self.positions is None:
+            return
+        self.positions.reload()
+        quantity = self.positions.get(order.portfolio_id, order.instrument_id).quantity
+        side = OrderSide.SELL if quantity > 0 else OrderSide.BUY
+        coverage = sum(
+            stop.protected_quantity
+            for stop in stops
+            if stop.status is StopStatus.PROTECTED and stop.exit_side is side
+        )
+        if coverage + 1e-12 < abs(quantity):
+            raise ProtectiveStopError("existing position lacks confirmed protective coverage")
 
     def on_fill(
         self,
@@ -120,78 +144,112 @@ class LiveProtectiveStopService:
                 "protective stop side does not reduce the filled position",
                 stop=stop,
             )
-        desired_quantity = abs(position_quantity)
-        venue = self.venues[product_id]
-        broker = venue.broker
+        covered = sum(
+            other.protected_quantity
+            for other in self._position_stops(order)
+            if other.stop_id != stop.stop_id and other.exit_side is stop.exit_side
+        )
+        desired_quantity = max(0.0, abs(position_quantity) - covered)
+        if desired_quantity <= 1e-12:
+            return self._after_reduce(product_id, order, position_quantity, at)
+        return self._ensure_quantity(product_id, stop, desired_quantity, position_quantity, at)
+
+    def _ensure_quantity(
+        self,
+        product_id: str,
+        stop: ProtectiveStop,
+        desired_quantity: float,
+        position_quantity: float,
+        at: str,
+    ) -> ProtectiveStop:
         if (
             stop.status is StopStatus.PROTECTED
             and abs(stop.protected_quantity - desired_quantity) <= 1e-12
         ):
-            return stop
-        if stop.native_order_id:
-            try:
-                cancelled = broker.cancel_protective_stop(
-                    symbol=_exchange_symbol(venue, stop.instrument_id),
-                    order_id=stop.native_order_id,
-                    client_id=str(stop.native_client_id or ""),
-                )
-                if ProtectiveOrderStatus(cancelled.status) is ProtectiveOrderStatus.OPEN:
-                    raise ProtectiveStopError("native protective stop remained open after resize")
-            except Exception as exc:
-                return self._fail_unprotected(
-                    product_id,
-                    order,
-                    position_quantity,
-                    at,
-                    f"could not cancel protective stop for resize: {exc}",
-                    stop=stop,
-                )
-        if abs(stop.quantity - desired_quantity) > 1e-12 or stop.native_order_id:
+            return self._retire_previous(product_id, stop, position_quantity, at)
+        if abs(stop.quantity - desired_quantity) > 1e-12:
             stop = self.stop_manager.resize(stop.stop_id, quantity=desired_quantity)
         return self._place(product_id, stop, position_quantity, at)
+
+    def _position_stops(self, order: OrderIntent) -> tuple[ProtectiveStop, ...]:
+        return tuple(
+            stop
+            for stop in self.stop_manager.active()
+            if stop.portfolio_id == order.portfolio_id and stop.instrument_id == order.instrument_id
+        )
+
+    def _retire_previous(
+        self,
+        product_id: str,
+        stop: ProtectiveStop,
+        position_quantity: float,
+        at: str,
+    ) -> ProtectiveStop:
+        if not stop.previous_native_order_id:
+            return stop
+        venue = self.venues[product_id]
+        try:
+            current_quantity = float(
+                venue.broker.get_position(_exchange_symbol(venue, stop.instrument_id)).qty
+            )
+            if (
+                not math.isfinite(current_quantity)
+                or abs(current_quantity - position_quantity) > 1e-12
+            ):
+                raise ProtectiveStopError("exchange position changed during protection replacement")
+            cancelled = venue.broker.cancel_protective_stop(
+                symbol=_exchange_symbol(venue, stop.instrument_id),
+                order_id=stop.previous_native_order_id,
+                client_id=str(stop.previous_native_client_id or ""),
+            )
+            if ProtectiveOrderStatus(cancelled.status) is ProtectiveOrderStatus.TRIGGERED:
+                outcome = self._record_trigger(product_id, stop, cancelled, at)
+                if outcome["reason_code"] == "protective_child_reconciled":
+                    return self.stop_manager.replacement_complete(stop.stop_id)
+            if ProtectiveOrderStatus(cancelled.status) is not ProtectiveOrderStatus.CANCELED:
+                raise ProtectiveStopError("previous stop was not cancelled; reconcile trigger race")
+            return self.stop_manager.replacement_complete(stop.stop_id)
+        except Exception as exc:
+            return self._fail_unprotected(
+                product_id,
+                None,
+                position_quantity,
+                at,
+                f"previous protection requires reconciliation: {exc}",
+                stop=stop,
+            )
 
     def reconcile(self, product_id: str, at: str) -> tuple[dict[str, Any], ...]:
         """Re-read every confirmed native stop and queue unsafe exposure recovery."""
 
         venue = self.venues[product_id]
         results: list[dict[str, Any]] = []
-        for stop in self.stop_manager.active():
-            if stop.portfolio_id != _portfolio_id(self.products[product_id]):
-                continue
+        for stop in self._reconcilable_stops(product_id):
             position_quantity = self._position_quantity(stop)
+            if stop.status is StopStatus.TRIGGERED:
+                results.append(self._reconcile_triggered(product_id, stop, at))
+                continue
             if abs(position_quantity) <= 1e-12:
                 if stop.status is StopStatus.ACTIVE and not stop.native_order_id:
                     results.append({"stop_id": stop.stop_id, "status": "awaiting_entry_fill"})
                     continue
-                if stop.native_order_id:
-                    try:
-                        cancelled = venue.broker.cancel_protective_stop(
-                            symbol=_exchange_symbol(venue, stop.instrument_id),
-                            order_id=stop.native_order_id,
-                            client_id=str(stop.native_client_id or ""),
-                        )
-                        if ProtectiveOrderStatus(cancelled.status) is ProtectiveOrderStatus.OPEN:
-                            raise ProtectiveStopError(
-                                "native protective stop remained open after flat reconciliation"
-                            )
-                    except Exception as exc:
-                        self.stop_manager.mark_failure(
-                            stop.stop_id, reason=f"flat stop cancellation failed: {exc}"
-                        )
-                        self._emit_alert(
-                            event_type="protective_stop_orphaned",
-                            dedupe_key=f"protective-stop:{product_id}:{stop.stop_id}:flat",
-                            target=product_id,
-                            message="a flat position still has an active protective stop",
-                            emitted_at=at,
-                            payload={"stop_id": stop.stop_id},
-                        )
-                        results.append(
-                            {"stop_id": stop.stop_id, "status": "orphan_cancellation_failed"}
-                        )
-                        continue
-                self.stop_manager.cancel(stop.stop_id)
-                results.append({"stop_id": stop.stop_id, "status": "cancelled_flat"})
+                self._cancel_flat_stops(product_id, (stop,), at)
+                status = self.stop_manager.get(stop.stop_id).status
+                results.append(
+                    {
+                        "stop_id": stop.stop_id,
+                        "status": "cancelled_flat"
+                        if status is StopStatus.CANCELLED
+                        else "orphan_cancellation_failed",
+                    }
+                )
+                continue
+            if stop.submission_attempted and not stop.native_order_id:
+                try:
+                    recovered = self._place(product_id, stop, position_quantity, at)
+                    results.append({"stop_id": stop.stop_id, "status": recovered.status.value})
+                except ProtectiveStopError:
+                    results.append({"stop_id": stop.stop_id, "status": "recovery_required"})
                 continue
             if not stop.native_order_id or not stop.native_client_id:
                 self.stop_manager.mark_failure(
@@ -232,6 +290,26 @@ class LiveProtectiveStopService:
                 results.append({"stop_id": stop.stop_id, "status": "reconciliation_failed"})
         return tuple(results)
 
+    def _reconcilable_stops(self, product_id: str) -> tuple[ProtectiveStop, ...]:
+        return tuple(
+            stop
+            for stop in self.stop_manager.all()
+            if stop.portfolio_id == _portfolio_id(self.products[product_id])
+            and stop.status not in {StopStatus.CANCELLED, StopStatus.RECONCILED}
+        )
+
+    def _reconcile_triggered(
+        self, product_id: str, stop: ProtectiveStop, at: str
+    ) -> dict[str, Any]:
+        venue = self.venues[product_id]
+        native = venue.broker.get_protective_stop(
+            symbol=_exchange_symbol(venue, stop.instrument_id),
+            order_id=stop.native_order_id,
+            client_id=str(stop.native_client_id or ""),
+        )
+        _validate_native(native, stop, symbol=_exchange_symbol(venue, stop.instrument_id))
+        return self._record_trigger(product_id, stop, native, at)
+
     def on_algo_update(self, product_id: str, event: MarketEvent) -> dict[str, Any]:
         """Apply a Binance conditional-order update to its durable stop."""
 
@@ -240,9 +318,10 @@ class LiveProtectiveStopService:
         native_client_id = _first_text(values, "c", "C", "clientOrderId", "clientAlgoId", "caid")
         matches = tuple(
             stop
-            for stop in self.stop_manager.active()
-            if (native_order_id and stop.native_order_id == native_order_id)
-            or (native_client_id and stop.native_client_id == native_client_id)
+            for stop in self.stop_manager.all()
+            if stop.portfolio_id == _portfolio_id(self.products[product_id])
+            and stop.instrument_id == event.instrument_id
+            and _matches_native(stop, native_order_id, native_client_id)
         )
         if len(matches) != 1:
             recovery_payload = {
@@ -257,11 +336,15 @@ class LiveProtectiveStopService:
         stop = matches[0]
         status = _protective_status(values)
         if status is ProtectiveOrderStatus.TRIGGERED:
-            if stop.status is not StopStatus.TRIGGERED:
-                stop = self.stop_manager.triggered(
-                    stop.stop_id, triggered_at=event.exchange_timestamp
-                )
-            return {"reason_code": "protective_stop_triggered", "stop_id": stop.stop_id}
+            venue = self.venues[product_id]
+            native = venue.broker.get_protective_stop(
+                symbol=_exchange_symbol(venue, stop.instrument_id),
+                order_id=native_order_id or None,
+                client_id=native_client_id,
+            )
+            plan = self.stop_manager.native_plan(native.order_id) or stop
+            _validate_native(native, plan, symbol=_exchange_symbol(venue, stop.instrument_id))
+            return self._record_trigger(product_id, stop, native, event.receive_timestamp)
         if status in {
             ProtectiveOrderStatus.CANCELED,
             ProtectiveOrderStatus.EXPIRED,
@@ -280,41 +363,109 @@ class LiveProtectiveStopService:
             return {"reason_code": f"protective_stop_{status.value}", "stop_id": stop.stop_id}
         return {"reason_code": "protective_stop_open", "stop_id": stop.stop_id}
 
+    def _record_trigger(
+        self,
+        product_id: str,
+        stop: ProtectiveStop,
+        native: ProtectiveOrder,
+        at: str,
+    ) -> dict[str, Any]:
+        child = None
+        if native.child_order_id:
+            if self.order_manager is None:
+                raise ProtectiveStopError("triggered child has no durable order manager")
+            child = adopt_protective_child(
+                self.order_manager,
+                stop,
+                native,
+                self.venues[product_id].broker,
+                at,
+            )
+        previous = native.order_id == stop.previous_native_order_id
+        if previous and (child is None or not child.is_terminal):
+            self.stop_manager.mark_failure(
+                stop.stop_id, reason="previous stop triggered during replacement"
+            )
+        elif not previous and stop.status is not StopStatus.TRIGGERED:
+            self.stop_manager.mark_protected(
+                stop.stop_id,
+                native_order_id=native.order_id,
+                native_client_id=native.client_id,
+                protected_quantity=stop.quantity,
+            )
+            self.stop_manager.triggered(stop.stop_id, triggered_at=at)
+        if child is not None and child.is_terminal:
+            self._complete_child(product_id, stop, previous, at)
+            return {
+                "reason_code": "protective_child_reconciled",
+                "stop_id": stop.stop_id,
+                "child_order_id": child.order_id,
+            }
+        self._enqueue_recovery(
+            {
+                "product_id": product_id,
+                "stop_id": stop.stop_id,
+                "reason_code": "protective_stop_triggered",
+                "recovery_kind": "protective_child",
+                "protective_child_order_id": child.order_id if child else None,
+                "observed_at": at,
+            },
+            at,
+        )
+        return {
+            "reason_code": "protective_stop_triggered",
+            "stop_id": stop.stop_id,
+            "child_order_id": child.order_id if child else None,
+        }
+
+    def _complete_child(
+        self, product_id: str, stop: ProtectiveStop, previous: bool, at: str
+    ) -> None:
+        if previous:
+            return
+        self.stop_manager.reconciled(stop.stop_id)
+        remaining = self._position_quantity(stop)
+        side = OrderSide.SELL if remaining > 0 else OrderSide.BUY
+        covered = sum(
+            item.protected_quantity
+            for item in self.stop_manager.active()
+            if item.portfolio_id == stop.portfolio_id
+            and item.instrument_id == stop.instrument_id
+            and item.exit_side is side
+            and item.status is StopStatus.PROTECTED
+        )
+        uncovered = max(0.0, abs(remaining) - covered)
+        self._enqueue_reduction(
+            product_id=product_id,
+            stop=stop,
+            position_quantity=math.copysign(uncovered, remaining),
+            at=at,
+            reason_code="protective_child_terminal_residual",
+        )
+
     def _place(
         self, product_id: str, stop: ProtectiveStop, position_quantity: float, at: str
     ) -> ProtectiveStop:
         venue = self.venues[product_id]
         try:
-            native = venue.broker.place_protective_stop(
-                symbol=_exchange_symbol(venue, stop.instrument_id),
-                side=stop.exit_side,
-                qty=stop.quantity,
-                trigger_price=stop.trigger_price,
-                client_id=str(stop.native_client_id or _native_client_id(product_id, stop.stop_id)),
-            )
+            native = self._submit_or_recover(venue, stop)
             _validate_native(
                 native,
                 stop,
                 symbol=_exchange_symbol(venue, stop.instrument_id),
             )
             if ProtectiveOrderStatus(native.status) is ProtectiveOrderStatus.TRIGGERED:
-                updated = self.stop_manager.triggered(stop.stop_id, triggered_at=at)
-                self._enqueue_reduction(
-                    product_id=product_id,
-                    stop=updated,
-                    position_quantity=position_quantity,
-                    at=at,
-                    reason_code="protective_stop_triggered_on_placement",
-                )
+                self._record_trigger(product_id, stop, native, at)
                 raise ProtectiveStopError("protective stop triggered during placement")
-            return self.stop_manager.mark_protected(
+            updated = self.stop_manager.mark_protected(
                 stop.stop_id,
                 native_order_id=native.order_id,
                 native_client_id=native.client_id,
                 protected_quantity=stop.quantity,
             )
+            return self._retire_previous(product_id, updated, position_quantity, at)
         except ProtectiveStopError as exc:
-            if stop.status is not StopStatus.TRIGGERED:
+            if self.stop_manager.get(stop.stop_id).status is not StopStatus.TRIGGERED:
                 self._fail_unprotected(
                     product_id,
                     None,
@@ -334,53 +485,114 @@ class LiveProtectiveStopService:
                 stop=stop,
             )
 
+    def _submit_or_recover(self, venue: Any, stop: ProtectiveStop) -> ProtectiveOrder:
+        symbol = _exchange_symbol(venue, stop.instrument_id)
+        if stop.submission_attempted or stop.native_order_id:
+            return venue.broker.get_protective_stop(
+                symbol=symbol,
+                order_id=stop.native_order_id,
+                client_id=str(stop.native_client_id or ""),
+            )
+        self.stop_manager.submission_started(stop.stop_id)
+        return venue.broker.place_protective_stop(
+            symbol=symbol,
+            side=stop.exit_side,
+            qty=stop.quantity,
+            trigger_price=stop.trigger_price,
+            client_id=str(stop.native_client_id or ""),
+        )
+
     def _after_reduce(
         self, product_id: str, order: OrderIntent, position_quantity: float, at: str
     ) -> ProtectiveStop | None:
-        stops = tuple(
-            stop
-            for stop in self.stop_manager.active()
-            if stop.portfolio_id == order.portfolio_id and stop.instrument_id == order.instrument_id
-        )
+        stops = self._position_stops(order)
         if not stops:
             return None
         if abs(position_quantity) <= 1e-12:
-            for stop in stops:
-                if stop.native_order_id:
-                    try:
-                        native = self.venues[product_id].broker.cancel_protective_stop(
-                            symbol=_exchange_symbol(self.venues[product_id], stop.instrument_id),
-                            order_id=stop.native_order_id,
-                            client_id=str(stop.native_client_id or ""),
-                        )
-                        if ProtectiveOrderStatus(native.status) is ProtectiveOrderStatus.OPEN:
-                            raise ProtectiveStopError(
-                                "protective stop remained open after flat close"
-                            )
-                    except Exception as exc:
-                        self.stop_manager.mark_failure(
-                            stop.stop_id, reason=f"stop cancellation after flat close failed: {exc}"
-                        )
-                        self._enqueue_reduction(
-                            product_id=product_id,
-                            stop=stop,
-                            position_quantity=0.0,
-                            at=at,
-                            reason_code="protective_stop_cancel_failed",
-                        )
-                        continue
-                self.stop_manager.cancel(stop.stop_id)
+            self._cancel_flat_stops(product_id, stops, at)
             return None
+        remaining = abs(position_quantity)
+        result = None
         for stop in stops:
-            if (
-                stop.status is StopStatus.PROTECTED
-                and abs(stop.protected_quantity - abs(position_quantity)) > 1e-12
-            ):
-                self.stop_manager.resize(stop.stop_id, quantity=abs(position_quantity))
-                return self._place(
-                    product_id, self.stop_manager.get(stop.stop_id), position_quantity, at
+            if stop.status is StopStatus.ACTIVE and not stop.native_order_id:
+                continue
+            desired = min(stop.quantity, remaining)
+            if desired <= 1e-12:
+                try:
+                    self._cancel_stop(product_id, stop)
+                except Exception as exc:
+                    return self._fail_unprotected(
+                        product_id,
+                        order,
+                        position_quantity,
+                        at,
+                        f"redundant protection cancellation failed: {exc}",
+                        stop=stop,
+                    )
+                continue
+            result = self._ensure_quantity(product_id, stop, desired, position_quantity, at)
+            remaining -= desired
+        if remaining > 1e-12:
+            return self._fail_unprotected(
+                product_id,
+                order,
+                position_quantity,
+                at,
+                "position exceeds confirmed stop coverage",
+                stop=stops[0],
+            )
+        return result
+
+    def _cancel_flat_stops(
+        self, product_id: str, stops: tuple[ProtectiveStop, ...], at: str
+    ) -> None:
+        for stop in stops:
+            try:
+                self._cancel_stop(product_id, stop)
+            except Exception as exc:
+                self.stop_manager.mark_failure(
+                    stop.stop_id, reason=f"flat stop cancellation failed: {exc}"
                 )
-        return stops[0]
+                self._enqueue_recovery(
+                    {
+                        "product_id": product_id,
+                        "stop_id": stop.stop_id,
+                        "reason_code": "protective_stop_cancel_failed",
+                    },
+                    at,
+                )
+                self._emit_alert(
+                    event_type="protective_stop_orphaned",
+                    dedupe_key=f"protective-stop:{product_id}:{stop.stop_id}:flat",
+                    target=product_id,
+                    message="flat position has unresolved native protection",
+                    emitted_at=at,
+                    payload={"stop_id": stop.stop_id},
+                )
+
+    def _cancel_stop(self, product_id: str, stop: ProtectiveStop) -> None:
+        venue = self.venues[product_id]
+        native_order_id = stop.native_order_id
+        if stop.submission_attempted and not native_order_id:
+            native = venue.broker.get_protective_stop(
+                symbol=_exchange_symbol(venue, stop.instrument_id),
+                order_id=None,
+                client_id=str(stop.native_client_id or ""),
+            )
+            native_order_id = native.order_id
+        for order_id, client_id in (
+            (native_order_id, stop.native_client_id),
+            (stop.previous_native_order_id, stop.previous_native_client_id),
+        ):
+            if order_id:
+                native = venue.broker.cancel_protective_stop(
+                    symbol=_exchange_symbol(venue, stop.instrument_id),
+                    order_id=order_id,
+                    client_id=str(client_id or ""),
+                )
+                if ProtectiveOrderStatus(native.status) is not ProtectiveOrderStatus.CANCELED:
+                    raise ProtectiveStopError("stop cancellation requires trigger reconciliation")
+        self.stop_manager.cancel(stop.stop_id)
 
     def on_order_status(
         self, product_id: str, order: OrderIntent, status: str, at: str
@@ -403,29 +615,8 @@ class LiveProtectiveStopService:
         position_quantity = self._position_quantity(stop)
         if abs(position_quantity) > 1e-12:
             return self.on_fill(product_id, order, position_quantity, at)
-        if stop.native_order_id:
-            try:
-                native = self.venues[product_id].broker.cancel_protective_stop(
-                    symbol=_exchange_symbol(self.venues[product_id], stop.instrument_id),
-                    order_id=stop.native_order_id,
-                    client_id=str(stop.native_client_id or ""),
-                )
-                if ProtectiveOrderStatus(native.status) is ProtectiveOrderStatus.OPEN:
-                    raise ProtectiveStopError("protective stop remained open after entry ended")
-            except Exception as exc:
-                self.stop_manager.mark_failure(
-                    stop.stop_id, reason=f"orphan protective stop cancellation failed: {exc}"
-                )
-                self._emit_alert(
-                    event_type="protective_stop_orphaned",
-                    dedupe_key=f"protective-stop:{product_id}:{stop.stop_id}:orphaned",
-                    target=product_id,
-                    message="entry ended but its protective stop could not be cancelled",
-                    emitted_at=at,
-                    payload={"stop_id": stop.stop_id, "order_id": order.order_id},
-                )
-                raise ProtectiveStopError(str(exc)) from exc
-        return self.stop_manager.cancel(stop.stop_id)
+        self._cancel_flat_stops(product_id, (stop,), at)
+        return self.stop_manager.get(stop.stop_id)
 
     def _fail_unprotected(
         self,
@@ -440,7 +631,18 @@ class LiveProtectiveStopService:
         if stop is None:
             if order is None:
                 raise ProtectiveStopError(reason)
-            stop = self.stop_manager.for_entry_order(order.order_id)[0]
+            matches = self.stop_manager.for_entry_order(order.order_id)
+            if not matches:
+                self._enqueue_recovery(
+                    {
+                        "product_id": product_id,
+                        "order_id": order.order_id,
+                        "reason_code": "filled_entry_missing_protection",
+                    },
+                    at,
+                )
+                raise ProtectiveStopError(reason)
+            stop = matches[0]
         self.stop_manager.mark_failure(stop.stop_id, reason=reason)
         self._emit_alert(
             event_type="protective_stop_failed",
@@ -469,16 +671,16 @@ class LiveProtectiveStopService:
         status = ProtectiveOrderStatus(native.status)
         if status is ProtectiveOrderStatus.OPEN:
             if stop.status is not StopStatus.PROTECTED:
-                self.stop_manager.mark_protected(
+                stop = self.stop_manager.mark_protected(
                     stop.stop_id,
                     native_order_id=native.order_id,
                     native_client_id=native.client_id,
                     protected_quantity=native.qty,
                 )
+            self._retire_previous(product_id, stop, self._position_quantity(stop), at)
             return {"stop_id": stop.stop_id, "status": "open"}
         if status is ProtectiveOrderStatus.TRIGGERED:
-            if stop.status is not StopStatus.TRIGGERED:
-                self.stop_manager.triggered(stop.stop_id, triggered_at=at)
+            self._record_trigger(product_id, stop, native, at)
             return {"stop_id": stop.stop_id, "status": "triggered"}
         self.stop_manager.mark_failure(
             stop.stop_id, reason=f"native protective stop {status.value}"
@@ -495,6 +697,7 @@ class LiveProtectiveStopService:
     def _position_quantity(self, stop: ProtectiveStop) -> float:
         if self.positions is None:
             return stop.protected_quantity
+        self.positions.reload()
         return self.positions.get(stop.portfolio_id, stop.instrument_id).quantity
 
     def _enqueue_reduction(
@@ -655,7 +858,7 @@ def _validate_native(native: ProtectiveOrder, stop: ProtectiveStop, *, symbol: s
         raise ProtectiveStopError("native protective stop identity does not match the durable stop")
     if native.symbol != symbol:
         raise ProtectiveStopError("native protective stop symbol does not match the durable stop")
-    if native.side is not stop.exit_side or abs(native.qty - stop.quantity) > 1e-12:
+    if native.side.value != stop.exit_side.value or abs(native.qty - stop.quantity) > 1e-12:
         raise ProtectiveStopError("native protective stop side or quantity does not match")
     if abs(native.trigger_price - stop.trigger_price) > 1e-12:
         raise ProtectiveStopError("native protective stop trigger does not match")
@@ -665,7 +868,7 @@ def _algo_values(event: MarketEvent) -> Mapping[str, Any]:
     raw = event.payload.get("data")
     if not isinstance(raw, Mapping):
         return {}
-    nested = raw.get("a")
+    nested = raw.get("o")
     if isinstance(nested, Mapping):
         return {**dict(raw), **dict(nested)}
     return raw
@@ -681,9 +884,9 @@ def _first_text(values: Mapping[str, Any], *keys: str) -> str:
 
 def _protective_status(values: Mapping[str, Any]) -> ProtectiveOrderStatus:
     raw = _first_text(values, "algoStatus", "status", "X", "x").lower()
-    if raw in {"new", "open", "accepted", "triggering", "pending"}:
+    if raw in {"new", "open", "accepted", "pending"}:
         return ProtectiveOrderStatus.OPEN
-    if raw in {"triggered", "filled", "executed", "closed"}:
+    if raw in {"triggering", "triggered", "finished", "filled", "executed", "closed"}:
         return ProtectiveOrderStatus.TRIGGERED
     if raw in {"canceled", "cancelled"}:
         return ProtectiveOrderStatus.CANCELED
@@ -692,3 +895,20 @@ def _protective_status(values: Mapping[str, Any]) -> ProtectiveOrderStatus:
     if raw == "rejected":
         return ProtectiveOrderStatus.REJECTED
     raise ProtectiveStopError(f"unsupported protective algo status: {raw or '<missing>'}")
+
+
+def _matches_native(stop: ProtectiveStop, order_id: str, client_id: str) -> bool:
+    identities = (
+        (stop.native_order_id, stop.native_client_id),
+        (stop.previous_native_order_id, stop.previous_native_client_id),
+    )
+    return any(
+        (
+            not order_id
+            or native_id == order_id
+            or (native_id is None and client_id == native_client)
+        )
+        and (not client_id or native_client == client_id)
+        and bool(order_id or client_id)
+        for native_id, native_client in identities
+    )

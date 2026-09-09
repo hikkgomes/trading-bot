@@ -188,39 +188,3 @@ def test_plan_leg_to_order():
 
 
 # --------------------------------------------------------------------------- run_bot macro regime gate
-def test_macro_step_aside_trend_break():
-    from src.run_bot import compute_macro_step_aside
-
-    # 300 rising daily bars, then a crash on the last bar -> close below the EMA.
-    close = pd.Series(list(np.linspace(100, 200, 300)) + [80.0])
-    aside, detail = compute_macro_step_aside(close)
-    assert aside is True
-    assert detail["trend_break"] is True
-
-
-def test_macro_step_aside_risk_on():
-    from src.run_bot import compute_macro_step_aside
-
-    # Steady uptrend, close above its EMA, overheat threshold way out of reach.
-    close = pd.Series(np.linspace(100, 200, 300))
-    aside, detail = compute_macro_step_aside(close, mayer_top=100.0)
-    assert aside is False
-    assert detail["trend_break"] is False
-
-
-def test_macro_step_aside_overheated_threshold():
-    from src.run_bot import compute_macro_step_aside
-
-    # Same uptrend but a very low Mayer threshold trips the overheat gate.
-    close = pd.Series(np.linspace(100, 200, 300))
-    aside, detail = compute_macro_step_aside(close, mayer_top=1.0)
-    assert aside is True
-    assert detail["overheated"] is True
-
-
-def test_macro_step_aside_insufficient_history():
-    from src.run_bot import compute_macro_step_aside
-
-    aside, detail = compute_macro_step_aside(pd.Series(np.linspace(100, 110, 50)))
-    assert aside is False
-    assert detail["reason"] == "insufficient_daily_history"

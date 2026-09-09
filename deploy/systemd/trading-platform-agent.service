@@ -1,21 +1,21 @@
 [Unit]
+RequiresMountsFor=/opt/trading-bot/data /opt/trading-bot/runtime/backups
 Description=Trading platform isolated agent process
-After=network-online.target postgresql.service trading-platform-migration.service
+After=network-online.target trading-platform-control.service
 Wants=network-online.target
-Requires=postgresql.service trading-platform-migration.service
+Requires=trading-platform-control.service
 
 [Service]
 Type=simple
 User=trading-agent
 Group=trading-agent
+Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/agent-worktrees/numba-cache
 WorkingDirectory=/opt/trading-bot
 EnvironmentFile=/etc/trading-platform/agent.env
 Environment=PYTHONUNBUFFERED=1
-Environment=TRADING_PLATFORM_AGENT_WORKTREE_ROOT=/opt/trading-bot/runtime/agent-worktrees
-Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/agent-worktrees/numba-cache
-Environment=GIT_CONFIG_COUNT=1
-Environment=GIT_CONFIG_KEY_0=safe.directory
-Environment=GIT_CONFIG_VALUE_0=/opt/trading-bot
+Environment=TRADING_PLATFORM_AGENT_API_URL=http://127.0.0.1:8088
+Environment=TRADING_PLATFORM_OPENCLAW_CONFIG=/opt/trading-bot/runtime/agent-worktrees/openclaw.json
+Environment=TRADING_PLATFORM_OPENCLAW_AGENT=research
 ExecStartPre=/opt/trading-bot/.venv-agent/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process agent-runtime --validate
 ExecStart=/opt/trading-bot/.venv-agent/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process agent-runtime
 Restart=always

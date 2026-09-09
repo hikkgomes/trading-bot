@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import time
@@ -51,6 +52,7 @@ PROCESS_SERVICES = {
         "trading-runtime",
         "scheduler-operations",
         "research-runtime",
+        "evaluation-runtime",
         "agent-runtime",
     }
 }
@@ -153,48 +155,26 @@ def _build_research_work(
         work["promotion-engine"] = _promotion_cycle(
             database=database, node_id=node_id, configuration=configuration
         )
-    if "research-worker" in selected:
-        work["research-worker"] = _research_cycle(
-            database=database,
-            node_id=node_id,
-            service_name="research-worker",
-            runtime=runtime_by_service["research-worker"],
-            maximum_runtime_seconds=int(
-                configuration["research"]["resource_limits"]["maximum_runtime_seconds"]
-            ),
-            parquet_root=Path(config.paths["parquet"]),
-            artefact_root=Path(config.paths["artefacts"]),
-            research_configuration=configuration["research"],
-            configuration=configuration,
-        )
-    if "ml-worker" in selected:
-        work["ml-worker"] = _research_cycle(
-            database=database,
-            node_id=node_id,
-            service_name="ml-worker",
-            runtime=runtime_by_service["ml-worker"],
-            maximum_runtime_seconds=int(
-                configuration["research"]["resource_limits"]["maximum_runtime_seconds"]
-            ),
-            parquet_root=Path(config.paths["parquet"]),
-            artefact_root=Path(config.paths["artefacts"]),
-            research_configuration=configuration["research"],
-            configuration=configuration,
-        )
-    if "event-replay-worker" in selected:
-        work["event-replay-worker"] = _research_cycle(
-            database=database,
-            node_id=node_id,
-            service_name="event-replay-worker",
-            runtime=runtime_by_service["event-replay-worker"],
-            maximum_runtime_seconds=int(
-                configuration["research"]["resource_limits"]["maximum_runtime_seconds"]
-            ),
-            parquet_root=Path(config.paths["parquet"]),
-            artefact_root=Path(config.paths["artefacts"]),
-            research_configuration=configuration["research"],
-            configuration=configuration,
-        )
+    for service_name in (
+        "research-worker",
+        "evaluation-worker",
+        "ml-worker",
+        "event-replay-worker",
+    ):
+        if service_name in selected:
+            work[service_name] = _research_cycle(
+                database=database,
+                node_id=node_id,
+                service_name=service_name,
+                runtime=runtime_by_service[service_name],
+                maximum_runtime_seconds=int(
+                    configuration["research"]["resource_limits"]["maximum_runtime_seconds"]
+                ),
+                parquet_root=Path(config.paths["parquet"]),
+                artefact_root=Path(config.paths["artefacts"]),
+                research_configuration=configuration["research"],
+                configuration=configuration,
+            )
     if "feature-build-worker" in selected:
         work["feature-build-worker"] = _feature_cycle(
             database=database,
@@ -202,23 +182,29 @@ def _build_research_work(
             service_name="feature-build-worker",
             parquet_root=Path(config.paths["parquet"]),
         )
+    if "agent-coordinator" in selected:
+        work.update(
+            _build_agent_coordinator_work(
+                database=database, config=config, configuration=configuration, node_id=node_id
+            )
+        )
     return work
 
 
-def _build_agent_work(
+def _build_agent_coordinator_work(
     *, database: PlatformDatabase, config: Any, configuration: Mapping[str, Any], node_id: str
 ) -> dict[str, Callable[[], Mapping[str, Any] | None]]:
     runtime = ServiceRuntime(
         config=config,
         node_id=node_id,
-        service_name="agent-sandbox",
+        service_name="agent-coordinator",
         heartbeat_store=DatabaseHeartbeatStore(database.engine),
     )
     root = os.environ.get("TRADING_PLATFORM_AGENT_WORKTREE_ROOT")
     if not root:
         raise RuntimeError("TRADING_PLATFORM_AGENT_WORKTREE_ROOT must be configured")
     return {
-        "agent-sandbox": _agent_cycle(
+        "agent-coordinator": _agent_cycle(
             database=database,
             node_id=node_id,
             runtime=runtime,
@@ -258,17 +244,13 @@ def _build_work(
             alerts=alerts,
             selected_services=PROCESS_SERVICES[process_name],
         )
-    if process_name == "research-runtime":
+    if process_name in {"research-runtime", "evaluation-runtime"}:
         return _build_research_work(
             database=database,
             config=config,
             configuration=configuration,
             node_id=node_id,
             selected_services=PROCESS_SERVICES[process_name],
-        )
-    if process_name == "agent-runtime":
-        return _build_agent_work(
-            database=database, config=config, configuration=configuration, node_id=node_id
         )
     raise ValueError(f"unsupported platform process: {process_name}")
 
@@ -283,10 +265,15 @@ def run(args: argparse.Namespace) -> int:
         config.assert_service_assignment(node_id=args.node, service=service)
     if args.validate:
         return 0
+    if args.process == "agent-runtime":
+        return _run_agent_transport(args, configuration=configuration)
     database = PlatformDatabase(config.database_url())
     if not database.is_postgresql:
         raise ValueError("platform processes require PostgreSQL")
     database.assert_migrated()
+    from src.services.database_roles import check_service_roles
+
+    check_service_roles(database.engine, config, services)
     heartbeat_store = DatabaseHeartbeatStore(database.engine)
     alerts = configured_alert_service(database.engine, configuration=config.alerting)
     work = _build_work(
@@ -304,6 +291,28 @@ def run(args: argparse.Namespace) -> int:
         config=config,
         heartbeat_store=heartbeat_store,
     )
+
+
+def _run_agent_transport(args: argparse.Namespace, *, configuration: Mapping[str, Any]) -> int:
+    from src.agents.consumer import consume_configured_review
+
+    forbidden = {
+        "TRADING_PLATFORM_DATABASE_URL",
+        *(
+            str(account[field])
+            for account in configuration["accounts"]["accounts"]
+            for field in ("api_key_env", "api_secret_env")
+            if account.get(field)
+        ),
+    }
+    if any(os.environ.get(name) for name in forbidden):
+        raise PermissionError("agent transport must not receive database or exchange credentials")
+    while True:
+        result = consume_configured_review()
+        print(json.dumps(result, sort_keys=True), flush=True)
+        if args.once:
+            return 0
+        time.sleep(args.interval_seconds)
 
 
 def _run_process_loop(

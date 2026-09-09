@@ -433,10 +433,12 @@ def _strict_command(
         _hash_id(payload, field)
     for field in required - hash_fields - {"horizon_seconds", "feature_ids"}:
         _required_text(payload, field)
-    if "horizon_seconds" in payload:
-        value = payload["horizon_seconds"]
+    for field in ("horizon_seconds", "observation_interval_seconds"):
+        if field not in payload:
+            continue
+        value = payload[field]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise JobSchemaError("horizon_seconds must be a positive integer")
+            raise JobSchemaError(f"{field} must be a positive integer")
     evaluated_at = timestamp(_required_text(payload, "evaluated_at"), field="evaluated_at")
     content_hash = _hash_id(payload, "content_hash")
     unsigned = dict(payload)
@@ -462,13 +464,21 @@ def validate_job_payload(name: str, payload: Mapping[str, Any]) -> dict[str, Any
         "portfolio_target_build": _validate_portfolio_target_build,
         "emergency_reduction": _validate_emergency_reduction,
         "historical_bootstrap": _validate_historical_bootstrap,
+        "financial_live_followup": _validate_financial_followup,
     }
     validator = validators.get(name)
+    if name.startswith("financial_live_followup:"):
+        validator = _validate_financial_followup
     return (
         validator(payload)
         if validator is not None
         else json_value(dict(payload), field=f"{name} payload")
     )
+
+
+def _validate_financial_followup(payload: Mapping[str, Any]) -> dict[str, Any]:
+    _strict_fields(payload, frozenset({"application_id"}), name="financial followup")
+    return {"application_id": _hash_id(payload, "application_id")}
 
 
 def _validate_evaluate_candidate(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -509,6 +519,7 @@ def _validate_strategy_evaluation(payload: Mapping[str, Any]) -> dict[str, Any]:
                 "input_reference_id",
                 "evaluated_at",
                 "horizon_seconds",
+                "observation_interval_seconds",
                 "producer_identity",
                 "content_hash",
             }

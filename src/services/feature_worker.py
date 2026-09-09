@@ -18,7 +18,7 @@ from src.data.parquet_store import (
     FeatureBatchSegment,
     PartitionedFeatureStore,
 )
-from src.domain._codec import canonical_hash
+from src.domain._codec import canonical_hash, timeframe_seconds
 from src.risk.engine import SqlRiskSnapshotStore
 from src.services.job_schemas import build_content_hash
 from src.services.scheduler import DatabaseJobQueue
@@ -93,6 +93,7 @@ class DatabaseFeatureWorker:
             raw_inputs, scalar_inputs = self._input_values(payload, job_name=claimed.name)
             values = self._calculate_core_values(payload, scalar_inputs)
             assignments = tuple(self.active_assignments(str(payload["instrument_id"])))
+            assignments = self._matching_timeframes(assignments, payload)
             required_by_assignment, graph_values, graph_output_features = self._graph_features(
                 payload=payload,
                 raw_inputs=raw_inputs,
@@ -216,6 +217,18 @@ class DatabaseFeatureWorker:
         )
         graph_values, output_features = self._normalise_graph_outputs(calculated)
         return required_by_assignment, graph_values, output_features
+
+    def _matching_timeframes(self, assignments, payload):
+        if self.feature_graph_for_assignment is None:
+            return assignments
+        result = []
+        for assignment in assignments:
+            declared = self.feature_graph_for_assignment(assignment).get("timeframe")
+            if declared is None or timeframe_seconds(str(declared)) == timeframe_seconds(
+                str(payload.get("timeframe", "1m"))
+            ):
+                result.append(assignment)
+        return tuple(result)
 
     def _assignment_feature_requirements(
         self, assignments: tuple[Mapping[str, Any], ...]
@@ -416,7 +429,12 @@ class DatabaseFeatureWorker:
             "feature_ids": feature_ids,
             "feature_set_version": str(payload["feature_set_version"]),
             "evaluated_at": str(payload["availability_time"]),
-            "horizon_seconds": int(payload.get("horizon_seconds", 60)),
+            "horizon_seconds": int(
+                payload.get(
+                    "horizon_seconds", timeframe_seconds(str(payload.get("timeframe", "1m")))
+                )
+            ),
+            "observation_interval_seconds": timeframe_seconds(str(payload.get("timeframe", "1m"))),
             "producer_identity": self.worker_id,
         }
         if snapshot_id is not None:

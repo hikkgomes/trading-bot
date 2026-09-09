@@ -6,6 +6,7 @@ import os
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from src.research.outcomes import OutcomeCategory
 from src.services.heavy_compute import HeavyComputeLeaseStore
 from src.services.runtime import ServiceRuntime, utc_now
 from src.services.scheduler import ClaimedJob, DatabaseJobQueue
@@ -137,14 +138,19 @@ class ResearchWorker:
             defer_at = _add_seconds(utc_now(), min(self.lease_seconds, 300))
             if compute_lease is not None and heavy_compute is not None:
                 heavy_compute.release(compute_lease)
-            self.queue.defer(current, available_at=defer_at, reason=defer_reason)
+            category = OutcomeCategory(
+                result.get("outcome_category") or OutcomeCategory.BLOCKED_INFRASTRUCTURE
+            )
+            self.queue.defer(
+                current, available_at=defer_at, reason=defer_reason, outcome_category=category
+            )
             return {
                 "reason_code": "research_job_deferred",
                 "job_id": current.job_id,
                 **result,
                 "defer_reason": defer_reason,
             }
-        self.queue.complete(current, completed_at=utc_now())
+        self.queue.complete(current, completed_at=utc_now(), outcome=result)
         if compute_lease is not None and heavy_compute is not None:
             heavy_compute.release(compute_lease)
         return _completed_outcome(current.job_id, result)

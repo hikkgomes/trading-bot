@@ -28,7 +28,7 @@ def non_empty(value: str, *, field: str) -> str:
     return value
 
 
-def timestamp(value: str | dt.datetime, *, field: str) -> str:
+def timestamp(value: str | dt.datetime, *, field: str, preserve_subseconds: bool = False) -> str:
     if isinstance(value, dt.datetime):
         parsed = value
     else:
@@ -39,7 +39,8 @@ def timestamp(value: str | dt.datetime, *, field: str) -> str:
             raise ValueError(f"{field} must be an ISO-8601 timestamp") from exc
     if parsed.tzinfo is None:
         raise ValueError(f"{field} must include a timezone")
-    return parsed.astimezone(dt.UTC).replace(microsecond=0).isoformat()
+    parsed = parsed.astimezone(dt.UTC)
+    return (parsed if preserve_subseconds else parsed.replace(microsecond=0)).isoformat()
 
 
 def json_value(value: Any, *, field: str) -> Any:
@@ -74,3 +75,17 @@ def _json_default(value: Any) -> Any:
 def to_primitive(value: Any) -> Any:
     """Return a JSON-safe representation of an enum/dataclass contract."""
     return json.loads(json.dumps(value, default=_json_default, allow_nan=False))
+
+
+def timeframe_seconds(timeframe: str) -> int:
+    units = {"m": 60, "h": 3_600, "d": 86_400, "w": 604_800}
+    value = str(timeframe).strip()
+    if len(value) < 2 or value[-1] not in units:
+        raise ValueError(f"unsupported declared timeframe: {timeframe}")
+    try:
+        count = int(value[:-1])
+    except ValueError as exc:
+        raise ValueError(f"unsupported declared timeframe: {timeframe}") from exc
+    if count <= 0:
+        raise ValueError(f"unsupported declared timeframe: {timeframe}")
+    return count * units[value[-1]]

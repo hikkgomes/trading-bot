@@ -9,6 +9,7 @@ from typing import Any
 
 from src.services.config import ORDER_SUBMISSION_SERVICES, PlatformConfig
 from src.services.health import DatabaseHeartbeatStore, ServiceHealth
+from src.services.release import observed_release
 
 Work = Callable[[], Mapping[str, Any] | None]
 
@@ -73,7 +74,7 @@ class ServiceRuntime:
             node_id=self.node.node_id,
             observed_at=observed_at,
             healthy=healthy,
-            payload=detail,
+            payload={**detail, "release": observed_release()},
         )
         return ServiceCycle(
             service_name=self.service_name,
@@ -95,5 +96,8 @@ class ServiceRuntime:
             node_id=self.node.node_id,
             observed_at=observed_at or utc_now(),
             healthy=healthy,
-            payload=payload or {"reason_code": "service_alive"},
+            payload={
+                **(payload or {"reason_code": "service_alive"}),
+                "release": observed_release(),
+            },
         )
