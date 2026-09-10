@@ -7,6 +7,7 @@ from src.data.database import PlatformDatabase
 from src.domain._codec import canonical_hash
 from src.research.coordinator import ResearchCoordinator
 from src.research.datasets import RESEARCH_BUNDLE_ROLES, CanonicalResearchDatasetBuilder
+from src.research.economic_series import ECONOMIC_ENGINE_VERSION
 from src.research.generation import (
     CAMPAIGNS,
     GenerationAllocator,
@@ -69,7 +70,7 @@ def test_campaign_allocator_keeps_exploration_and_reduces_failed_family(tmp_path
             candidate_id=f"candidate-{index}",
             metadata={
                 "stage": "development",
-                "economic_engine": "economic-engine/v4",
+                "economic_engine": ECONOMIC_ENGINE_VERSION,
                 "net_return": -0.1,
             },
         )

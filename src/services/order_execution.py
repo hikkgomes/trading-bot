@@ -5,27 +5,36 @@ from __future__ import annotations
 import datetime as dt
 import math
 from collections.abc import Callable, Mapping
+from copy import copy
+from time import monotonic
 from typing import Any
 
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, text
 from sqlalchemy.engine import Engine
 
+from src.accounting.fees import instrument_asset
 from src.accounting.ledger import Ledger
 from src.accounting.paper_account import PaperAccountLedger
-from src.data.database import account_snapshot, reconciliation_event
-from src.domain._codec import canonical_hash, timestamp
+from src.data.database import (
+    account_portfolio_plan,
+    account_snapshot,
+    book_event,
+    reconciliation_event,
+)
+from src.domain._codec import canonical_hash, timestamp, to_primitive
 from src.domain.market_events import MarketEvent, MarketEventType
 from src.domain.orders import Fill, OrderIntent, OrderSide, OrderStatus
 from src.domain.portfolios import TargetPosition
 from src.execution.order_groups import (
     OrderGroupManager,
     OrderGroupStatus,
+    SqlOrderGroupStore,
     plan_order_group,
 )
-from src.execution.order_manager import OrderManager
+from src.execution.order_manager import OrderManager, SqlOrderStore, entry_notional
 from src.execution.order_planner import plan_orders
 from src.execution.paper_exchange import paper_fill
-from src.execution.position_manager import PositionManager
+from src.execution.position_manager import PositionManager, SqlPositionStore
 from src.observability.decision_trace import (
     DecisionTrace,
     DecisionTraceStage,
@@ -111,8 +120,12 @@ class DatabaseExecutionWorker:
         snapshot_store: SqlRiskSnapshotStore | None = None,
         control_plane: Any | None = None,
         lease_seconds: int = 60,
+        plan_authority=None,
+        connection=None,
     ) -> None:
         self.queue = queue
+        self.plan_authority = plan_authority
+        self.connection = connection
         self.worker_id = worker_id
         self.order_manager = order_manager
         self.positions = positions
@@ -172,6 +185,78 @@ class DatabaseExecutionWorker:
                 "orders": 0,
                 "first_blocked_stage": DecisionTraceStage.RISK_ACCEPTED.value,
             }
+        plans = {target.metadata.get("account_plan_id") for target in targets} - {None}
+        if plans:
+            if len(plans) != 1:
+                raise ValueError("one execution request must belong to one account plan")
+            return self._process_account_plan(
+                str(next(iter(plans))),
+                payload,
+                product_id,
+                mode,
+                configuration,
+                inputs,
+                targets,
+                now,
+            )
+        return self._execute_targets(payload, product_id, mode, configuration, inputs, targets)
+
+    def _process_account_plan(
+        self, identity, payload, product_id, mode, configuration, inputs, targets, now
+    ):
+        from src.accounting.book_allocations import apply_internal_transfers
+        from src.portfolio.account_plans import apply_initial_capital, assert_plan_state
+
+        if mode != "live" or self.plan_authority is None:
+            raise PermissionError("account portfolio execution requires approved plan authority")
+        engine = self.queue.engine
+        with engine.begin() as connection:
+            plan = connection.execute(
+                select(account_portfolio_plan.c.payload).where(
+                    account_portfolio_plan.c.id == identity
+                )
+            ).scalar_one()
+            if plan["product_id"] != product_id or plan["targets"] != to_primitive(targets):
+                raise PermissionError("execution targets differ from the immutable account plan")
+            if connection.dialect.name == "postgresql":
+                for key in ("account-plan:" + plan["account_id"], product_id):
+                    connection.execute(
+                        text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key}
+                    )
+            marker = "account-plan-applied:" + identity
+            previous = connection.execute(
+                select(book_event.c.payload).where(book_event.c.id == marker)
+            ).scalar_one_or_none()
+            if previous is not None:
+                return previous["result"]
+            worker = copy(self)
+            worker.connection = connection
+            worker.positions = PositionManager(SqlPositionStore(engine, connection=connection))
+            worker.order_manager = OrderManager(SqlOrderStore(engine, connection=connection))
+            worker.order_groups = OrderGroupManager(
+                SqlOrderGroupStore(engine, connection=connection)
+            )
+            assert_plan_state(engine, connection, plan, worker.positions, now)
+            worker._assert_reconciled_positions(inputs, targets)
+            # No capital, transfer, order or queue mutation precedes current authority.
+            self.plan_authority(plan, now=now, connection=connection)
+            apply_initial_capital(connection, plan, worker.positions)
+            apply_internal_transfers(engine, connection, plan, worker.positions)
+            result = worker._execute_targets(
+                payload, product_id, mode, configuration, inputs, targets
+            )
+            connection.execute(
+                insert(book_event).values(
+                    id=marker,
+                    created_at=now,
+                    payload={"kind": "account_plan_applied", "plan_id": identity, "result": result},
+                )
+            )
+        self.order_manager.reload()
+        self.positions.reload()
+        return result
+
+    def _execute_targets(self, payload, product_id, mode, configuration, inputs, targets):
         self._assert_reconciled_positions(inputs, targets)
         current = self.positions.current_quantities(targets[0].portfolio_id)
         prices = {str(key): float(value) for key, value in inputs["prices"].items()}
@@ -211,7 +296,7 @@ class DatabaseExecutionWorker:
         product_id = str(payload["product_id"])
         configuration = self.product_execution[product_id]
         mode = str(payload["execution_mode"])
-        if mode != configuration["execution_mode"]:
+        if mode != configuration["execution_mode"] and mode != "paper":
             raise ValueError("execution job mode differs from product configuration")
         if mode not in {"paper", "live"}:
             raise ValueError(f"unsupported execution mode: {mode}")
@@ -222,6 +307,18 @@ class DatabaseExecutionWorker:
         targets = tuple(TargetPosition(**dict(item)) for item in inputs["targets"])
         if not targets:
             raise ValueError("execution job has no targets")
+        if mode != configuration["execution_mode"]:
+            from src.portfolio.books import load_book
+
+            if any(
+                not target.metadata.get("book_id")
+                or load_book(self.queue.engine, str(target.metadata["book_id"]))["execution_mode"]
+                != "paper"
+                for target in targets
+            ):
+                raise ValueError(
+                    "only an isolated paper book can differ from the product execution mode"
+                )
         if mode == "paper" and now is not None:
             self._assert_paper_assignment_current(
                 product_id=product_id,
@@ -286,6 +383,8 @@ class DatabaseExecutionWorker:
         prices: Mapping[str, float],
     ) -> str | None:
         if self._blocks_new_risk(product_id, order):
+            if self.connection is not None:
+                raise PermissionError("control plane blocks the atomic account plan")
             self._record_control_rejection(order, payload, prices)
             return None
         existing = {item.order_id: item for item in self.order_manager.all()}.get(order.order_id)
@@ -305,6 +404,7 @@ class DatabaseExecutionWorker:
             payload=order_payload,
             available_at=str(payload["evaluated_at"]),
             priority=self._order_priority(order),
+            connection=self.connection,
         )
         return job_id
 
@@ -356,7 +456,7 @@ class DatabaseExecutionWorker:
             "quantity": order.quantity,
             "execution_costs": configuration["execution_costs"],
             "accounting_asset": configuration["base_accounting_asset"],
-            "fee_in_base": configuration["base_accounting_asset"] == "BTC",
+            "fee_in_base": False,
             "order_group_id": order.group_id,
             "strategy_version_ids": sorted(order.strategy_contributions),
             "strategy_version_id": (
@@ -585,6 +685,7 @@ class DatabaseLiveExecutionWorker:
         return {**result, "job_id": claimed.job_id}
 
     def _submit_order(self, payload: Mapping[str, Any], now: str) -> dict[str, Any]:
+        started = monotonic()
         self.order_manager.reload()
         self.positions.reload()
         order = self.order_manager.get(str(payload["order_id"]))
@@ -593,6 +694,7 @@ class DatabaseLiveExecutionWorker:
             return early
         self._assert_order_dependencies(order)
         product_id = str(payload["product_id"])
+        order, now = self._bind_entry_quote(product_id, order, now, started)
         self._assert_control_allows(product_id, order, payload)
         self.authorise({**payload, "authorisation_at": now}, order)
         acknowledgement = self._submit_to_venue(product_id, order, now)
@@ -604,6 +706,28 @@ class DatabaseLiveExecutionWorker:
             "client_order_id": acknowledgement.client_order_id,
             "remaining_quantity": updated.remaining_quantity,
         }
+
+    def _bind_entry_quote(self, product_id, order, now, started):
+        rules = order.metadata.get("target_metadata", {}).get("position_rules") or {}
+        if order.reduce_only or rules.get("execution_policy") != "resting_bracket/v1":
+            return order, now
+        venue = self.venues[product_id]
+        symbol = venue.instruments[order.instrument_id].exchange_symbol
+        price = float(venue.broker.get_price(symbol))
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError("entry quote must be finite and positive")
+        quantity = venue.broker.normalize_order_qty(
+            symbol, entry_notional(order) / price, price=price
+        )
+        instrument = venue.instruments[order.instrument_id]
+        if quantity < instrument.minimum_quantity or quantity * price < instrument.minimum_notional:
+            raise ValueError("normalised entry is below the declared instrument minimum")
+        observed_at = (
+            dt.datetime.fromisoformat(now) + dt.timedelta(seconds=monotonic() - started)
+        ).isoformat()
+        return self.order_manager.bind_entry_reference(
+            order.order_id, price=price, observed_at=observed_at, quantity=quantity
+        ), observed_at
 
     def _early_order_result(self, order: OrderIntent, now: str) -> dict[str, Any] | None:
         if order.status is OrderStatus.FILLED:
@@ -685,11 +809,19 @@ class DatabasePaperExecutionWorker:
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.lease_seconds,
-            names=("paper_order_submit", "paper_order_continue"),
+            names=("paper_order_submit", "paper_order_continue", "paper_protection_evaluate"),
         )
         if claimed is None:
             return {"reason_code": "paper_order_queue_empty"}
         try:
+            if claimed.name == "paper_protection_evaluate":
+                from src.services.paper_protection import PaperProtectionRunner
+
+                result = PaperProtectionRunner(
+                    self.queue.engine, self.paper_accounts, queue_scope=self.queue.claim_scope
+                ).execute(str(claimed.payload["market_snapshot_id"]), now=now)
+                self.queue.complete(claimed, completed_at=now)
+                return result
             return self._execute_paper_order(claimed, now=now)
         except Exception as exc:
             try:
@@ -763,7 +895,7 @@ class DatabasePaperExecutionWorker:
         order = self.order_manager.get(str(payload["order_id"]))
         if order.status is OrderStatus.FILLED:
             fills = self.order_manager.fills_for(order.order_id)
-            paper_account = self.paper_accounts.get(str(payload["product_id"]))
+            paper_account = self._paper_account(order, str(payload["product_id"]))
             if paper_account is not None:
                 if not fills:
                     raise RuntimeError("filled paper order has no durable fill records")
@@ -773,7 +905,16 @@ class DatabasePaperExecutionWorker:
                     fills=fills,
                 )
             return self._complete_already_filled(claimed, now=now, order=order, fills=fills)
-        if now >= order.valid_until and not order.is_terminal:
+        if order.is_terminal:
+            self.queue.complete(claimed, completed_at=now)
+            return {
+                "reason_code": "paper_order_terminal",
+                "order_id": order.order_id,
+                "status": order.status.value,
+            }
+        resolved = self._paper_execution_payload(order, payload, now)
+        effective_at = resolved.get("execution_at", now) if resolved else now
+        if effective_at >= order.valid_until and not order.is_terminal:
             self.order_manager.transition(
                 order.order_id,
                 OrderStatus.EXPIRED,
@@ -786,6 +927,12 @@ class DatabasePaperExecutionWorker:
                 "order_id": order.order_id,
                 "valid_until": order.valid_until,
             }
+        if resolved is None:
+            self.queue.defer(
+                claimed, available_at=_retry_at(now, 60), reason="paper_next_execution_bar_pending"
+            )
+            return {"reason_code": "paper_next_execution_bar_pending", "order_id": order.order_id}
+        payload = resolved
         _before_group_submission(self.order_groups, order)
         applied, application = self._apply_paper_fill(claimed, order, payload, now)
         fill, updated, position = applied.fill, applied.order, applied.position
@@ -818,6 +965,25 @@ class DatabasePaperExecutionWorker:
             "continuation_job_id": continuation_job_id,
         }
 
+    def _paper_execution_payload(self, order, payload, now):
+        from src.services.paper_protection import next_execution_bar
+
+        metadata = order.metadata.get("target_metadata", order.metadata)
+        if order.status is OrderStatus.PARTIALLY_FILLED and payload.get("execution_bar_id"):
+            return payload
+        if not metadata.get("position_rules") or not metadata.get("timeframe"):
+            return payload
+        resolved = next_execution_bar(self.queue.engine, order, now=now)
+        if resolved is None:
+            return None
+        identity, bar = resolved
+        at = dt.datetime.fromtimestamp(bar["open_time_ms"] / 1000, dt.UTC).isoformat()
+        if not order.reduce_only and order.status is OrderStatus.PERSISTED:
+            self.order_manager.bind_entry_reference(
+                order.order_id, price=float(bar["open"]), observed_at=at, source="paper_bar_open"
+            )
+        return {**payload, "price": bar["open"], "execution_at": at, "execution_bar_id": identity}
+
     def _complete_already_filled(
         self, claimed, *, now: str, order: OrderIntent, fills: tuple[Fill, ...]
     ) -> dict[str, Any]:
@@ -832,7 +998,7 @@ class DatabasePaperExecutionWorker:
 
     def _apply_paper_fill(self, claimed, order, payload, now):
         product_id = str(payload["product_id"])
-        account = self.paper_accounts.get(product_id)
+        account = self._paper_account(order, product_id)
         account_id = (
             account.account_id
             if account is not None
@@ -862,9 +1028,11 @@ class DatabasePaperExecutionWorker:
                 fill_fraction=1.0
                 if current.status is OrderStatus.PARTIALLY_FILLED
                 else float(payload.get("fill_fraction", 1.0)),
-                fee_asset=str(payload["accounting_asset"]),
+                fee_asset=instrument_asset(
+                    order.instrument_id, "base" if payload["fee_in_base"] else "quote"
+                ),
                 fee_in_base=bool(payload["fee_in_base"]),
-                now=now,
+                now=str(payload.get("execution_at", now)),
             )
 
         result = application.apply_paper(
@@ -879,6 +1047,13 @@ class DatabasePaperExecutionWorker:
         if account is not None:
             account.ensure_seed(observed_at=now)
         return result, application
+
+    def _paper_account(self, order, product_id):
+        from src.portfolio.books import paper_account_for_order
+
+        return paper_account_for_order(
+            self.queue.engine, order, self.paper_accounts, product_id=product_id
+        )
 
 
 class DatabaseUserStreamWorker:

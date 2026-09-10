@@ -94,13 +94,18 @@ class DatabaseRiskWorker:
                 store=self.store,
             )
             if product_id in self.execution_modes:
+                target_snapshot = (
+                    self.snapshot_store or SqlRiskSnapshotStore(self.store.engine)
+                ).get(request.target_position_snapshot_id)
                 execution_payload = {
                     "product_id": product_id,
                     "event_id": request.event_id,
                     "evaluated_at": request.evaluated_at,
                     "risk_assessment_id": assessment.aggregate.decision_id,
                     "target_position_snapshot_id": request.target_position_snapshot_id,
-                    "execution_mode": self.execution_modes[product_id],
+                    "execution_mode": target_snapshot.get(
+                        "execution_mode", self.execution_modes[product_id]
+                    ),
                 }
                 execution_job_id = "execution:" + canonical_hash(execution_payload).removeprefix(
                     "sha256:"

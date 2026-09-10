@@ -19,7 +19,7 @@
       "symbols": ["BTCUSDT"],
       "dynamic_universe": true,
       "max_dynamic_symbols": 12,
-      "streams": ["kline_1m"],
+      "streams": ["kline_1m", "kline_15m"],
       "include_liquidations": false
     },
     {
@@ -45,7 +45,7 @@
       "url": "wss://stream.binance.com:443/stream",
       "symbols": ["BTCUSDT"],
       "dynamic_universe": false,
-      "streams": ["aggTrade", "bookTicker", "depth20@100ms", "kline_1m"],
+      "streams": ["aggTrade", "bookTicker", "depth20@100ms", "kline_1m", "kline_1h"],
       "include_liquidations": false
     }
   ]

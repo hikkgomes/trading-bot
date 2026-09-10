@@ -1580,7 +1580,14 @@ class SqlForwardEvidenceRepository:
                 float(benchmark) for benchmark in benchmark_values if benchmark is not None
             ]
             excess_values = [float(excess) for excess in objective_excesses if excess is not None]
-            objective_benchmark = sum(base_values)
+            # A panel has one capital allocation shared by its instrument observations.
+            capital_by_assignment: dict[str, float] = {}
+            for index, (objective_payload, base) in enumerate(
+                zip(objective_payloads, base_values, strict=True)
+            ):
+                owner = str(objective_payload["observation"].get("assignment_id") or index)
+                capital_by_assignment[owner] = max(capital_by_assignment.get(owner, 0.0), base)
+            objective_benchmark = sum(capital_by_assignment.values())
             objective_excess = sum(excess_values)
             objective_value = objective_benchmark + objective_excess
             objective_excess_fraction = (
@@ -2710,6 +2717,8 @@ class SqlActiveStrategyAssignmentRepository:
                     active_strategy_assignment.c.sleeve_id == sleeve_id,
                     active_strategy_assignment.c.assignment_scope_id == scope_id,
                     active_strategy_assignment.c.execution_mode == "live",
+                    active_strategy_assignment.c.payload["book_id"].as_string()
+                    == record["payload"]["book_id"],
                 )
                 .order_by(
                     active_strategy_assignment.c.assigned_at,
@@ -2752,6 +2761,17 @@ class SqlActiveStrategyAssignmentRepository:
         if record["execution_mode"] == "live":
             self._assert_live_authority(connection, record, artefact)
             self._assert_no_live_conflict(connection, record)
+        from src.data.database import book_event
+        from src.portfolio.books import ensure_assignment_book, initialise_paper_book
+
+        book = ensure_assignment_book(connection, record, artefact)
+        if (
+            record["execution_mode"] == "paper"
+            and connection.execute(
+                select(book_event.c.id).where(book_event.c.id == "book-capital:" + book["book_id"])
+            ).first()
+        ):
+            initialise_paper_book(self.engine, connection, book, identity)
         return _immutable_insert(connection, active_strategy_assignment, {"id": identity, **record})
 
     def assign(
@@ -2817,6 +2837,9 @@ class SqlActiveStrategyAssignmentRepository:
                 assignment_reason=record.get("assignment_reason", "unspecified"),
                 payload=record.get("payload"),
             )
+        from src.portfolio.books import assignment_book_payload
+
+        record["payload"] = assignment_book_payload(record)
         identity = _hash(record, field="active assignment")
         return self._persist(connection, record, identity)
 

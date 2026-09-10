@@ -232,7 +232,7 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
         minimum_quantity=0.000001,
         minimum_notional=5.0,
     )
-    queue = DatabaseJobQueue(database.engine)
+    queue = DatabaseJobQueue(database.engine, claim_scope=f"testnet-rehearsal:{suffix}")
     roles = (
         "data",
         "feature",
@@ -275,6 +275,7 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
         prefix,
         strategy_name="condition_grid",
         execution_mode="live",
+        capital_limit=100,
     )
     assignments = SqlActiveStrategyAssignmentRepository(database.engine)
     snapshots = SqlRiskSnapshotStore(database.engine)
@@ -454,6 +455,9 @@ def _run_rehearsal(database: PlatformDatabase, root: Path) -> None:
         trace_store=traces,
         order_groups=order_groups,
         snapshot_store=snapshots,
+        plan_authority=lambda plan, **_kwargs: _assert_live_assignment(
+            assignments, product_id, str(plan["product_id"])
+        ),
         product_execution={
             product_id: {
                 "execution_mode": "live",

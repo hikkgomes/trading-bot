@@ -18,15 +18,24 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from src.data.atomic import write_json_atomic
 from src.config import PROJECT_ROOT
+from src.data.atomic import write_json_atomic
 
 SCHEMA = "autopilot.market_event/v1"
 STATUS_SCHEMA = "autopilot.event_capture_status/v1"
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "event_capture.json"
 DEFAULT_STATUS = PROJECT_ROOT / "runtime" / "event_capture_status.json"
 ALLOWED_STREAMS = frozenset(
-    {"aggTrade", "trade", "bookTicker", "depth20@100ms", "markPrice@1s", "kline_1m"}
+    {
+        "aggTrade",
+        "trade",
+        "bookTicker",
+        "depth20@100ms",
+        "markPrice@1s",
+        "kline_1m",
+        "kline_15m",
+        "kline_1h",
+    }
 )
 ALLOWED_HOSTS = frozenset(
     {
@@ -298,7 +307,7 @@ def stream_names(
         else:
             tier = (
                 "candles_funding_open_interest"
-                if stream in {"kline_1m", "markPrice@1s"}
+                if stream.startswith("kline_") or stream == "markPrice@1s"
                 else ("rotating_depth" if stream.startswith("depth") else "trades_best_bid_ask")
             )
             maximum = budgets.get(tier, source.max_dynamic_symbols)

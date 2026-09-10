@@ -13,6 +13,7 @@
   ],
   "search_budgets": {
     "maximum_candidates_per_day": 100,
+    "maximum_candidates_per_epoch": 100,
     "maximum_cpu_minutes_per_job": 120,
     "maximum_memory_mb": 3072,
     "maximum_threads": 2,
@@ -21,7 +22,14 @@
   "data_requirements": {
     "point_in_time_universe": true,
     "availability_timestamps": true,
-    "minimum_history_days": 365
+    "minimum_history_days": 365,
+    "warmup_bars": 200
+  },
+  "data_resource_limits": {
+    "maximum_rows": 500000,
+    "maximum_bytes": 1073741824,
+    "estimated_bytes_per_row": 2048,
+    "batch_rows": 4096
   },
   "validation": {
     "chronological_only": true,

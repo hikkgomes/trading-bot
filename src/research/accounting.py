@@ -53,7 +53,10 @@ def _events(value: Iterable[Mapping[str, Any]]) -> tuple[tuple[str, Mapping[str,
         if not isinstance(event, Mapping):
             raise ProductAccountingError(f"event {index} must be an object")
         materialised.append((_event_time(event, index=index), dict(event)))
-    return tuple(sorted(materialised, key=lambda item: item[0]))
+    # Settlements use the quantity held before orders at the same timestamp.
+    return tuple(
+        sorted(materialised, key=lambda item: (item[0], _event_kind(item[1]) != "funding"))
+    )
 
 
 def _price(event: Mapping[str, Any], *, field_name: str = "price") -> float:
@@ -1023,29 +1026,21 @@ def _record_futures_event(
     symbol: str,
     funding_applied: bool | None,
     funding_amount: float,
+    assess_risk: bool = True,
 ) -> None:
     equity, unrealised, notional = FuturesIncomeAccounting._equity(
         state.cash, state.positions, state.marks
     )
     margin = notional / options.leverage
-    symbol_target = options.target_by_symbol.get(symbol, options.target_value)
+    symbol_target = options.target_by_symbol.get(symbol)
     event_target = event.get("target_notional")
     if event_target is not None:
         symbol_target = _number(event_target, field_name="target_notional", minimum=0.0)
-    if symbol_target is not None and notional > symbol_target + 1e-12:
+    symbol_notional = abs(state.positions.get(symbol, (0.0, 0.0))[0]) * state.marks.get(symbol, 0.0)
+    if symbol_target is not None and symbol_notional > symbol_target + 1e-12:
         state.capacity_violations += 1
-    if equity > 0:
-        state.max_leverage = max(state.max_leverage, notional / equity)
-        if notional > equity * options.leverage + 1e-12:
-            state.capacity_violations += 1
-    state.observed_max_margin_fraction = max(
-        state.observed_max_margin_fraction,
-        margin / equity if equity > 0 else 0.0,
-    )
-    if equity > 0 and margin / equity > options.margin_limit + 1e-12:
-        state.capacity_violations += 1
-    if equity <= (options.maintenance + options.liquidation_buffer) * margin and notional > 0:
-        state.liquidation = True
+    if assess_risk:
+        _record_account_risk(state, options, equity, notional, margin)
     receipt = {
         "event_hash": canonical_hash(dict(event)),
         "occurred_at": observed_at,
@@ -1063,11 +1058,30 @@ def _record_futures_event(
         "notional": notional,
         "margin": margin,
         "target_notional": symbol_target,
+        "instrument_notional": symbol_notional,
+        "portfolio_notional_limit": options.target_value,
+        "account_risk_assessed": assess_risk,
         "liquidation_buffer_fraction": options.liquidation_buffer,
     }
     if funding_applied is not None:
         receipt.update({"funding_applied": funding_applied, "funding_pnl": funding_amount})
     state.receipts.append(receipt)
+
+
+def _record_account_risk(state, options, equity, notional, margin):
+    if options.target_value is not None and notional > options.target_value + 1e-12:
+        state.capacity_violations += 1
+    if equity > 0:
+        state.max_leverage = max(state.max_leverage, notional / equity)
+        if notional > equity * options.leverage + 1e-12:
+            state.capacity_violations += 1
+    state.observed_max_margin_fraction = max(
+        state.observed_max_margin_fraction, margin / equity if equity > 0 else 0.0
+    )
+    if equity > 0 and margin / equity > options.margin_limit + 1e-12:
+        state.capacity_violations += 1
+    if equity <= (options.maintenance + options.liquidation_buffer) * margin and notional > 0:
+        state.liquidation = True
 
 
 def _build_futures_report(
@@ -1162,7 +1176,12 @@ class FuturesIncomeAccounting:
             terminal_fee_rate=terminal_fee_rate,
             terminal_slippage_rate=terminal_slippage_rate,
         )
-        for observed_at, event in ordered:
+        funding_ends = {
+            at: index
+            for index, (at, event) in enumerate(ordered)
+            if _event_kind(event) == "funding"
+        }
+        for index, (observed_at, event) in enumerate(ordered):
             kind, symbol, funding_applied, funding_amount = _apply_futures_event(
                 state, options, observed_at, event
             )
@@ -1175,6 +1194,7 @@ class FuturesIncomeAccounting:
                 symbol=symbol,
                 funding_applied=funding_applied,
                 funding_amount=funding_amount,
+                assess_risk=kind != "funding" or index == funding_ends[observed_at],
             )
         return _build_futures_report(state, options)
 

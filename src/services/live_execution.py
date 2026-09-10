@@ -65,6 +65,10 @@ _EXECUTION_IDENTITY_FILES = (
     Path("src/portfolio/aggregation.py"),
     Path("src/services/artefact_dispatcher.py"),
     Path("src/services/portfolio_engine.py"),
+    Path("src/portfolio/account_plans.py"),
+    Path("src/portfolio/book_plans.py"),
+    Path("src/portfolio/books.py"),
+    Path("src/accounting/book_allocations.py"),
     Path("requirements-runtime.txt"),
     Path("src/data/binance_user_stream.py"),
     Path("src/execution/ccxt_broker.py"),
@@ -285,6 +289,8 @@ class ApprovedLiveExecution:
 
         venue = self.venues[product_id]
         broker = venue.broker
+        if action.action_type is RecoveryActionType.CANCEL_ORDER:
+            return self._cancel_known_order(product_id, action.target)
         if action.action_type is RecoveryActionType.CANCEL_UNKNOWN_ORDER:
             return self._cancel_unknown_order(broker, action.target)
         if action.action_type is RecoveryActionType.RECONCILE_ORDER:
@@ -294,6 +300,26 @@ class ApprovedLiveExecution:
         if action.action_type is RecoveryActionType.EMERGENCY_FLATTEN:
             return self._emergency_flatten(product_id, action.target, action.quantity)
         raise ValueError(f"unsupported recovery action: {action.action_type}")
+
+    def _cancel_known_order(self, product_id, identity):
+        self.order_manager.reload()
+        order = self.order_manager.get(identity)
+        if order.portfolio_id != self.product_portfolios[product_id]:
+            raise PermissionError("entry cancellation crosses the reconciled product account")
+        if order.is_terminal:
+            return {"order_id": identity, "status": order.status.value}
+        if order.status in {OrderStatus.ACKNOWLEDGED, OrderStatus.PARTIALLY_FILLED}:
+            self.order_manager.request_cancel(identity)
+        venue = self.venues[product_id]
+        venue.broker.cancel_order(
+            symbol=venue.instruments[order.instrument_id].exchange_symbol,
+            exchange_order_id=str(order.metadata.get("exchange_order_id") or ""),
+            client_order_id=str(order.metadata.get("client_order_id") or ""),
+        )
+        result = self._reconcile_missing_order(product_id, identity)
+        if not self.order_manager.get(identity).is_terminal:
+            raise RuntimeError("triggered protection entry cancellation remains pending")
+        return result
 
     def _cancel_unknown_order(self, broker: Any, target: str) -> Mapping[str, Any]:
         matches = []
@@ -404,11 +430,9 @@ class ApprovedLiveExecution:
         current = self.order_manager.get(order_id)
         if current.status is OrderStatus.RECONCILED:
             return
-        if state_status in {"canceled", "cancelled"} and current.status in {
-            OrderStatus.RECOVERY_REQUIRED,
-            OrderStatus.ACKNOWLEDGED,
-            OrderStatus.PARTIALLY_FILLED,
-        }:
+        if state_status in {"canceled", "cancelled"} and not current.is_terminal:
+            if current.status not in {OrderStatus.CANCEL_PENDING, OrderStatus.RECOVERY_REQUIRED}:
+                self.order_manager.recovery_required(order_id)
             self.order_manager.cancelled(order_id)
         elif state_status in {"rejected", "expired"} and current.status in {
             OrderStatus.RECOVERY_REQUIRED,
@@ -658,6 +682,22 @@ class ApprovedLiveExecution:
                 "reference_price": reference_price,
             },
         )
+        from src.portfolio.account_plans import prepare_book_flatten
+
+        account = self.accounts[self.products[product_id]["account_id"]]
+        intent = prepare_book_flatten(
+            self.engine,
+            FinancialScope(
+                product_id,
+                account["account_id"],
+                account["environment"],
+                account["venue"],
+                self.products[product_id]["base_accounting_asset"],
+            ),
+            intent,
+        )
+        self.order_manager.reload()
+        self.positions.reload()
         venue.submit(intent)
         status = (
             "flat_reconciled"
@@ -696,6 +736,9 @@ class ApprovedLiveExecution:
     def authorise(self, payload: Mapping[str, Any], order: OrderIntent) -> None:
         if execution_engine_identity() != self.loaded_execution_identity:
             raise PermissionError("execution code changed after process startup")
+        if order.metadata.get("target_metadata", {}).get("account_plan_id"):
+            self._authorise_account_order(payload, order)
+            return
         product_id, product, account_id, authority_at = self._order_context(payload, order)
         if not order.reduce_only:
             self._assert_financial_followups_complete(account_id)
@@ -737,6 +780,205 @@ class ApprovedLiveExecution:
             orders=self.order_manager.all(),
         )
 
+    def authorise_plan(self, plan, *, now, connection):
+        """Validate every current book authority before an atomic local allocation."""
+        from src.portfolio.account_plans import _capital_proposals, _owner, book_reserve_fraction
+        from src.portfolio.books import load_book
+        from src.services.exposure_budget import enforce_book_plan
+
+        if execution_engine_identity() != self.loaded_execution_identity:
+            raise PermissionError("execution code changed after process startup")
+        product_id = plan["product_id"]
+        product = self.products[product_id]
+        if product["execution_mode"] != "live" or product_id not in self.venues:
+            raise PermissionError("account plan has no configured live authority")
+        if plan["account_id"] != product["account_id"] or any(
+            target["portfolio_id"] != product["portfolio_id"] or now >= target["valid_until"]
+            for target in plan["targets"]
+        ):
+            raise PermissionError("account plan scope or validity changed")
+        self._assert_financial_followups_complete(plan["account_id"])
+        account_payload, fingerprint = self._validated_account_authority(
+            product_id=product_id,
+            account_id=plan["account_id"],
+            authority_at=now,
+            product=product,
+        )
+        assignments = tuple(
+            row
+            for row in self.assignments.active_assignments(product_id, at=now)
+            if row["execution_mode"] == "live"
+        )
+        owners = {row["payload"].get("book_id"): _owner(row) for row in assignments}
+        if owners != plan["books"]:
+            raise PermissionError("account plan no longer contains every current live book")
+        for assignment in assignments:
+            book = load_book(self.engine, assignment["payload"]["book_id"], connection=connection)
+            self._assert_live_book(assignment, book, product, fingerprint, now)
+        clean = {
+            **account_payload,
+            "market": {
+                instrument: {"price": price} for instrument, price in plan["prices"].items()
+            },
+        }
+        proposed = _capital_proposals(
+            self.engine,
+            connection,
+            assignments,
+            clean,
+            now,
+            reserve_fraction=book_reserve_fraction(product),
+        )
+        planned = {
+            row["book_id"]: (row["balance_changes"], row.get("btc_capital_baseline"))
+            for row in plan["initial_capital"]
+        }
+        if any(
+            planned.get(row["book_id"]) != (row["balance_changes"], row.get("btc_capital_baseline"))
+            for row in proposed
+        ):
+            raise PermissionError("account capital allocation changed since planning")
+        enforce_book_plan(
+            plan,
+            assignments,
+            product,
+            self.accounts[plan["account_id"]],
+            self.risk_configuration,
+            account_payload,
+        )
+
+    def _assert_live_book(self, assignment, book, product, fingerprint, now):
+        if (
+            book["execution_mode"] != "live"
+            or book["account_id"] != product["account_id"]
+            or book["artefact_hash"] != assignment["artefact_hash"]
+            or book["strategy_version_id"] != assignment["strategy_version_id"]
+        ):
+            raise PermissionError("live assignment does not own the planned book")
+        artifact = self.artefacts.get(assignment["artefact_hash"])
+        product_id = product["product_id"]
+        self._assert_artifact_identity(
+            artifact, assignment=assignment, product_id=product_id, account_id=product["account_id"]
+        )
+        allowed = _live_assignment_instrument_ids(
+            self.engine, (assignment,), product=product, at=now
+        )
+        venue = self.venues[product_id]
+        for instrument in book["instrument_ids"]:
+            if instrument not in allowed or instrument not in venue.instruments:
+                raise PermissionError("book instrument is outside current live authority")
+            self._current_approval_and_preflight(
+                assignment=assignment,
+                artifact=artifact,
+                product_id=product_id,
+                account_id=product["account_id"],
+                authority_at=now,
+                product=product,
+                actual_fingerprint=fingerprint,
+                instrument_id=instrument,
+            )
+        if self.accounts[product["account_id"]]["market"] != "spot":
+            supports_stops = getattr(venue.broker, "supports_native_protective_stops", None)
+            if not callable(supports_stops) or not supports_stops():
+                raise PermissionError("live futures entry requires native protective stops")
+
+    def _authorise_account_order(self, payload, order):
+        from src.data.database import account_portfolio_plan, book_event
+        from src.domain.portfolios import TargetPosition
+        from src.execution.order_planner import plan_orders
+
+        product_id, product, account_id, now = self._order_context(payload, order)
+        metadata = order.metadata["target_metadata"]
+        with self.engine.connect() as connection:
+            plan = connection.execute(
+                select(account_portfolio_plan.c.payload).where(
+                    account_portfolio_plan.c.id == metadata["account_plan_id"]
+                )
+            ).scalar_one()
+            target = next(
+                row for row in plan["targets"] if row["instrument_id"] == order.instrument_id
+            )
+            if (
+                plan["product_id"] != product_id
+                or metadata != target["metadata"]
+                or not metadata["book_contributions"]
+            ):
+                raise PermissionError("net order differs from its immutable book contributions")
+            if (
+                connection.execute(
+                    select(book_event.c.id).where(
+                        book_event.c.id == "account-plan-applied:" + plan["plan_id"]
+                    )
+                ).first()
+                is None
+            ):
+                raise PermissionError("account allocation transaction has not completed")
+            expected = plan_orders(
+                (TargetPosition(**target),),
+                current_quantities=plan["account_positions"],
+                decided_at=plan["decision_at"],
+                prices=plan["prices"],
+            )
+            if not any(
+                order.side == item.side
+                and order.reduce_only == item.reduce_only
+                and _planned_order_size_matches(order, item)
+                and order.portfolio_id == item.portfolio_id
+                and order.strategy_contributions == item.strategy_contributions
+                for item in expected
+            ):
+                raise PermissionError(
+                    "net order direction or quantity differs from the approved plan"
+                )
+            self.authorise_plan(plan, now=now, connection=connection)
+        account_payload, _ = self._validated_account_authority(
+            product_id=product_id,
+            account_id=account_id,
+            authority_at=now,
+            product=product,
+        )
+        active = {row["id"]: row for row in self.assignments.active_assignments(product_id, at=now)}
+        self.positions.reload()
+        self.order_manager.reload()
+        resources = (
+            self._btc_book_resources(metadata["book_authorities"], now)
+            if product_id == "btc_accumulation"
+            else None
+        )
+        # Reassess every book, including holdings with no net external contribution.
+        for owner in metadata["book_authorities"]:
+            self.exposure_guard.enforce(
+                product_id=product_id,
+                product=product,
+                account=self.accounts[account_id],
+                assignment=active[owner["assignment_id"]],
+                risk_configuration=self.risk_configuration,
+                account_payload=account_payload,
+                order=order,
+                positions=self.positions.all(),
+                orders=self.order_manager.all(),
+                book_resources=resources,
+            )
+
+    def _btc_book_resources(self, owners, at):
+        from src.data.database import book_event
+        from src.portfolio.books import book_balances
+
+        with self.engine.connect() as connection:
+            return {
+                owner["book_id"]: {
+                    "balances": book_balances(
+                        self.engine, owner["book_id"], at=at, connection=connection
+                    ),
+                    "capital": connection.execute(
+                        select(book_event.c.payload).where(
+                            book_event.c.id == "live-capital:" + owner["book_id"]
+                        )
+                    ).scalar_one(),
+                }
+                for owner in owners
+            }
+
     def _assert_financial_followups_complete(self, account_id: str) -> None:
         from src.data.database import financial_application, financial_outbox
 
@@ -766,6 +1008,7 @@ class ApprovedLiveExecution:
         authority_at = timestamp(
             str(payload.get("authorisation_at") or order.created_at),
             field="live authorisation time",
+            preserve_subseconds=True,
         )
         order_created_at = timestamp(order.created_at, field="order.created_at")
         if authority_at < order_created_at:
@@ -1153,6 +1396,20 @@ class ApprovedLiveExecution:
             raise PermissionError("live order instrument is not persisted and tradable")
         if instrument.instrument_id not in set(artifact.get("supported_instruments", [])):
             raise PermissionError("live order instrument is not bound to the canonical artefact")
+
+
+def _planned_order_size_matches(order, planned):
+    from src.execution.order_manager import entry_notional
+
+    reference = order.metadata.get("entry_reference")
+    if reference is None:
+        return order.quantity <= planned.quantity
+    budget = entry_notional(planned)
+    return (
+        not order.reduce_only
+        and reference.get("notional") == budget
+        and order.quantity * float(reference["price"]) <= budget + max(1e-9, budget * 1e-12)
+    )
 
 
 def _domain_fill(

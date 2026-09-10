@@ -192,6 +192,7 @@ def test_target_builder_consumes_canonical_market_and_balance_snapshots(tmp_path
                 "account_id": "futures",
                 "portfolio_id": "active-income-portfolio",
                 "risk_policy_id": "active-income",
+                "execution_mode": "paper",
             }
         },
         account_configuration={},

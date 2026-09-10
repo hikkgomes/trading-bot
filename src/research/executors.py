@@ -14,7 +14,7 @@ import statistics
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeAlias, cast
 
 from src.accounting.spot_allocation import target_trade_quantity
 from src.domain._codec import canonical_hash, json_value
@@ -41,7 +41,7 @@ from src.strategies.behaviour import (
     economic_parity_receipt,
 )
 from src.strategies.causality import prefix_invariant
-from src.strategies.position_state import PositionAction, position_path
+from src.strategies.position_state import PositionAction, PositionRules, position_path
 from src.strategies.semantic import (
     SEMANTIC_STRATEGIES,
     SemanticEvaluationError,
@@ -94,7 +94,7 @@ class ExecutionResult:
 
 
 Executor = Callable[[Candidate, Mapping[str, Any]], ExecutionResult]
-ContextCandidate = Candidate | CandidateEvaluationView
+ContextCandidate: TypeAlias = Candidate | CandidateEvaluationView
 ContextBuilder = Callable[[ContextCandidate, Mapping[str, Any]], Mapping[str, Any]]
 
 
@@ -200,6 +200,11 @@ def _unsupported_economic_contract(candidate: Candidate) -> str | None:
             and str(rule.get("direction") or "long") not in DIRECTIONAL_DSL_DIRECTIONS
         ):
             return "directional DSL cannot implement hedged or market-neutral exposure"
+        if (
+            candidate.definition.product == "active_income"
+            and not candidate.definition.position_model.get("execution_policy")
+        ):
+            return "directional futures DSL requires an explicit protective execution policy"
     unavailable = {
         StrategySourceType.RELATIVE_VALUE: "relative-value qualification needs proven inventory and frozen hedge estimates",
         StrategySourceType.MICROSTRUCTURE: "microstructure qualification needs historical book and latency execution",
@@ -703,6 +708,7 @@ def _measured_result(
             candidate=candidate,
             dataset_snapshot_ids=snapshots,
             executor_version=ECONOMIC_ENGINE_VERSION,
+            evaluation_input=context.get("evaluation_input"),
             evidence_policy_hash=(
                 str(context["evidence_policy_hash"])
                 if context.get("evidence_policy_hash") is not None
@@ -1586,6 +1592,13 @@ def _decision_returns(context, signals, *, actions=None) -> list[float]:
             for value in signals
         ]
     prepared.pop("position_actions", None)
+    if actions is None and context.get("position_rules"):
+        rows = _frame_rows(context)
+        if rows is None:
+            raise DataUnavailableError("position policy replay requires market bars")
+        path = position_path(rows, signals, PositionRules(**context["position_rules"]))
+        prepared["signals"] = list(path.decisions)
+        actions = [action.__dict__ for action in path.actions]
     if actions is not None:
         prepared["position_actions"] = actions
     accounting = _product_accounting(prepared)
@@ -2504,6 +2517,7 @@ def execute_generated_dsl(candidate: Candidate, context: Mapping[str, Any]) -> E
             **context,
             "behaviour_hash": behaviour.behaviour_hash,
             "parity_receipt": parity,
+            **_dsl_position_context(candidate, context, signals),
             "causality_valid": prefix_invariant(behaviour.generate_signals, rows),
             **(
                 {
@@ -2516,6 +2530,27 @@ def execute_generated_dsl(candidate: Candidate, context: Mapping[str, Any]) -> E
         },
         signals,
     )
+
+
+def _dsl_position_context(candidate, context, signals):
+    model = candidate.definition.position_model
+    if candidate.definition.product != "active_income":
+        return {"signals": signals}
+    if not model.get("execution_policy"):
+        raise UnsupportedExecutorError(
+            "directional futures DSL requires an explicit protective execution policy"
+        )
+    rules = PositionRules.from_model(model)
+    rows = _frame_rows(context)
+    if rows is None:
+        raise DataUnavailableError("directional execution policy requires aligned market bars")
+    path = position_path(rows, signals, rules)
+    return {
+        "signals": list(path.decisions),
+        "position_rules": rules.__dict__,
+        "position_actions": [action.__dict__ for action in path.actions],
+        "position_state": path.state.__dict__,
+    }
 
 
 def _dsl_signals(rows: list[Any] | tuple[Any, ...], rule: Mapping[str, Any]) -> tuple[int, ...]:
@@ -2720,8 +2755,23 @@ def _semantic_panel_series_context(
     events: list[dict[str, Any]] = []
     positions: dict[str, float] = {}
     initial_cash = _semantic_initial_cash(context)
+    execution_bars = _semantic_execution_index(context)
+    pending = None
     for item in inputs:
+        if pending is not None:
+            _append_semantic_futures_events(
+                events,
+                positions,
+                pending[0],
+                pending[1],
+                initial_cash=initial_cash,
+                execution_bars=execution_bars.get(_semantic_time(item["information_time"]), {}),
+            )
+        _append_semantic_marks(
+            events, positions, item["cross_sectional_values"], str(item["information_time"])
+        )
         current = _evaluate_semantic_history_item(name, model, item, "cross_sectional_values")
+        pending = (current, item) if current is not None else None
         if current is None:
             continue
         outputs.append(current)
@@ -2729,8 +2779,9 @@ def _semantic_panel_series_context(
         if isinstance(forward, Mapping) and forward:
             returns.append(_portfolio_forward_return(current.target_fractions, forward))
             signals.append(semantic_signal(current, instrument_id=instrument_id))
-        _append_semantic_futures_events(events, positions, current, item, initial_cash=initial_cash)
-    return _semantic_series_result(returns, outputs, events, inputs, signals=signals)
+    return _semantic_series_result(
+        returns, outputs, events, inputs, signals=signals, context=context
+    )
 
 
 def _semantic_pair_series_context(
@@ -2752,8 +2803,23 @@ def _semantic_pair_series_context(
     events: list[dict[str, Any]] = []
     positions: dict[str, float] = {}
     initial_cash = _semantic_initial_cash(context)
+    execution_bars = _semantic_execution_index(context)
+    pending = None
     for item in inputs:
+        if pending is not None:
+            _append_semantic_futures_events(
+                events,
+                positions,
+                pending[0],
+                pending[1],
+                initial_cash=initial_cash,
+                execution_bars=execution_bars.get(_semantic_time(item["information_time"]), {}),
+            )
+        _append_semantic_marks(
+            events, positions, item["linked_instruments"], str(item["information_time"])
+        )
         current = _evaluate_semantic_history_item(name, model, item, "linked_instruments")
+        pending = (current, item) if current is not None else None
         if current is None:
             continue
         outputs.append(current)
@@ -2761,8 +2827,9 @@ def _semantic_pair_series_context(
         if isinstance(forward, Mapping) and forward:
             returns.append(_portfolio_forward_return(current.target_notionals, forward))
             signals.append(semantic_signal(current, instrument_id=instrument_id))
-        _append_semantic_futures_events(events, positions, current, item, initial_cash=initial_cash)
-    return _semantic_series_result(returns, outputs, events, inputs, signals=signals)
+    return _semantic_series_result(
+        returns, outputs, events, inputs, signals=signals, context=context
+    )
 
 
 def _evaluate_semantic_history_item(
@@ -2795,13 +2862,16 @@ def _semantic_series_result(
     inputs: Sequence[Mapping[str, Any]],
     *,
     signals: list[float],
+    context: Mapping[str, Any],
 ) -> tuple[dict[str, Any], tuple[Any, ...]]:
+    from src.research.funding import merge_native_settlements
+
     if not events:
         return {}, tuple(outputs)
     return {
         "signals": [*signals, signals[-1] if signals else 0.0],
         "returns": returns,
-        "futures_events": events,
+        "futures_events": merge_native_settlements(events, context),
         "trading_days": len(
             {str(item["information_time"])[:10] for item in inputs if item.get("information_time")}
         ),
@@ -2818,6 +2888,18 @@ def _semantic_initial_cash(context: Mapping[str, Any]) -> float:
     return value
 
 
+def _semantic_execution_index(context):
+    rows = _frame_rows(context) or ()
+    times = _frame_times(context, rows)
+    if times is None:
+        return {}
+    result = {}
+    for time, row in zip(times, rows, strict=True):
+        symbol = str(row.get("instrument_id", row.get("symbol", "")))
+        result.setdefault(_semantic_time(time), {})[symbol] = row
+    return result
+
+
 def _append_semantic_futures_events(
     events: list[dict[str, Any]],
     positions: dict[str, float],
@@ -2825,15 +2907,15 @@ def _append_semantic_futures_events(
     item: Mapping[str, Any],
     *,
     initial_cash: float,
+    execution_bars: Mapping[str, Mapping[str, Any]],
 ) -> None:
-    targets = getattr(output, "target_fractions", None) or getattr(output, "target_notionals", None)
+    targets = getattr(output, "target_fractions", None)
+    if targets is None:
+        targets = getattr(output, "target_notionals", None)
     prices = item.get("cross_sectional_values") or item.get("linked_instruments")
     if not isinstance(targets, Mapping) or not isinstance(prices, Mapping):
         return
     timestamp_value = str(item["information_time"])
-    # Mark existing exposure before changing the target. This preserves the
-    # realised-to-unrealised transition between consecutive panel decisions.
-    _append_semantic_marks(events, positions, prices, timestamp_value)
     _append_semantic_targets(
         events,
         positions,
@@ -2841,6 +2923,7 @@ def _append_semantic_futures_events(
         prices,
         timestamp_value,
         initial_cash=initial_cash,
+        execution_bars=execution_bars,
     )
 
 
@@ -2850,7 +2933,8 @@ def _append_semantic_marks(
     prices: Mapping[str, Any],
     timestamp_value: str,
 ) -> None:
-    for instrument, quantity in positions.items():
+    for instrument in sorted(set(positions) | set(prices)):
+        quantity = positions.get(instrument, 0.0)
         price = _semantic_price(prices.get(instrument))
         if price is None:
             if abs(quantity) > 1e-12:
@@ -2874,12 +2958,16 @@ def _append_semantic_targets(
     timestamp_value: str,
     *,
     initial_cash: float,
+    execution_bars: Mapping[str, Mapping[str, Any]],
 ) -> None:
     for instrument in sorted(set(targets) | set(positions)):
         raw_target = targets.get(instrument, 0.0)
-        price = _semantic_price(prices.get(instrument))
-        if price is None:
+        if not raw_target and not positions.get(instrument, 0.0):
+            continue
+        reference = _semantic_price(prices.get(instrument))
+        if reference is None:
             raise ExecutorError(f"missing execution price for semantic instrument: {instrument}")
+        price, execution_time = _semantic_next_open(execution_bars.get(instrument), timestamp_value)
         target_quantity = float(raw_target) * initial_cash / price
         instrument_id = str(instrument)
         delta = target_quantity - positions.get(instrument_id, 0.0)
@@ -2887,16 +2975,40 @@ def _append_semantic_targets(
             events.append(
                 {
                     "type": "fill",
-                    "timestamp": timestamp_value,
+                    "timestamp": execution_time,
                     "symbol": instrument_id,
                     "side": "buy" if delta > 0.0 else "sell",
                     "quantity": abs(delta),
                     "price": price,
-                    "reference_price": price,
+                    "reference_price": reference,
+                    "decision_at": timestamp_value,
+                    "execution_policy": "next_open/v1",
                     "target_notional": abs(float(raw_target)) * initial_cash,
                 }
             )
         positions[instrument_id] = target_quantity
+
+
+def _semantic_next_open(row, decision_at):
+    if not isinstance(row, Mapping):
+        raise DataUnavailableError("semantic execution requires the next native bar")
+    price = _row_price(row, field="open")
+    opened = row.get("open_timestamp", row.get("open_time_ms"))
+    if price is None or opened is None:
+        raise DataUnavailableError(
+            "semantic execution requires an explicit native opening price and time"
+        )
+    at = _semantic_time(opened)
+    if at <= _semantic_time(decision_at):
+        raise DataUnavailableError("semantic execution must follow its closed-bar decision")
+    return price, at
+
+
+def _semantic_time(value):
+    parsed = dt.datetime.fromisoformat(_accounting_time(value, index=0))
+    if parsed.utcoffset() is None:
+        raise DataUnavailableError("semantic execution timestamps require an explicit timezone")
+    return parsed.astimezone(dt.UTC).isoformat()
 
 
 def _semantic_execution_costs(
@@ -2954,8 +3066,9 @@ def execution_receipt(
     executor_version: str,
     evidence_policy_hash: str | None = None,
     behaviour_hash: str | None = None,
+    evaluation_input: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    payload = {
+    payload: dict[str, Any] = {
         "candidate_id": candidate.candidate_id,
         "dataset_snapshot_ids": list(dataset_snapshot_ids),
         "executor_version": executor_version,
@@ -2964,4 +3077,7 @@ def execution_receipt(
         payload["evidence_policy_hash"] = evidence_policy_hash
     if behaviour_hash is not None:
         payload["behaviour_hash"] = behaviour_hash
+    if evaluation_input is not None:
+        payload["evaluation_input"] = dict(evaluation_input)
+        payload["evaluation_input_id"] = canonical_hash(evaluation_input)
     return {**payload, "input_hash": canonical_hash(payload)}

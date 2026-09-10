@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 import pytest
 
 from src.domain.market_events import MarketEvent
-from src.domain.orders import OrderIntent, OrderSide, OrderStatus, OrderType
+from src.domain.orders import OrderIntent, OrderSide, OrderStatus, OrderType, ProtectionKind
 from src.execution.broker import Position, ProtectiveOrder, ProtectiveOrderStatus
 from src.execution.stops import ProtectiveStop, StopManager, StopStatus
 from src.services.protective_stops import LiveProtectiveStopService, ProtectiveStopError
@@ -46,7 +46,9 @@ class _Broker:
     def get_position(self, symbol):
         return Position(symbol=symbol, qty=self.position_quantity)
 
-    def place_protective_stop(self, *, symbol, side, qty, trigger_price, client_id):
+    def place_protective_stop(
+        self, *, symbol, side, qty, trigger_price, client_id, kind=ProtectionKind.STOP
+    ):
         self.actions.append("place")
         item = ProtectiveOrder(
             symbol=symbol,
@@ -56,6 +58,7 @@ class _Broker:
             status=ProtectiveOrderStatus.OPEN,
             order_id=f"native-{len(self.placed) + 1}",
             client_id=client_id,
+            kind=kind,
         )
         self.placed.append(item)
         return item
@@ -127,6 +130,182 @@ def test_entry_stop_is_durable_before_native_side_effect_and_confirmed_after_fil
     assert protected is not None
     assert protected.status is StopStatus.PROTECTED
     assert protected.protected_quantity == pytest.approx(1.0)
+    assert len(broker.placed) == 1
+    assert manager.for_entry_order(order.order_id)[0].native_order_id == "native-1"
+
+
+@pytest.mark.parametrize("side", [OrderSide.BUY, OrderSide.SELL])
+@pytest.mark.parametrize("quote_delay", [0.0, 601.0])
+def test_live_bracket_uses_entry_quote_and_rechecks_expiry(
+    tmp_path, monkeypatch, side, quote_delay
+):
+    from types import SimpleNamespace
+
+    from src.data.database import PlatformDatabase
+    from src.domain.instruments import Instrument, MarketType
+    from src.domain.orders import Fill
+    from src.execution.broker import BrokerOrderAcknowledgement
+    from src.execution.live_exchange import BrokerExecutionVenue
+    from src.execution.order_manager import OrderManager, SqlOrderStore
+    from src.execution.position_manager import PositionManager, SqlPositionStore
+    from src.execution.stops import SqlStopStore
+    from src.services.financial_application import FinancialApplication, FinancialScope
+    from src.services.live_execution import ApprovedLiveExecution
+    from src.services.order_execution import DatabaseLiveExecutionWorker
+    from src.services.scheduler import DatabaseJobQueue
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'quote.db'}")
+    database.create_schema()
+    orders = OrderManager(SqlOrderStore(database.engine))
+    positions = PositionManager(SqlPositionStore(database.engine))
+    broker = _Broker()
+    broker.get_price = lambda symbol: 120.0
+    broker.normalize_order_qty = lambda symbol, quantity, **_kwargs: quantity
+    sent = []
+
+    def submit(order):
+        persisted = OrderManager(SqlOrderStore(database.engine)).get("entry-1")
+        assert persisted.metadata["entry_reference"]["price"] == 120
+        sent.append(order)
+        return BrokerOrderAcknowledgement("exchange-entry", order.client_id, "acknowledged")
+
+    broker.submit_order = submit
+    instrument = Instrument(
+        venue="binance",
+        market_type=MarketType.FUTURES,
+        base_asset="BTC",
+        quote_asset="USDT",
+        settlement_asset="USDT",
+        exchange_symbol="BTCUSDT",
+        price_precision=2,
+        quantity_precision=3,
+        minimum_quantity=0.001,
+        minimum_notional=5,
+    )
+    venue = BrokerExecutionVenue(
+        order_manager=orders,
+        position_manager=positions,
+        broker=broker,
+        instruments={INSTRUMENT: instrument},
+    )
+    stops = StopManager(SqlStopStore(database.engine))
+    service = LiveProtectiveStopService(
+        stop_manager=stops,
+        venues={"active_income": venue},
+        products={
+            "active_income": {
+                "portfolio_id": "active-income-portfolio",
+                "account_id": "futures-account",
+            }
+        },
+        accounts={"futures-account": {"market": "usdt_futures"}},
+        order_manager=orders,
+        positions=positions,
+    )
+    order = replace(
+        _order(quantity=1.2),
+        status=OrderStatus.CREATED,
+        side=side,
+        metadata={
+            "reference_price": 100,
+            "target_metadata": {
+                "position_rules": {
+                    "stop_loss": 0.03,
+                    "take_profit": 0.06,
+                    "horizon_bars": 8,
+                    "execution_policy": "resting_bracket/v1",
+                }
+            },
+        },
+    )
+    orders.create(order)
+    orders.persist_for_submission(order.order_id)
+    service.prepare_entry("active_income", orders.get(order.order_id), NOW)
+    context = SimpleNamespace(products={"active_income": {"account_id": "futures-account"}})
+    worker = DatabaseLiveExecutionWorker(
+        queue=DatabaseJobQueue(database.engine),
+        worker_id="quote-fixture",
+        order_manager=orders,
+        positions=positions,
+        ledgers={},
+        trace_store=None,
+        venues={"active_income": venue},
+        authorise=lambda payload, intent: ApprovedLiveExecution._order_context(
+            context, payload, intent
+        ),
+        prepare_protective_stop=service.prepare_entry,
+    )
+    clock = iter((0.0, quote_delay))
+    monkeypatch.setattr("src.services.order_execution.monotonic", lambda: next(clock))
+    if quote_delay:
+        with pytest.raises(PermissionError, match="expired"):
+            worker._submit_order({"product_id": "active_income", "order_id": order.order_id}, NOW)
+        assert not sent and not broker.placed
+        database.dispose()
+        return
+    worker._submit_order({"product_id": "active_income", "order_id": order.order_id}, NOW)
+    assert orders.get(order.order_id).quantity == 1
+    assert orders.get(order.order_id).metadata["entry_reference"]["notional"] == 120
+    FinancialApplication(
+        database.engine,
+        FinancialScope("active_income", "futures-account", "testnet", "binance", "USDT"),
+    ).apply_fill(
+        Fill(
+            "quote-fill",
+            order.order_id,
+            INSTRUMENT,
+            side,
+            1,
+            121,
+            0,
+            NOW,
+            fee_asset="USDT",
+            metadata={"trade_id": "1"},
+        )
+    )
+    orders.reload()
+    positions.reload()
+    sign = 1 if side is OrderSide.BUY else -1
+    broker.position_quantity = sign
+    service.on_fill("active_income", orders.get(order.order_id), sign, NOW)
+    assert {row.kind: row.trigger_price for row in broker.placed} == pytest.approx(
+        {
+            ProtectionKind.STOP: 120 * (1 - sign * 0.03),
+            ProtectionKind.TAKE_PROFIT: 120 * (1 + sign * 0.06),
+        }
+    )
+    assert positions.get(order.portfolio_id, INSTRUMENT).metadata["reference_entry_price"] == 120
+    assert orders.get(order.order_id).metadata["reference_price"] == 100
+    with pytest.raises(ValueError, match="before submission"):
+        orders.bind_entry_reference(order.order_id, price=130, observed_at=NOW)
+    with pytest.raises(ValueError, match="cannot be repriced"):
+        stops.reprice_unsubmitted(stops.all()[0].stop_id, 130)
+    database.dispose()
+
+
+def test_native_reconciliation_does_not_submit_or_count_paper_protection():
+    service, broker, manager = _service()
+    manager.create(
+        ProtectiveStop(
+            stop_id="paper-only",
+            portfolio_id="active-income-portfolio",
+            instrument_id=INSTRUMENT,
+            exit_side=OrderSide.SELL,
+            quantity=10,
+            trigger_price=95,
+            created_at=NOW,
+            entry_order_id="paper-entry",
+            entry_quantity=10,
+            execution_mode="paper",
+        )
+    )
+    assert service.reconcile("active_income", NOW) == ()
+    assert broker.actions == []
+    order = _order()
+    service.prepare_entry("active_income", order, NOW)
+    protected = service.on_fill("active_income", order, 1, NOW)
+    assert protected.protected_quantity == 1
+    assert broker.placed[0].qty == 1
     assert len(broker.placed) == 1
     assert manager.for_entry_order(order.order_id)[0].native_order_id == "native-1"
 
@@ -356,3 +535,47 @@ def test_reconcile_cancels_orphaned_native_stop_after_position_is_flat() -> None
     assert result == ({"stop_id": stop_id, "status": "cancelled_flat"},)
     assert broker.cancelled == ["native-1"]
     assert manager.active() == ()
+
+
+def test_native_bracket_keeps_stop_and_target_coverage_separate_after_partial_fills():
+    service, broker, manager = _service()
+    order = _order()
+    order = replace(
+        order,
+        metadata={
+            **order.metadata,
+            "position_rules": {
+                "stop_loss": 0.05,
+                "take_profit": 0.06,
+                "horizon_bars": 3,
+                "execution_policy": "resting_bracket/v1",
+            },
+        },
+    )
+    service.prepare_entry("active_income", order, NOW)
+    assert len(manager.for_entry_order(order.order_id)) == 2
+    assert not broker.placed
+    for quantity in (0.4, 1.0):
+        broker.position_quantity = quantity
+        filled = replace(
+            order,
+            filled_quantity=quantity,
+            status=OrderStatus.PARTIALLY_FILLED if quantity < 1 else OrderStatus.FILLED,
+        )
+        service.on_fill("active_income", filled, quantity, NOW)
+        coverage = {stop.kind: stop.protected_quantity for stop in manager.active()}
+        assert coverage == {ProtectionKind.STOP: quantity, ProtectionKind.TAKE_PROFIT: quantity}
+    assert [item.kind for item in broker.placed[:2]] == [
+        ProtectionKind.STOP,
+        ProtectionKind.TAKE_PROFIT,
+    ]
+    assert broker.placed[1].trigger_price == pytest.approx(106)
+    broker.position_quantity = 0.2
+    service.on_fill("active_income", _order(reduce_only=True, quantity=0.8), 0.2, NOW)
+    assert {stop.kind: stop.protected_quantity for stop in manager.active()} == {
+        ProtectionKind.STOP: 0.2,
+        ProtectionKind.TAKE_PROFIT: 0.2,
+    }
+    broker.position_quantity = 0
+    service.on_fill("active_income", _order(reduce_only=True, quantity=0.2), 0, NOW)
+    assert not manager.active()

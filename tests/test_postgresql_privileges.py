@@ -106,6 +106,14 @@ def test_evaluator_completes_research_without_runtime_membership(monkeypatch):
         database.migrate()
         bundle = _bundle(database)
         candidate = _candidate(database, bundle)
+        from src.research.rounds import ResearchRoundCoordinator
+
+        ResearchRoundCoordinator(database.engine).close_finite(
+            bundle.bundle_id,
+            product_id="active_income",
+            candidate_ids=[candidate.candidate_id],
+            at=NOW,
+        )
         evaluator = create_engine(base.set(database=name, username=role, password=password))
         with evaluator.connect() as connection:
             check_connection_role(connection, "trading_evaluator")
@@ -202,7 +210,7 @@ def test_evaluator_completes_research_without_runtime_membership(monkeypatch):
                     (id, strategy_version_id, provider, state, submitted_at,
                         dataset_snapshot_hashes, dataset_bundle_id, metadata)
                     SELECT 'legacy-fixture', strategy_version_id, provider, 'legacy_import',
-                        submitted_at, dataset_snapshot_hashes, dataset_bundle_id, metadata
+                    submitted_at, dataset_snapshot_hashes, NULL, metadata - '_dataset_plan'
                     FROM experiment WHERE id=:id"""),
                 {"id": candidate.candidate_id},
             )

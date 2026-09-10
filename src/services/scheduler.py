@@ -31,8 +31,10 @@ from src.data.database import (
 from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp
 from src.research.canonical import SqlActiveStrategyAssignmentRepository
+from src.research.data_plan import product_data_plan
 from src.research.datasets import SqlDatasetBundleRepository
-from src.research.outcomes import OutcomeCategory
+from src.research.outcomes import OutcomeCategory, TrialDisposition
+from src.research.rounds import ResearchRoundCoordinator
 from src.research.store import SqlResearchStore
 from src.services.alerting import AlertSeverity, SqlAlertService, configured_alert_service
 from src.services.job_schemas import JobSchemaError, validate_job_payload
@@ -112,11 +114,13 @@ class PlatformScheduler:
         products: Mapping[str, Mapping[str, Any]],
         node_id: str,
         bootstrap: Any | None = None,
+        research_configuration: Mapping[str, Any] | None = None,
     ) -> None:
         self.engine = engine
         self.products = {str(key): dict(value) for key, value in products.items()}
         self.node_id = node_id
         self.bootstrap = bootstrap
+        self.research_configuration = research_configuration or {}
         self.queue = DatabaseJobQueue(engine)
 
     def run_once(self, *, now: str) -> dict[str, Any]:
@@ -273,11 +277,14 @@ class PlatformScheduler:
             )
             if not symbols:
                 return ()
+            plan = product_data_plan(product, self.research_configuration, symbols)
             payload = {
                 **self._payload(schedule_name, product_id, product, now),
-                "minimum_history_days": 365,
+                "minimum_history_days": plan.minimum_history_days,
                 "symbols": symbols,
-                "timeframe": str(product.get("dataset_timeframe") or "1m"),
+                "timeframe": plan.timeframe,
+                "data_plan": plan.to_payload(),
+                "history_as_of": due_at,
             }
             payload["available_at"] = "1970-01-01T00:00:00+00:00"
             payload["content_hash"] = canonical_hash(payload)
@@ -291,6 +298,8 @@ class PlatformScheduler:
                             "symbols": symbols,
                             "minimum_history_days": payload["minimum_history_days"],
                             "timeframe": payload["timeframe"],
+                            "data_plan_id": plan.plan_id,
+                            "history_as_of": due_at,
                         },
                     ),
                     "historical_bootstrap",
@@ -330,6 +339,17 @@ class PlatformScheduler:
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
         catalogue = self._payload("register_strategy_catalogue", product_id, product, now)
         payload = self._hypothesis_generation_payload(product_id, product, catalogue)
+        limits = self.research_configuration.get("search_budgets", {})
+        if payload.get("dataset_bundle_id"):
+            claimed = ResearchRoundCoordinator(self.engine).claim(
+                payload,
+                now=now,
+                epoch_budget=int(limits.get("maximum_candidates_per_epoch", 100)),
+                daily_budget=int(limits.get("maximum_candidates_per_day", 100)),
+            )
+            if claimed is None:
+                return ()
+            payload = claimed
         return (
             (
                 immutable_work_id("generate_hypotheses", payload),
@@ -524,7 +544,7 @@ class PlatformScheduler:
                 "observed_at": now,
             }
             if (
-                row["state"] == f"blocked_dead_letter:{stage}"
+                row["state"] == TrialDisposition.INFRASTRUCTURE_EXHAUSTED.value
                 and metadata.get("blocked_reason") == blocked
             ):
                 return
@@ -533,7 +553,7 @@ class PlatformScheduler:
                 update(experiment)
                 .where(experiment.c.id == candidate_id)
                 .values(
-                    state=f"blocked_dead_letter:{stage}",
+                    state=TrialDisposition.INFRASTRUCTURE_EXHAUSTED.value,
                     metadata=json_value(metadata, field="metadata"),
                 )
             )
@@ -625,6 +645,7 @@ class PlatformScheduler:
             "universe_id": str(product.get("universe_id") or ""),
             "market_type": "spot" if product_id == "btc_accumulation" else "futures",
             "dataset_timeframe": str(product.get("dataset_timeframe") or "1m"),
+            "data_plan": catalogue.get("data_plan"),
             "available_at": ("1970-01-01T00:00:00+00:00"),
         }
         return {key: value for key, value in payload.items() if value is not None}
@@ -849,10 +870,16 @@ class PlatformScheduler:
             for instrument_id in instrument_ids:
                 if (assignment_id, instrument_id) in pending:
                     continue
-                suffix = instrument_id or "waiting"
                 jobs.append(
                     (
-                        f"scheduled:forward_paper_observation:{assignment_id}:{suffix}:{due_at}",
+                        immutable_work_id(
+                            "forward_paper_observation",
+                            {
+                                "assignment_id": assignment_id,
+                                "instrument_id": instrument_id,
+                                "due_at": due_at,
+                            },
+                        ),
                         "forward_paper_observation",
                         {
                             "assignment_id": assignment_id,
@@ -1031,12 +1058,25 @@ class PlatformScheduler:
                 "maximum_symbols": int(product.get("research_max_symbols", 100)),
             }
         if schedule_name == "register_strategy_catalogue":
-            bundle = SqlDatasetBundleRepository(self.engine).latest_ready(product_id, at=now)
+            symbols = self._universe_symbols(product_id, product, now)
+            plan = (
+                product_data_plan(product, self.research_configuration, symbols)
+                if symbols
+                else None
+            )
+            bundle = (
+                SqlDatasetBundleRepository(self.engine).latest_ready(
+                    product_id, at=now, data_plan_id=plan.plan_id
+                )
+                if plan
+                else None
+            )
             stage_ids = bundle.stage_snapshot_ids if bundle is not None else {}
             snapshot_ids = list(dict.fromkeys(str(value) for value in stage_ids.values()))
             return {
                 **base,
-                "instrument_universe": self._universe_symbols(product_id, product, now),
+                "instrument_universe": symbols,
+                "data_plan": plan.to_payload() if plan else None,
                 "dataset_snapshot_hashes": snapshot_ids,
                 "dataset_bundle_id": bundle.bundle_id if bundle is not None else None,
                 "dataset_timeframe": str(product.get("dataset_timeframe") or "1m"),

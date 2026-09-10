@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any
 
@@ -66,12 +66,16 @@ class PaperAccountLedger:
         starting_balances: Mapping[str, Any],
         starting_positions: Mapping[str, Any] | None = None,
         connection=None,
+        book_id: str | None = None,
     ) -> None:
         if not account_id or not product_id:
             raise ValueError("paper account identity is required")
         if not isinstance(starting_balances, Mapping) or not starting_balances:
             raise ValueError("paper account needs explicit starting balances")
         self.account_id = account_id
+        if book_id is not None and book_id != account_id:
+            raise ValueError("paper book balances require an isolated matching account")
+        self.engine, self.connection, self.book_id = engine, connection, book_id
         self.product_id = product_id
         self.starting_balances = _balances(starting_balances)
         self.starting_positions = _positions(starting_positions or {})
@@ -100,6 +104,7 @@ class PaperAccountLedger:
         observed_at = timestamp(observed_at, field="paper seed timestamp")
         payload = {
             "kind": "paper_account_state",
+            "book_id": self.book_id,
             "account_id": self.account_id,
             "product_id": self.product_id,
             "observed_at": observed_at,
@@ -124,7 +129,9 @@ class PaperAccountLedger:
             raise RuntimeError("paper account seed was not persisted")
         return result
 
-    def state(self) -> PaperAccountState | None:
+    def state(self, *, at: str | None = None) -> PaperAccountState | None:
+        if at is not None:
+            at = timestamp(at, field="paper state as-of time", preserve_subseconds=True)
         self.ledger.reload()
         entries = self.ledger.entries
         for entry in reversed(entries):
@@ -133,8 +140,21 @@ class PaperAccountLedger:
                 metadata.get("kind") == "paper_account_state"
                 and metadata.get("account_id") == self.account_id
                 and metadata.get("product_id") == self.product_id
+                and (at is None or metadata["observed_at"] <= at)
             ):
-                return _state_from_payload(metadata)
+                state = _state_from_payload(metadata)
+                if self.book_id is not None:
+                    from src.portfolio.books import book_balance_snapshot
+
+                    balances, observed_at = book_balance_snapshot(
+                        self.engine, self.book_id, at=at, connection=self.connection
+                    )
+                    return replace(
+                        state,
+                        balances=balances,
+                        observed_at=max(state.observed_at, observed_at or state.observed_at),
+                    )
+                return state
         return None
 
     def recorded_fill_ids(self) -> frozenset[str]:
@@ -144,6 +164,7 @@ class PaperAccountLedger:
             str(entry.metadata["last_fill_id"])
             for entry in self.ledger.entries
             if entry.metadata.get("kind") == "paper_account_state"
+            and entry.metadata.get("account_id") == self.account_id
             and entry.metadata.get("last_fill_id")
         )
 
@@ -164,6 +185,7 @@ class PaperAccountLedger:
             entry.metadata.get("last_fill_id") == fill.fill_id
             for entry in self.ledger.entries
             if entry.metadata.get("kind") == "paper_account_state"
+            and entry.metadata.get("account_id") == self.account_id
         ):
             return state
         balances = dict(state.balances)
@@ -175,9 +197,12 @@ class PaperAccountLedger:
         position_map[order.instrument_id] = float(position.quantity)
         payload = {
             "kind": "paper_account_state",
+            "book_id": self.book_id,
             "account_id": self.account_id,
             "product_id": self.product_id,
-            "observed_at": timestamp(fill.occurred_at, field="paper fill timestamp"),
+            "observed_at": timestamp(
+                fill.occurred_at, field="paper fill timestamp", preserve_subseconds=True
+            ),
             "balances": balances,
             "positions": position_map,
             "position_entry_prices": {
@@ -266,7 +291,9 @@ class PaperAccountLedger:
             reference_price = fill.price
             direction = 1.0 if previous_position.quantity > 0 else -1.0
             realised = quantity * (reference_price - entry_price) * direction
-        balances[quote] = balances.get(quote, 0.0) + realised - float(fill.fee)
+        balances[quote] = balances.get(quote, 0.0) + realised
+        fee_asset = str(fill.fee_asset or quote).upper()
+        balances[fee_asset] = balances.get(fee_asset, 0.0) - float(fill.fee)
         _assert_nonnegative(balances)
 
 
@@ -274,7 +301,9 @@ def _state_from_payload(payload: Mapping[str, Any]) -> PaperAccountState:
     return PaperAccountState(
         account_id=str(payload["account_id"]),
         product_id=str(payload["product_id"]),
-        observed_at=timestamp(str(payload["observed_at"]), field="paper state observed_at"),
+        observed_at=timestamp(
+            str(payload["observed_at"]), field="paper state observed_at", preserve_subseconds=True
+        ),
         balances=_balances(payload["balances"]),
         positions=_positions(payload.get("positions", {})),
         position_entry_prices=_entry_prices(payload.get("position_entry_prices", {})),

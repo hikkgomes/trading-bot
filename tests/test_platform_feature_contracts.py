@@ -289,7 +289,13 @@ def test_market_data_writer_publishes_authoritative_market_snapshot(tmp_path) ->
         SqlRiskSnapshotStore(database.engine).get(result["market_snapshot_ids"][0])
         for result in results
     ]
-    assert snapshots[0]["values"] == {"close": 102.0}
+    assert snapshots[0]["values"] == {
+        "open": 100.0,
+        "high": 103.0,
+        "low": 99.0,
+        "close": 102.0,
+        "volume": 25.0,
+    }
     assert snapshots[1]["values"] == {
         "close": 102.0,
         "spread_bps": pytest.approx(1.9607843137),
@@ -394,7 +400,7 @@ def test_live_sma_chain_holds_entry_until_configured_horizon(tmp_path) -> None:
         "promotion_policy_id": "active-income",
         "base_accounting_asset": "USDT",
     }
-    _seed_strategy(
+    assignment_id = _seed_strategy(
         database,
         product,
         instrument,
@@ -404,6 +410,7 @@ def test_live_sma_chain_holds_entry_until_configured_horizon(tmp_path) -> None:
         strategy_name="sma_cross",
     )
     assignments = SqlActiveStrategyAssignmentRepository(database.engine)
+    book_id = assignments.by_id(assignment_id)["payload"]["book_id"]
     snapshots = SqlRiskSnapshotStore(database.engine)
     graph_enabled = False
     writer = DatabaseMarketDataWriter(
@@ -439,7 +446,7 @@ def test_live_sma_chain_holds_entry_until_configured_horizon(tmp_path) -> None:
     forecasts = []
     orders = OrderManager(SqlOrderStore(database.engine))
     application = FinancialApplication(
-        database.engine, FinancialScope("active_income", "futures", "paper", "binance", "USDT")
+        database.engine, FinancialScope("active_income", book_id, "paper", "binance", "USDT")
     )
     held = False
     last_time = start
@@ -495,7 +502,7 @@ def test_live_sma_chain_holds_entry_until_configured_horizon(tmp_path) -> None:
                 side = OrderSide.SELL if held else OrderSide.BUY
                 order = OrderIntent(
                     f"sma-order-{index}",
-                    product["portfolio_id"],
+                    book_id,
                     instrument.instrument_id,
                     side,
                     1,
@@ -506,7 +513,8 @@ def test_live_sma_chain_holds_entry_until_configured_horizon(tmp_path) -> None:
                         "reference_price": close,
                         "target_metadata": {
                             "assignment_id": forecast.metadata["assignment_id"],
-                            "account_id": "futures",
+                            "account_id": book_id,
+                            "book_id": book_id,
                             "execution_environment": "paper",
                         },
                     },

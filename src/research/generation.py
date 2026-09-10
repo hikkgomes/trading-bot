@@ -10,9 +10,10 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, cast
 
 from sqlalchemy import insert, select
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from src.data.database import generation_feedback, strategy_identity
+from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, json_value, non_empty, timestamp, to_primitive
 from src.domain.instruments import MarketType, canonical_instrument_id
 from src.domain.strategies import (
@@ -398,12 +399,22 @@ class GenerationFeedbackStore(Protocol):
 class SqlGenerationFeedbackStore:
     """Append-only PostgreSQL/SQLite memory for allocator feedback."""
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        connection: Connection | None = None,
+        as_of: str | None = None,
+        feedback_ids: list[str] | None = None,
+    ) -> None:
         self.engine = engine
+        self.connection = connection
+        self.as_of = as_of
+        self.feedback_ids = feedback_ids
 
     def append(self, feedback: GenerationFeedback) -> str:
         payload = to_primitive(feedback)
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, self.connection, write=True) as connection:
             existing = connection.execute(
                 select(generation_feedback.c.payload).where(
                     generation_feedback.c.id == feedback.feedback_id
@@ -422,13 +433,15 @@ class SqlGenerationFeedbackStore:
         return feedback.feedback_id
 
     def load(self, *, campaign: str | None = None) -> tuple[GenerationFeedback, ...]:
-        with self.engine.connect() as connection:
-            rows = connection.execute(
-                select(generation_feedback.c.payload).order_by(
-                    generation_feedback.c.created_at,
-                    generation_feedback.c.id,
-                )
-            ).scalars()
+        query = select(generation_feedback.c.payload).order_by(
+            generation_feedback.c.created_at, generation_feedback.c.id
+        )
+        if self.as_of is not None:
+            query = query.where(generation_feedback.c.created_at <= self.as_of)
+        if self.feedback_ids is not None:
+            query = query.where(generation_feedback.c.id.in_(self.feedback_ids))
+        with connection_scope(self.engine, self.connection, write=False) as connection:
+            rows = connection.execute(query).scalars().all()
         result = tuple(_feedback_from_payload(payload) for payload in rows)
         if campaign is None:
             return result
@@ -640,14 +653,16 @@ class HypothesisMemory(Protocol):
 class SqlHypothesisMemory:
     """Search immutable strategy identities for exact and semantic duplicates."""
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, *, connection: Connection | None = None) -> None:
         self.engine = engine
+        self.connection = connection
 
     def find(self, candidate: Candidate, *, maximum_distance: float = 0.2) -> DuplicateMatch | None:
         if not 0.0 <= maximum_distance <= 1.0:
             raise GenerationError("maximum duplicate distance must be between zero and one")
         signature = hypothesis_signature(candidate.definition)
-        with self.engine.connect() as connection:
+        nearest = None
+        with connection_scope(self.engine, self.connection, write=False) as connection:
             rows = connection.execute(
                 select(
                     strategy_identity.c.id,
@@ -660,9 +675,11 @@ class SqlHypothesisMemory:
                 if str(row["behavior_hash"]) == behaviour_hash_for_definition(candidate.definition):
                     return DuplicateMatch(str(row["id"]), "exact", 0.0, signature)
                 distance = semantic_distance(candidate.definition, row["submitted_spec"])
-                if distance <= maximum_distance:
-                    return DuplicateMatch(str(row["id"]), "near", distance, signature)
-        return None
+                if distance <= maximum_distance and (
+                    nearest is None or distance < nearest.distance
+                ):
+                    nearest = DuplicateMatch(str(row["id"]), "near", distance, signature)
+        return nearest
 
 
 @dataclass(frozen=True)
@@ -708,6 +725,7 @@ class HypothesisGenerator:
         universe_snapshot_id: str | None = None,
         parent_thesis_ids: tuple[str, ...] = (),
         parent_candidates: Sequence[Candidate] = (),
+        dataset_plan: Any | None = None,
     ) -> tuple[GeneratedHypothesis, ...]:
         available_campaigns = CAMPAIGNS if campaigns is None else campaigns
         selected = tuple(
@@ -746,6 +764,13 @@ class HypothesisGenerator:
                     reason_code=str(exc),
                 )
                 continue
+            if dataset_plan is not None:
+                candidate = replace(hypothesis.candidate, dataset_plan=dataset_plan)
+                hypothesis = replace(
+                    hypothesis,
+                    candidate=candidate,
+                    semantic_signature=hypothesis_signature(candidate.definition),
+                )
             match = self.memory.find(hypothesis.candidate) if self.memory is not None else None
             if match is not None and match.kind == "exact":
                 derived = _derive_duplicate_hypothesis(
@@ -1586,7 +1611,9 @@ def _campaign_position_model(campaign: CampaignSpec) -> dict[str, Any]:
         return {"kind": "event_time_signed_position", "maximum_holding_seconds": 300}
     if campaign.source_type is StrategySourceType.ENSEMBLE:
         return {"kind": "portfolio_forecast_aggregation", "net_exposure": 0.5}
-    return {"kind": "volatility_scaled", "signal_timing": "next_bar"}
+    from src.strategies.position_state import directional_position_model
+
+    return directional_position_model(32 if campaign.evidence_type == "intraday" else 96)
 
 
 def _threshold_unit(campaign: CampaignSpec) -> str:

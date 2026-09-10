@@ -13,6 +13,7 @@ from sqlalchemy import select
 from src.data.database import (
     account_snapshot,
     accounting_entry,
+    book_fill_allocation,
     exchange_order,
     fill,
     nav_snapshot,
@@ -25,6 +26,52 @@ from src.data.database import (
 from src.domain._codec import canonical_hash, timeframe_seconds, timestamp
 
 AssignmentFilter = str | tuple[str, ...]
+
+
+def _book_order_view(payload, book_id):
+    metadata = payload.get("metadata", {})
+    contributions = metadata.get("target_metadata", metadata).get("book_contributions", ())
+    owned = [row for row in contributions if row["book_id"] == book_id]
+    if not owned:
+        return None
+    total = sum(abs(float(row["signed_quantity"])) for row in contributions)
+    weight = sum(abs(float(row["signed_quantity"])) for row in owned) / total
+    return {**payload, "quantity": float(payload["quantity"]) * weight, "portfolio_id": book_id}
+
+
+def _allocated_fill_view(row, allocation):
+    payload = row["payload"]
+    return {
+        **row,
+        "payload": {
+            **payload,
+            "quantity": abs(float(allocation["signed_quantity"])),
+            "fee": float(allocation["fee"]),
+            "metadata": {
+                **payload.get("metadata", {}),
+                "book_id": allocation["book_id"],
+                "allocation_id": allocation["id"],
+                "source_fill_id": row["id"],
+            },
+        },
+    }
+
+
+def _book_ledger_views(engine, book_id, start, at, instrument_id):
+    from src.portfolio.books import book_event_pnl, book_financial_events
+
+    return tuple(
+        {
+            **row,
+            "payload": {
+                "metadata": {**row["payload"], "pnl_effect": str(book_event_pnl(row["payload"]))}
+            },
+        }
+        for row in book_financial_events(engine, book_id, start=start, at=at)
+        if row["payload"].get("kind")
+        in {"external_fill_allocation", "internal_netting", "funding_allocation"}
+        and (instrument_id is None or row["payload"].get("instrument_id") == instrument_id)
+    )
 
 
 @dataclass(frozen=True)
@@ -153,6 +200,9 @@ class ForwardEvidenceCollector:
         strategy_version_id: str | None = None,
         assignment_id: AssignmentFilter | None = None,
     ) -> ForwardEvidenceMetrics:
+        from src.portfolio.books import position_scope
+
+        assignment = {**assignment, "portfolio_id": position_scope(assignment)}
         created_at = timestamp(artefact_created_at, field="artefact_created_at")
         evaluated_at = timestamp(evaluation_time, field="evaluation_time")
         window_start = timestamp(previous_observed_at or created_at, field="window_start")
@@ -167,7 +217,8 @@ class ForwardEvidenceCollector:
             assignment_id=assignment_id,
         )
         order_ids = tuple(str(row["id"]) for row in orders)
-        fills = self._fills(order_ids, start=window_start, at=evaluated_at)
+        book_id = assignment.get("payload", {}).get("book_id")
+        fills = self._fills(order_ids, start=window_start, at=evaluated_at, book_id=book_id)
         all_orders = self._orders(
             portfolio_id=str(assignment["portfolio_id"]),
             instrument_id=instrument_id,
@@ -180,6 +231,7 @@ class ForwardEvidenceCollector:
             tuple(str(row["id"]) for row in all_orders),
             start=created_at,
             at=evaluated_at,
+            book_id=book_id,
         )
         ledger_rows = self._ledger_rows(
             product_id=product_id,
@@ -188,6 +240,7 @@ class ForwardEvidenceCollector:
             strategy_version_id=strategy_version_id,
             assignment_id=assignment_id,
             instrument_id=instrument_id,
+            book_id=assignment.get("payload", {}).get("book_id"),
         )
         all_ledger_rows = self._ledger_rows(
             product_id=product_id,
@@ -196,6 +249,7 @@ class ForwardEvidenceCollector:
             strategy_version_id=strategy_version_id,
             assignment_id=assignment_id,
             instrument_id=instrument_id,
+            book_id=assignment.get("payload", {}).get("book_id"),
         )
         all_market_rows = self._market_rows(
             product_id=product_id,
@@ -508,6 +562,10 @@ class ForwardEvidenceCollector:
             result = []
             for row in rows:
                 payload = row["payload"]
+                owned = _book_order_view(payload, portfolio_id)
+                if owned is not None and str(payload.get("instrument_id")) == instrument_id:
+                    result.append({**row, "payload": owned})
+                    continue
                 if (
                     isinstance(payload, Mapping)
                     and str(payload.get("portfolio_id")) == portfolio_id
@@ -519,7 +577,7 @@ class ForwardEvidenceCollector:
         return tuple(result)
 
     def _fills(
-        self, order_ids: tuple[str, ...], *, start: str, at: str
+        self, order_ids: tuple[str, ...], *, start: str, at: str, book_id: str | None = None
     ) -> tuple[Mapping[str, Any], ...]:
         if not order_ids:
             return ()
@@ -533,7 +591,23 @@ class ForwardEvidenceCollector:
                 )
                 .order_by(fill.c.created_at, fill.c.id)
             ).mappings()
-            return tuple(row for row in rows if isinstance(row["payload"], Mapping))
+            result = tuple(row for row in rows if isinstance(row["payload"], Mapping))
+            if not book_id:
+                return result
+            allocations = {
+                row["fill_id"]: row
+                for row in connection.execute(
+                    select(book_fill_allocation).where(
+                        book_fill_allocation.c.book_id == book_id,
+                        book_fill_allocation.c.fill_id.in_([row["id"] for row in result]),
+                    )
+                ).mappings()
+            }
+            return tuple(
+                _allocated_fill_view(row, allocations[row["id"]])
+                for row in result
+                if row["id"] in allocations
+            )
 
     def _ledger_rows(
         self,
@@ -544,7 +618,13 @@ class ForwardEvidenceCollector:
         strategy_version_id: str | None = None,
         assignment_id: AssignmentFilter | None = None,
         instrument_id: str | None = None,
+        book_id: str | None = None,
     ) -> tuple[Mapping[str, Any], ...]:
+        if book_id:
+            from src.portfolio.books import load_book
+
+            if load_book(self.engine, book_id)["execution_mode"] == "live":
+                return _book_ledger_views(self.engine, book_id, start, at, instrument_id)
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(
@@ -566,6 +646,7 @@ class ForwardEvidenceCollector:
                     strategy_version_id=strategy_version_id,
                     assignment_id=assignment_id,
                     instrument_id=instrument_id,
+                    book_id=book_id,
                 )
             )
 
@@ -962,6 +1043,16 @@ class ForwardEvidenceCollector:
         at: str | None = None,
         price: float | None = None,
     ) -> float:
+        from src.portfolio.books import book_balances, book_foreign_fee_cost, load_book
+
+        book_id = assignment.get("payload", {}).get("book_id")
+        if book_id and load_book(self.engine, book_id)["execution_mode"] == "live":
+            balances = book_balances(self.engine, book_id, at=at)
+            if product_id == "btc_accumulation":
+                if not price or price <= 0:
+                    raise ValueError("BTC book equity requires its observed mark")
+                return balances.get("BTC", 0) + balances.get("USDT", 0) / price
+            return balances.get("USDT", 0) - book_foreign_fee_cost(self.engine, book_id, at=at)
         account_id = _assignment_account_id(assignment)
         assignment_payload = assignment.get("payload")
         if not account_id and isinstance(assignment_payload, Mapping):
@@ -1049,6 +1140,7 @@ class ForwardEvidenceCollector:
                 market_rows=market_rows,
                 fill_rows=fill_rows,
                 assignment_id=assignment_id,
+                evaluation_time=evaluation_time,
             )
         if product_id != "btc_accumulation":
             return (product_id, None, None, None, None, ())
@@ -1073,6 +1165,7 @@ class ForwardEvidenceCollector:
         market_rows: tuple[Mapping[str, Any], ...],
         fill_rows: tuple[Mapping[str, Any], ...],
         assignment_id: AssignmentFilter | None = None,
+        evaluation_time: str | None = None,
     ) -> tuple[str, float | None, float | None, float | None, float | None, tuple[str, ...]]:
         initial = self._starting_equity("active_income", assignment, at=artefact_created_at)
         instrument_id = str(assignment.get("instrument_id") or "")
@@ -1099,6 +1192,10 @@ class ForwardEvidenceCollector:
             else 0.0,
             opening_mark_price=opening_price,
         )
+        if assignment.get("payload", {}).get("book_id") and evaluation_time:
+            exact = self._book_futures_equity(
+                assignment, initial, ledger_rows, market_rows, artefact_created_at, evaluation_time
+            )
         if exact is not None:
             return (
                 "USDT",
@@ -1125,6 +1222,36 @@ class ForwardEvidenceCollector:
             excess / initial if initial > 0.0 else None,
             (),
         )
+
+    def _book_futures_equity(self, assignment, initial, ledger_rows, market_rows, start, at):
+        marks = self._market_prices(market_rows)
+        if not marks:
+            return None
+        instrument_id = str(
+            assignment.get("instrument_id") or market_rows[-1]["payload"].get("instrument_id")
+        )
+        end = self._opening_position(
+            portfolio_id=assignment["portfolio_id"],
+            instrument_id=instrument_id,
+            at=at,
+            assignment_id=None,
+        )
+        opening = self._opening_position(
+            portfolio_id=assignment["portfolio_id"],
+            instrument_id=instrument_id,
+            at=start,
+            assignment_id=None,
+        )
+        change = 0.0
+        for row, mark, sign in (
+            (end, marks[-1], 1),
+            (opening, self._opening_market_price("active_income", instrument_id, start), -1),
+        ):
+            if row and float(row["quantity"]):
+                if mark is None:
+                    return None
+                change += sign * float(row["quantity"]) * (mark - float(row["average_entry_price"]))
+        return initial + self._ledger_pnl(ledger_rows) + change
 
     def _btc_objective(
         self,
@@ -1206,7 +1333,14 @@ class ForwardEvidenceCollector:
                 continue
             btc, stable = _apply_spot_fill_to_balances(btc, stable, payload)
         final = btc + stable / prices[-1]
-        benchmark = initial * prices[-1] / prices[0]
+        book_id = assignment.get("payload", {}).get("book_id")
+        if book_id:
+            from src.portfolio.books import book_balances, load_book
+
+            if load_book(self.engine, book_id)["execution_mode"] == "live":
+                closing = book_balances(self.engine, book_id, at=evaluation_time)
+                final = closing.get("BTC", 0) + closing.get("USDT", 0) / prices[-1]
+        benchmark = initial
         excess = final - benchmark
         source_ids = tuple(dict.fromkeys(str(row["id"]) for row in (*ledger_rows, *market_rows)))
         return (
@@ -1225,6 +1359,11 @@ class ForwardEvidenceCollector:
         product_id: str,
         at: str,
     ) -> Mapping[str, Any] | None:
+        from src.portfolio.books import book_balances, load_book
+
+        book_id = assignment.get("payload", {}).get("book_id")
+        if book_id and load_book(self.engine, book_id)["execution_mode"] == "live":
+            return book_balances(self.engine, book_id, at=at)
         account_id = _assignment_account_id(assignment)
         if not account_id:
             payload = assignment.get("payload")
@@ -1311,7 +1450,7 @@ class ForwardEvidenceCollector:
         initial = self._btc_nav(first_snapshot["payload"], prices[0])
         if initial is None or initial <= 0.0:
             return None
-        benchmark = initial * prices[-1] / prices[0]
+        benchmark = initial
         final = initial + self._ledger_pnl(ledger_rows)
         excess = final - benchmark
         source_ids = tuple(str(row["id"]) for row in (*snapshots, *ledger_rows, *market_rows))
@@ -1736,22 +1875,26 @@ def _ledger_belongs_to_scope(
     strategy_version_id: str | None,
     assignment_id: AssignmentFilter | None,
     instrument_id: str | None,
+    book_id: str | None = None,
 ) -> bool:
     metadata = payload.get("metadata")
     if not isinstance(metadata, Mapping):
         return not any((strategy_version_id, assignment_id, instrument_id))
-    if assignment_id is not None:
+    if book_id is not None and metadata.get("book_id") != book_id:
+        return False
+    if assignment_id is not None and book_id is None:
         declared_assignment = metadata.get("assignment_id")
         if not _assignment_matches(declared_assignment, assignment_id):
             return False
-    if strategy_version_id is not None:
-        declared_strategy = metadata.get("strategy_version_id", metadata.get("strategy"))
-        declared_strategies = metadata.get("strategy_version_ids")
-        if declared_strategy is None and isinstance(declared_strategies, list | tuple):
-            if strategy_version_id not in {str(value) for value in declared_strategies}:
-                return False
-        elif declared_strategy is None or str(declared_strategy) != strategy_version_id:
-            return False
+    declared_strategy = metadata.get("strategy_version_id", metadata.get("strategy"))
+    strategies = (
+        metadata.get("strategy_version_ids") if declared_strategy is None else (declared_strategy,)
+    )
+    if strategy_version_id is not None and (
+        not isinstance(strategies, list | tuple)
+        or strategy_version_id not in {str(value) for value in strategies}
+    ):
+        return False
     if instrument_id is not None:
         declared_instrument = metadata.get("instrument_id", metadata.get("symbol"))
         if declared_instrument is None or str(declared_instrument) != instrument_id:

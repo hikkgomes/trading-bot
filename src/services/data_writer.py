@@ -327,6 +327,8 @@ class DatabaseMarketDataWriter:
                 symbols=tuple(str(symbol) for symbol in claimed.payload["symbols"]),
                 minimum_history_days=int(claimed.payload["minimum_history_days"]),
                 timeframe=str(claimed.payload["timeframe"]),
+                data_plan=claimed.payload.get("data_plan"),
+                now=str(claimed.payload.get("history_as_of") or now),
                 heartbeat=heartbeat,
             )
             result = {
@@ -466,7 +468,7 @@ class DatabaseMarketDataWriter:
         values = _market_snapshot_values(event)
         if values is None:
             return ()
-        return tuple(
+        identities = tuple(
             self.snapshot_store.save(
                 {
                     "kind": "market_data_input",
@@ -475,6 +477,7 @@ class DatabaseMarketDataWriter:
                     "source_event_id": event.event_id,
                     "source_event_type": event.event_type.value,
                     "source_timeframe": event.payload.get("data", {}).get("k", {}).get("i"),
+                    "source_open_time_ms": event.payload.get("data", {}).get("k", {}).get("t"),
                     "source_close_time_ms": event.payload.get("data", {}).get("k", {}).get("T"),
                     "source_candle_closed": event.payload.get("data", {}).get("k", {}).get("x"),
                     "source_event_time": event.exchange_timestamp,
@@ -485,6 +488,22 @@ class DatabaseMarketDataWriter:
             )
             for product_id in self.product_ids_by_market.get(market, ())
         )
+
+        if _is_closed_candle(event):
+            from src.services.paper_protection import has_paper_protection
+
+            for product_id, identity in zip(
+                self.product_ids_by_market.get(market, ()), identities, strict=True
+            ):
+                if has_paper_protection(self.queue.engine, event.instrument_id, product_id):
+                    self.queue.enqueue_if_absent(
+                        job_id=f"paper-protection:{identity}",
+                        name="paper_protection_evaluate",
+                        payload={"market_snapshot_id": identity},
+                        available_at=event.availability_timestamp,
+                        priority=100,
+                    )
+        return identities
 
     def _enqueue_closed_candle_features(
         self,
@@ -662,7 +681,14 @@ def _candle_snapshot_values(raw_data: Mapping[str, Any]) -> dict[str, float] | N
         parsed = float(close)
     except (TypeError, ValueError):
         return None
-    return {"close": parsed} if math.isfinite(parsed) else None
+    if not math.isfinite(parsed):
+        return None
+    values = {"close": parsed}
+    for name, source in (("open", "o"), ("high", "h"), ("low", "l"), ("volume", "v")):
+        value = _market_number(candle, source)
+        if value is not None:
+            values[name] = value
+    return values
 
 
 def _book_snapshot_values(

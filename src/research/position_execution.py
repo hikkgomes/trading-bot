@@ -50,6 +50,7 @@ def managed_futures_events(
                     "fee_asset": "USDT",
                     "position_reason": action.reason,
                     "execution_time_resolution": "bar",
+                    "ambiguous_bar": action.ambiguous_bar,
                 }
             )
             quantity = target
@@ -64,10 +65,8 @@ def _action_time(action: PositionAction, row: Mapping[str, Any], close: str) -> 
         opened = dt.datetime.fromtimestamp(float(row["open_time_ms"]) / 1000, dt.UTC).isoformat()
     else:
         opened = str(row.get("open_timestamp", close))
-    if action.kind == "entry":
+    if action.kind == "entry" or action.reason == "horizon":
         return opened
-    if action.reason == "horizon":
-        return close
     gap = action.direction * (float(row["open"]) - action.price)
     if (action.reason == "stop" and gap <= 0) or (action.reason == "take_profit" and gap >= 0):
         return opened

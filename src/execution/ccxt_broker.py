@@ -31,6 +31,7 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from src.domain.orders import ProtectionKind
 from src.execution.broker import (
     Broker,
     BrokerFill,
@@ -307,6 +308,8 @@ class CcxtBroker(Broker):
     @staticmethod
     def _trade_timestamp(item: dict, info: dict) -> float:
         raw = item.get("timestamp") or item.get("time") or info.get("time") or info.get("T")
+        if raw is None:
+            raise RuntimeError("exchange trade timestamp is invalid")
         try:
             result = float(raw) / 1_000.0 if float(raw) > 10_000_000_000 else float(raw)
         except (TypeError, ValueError) as exc:
@@ -1299,7 +1302,11 @@ class CcxtBroker(Broker):
         if futures_supported and conditional:
             algo_orders = getattr(self._client, "fapiPrivateGetOpenAlgoOrders", None)
             if callable(algo_orders):
-                params = {"symbol": self._ccxt_symbol(symbol)} if symbol is not None else {}
+                params = (
+                    {"symbol": "".join(self._split_symbol(symbol)[:2])}
+                    if symbol is not None
+                    else {}
+                )
                 try:
                     payload = algo_orders(params)
                 except Exception as exc:
@@ -1316,9 +1323,9 @@ class CcxtBroker(Broker):
                 "ccxt client cannot fetch open orders; refusing to assume the inventory is empty."
             )
         client_symbol = self._ccxt_symbol(symbol) if symbol is not None else None
-        params = {"trigger": True} if conditional else {}
+        trigger_params = {"trigger": True} if conditional else {}
         try:
-            payload = fetch_open_orders(client_symbol, params=params)
+            payload = fetch_open_orders(client_symbol, params=trigger_params)
         except Exception as exc:
             order_kind = "conditional" if conditional else "regular"
             raise RuntimeError(
@@ -1609,6 +1616,7 @@ class CcxtBroker(Broker):
         qty: float,
         trigger_price: float,
         client_id: str,
+        kind: ProtectionKind = ProtectionKind.STOP,
     ) -> ProtectiveOrder:
         """Place a Binance USD-M one-way reduce-only stop-market order.
 
@@ -1618,6 +1626,7 @@ class CcxtBroker(Broker):
         leave the caller falsely believing the position is protected.
         """
 
+        kind = ProtectionKind(kind)
         self._assert_protective_stop_supported()
         trigger_price = self.normalize_order_price(symbol, trigger_price)
         qty = self.normalize_order_qty(
@@ -1644,8 +1653,11 @@ class CcxtBroker(Broker):
             qty=qty,
             trigger_price=trigger_price,
             client_id=client_id,
+            kind=kind,
         )
         protective = self._parse_protective_order(result, requested_symbol=symbol)
+        if protective.kind is not kind or protective.working_type != "CONTRACT_PRICE":
+            raise ValueError("protective order type or trigger reference does not match")
         self._assert_protective_order_matches(
             protective,
             symbol=symbol,
@@ -1684,7 +1696,7 @@ class CcxtBroker(Broker):
         self._assert_protective_stop_supported()
         algo_get = getattr(self._client, "fapiPrivateGetAlgoOrder", None)
         if callable(algo_get):
-            params = {"symbol": self._ccxt_symbol(symbol)}
+            params = {"symbol": "".join(self._split_symbol(symbol)[:2])}
             if order_id is not None:
                 params["algoId"] = str(order_id)
             else:
@@ -1716,7 +1728,7 @@ class CcxtBroker(Broker):
         self._assert_protective_stop_supported()
         algo_delete = getattr(self._client, "fapiPrivateDeleteAlgoOrder", None)
         if callable(algo_delete):
-            params = {"symbol": self._ccxt_symbol(symbol)}
+            params = {"symbol": "".join(self._split_symbol(symbol)[:2])}
             if order_id is not None:
                 params["algoId"] = str(order_id)
             else:
@@ -1750,15 +1762,18 @@ class CcxtBroker(Broker):
         qty: float,
         trigger_price: float,
         client_id: str,
+        kind: ProtectionKind = ProtectionKind.STOP,
     ) -> dict:
         algo_post = getattr(self._client, "fapiPrivatePostAlgoOrder", None)
         if callable(algo_post):
             return algo_post(
                 {
-                    "symbol": self._ccxt_symbol(symbol),
+                    "symbol": "".join(self._split_symbol(symbol)[:2]),
                     "side": side.value.upper(),
                     "positionSide": "BOTH",
-                    "type": "STOP_MARKET",
+                    "type": "STOP_MARKET" if kind is ProtectionKind.STOP else "TAKE_PROFIT_MARKET",
+                    "algoType": "CONDITIONAL",
+                    "workingType": "CONTRACT_PRICE",
                     "quantity": qty,
                     "triggerPrice": trigger_price,
                     "reduceOnly": True,
@@ -1772,7 +1787,10 @@ class CcxtBroker(Broker):
             amount=qty,
             price=None,
             params={
-                "stopLossPrice": trigger_price,
+                (
+                    "stopLossPrice" if kind is ProtectionKind.STOP else "takeProfitPrice"
+                ): trigger_price,
+                "workingType": "CONTRACT_PRICE",
                 "reduceOnly": True,
                 "positionSide": "BOTH",
                 "newClientOrderId": client_id,
@@ -1887,7 +1905,21 @@ class CcxtBroker(Broker):
             average_price=average_price,
             fee=fee,
             child_order_id=self._protective_child_id(payload, info),
+            kind=self._protective_kind(payload, info),
+            working_type=str(self._payload_value(payload, info, "workingType") or ""),
         )
+
+    def _protective_kind(self, payload: dict, info: dict) -> ProtectionKind:
+        raw = self._payload_value({}, info, "orderType", "type") or self._payload_value(
+            payload, {}, "orderType", "type"
+        )
+        kinds = {
+            "STOP_MARKET": ProtectionKind.STOP,
+            "TAKE_PROFIT_MARKET": ProtectionKind.TAKE_PROFIT,
+        }
+        if str(raw).upper() not in kinds:
+            raise ValueError("native protection response has no supported conditional order type")
+        return kinds[str(raw).upper()]
 
     def _protective_child_id(self, payload: dict, info: dict) -> str | None:
         value = self._payload_value(payload, info, "actualOrderId", "ai")

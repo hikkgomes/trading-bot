@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from decimal import Decimal
 
 from sqlalchemy import (
     JSON,
@@ -47,7 +48,26 @@ class UtcTimestamp(TypeDecorator[str]):
             value = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
         if value.tzinfo is None:
             value = value.replace(tzinfo=dt.UTC)
-        return value.astimezone(dt.UTC).replace(microsecond=0).isoformat()
+        return value.astimezone(dt.UTC).isoformat()
+
+
+class BookAmount(TypeDecorator[Decimal]):
+    """Native PostgreSQL decimals; lossless text in the SQLite development adapter."""
+
+    impl = Numeric()
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        return dialect.type_descriptor(Text() if dialect.name == "sqlite" else self.impl)
+
+    def process_bind_param(self, value, dialect):
+        amount = Decimal(str(value))
+        if not amount.is_finite():
+            raise ValueError("book amount must be finite")
+        return str(amount) if dialect.name == "sqlite" else amount
+
+    def process_result_value(self, value, dialect):
+        return Decimal(str(value))
 
 
 metadata = MetaData()
@@ -162,6 +182,34 @@ strategy_identity = Table(
 )
 strategy_lineage = _id_payload_table("strategy_lineage")
 generation_feedback = _id_payload_table("generation_feedback")
+research_epoch = Table(
+    "research_epoch",
+    metadata,
+    Column("id", String(80), primary_key=True),
+    Column("product_id", String(80), nullable=False, index=True),
+    Column("dataset_bundle_id", ForeignKey("dataset_bundle.id"), nullable=False, unique=True),
+    Column("state", String(40), nullable=False),
+    Column("round_cursor", Integer, nullable=False),
+    Column("budget", Integer, nullable=False),
+    Column("consumed", Integer, nullable=False),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("payload", JSON, nullable=False),
+    CheckConstraint(
+        "round_cursor >= 0 AND consumed >= 0 AND budget >= consumed",
+        name="ck_research_epoch_budget",
+    ),
+)
+research_round = Table(
+    "research_round",
+    metadata,
+    Column("id", String(80), primary_key=True),
+    Column("epoch_id", ForeignKey("research_epoch.id"), nullable=False),
+    Column("round_number", Integer, nullable=False),
+    Column("state", String(40), nullable=False),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("payload", JSON, nullable=False),
+    UniqueConstraint("epoch_id", "round_number", name="uq_research_round_cursor"),
+)
 research_thesis = Table(
     "research_thesis",
     metadata,
@@ -567,6 +615,56 @@ fill = Table(
 )
 position = _id_payload_table("position")
 position_event = _id_payload_table("position_event")
+strategy_book = Table(
+    "strategy_book",
+    metadata,
+    Column("id", String(80), primary_key=True),
+    Column("product_id", String(80), nullable=False, index=True),
+    Column("artefact_hash", ForeignKey("strategy_artefact.id"), nullable=False),
+    Column("strategy_version_id", ForeignKey("strategy_version.id"), nullable=False),
+    Column("execution_mode", String(40), nullable=False),
+    Column("sleeve_id", String(160), nullable=False),
+    Column("account_id", String(160), nullable=False, index=True),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("payload", JSON, nullable=False),
+    UniqueConstraint(
+        "artefact_hash", "execution_mode", "sleeve_id", name="uq_strategy_book_artefact_mode"
+    ),
+    CheckConstraint("execution_mode IN ('paper', 'live')", name="ck_strategy_book_mode"),
+)
+book_event = _id_payload_table("book_event")
+book_fill_allocation = Table(
+    "book_fill_allocation",
+    metadata,
+    Column("id", String(80), primary_key=True),
+    Column("fill_id", ForeignKey("fill.id"), nullable=False, index=True),
+    Column("book_id", ForeignKey("strategy_book.id"), nullable=False, index=True),
+    Column("signed_quantity", BookAmount(), nullable=False),
+    Column("fee", BookAmount(), nullable=False),
+    Column("fee_asset", String(40), nullable=False),
+    Column("created_at", UtcTimestamp(), nullable=False),
+    Column("payload", JSON, nullable=False),
+    UniqueConstraint("fill_id", "book_id", name="uq_book_fill_allocation"),
+    CheckConstraint(
+        "CAST(signed_quantity AS NUMERIC) <> 0 AND CAST(fee AS NUMERIC) >= 0",
+        name="ck_book_fill_amounts",
+    ),
+    CheckConstraint(
+        "CAST(signed_quantity AS TEXT) NOT IN ('NaN','Infinity','-Infinity') "
+        "AND CAST(fee AS TEXT) NOT IN ('NaN','Infinity','-Infinity')",
+        name="ck_book_fill_finite",
+    ),
+)
+account_portfolio_plan = Table(
+    "account_portfolio_plan",
+    metadata,
+    Column("id", String(80), primary_key=True),
+    Column("product_id", String(80), nullable=False),
+    Column("account_id", String(160), nullable=False),
+    Column("decision_at", UtcTimestamp(), nullable=False),
+    Column("payload", JSON, nullable=False),
+    UniqueConstraint("product_id", "account_id", "decision_at", name="uq_account_decision_cutoff"),
+)
 reconciliation_event = _id_payload_table("reconciliation_event")
 
 nav_snapshot = _id_payload_table("nav_snapshot")

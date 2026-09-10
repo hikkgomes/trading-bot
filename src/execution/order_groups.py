@@ -14,6 +14,7 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.engine import Engine
 
 from src.data.database import order_group as order_group_table
+from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.orders import OrderIntent
 from src.domain.portfolios import TargetPosition
@@ -130,14 +131,15 @@ class OrderGroupStore(Protocol):
 
 
 class SqlOrderGroupStore:
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: Engine, *, connection=None):
         self.engine = engine
+        self.connection = connection
 
     def append(self, group: OrderGroup) -> None:
         payload = to_primitive(group)
         event_id = canonical_hash(payload)
         created_at = str(group.metadata.get("created_at") or "1970-01-01T00:00:00+00:00")
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, self.connection, write=True) as connection:
             if connection.execute(
                 select(order_group_table.c.id).where(order_group_table.c.id == event_id)
             ).first():
@@ -164,7 +166,7 @@ class SqlOrderGroupStore:
             )
 
     def read(self) -> tuple[OrderGroup, ...]:
-        with self.engine.connect() as connection:
+        with connection_scope(self.engine, self.connection, write=False) as connection:
             payloads = connection.execute(
                 select(order_group_table.c.payload).order_by(
                     order_group_table.c.created_at,

@@ -7,6 +7,34 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from src.domain._codec import canonical_hash, timestamp
+from src.research.outcomes import OutcomeCategory
+
+
+class FundingUnavailable(ValueError):
+    outcome_category = OutcomeCategory.BLOCKED_DATA
+
+
+def merge_native_settlements(events, context):
+    """Merge each instrument's measured settlements into the economic event stream."""
+    rows = context.get("market_frame", context.get("bars"))
+    if context.get("funding_available") is not True or not isinstance(rows, list | tuple):
+        raise FundingUnavailable("panel funding coverage is unavailable")
+    if any("funding_events" not in row for row in rows):
+        raise FundingUnavailable(
+            "panel bars need native settlements or explicit empty settlement intervals"
+        )
+    required = {event["symbol"] for event in events}
+    covered = {row.get("instrument_id", row.get("symbol")) for row in rows}
+    if not required.issubset(covered):
+        raise FundingUnavailable("panel funding coverage omits an executed instrument")
+    settlements = {}
+    for row in rows:
+        for event in row_settlements(row):
+            identity = (event["symbol"], event["timestamp"])
+            previous = settlements.setdefault(identity, event)
+            if previous != event:
+                raise ValueError("conflicting panel funding settlement")
+    return [*events, *(settlements[key] for key in sorted(settlements))]
 
 
 def legacy_settlement_id(payload: Mapping[str, Any]) -> str:
@@ -46,16 +74,23 @@ def settlement_index(
 ) -> dict[str, dict[str, dict[str, Any]]]:
     result: dict[str, dict[str, dict[str, Any]]] = {}
     created = timestamp(created, field="funding as-of time", preserve_subseconds=True)
-    available_rows = tuple(_available_rows(rows, product_id, created))
+    native_rows = tuple(
+        row
+        for row in rows
+        if row["payload"].get("kind") == "historical_funding"
+        and row["payload"].get("product_id") == product_id
+    )
     superseded = set()
-    for row in available_rows:
+    # Known corrupt timestamps stay quarantined even for an earlier as-of query.
+    # The replacement's own availability still controls when it may be consumed.
+    for row in native_rows:
         payload = row["payload"]
         previous_id = payload.get("supersedes_record_id")
         if previous_id is not None:
             if previous_id != legacy_settlement_id(payload):
                 raise ValueError("funding precision correction does not match its legacy record")
             superseded.add(previous_id)
-    for row in available_rows:
+    for row in _available_rows(native_rows, product_id, created):
         if row.get("id") in superseded:
             continue
         payload = row["payload"]

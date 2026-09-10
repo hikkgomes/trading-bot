@@ -213,16 +213,12 @@ class DatabaseStrategyEvaluator:
         artefact = self._load_artefact(artefact_hash)
         evaluation_features = dict(features)
         definition = artefact.get("definition")
-        if isinstance(definition, Mapping) and definition.get("signal_model", {}).get(
-            "registered_strategy"
+        if isinstance(definition, Mapping) and (
+            definition.get("signal_model", {}).get("registered_strategy")
+            or definition.get("position_model", {}).get("execution_policy")
         ):
-            evaluation_features["prior_strategy_state"] = self.portfolio.prior_strategy_state(
-                assignment_id=str(assignment["id"]),
-                version_id=str(assignment["strategy_version_id"]),
-                portfolio_id=str(assignment["portfolio_id"]),
-                instrument_id=str(payload["instrument_id"]),
-                before=str(features.get("information_time", at)),
-                interval_seconds=payload.get("observation_interval_seconds"),
+            evaluation_features["prior_strategy_state"] = self._prior_state(
+                assignment, payload, features, at
             )
         source_type = definition.get("source_type") if isinstance(definition, Mapping) else None
         if str(source_type) == "ensemble":
@@ -274,7 +270,11 @@ class DatabaseStrategyEvaluator:
                 "artefact_hash": artefact_hash,
                 "engine_version": self.engine_version,
                 "observation_interval_seconds": payload.get("observation_interval_seconds"),
+                "timeframe": definition.get("data_requirements", {}).get("bars")
+                if isinstance(definition, Mapping)
+                else None,
                 "assignment_id": assignment["id"],
+                "book_id": assignment.get("payload", {}).get("book_id"),
                 "execution_receipt": forecast_values.get("execution_receipt", {}),
                 "parity_receipt": forecast_values.get("parity_receipt"),
                 "semantic_strategy": forecast_values.get("semantic_strategy"),
@@ -291,6 +291,7 @@ class DatabaseStrategyEvaluator:
                         "btc_tactical_fraction",
                         "btc_cycle_state",
                         "position_rules",
+                        "position_actions",
                         "position_state",
                         "entry_signal",
                         "funding_rate",
@@ -311,6 +312,23 @@ class DatabaseStrategyEvaluator:
                     if key not in forecast_values and features.get(key) is not None
                 },
             },
+        )
+
+    def _prior_state(self, assignment, payload, features, at):
+        from src.portfolio.books import position_scope
+
+        arguments = {
+            "assignment_id": str(assignment["id"]),
+            "version_id": str(assignment["strategy_version_id"]),
+            "before": str(features.get("information_time", at)),
+        }
+        if ":spot:" in str(payload["instrument_id"]):
+            return self.portfolio.prior_decision_state(**arguments)
+        return self.portfolio.prior_strategy_state(
+            **arguments,
+            portfolio_id=position_scope(assignment),
+            instrument_id=str(payload["instrument_id"]),
+            interval_seconds=payload.get("observation_interval_seconds"),
         )
 
     def _load_artefact(self, artefact_hash: str) -> Mapping[str, Any]:

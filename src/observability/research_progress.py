@@ -78,6 +78,27 @@ def _attempt_outcome(row: Mapping[str, Any]) -> str:
     return "unclassified"
 
 
+def epoch_progress(epochs, rounds) -> dict[str, Any]:
+    return {
+        "research_rounds_completed": sum(row["state"] == "completed" for row in rounds),
+        "research_epochs": [
+            {
+                key: row[key]
+                for key in (
+                    "id",
+                    "product_id",
+                    "dataset_bundle_id",
+                    "state",
+                    "round_cursor",
+                    "budget",
+                    "consumed",
+                )
+            }
+            for row in epochs
+        ],
+    }
+
+
 def eligible_work(jobs: Sequence[Mapping[str, Any]], *, now: str) -> dict[str, Any]:
     pending = [row for row in jobs if row["state"] == "pending" and row["available_at"] <= now]
     oldest = min(pending, key=lambda row: row["available_at"], default=None)

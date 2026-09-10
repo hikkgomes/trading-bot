@@ -14,7 +14,6 @@ from src.config import PROJECT_ROOT
 def _execution_source_paths(root: Path) -> list[Path]:
     paths = [
         *root.joinpath("src").rglob("*.py"),
-        *root.joinpath("research_exploration").rglob("*.py"),
         root / "build_binance_indicator_dataset.py",
         root / "requirements-runtime.txt",
     ]

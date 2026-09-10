@@ -8,6 +8,78 @@ from src.research.executors import DataUnavailableError, _product_accounting
 from src.research.funding import attach_settlements, settlement_index
 
 
+@pytest.mark.parametrize("metadata", [False, True])
+def test_declared_minute_cadence_rejects_daily_rows_without_optional_metadata(metadata):
+    import datetime as dt
+
+    from src.research.dataset_service import DatasetBundleBuildError, _validate_market_bars
+
+    rows = tuple(
+        {
+            "instrument_id": "BTC",
+            "close_timestamp": (
+                dt.datetime(2026, 9, 1, tzinfo=dt.UTC) + dt.timedelta(days=i)
+            ).isoformat(),
+            "open": 100,
+            "high": 101,
+            "low": 99,
+            "close": 100,
+            "volume": 1,
+            **({"timeframe": "1m"} if metadata else {}),
+        }
+        for i in range(8)
+    )
+    with pytest.raises(DatasetBundleBuildError, match="cadence"):
+        _validate_market_bars(rows, market_type="spot", timeframe="1m")
+
+
+@pytest.mark.parametrize("timeframe,seconds", [("1m", 60), ("1d", 86400)])
+def test_declared_cadence_accepts_correct_rows_and_rejects_conflicting_metadata(timeframe, seconds):
+    import datetime as dt
+
+    from src.research.dataset_service import DatasetBundleBuildError, _validate_market_bars
+
+    start = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    rows = tuple(
+        {
+            "instrument_id": "BTC",
+            "close_timestamp": (start + dt.timedelta(seconds=seconds * i)).isoformat(),
+            "open": 100,
+            "high": 101,
+            "low": 99,
+            "close": 100,
+            "volume": 1,
+        }
+        for i in range(8)
+    )
+    _validate_market_bars(rows, market_type="spot", timeframe=timeframe)
+    with pytest.raises(DatasetBundleBuildError, match="timeframe"):
+        _validate_market_bars(
+            ({**rows[0], "timeframe": "5m"},), market_type="spot", timeframe=timeframe
+        )
+
+
+def test_configured_research_plans_fit_budget_without_changing_declared_cadence():
+    from pathlib import Path
+
+    from src.research.data_plan import ResearchDataPlan, product_data_plan
+    from src.services.config import load_split_configuration, validate_split_configuration
+
+    config = load_split_configuration(Path("config"))
+    validate_split_configuration(config)
+    active = next(p for p in config["products"]["products"] if p["product_id"] == "active_income")
+    plan = product_data_plan(active, config["research"], ["BTCUSDT", "SOLUSDT"])
+    plan.validate_capacity(active["research_max_symbols"])
+    assert plan.required_rows == 2 * (365 * 96 + 201)
+    assert ResearchDataPlan.from_payload(plan.to_payload()) == plan
+    start, end = plan.acquisition_interval("2026-09-10T00:00:00+00:00")
+    assert end - start == plan.rows_per_instrument * 900_000
+    with pytest.raises(ValueError, match="row/byte budget"):
+        product_data_plan(
+            {**active, "dataset_timeframe": "1m"}, config["research"], ["BTCUSDT", "SOLUSDT"]
+        )
+
+
 def test_missing_funding_is_unavailable_instead_of_measured_zero():
     rows = [
         {
@@ -185,6 +257,8 @@ def test_funding_precision_correction_preserves_history_without_double_charging(
         )
         == {}
     )
+    datasets = DatabaseDatasetBundleService(database.engine, tmp_path)
+    assert datasets._funding_events("active_income", "2026-09-07T00:00:00.010000+00:00") == {}
     database.dispose()
 
 
@@ -402,3 +476,196 @@ def test_native_funding_rejects_invalid_or_conflicting_events(tmp_path, second_r
             root=tmp_path,
             session=session,
         )
+
+
+@pytest.mark.parametrize("complete_coverage", [True, False])
+@pytest.mark.parametrize("fixed_scope", [True, False])
+def test_bounded_two_market_plan_publishes_complete_warmup_and_funding(
+    tmp_path, complete_coverage, fixed_scope
+):
+    import datetime as dt
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from sqlalchemy import insert, select
+
+    from src.data.database import (
+        PlatformDatabase,
+        cost_model_manifest,
+        dataset_snapshot,
+        feature_manifest,
+        funding_entry,
+        historical_bootstrap_progress,
+    )
+    from src.data.universe import InstrumentObservation, SqlUniverseStore, UniverseEligibilityPolicy
+    from src.domain._codec import canonical_hash
+    from src.domain.instruments import Instrument, MarketType
+    from src.research.data_plan import ResearchDataPlan
+    from src.research.datasets import SqlDatasetBundleRepository
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'data.sqlite3'}")
+    database.create_schema()
+    plan = ResearchDataPlan(
+        "active_income", "15m", ("BTCUSDT", "SOLUSDT"), minimum_history_days=1, warmup_bars=2
+    )
+    start = dt.datetime(2026, 9, 1, tzinfo=dt.UTC)
+    now = (start + dt.timedelta(minutes=15 * plan.rows_per_instrument)).isoformat()
+    instruments = tuple(
+        Instrument(
+            venue="binance",
+            market_type=MarketType.FUTURES,
+            base_asset=symbol[:-4],
+            quote_asset="USDT",
+            settlement_asset="USDT",
+            exchange_symbol=symbol,
+            price_precision=2,
+            quantity_precision=3,
+            minimum_quantity=0.001,
+            minimum_notional=5,
+        )
+        for symbol in plan.instrument_scope
+    )
+    universes = SqlUniverseStore(database.engine)
+    if fixed_scope:
+        universes.record_fixed_research_scope(
+            universe_id="bounded-panel",
+            product_id="active_income",
+            instruments=instruments,
+            selected_at=now,
+            specification_hash=plan.plan_id,
+        )
+        assert (
+            universes.members_at(universe_id="bounded-panel", observed_at=start.isoformat()) == ()
+        )
+    else:
+        universes.record_snapshot(
+            universe_id="bounded-panel",
+            observed_at=start.isoformat(),
+            observations=tuple(
+                InstrumentObservation(instrument, 1000, 1e9, 1000000, 1, 1e9, 0, 0.2, 1e7, 1)
+                for instrument in instruments
+            ),
+            policy=UniverseEligibilityPolicy(),
+        )
+    with database.engine.begin() as connection:
+        for table, payload in (
+            (feature_manifest, {"market_type": "futures"}),
+            (cost_model_manifest, {"product_id": "active_income"}),
+        ):
+            connection.execute(
+                insert(table).values(
+                    id=canonical_hash(payload), created_at=start.isoformat(), payload=payload
+                )
+            )
+        for instrument in instruments:
+            coverage_end = (
+                now if complete_coverage else (start + dt.timedelta(hours=12)).isoformat()
+            )
+            coverage = {
+                "product_id": plan.product_id,
+                "market": "futures",
+                "symbol": instrument.exchange_symbol,
+                "timeframe": "funding",
+                "range_start": start.isoformat(),
+                "range_end": coverage_end,
+                "next_start": coverage_end,
+                "status": "completed",
+                "updated_at": now,
+                "payload": {"gaps": [], "source": "isolated_test_fixture"},
+            }
+            connection.execute(
+                insert(historical_bootstrap_progress).values(
+                    id=canonical_hash(coverage),
+                    content_hash=canonical_hash(coverage),
+                    **coverage,
+                )
+            )
+            for hour in (0, 8, 16, 24):
+                time = (start + dt.timedelta(hours=hour)).isoformat()
+                payload = {
+                    "kind": "historical_funding",
+                    "product_id": "active_income",
+                    "instrument_id": instrument.instrument_id,
+                    "symbol": instrument.exchange_symbol,
+                    "funding_time": time,
+                    "funding_rate": 0.001,
+                    "mark_price": 100,
+                    "source": "isolated_test_fixture",
+                }
+                connection.execute(
+                    insert(funding_entry).values(
+                        id=canonical_hash(payload), created_at=now, payload=payload
+                    )
+                )
+    for instrument in instruments:
+        rows = []
+        for index in range(plan.rows_per_instrument):
+            opened = start + dt.timedelta(minutes=index * 15)
+            closed = opened + dt.timedelta(minutes=15) - dt.timedelta(milliseconds=1)
+            rows.append(
+                {
+                    "instrument_id": instrument.instrument_id,
+                    "timeframe": plan.timeframe,
+                    "open_time_ms": int(opened.timestamp() * 1000),
+                    "close_time_ms": int(closed.timestamp() * 1000),
+                    "source_availability_time": closed.isoformat(),
+                    "availability_time": now,
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.0,
+                    "volume": 10.0,
+                }
+            )
+        partition = (
+            tmp_path / "bars" / "binance" / "futures" / instrument.exchange_symbol / plan.timeframe
+        )
+        partition.mkdir(parents=True)
+        pq.write_table(pa.Table.from_pylist(rows), partition / "fixture.parquet")
+    result = DatabaseDatasetBundleService(database.engine, tmp_path).run(
+        product_id=plan.product_id,
+        universe_id="bounded-panel",
+        market_type="futures",
+        created_at=now,
+        timeframe=plan.timeframe,
+        data_plan=plan,
+    )
+    if not complete_coverage:
+        assert result.state == "waiting_for_dataset"
+        assert result.reason_code == "funding_history_coverage_incomplete"
+        with database.engine.connect() as connection:
+            assert connection.execute(select(dataset_snapshot)).first() is None
+        database.dispose()
+        return
+    assert result.state == "ready", result
+    bundle = SqlDatasetBundleRepository(database.engine).get(result.bundle_id)
+    assert bundle.data_plan_id == plan.plan_id
+    repository = SqlDatasetBundleRepository(database.engine)
+    assert repository.latest_ready(plan.product_id, at=now, data_plan_id=plan.plan_id) == bundle
+    assert (
+        repository.latest_ready(
+            plan.product_id, at=now, data_plan_id=canonical_hash("different-timeframe-or-scope")
+        )
+        is None
+    )
+    with database.engine.connect() as connection:
+        payloads = list(connection.execute(select(dataset_snapshot.c.payload)).scalars())
+    total_events = 0
+    for record in payloads:
+        payload = record["payload"]
+        assert payload["data_plan_id"] == plan.plan_id
+        assert payload["point_in_time_universe"] is (not fixed_scope)
+        assert payload["universe_selection_mode"] == (
+            "fixed_research_scope" if fixed_scope else "point_in_time"
+        )
+        assert len(payload["warmup_market_frame"]) == 4
+        assert {row["instrument_id"] for row in payload["market_frame"]} == {
+            i.instrument_id for i in instruments
+        }
+        assert all(
+            row["close_timestamp"] < record["interval"]["start"]
+            for row in payload["warmup_market_frame"]
+        )
+        total_events += sum(len(row["funding_events"]) for row in payload["market_frame"])
+    assert total_events == 6
+    database.dispose()

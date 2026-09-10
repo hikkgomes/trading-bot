@@ -4,6 +4,8 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
+from bisect import bisect_left
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
@@ -27,7 +29,12 @@ def import_study(
 ) -> dict[str, Any]:
     raw = source.read_bytes()
     payload = json.loads(raw)
-    cells = google_id_cells(json.loads(id_cells.read_text())) if id_cells else {}
+    raw_cells = id_cells.read_bytes() if id_cells else None
+    cell_payload = json.loads(raw_cells) if raw_cells else {}
+    source_workbook = payload["source_id"].removeprefix("google-sheets:")
+    if cell_payload.get("spreadsheetId", source_workbook) != source_workbook:
+        raise ValueError("native ID cells belong to another source workbook")
+    cells = google_id_cells(cell_payload)
     orders: list[HistoricalOrder] = []
     positions = None
     for sheet in payload["sheets"].values():
@@ -56,6 +63,8 @@ def import_study(
         "schema": "historical.execution_study/v1",
         "promotable": False,
         "source_sha256": hashlib.sha256(raw).hexdigest(),
+        "id_cells_sha256": hashlib.sha256(raw_cells).hexdigest() if raw_cells else None,
+        "export_schema": payload.get("schema", "historical.google_values/legacy"),
         "source_id": payload["source_id"],
         "timezone": timezone,
         "timezone_status": "confirmed" if timezone else "unconfirmed",
@@ -71,6 +80,7 @@ def import_study(
             "no_account_return_or_liquidation_cause_inferred",
         ],
         "orders": len(orders),
+        "order_records": [asdict(order) for order in orders],
         "swap_orders": sum(order.market == "swap" for order in orders),
         "spot_orders": sum(order.market == "spot" for order in orders),
         "id_status": dict(Counter(order.id_status for order in orders)),
@@ -128,6 +138,8 @@ def study_entry_structure(
     embargo: int,
     pivot_width: int = 3,
     lookback: int = 20,
+    entry_exposure_states: Mapping[int, str | None] | None = None,
+    excluded_entries: Sequence[int] = (),
 ) -> dict[str, Any]:
     instrument_id = non_empty(instrument_id, field="instrument_id")
     if direction not in {"long", "short"}:
@@ -144,6 +156,8 @@ def study_entry_structure(
         seed=seed,
         horizon=horizon,
         embargo=embargo,
+        entry_exposure_states=entry_exposure_states,
+        excluded_entries=excluded_entries,
     )
     comparisons = []
     for entry, controls in matches.items():
@@ -170,12 +184,14 @@ def study_entry_structure(
         "embargo": embargo,
         "pivot_width": pivot_width,
         "lookback": lookback,
-        "matching": "hour_trend_fixed_volatility_exposure_bins/v2",
+        "matching": "hour_trend_fixed_volatility_execution_exposure/v3",
         "bar_hash": canonical_hash(bars),
         "entry_indices": list(entry_indices),
         "instrument_id": instrument_id,
         "direction": direction,
         "exposure_state_hash": canonical_hash(exposure_states),
+        "entry_exposure_states": sorted((entry_exposure_states or {}).items()),
+        "excluded_entry_indices": sorted(set(excluded_entries)),
     }
     return {
         "specification": specification,
@@ -192,7 +208,7 @@ def study_entry_structure(
 
 
 def write_study(output: Path, result: Mapping[str, Any]) -> Path:
-    output.mkdir(parents=True, exist_ok=True)
+    output.mkdir(mode=0o700, parents=True, exist_ok=True)
     serialised = json.dumps(result, default=str, sort_keys=True, indent=2)
     identity = hashlib.sha256(serialised.encode()).hexdigest()
     destination = output / f"{identity}.json"
@@ -200,10 +216,176 @@ def write_study(output: Path, result: Mapping[str, Any]) -> Path:
         if destination.read_text() != serialised:
             raise ValueError("immutable historical study identity collision")
         return destination
-    with destination.open("x", encoding="utf-8") as handle:
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(serialised)
     destination.chmod(0o600)
     return destination
+
+
+def _native_structure_bars(history):
+    from src.data.okx_history import INTERVALS
+
+    raw = history.read_bytes()
+    native = json.loads(raw)
+    scope = native["scope"]
+    if scope["schema"] != "okx_history/v1" or scope["kind"] != "trade":
+        raise ValueError("entry studies require native OKX traded-price candles")
+    symbol = scope["instrument"].removesuffix("-USDT-SWAP")
+    if scope["instrument"] != symbol + "-USDT-SWAP":
+        raise ValueError("historical entry study instrument is not an OKX USDT swap")
+    interval = INTERVALS[scope["timeframe"]]
+    rows = native["bars"]
+    times = [int(row["source_availability_time_ms"]) for row in rows]
+    if any(second - first != interval for first, second in zip(times, times[1:], strict=False)):
+        raise ValueError("market cadence gaps cannot supply matched controls")
+    if any(
+        not row["confirmed"] or int(row["open_time_ms"]) + interval != time
+        for row, time in zip(rows, times, strict=True)
+    ):
+        raise ValueError("historical bars have invalid confirmation times")
+    bars = tuple(
+        MarketBar(
+            dt.datetime.fromtimestamp(time / 1000, dt.UTC).isoformat(),
+            float(row["high"]),
+            float(row["low"]),
+            float(row["close"]),
+        )
+        for row, time in zip(rows, times, strict=True)
+    )
+    return raw, scope, symbol, interval, times, bars
+
+
+def align_campaign_structure(study, history: Path, *, horizon: int, embargo: int):
+    """Associate each observed campaign open with strictly earlier native bars."""
+    if study.get("timezone_status") != "confirmed":
+        raise ValueError("market alignment requires confirmed execution timezone")
+    if horizon < 1 or embargo < 0:
+        raise ValueError("historical structure horizon and embargo are invalid")
+    raw, scope, symbol, interval, times, bars = _native_structure_bars(history)
+    exposures = _exposure_states(study, symbol, times)
+    selected_campaigns = sorted(
+        (row for row in study["campaigns"] if row["symbol"] == symbol),
+        key=lambda row: (_milliseconds(row["started_at"]), row["campaign_id"]),
+    )
+    entry_states = _exposure_states(
+        study, symbol, [_milliseconds(row["started_at"]) for row in selected_campaigns]
+    )
+    campaigns, excluded = defaultdict(list), []
+    all_indices = []
+    for campaign, exposure in zip(selected_campaigns, entry_states, strict=True):
+        index = bisect_left(times, _milliseconds(campaign["started_at"])) - 1
+        all_indices.append(index)
+        reason = _alignment_exclusion(campaign, index, times, interval, horizon, exposure)
+        if reason:
+            excluded.append({"campaign_id": campaign["campaign_id"], "reason": reason})
+        else:
+            campaigns[campaign["side"]].append((index, campaign["campaign_id"], exposure))
+    results = {
+        side: _aligned_exposure_groups(
+            bars, selected, exposures, all_indices, scope["instrument"], side, horizon, embargo
+        )
+        for side, selected in campaigns.items()
+    }
+    return {
+        "schema": "historical.campaign_alignment/v2",
+        "source_study_hash": canonical_hash(json.loads(json.dumps(study, default=str))),
+        "native_history_sha256": hashlib.sha256(raw).hexdigest(),
+        "native_scope": scope,
+        "results": results,
+        "excluded_campaigns": excluded,
+        "promotable": False,
+        "limitations": [
+            "hourly_or_declared_bar_resolution",
+            "coincident_entries_share_a_market_bar_cluster",
+            "observed_export_inventory_only",
+            "not_an_independent_strategy_validation",
+        ],
+    }
+
+
+def _aligned_exposure_groups(
+    bars, selected, exposures, all_indices, instrument, side, horizon, embargo
+):
+    studies, comparisons = [], []
+    for state in sorted({state for _index, _identity, state in selected}):
+        indices = sorted({index for index, _identity, exposure in selected if exposure == state})
+        measured = study_entry_structure(
+            bars,
+            indices,
+            instrument_id="okx:swap:" + instrument,
+            direction=side,
+            exposure_states=exposures,
+            entry_exposure_states=dict.fromkeys(indices, state),
+            excluded_entries=all_indices,
+            seed=0,
+            horizon=horizon,
+            embargo=embargo,
+        )
+        studies.append(measured)
+        comparisons.extend(
+            {
+                **row,
+                "exposure_before_entry": state,
+                "specification_id": measured["specification_id"],
+            }
+            for row in measured["comparisons"]
+        )
+    return {
+        "studies": studies,
+        "comparisons": comparisons,
+        "promotable": False,
+        "campaign_observations": [
+            {
+                "index": index,
+                "campaign_id": identity,
+                "available_at": bars[index].timestamp,
+                "exposure_before_entry": state,
+            }
+            for index, identity, state in selected
+        ],
+    }
+
+
+def _milliseconds(value):
+    observed = dt.datetime.fromisoformat(value)
+    if observed.utcoffset() is None:
+        raise ValueError("historical alignment timestamp requires a timezone")
+    return int(observed.timestamp() * 1000)
+
+
+def _exposure_states(study, symbol, times):
+    events = sorted(
+        (row for row in study["inventory_events"] if row["symbol"] == symbol),
+        key=lambda row: _milliseconds(row["timestamp"]),
+    )
+    states, inventory, cursor = [], {"long": Decimal(0), "short": Decimal(0)}, 0
+    for time in times:
+        while cursor < len(events) and _milliseconds(events[cursor]["timestamp"]) < time:
+            event = events[cursor]
+            inventory[event["side"]] = Decimal(str(event["quantity"]))
+            cursor += 1
+        if cursor == 0 or min(inventory.values()) < 0:
+            states.append(None)
+        else:
+            active = [side for side, quantity in inventory.items() if quantity > 0]
+            states.append("hedged" if len(active) == 2 else active[0] if active else "flat")
+    return tuple(states)
+
+
+def _alignment_exclusion(campaign, index, times, interval, horizon, exposure):
+    if Decimal(str(campaign["minimum_inventory"])) < 0:
+        return "opening_inventory_unresolved"
+    if index < 19 or index + horizon >= len(times):
+        return "market_warmup_or_outcome_missing"
+    if _milliseconds(campaign["started_at"]) - times[index] > interval:
+        return "entry_market_gap"
+    window = times[index - 19 : index + horizon + 1]
+    if any(second - first != interval for first, second in zip(window, window[1:], strict=False)):
+        return "market_cadence_gap"
+    if exposure is None:
+        return "pre_entry_exposure_unresolved"
+    return None
 
 
 def main() -> None:
@@ -212,9 +394,26 @@ def main() -> None:
     parser.add_argument("--id-cells", type=Path)
     parser.add_argument("--timezone")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--market-history", type=Path, action="append", default=[])
+    parser.add_argument("--structure-horizon-bars", type=int, default=4)
+    parser.add_argument("--structure-embargo-bars", type=int, default=4)
     args = parser.parse_args()
     result = import_study(args.source, id_cells=args.id_cells, timezone=args.timezone)
     path = write_study(args.output, result)
+    alignments = [
+        str(
+            write_study(
+                args.output,
+                align_campaign_structure(
+                    result,
+                    history,
+                    horizon=args.structure_horizon_bars,
+                    embargo=args.structure_embargo_bars,
+                ),
+            )
+        )
+        for history in args.market_history
+    ]
     print(
         json.dumps(
             {
@@ -222,6 +421,7 @@ def main() -> None:
                 "promotable": False,
                 "swap_orders": result["swap_orders"],
                 "balanced_campaigns": result["balanced_campaigns"],
+                "structure_studies": alignments,
             }
         )
     )

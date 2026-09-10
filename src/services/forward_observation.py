@@ -150,7 +150,10 @@ class DatabaseForwardObservationWorker:
                 self.engine, str(payload["assignment_id"]), at=evaluation_time
             )
             current_position = self._latest_position(
-                portfolio_id=str(assignment["portfolio_id"]),
+                portfolio_id=str(
+                    assignment.get("payload", {}).get("position_portfolio_id")
+                    or assignment["portfolio_id"]
+                ),
                 instrument_id=str(payload["instrument_id"]),
                 at=evaluation_time,
                 assignment_id=ownership_ids,

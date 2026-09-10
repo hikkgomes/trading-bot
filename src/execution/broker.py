@@ -19,6 +19,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 
+from src.domain.orders import ProtectionKind
+
 
 class OrderSide(str, Enum):
     BUY = "buy"
@@ -128,6 +130,8 @@ class ProtectiveOrder:
     average_price: float | None = None
     fee: float = 0.0
     child_order_id: str | None = None
+    kind: ProtectionKind = ProtectionKind.STOP
+    working_type: str = "CONTRACT_PRICE"
 
 
 @dataclass(frozen=True)
@@ -331,6 +335,7 @@ class Broker(ABC):
         qty: float,
         trigger_price: float,
         client_id: str,
+        kind: ProtectionKind = ProtectionKind.STOP,
     ) -> ProtectiveOrder:
         raise NotImplementedError(f"{self.name} does not support native protective stops.")
 

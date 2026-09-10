@@ -342,6 +342,7 @@ def _target_metadata(
         "net_expected_return": net_expected_return,
         "confidence": forecast.confidence,
         "position_rules": forecast.metadata.get("position_rules"),
+        "timeframe": forecast.metadata.get("timeframe"),
         "score": forecast.score,
         "observed_volatility": observed_volatility.get(forecast.instrument_id),
         "funding_rate": funding_rate,

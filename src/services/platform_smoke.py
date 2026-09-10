@@ -166,6 +166,7 @@ def _product_fixture(
         "risk_policy_id": _install_risk_policy(
             database, f"platform-smoke:{product_id}:risk-v2", str(product["account_id"])
         ),
+        "dataset_timeframe": "1m",
     }
     observed = observed or dt.datetime(2026, 8, 23, tzinfo=dt.UTC)
     now = observed.isoformat()
@@ -240,7 +241,10 @@ def _product_fixture(
         strategy_name="condition_grid",
     )
     assignments = SqlActiveStrategyAssignmentRepository(database.engine)
-    snapshots = SqlRiskSnapshotStore(database.engine)
+    product, accounts = _smoke_book_context(
+        database, assignments.by_id(assignment_id), product, accounts
+    )
+    snapshots = SqlRiskSnapshotStore(database.engine, book_id=product["book_id"])
     health_node_id = f"platform-smoke:{run_id}"
 
     close_ms = int(observed.timestamp() * 1_000) - 1
@@ -522,6 +526,7 @@ def _product_fixture(
         "partial": paper_worker.run_once(now=now),
         "complete": paper_worker.run_once(now=now),
     }
+    _complete_smoke_paper(results, queue, data_worker, paper_worker, market, prefix, observed)
     fills = tuple(
         fill
         for fill in order_manager.all_fills()
@@ -605,6 +610,34 @@ def _product_fixture(
     }
 
 
+def _smoke_book_context(database, assignment, product, accounts):
+    from src.portfolio.books import (
+        initialise_paper_book,
+        load_book,
+        paper_book_view,
+        seed_paper_book,
+    )
+
+    book = load_book(database.engine, assignment["payload"]["book_id"])
+    template = accounts[book["execution_account_id"]]
+    with database.engine.begin() as connection:
+        seed_paper_book(
+            connection,
+            book,
+            balances=template["paper_starting_balances"],
+            positions=template.get("paper_starting_positions", {}),
+            accounting_asset=product["base_accounting_asset"],
+        )
+        initialise_paper_book(database.engine, connection, book, assignment["id"])
+    _, scoped_product, scoped_account = paper_book_view(
+        database.engine, assignment, product, accounts
+    )
+    scoped_product["risk_policy_id"] = _install_risk_policy(
+        database, f"platform-smoke:{product['product_id']}:book-risk-v2", book["account_id"]
+    )
+    return scoped_product, {**accounts, book["account_id"]: scoped_account}
+
+
 def _seed_strategy(
     database: PlatformDatabase,
     product: dict[str, Any],
@@ -615,6 +648,7 @@ def _seed_strategy(
     strategy_name: str = "momentum_roc",
     execution_mode: str = "paper",
     sleeve_id: str = "default",
+    capital_limit: float = 0.1,
 ) -> str:
     product_id = str(product["product_id"])
     feature_nodes, _ = registered_feature_contract(strategy_name)
@@ -719,7 +753,7 @@ def _seed_strategy(
                 "artefact_hash": artefact.artefact_hash,
                 "source_commit_hash": source_commit_hash,
                 "engine_version": "strategy-evaluator/v1",
-                "capital_cap": 0.1,
+                "capital_cap": capital_limit,
                 "checked_at": now,
                 "accepted": True,
                 "environment": "testnet",
@@ -737,7 +771,7 @@ def _seed_strategy(
             artefact_hash=artefact.artefact_hash,
             source_commit_hash=source_commit_hash,
             engine_version="strategy-evaluator/v1",
-            capital_cap=0.1,
+            capital_cap=capital_limit,
             actor="platform-testnet-operator",
             approved_at=now,
             payload={
@@ -759,8 +793,8 @@ def _seed_strategy(
         artefact_hash=artefact.artefact_hash,
         lifecycle_state="live_canary" if execution_mode == "live" else "forward_paper",
         execution_mode=execution_mode,
-        capital_limit=0.1,
-        risk_budget=0.1,
+        capital_limit=capital_limit,
+        risk_budget=capital_limit,
         assigned_at=now,
         assigned_by="platform-smoke",
         assignment_reason="real service-chain smoke",
@@ -873,6 +907,52 @@ def main(argv: list[str] | None = None) -> None:
     report = run_smoke(args.database_url, config_path=args.config)
     print(json.dumps(report, indent=2, sort_keys=True))
     raise SystemExit(0 if report["ok"] else 1)
+
+
+def _complete_smoke_paper(results, queue, data_worker, paper_worker, market, prefix, observed):
+    if results["partial"]["reason_code"] != "paper_next_execution_bar_pending":
+        return
+    next_at = (observed + dt.timedelta(minutes=1)).isoformat()
+    opened = int(observed.timestamp() * 1000)
+    event = normalise_public_event(
+        market=market,
+        stream="btcusdt@kline_1m",
+        receive_timestamp=next_at,
+        payload={
+            "e": "kline",
+            "E": opened + 60000,
+            "s": "BTCUSDT",
+            "k": {
+                "t": opened,
+                "T": opened + 59999,
+                "i": "1m",
+                "o": "102000",
+                "h": "102001",
+                "l": "101999",
+                "c": "102000",
+                "v": "25",
+                "x": True,
+            },
+        },
+    )
+    queue.enqueue(
+        job_id=prefix + ":execution-bar",
+        name="market_event_write",
+        payload={
+            "venue": "binance",
+            "market": market,
+            "symbol": "BTCUSDT",
+            "event": to_primitive(event),
+        },
+        available_at=next_at,
+    )
+    data_worker.run_once(now=next_at)
+    for _ in range(5):
+        result = paper_worker.run_once(now=next_at)
+        if result["reason_code"] == "paper_order_partially_filled":
+            results["partial"] = result
+        if result["reason_code"] == "paper_order_filled":
+            results["complete"] = result
 
 
 if __name__ == "__main__":

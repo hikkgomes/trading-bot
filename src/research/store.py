@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import column, insert, select, table, update
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from src.data.database import (
     experiment,
@@ -19,11 +19,13 @@ from src.data.database import (
     validation_result,
     validation_stage,
 )
+from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, json_value, timestamp, to_primitive
 from src.domain.strategies import StrategyDefinition, StrategySourceType
 from src.research.coordinator import Candidate, CandidateState, ResearchResult
 from src.research.datasets import CandidateDatasetPlan
 from src.research.economic_series import ECONOMIC_ENGINE_VERSION
+from src.research.rounds import assert_epoch_open, lock_epoch
 from src.strategies.behaviour import behaviour_hash_for_definition
 
 _ADAPTIVE_CANDIDATE = table(
@@ -60,8 +62,9 @@ def _definition_from_dict(payload: dict[str, object]) -> StrategyDefinition:
 
 
 class SqlResearchStore:
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: Engine, *, connection: Connection | None = None):
         self.engine = engine
+        self.connection = connection
         self.candidates = _ADAPTIVE_CANDIDATE if engine.dialect.name == "postgresql" else experiment
 
     def save_candidate(self, candidate: Candidate) -> None:
@@ -69,10 +72,12 @@ class SqlResearchStore:
         version_id = candidate.definition.strategy_version_id
         definition_payload = to_primitive(candidate.definition)
         metadata_payload = self._candidate_metadata(candidate)
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, self.connection, write=True) as connection:
+            lock_epoch(connection, candidate.definition.product)
             self._assert_claimed_trial(connection, candidate)
             if self._existing_candidate_matches(connection, candidate):
                 return
+            assert_epoch_open(connection, candidate.dataset_bundle_id)
             self._ensure_strategy_version(
                 connection,
                 candidate,
@@ -261,7 +266,9 @@ class SqlResearchStore:
             "metadata": metadata_payload,
         }
 
-    def development_parents(self, *, limit: int = 20) -> tuple[Candidate, ...]:
+    def development_parents(
+        self, *, limit: int = 20, as_of: str | None = None, stage_ids: list[str] | None = None
+    ) -> tuple[Candidate, ...]:
         if limit < 1:
             raise ValueError("parent selection limit must be positive")
         net_return = validation_stage.c.payload["evidence"]["cost_adjusted_return"].as_float()
@@ -275,12 +282,16 @@ class SqlResearchStore:
             .order_by(net_return.desc().nulls_last(), validation_stage.c.experiment_id)
             .limit(limit)
         )
-        with self.engine.connect() as connection:
+        if as_of is not None:
+            statement = statement.where(validation_stage.c.evaluated_at <= as_of)
+        if stage_ids is not None:
+            statement = statement.where(validation_stage.c.id.in_(stage_ids))
+        with connection_scope(self.engine, self.connection, write=False) as connection:
             ids = tuple(connection.execute(statement).scalars())
         return tuple(self.get_candidate(candidate_id) for candidate_id in dict.fromkeys(ids))
 
     def load_candidates(self) -> tuple[Candidate, ...]:
-        with self.engine.connect() as connection:
+        with connection_scope(self.engine, self.connection, write=False) as connection:
             rows = connection.execute(
                 select(self.candidates)
                 .where(self.candidates.c.state != "legacy_import")
@@ -289,7 +300,7 @@ class SqlResearchStore:
             return tuple(self._candidate_from_row(connection, row) for row in rows)
 
     def get_candidate(self, candidate_id: str) -> Candidate:
-        with self.engine.connect() as connection:
+        with connection_scope(self.engine, self.connection, write=False) as connection:
             row = (
                 connection.execute(
                     select(self.candidates).where(self.candidates.c.id == candidate_id)
@@ -341,7 +352,7 @@ class SqlResearchStore:
     def claim_trial(self, candidate: Candidate) -> None:
         from src.research.theses import SqlThesisRegistry
 
-        SqlThesisRegistry(self.engine).claim_trial(
+        SqlThesisRegistry(self.engine, connection=self.connection).claim_trial(
             thesis_id=candidate.thesis_id,
             candidate_id=candidate.candidate_id,
             lineage_id=candidate.lineage_id,
@@ -350,7 +361,7 @@ class SqlResearchStore:
 
     def save_result(self, result: ResearchResult) -> None:
         result_id = f"{result.candidate_id}:{result.state.value}"
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, self.connection, write=True) as connection:
             existing = (
                 connection.execute(
                     select(validation_result).where(validation_result.c.id == result_id)
@@ -380,14 +391,14 @@ class SqlResearchStore:
             )
 
     def load_results(self) -> tuple[ResearchResult, ...]:
-        with self.engine.connect() as connection:
+        with connection_scope(self.engine, self.connection, write=False) as connection:
             rows = connection.execute(
                 select(validation_result).order_by(validation_result.c.id)
             ).mappings()
             return tuple(self._result_from_row(row) for row in rows)
 
     def runs(self, candidate_id: str) -> tuple[dict[str, object], ...]:
-        with self.engine.connect() as connection:
+        with connection_scope(self.engine, self.connection, write=False) as connection:
             rows = connection.execute(
                 select(experiment_run).order_by(experiment_run.c.created_at, experiment_run.c.id)
             ).mappings()
@@ -441,7 +452,7 @@ class SqlResearchStore:
             "metrics": clean_metrics,
             "receipt": clean_receipt,
         }
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, self.connection, write=True) as connection:
             if (
                 connection.execute(
                     select(experiment.c.id).where(experiment.c.id == candidate_id)

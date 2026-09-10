@@ -43,6 +43,8 @@ from src.data.database import (
     promotion_event,
     protective_stop,
     reconciliation_event,
+    research_epoch,
+    research_round,
     research_thesis,
     risk_snapshot,
     strategy_approval,
@@ -60,7 +62,12 @@ from src.data.database import (
 )
 from src.domain._codec import timestamp, to_primitive
 from src.observability.decision_trace import SqlDecisionTraceStore
-from src.observability.research_progress import current_stages, eligible_work, measured_progress
+from src.observability.research_progress import (
+    current_stages,
+    eligible_work,
+    epoch_progress,
+    measured_progress,
+)
 from src.services.health import DatabaseHeartbeatStore
 
 
@@ -262,6 +269,7 @@ class DatabasePlatformReport:
         return {
             **measured_progress(self._rows(experiment_run), attempts),
             **eligible_work(jobs, now=now),
+            **epoch_progress(self._rows(research_epoch), self._rows(research_round)),
             "theses_generated": self._count(research_thesis),
             "candidates_generated": len(experiments),
             "candidates_compiled": sum(

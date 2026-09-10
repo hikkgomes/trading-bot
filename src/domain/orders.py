@@ -21,6 +21,11 @@ class OrderType(StrEnum):
     LIMIT = "limit"
 
 
+class ProtectionKind(StrEnum):
+    STOP = "stop"
+    TAKE_PROFIT = "take_profit"
+
+
 class OrderStatus(StrEnum):
     CREATED = "created"
     VALIDATED = "validated"
@@ -186,7 +191,11 @@ class Fill:
                 raise ValueError(f"{attribute} must be positive")
             object.__setattr__(self, attribute, value)
         object.__setattr__(self, "fee", finite(self.fee, field="fee", minimum=0.0))
-        object.__setattr__(self, "occurred_at", timestamp(self.occurred_at, field="occurred_at"))
+        object.__setattr__(
+            self,
+            "occurred_at",
+            timestamp(self.occurred_at, field="occurred_at", preserve_subseconds=True),
+        )
         if self.fee_asset is not None:
             object.__setattr__(
                 self, "fee_asset", non_empty(self.fee_asset, field="fee_asset").upper()

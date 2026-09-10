@@ -281,7 +281,7 @@ def test_dead_lettered_stage_is_durably_blocked_from_recurring_resubmission(tmp_
                 experiment.c.id == hypothesis.candidate.candidate_id
             )
         ).one()
-    assert state == "blocked_dead_letter:development"
+    assert state == "infrastructure_exhausted"
     assert metadata["blocked_reason"]["reason_code"] == "evaluation_job_dead_letter"
 
 
@@ -1571,9 +1571,9 @@ def test_dataset_bundle_supports_explicit_pending_lifecycle_and_verifies_stages(
     database.create_schema()
     identity = "sha256:" + "a" * 64
     builder = CanonicalResearchDatasetBuilder(database.engine)
-    bundle = builder.build(
-        "active_income",
-        intervals={
+    request = {
+        "product_id": "active_income",
+        "intervals": {
             "screening": {
                 "start": "2026-08-29T00:00:00+00:00",
                 "end": "2026-08-29T06:00:00+00:00",
@@ -1583,20 +1583,35 @@ def test_dataset_bundle_supports_explicit_pending_lifecycle_and_verifies_stages(
                 "end": "2026-08-29T12:00:00+00:00",
             },
         },
-        payload_by_role={"screening": {"rows": 1}, "development": {"rows": 2}},
-        universe_snapshot_id=identity,
-        feature_manifest_id=identity,
-        cost_model_id=identity,
-        parameter_set_id=identity,
-        instrument_scope=("BTCUSDT",),
-        availability_timestamp=NOW,
-        created_at=NOW,
-        lifecycle_state=DatasetLifecycleState.DATA_PENDING,
-    )
+        "payload_by_role": {"screening": {"rows": 1}, "development": {"rows": 2}},
+        "universe_snapshot_id": identity,
+        "feature_manifest_id": identity,
+        "cost_model_id": identity,
+        "parameter_set_id": identity,
+        "instrument_scope": ("BTCUSDT",),
+        "availability_timestamp": NOW,
+        "created_at": NOW,
+        "lifecycle_state": DatasetLifecycleState.DATA_PENDING,
+    }
+    bundle = builder.build(**request)
 
     assert bundle.lifecycle_state is DatasetLifecycleState.DATA_PENDING
     assert set(bundle.stage_snapshot_ids) == {"screening", "development"}
     assert SqlDatasetBundleRepository(database.engine).get(bundle.bundle_id) == bundle
+    later = "2026-09-08T00:00:00+00:00"
+    assert (
+        builder.build(**{**request, "created_at": later, "availability_timestamp": later}) == bundle
+    )
+    changed = builder.build(
+        **{
+            **request,
+            "created_at": later,
+            "availability_timestamp": later,
+            "payload_by_role": {"screening": {"rows": 1}, "development": {"rows": 3}},
+        }
+    )
+    assert changed.bundle_id != bundle.bundle_id
+    assert changed.stage_snapshot_ids["development"] != bundle.stage_snapshot_ids["development"]
 
 
 def test_ready_dataset_bundle_rejects_overlapping_intervals(tmp_path) -> None:
@@ -1812,16 +1827,16 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
         arguments = {
             "universe_id": universe_id,
             "product_id": "btc_accumulation",
-            "instrument": instrument,
+            "instruments": (instrument,),
             "selected_at": NOW,
             "specification_hash": canonical_hash({"product": "btc_accumulation", "scope": "BTC"}),
         }
         with pytest.raises(ValueError, match="dynamic universes"):
-            store.record_btc_research_scope(**arguments)
+            store.record_fixed_research_scope(**arguments)
         universe_id = "explicit-btc-research"
         arguments["universe_id"] = universe_id
-        snapshot_id = store.record_btc_research_scope(**arguments)
-        assert store.record_btc_research_scope(**arguments) == snapshot_id
+        snapshot_id = store.record_fixed_research_scope(**arguments)
+        assert store.record_fixed_research_scope(**arguments) == snapshot_id
     cost_id = canonical_hash({"schema": "platform.cost_model/v1", "product_id": "btc_accumulation"})
     with database.engine.begin() as connection:
         connection.execute(
@@ -1839,7 +1854,7 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
             )
         )
     root = tmp_path / "data"
-    partition = root / "bars" / "binance" / "spot" / "BTCUSDT" / "1m" / "date=2026-08-20"
+    partition = root / "bars" / "binance" / "spot" / "BTCUSDT" / "1d" / "date=2026-08-20"
     partition.mkdir(parents=True)
     timestamps = [
         int(dt.datetime(2026, 8, 20 + index, tzinfo=dt.UTC).timestamp() * 1_000)
@@ -1866,7 +1881,7 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
         partition / "bars.parquet",
     )
 
-    result = DatabaseDatasetBundleService(database.engine, root).run(
+    result = DatabaseDatasetBundleService(database.engine, root, timeframe="1d").run(
         product_id="btc_accumulation",
         universe_id=universe_id,
         market_type="spot",
@@ -1887,7 +1902,7 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
     assert snapshot_payload["payload"]["market_frame"]
     assert snapshot_payload["payload"]["point_in_time_universe"] is not fixed_scope
 
-    forward = DatabaseDatasetBundleService(database.engine, root).run_forward(
+    forward = DatabaseDatasetBundleService(database.engine, root, timeframe="1d").run_forward(
         product_id="btc_accumulation",
         universe_id=universe_id,
         market_type="spot",
@@ -1900,7 +1915,9 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
     forward_bundle = SqlDatasetBundleRepository(database.engine).get(str(forward.bundle_id))
     assert set(forward_bundle.stage_snapshot_ids) == {"forward_observation"}
 
-    pending = DatabaseDatasetBundleService(database.engine, root, minimum_history_days=365).run(
+    pending = DatabaseDatasetBundleService(
+        database.engine, root, minimum_history_days=365, timeframe="1d"
+    ).run(
         product_id="btc_accumulation",
         universe_id=universe_id,
         market_type="spot",
@@ -1919,7 +1936,7 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
             "dataset_bundle_id": None,
             "universe_id": universe_id,
             "market_type": "spot",
-            "dataset_timeframe": "1m",
+            "dataset_timeframe": "1d",
             "available_at": NOW,
             "catalogue_submitted_at": NOW,
         },
@@ -1929,7 +1946,7 @@ def test_dataset_service_builds_a_real_bundle_from_point_in_time_bars(
     )
     catalogue = DatabaseResearchJobHandlers(
         SqlResearchStore(database.engine),
-        dataset_bundle_service=DatabaseDatasetBundleService(database.engine, root),
+        dataset_bundle_service=DatabaseDatasetBundleService(database.engine, root, timeframe="1d"),
     ).register_strategy_catalogue(
         claimed,
         lambda: claimed,
@@ -2018,7 +2035,7 @@ def test_dataset_service_keeps_delisted_symbols_in_their_historical_roles(tmp_pa
     }
     for item, prices in rows_by_instrument.items():
         symbol = "BTCUSDT" if item == btc.instrument_id else "ETHUSDT"
-        partition = root / "bars" / "binance" / "spot" / symbol / "1m" / "history"
+        partition = root / "bars" / "binance" / "spot" / symbol / "1d" / "history"
         partition.mkdir(parents=True)
         times = [
             int(dt.datetime(2026, 8, 1 + index, tzinfo=dt.UTC).timestamp() * 1_000)
@@ -2040,7 +2057,7 @@ def test_dataset_service_keeps_delisted_symbols_in_their_historical_roles(tmp_pa
             partition / "bars.parquet",
         )
 
-    result = DatabaseDatasetBundleService(database.engine, root).run(
+    result = DatabaseDatasetBundleService(database.engine, root, timeframe="1d").run(
         product_id="active_income",
         universe_id=universe_id,
         market_type="spot",

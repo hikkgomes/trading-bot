@@ -33,27 +33,7 @@ def record_execution_costs(
         raise ValueError(str(exc)) from exc
     allocations = _strategy_allocations(order.strategy_contributions)
     multi_attribution = len(allocations) > 1
-    fill_sign = 1.0 if fill.side.value == "buy" else -1.0
-    opposing = previous_position.quantity != 0 and (previous_position.quantity > 0) != (
-        fill_sign > 0
-    )
-    if opposing:
-        closing_quantity = min(abs(previous_position.quantity), fill.quantity)
-        direction = Decimal("1") if previous_position.quantity > 0 else Decimal("-1")
-        reference_price = fill.price
-        reference_entry_price = previous_position.average_entry_price
-        quote_pnl = (
-            (Decimal(str(reference_price)) - Decimal(str(reference_entry_price)))
-            * Decimal(str(closing_quantity))
-            * direction
-        )
-        realised_pnl = (
-            quote_pnl / Decimal(str(fill.price)) if ledger.accounting_asset == "BTC" else quote_pnl
-        )
-    else:
-        realised_pnl = Decimal("0")
-    if ledger.accounting_asset == "BTC" and ":spot:" in order.instrument_id:
-        realised_pnl = Decimal("0")
+    realised_pnl = realised_fill_pnl(previous_position, fill, ledger.accounting_asset)
     for strategy, fraction in allocations:
         suffix = (
             ""
@@ -70,6 +50,8 @@ def record_execution_costs(
             "strategy_contribution_fraction": fraction,
             "sleeve": target_metadata.get("sleeve") or "unassigned",
             "assignment_id": target_metadata.get("assignment_id"),
+            "account_id": fill.metadata.get("account_id"),
+            "book_id": target_metadata.get("book_id"),
             **fee_conversion.to_payload(),
         }
         fee_amount = (
@@ -109,6 +91,31 @@ def record_execution_costs(
                 occurred_at=fill.occurred_at,
                 attribution=attribution,
             )
+
+
+def realised_fill_pnl(previous_position: Position, fill: Fill, accounting_asset: str) -> Decimal:
+    fill_sign = 1.0 if fill.side.value == "buy" else -1.0
+    opposing = previous_position.quantity != 0 and (previous_position.quantity > 0) != (
+        fill_sign > 0
+    )
+    if opposing:
+        closing_quantity = min(abs(previous_position.quantity), fill.quantity)
+        direction = Decimal("1") if previous_position.quantity > 0 else Decimal("-1")
+        reference_price = fill.price
+        reference_entry_price = previous_position.average_entry_price
+        quote_pnl = (
+            (Decimal(str(reference_price)) - Decimal(str(reference_entry_price)))
+            * Decimal(str(closing_quantity))
+            * direction
+        )
+        realised_pnl = (
+            quote_pnl / Decimal(str(fill.price)) if accounting_asset == "BTC" else quote_pnl
+        )
+    else:
+        realised_pnl = Decimal("0")
+    if accounting_asset == "BTC" and ":spot:" in fill.instrument_id:
+        realised_pnl = Decimal("0")
+    return realised_pnl
 
 
 def _strategy_allocations(contributions) -> tuple[tuple[str, float], ...]:

@@ -52,7 +52,11 @@ class Position:
             PositionStatus.FLAT_CONFIRMED,
         }:
             raise ValueError("non-zero positions cannot be flat")
-        object.__setattr__(self, "updated_at", timestamp(self.updated_at, field="updated_at"))
+        object.__setattr__(
+            self,
+            "updated_at",
+            timestamp(self.updated_at, field="updated_at", preserve_subseconds=True),
+        )
         if not isinstance(self.strategy_contributions, Mapping):
             raise ValueError("strategy_contributions must be an object")
         object.__setattr__(

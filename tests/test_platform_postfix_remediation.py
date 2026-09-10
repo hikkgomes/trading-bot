@@ -78,6 +78,7 @@ class _Response:
 
 class _HistorySession:
     def __init__(self, *, start_ms: int, interval_ms: int) -> None:
+        self.requests = []
         self.klines = [
             [
                 start_ms + index * interval_ms,
@@ -110,6 +111,7 @@ class _HistorySession:
         ]
 
     def get(self, url: str, *, params=None, timeout: float):
+        self.requests.append((url, dict(params or {})))
         if "exchangeInfo" in url:
             return _Response({"symbols": [{"symbol": "BTCUSDT", "status": "TRADING"}]})
         if "fundingRate" in url:
@@ -303,6 +305,35 @@ def test_history_bootstrap_resumes_and_records_native_funding(tmp_path: Path) ->
         with database.engine.connect() as connection:
             payloads = connection.execute(select(funding_entry.c.payload)).scalars().all()
         assert {float(payload["funding_rate"]) for payload in payloads} == {-0.001, 0.002}
+        next_bar = list(session.klines[-1])
+        next_bar[0] += interval_ms
+        next_bar[6] += interval_ms
+        session.klines.append(next_bar)
+        session.requests.clear()
+        refreshed = service.bootstrap(
+            product_id="active_income",
+            market="futures",
+            symbol="BTCUSDT",
+            timeframe="1m",
+            range_start_ms=start_ms + interval_ms,
+            range_end_ms=start_ms + 5 * interval_ms,
+        )
+        assert refreshed.completed and refreshed.resumed and refreshed.rows == 1
+        assert session.requests[0][1]["startTime"] == start_ms + 4 * interval_ms
+        session.funding.append({**session.funding[-1], "fundingTime": start_ms + 16 * 3_600_000})
+        session.requests.clear()
+        refreshed_funding = service.bootstrap_funding(
+            product_id="active_income",
+            symbol="BTCUSDT",
+            range_start_ms=start_ms + 1,
+            range_end_ms=start_ms + 16 * 3_600_000 + 1,
+        )
+        assert (
+            refreshed_funding.completed
+            and refreshed_funding.resumed
+            and refreshed_funding.rows == 1
+        )
+        assert session.requests[0][1]["startTime"] == funding_end
     finally:
         database.dispose()
 
@@ -576,14 +607,17 @@ def test_forward_policy_is_selected_by_exact_product_and_family() -> None:
     assert selected.maximum_drawdown == base.maximum_drawdown
 
 
-def test_paper_account_state_survives_reinstantiation_and_reconciliation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("fee_asset", ["USDT", "BNB"])
+def test_paper_account_state_survives_reinstantiation_and_reconciliation(
+    tmp_path: Path, fee_asset
+) -> None:
     database = _database(tmp_path)
     account = PaperAccountLedger(
         engine=database.engine,
         account_id="paper-futures",
         product_id="active_income",
         accounting_asset="USDT",
-        starting_balances={"USDT": 1_000.0},
+        starting_balances={"USDT": 1_000.0, "BNB": 1.0},
     )
     order = OrderIntent(
         order_id="paper-order",
@@ -604,7 +638,7 @@ def test_paper_account_state_survives_reinstantiation_and_reconciliation(tmp_pat
         price=100.0,
         fee=0.1,
         occurred_at=NOW,
-        fee_asset="USDT",
+        fee_asset=fee_asset,
         metadata={"slippage_cost": 0.2},
     )
     previous = Position(
@@ -629,10 +663,13 @@ def test_paper_account_state_survives_reinstantiation_and_reconciliation(tmp_pat
         account_id="paper-futures",
         product_id="active_income",
         accounting_asset="USDT",
-        starting_balances={"USDT": 1_000.0},
+        starting_balances={"USDT": 1_000.0, "BNB": 1.0},
     )
     assert restarted.state() is not None
-    assert restarted.state().balances["USDT"] == pytest.approx(999.9)
+    assert restarted.state().balances["USDT"] == pytest.approx(
+        999.9 if fee_asset == "USDT" else 1000
+    )
+    assert restarted.state().balances["BNB"] == pytest.approx(0.9 if fee_asset == "BNB" else 1)
     assert restarted.state().positions[order.instrument_id] == pytest.approx(0.1)
     database.dispose()
 

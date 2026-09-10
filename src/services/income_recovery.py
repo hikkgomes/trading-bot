@@ -5,11 +5,11 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
-from src.accounting.ledger import Ledger
+from src.accounting.ledger import Ledger, SqlLedgerStore
 from src.data.database import financial_application
 from src.domain._codec import canonical_hash, to_primitive
 from src.execution.broker import BrokerIncome
-from src.services.financial_application import FinancialScope
+from src.services.financial_application import FinancialApplication, FinancialScope
 
 
 def income_window(
@@ -52,6 +52,19 @@ def checkpoint_income(ledger: Ledger, scope: FinancialScope, through: float, at:
 
 
 def reconcile_income(engine, ledger: Ledger, scope: FinancialScope, income: BrokerIncome) -> bool:
+    with engine.begin() as connection:
+        FinancialApplication(engine, scope)._lock(connection)
+        bound = Ledger(
+            product_id=scope.product_id,
+            accounting_asset=scope.accounting_asset,
+            store=SqlLedgerStore(engine, product_id=scope.product_id, connection=connection),
+        )
+        applied = _reconcile_income(engine, bound, scope, income, connection)
+    ledger.reload()
+    return applied
+
+
+def _reconcile_income(engine, ledger, scope, income, connection):
     source = to_primitive(income)
     identity = canonical_hash(
         {
@@ -88,6 +101,9 @@ def reconcile_income(engine, ledger: Ledger, scope: FinancialScope, income: Brok
             occurred_at=at,
             attribution=metadata,
         )
+        from src.accounting.book_allocations import record_book_funding
+
+        record_book_funding(connection, scope, income, identity, at)
     else:
         fill_id = _match_fill(engine, ledger, scope, income)
         ledger.append(

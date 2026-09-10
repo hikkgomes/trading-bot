@@ -152,6 +152,13 @@ class DatabaseLiveRecoveryWorker:
         }
 
     def _recover_protective_child(self, product_id: str, payload: Mapping[str, Any]) -> None:
+        parent_id = payload.get("protective_entry_order_id")
+        if parent_id:
+            if self.execute_action is None:
+                raise RuntimeError("protective entry cancellation requires an order reconciler")
+            self.execute_action(
+                product_id, RecoveryAction(RecoveryActionType.CANCEL_ORDER, str(parent_id))
+            )
         child_id = payload.get("protective_child_order_id")
         if not child_id:
             if payload.get("recovery_kind") == "protective_child":

@@ -1,6 +1,8 @@
 """Outcome vocabulary shared by execution, evaluation and operator reports."""
 
+from collections.abc import Mapping
 from enum import StrEnum
+from typing import Any
 
 
 class OutcomeCategory(StrEnum):
@@ -10,6 +12,29 @@ class OutcomeCategory(StrEnum):
     BLOCKED_DATA = "blocked_data"
     BLOCKED_INFRASTRUCTURE = "blocked_infrastructure"
     UNSUPPORTED = "unsupported"
+
+
+class TrialDisposition(StrEnum):
+    PENDING = "pending"
+    FINALIST = "finalist"
+    REJECTED = "rejected"
+    INCONCLUSIVE = "inconclusive"
+    BLOCKED_DATA = "blocked_data"
+    INFRASTRUCTURE_EXHAUSTED = "infrastructure_exhausted"
+    UNSUPPORTED = "unsupported"
+
+
+def terminal_trial_disposition(
+    state: str, metadata: Mapping[str, Any] | None = None
+) -> TrialDisposition | None:
+    terminal = {
+        "infrastructure_exhausted": TrialDisposition.INFRASTRUCTURE_EXHAUSTED,
+        "unsupported": TrialDisposition.UNSUPPORTED,
+    }.get(state)
+    deferred = (metadata or {}).get("evaluation_deferred", {}).get("outcome_category")
+    if terminal is None and deferred in {"blocked_data", "inconclusive", "unsupported"}:
+        return TrialDisposition(deferred)
+    return terminal
 
 
 def forward_outcome(accepted: bool, reason: str | None) -> OutcomeCategory:

@@ -149,26 +149,33 @@ class SqlUniverseStore:
             snapshot_payload, tuple(item.instrument for item in materialised)
         )
 
-    def record_btc_research_scope(
+    def record_fixed_research_scope(
         self,
         *,
         universe_id: str,
         product_id: str,
-        instrument: Instrument,
+        instruments: tuple[Instrument, ...],
         selected_at: str,
         specification_hash: str,
     ) -> str:
-        expected = {
-            "btc_accumulation": "binance:spot:BTCUSDT",
-            "active_income": "binance:futures:BTCUSDT:USDT",
-        }.get(product_id)
-        if instrument.instrument_id != expected:
-            raise ValueError("fixed BTC research scope must match its configured product")
+        if not instruments or len({item.instrument_id for item in instruments}) != len(instruments):
+            raise ValueError("fixed research scope requires distinct instruments")
+        if product_id == "btc_accumulation":
+            valid = tuple(item.instrument_id for item in instruments) == ("binance:spot:BTCUSDT",)
+        else:
+            valid = product_id == "active_income" and all(
+                item.venue == "binance"
+                and item.market_type is MarketType.FUTURES
+                and item.quote_asset == item.settlement_asset == "USDT"
+                for item in instruments
+            )
+        if not valid:
+            raise ValueError("fixed research scope must match its configured product")
         if len(specification_hash) != 71 or not specification_hash.startswith("sha256:"):
             raise ValueError("fixed research scope requires a specification hash")
         int(specification_hash[7:], 16)
         payload = {
-            "schema": "fixed_btc_research_scope/v1",
+            "schema": "fixed_research_scope/v1",
             "universe_id": universe_id,
             "product_id": product_id,
             "observed_at": timestamp(selected_at, field="selected_at"),
@@ -181,14 +188,15 @@ class SqlUniverseStore:
                     "strategy_eligibility": [],
                     "reason_code": "fixed_research_scope",
                 }
+                for instrument in sorted(instruments, key=lambda item: item.instrument_id)
             ],
         }
-        return self._persist_snapshot(payload, (instrument,))
+        return self._persist_snapshot(payload, instruments)
 
     def _persist_snapshot(self, snapshot_payload, instruments: tuple[Instrument, ...]) -> str:
         universe_id = snapshot_payload["universe_id"]
         observed_at = snapshot_payload["observed_at"]
-        fixed = snapshot_payload.get("schema") == "fixed_btc_research_scope/v1"
+        fixed = snapshot_payload.get("historical_liquidity_eligibility") == "not_asserted"
         content_hash = canonical_hash(snapshot_payload)
         snapshot_id = canonical_hash({"universe_id": universe_id, "content_hash": content_hash})
         with self.engine.begin() as connection:
@@ -205,7 +213,10 @@ class SqlUniverseStore:
                     insert(universe).values(
                         id=universe_id,
                         created_at=observed_at,
-                        payload={"dynamic": not fixed, "fixed_maximum": 1 if fixed else None},
+                        payload={
+                            "dynamic": not fixed,
+                            "fixed_maximum": len(instruments) if fixed else None,
+                        },
                     )
                 )
             existing = connection.execute(

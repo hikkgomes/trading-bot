@@ -243,7 +243,18 @@ def test_every_promotable_source_type_runs_a_complete_paper_service_chain(
         data_requirements={"bars": "1m", "closed_only": True},
         feature_graph={"version": "core-bars-v1", "required_nodes": list(required_nodes)},
         signal_model=source_signal_model,
-        position_model={"kind": "volatility_scaled"},
+        position_model={
+            "kind": "volatility_scaled",
+            **(
+                {
+                    "execution_policy": "resting_bracket/v1",
+                    "stop_loss": 0.02,
+                    "horizon_bars": 96,
+                }
+                if source_type is StrategySourceType.GENERATED_DSL
+                else {}
+            ),
+        },
         execution_preferences={"policy": "market"},
         risk_policy={"id": "paper-chain-risk"},
         validation_policy={"id": "paper-chain-validation"},

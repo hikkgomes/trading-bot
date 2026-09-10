@@ -6,7 +6,7 @@ from typing import Any
 
 from src.research.returns import PositionReturnReport
 
-ECONOMIC_ENGINE_VERSION = "economic-engine/v4"
+ECONOMIC_ENGINE_VERSION = "economic-engine/v5"
 
 
 def completed_campaigns(accounting: Mapping[str, Any] | None) -> int | None:

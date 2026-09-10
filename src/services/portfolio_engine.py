@@ -83,6 +83,10 @@ class NoPortfolioTarget:
     reason_code: str
 
 
+class PortfolioInputsPending(ValueError):
+    """A forecast is waiting for its own durable financial/risk inputs."""
+
+
 class DatabasePortfolioTargetBuilder:
     """Build one preliminary target from immutable forecast and account inputs."""
 
@@ -107,11 +111,17 @@ class DatabasePortfolioTargetBuilder:
 
     def __call__(self, payload: Mapping[str, Any]) -> TargetRiskReferences | NoPortfolioTarget:
         product_id, product, evaluated_at, seed, forecasts = self._forecast_context(payload)
-        state_id, state = self.snapshot_store.latest(
-            kind="canonical_portfolio_risk_state", product_id=product_id, at=evaluated_at
-        )
+        scoped_store = SqlRiskSnapshotStore(self.repository.engine, book_id=product.get("book_id"))
+        try:
+            state_id, state = scoped_store.latest(
+                kind="canonical_portfolio_risk_state", product_id=product_id, at=evaluated_at
+            )
+        except KeyError as exc:
+            raise PortfolioInputsPending("book_risk_state_pending") from exc
         clean = _canonical_portfolio_state(state, product_id=product_id)
         _assert_state_fresh(clean, evaluated_at)
+        if product.get("book_id") and clean["open_orders"]:
+            raise PortfolioInputsPending("book_execution_pending")
         balances = {str(key): float(value) for key, value in clean["balances"].items()}
         current_positions = {str(key): float(value) for key, value in clean["positions"].items()}
         market = {str(key): dict(value) for key, value in clean["market"].items()}
@@ -142,6 +152,7 @@ class DatabasePortfolioTargetBuilder:
                     **target.metadata,
                     "account_id": account_id,
                     "execution_environment": environment,
+                    "book_id": product.get("book_id"),
                 },
             )
             for target in targets
@@ -166,6 +177,7 @@ class DatabasePortfolioTargetBuilder:
                 "kind": "target_position",
                 "product_id": product_id,
                 "event_id": event_id,
+                "execution_mode": str(product["execution_mode"]),
                 "canonical_state_id": state_id,
                 "target_position_ids": list(target_ids),
                 "targets": [to_primitive(item) for item in targets],
@@ -238,6 +250,22 @@ class DatabasePortfolioTargetBuilder:
         assignment_id = (
             requested_assignment_id or str(seed.metadata.get("assignment_id") or "").strip()
         )
+        if assignment_id:
+            from src.portfolio.books import paper_book_view
+            from src.research.canonical import SqlActiveStrategyAssignmentRepository
+
+            assignment = SqlActiveStrategyAssignmentRepository(self.repository.engine).by_id(
+                assignment_id
+            )
+            if (
+                assignment
+                and assignment["execution_mode"] == "paper"
+                and assignment["payload"].get("book_id")
+            ):
+                book, product, account = paper_book_view(
+                    self.repository.engine, assignment, product, self.account_configuration
+                )
+                self.account_configuration[book["account_id"]] = account
         all_forecasts = self.repository.active_forecasts(product_id=product_id, at=evaluated_at)
         forecasts = (
             tuple(
@@ -245,7 +273,7 @@ class DatabasePortfolioTargetBuilder:
                 for item in all_forecasts
                 if str(item.metadata.get("assignment_id") or "") == assignment_id
             )
-            if assignment_id
+            if assignment_id and product.get("execution_mode") != "live"
             else all_forecasts
         )
         if seed not in forecasts:
@@ -267,6 +295,20 @@ class DatabasePortfolioTargetBuilder:
         prices: Mapping[str, float],
         state_id: str,
     ) -> tuple[tuple[TargetPosition, ...], float, dict[str, float]]:
+        if product.get("execution_mode") == "live":
+            from src.portfolio.account_plans import live_book_targets
+
+            return live_book_targets(
+                self,
+                product_id=product_id,
+                product=product,
+                forecasts=forecasts,
+                clean=clean,
+                current_positions=current_positions,
+                prices=prices,
+                state_id=state_id,
+                at=seed.valid_from,
+            )
         if product_family == "btc_accumulation":
             return self._btc_targets(
                 product_id=product_id,
@@ -301,6 +343,7 @@ class DatabasePortfolioTargetBuilder:
         current_positions: dict[str, float],
         prices: Mapping[str, float],
         state_id: str,
+        capital: Mapping[str, Any] | None = None,
     ) -> tuple[tuple[TargetPosition, ...], float, dict[str, float]]:
         instrument_id = assert_btc_spot_instrument(seed.instrument_id)
         price = prices[instrument_id]
@@ -322,17 +365,21 @@ class DatabasePortfolioTargetBuilder:
         allocation = target_btc_allocation(forecasts, policy=policy)
         costs = product.get("execution_costs")
         costs = costs if isinstance(costs, Mapping) else {}
-        capital = btc_capital_baseline(
-            self.repository.engine,
-            product_id=product_id,
-            account_id=str(product["account_id"]),
-            mode=str(product.get("execution_mode", "paper")),
-            state_id=state_id,
-            observed_at=seed.valid_from,
-            btc=current_btc,
-            quote=float(balances.get("USDT", 0.0)),
-            price=price,
-            reserve_fraction=policy.minimum_btc_fraction,
+        capital = (
+            capital
+            if capital is not None
+            else btc_capital_baseline(
+                self.repository.engine,
+                product_id=product_id,
+                account_id=str(product["account_id"]),
+                mode=str(product.get("execution_mode", "paper")),
+                state_id=state_id,
+                observed_at=seed.valid_from,
+                btc=current_btc,
+                quote=float(balances.get("USDT", 0.0)),
+                price=price,
+                reserve_fraction=policy.minimum_btc_fraction,
+            )
         )
         quantity = _affordable_btc_target(
             current_btc,
@@ -453,15 +500,23 @@ class DatabasePortfolioTargetBuilder:
         result = []
         for forecast in forecasts:
             position = self.positions.get(portfolio_id, forecast.instrument_id)
-            state = forecast.metadata.get("position_state") or {}
+            direction = (
+                1
+                if forecast.direction is ForecastDirection.LONG
+                else -1
+                if forecast.direction is ForecastDirection.SHORT
+                else 0
+            )
             holding = (
                 bool(forecast.metadata.get("position_rules"))
-                and state.get("direction") in {-1, 1}
-                and position.metadata.get("assignment_id") == forecast.metadata.get("assignment_id")
+                and direction != 0
+                and (
+                    position.metadata.get("assignment_id") == forecast.metadata.get("assignment_id")
+                    or forecast.metadata.get("book_id") == position.portfolio_id
+                )
                 and forecast.metadata.get("assignment_id") is not None
                 and position.quantity == current_positions.get(forecast.instrument_id)
-                and position.quantity * state["direction"] > 0
-                and position.updated_at <= forecast.valid_from
+                and position.quantity * direction > 0
             )
             result.append(
                 replace(
@@ -554,7 +609,7 @@ def _assert_state_fresh(clean: Mapping[str, Any], evaluated_at: str) -> None:
     evaluated = dt.datetime.fromisoformat(evaluated_at)
     age = (evaluated - observed_at).total_seconds()
     if age < 0 or age > maximum_age:
-        raise ValueError("canonical portfolio/risk state is stale")
+        raise PortfolioInputsPending("canonical portfolio/risk state is stale")
 
 
 def _validated_prices(
@@ -590,6 +645,11 @@ def _target_risk_scopes(
     )
     gross = sum(abs(value) for value in notionals) / equity
     net = sum(notionals) / equity
+    active_notionals = tuple(
+        _strategy_risk_notional(target, notional, equity)
+        for target, notional in zip(targets, notionals, strict=True)
+    )
+    active_gross = sum(abs(value) for value in active_notionals) / equity
     turnover = sum(order_notionals) / equity
     worst_spread = max(float(market[item.instrument_id]["spread_bps"]) for item in targets)
     worst_volatility = max(float(market[item.instrument_id]["volatility"]) for item in targets)
@@ -597,7 +657,7 @@ def _target_risk_scopes(
         amount / max(float(market[item.instrument_id]["visible_depth"]), 1e-12)
         for item, amount in zip(targets, order_notionals, strict=True)
     )
-    maximum_position = max(abs(value) for value in notionals) / equity
+    maximum_position = max(abs(value) for value in active_notionals) / equity
     funding_cost = (
         sum(
             max(0.0, notional * float(market[item.instrument_id]["funding"]))
@@ -633,12 +693,12 @@ def _target_risk_scopes(
         },
         "sleeve": {
             "inputs": {
-                "capital_fraction": gross,
+                "capital_fraction": active_gross,
                 "drawdown_fraction": float(clean["product_drawdown_fraction"]),
                 "maximum_correlation": _maximum_correlation(clean["correlations"]),
                 "beta": sum(
                     notional / equity * float(clean["beta"].get(item.instrument_id, 0.0))
-                    for item, notional in zip(targets, notionals, strict=True)
+                    for item, notional in zip(targets, active_notionals, strict=True)
                 ),
                 "turnover_fraction": turnover,
             },
@@ -655,6 +715,16 @@ def _target_risk_scopes(
             "decision_id": identity("product"),
         },
     }
+
+
+def _strategy_risk_notional(target, notional, equity):
+    if target.metadata.get("product_id") != "btc_accumulation":
+        return notional
+    assert_btc_spot_instrument(target.instrument_id)
+    cash_fraction = float(target.metadata["stablecoin_fraction"])
+    if not math.isfinite(cash_fraction) or not 0 <= cash_fraction <= 1:
+        raise ValueError("BTC tactical risk requires a valid stablecoin fraction")
+    return -equity * cash_fraction
 
 
 _PORTFOLIO_STATE_FIELDS = frozenset(
@@ -836,7 +906,10 @@ class DatabasePortfolioTargetWorker:
         if claimed is None:
             return {"reason_code": "portfolio_target_queue_empty"}
         try:
-            payload = validate_job_payload("portfolio_target_build", claimed.payload)
+            payload = {
+                **validate_job_payload("portfolio_target_build", claimed.payload),
+                "evaluated_at": now,
+            }
             references = self.build_target(payload)
             if isinstance(references, NoPortfolioTarget):
                 result = {
@@ -876,6 +949,20 @@ class DatabasePortfolioTargetWorker:
                 priority=18,
                 producer_identity=self.worker_id,
             )
+        except PortfolioInputsPending as exc:
+            from src.research.outcomes import OutcomeCategory
+
+            self.queue.defer(
+                claimed,
+                available_at=_retry_at(now, 1),
+                reason=str(exc),
+                outcome_category=OutcomeCategory.BLOCKED_DATA,
+            )
+            return {
+                "reason_code": "portfolio_inputs_pending",
+                "job_id": claimed.job_id,
+                "dependency": str(exc),
+            }
         except Exception as exc:
             self.queue.fail(
                 claimed,

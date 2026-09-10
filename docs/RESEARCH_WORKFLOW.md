@@ -22,7 +22,7 @@ evidence. Protected outcomes are hidden from research and agent database roles.
 Candidate definitions are read through `adaptive_candidate`; protected status
 and mutable deferral details remain available only to trusted operational readers.
 
-Fixed BTC studies use `SqlUniverseStore.record_btc_research_scope`. These record
+Fixed-market studies use `SqlUniverseStore.record_fixed_research_scope`. These record
 the selection time and specification hash without asserting historical liquidity
 eligibility. Dynamic universe studies still require historical membership.
 
@@ -63,6 +63,17 @@ closed. Statistical diagnostics such as PBO, bootstrap intervals, and regime
 breadth are not universal substitutes for economic evidence.
 
 ## Generation and agents
+
+Native generation persists an epoch and round cursor. Retries use the same
+round request and feedback watermark; only new registrations consume another
+trial. For an explicitly finite campaign, the coordinator calls
+`ResearchRoundCoordinator.close_finite` with the complete registered candidate
+set before protected evaluation. A missing epoch leaves protected access
+pending. Closure cannot replace an adaptive epoch or admit another candidate.
+
+The separate `research_exploration` evaluator, grammar and file memory have
+been removed. Use the canonical generator, dataset and evaluation services
+below. Current strategy indicator libraries remain available.
 
 The scheduled generator uses typed campaigns, exact and near-duplicate
 identity, lineage budgets, bounded mutation and crossover, and failure
@@ -239,20 +250,41 @@ contract are rejected for current use.
 
 ## Historical execution study
 
-Keep source exports and study outputs outside the checkout. Import the Google
-Sheets values snapshot and native ID-cell metadata with:
+Keep source exports and study outputs outside the checkout. With an authorised
+read-only Sheets OAuth token in `GOOGLE_ACCESS_TOKEN`, export the three order
+tabs and position-history tab:
+
+```bash
+python -m src.research.historical.export \
+  --spreadsheet-id <authorised-workbook-id> \
+  --output /private/research/export
+```
+
+The command prints the content-addressed values and native ID-cell paths. It
+uses bounded cell reads and preserves blank row offsets, exact strings and
+numeric cell types. `--order-sheet` (repeatable) and `--position-sheet` declare
+different source tab names when needed. Export a stable workbook snapshot;
+Google's range reads do not provide a transaction across all tabs. Rerunning
+the command against unchanged cells gives identical file hashes.
+
+Import the printed values snapshot and native ID-cell metadata paths with:
 
 ```bash
 python -m src.research.historical.study \
   --source /private/research/study-values.json \
   --id-cells /private/research/study-id-cells.json \
+  --timezone Asia/Dubai \
   --output /private/research/reconstruction
 ```
 
-Supply `--timezone` only after confirming the export timezone. Numeric IDs
+The source owner confirmed Dubai time for this export. For another export,
+supply `--timezone` only after confirming its timezone. Numeric IDs
 whose precision was lost remain unresolved. Campaign reconstruction retains
 missing inventory and separates spot from swaps; no strategy or assignment is
-created by the import.
+created by the import. Both input hashes, export schema and source row records
+are retained in the private result. The workbook display timezone is not used
+to infer the execution export timezone. Unreconciled campaign differences stay
+visible at the existing tolerance.
 
 `src.data.okx_history.download_history` acquires bounded native trade, mark and
 index candles. `download_funding_history` reads the official daily funding
@@ -260,6 +292,20 @@ archives, with at most 93 archive days per invocation. It retains source URLs,
 checksums and signed funding rates, resumes completed downloads and reports
 missing instruments. Complete archive coverage does not certify the historical
 funding schedule or replace private account bills.
+
+Add `--market-history /private/research/native-bars.json` for each native
+traded-price file produced by `download_history`. The command records a separate
+immutable study for each market, splits directions, links campaign IDs to the
+last strictly earlier closed bar and retains excluded campaigns with reasons.
+The declared defaults are a four-bar outcome horizon and four-bar embargo;
+use `--structure-horizon-bars` and `--structure-embargo-bars` to specify another
+study. Gaps and unknown exposure cannot supply controls. Each comparison uses
+the recorded exposure strictly before its actual execution, with separate
+specifications for each exposure state. All actual entry bars are excluded from
+the control pool. Entries within one bar retain their campaign references and
+share a market-bar cluster; they are not independent price observations.
+The study includes 14 July and does not interpret bar returns as obtainable
+entry fills or stop prices.
 
 Run `study_entry_structure` separately for each market and trade direction.
 Pass closed-bar availability timestamps and an as-of exposure state for every

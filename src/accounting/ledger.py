@@ -35,7 +35,11 @@ class LedgerEntry:
                 self, attribute, non_empty(getattr(self, attribute), field=attribute)
             )
         object.__setattr__(self, "accounting_asset", self.accounting_asset.upper())
-        object.__setattr__(self, "occurred_at", timestamp(self.occurred_at, field="occurred_at"))
+        object.__setattr__(
+            self,
+            "occurred_at",
+            timestamp(self.occurred_at, field="occurred_at", preserve_subseconds=True),
+        )
         if len(self.postings) < 2:
             raise ValueError("ledger entries need at least two postings")
         normalised = {

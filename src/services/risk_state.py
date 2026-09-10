@@ -67,7 +67,9 @@ class PortfolioRiskCalculator:
         product_ids = tuple(sorted(str(value) for value in self._products_for_account(account_id)))
         if product_id not in product_ids:
             product_ids = tuple(sorted((*product_ids, product_id)))
-        effects = self._ledger_effects(product_ids, at)
+        effects = self._ledger_effects(
+            product_ids, at, account_id=account_id, include_unscoped=not product.get("book_id")
+        )
         initial = self._initial_equity(
             account_id=account_id,
             product_id=product_id,
@@ -99,7 +101,12 @@ class PortfolioRiskCalculator:
             if product_family == "btc_accumulation"
             else current_equity
         )
-        nav_points = self._nav_values(product_id=product_id, at=at)
+        nav_points = self._nav_values(
+            product_id=product_id,
+            at=at,
+            portfolio_id=str(product.get("portfolio_id") or ""),
+            include_unscoped=not product.get("book_id"),
+        )
         nav_values = [value for _observed_at, value in nav_points]
         if nav_values:
             if not math.isclose(nav_values[-1], current_equity, rel_tol=0.0, abs_tol=1e-12):
@@ -172,7 +179,12 @@ class PortfolioRiskCalculator:
         return tuple(sorted(products))
 
     def _ledger_effects(
-        self, product_ids: tuple[str, ...], at: str
+        self,
+        product_ids: tuple[str, ...],
+        at: str,
+        *,
+        account_id: str,
+        include_unscoped: bool = False,
     ) -> dict[str, tuple[tuple[str, float], ...]]:
         if not product_ids:
             return {}
@@ -194,6 +206,10 @@ class PortfolioRiskCalculator:
             payload = row["payload"]
             metadata = payload.get("metadata") if isinstance(payload, Mapping) else None
             if not isinstance(metadata, Mapping) or metadata.get("pnl_effect") is None:
+                continue
+            if metadata.get("account_id") != account_id and not (
+                include_unscoped and not metadata.get("account_id") and not metadata.get("book_id")
+            ):
                 continue
             value = _finite_number(metadata["pnl_effect"], "ledger pnl_effect")
             result.setdefault(str(row["product_id"]), []).append((str(row["created_at"]), value))
@@ -300,7 +316,14 @@ class PortfolioRiskCalculator:
             result[instrument_id] = (quantity, entry_price)
         return result
 
-    def _nav_values(self, *, product_id: str, at: str) -> list[tuple[str, float]]:
+    def _nav_values(
+        self,
+        *,
+        product_id: str,
+        at: str,
+        portfolio_id: str,
+        include_unscoped: bool = False,
+    ) -> list[tuple[str, float]]:
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(nav_snapshot.c.payload)
@@ -310,6 +333,10 @@ class PortfolioRiskCalculator:
         values: list[tuple[str, float]] = []
         for payload in rows:
             if not isinstance(payload, Mapping) or str(payload.get("product_id")) != product_id:
+                continue
+            if payload.get("portfolio_id") != portfolio_id and not (
+                include_unscoped and not payload.get("portfolio_id")
+            ):
                 continue
             observed_at = timestamp(str(payload.get("observed_at") or ""), field="NAV observed_at")
             values.append((observed_at, _finite_number(payload.get("nav"), "NAV")))

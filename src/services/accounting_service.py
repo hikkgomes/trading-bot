@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy import insert, select
 from sqlalchemy.engine import Engine
 
+from src.accounting.book_allocations import PaperFundingPending, settle_public_paper_funding
 from src.accounting.ledger import Ledger
 from src.accounting.nav import NavSnapshot
 from src.data.database import (
@@ -42,7 +43,9 @@ class AccountingService:
         self._append(nav_snapshot, identity, snapshot.observed_at, payload)
         return identity
 
-    def latest_nav(self, *, product_id: str, at: str) -> NavSnapshot | None:
+    def latest_nav(
+        self, *, product_id: str, at: str, portfolio_id: str | None = None
+    ) -> NavSnapshot | None:
         at = timestamp(at, field="NAV lookup time")
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -51,7 +54,11 @@ class AccountingService:
                 .order_by(nav_snapshot.c.created_at.desc(), nav_snapshot.c.id.desc())
             ).scalars()
             for payload in rows:
-                if isinstance(payload, dict) and str(payload.get("product_id")) == product_id:
+                if (
+                    isinstance(payload, dict)
+                    and str(payload.get("product_id")) == product_id
+                    and (portfolio_id is None or payload.get("portfolio_id") == portfolio_id)
+                ):
                     return NavSnapshot(**payload)
         return None
 
@@ -241,8 +248,16 @@ class DatabaseAccountingWorker:
                     attribution=dict(payload["attribution"]),
                 )
                 identity = str(payload["entry_id"])
+            elif kind == "public_funding_settlement":
+                identity = str(payload["funding_record_id"])
+                settle_public_paper_funding(self.service.engine, identity, now=now)
             else:
                 raise ValueError(f"unsupported accounting event kind: {kind}")
+        except PaperFundingPending as exc:
+            self.queue.defer(
+                claimed, available_at=_retry_at(now, self.lease_seconds), reason=str(exc)
+            )
+            return {"reason_code": "paper_funding_pending", "job_id": claimed.job_id}
         except Exception as exc:
             self.queue.fail(
                 claimed,

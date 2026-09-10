@@ -1843,7 +1843,9 @@ class DatabasePromotionWorker:
         risk_budget = self._assignment_budget(
             connection, execution_mode, current_state, decision, evidence
         )
-        for instrument_id in evidence.supported_instruments or (None,):
+        panel = len(evidence.supported_instruments) > 1
+        scope = (None,) if panel else (evidence.supported_instruments or (None,))
+        for instrument_id in scope:
             assign_kwargs: dict[str, Any] = {
                 "product_id": evidence.product_id,
                 "portfolio_id": evidence.portfolio_id,
@@ -1855,12 +1857,19 @@ class DatabasePromotionWorker:
                 "assigned_at": decision.evaluated_at,
                 "assigned_by": self.worker_id,
                 "instrument_id": instrument_id,
+                "universe_id": canonical_hash(
+                    {"frozen_instruments": list(evidence.supported_instruments)}
+                )
+                if panel
+                else None,
                 "sleeve_id": evidence.sleeve_id or "default",
                 "risk_budget": risk_budget,
                 "assignment_reason": f"canonical promotion: {decision.reason_code}",
                 "payload": {
                     "promotion_event_id": identity,
                     "source": "canonical_promotion_worker",
+                    "instrument_ids": list(evidence.supported_instruments),
+                    "scope_kind": "fixed_instrument_vector" if panel else "instrument",
                     "risk_budget_unit": "equity_fraction"
                     if execution_mode == "paper"
                     else "quote_notional",
@@ -1868,34 +1877,45 @@ class DatabasePromotionWorker:
                 },
             }
             if connection is None:
-                assignments.assign(**assign_kwargs)
+                assignment_id = assignments.assign(**assign_kwargs)
             else:
-                assignments.assign_in_connection(connection, **assign_kwargs)
+                assignment_id = assignments.assign_in_connection(connection, **assign_kwargs)
+
+            if execution_mode == "paper" and connection is not None:
+                self._initialise_paper_account(connection, decision, evidence, assignment_id)
 
     def _assignment_budget(
         self, connection, execution_mode, current_state, decision, evidence
     ) -> float:
         if execution_mode != "paper" or connection is None:
             return min(decision.capital_limit, evidence.risk_budget_available)
-        self._initialise_paper_account(connection, decision, evidence)
         if current_state in {LifecycleState.REGISTERED, LifecycleState.DEVELOPMENT}:
             return self._paper_entry_budget(connection, evidence)
         return min(decision.capital_limit, evidence.risk_budget_available)
 
-    def _initialise_paper_account(self, connection, decision, evidence) -> None:
+    def _initialise_paper_account(self, connection, decision, evidence, assignment_id) -> None:
+        from src.portfolio.books import (
+            book_identity,
+            initialise_paper_book,
+            load_book,
+            seed_paper_book,
+        )
+
         template = self.paper_accounts.get(str(evidence.product_id))
         if template is None or template.account_id != evidence.account_id:
             raise ValueError("paper entry requires its configured account and starting resources")
-        account = PaperAccountLedger(
-            engine=self.store.engine,
-            account_id=template.account_id,
-            product_id=template.product_id,
-            accounting_asset=template.ledger.accounting_asset,
-            starting_balances=template.starting_balances,
-            starting_positions=template.starting_positions,
-            connection=connection,
+        identity = book_identity(
+            evidence.strategy_artefact_hash, "paper", evidence.sleeve_id or "default"
         )
-        account.ensure_seed(observed_at=decision.evaluated_at)
+        book = load_book(self.store.engine, identity, connection=connection)
+        seed_paper_book(
+            connection,
+            book,
+            balances=template.starting_balances,
+            positions=template.starting_positions,
+            accounting_asset=template.ledger.accounting_asset,
+        )
+        initialise_paper_book(self.store.engine, connection, book, assignment_id)
 
     @staticmethod
     def _paper_entry_budget(connection, evidence) -> float:

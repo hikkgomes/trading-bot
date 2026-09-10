@@ -44,6 +44,7 @@ def test_signed_rule_comparison_preserves_trend_or_reversion_in_research_and_pap
         provider="fixture",
         source_type=StrategySourceType.GENERATED_DSL,
         source_payload={"kind": "typed_rule", "rule": rule},
+        position_model=PositionRules(0.03, None, 8).__dict__,
         dataset_snapshot_hashes=(canonical_hash("data"),),
         submitted_at="2026-09-07T00:00:00+00:00",
     )
@@ -56,7 +57,12 @@ def test_signed_rule_comparison_preserves_trend_or_reversion_in_research_and_pap
     directions = {"long": 1, "short": -1, "flat": 0}
     assert (
         tuple(
-            directions[ArtefactDispatcher.default().evaluate(row, artefact)["direction"]]
+            directions[
+                ArtefactDispatcher.default().evaluate(
+                    {**row, "market_frame": [{"open": 100, "high": 101, "low": 99, "close": 100}]},
+                    artefact,
+                )["direction"]
+            ]
             for row in rows
         )
         == expected
@@ -108,7 +114,10 @@ def test_directional_rule_does_not_invent_expected_return_or_confidence():
         "position_limits": {"maximum_position": 0.1},
     }
     artefact["artefact_hash"] = canonical_hash(artefact)
-    result = ArtefactDispatcher.default().evaluate({"trend": 0.01}, artefact)
+    result = ArtefactDispatcher.default().evaluate(
+        {"trend": 0.01, "market_frame": [{"open": 100, "high": 101, "low": 99, "close": 101}]},
+        artefact,
+    )
     assert result["direction"] == "long"
     assert result["expected_return"] is None
     assert result["confidence"] is None
@@ -154,21 +163,21 @@ def test_frozen_model_uses_each_timestamp_vector():
 
 
 def test_entry_pulse_holds_until_horizon_and_ledger_uses_actual_exit():
-    rows = [{"open": 100 + i, "high": 101 + i, "low": 99 + i, "close": 100 + i} for i in range(4)]
-    signals = [1, 0, 0, 0]
+    rows = [{"open": 100 + i, "high": 101 + i, "low": 99 + i, "close": 100 + i} for i in range(5)]
+    signals = [1, 0, 0, 0, 0]
     path = position_path(rows, signals, PositionRules(0.03, 0.06, 3))
-    assert path.decisions == (1, 1, 1, 0)
-    assert [(action.bar_index, action.price) for action in path.actions] == [(1, 101), (3, 103)]
+    assert path.decisions == (1, 1, 1, 0, 0)
+    assert [(action.bar_index, action.price) for action in path.actions] == [(1, 101), (4, 104)]
     events = managed_futures_events(
         rows,
-        [f"2026-09-07T00:0{i}:00+00:00" for i in range(4)],
+        [f"2026-09-07T00:0{i}:00+00:00" for i in range(5)],
         path.actions,
         notional=101,
         fee_rate=0,
         slippage_rate=0,
     )
     report = FuturesResearchAccounting().evaluate(initial_cash=1000, events=events)
-    assert report.final_equity == pytest.approx(1002)
+    assert report.final_equity == pytest.approx(1003)
     assert report.fills == 2
 
 
@@ -264,7 +273,165 @@ def test_strategy_state_uses_fills_and_preserves_campaign_age_after_partial_redu
 
 
 def test_exit_is_a_flat_target_even_when_entry_signal_remains_active():
-    rows = [{"open": 100, "high": 101, "low": 99, "close": 100}] * 3
-    path = position_path(rows, [1, 1, 1], PositionRules(0.03, 0.06, 1))
-    assert path.decisions == (1, 0, 0)
+    rows = [{"open": 100, "high": 101, "low": 99, "close": 100}] * 6
+    path = position_path(rows, [1, 1, 1, 1, 1, 1], PositionRules(0.03, 0.06, 1))
+    assert path.decisions == (1, 0, 0, 1, 0, 0)
     assert [action.kind for action in path.actions] == ["entry", "exit", "entry", "exit"]
+
+
+@pytest.mark.parametrize(
+    "exit_bar,net,triggered",
+    [
+        ({"open": 100, "high": 107, "low": 98, "close": 99}, 6, "take_profit"),
+        ({"open": 90, "high": 92, "low": 89, "close": 91}, -10, "stop"),
+        ({"open": 100, "high": 107, "low": 96, "close": 100}, -3, "stop"),
+    ],
+)
+@pytest.mark.parametrize("entry_price", [100, 120])
+def test_resting_paper_brackets_match_research_and_replay_once(
+    tmp_path, exit_bar, net, triggered, entry_price
+):
+    import datetime as dt
+
+    from src.accounting.paper_account import PaperAccountLedger
+    from src.data.database import PlatformDatabase
+    from src.domain._codec import canonical_hash
+    from src.domain.orders import OrderIntent, OrderSide, OrderType
+    from src.execution.order_manager import OrderManager, SqlOrderStore
+    from src.execution.paper_exchange import paper_fill
+    from src.execution.position_manager import PositionManager, SqlPositionStore
+    from src.execution.stops import SqlStopStore, StopManager, StopStatus
+    from src.risk.engine import SqlRiskSnapshotStore
+    from src.services.financial_application import FinancialApplication, FinancialScope
+    from src.services.order_execution import DatabasePaperExecutionWorker
+    from src.services.paper_protection import PaperProtectionRunner
+    from src.services.scheduler import DatabaseJobQueue
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'bracket.sqlite3'}")
+    database.create_schema()
+    instrument = "binance:futures:BTCUSDT:USDT"
+    rules = PositionRules(0.03, 0.06, 96)
+    rows = [
+        {"open": 100, "high": 101, "low": 99, "close": 100},
+        {
+            "open": entry_price,
+            "high": entry_price * 1.01,
+            "low": entry_price * 0.99,
+            "close": entry_price,
+        },
+        {key: value * entry_price / 100 for key, value in exit_bar.items()},
+    ]
+    opened = [dt.datetime(2026, 9, 7, hour, tzinfo=dt.UTC) for hour in range(3)]
+    times = [(value + dt.timedelta(hours=1, milliseconds=-1)).isoformat() for value in opened]
+    rows = [
+        {**row, "open_timestamp": time.isoformat()} for row, time in zip(rows, opened, strict=True)
+    ]
+    path = position_path(rows, [1, 0, 0], rules)
+    research = FuturesResearchAccounting().evaluate(
+        initial_cash=1000,
+        events=managed_futures_events(
+            rows, times, path.actions, notional=100, fee_rate=0, slippage_rate=0
+        ),
+    )
+    account = PaperAccountLedger(
+        engine=database.engine,
+        account_id="paper-book",
+        product_id="active_income",
+        accounting_asset="USDT",
+        starting_balances={"USDT": 1000},
+    )
+    orders = OrderManager(SqlOrderStore(database.engine))
+    order = orders.create(
+        OrderIntent(
+            order_id="entry",
+            portfolio_id="paper-portfolio",
+            instrument_id=instrument,
+            side=OrderSide.BUY,
+            quantity=1,
+            order_type=OrderType.MARKET,
+            created_at=opened[1].isoformat(),
+            strategy_contributions={"strategy": 1},
+            metadata={
+                "position_rules": rules.__dict__,
+                "account_id": "paper-book",
+                "reference_price": 100,
+                "timeframe": "1h",
+            },
+        )
+    )
+    orders.persist_for_submission(order.order_id)
+    snapshots = SqlRiskSnapshotStore(database.engine)
+
+    def save_bar(index):
+        return snapshots.save(
+            {
+                "kind": "market_data_input",
+                "product_id": "active_income",
+                "instrument_id": instrument,
+                "source_candle_closed": True,
+                "source_timeframe": "1h",
+                "source_open_time_ms": int(opened[index].timestamp() * 1000),
+                "source_close_time_ms": int(
+                    dt.datetime.fromisoformat(times[index]).timestamp() * 1000
+                ),
+                "values": rows[index],
+            },
+            created_at=times[index],
+        )
+
+    entry_bar_id = save_bar(1)
+    worker = DatabasePaperExecutionWorker(
+        queue=DatabaseJobQueue(database.engine),
+        worker_id="entry-fixture",
+        order_manager=orders,
+        positions=PositionManager(SqlPositionStore(database.engine)),
+        ledgers={},
+        trace_store=None,
+    )
+    execution = worker._paper_execution_payload(orders.get(order.order_id), {}, times[1])
+    assert execution["execution_bar_id"] == entry_bar_id
+    assert orders.get(order.order_id).quantity == pytest.approx(100 / entry_price)
+    application = FinancialApplication(
+        database.engine, FinancialScope("active_income", "paper-book", "paper", "paper", "USDT")
+    )
+    application.apply_paper(
+        order_id=order.order_id,
+        instrument_id=instrument,
+        request_id="entry-fill",
+        request_hash=canonical_hash("entry-fill"),
+        account=account,
+        request_payload={
+            **execution,
+            "execution_costs": {"fee_bps": 0, "slippage_bps": 0},
+            "fee_in_base": False,
+        },
+        build_fill=lambda current: paper_fill(
+            current,
+            price=execution["price"],
+            fee_bps=0,
+            slippage_bps=0,
+            fill_fraction=1,
+            fee_asset="USDT",
+            fee_in_base=False,
+            now=execution["execution_at"],
+        ),
+    )
+    assert len(StopManager(SqlStopStore(database.engine)).active()) == 2
+    bar_id = save_bar(2)
+    runner = PaperProtectionRunner(database.engine, {"active_income": account})
+    result = runner.execute(bar_id, now=times[2])
+    assert len(result["fills"]) == 1
+    assert not runner.execute(bar_id, now=times[2])["fills"]
+    state = account.ensure_seed(observed_at=times[2])
+    assert state.balances["USDT"] == pytest.approx(1000 + net)
+    assert research.final_equity == pytest.approx(state.balances["USDT"])
+    position = PositionManager(SqlPositionStore(database.engine)).get(
+        order.portfolio_id, instrument
+    )
+    assert position.quantity == 0
+    states = {
+        stop.kind.value: stop.status for stop in StopManager(SqlStopStore(database.engine)).all()
+    }
+    assert states[triggered] is StopStatus.RECONCILED
+    assert states["stop" if triggered == "take_profit" else "take_profit"] is StopStatus.CANCELLED
+    database.dispose()

@@ -375,6 +375,7 @@ def _unique_records(
 
 
 def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> None:
+    from src.research.data_plan import product_data_plan
     from src.risk.policy import validate_risk_policy
 
     accounts, products, portfolios, policies, risk_products = _split_records(configuration)
@@ -389,6 +390,10 @@ def validate_split_configuration(configuration: dict[str, dict[str, Any]]) -> No
     _validate_forward_profiles(configuration["promotion"])
     _validate_products(products, accounts, portfolios, policies, risk_products)
     _validate_research_configuration(configuration["research"])
+    for product in products.values():
+        product_data_plan(product, configuration["research"], ["BTCUSDT"]).validate_capacity(
+            int(product.get("research_max_symbols", 1))
+        )
 
 
 def _split_records(

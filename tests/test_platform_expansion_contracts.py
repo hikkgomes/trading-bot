@@ -180,6 +180,11 @@ def test_thesis_factory_builds_family_specific_contracts() -> None:
 def test_dispatcher_verifies_hashes_and_emits_execution_receipt() -> None:
     definition = {
         "source_type": "generated_dsl",
+        "position_model": {
+            "execution_policy": "resting_bracket/v1",
+            "stop_loss": 0.02,
+            "horizon_bars": 96,
+        },
         "signal_model": {"rule": {"feature": "bar_return", "operator": "gt", "threshold": 0}},
     }
     definition_hash = canonical_hash(definition)
@@ -190,7 +195,11 @@ def test_dispatcher_verifies_hashes_and_emits_execution_receipt() -> None:
     }
     artefact["artefact_hash"] = canonical_hash(artefact)
 
-    result = ArtefactDispatcher.default().evaluate({"bar_return": 0.01}, artefact)
+    features = {
+        "bar_return": 0.01,
+        "market_frame": [{"open": 100, "high": 101, "low": 99, "close": 100}],
+    }
+    result = ArtefactDispatcher.default().evaluate(features, artefact)
     assert result["direction"] == "long"
     assert result["execution_receipt"]["definition_hash"] == definition_hash
     with pytest.raises(ArtefactDispatchError, match="content hash"):

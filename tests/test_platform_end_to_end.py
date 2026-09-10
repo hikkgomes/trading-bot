@@ -105,7 +105,7 @@ def test_platform_postgres_builds_idempotent_bundle_from_real_parquet(tmp_path: 
                     },
                 )
             )
-        partition = tmp_path / "bars" / "binance" / "spot" / "BTCUSDT" / "1m" / "date=2026-08-20"
+        partition = tmp_path / "bars" / "binance" / "spot" / "BTCUSDT" / "1d" / "date=2026-08-20"
         partition.mkdir(parents=True)
         close_times = [
             int(dt.datetime(2026, 8, 20 + index, tzinfo=dt.UTC).timestamp() * 1_000)
@@ -131,7 +131,7 @@ def test_platform_postgres_builds_idempotent_bundle_from_real_parquet(tmp_path: 
             ),
             partition / "bars.parquet",
         )
-        service = DatabaseDatasetBundleService(database.engine, tmp_path)
+        service = DatabaseDatasetBundleService(database.engine, tmp_path, timeframe="1d")
         first = service.run(
             product_id=product_id,
             universe_id=universe_id,

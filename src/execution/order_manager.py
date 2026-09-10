@@ -15,7 +15,7 @@ from sqlalchemy.engine import Engine
 from src.data.database import exchange_order, order_intent
 from src.data.database import fill as fill_table
 from src.data.transactions import connection_scope
-from src.domain._codec import to_primitive
+from src.domain._codec import finite, timestamp, to_primitive
 from src.domain.orders import Fill, OrderIntent, OrderSide, OrderStatus, OrderType
 
 _ALLOWED_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
@@ -265,15 +265,21 @@ def _validate_replay_event(
         if intent != previous:
             raise ValueError(f"fill event snapshot differs from order state at line {line_number}")
         return
-    if event_type == "client_id_bound":
-        if intent.status is not previous.status:
-            raise ValueError(f"client binding changed order status at line {line_number}")
-        return
-    if event_type == "rest_checkpoint":
+    binding = {
+        "client_id_bound": "client_order_id",
+        "rest_checkpoint": "rest_checkpoint",
+        "entry_reference_bound": "entry_reference",
+    }.get(str(event_type))
+    if binding is not None:
         metadata = dict(previous.metadata)
-        metadata["rest_checkpoint"] = intent.metadata.get("rest_checkpoint")
-        if replace(previous, metadata=metadata) != intent:
-            raise ValueError(f"REST checkpoint changed economic order state at line {line_number}")
+        metadata[binding] = intent.metadata.get(binding)
+        quantity = previous.quantity
+        if binding == "entry_reference":
+            quantity = _validate_entry_reference(previous, metadata[binding], intent.quantity)
+        if replace(previous, quantity=quantity, metadata=metadata) != intent:
+            raise ValueError(f"metadata binding changed economic order state at line {line_number}")
+        if binding == "entry_reference" and previous.status is not OrderStatus.PERSISTED:
+            raise ValueError("entry reference cannot change after submission")
         return
     if intent.status not in _ALLOWED_TRANSITIONS[previous.status]:
         raise ValueError(
@@ -289,6 +295,41 @@ def _validate_replay_start(event_type: object, intent: OrderIntent, line_number:
         raise ValueError(
             f"order journal starts {intent.order_id} without a created event at line {line_number}"
         )
+
+
+def entry_notional(order: OrderIntent) -> float:
+    reference = order.metadata.get("entry_reference", {})
+    raw = reference.get("notional")
+    if raw is None:
+        raw = order.quantity * finite(
+            order.metadata.get("reference_price"), field="decision quote", minimum=0
+        )
+    value = finite(raw, field="entry notional", minimum=0)
+    if value <= 0:
+        raise ValueError("entry notional must be positive")
+    return value
+
+
+def _validate_entry_reference(previous, reference, quantity):
+    if previous.status is not OrderStatus.PERSISTED:
+        raise ValueError("entry reference cannot change after submission")
+    budget = entry_notional(previous)
+    price = finite(reference["price"], field="entry quote", minimum=0)
+    quoted = finite(reference["notional"], field="quoted notional", minimum=0)
+    quantity = finite(quantity, field="normalised entry quantity", minimum=0)
+    if (
+        price <= 0
+        or quantity <= 0
+        or quoted != budget
+        or quantity * price > budget + max(1e-9, budget * 1e-12)
+    ):
+        raise ValueError("entry quote cannot increase its frozen notional budget")
+    if (
+        timestamp(reference["observed_at"], field="entry quote time", preserve_subseconds=True)
+        < previous.created_at
+    ):
+        raise ValueError("entry quote predates its order")
+    return quantity
 
 
 def _terminal_fill_forbidden(order: OrderIntent) -> bool:
@@ -420,6 +461,39 @@ class OrderManager:
             current, metadata={**dict(current.metadata), "rest_checkpoint": checkpoint}
         )
         self.store.append(event_type="rest_checkpoint", intent=updated)
+        self._orders[order_id] = updated
+        return updated
+
+    def bind_entry_reference(
+        self,
+        order_id: str,
+        *,
+        price: float,
+        observed_at: str,
+        quantity: float | None = None,
+        source: str = "broker_quote",
+    ) -> OrderIntent:
+        current = self.get(order_id)
+        if current.status is not OrderStatus.PERSISTED:
+            raise ValueError("entry reference can only bind before submission")
+        value = finite(price, field="entry reference price", minimum=0)
+        observed_at = timestamp(observed_at, field="entry quote time", preserve_subseconds=True)
+        if value <= 0 or observed_at < current.created_at:
+            raise ValueError("entry quote price or time is invalid")
+        budget = entry_notional(current)
+        reference = {
+            "price": value,
+            "observed_at": observed_at,
+            "source": source,
+            "notional": budget,
+        }
+        quantity = _validate_entry_reference(
+            current, reference, budget / value if quantity is None else quantity
+        )
+        updated = replace(
+            current, quantity=quantity, metadata={**current.metadata, "entry_reference": reference}
+        )
+        self.store.append(event_type="entry_reference_bound", intent=updated, event_at=observed_at)
         self._orders[order_id] = updated
         return updated
 

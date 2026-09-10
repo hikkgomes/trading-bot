@@ -305,6 +305,7 @@ def _registered_position_model(strategy_class: Any) -> dict[str, Any]:
     config = strategy_class.default_config()
     return {
         "kind": "entry_pulse",
+        "execution_policy": "resting_bracket/v1",
         "flat_action": "hold",
         "decision_timing": "next_open",
         "stop_loss": config.stop_loss,

@@ -459,3 +459,68 @@ def test_unfilled_opposite_orders_cannot_offset_reserved_net_risk():
     assert assessment.net_notional == 10
     assert assessment.scoped_exposure["product_net"] == 510
     assert assessment.gross_notional == 1010
+
+
+def test_book_netting_preserves_absent_forecasts_and_explicit_close_ownership():
+    from src.portfolio.book_plans import net_book_changes
+
+    held = {"A": {"SOL": 2}, "B": {}}
+    plan = net_book_changes({"A": None, "B": {"BTC": 1}}, held, {"BTC": 100})
+    assert plan.desired_positions["A"] == {"SOL": 2}
+    assert plan.external_changes == {"BTC": 1}
+    assert plan.contributions["BTC"] == ({"book_id": "B", "signed_quantity": 1},)
+    closing = net_book_changes({"A": {}, "B": None}, held, {"SOL": 50})
+    assert closing.external_changes == {"SOL": -2}
+    assert closing.contributions["SOL"] == ({"book_id": "A", "signed_quantity": -2},)
+
+
+@pytest.mark.parametrize("quantity", [2, 0.0049504950495049506])
+def test_fractional_book_allocations_conserve_beyond_default_decimal_context(quantity):
+    from decimal import Decimal, localcontext
+
+    from src.portfolio.book_plans import allocate_book_fill
+
+    allocations = allocate_book_fill(
+        quantity,
+        0.25005,
+        [
+            {"book_id": "A", "signed_quantity": 1},
+            {"book_id": "B", "signed_quantity": 2},
+        ],
+    )
+    with localcontext() as context:
+        context.prec = 60
+        assert sum(item["signed_quantity"] for item in allocations) == Decimal(str(quantity))
+        assert sum(item["fee"] for item in allocations) == Decimal("0.25005")
+
+
+def test_internal_netting_is_separate_from_conserved_partial_external_fills():
+    from decimal import Decimal
+
+    from src.portfolio.book_plans import allocate_book_fill, net_book_changes
+
+    plan = net_book_changes({"A": {"BTC": 10}, "B": {"BTC": -5}, "C": {"BTC": 5}}, {}, {"BTC": 100})
+    assert plan.external_changes == {"BTC": 10}
+    assert plan.internal_transfers == (
+        {
+            "kind": "internal_netting",
+            "instrument_id": "BTC",
+            "from_book": "B",
+            "to_book": "A",
+            "quantity": 5,
+            "price": 100,
+        },
+    )
+    allocations = allocate_book_fill(3, 0.17, plan.contributions["BTC"])
+    assert sum(row["signed_quantity"] for row in allocations) == Decimal("3")
+    assert sum(row["fee"] for row in allocations) == Decimal("0.17")
+    assert {row["book_id"]: row["signed_quantity"] for row in allocations} == {
+        "A": Decimal("1.5"),
+        "C": Decimal("1.5"),
+    }
+    with pytest.raises(ValueError, match="opposing intent"):
+        allocate_book_fill(
+            3,
+            0.17,
+            [{"book_id": "A", "signed_quantity": 4}, {"book_id": "B", "signed_quantity": -1}],
+        )

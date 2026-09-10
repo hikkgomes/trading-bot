@@ -446,6 +446,7 @@ def test_load_dotenv_handles_inline_comments_and_quoted_hashes(tmp_path, monkeyp
 def test_shipped_dotenv_example_builds_execution_config(monkeypatch):
     from src.execution.config import load_dotenv
 
+    monkeypatch.setattr(os, "environ", dict(os.environ))
     keys = (
         "FUTURES_EXCHANGE",
         "EXCHANGE_MARKET_TYPE",
@@ -2099,6 +2100,8 @@ def _protective_payload(
         "side": "sell",
         "amount": 1.0,
         "triggerPrice": 95.0,
+        "orderType": "STOP_MARKET",
+        "workingType": "CONTRACT_PRICE",
         "status": status,
         "filled": filled,
         "average": average,
@@ -2455,6 +2458,7 @@ def test_ccxt_places_binance_usdm_reduce_only_stop_market_and_validates_ack():
         "price": None,
         "params": {
             "stopLossPrice": 95.0,
+            "workingType": "CONTRACT_PRICE",
             "reduceOnly": True,
             "positionSide": "BOTH",
             "newClientOrderId": client_id,
@@ -2483,6 +2487,8 @@ def test_ccxt_uses_binance_algo_order_api_when_available():
                 "quantity": 1.0,
                 "triggerPrice": 95.0,
                 "algoStatus": self.status,
+                "orderType": "STOP_MARKET",
+                "workingType": "CONTRACT_PRICE",
                 "reduceOnly": True,
                 "positionSide": "BOTH",
             }
@@ -2515,10 +2521,12 @@ def test_ccxt_uses_binance_algo_order_api_when_available():
     assert client.calls[0] == (
         "post",
         {
-            "symbol": "BTC/USDT:USDT",
+            "symbol": "BTCUSDT",
             "side": "SELL",
             "positionSide": "BOTH",
             "type": "STOP_MARKET",
+            "algoType": "CONDITIONAL",
+            "workingType": "CONTRACT_PRICE",
             "quantity": 1.0,
             "triggerPrice": 95.0,
             "reduceOnly": True,
@@ -2534,7 +2542,7 @@ def test_ccxt_uses_binance_algo_order_api_when_available():
     assert cancelled.status is ProtectiveOrderStatus.CANCELED
     assert client.calls[1] == (
         "delete",
-        {"symbol": "BTC/USDT:USDT", "algoId": "987654321"},
+        {"symbol": "BTCUSDT", "algoId": "987654321"},
     )
     assert client.calls[2][0] == "get"
 

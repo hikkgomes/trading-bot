@@ -630,6 +630,8 @@ def _validate_historical_bootstrap(payload: Mapping[str, Any]) -> dict[str, Any]
             "producer_identity",
             "market_type",
             "minimum_history_days",
+            "history_as_of",
+            "data_plan",
             "symbols",
             "timeframe",
             "content_hash",
@@ -638,6 +640,8 @@ def _validate_historical_bootstrap(payload: Mapping[str, Any]) -> dict[str, Any]
     _strict_fields(payload, allowed, name="historical bootstrap")
     for field in ("product_id", "producer_identity", "market_type", "timeframe"):
         _required_text(payload, field)
+    if "history_as_of" in payload:
+        timestamp(_required_text(payload, "history_as_of"), field="history_as_of")
     symbols = payload.get("symbols")
     if not isinstance(symbols, Sequence) or isinstance(symbols, str) or not symbols:
         raise JobSchemaError("historical bootstrap symbols must be a non-empty list")

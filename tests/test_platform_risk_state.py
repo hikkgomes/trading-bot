@@ -209,7 +209,12 @@ def test_risk_measurements_mark_missing_factor_history_unavailable(tmp_path) -> 
     database.dispose()
 
 
-def test_risk_measurements_use_canonical_nav_for_open_position_loss(tmp_path) -> None:
+@pytest.mark.parametrize("book", [False, True])
+def test_risk_measurements_use_canonical_nav_for_open_position_loss(tmp_path, book) -> None:
+    from decimal import Decimal
+
+    from src.accounting.ledger import LedgerEntry, SqlLedgerStore
+
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'risk-nav.sqlite3'}")
     database.create_schema()
     for observed_at, value in (
@@ -222,6 +227,7 @@ def test_risk_measurements_use_canonical_nav_for_open_position_loss(tmp_path) ->
             "nav": value,
             "observed_at": observed_at,
             "components": {},
+            **({"portfolio_id": "portfolio-active-income"} if book else {}),
         }
         with database.engine.begin() as connection:
             connection.execute(
@@ -232,10 +238,31 @@ def test_risk_measurements_use_canonical_nav_for_open_position_loss(tmp_path) ->
                 )
             )
 
+    foreign = {**payload, "portfolio_id": "other-book", "nav": 1}
+    with database.engine.begin() as connection:
+        connection.execute(
+            nav_snapshot.insert().values(
+                id=canonical_hash(foreign), created_at=foreign["observed_at"], payload=foreign
+            )
+        )
+    SqlLedgerStore(database.engine, product_id="active_income").append(
+        LedgerEntry(
+            entry_id="other-book-loss",
+            product_id="active_income",
+            accounting_asset="USDT",
+            occurred_at=foreign["observed_at"],
+            postings={"expense:fees": Decimal(500), "cash": Decimal(-500)},
+            metadata={"pnl_effect": -500, "account_id": "other-account", "book_id": "other-book"},
+        )
+    )
+
     measurements = PortfolioRiskCalculator(database.engine).calculate(
         product_id="active_income",
         account_id="account-usdt",
-        product={"portfolio_id": "portfolio-active-income"},
+        product={
+            "portfolio_id": "portfolio-active-income",
+            **({"book_id": "this-book"} if book else {}),
+        },
         account={"paper_starting_balances": {"USDT": 1_000.0}},
         balances={"USDT": 950.0},
         positions={},
@@ -254,6 +281,7 @@ def test_risk_measurements_use_canonical_nav_for_open_position_loss(tmp_path) ->
 
     assert measurements.product_drawdown_fraction == pytest.approx(0.05)
     assert measurements.daily_pnl_fraction == pytest.approx(-0.05)
+    assert measurements.global_drawdown_fraction == 0
     database.dispose()
 
 

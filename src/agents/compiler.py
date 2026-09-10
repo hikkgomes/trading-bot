@@ -16,6 +16,7 @@ from src.research.providers import (
     DIRECTIONAL_DSL_FAMILIES,
     provider_candidate,
 )
+from src.strategies.position_state import directional_position_model
 
 
 class AgentCompilationError(ValueError):
@@ -127,7 +128,11 @@ def compile_openclaw_candidate(
             "required_nodes": list(thesis.permitted_features),
         },
         signal_model=source_payload,
-        position_model={"kind": "volatility_scaled", "signal_timing": "next_bar"},
+        position_model=(
+            {"kind": "target_allocation", "signal_timing": "next_bar"}
+            if proposal.product_id == "btc_accumulation"
+            else directional_position_model(96)
+        ),
         execution_preferences={"policy": "market", "paper_only_until_approved": True},
         risk_policy={"product_policy": proposal.product_id},
         validation_policy={

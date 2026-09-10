@@ -2,11 +2,14 @@
 
 import datetime as dt
 import math
+import os
+import uuid
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.engine import make_url
 
 from src.accounting.paper_account import configured_paper_accounts
 from src.data.binance_market import normalise_public_event
@@ -40,6 +43,7 @@ from src.research.datasets import (
     SqlCanonicalDatasetRepository,
 )
 from src.research.executors import DataUnavailableError
+from src.research.rounds import ResearchRoundCoordinator
 from src.research.store import SqlResearchStore
 from src.research.theses import SqlThesisRegistry
 from src.services import supervisor
@@ -58,7 +62,36 @@ NOW = "2026-09-07T00:00:00+00:00"
 INSTRUMENT = "binance:futures:BTCUSDT:USDT"
 
 
-def _bundle(database, *, source_revision=0):
+@pytest.fixture(params=["sqlite", "postgresql"])
+def lifecycle_database(request, tmp_path):
+    if request.param == "sqlite":
+        database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'lifecycle.sqlite3'}")
+        database.create_schema()
+        yield database
+        database.dispose()
+        return
+    url = os.environ.get("TRADING_PLATFORM_DATABASE_URL", "")
+    if not url.startswith("postgresql"):
+        pytest.skip("requires isolated PostgreSQL for the full candidate lifecycle")
+    base = make_url(url)
+    name = "candidate_lifecycle_" + uuid.uuid4().hex[:16]
+    admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+    database = None
+    with admin.connect() as connection:
+        connection.execute(text(f"CREATE DATABASE {name}"))
+    try:
+        database = PlatformDatabase(base.set(database=name).render_as_string(hide_password=False))
+        database.migrate()
+        yield database
+    finally:
+        if database is not None:
+            database.dispose()
+        with admin.connect() as connection:
+            connection.execute(text(f"DROP DATABASE {name} WITH (FORCE)"))
+        admin.dispose()
+
+
+def _bundle(database, *, source_revision=0, extra_market_scale=None, data_plan_id=None):
     instrument = Instrument(
         venue="binance",
         market_type=MarketType.FUTURES,
@@ -71,12 +104,15 @@ def _bundle(database, *, source_revision=0):
         minimum_quantity=0.000001,
         minimum_notional=5,
     )
+    instruments = (instrument,)
+    if extra_market_scale is not None:
+        instruments += (replace(instrument, base_asset="SOL", exchange_symbol="SOLUSDT"),)
     snapshot_id = SqlUniverseStore(database.engine).record_snapshot(
         universe_id="lifecycle-fixture",
         observed_at="2025-01-01T00:00:00+00:00",
-        observations=(
+        observations=tuple(
             InstrumentObservation(
-                instrument=instrument,
+                instrument=item,
                 listing_age_days=2000,
                 quote_volume=1000000000,
                 trade_count=1000000,
@@ -86,7 +122,8 @@ def _bundle(database, *, source_revision=0):
                 realised_volatility=0.2,
                 depth_notional=10000000,
                 data_completeness=1,
-            ),
+            )
+            for item in instruments
         ),
         policy=UniverseEligibilityPolicy(),
     )
@@ -117,8 +154,36 @@ def _bundle(database, *, source_revision=0):
             "start": rows[0]["timestamp"],
             "end": (time + dt.timedelta(hours=1)).isoformat(),
         }
+        if extra_market_scale is not None:
+            rows.extend(
+                [
+                    {
+                        **row,
+                        "instrument_id": instruments[1].instrument_id,
+                        **{
+                            key: row[key] * extra_market_scale
+                            for key in ("open", "high", "low", "close")
+                        },
+                        "funding_rate": extra_market_scale / 1000,
+                        "funding_events": [
+                            {
+                                "type": "funding",
+                                "timestamp": row["timestamp"],
+                                "symbol": instruments[1].instrument_id,
+                                "event_id": row["timestamp"],
+                                "mark_price": row["close"] * extra_market_scale,
+                                "funding_rate": extra_market_scale / 1000,
+                            }
+                        ],
+                    }
+                    for row in rows.copy()
+                ]
+            )
+            rows.reverse()
         payloads[role] = CanonicalResearchDatasetBuilder._bar_payload(rows, timeframe="1h")
         payloads[role]["source_revision"] = source_revision
+        if data_plan_id:
+            payloads[role]["data_plan_id"] = data_plan_id
     return CanonicalResearchDatasetBuilder(database.engine).build(
         "active_income",
         intervals=intervals,
@@ -127,7 +192,7 @@ def _bundle(database, *, source_revision=0):
         feature_manifest_id=canonical_hash("fixture-features"),
         cost_model_id=canonical_hash("fixture-costs"),
         parameter_set_id=canonical_hash("fixture-parameters"),
-        instrument_scope=(INSTRUMENT,),
+        instrument_scope=tuple(item.instrument_id for item in instruments),
         created_at=NOW,
         availability_timestamp=NOW,
     )
@@ -165,13 +230,15 @@ def _candidate(database, bundle):
 
 @pytest.mark.parametrize("approved_research", [False, True])
 def test_fresh_candidate_reaches_paper_fill_and_honest_forward_decision(
-    tmp_path, monkeypatch, approved_research
+    tmp_path, monkeypatch, approved_research, lifecycle_database
 ):
-    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'lifecycle.sqlite3'}")
-    database.create_schema()
+    database = lifecycle_database
     bundle = _bundle(database)
     candidate = _candidate(database, bundle)
     assert candidate.definition.data_requirements["bars"] == "1h"
+    ResearchRoundCoordinator(database.engine).close_finite(
+        bundle.bundle_id, product_id="active_income", candidate_ids=[candidate.candidate_id], at=NOW
+    )
     configuration = load_split_configuration(Path(__file__).resolve().parents[1] / "config")
     for configured_product in configuration["products"]["products"]:
         if configured_product["product_id"] == "active_income":
@@ -236,7 +303,7 @@ def test_fresh_candidate_reaches_paper_fill_and_honest_forward_decision(
         engine=database.engine, products={"active_income": product}, node_id="fixture"
     )
     clock = [NOW]
-    monkeypatch.setattr("src.services.research_jobs.utc_now", lambda: clock[0])
+    monkeypatch.setattr("src.services.research_jobs.utc_now", lambda clock=clock: clock[0])
     for index, stage in enumerate(("screening", "development", "robustness", "protected")):
         clock[0] = (dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=index)).isoformat()
         scheduler.run_once(now=clock[0])
@@ -347,7 +414,9 @@ def test_fresh_candidate_reaches_paper_fill_and_honest_forward_decision(
     assert window["source_event_id"] == promoted["promotion_event_id"]
     assert window["payload"]["family_evidence"]["family"] == candidate.definition.family
     assert assignments[0]["risk_budget"] > 0
-    state = configured_paper_accounts(database.engine, configuration)["active_income"].state()
+    from src.portfolio.books import paper_book_account
+
+    state = paper_book_account(database.engine, assignments[0]["payload"]["book_id"]).state()
     assert state is not None and state.balances == {"USDT": 10000.0}
     assert state.observed_at == assignments[0]["assigned_at"]
     restarted = PlatformScheduler(
@@ -398,7 +467,7 @@ def test_fresh_candidate_reaches_paper_fill_and_honest_forward_decision(
 
 
 def _forward_services(database, configuration, queue, clock, root, monkeypatch):
-    monkeypatch.setattr(supervisor, "utc_now", lambda: clock[0])
+    monkeypatch.setattr(supervisor, "utc_now", lambda clock=clock: clock[0])
     common = {"database": database, "configuration": configuration, "node_id": "fixture"}
     history = tuple(
         _candle((dt.datetime.fromisoformat(NOW) - dt.timedelta(hours=index)).isoformat(), 100, 100)
@@ -467,6 +536,7 @@ def _forward_services(database, configuration, queue, clock, root, monkeypatch):
         )
         written = writer()
         assert written["reason_code"] == "market_event_written", written
+        trading[-1]()
         featured = feature()
         assert featured["reason_code"] == "features_persisted", featured
         evaluated = strategy()
@@ -478,7 +548,9 @@ def _forward_services(database, configuration, queue, clock, root, monkeypatch):
             healthy=True,
             payload={"completed_job": evaluated["job_id"]},
         )
-        results = [cycle() for cycle in trading]
+        results = [trading[0]()]
+        results.extend(trading[1]() for _ in range(3))
+        results.extend(cycle() for cycle in trading[2:])
         assert not any(result.get("error_type") for result in results), results
         outcomes.append(results)
     with database.engine.connect() as connection:
@@ -557,7 +629,9 @@ def _repair_window_cycle(database, configuration, queue, clock, services, assign
     }
     old_summary_id, old_summary = evidence.build_summary(**scope, observed_at=clock[0])
     assert incident_id in old_summary.data_gap_ids
-    ledger = configured_paper_accounts(database.engine, configuration)["active_income"]
+    from src.portfolio.books import paper_book_account
+
+    ledger = paper_book_account(database.engine, assignment["payload"]["book_id"])
     state_before = ledger.state()
     with database.engine.connect() as connection:
         positions_before = connection.execute(select(position.c.payload)).scalars().all()
@@ -651,12 +725,13 @@ def _repair_window_cycle(database, configuration, queue, clock, services, assign
 
 
 def _resume_paper_cycle(database, configuration, queue, clock, services, assignment):
+    from src.portfolio.books import paper_book_account
     from src.research.canonical import (
         SqlActiveStrategyAssignmentRepository,
         SqlForwardEvidenceRepository,
     )
 
-    ledger = configured_paper_accounts(database.engine, configuration)["active_income"]
+    ledger = paper_book_account(database.engine, assignment["payload"]["book_id"])
     state_before = ledger.state()
     with database.engine.connect() as connection:
         positions_before = connection.execute(select(position.c.payload)).scalars().all()
@@ -724,7 +799,9 @@ def _resume_paper_cycle(database, configuration, queue, clock, services, assignm
         healthy=True,
         payload={"completed_job": evaluated["job_id"]},
     )
-    results = [cycle() for cycle in trading]
+    results = [trading[0]()]
+    results.extend(trading[1]() for _ in range(3))
+    results.extend(cycle() for cycle in trading[2:])
     assert not any(result.get("error_type") for result in results), results
     clock[0] = (dt.datetime.fromisoformat(clock[0]) + dt.timedelta(minutes=1)).isoformat()
     queue.enqueue(
@@ -754,14 +831,16 @@ def _resume_paper_cycle(database, configuration, queue, clock, services, assignm
     previous_position = next(
         row
         for row in positions_before
-        if row["instrument_id"] == INSTRUMENT and row["portfolio_id"] == assignment["portfolio_id"]
+        if row["instrument_id"] == INSTRUMENT
+        and row["portfolio_id"] == assignment["payload"]["position_portfolio_id"]
     )
     with database.engine.connect() as connection:
         current_positions = connection.execute(select(position.c.payload)).scalars().all()
     current_position = next(
         row
         for row in current_positions
-        if row["instrument_id"] == INSTRUMENT and row["portfolio_id"] == assignment["portfolio_id"]
+        if row["instrument_id"] == INSTRUMENT
+        and row["portfolio_id"] == assignment["payload"]["position_portfolio_id"]
     )
     assert observed["observation"]["position"]["quantity"] == current_position["quantity"]
     assert (
@@ -809,7 +888,7 @@ def _resume_paper_cycle(database, configuration, queue, clock, services, assignm
         SqlPortfolioRepository(database.engine).prior_strategy_state(
             assignment_id=other,
             version_id=resumed["strategy_version_id"],
-            portfolio_id=resumed["portfolio_id"],
+            portfolio_id=resumed["payload"]["position_portfolio_id"],
             instrument_id=INSTRUMENT,
             before=clock[0],
             interval_seconds=3600,
@@ -903,6 +982,14 @@ def test_cohort_waits_for_all_trials_and_cannot_expand_after_freeze(tmp_path, mo
         ),
     )
     ResearchCoordinator(SqlResearchStore(database.engine)).submit(second)
+    with pytest.raises(CohortPending, match="epoch must close"):
+        prepare_cohort(database.engine, first, now=NOW, policy_hash="not-opened")
+    ResearchRoundCoordinator(database.engine).close_finite(
+        bundle.bundle_id,
+        product_id="active_income",
+        candidate_ids=[first.candidate_id, second.candidate_id],
+        at=NOW,
+    )
     configuration = load_split_configuration(Path(__file__).resolve().parents[1] / "config")
     product = next(
         row for row in configuration["products"]["products"] if row["product_id"] == "active_income"
@@ -927,7 +1014,7 @@ def test_cohort_waits_for_all_trials_and_cannot_expand_after_freeze(tmp_path, mo
         engine=database.engine, products={"active_income": product}, node_id="fixture"
     )
     clock = [NOW]
-    monkeypatch.setattr("src.services.research_jobs.utc_now", lambda: clock[0])
+    monkeypatch.setattr("src.services.research_jobs.utc_now", lambda clock=clock: clock[0])
     for step, stage in enumerate(("screening", "development", "robustness")):
         clock[0] = (dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=step)).isoformat()
         scheduler.run_once(now=clock[0])
@@ -986,6 +1073,12 @@ def test_cohort_waits_for_all_trials_and_cannot_expand_after_freeze(tmp_path, mo
     assert set(result["adjusted_pvalues"]) == {first.candidate_id, second.candidate_id}
     assert result["qualification_authority"] is False
     revised = _candidate(database, _bundle(database, source_revision=1))
+    ResearchRoundCoordinator(database.engine).close_finite(
+        revised.dataset_bundle_id,
+        product_id="active_income",
+        candidate_ids=[revised.candidate_id],
+        at=clock[0],
+    )
     with pytest.raises(DataUnavailableError, match="overlaps an already opened cohort"):
         prepare_cohort(
             database.engine, revised, now=clock[0], policy_hash=handlers.evidence_policy.policy_hash
@@ -1037,3 +1130,99 @@ def _write_market_support(queue, writer, at, index, price):
         )
         result = writer()
         assert result["reason_code"] == "market_event_written", result
+
+
+def test_protected_economic_result_ignores_other_market_and_excludes_exhausted_worker(
+    tmp_path, monkeypatch
+):
+    from src.data.database import holdout_outcome
+
+    protected_results = []
+    for scale in (1, 1000):
+        database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / f'scope-{scale}.sqlite3'}")
+        database.create_schema()
+        bundle = _bundle(database, extra_market_scale=scale)
+        candidate = _candidate(database, bundle)
+        excluded = replace(
+            candidate,
+            definition=replace(
+                candidate.definition,
+                signal_model={
+                    **candidate.definition.signal_model,
+                    "parameters": {"fast": 3, "slow": 5, "allow_short": True},
+                },
+            ),
+        )
+        ResearchCoordinator(SqlResearchStore(database.engine)).submit(excluded)
+        ResearchRoundCoordinator(database.engine).close_finite(
+            bundle.bundle_id,
+            product_id="active_income",
+            candidate_ids=[candidate.candidate_id, excluded.candidate_id],
+            at=NOW,
+        )
+        product = {"product_id": "active_income", "dataset_timeframe": "1h"}
+        scheduler = PlatformScheduler(
+            engine=database.engine, products={"active_income": product}, node_id="fixture"
+        )
+        scheduler._mark_candidate_dead_letter(excluded.candidate_id, "development", NOW)
+        queue = DatabaseJobQueue(database.engine)
+        queue.register_worker(
+            worker_id="scope-worker",
+            node_id="fixture",
+            role="research",
+            capabilities=("evaluate_candidate",),
+            observed_at=NOW,
+        )
+        handlers = DatabaseResearchJobHandlers(
+            SqlResearchStore(database.engine),
+            configuration=load_split_configuration(Path(__file__).resolve().parents[1] / "config"),
+            dataset_resolver=CanonicalDatasetResolver(
+                SqlCanonicalDatasetRepository(database.engine)
+            ),
+        )
+        monkeypatch.setattr(
+            "src.services.scheduler.AUTONOMOUS_SCHEDULES",
+            (ScheduleSpec("candidate_evaluation", 1),),
+        )
+        clock = [NOW]
+        monkeypatch.setattr("src.services.research_jobs.utc_now", lambda clock=clock: clock[0])
+        protected = False
+        for tick in range(6):
+            clock[0] = (dt.datetime.fromisoformat(NOW) + dt.timedelta(seconds=tick)).isoformat()
+            scheduler.run_once(now=clock[0])
+            claimed = queue.claim(
+                worker_id="scope-worker",
+                now=clock[0],
+                lease_seconds=60,
+                names=("evaluate_candidate",),
+            )
+            assert claimed is not None
+            result = handlers.evaluate_candidate(claimed, lambda claimed=claimed: claimed)
+            if result.get("reason_code") == "cohort_pending":
+                queue.defer(
+                    claimed,
+                    available_at=(
+                        dt.datetime.fromisoformat(clock[0]) + dt.timedelta(seconds=1)
+                    ).isoformat(),
+                    reason=result["_defer_reason"],
+                )
+                continue
+            assert result["accepted"], result
+            queue.complete(claimed, completed_at=clock[0], outcome=result)
+            if result["stage"] == "protected":
+                protected = True
+                break
+        assert protected
+        with database.engine.connect() as connection:
+            cohort = connection.execute(select(selection_cohort.c.payload)).scalar_one()
+            outcome = connection.execute(select(holdout_outcome.c.payload)).scalar_one()
+        assert cohort["excluded_trials"][excluded.candidate_id] == "infrastructure_exhausted"
+        protected_results.append(outcome)
+        database.dispose()
+    left, right = protected_results
+    assert left["metrics"] == right["metrics"]
+    assert left["selection_stream"] == right["selection_stream"]
+    for outcome in protected_results:
+        receipt = outcome["execution_receipt"]
+        assert receipt["evaluation_input"]["instrument_scope"] == [INSTRUMENT]
+        assert receipt["evaluation_input"]["dataset_roles"] == ["protected_holdout"]

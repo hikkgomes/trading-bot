@@ -294,7 +294,9 @@ class DatabasePortfolioSourceService:
                 stablecoin_balance=stablecoin_balance,
                 stablecoin_per_btc=price,
             )
-            previous = self.accounting.latest_nav(product_id=product_id, at=observed_at)
+            previous = self.accounting.latest_nav(
+                product_id=product_id, at=observed_at, portfolio_id=str(product["portfolio_id"])
+            )
             passive = (
                 _initial_btc_benchmark(btc_balance, stablecoin_balance, price, product)
                 if previous is None
@@ -538,6 +540,12 @@ class DatabasePortfolioSourceService:
                     ),
                     risk_snapshot.c.payload["kind"].as_string() == "market_data_input",
                     risk_snapshot.c.payload["product_id"].as_string() == product_id,
+                    or_(
+                        product.get("book_id") is None,
+                        risk_snapshot.c.payload["instrument_id"]
+                        .as_string()
+                        .in_(product.get("instrument_ids", ())),
+                    ),
                 )
                 .order_by(risk_snapshot.c.created_at.desc(), risk_snapshot.c.id.desc())
             ).mappings()
@@ -944,6 +952,9 @@ class DatabasePortfolioStateWorker:
 
     def _merge_source(self, assembled: dict[str, Any], source: str, identity: str) -> str:
         snapshot = self.store.get(identity)
+        if "book_id" in assembled and assembled["book_id"] != snapshot.get("book_id"):
+            raise ValueError("portfolio state sources belong to different books")
+        assembled["book_id"] = snapshot.get("book_id")
         if snapshot.get("kind") not in {source, f"{source}_snapshot"}:
             raise ValueError(f"portfolio state {source} snapshot has the wrong kind")
         if str(snapshot.get("product_id") or "") != assembled["product_id"]:
@@ -1006,7 +1017,11 @@ def portfolio_state_policies(
                 float(global_limits["maximum_database_staleness_seconds"]),
             ),
             "risk_policy_ids": [
-                risk_policy_identity(risk_policy_id, risk, account_id=str(product["account_id"]))
+                risk_policy_identity(
+                    risk_policy_id,
+                    risk,
+                    account_id=str(product["account_id"]),
+                )
             ],
             "portfolio_risk_budget": float(
                 limits.get("maximum_exposure", limits.get("maximum_gross", 1.0))

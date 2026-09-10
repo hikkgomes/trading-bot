@@ -248,13 +248,17 @@ def _candidate_supported_instruments(
 
 
 def _candidate_scope_context(candidate: Candidate, context: Mapping[str, Any]) -> dict[str, Any]:
-    declared = candidate.definition.universe.get("instrument_ids")
+    declared = (
+        candidate.definition.universe.get("instrument_ids")
+        or candidate.definition.universe.get("symbols")
+        or context.get("instrument_scope")
+    )
     if not isinstance(declared, list | tuple) or not declared:
-        return dict(context)
+        raise DataUnavailableError("candidate evaluation requires a frozen instrument scope")
     scope = tuple(dict.fromkeys(str(value) for value in declared if str(value).strip()))
     selected = {item.upper() for item in scope}
     result = dict(context)
-    for field in ("market_frame", "feature_rows", "bars"):
+    for field in ("market_frame", "feature_rows", "bars", "warmup_market_frame", "funding_events"):
         rows = result.get(field)
         if isinstance(rows, list | tuple):
             result[field] = tuple(
@@ -282,7 +286,55 @@ def _candidate_scope_context(candidate: Candidate, context: Mapping[str, Any]) -
         if isinstance(history, list | tuple):
             result[field_name] = _scoped_history(history, value_field, selected)
     result["instrument_scope"] = scope
+    result = _rebuild_scoped_series(result)
+    result["evaluation_input"] = {
+        "schema": "research.evaluation_input/v1",
+        "candidate_id": candidate.candidate_id,
+        "strategy_version_id": candidate.definition.strategy_version_id,
+        "instrument_scope": list(scope),
+        "dataset_snapshot_ids": list(context.get("dataset_snapshot_ids", ())),
+        "dataset_roles": [row.get("role") for row in context.get("dataset_receipts", ())],
+        "timeframe": result.get("timeframe"),
+        "feature_manifest_id": context.get("feature_manifest_id"),
+        "cost_model_id": context.get("cost_model_id"),
+        "data_plan_id": context.get("data_plan_id"),
+        "rows_hash": canonical_hash(
+            {
+                field: result.get(field)
+                for field in ("market_frame", "feature_rows", "warmup_market_frame")
+            }
+        ),
+    }
     return result
+
+
+def _rebuild_scoped_series(context: dict[str, Any]) -> dict[str, Any]:
+    from src.research.datasets import CanonicalResearchDatasetBuilder
+
+    rows = context.get("market_frame")
+    if not isinstance(rows, list | tuple):
+        return context
+    if not rows:
+        raise DataUnavailableError("candidate has no market rows in its declared scope")
+    actual = {str(row.get("instrument_id") or row.get("symbol")) for row in rows}
+    if not all(
+        any(_value_in_scope(value, {instrument.upper()}) for value in actual)
+        for instrument in context["instrument_scope"]
+    ):
+        raise DataUnavailableError("candidate panel is missing a declared instrument")
+    derived = CanonicalResearchDatasetBuilder._bar_payload(
+        list(rows),
+        timeframe=context.get("timeframe"),
+        warmup=tuple(context.get("warmup_market_frame", ())),
+    )
+    return {
+        **context,
+        **{
+            key: value
+            for key, value in derived.items()
+            if key not in {"feature_rows", "market_frame", "bars", "warmup_market_frame"}
+        },
+    }
 
 
 def _row_in_scope(row: Mapping[str, Any], scope: set[str]) -> bool:
@@ -414,6 +466,7 @@ class DatabaseResearchJobHandlers:
             symbols=tuple(str(symbol) for symbol in symbols),
             minimum_history_days=int(claimed.payload["minimum_history_days"]),
             timeframe=str(claimed.payload["timeframe"]),
+            data_plan=claimed.payload.get("data_plan"),
             heartbeat=renew,
         )
         result: dict[str, Any] = {
@@ -555,6 +608,8 @@ class DatabaseResearchJobHandlers:
         snapshot_ids = tuple(str(item) for item in payload["dataset_snapshot_hashes"])
         bundle_id = _optional_text(payload.get("dataset_bundle_id"))
         if self.dataset_bundle_service is not None and bundle_id is None:
+            from src.research.data_plan import ResearchDataPlan
+
             built = self.dataset_bundle_service.run(
                 product_id=product_id,
                 universe_id=str(payload.get("universe_id") or ""),
@@ -565,6 +620,9 @@ class DatabaseResearchJobHandlers:
                     or payload.get("available_at")
                 ),
                 timeframe=_optional_text(payload.get("dataset_timeframe")),
+                data_plan=ResearchDataPlan.from_payload(payload["data_plan"])
+                if payload.get("data_plan")
+                else None,
             )
             if built.state != "ready" or built.bundle_id is None:
                 return None, {
@@ -609,9 +667,43 @@ class DatabaseResearchJobHandlers:
     ) -> dict[str, Any]:
         """Compile safe campaigns into the same candidate queue as all providers."""
 
+        from src.research.rounds import ResearchRoundCoordinator
+
+        rounds = ResearchRoundCoordinator(self.store.engine)
+        payload = self._resolve_generation_dataset(claimed.payload)
+        if not payload.get("dataset_bundle_id"):
+            return self._generation_waiting_response(
+                str(payload["product_id"]),
+                universe_available=bool(payload.get("instrument_universe")),
+            )
+        if not payload.get("round_id"):
+            limits = (self.configuration or {}).get("research", {}).get("search_budgets", {})
+            request = rounds.claim(
+                payload,
+                now=_runtime_data_timestamp(payload, "submitted_at"),
+                epoch_budget=int(limits.get("maximum_candidates_per_epoch", 100)),
+                daily_budget=int(limits.get("maximum_candidates_per_day", 100)),
+            )
+            if request is None:
+                return {"state": "no_new_round", "candidate_ids": [], "candidate_count": 0}
+            payload = request
+        return rounds.complete(
+            str(payload["round_id"]),
+            produce=lambda connection, request: self._generate_hypotheses(
+                replace(claimed, payload=dict(request)), renew, connection=connection
+            ),
+        )
+
+    def _generate_hypotheses(self, claimed, renew, *, connection=None):
         payload = self._resolve_generation_dataset(claimed.payload)
         product_id, universe, snapshot_ids = self._generation_inputs(payload)
-        feedback_store = SqlGenerationFeedbackStore(self.store.engine)
+        store = SqlResearchStore(self.store.engine, connection=connection)
+        feedback_store = SqlGenerationFeedbackStore(
+            self.store.engine,
+            connection=connection,
+            as_of=payload.get("feedback_at"),
+            feedback_ids=payload.get("feedback_ids"),
+        )
         if not universe or not snapshot_ids:
             self._record_generation_waiting(
                 product_id=product_id,
@@ -623,10 +715,13 @@ class DatabaseResearchJobHandlers:
         generator = HypothesisGenerator(
             product=product_id,
             instrument_universe=universe,
-            memory=SqlHypothesisMemory(self.store.engine),
+            memory=SqlHypothesisMemory(self.store.engine, connection=connection),
             feedback_store=feedback_store,
         )
-        parent_candidates = self.store.development_parents()
+        parent_candidates = store.development_parents(
+            as_of=payload.get("feedback_at"), stage_ids=payload.get("development_stage_ids")
+        )
+        bundle, plan = self._generation_plan(payload)
         hypotheses = generator.generate(
             dataset_snapshot_hashes=snapshot_ids,
             submitted_at=str(payload["submitted_at"]),
@@ -640,8 +735,8 @@ class DatabaseResearchJobHandlers:
                 else None
             ),
             parent_candidates=parent_candidates,
+            dataset_plan=plan,
         )
-        bundle, plan = self._generation_plan(payload)
         registered = self._register_hypotheses(
             hypotheses,
             renew=renew,
@@ -649,6 +744,7 @@ class DatabaseResearchJobHandlers:
             bundle=bundle,
             observed_at=str(payload["submitted_at"]),
             feedback_store=feedback_store,
+            store=store,
         )
         return {
             "product_id": product_id,
@@ -664,8 +760,14 @@ class DatabaseResearchJobHandlers:
         if snapshot_ids or self.dataset_bundle_service is None or bundle_id is not None:
             return resolved
         observed_at = _runtime_data_timestamp(payload, "submitted_at", "available_at")
+        from src.research.data_plan import ResearchDataPlan
+
         bundle = SqlDatasetBundleRepository(self.store.engine).latest_ready(
-            str(payload["product_id"]), at=observed_at
+            str(payload["product_id"]),
+            at=observed_at,
+            data_plan_id=ResearchDataPlan.from_payload(payload["data_plan"]).plan_id
+            if payload.get("data_plan")
+            else None,
         )
         if bundle is None:
             return resolved
@@ -759,12 +861,14 @@ class DatabaseResearchJobHandlers:
         bundle: Any | None,
         observed_at: str,
         feedback_store: SqlGenerationFeedbackStore,
+        store: SqlResearchStore,
     ) -> list[str]:
-        thesis_registry = SqlThesisRegistry(self.store.engine)
-        coordinator = ResearchCoordinator(self.store)
+        thesis_registry = SqlThesisRegistry(store.engine, connection=store.connection)
+        coordinator = ResearchCoordinator(store)
         registered: list[str] = []
         for hypothesis in hypotheses:
-            renew()
+            if store.connection is None:
+                renew()
             hypothesis = self._bind_generation_plan(hypothesis, plan=plan, bundle=bundle)
             try:
                 thesis_registry.register(hypothesis.thesis)
@@ -899,7 +1003,9 @@ class DatabaseResearchJobHandlers:
             protected_context = claim.get("protected_context")
             if not isinstance(protected_context, Mapping):
                 raise JobSchemaError("protected holdout worker did not resolve its dataset")
-            frozen_context = self.context_builders.build(candidate, protected_context)
+            frozen_context = self.context_builders.build(
+                candidate, _candidate_scope_context(candidate, protected_context)
+            )
             execution = self.executors.execute(
                 candidate,
                 {

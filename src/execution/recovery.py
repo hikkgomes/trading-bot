@@ -19,6 +19,7 @@ from src.execution.reconciler import ReconciliationResult
 
 
 class RecoveryActionType(StrEnum):
+    CANCEL_ORDER = "cancel_order"
     CANCEL_UNKNOWN_ORDER = "cancel_unknown_order"
     RECONCILE_ORDER = "reconcile_order"
     RECONCILE_POSITION = "reconcile_position"

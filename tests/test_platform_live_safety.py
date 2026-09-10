@@ -8,7 +8,7 @@ from src.accounting.ledger import Ledger, SqlLedgerStore
 from src.data.binance_user_stream import normalise_user_event
 from src.data.database import PlatformDatabase
 from src.domain._codec import to_primitive
-from src.domain.orders import Fill, OrderIntent, OrderSide, OrderType
+from src.domain.orders import Fill, OrderIntent, OrderSide, OrderType, ProtectionKind
 from src.execution.broker import (
     BrokerFill,
     BrokerIncome,
@@ -41,6 +41,7 @@ class NativeBroker:
         self.trades = {}
         self.trade_queries = []
         self.external_positions = []
+        self.parent_cancellations = 0
         self.config = SimpleNamespace(market_type="futures")
 
     def list_account_futures_positions(self):
@@ -53,7 +54,9 @@ class NativeBroker:
     def supports_native_protective_stops(self):
         return True
 
-    def place_protective_stop(self, *, symbol, side, qty, trigger_price, client_id):
+    def place_protective_stop(
+        self, *, symbol, side, qty, trigger_price, client_id, kind=ProtectionKind.STOP
+    ):
         self.native = ProtectiveOrder(
             symbol,
             BrokerSide(side.value),
@@ -69,6 +72,8 @@ class NativeBroker:
         return self.native
 
     def query_order(self, **kwargs):
+        if kwargs["exchange_order_id"] == "parent-1":
+            return BrokerOrderState("parent-1", "parent-client", "cancelled", 1, 100)
         assert kwargs["exchange_order_id"] == "child-1"
         quantity = sum(trade.quantity for trade in self.trades.values())
         return BrokerOrderState(
@@ -80,15 +85,40 @@ class NativeBroker:
         )
 
     def query_order_fills(self, **kwargs):
+        if kwargs["exchange_order_id"] == "parent-1":
+            return (
+                BrokerFill(
+                    "entry-trade",
+                    "parent-1",
+                    "parent-client",
+                    "BTCUSDT",
+                    BrokerSide.BUY,
+                    1,
+                    100,
+                    0.1,
+                    1788911999,
+                    "USDT",
+                ),
+            )
         cursor = int(kwargs.get("from_trade_id", "0"))
         self.trade_queries.append(cursor)
         return tuple(trade for trade in self.trades.values() if int(trade.trade_id) >= cursor)
 
+    def cancel_order(self, **kwargs):
+        assert kwargs["exchange_order_id"] == "parent-1"
+        self.parent_cancellations += 1
+        return self.query_order(**kwargs)
+
 
 @pytest.mark.parametrize("transport", ["user_stream", "rest_recovery"])
 def test_native_trigger_child_fills_reconcile_once_through_shared_ledger(tmp_path, transport):
+    from test_platform_execution_recovery import _allocation_books
+
+    from src.portfolio.books import book_balances
+
     database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'protection.sqlite3'}")
     database.create_schema()
+    book = _allocation_books(database, "account", "native-child")[0]
     orders = OrderManager(SqlOrderStore(database.engine))
     positions = PositionManager(SqlPositionStore(database.engine))
     queue = DatabaseJobQueue(database.engine)
@@ -100,6 +130,7 @@ def test_native_trigger_child_fills_reconcile_once_through_shared_ledger(tmp_pat
         observed_at=NOW,
     )
     broker = NativeBroker()
+    entry_at = "2026-09-08T23:59:59+00:00"
     service = LiveProtectiveStopService(
         stop_manager=StopManager(SqlStopStore(database.engine)),
         venues={
@@ -119,18 +150,28 @@ def test_native_trigger_child_fills_reconcile_once_through_shared_ledger(tmp_pat
         "portfolio",
         INSTRUMENT,
         OrderSide.BUY,
-        1,
+        2,
         OrderType.MARKET,
-        NOW,
+        entry_at,
+        strategy_contributions={book: 1},
         metadata={
             "reference_price": 100,
             "protective_stop_price": 95,
-            "target_metadata": {"account_id": "account", "execution_environment": "testnet"},
+            "target_metadata": {
+                "account_id": "account",
+                "execution_environment": "testnet",
+                "book_contributions": [{"book_id": book, "signed_quantity": 2}],
+            },
         },
     )
     orders.create(entry)
-    service.prepare_entry("active_income", entry, NOW)
+    service.prepare_entry("active_income", entry, entry_at)
     orders.persist_for_submission(entry.order_id)
+    orders.bind_client_order_id(entry.order_id, client_order_id="parent-client")
+    orders.submitted(entry.order_id)
+    orders.bind_exchange_acknowledgement(
+        entry.order_id, exchange_order_id="parent-1", client_order_id="parent-client"
+    )
     FinancialApplication(
         database.engine,
         FinancialScope(
@@ -149,11 +190,13 @@ def test_native_trigger_child_fills_reconcile_once_through_shared_ledger(tmp_pat
             1,
             100,
             0.1,
-            NOW,
+            entry_at,
             fee_asset="USDT",
             metadata={"trade_id": "entry-trade"},
         )
     )
+    orders.reload()
+    entry = orders.get(entry.order_id)
     service.on_fill("active_income", entry, 1, NOW)
     evidence = {
         "native_stop_created": False,
@@ -177,6 +220,7 @@ def test_native_trigger_child_fills_reconcile_once_through_shared_ledger(tmp_pat
         "algo_update_processed": False,
     }
     assert broker.native.qty == 1
+    assert orders.get(entry.order_id).filled_quantity == 1 < entry.quantity
     broker.native = replace(
         broker.native,
         status=ProtectiveOrderStatus.TRIGGERED,
@@ -225,6 +269,11 @@ def test_native_trigger_child_fills_reconcile_once_through_shared_ledger(tmp_pat
     positions.reload()
     assert positions.get("portfolio", INSTRUMENT).quantity == 1
     recovery = _recovery_worker(database, orders, positions, ledger, broker, queue, service)
+    recovered = recovery.run_once(now=NOW)
+    assert recovered["reason_code"] == "live_recovery_verified", recovered
+    assert broker.parent_cancellations == 1
+    assert orders.get(entry.order_id).status.value == "reconciled"
+    assert orders.get(entry.order_id).filled_quantity == 1
     for event_id, trade_id, quantity, cumulative in (
         ("partial", 2, 0.4, 0.4),
         ("partial-replay", 2, 0.4, 0.4),
@@ -279,6 +328,8 @@ def test_native_trigger_child_fills_reconcile_once_through_shared_ledger(tmp_pat
             },
         )
     assert positions.get("portfolio", INSTRUMENT).quantity == 0
+    assert positions.get(book, INSTRUMENT).quantity == 0
+    assert book_balances(database.engine, book, at=NOW)["USDT"] == pytest.approx(-5.20)
     assert len(orders.fills_for(children[0].order_id)) == 2
     assert orders.get(children[0].order_id).filled_quantity == 1
     if transport == "rest_recovery":
@@ -287,7 +338,7 @@ def test_native_trigger_child_fills_reconcile_once_through_shared_ledger(tmp_pat
             "next_trade_id": "4",
             "verified_quantity": 1,
         }
-        assert broker.trade_queries[:3] == [0, 3, 3]
+        assert broker.trade_queries[:4] == [0, 0, 3, 3]
     assert ledger.balances()["assets:cash"] == Decimal("-5.20")
     assert ledger.balances()["expense:fees"] == Decimal("0.20")
     assert ledger.balances()["income:realised_pnl"] == Decimal("5.00")
@@ -320,12 +371,13 @@ def test_native_trigger_child_fills_reconcile_once_through_shared_ledger(tmp_pat
     incomes = (
         BrokerIncome("shared-id", "BTCUSDT", "COMMISSION", -0.04, "USDT", 1788912000, trade_id="2"),
         BrokerIncome("shared-id", "BTCUSDT", "REALIZED_PNL", -2, "USDT", 1788912000, trade_id="2"),
-        BrokerIncome("shared-id", "BTCUSDT", "FUNDING_FEE", 0.30, "USDT", 1788912000),
+        BrokerIncome("shared-id", "BTCUSDT", "FUNDING_FEE", 0.30, "USDT", 1788911999.5),
     )
     for income in incomes:
         assert reconcile_income(database.engine, ledger, scope, income) is True
         assert reconcile_income(database.engine, ledger, scope, income) is False
     assert ledger.balances()["assets:cash"] == Decimal("-4.90")
+    assert book_balances(database.engine, book, at=NOW)["USDT"] == pytest.approx(-4.90)
     assert ledger.balances()["expense:fees"] == Decimal("0.20")
     assert ledger.balances()["income:realised_pnl"] == Decimal("5.00")
     with pytest.raises(ValueError, match="changed its financial values"):

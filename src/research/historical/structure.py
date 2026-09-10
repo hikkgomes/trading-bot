@@ -4,7 +4,7 @@ import math
 import random
 import statistics
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from src.domain._codec import timestamp
@@ -20,7 +20,11 @@ class MarketBar:
     close: float
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "timestamp", timestamp(self.timestamp, field="market timestamp"))
+        object.__setattr__(
+            self,
+            "timestamp",
+            timestamp(self.timestamp, field="market timestamp", preserve_subseconds=True),
+        )
         if not all(
             math.isfinite(value) and value > 0 for value in (self.high, self.low, self.close)
         ):
@@ -126,6 +130,8 @@ def matched_pseudo_entries(
     horizon: int,
     embargo: int,
     controls_per_entry: int = 10,
+    entry_exposure_states: Mapping[int, str | None] | None = None,
+    excluded_entries: Sequence[int] = (),
 ) -> dict[int, tuple[int, ...]]:
     if horizon < 1 or embargo < 0 or controls_per_entry < 1:
         raise ValueError("pseudo-entry study bounds are invalid")
@@ -133,7 +139,17 @@ def matched_pseudo_entries(
         value not in {None, "flat", "long", "short", "hedged"} for value in exposure_states
     ):
         raise ValueError("one known or explicitly unresolved exposure state is required per bar")
-    excluded = {index for entry in entries for index in range(entry - embargo, entry + embargo + 1)}
+    overrides = dict(entry_exposure_states or {})
+    if any(
+        key not in entries or value not in {None, "flat", "long", "short", "hedged"}
+        for key, value in overrides.items()
+    ):
+        raise ValueError("entry exposure overrides must identify declared entries and states")
+    excluded = {
+        index
+        for entry in {*entries, *excluded_entries}
+        for index in range(entry - embargo, entry + embargo + 1)
+    }
     buckets: dict[tuple, list[int]] = defaultdict(list)
     for index, observation in enumerate(observations[:-horizon]):
         if (
@@ -148,7 +164,9 @@ def matched_pseudo_entries(
         for entry in entries
         if 0 <= entry < len(observations) - horizon
         for candidates in (
-            buckets.get((_match_key(observations[entry]), exposure_states[entry]), []),
+            buckets.get(
+                (_match_key(observations[entry]), overrides.get(entry, exposure_states[entry])), []
+            ),
         )
     }
 

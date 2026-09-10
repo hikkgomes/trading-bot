@@ -170,6 +170,18 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
         )
     restarted = scheduler.run_once(now="2026-08-27T10:00:01+00:00")
     assert restarted["jobs_enqueued"] == 0
+    scheduler.run_once(now="2026-08-27T11:00:00+00:00")
+    with database.engine.connect() as connection:
+        cutoffs = set(
+            connection.execute(
+                select(job.c.payload["history_as_of"].as_string()).where(
+                    job.c.name == "historical_bootstrap",
+                    job.c.payload["product_id"].as_string() == "btc_accumulation",
+                    job.c.payload["schedule_name"].as_string() == "historical_bootstrap",
+                )
+            ).scalars()
+        )
+    assert {NOW, "2026-08-27T11:00:00+00:00"} <= cutoffs
 
     testnet_configuration = copy.deepcopy(configuration)
     next(

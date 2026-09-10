@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import func, insert, select
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from src.data.database import research_thesis, thesis_trial
+from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.strategies import MechanismCategory, ResearchThesis
 
@@ -99,12 +100,13 @@ class ThesisRegistry:
 class SqlThesisRegistry:
     """Durable append-only thesis authority with atomic trial budgets."""
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, *, connection: Connection | None = None) -> None:
         self.engine = engine
+        self.connection = connection
 
     def register(self, thesis: ResearchThesis) -> str:
         payload = to_primitive(thesis)
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, self.connection, write=True) as connection:
             existing = (
                 connection.execute(
                     select(research_thesis).where(research_thesis.c.id == thesis.thesis_id)
@@ -136,7 +138,7 @@ class SqlThesisRegistry:
         return thesis.thesis_id
 
     def get(self, thesis_id: str) -> ResearchThesis:
-        with self.engine.connect() as connection:
+        with connection_scope(self.engine, self.connection, write=False) as connection:
             payload = connection.execute(
                 select(research_thesis.c.payload).where(research_thesis.c.id == thesis_id)
             ).scalar_one_or_none()
@@ -147,7 +149,7 @@ class SqlThesisRegistry:
     def claim_trial(
         self, *, thesis_id: str, candidate_id: str, lineage_id: str, claimed_at: str
     ) -> ThesisTrial:
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, self.connection, write=True) as connection:
             statement = select(research_thesis).where(research_thesis.c.id == thesis_id)
             if self.engine.dialect.name == "postgresql":
                 statement = statement.with_for_update()
@@ -196,7 +198,7 @@ class SqlThesisRegistry:
     def lineage_trial_count(self, thesis_id: str) -> int:
         """Return every registered trial in the thesis lineage for DSR/PBO."""
 
-        with self.engine.connect() as connection:
+        with connection_scope(self.engine, self.connection, write=False) as connection:
             lineage_ids = _sql_lineage_ids(connection, thesis_id)
             return int(
                 connection.execute(

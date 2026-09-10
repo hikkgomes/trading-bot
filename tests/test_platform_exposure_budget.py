@@ -9,6 +9,86 @@ from src.services.exposure_budget import ExposureBudgetError, ExposureBudgetGuar
 NOW = "2026-08-31T10:00:00+00:00"
 
 
+def test_btc_book_risk_measures_cash_deviation_and_reserves_core_and_purchase_fees():
+    from dataclasses import replace
+
+    from src.services.exposure_budget import enforce_book_plan
+
+    product, account, assignment, risk, snapshot = _configuration(
+        risk_budget=200, instrument_fraction=0.2
+    )
+    product.update(product_id="btc_accumulation", execution_costs={"fee_bps": 10})
+    account["market"] = "spot"
+    assignment["payload"]["book_id"] = "A"
+    snapshot["balances"] = {"BTC": 10, "USDT": 0}
+    resources = {
+        "A": {
+            "balances": dict(snapshot["balances"]),
+            "capital": {"btc_capital_baseline": {"core_btc_quantity": 7}},
+        }
+    }
+    owner = {"book_id": "A", "sleeve_id": "directional"}
+
+    def intent(quantity, side=OrderSide.SELL, identity="new"):
+        return replace(
+            _order(
+                order_id=identity, side=side, quantity=quantity, reduce_only=side is OrderSide.SELL
+            ),
+            instrument_id="binance:spot:BTCUSDT",
+            metadata={
+                "reference_price": 100,
+                "target_metadata": {
+                    "book_authorities": [owner],
+                    "book_contributions": [
+                        {
+                            **owner,
+                            "signed_quantity": quantity * (1 if side is OrderSide.BUY else -1),
+                        }
+                    ],
+                },
+            },
+        )
+
+    def assess(order, pending=()):
+        return ExposureBudgetGuard().assess(
+            product_id="btc_accumulation",
+            product=product,
+            account=account,
+            assignment=assignment,
+            risk_configuration=risk,
+            account_payload=snapshot,
+            order=order,
+            positions=(),
+            orders=pending,
+            book_resources=resources,
+        )
+
+    plan = {
+        "product_id": "btc_accumulation",
+        "prices": {"binance:spot:BTCUSDT": 100},
+        "book_targets": {"A": {"binance:spot:BTCUSDT": 10}},
+        "books": {"A": owner},
+        "book_resources": resources,
+    }
+    enforce_book_plan(plan, [assignment], product, account, risk, snapshot)
+    assert assess(intent(1)).scoped_exposure["assignment"] == 100
+    with pytest.raises(ExposureBudgetError, match="budget"):
+        assess(intent(2.1))
+    with pytest.raises(ExposureBudgetError, match="core"):
+        assess(intent(3.1))
+    with pytest.raises(ExposureBudgetError, match="budget"):
+        assess(intent(1), (intent(1.5, identity="pending"),))
+    resources["A"]["balances"] = snapshot["balances"] = {"BTC": 9, "USDT": 100}
+    assert assess(intent(0.9, OrderSide.BUY)).proposed_notional == 90
+    with pytest.raises(ExposureBudgetError, match="settled cash"):
+        assess(intent(1, OrderSide.BUY))
+    resources["A"]["balances"] = snapshot["balances"] = {"BTC": 0, "USDT": 1000}
+    assert assess(intent(9.9, OrderSide.BUY)).proposed_notional == 990
+    risk["instrument"]["maximum_order_notional"] = 500
+    with pytest.raises(ExposureBudgetError, match="order_notional"):
+        assess(intent(9.9, OrderSide.BUY))
+
+
 def _order(
     *,
     order_id: str = "new",

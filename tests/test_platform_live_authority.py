@@ -349,8 +349,66 @@ def test_manual_authority_records_exact_preflight_approval_and_live_assignment(
         assert active["artefact_hash"] == selection["artefact_hash"]
         assert active["instrument_id"] == selection["instrument_id"]
         assert active["sleeve_id"] == selection["sleeve_id"]
+        _assert_guarded_plan_authority(database, authority, active, approval, monkeypatch)
     finally:
         database.dispose()
+
+
+def _assert_guarded_plan_authority(database, authority, active, approval, monkeypatch):
+    from src.execution.order_manager import OrderManager, SqlOrderStore
+    from src.execution.position_manager import PositionManager, SqlPositionStore
+    from src.portfolio.account_plans import _owner
+    from src.services.live_execution import ApprovedLiveExecution
+
+    monkeypatch.setattr(
+        "src.services.live_execution.CcxtBroker",
+        lambda exchange: _Broker(exchange.account_fingerprint),
+    )
+    execution = ApprovedLiveExecution(
+        engine=database.engine,
+        configuration=authority.configuration,
+        order_manager=OrderManager(SqlOrderStore(database.engine)),
+        positions=PositionManager(SqlPositionStore(database.engine)),
+    )
+    book = active["payload"]["book_id"]
+    plan = {
+        "product_id": "active_income",
+        "account_id": "binance-futures-main",
+        "books": {book: _owner(active)},
+        "prices": {active["instrument_id"]: 100_000},
+        "initial_capital": [{"book_id": book, "balance_changes": {"USDT": 0.01}}],
+        "book_targets": {book: {active["instrument_id"]: 0.00000001}},
+        "targets": [
+            {"portfolio_id": "active-income-portfolio", "valid_until": "2026-08-29T10:01:00+00:00"}
+        ],
+    }
+    with database.engine.begin() as connection:
+        execution.authorise_plan(plan, now=ASSIGNED_AT, connection=connection)
+        altered = copy.deepcopy(plan)
+        altered["books"][book]["capital_limit"] = 1
+        with pytest.raises(PermissionError, match="every current live book"):
+            execution.authorise_plan(altered, now=ASSIGNED_AT, connection=connection)
+        over_budget = copy.deepcopy(plan)
+        over_budget["book_targets"][book][active["instrument_id"]] = 1
+        with pytest.raises(PermissionError, match="assignment_capital_notional"):
+            execution.authorise_plan(over_budget, now=ASSIGNED_AT, connection=connection)
+    artifact = authority.artefacts.get(active["artefact_hash"])
+    SqlApprovalRepository(database.engine).append(
+        strategy_version_id=active["strategy_version_id"],
+        product_id="active_income",
+        account_id="binance-futures-main",
+        artefact_hash=active["artefact_hash"],
+        source_commit_hash=artifact["source_commit_hash"],
+        engine_version=artifact["engine_version"],
+        capital_cap=approval["capital_cap"],
+        actor="henrique",
+        approved_at="2026-08-29T10:00:04+00:00",
+        status="revoked",
+        payload={"reason": "fixture revocation"},
+    )
+    with database.engine.begin() as connection:
+        with pytest.raises(PermissionError, match="current human approval"):
+            execution.authorise_plan(plan, now="2026-08-29T10:00:05+00:00", connection=connection)
 
 
 def test_canary_to_live_requires_signed_canary_evidence_and_replaces_canary(

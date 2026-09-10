@@ -126,6 +126,7 @@ class HistoricalBootstrapService:
         now: str | None = None,
         maximum_pages: int = 10_000,
         heartbeat: Callable[[], Any] | None = None,
+        data_plan: Mapping[str, Any] | None = None,
     ) -> tuple[HistoricalBootstrapReport, ...]:
         if minimum_history_days <= 0 or maximum_pages <= 0:
             raise ValueError("history days and maximum pages must be positive")
@@ -141,6 +142,18 @@ class HistoricalBootstrapService:
         interval = self._interval(timeframe)
         end = int(current.timestamp() * 1_000) // interval * interval
         start = end - minimum_history_days * 86_400_000 - interval
+        if data_plan is not None:
+            from src.research.data_plan import ResearchDataPlan
+
+            plan = ResearchDataPlan.from_payload(data_plan)
+            if (
+                plan.product_id,
+                plan.timeframe,
+                plan.instrument_scope,
+                plan.minimum_history_days,
+            ) != (product_id, timeframe, normalised_symbols, minimum_history_days):
+                raise ValueError("bootstrap request conflicts with its research data plan")
+            start, end = plan.acquisition_interval(current.isoformat())
         metadata = self._fetch_metadata(market=market, symbols=normalised_symbols)
         reports: list[HistoricalBootstrapReport] = []
         for symbol in normalised_symbols:
@@ -202,6 +215,36 @@ class HistoricalBootstrapService:
             self._publish_metadata(market=market, symbol=symbol, payload=dict(item))
             matched.add(symbol)
         return matched
+
+    def _covered_cursor(self, product_id, market, symbol, timeframe, start, end):
+        """Reuse only contiguous, completed native acquisition ranges."""
+        with self.engine.connect() as connection:
+            rows = (
+                connection.execute(
+                    select(historical_bootstrap_progress)
+                    .where(
+                        historical_bootstrap_progress.c.product_id == product_id,
+                        historical_bootstrap_progress.c.market == market,
+                        historical_bootstrap_progress.c.symbol == symbol,
+                        historical_bootstrap_progress.c.timeframe == timeframe,
+                        historical_bootstrap_progress.c.status == "completed",
+                        historical_bootstrap_progress.c.range_end > _millis_timestamp(start),
+                        historical_bootstrap_progress.c.range_start < _millis_timestamp(end),
+                    )
+                    .order_by(historical_bootstrap_progress.c.range_start)
+                )
+                .mappings()
+                .all()
+            )
+        cursor = start
+        for row in rows:
+            if _progress_gaps(row) or row["next_start"] < row["range_end"]:
+                continue
+            left = int(dt.datetime.fromisoformat(row["range_start"]).timestamp() * 1000)
+            right = int(dt.datetime.fromisoformat(row["range_end"]).timestamp() * 1000)
+            if left <= cursor:
+                cursor = max(cursor, right)
+        return min(cursor, end)
 
     def _publish_metadata(self, *, market: str, symbol: str, payload: Mapping[str, Any]) -> None:
         instrument_payload = _instrument_payload(market=market, symbol=symbol, payload=payload)
@@ -329,13 +372,14 @@ class HistoricalBootstrapService:
         )
         progress = self._progress(progress_id)
         cursor = range_start_ms if progress is None else _resume_cursor(progress, range_start_ms)
-        resumed = progress is not None
-        already_completed = (
-            progress is not None
-            and progress["status"] == "completed"
-            and not _progress_gaps(progress)
-            and cursor >= range_end_ms
+        cursor = max(
+            cursor,
+            self._covered_cursor(
+                product_id, market, symbol, timeframe, range_start_ms, range_end_ms
+            ),
         )
+        resumed = progress is not None or cursor > range_start_ms
+        already_completed = cursor >= range_end_ms
         if not already_completed:
             self._save_progress(
                 progress_id=progress_id,
@@ -426,13 +470,14 @@ class HistoricalBootstrapService:
         )
         progress = self._progress(progress_id)
         cursor = range_start_ms if progress is None else _resume_cursor(progress, range_start_ms)
-        resumed = progress is not None
-        if (
-            progress is not None
-            and progress["status"] == "completed"
-            and not _progress_gaps(progress)
-            and cursor >= range_end_ms
-        ):
+        cursor = max(
+            cursor,
+            self._covered_cursor(
+                product_id, "futures", symbol, "funding", range_start_ms, range_end_ms
+            ),
+        )
+        resumed = progress is not None or cursor > range_start_ms
+        if cursor >= range_end_ms:
             return HistoricalBootstrapReport(
                 product_id=product_id,
                 market="futures",
@@ -722,7 +767,7 @@ class HistoricalBootstrapService:
     ) -> list[dict[str, Any]]:
         rows: dict[int, dict[str, Any]] = {}
         interval = self._interval(timeframe)
-        downloaded_at = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+        downloaded_at = dt.datetime.now(dt.UTC).isoformat()
         instrument_id = (
             f"binance:spot:{symbol}" if market == "spot" else f"binance:futures:{symbol}:USDT"
         )
@@ -779,7 +824,7 @@ class HistoricalBootstrapService:
         self, raw: Iterable[Any], *, product_id: str, symbol: str
     ) -> list[dict[str, Any]]:
         rows: dict[int, dict[str, Any]] = {}
-        downloaded_at = dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
+        downloaded_at = dt.datetime.now(dt.UTC).isoformat()
         instrument_id = f"binance:futures:{symbol}:USDT"
         for index, item in enumerate(raw):
             if not isinstance(item, Mapping):
@@ -903,7 +948,9 @@ class HistoricalBootstrapService:
         return destination
 
     def _record_funding_entries(self, rows: Iterable[Mapping[str, Any]]) -> None:
+        from src.data.database import strategy_book
         from src.research.funding import legacy_settlement_id
+        from src.services.scheduler import DatabaseJobQueue
 
         with self.engine.begin() as connection:
             for row in rows:
@@ -933,6 +980,23 @@ class HistoricalBootstrapService:
                             payload=json_value(payload, field="historical funding"),
                         )
                     )
+                books = connection.execute(
+                    select(strategy_book.c.payload).where(
+                        strategy_book.c.product_id == row["product_id"],
+                        strategy_book.c.execution_mode.in_(("paper", "live")),
+                        strategy_book.c.created_at < row["funding_timestamp"],
+                    )
+                ).scalars()
+                if not any(row["instrument_id"] in book["instrument_ids"] for book in books):
+                    continue
+                DatabaseJobQueue(self.engine).enqueue_if_absent(
+                    job_id="public-funding:" + identity,
+                    name="accounting_event",
+                    payload={"kind": "public_funding_settlement", "funding_record_id": identity},
+                    available_at=dt.datetime.now(dt.UTC).isoformat(),
+                    priority=100,
+                    connection=connection,
+                )
 
     def _progress(self, progress_id: str) -> Mapping[str, Any] | None:
         with self.engine.connect() as connection:
@@ -1196,7 +1260,7 @@ def _finite_metadata_number(value: Any, default: float) -> float:
 
 
 def _millis_timestamp(value: int) -> str:
-    return dt.datetime.fromtimestamp(value / 1_000, dt.UTC).replace(microsecond=0).isoformat()
+    return dt.datetime.fromtimestamp(value / 1_000, dt.UTC).isoformat()
 
 
 def _timestamp_millis(value: object) -> int:

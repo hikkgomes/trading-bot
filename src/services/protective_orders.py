@@ -7,6 +7,7 @@ from src.domain.orders import OrderIntent, OrderSide, OrderStatus, OrderType
 from src.execution.broker import ProtectiveOrder
 from src.execution.order_manager import OrderManager
 from src.execution.stops import ProtectiveStop
+from src.portfolio.book_plans import protective_book_metadata
 
 
 def adopt_protective_child(
@@ -50,6 +51,10 @@ def adopt_protective_child(
                 strategy_contributions=parent.strategy_contributions,
                 metadata={
                     **dict(parent.metadata),
+                    "target_metadata": protective_book_metadata(
+                        parent.metadata.get("target_metadata", {}),
+                        exit_sign=1 if native.side.value == "buy" else -1,
+                    ),
                     "reference_price": native.trigger_price,
                     "client_order_id": state.client_order_id,
                     "exchange_order_id": native.child_order_id,

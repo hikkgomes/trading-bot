@@ -13,6 +13,7 @@ from src.accounting.ledger import Ledger, SqlLedgerStore
 from src.accounting.paper_account import PaperAccountLedger
 from src.data.database import fill as fill_table
 from src.data.database import financial_application, financial_outbox, job
+from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, to_primitive
 from src.domain.orders import Fill, OrderIntent, OrderSide, OrderStatus
 from src.domain.positions import Position
@@ -47,6 +48,7 @@ class FinancialApplication:
         *,
         fault: Callable[[str], None] | None = None,
         queue_scope: str | None = None,
+        connection=None,
     ):
         if not all((scope.product_id, scope.account_id, scope.venue, scope.accounting_asset)):
             raise ValueError("financial application requires an explicit account scope")
@@ -54,6 +56,7 @@ class FinancialApplication:
             raise ValueError("financial environment is unknown")
         self.engine, self.scope, self.fault = engine, scope, fault
         self.queue_scope = queue_scope
+        self.connection = connection
 
     def apply_fill(self, fill: Fill) -> FinancialResult:
         trade = fill.metadata.get("trade_id", fill.metadata.get("exchange_trade_id"))
@@ -86,6 +89,9 @@ class FinancialApplication:
             metadata={
                 **fill.metadata,
                 "reference_price": reference,
+                "entry_reference_price": order.metadata.get("entry_reference", {}).get(
+                    "price", fill.metadata.get("entry_reference_price", reference)
+                ),
                 "reference_source": "persisted_order" if reference is not None else "unavailable",
                 "slippage_cost": shortfall,
                 "slippage_asset": self.scope.accounting_asset,
@@ -141,7 +147,7 @@ class FinancialApplication:
         paper_account=None,
         request_payload=None,
     ) -> FinancialResult:
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, self.connection, write=True) as connection:
             self._lock(connection)
             orders = OrderManager(SqlOrderStore(self.engine, connection=connection))
             positions = PositionManager(SqlPositionStore(self.engine, connection=connection))
@@ -179,6 +185,20 @@ class FinancialApplication:
             )
             self._checkpoint("position")
             self._account(connection, order, fill, previous, position, paper_account)
+            from src.accounting.book_allocations import record_book_allocations
+
+            record_book_allocations(
+                self.engine, connection, self.scope, updated, fill, positions, previous
+            )
+            self._checkpoint("book_allocations")
+            if self.scope.environment == "paper":
+                from src.services.paper_protection import sync_paper_protection
+
+                sync_paper_protection(
+                    self.engine, connection, self.scope, updated, fill, position, request_payload
+                )
+                orders.reload()
+                updated = orders.get(order.order_id)
             self._checkpoint("accounting")
             continuation_id = self._schedule_followup(
                 connection, identity, updated, fill, request_payload
@@ -261,6 +281,7 @@ class FinancialApplication:
                 starting_balances=paper_account.starting_balances,
                 starting_positions=paper_account.starting_positions,
                 connection=connection,
+                book_id=paper_account.book_id,
             )
             account.record_fill(
                 order=order, fill=fill, position=position, previous_position=previous
@@ -294,7 +315,20 @@ class FinancialApplication:
                 priority=100,
                 connection=connection,
             )
-        if request_payload is None or order.status is not OrderStatus.PARTIALLY_FILLED:
+        if request_payload and request_payload.get("execution_bar_id"):
+            queue.enqueue_if_absent(
+                job_id=f"paper-protection-fill:{identity}",
+                name="paper_protection_evaluate",
+                payload={"market_snapshot_id": request_payload["execution_bar_id"]},
+                available_at=fill.occurred_at,
+                priority=100,
+                connection=connection,
+            )
+        if (
+            request_payload is None
+            or order.status is not OrderStatus.PARTIALLY_FILLED
+            or order.metadata.get("protective_stop_id")
+        ):
             return None
         job_id = "paper-order-continue:" + canonical_hash(
             {"order_id": order.order_id, "filled_quantity": order.filled_quantity}
@@ -310,7 +344,7 @@ class FinancialApplication:
         return job_id
 
     def acknowledge(self, application_id: str, *, at: str) -> None:
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, self.connection, write=True) as connection:
             connection.execute(
                 update(financial_outbox)
                 .where(financial_outbox.c.id == application_id)

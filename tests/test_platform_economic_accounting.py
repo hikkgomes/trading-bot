@@ -16,6 +16,35 @@ from src.strategies.position_state import PositionAction
 from src.strategies.semantic import RankedTargets
 
 
+def test_forward_passive_btc_benchmark_stays_in_btc_when_the_quote_price_doubles(tmp_path):
+    from src.accounting.paper_account import PaperAccountLedger
+    from src.services.forward_metrics import ForwardEvidenceCollector
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'btc-benchmark.db'}")
+    database.create_schema()
+    at, end = "2026-09-07T00:00:00+00:00", "2026-09-07T01:00:00+00:00"
+    PaperAccountLedger(
+        engine=database.engine,
+        account_id="btc-paper",
+        product_id="btc_accumulation",
+        accounting_asset="BTC",
+        starting_balances={"BTC": 1, "USDT": 0},
+    ).ensure_seed(observed_at=at)
+    result = ForwardEvidenceCollector(database.engine)._objective_metrics(
+        product_id="btc_accumulation",
+        assignment={"account_id": "btc-paper"},
+        artefact_created_at=at,
+        evaluation_time=end,
+        ledger_rows=(),
+        nav_rows=(),
+        market_rows=tuple(
+            {"id": str(price), "payload": {"values": {"close": price}}} for price in (100, 200)
+        ),
+    )
+    assert result[:5] == ("BTC", 1, 1, 0, 0)
+    database.dispose()
+
+
 def test_completed_futures_campaigns_ignore_marks_and_partial_reductions():
     import datetime as dt
 
@@ -434,6 +463,8 @@ def test_execution_price_slippage_is_not_deducted_twice():
 
 
 def test_short_first_leg_and_removed_member_reconcile_to_cash():
+    import datetime as dt
+
     events, positions = [], {}
     start = "2026-09-07T00:00:00+00:00"
     end = "2026-09-07T01:00:00+00:00"
@@ -447,6 +478,15 @@ def test_short_first_leg_and_removed_member_reconcile_to_cash():
             RankedTargets(time, targets, targets),
             {"information_time": time, "cross_sectional_values": prices},
             initial_cash=1000,
+            execution_bars={
+                symbol: {
+                    "open": price,
+                    "open_timestamp": (
+                        dt.datetime.fromisoformat(time) + dt.timedelta(minutes=1)
+                    ).isoformat(),
+                }
+                for symbol, price in prices.items()
+            },
         )
     report = FuturesResearchAccounting().evaluate(initial_cash=1000, events=events)
     assert positions == {"A": 0.0, "B": 0.0}
@@ -531,6 +571,117 @@ def test_capital_reserve_survives_restart_and_price_change(tmp_path):
     database.dispose()
 
 
+def test_live_btc_books_use_their_own_fixed_capital_reserves(tmp_path):
+    from types import SimpleNamespace
+
+    from sqlalchemy import insert, select
+    from test_platform_execution_recovery import _allocation_books
+
+    from src.data.database import book_event, capital_baseline
+    from src.domain._codec import canonical_hash
+    from src.domain.forecasts import AlphaForecast, ForecastDirection
+    from src.execution.position_manager import PositionManager, SqlPositionStore
+    from src.portfolio.account_plans import _book_targets, _capital_proposals, apply_initial_capital
+    from src.services.portfolio_engine import DatabasePortfolioTargetBuilder
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'btc-books.db'}")
+    database.create_schema()
+    books = _allocation_books(database, "btc-account", "btc-core", product="btc_accumulation")
+    at = "2026-09-07T00:00:00+00:00"
+    symbol = "binance:spot:BTCUSDT"
+    assignments = [
+        {
+            "id": book,
+            "product_id": "btc_accumulation",
+            "capital_limit": 100,
+            "payload": {"book_id": book},
+        }
+        for book in books
+    ]
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(capital_baseline).values(
+                id=canonical_hash(
+                    {"product_id": "btc_accumulation", "account_id": "btc-account", "mode": "live"}
+                ),
+                created_at=at,
+                payload={"core_btc_quantity": 1.4},
+            )
+        )
+        allocations = _capital_proposals(
+            database.engine,
+            connection,
+            assignments,
+            {"balances": {"BTC": 2, "USDT": 0}, "market": {symbol: {"price": 100}}},
+            at,
+            reserve_fraction=0.7,
+        )
+        assert connection.execute(select(book_event.c.id)).first() is None
+        positions = PositionManager(SqlPositionStore(database.engine, connection=connection))
+        apply_initial_capital(
+            connection,
+            {
+                "initial_capital": allocations,
+                "decision_at": at,
+                "prices": {symbol: 100},
+                "books": {book: {"strategy_version_id": book} for book in books},
+            },
+            positions,
+        )
+    builder = DatabasePortfolioTargetBuilder(
+        repository=SimpleNamespace(engine=database.engine),
+        snapshot_store=None,
+        positions=PositionManager(SqlPositionStore(database.engine)),
+        product_configuration={},
+        account_configuration={},
+    )
+    for assignment in assignments:
+        with database.engine.connect() as connection:
+            capital = connection.execute(
+                select(book_event.c.payload).where(
+                    book_event.c.id == "live-capital:" + assignment["id"]
+                )
+            ).scalar_one()
+        assert capital["btc_capital_baseline"]["core_btc_quantity"] == pytest.approx(0.7)
+        forecast = AlphaForecast(
+            assignment["id"],
+            "btc_accumulation",
+            symbol,
+            ForecastDirection.SHORT,
+            1,
+            None,
+            None,
+            60,
+            at,
+            "2026-09-07T00:01:00+00:00",
+            0.1,
+            0.3,
+        )
+        targets = _book_targets(
+            builder,
+            {
+                "product_id": "btc_accumulation",
+                "account_id": "btc-account",
+                "execution_mode": "live",
+                "btc_core_fraction": 1,
+                "btc_max_tactical_fraction": 0.3,
+            },
+            assignment,
+            (forecast,),
+            {symbol: 1},
+            {"BTC": 1, "USDT": 0},
+            {"portfolio_risk_budget": 0.3},
+            {symbol: 200},
+            "later-mark",
+            builder.positions,
+            capital,
+        )
+        assert targets[0].portfolio_id == assignment["id"]
+        assert targets[0].target_quantity == pytest.approx(0.7)
+        assert targets[0].metadata["core_btc_quantity"] == pytest.approx(0.7)
+    database.dispose()
+
+
 @pytest.mark.parametrize(
     "side,price,expected", [("buy", 110, 0.1), ("buy", 90, -0.1), ("sell", 90, 0.1)]
 )
@@ -609,10 +760,19 @@ def test_forward_equity_retains_losses_beyond_the_starting_allocation():
 
 
 @pytest.mark.parametrize("product_id", ["btc_accumulation", "btc-diagnostic"])
-def test_paper_btc_fee_denomination_does_not_depend_on_product_name(product_id):
+def test_paper_btc_fee_denomination_does_not_depend_on_product_name(product_id, tmp_path):
+    from decimal import Decimal
+
+    from src.accounting.ledger import Ledger, SqlLedgerStore
+    from src.accounting.paper_account import PaperAccountLedger
+    from src.data.database import PlatformDatabase
     from src.domain.orders import OrderIntent, OrderSide, OrderType
+    from src.execution.order_manager import OrderManager, SqlOrderStore
     from src.execution.paper_exchange import paper_fill
-    from src.services.order_execution import DatabaseExecutionWorker
+    from src.execution.position_manager import PositionManager, SqlPositionStore
+    from src.observability.decision_trace import SqlDecisionTraceStore
+    from src.services.order_execution import DatabaseExecutionWorker, DatabasePaperExecutionWorker
+    from src.services.scheduler import DatabaseJobQueue
 
     now = "2026-09-07T00:00:00+00:00"
     order = OrderIntent(
@@ -631,16 +791,202 @@ def test_paper_btc_fee_denomination_does_not_depend_on_product_name(product_id):
         {"base_accounting_asset": "BTC", "execution_costs": {"fee_bps": 10, "slippage_bps": 0}},
         {order.instrument_id: 50000},
     )
-    filled = paper_fill(
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'fee-units.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="paper",
+        node_id="fixture",
+        role="paper",
+        capabilities=("paper_order_submit",),
+        observed_at=now,
+    )
+    orders = OrderManager(SqlOrderStore(database.engine))
+    orders.create(order)
+    account = PaperAccountLedger(
+        engine=database.engine,
+        account_id="paper-account",
+        product_id=product_id,
+        accounting_asset="BTC",
+        starting_balances={"BTC": 0, "USDT": 1000},
+    )
+    ledger = Ledger(
+        product_id=product_id,
+        accounting_asset="BTC",
+        store=SqlLedgerStore(database.engine, product_id=product_id),
+    )
+    worker = DatabasePaperExecutionWorker(
+        queue=queue,
+        worker_id="paper",
+        order_manager=orders,
+        positions=PositionManager(SqlPositionStore(database.engine)),
+        ledgers={product_id: ledger},
+        trace_store=SqlDecisionTraceStore(database.engine),
+        paper_accounts={product_id: account},
+    )
+    queue.enqueue(job_id="fee-fill", name="paper_order_submit", payload=payload, available_at=now)
+    assert worker.run_once(now=now)["reason_code"] == "paper_order_filled"
+    filled = orders.fills_for(order.order_id)[0]
+    assert filled.fee_asset == "USDT"
+    assert filled.fee == pytest.approx(0.5)
+    assert account.state().balances == {"BTC": 0.01, "USDT": 499.5}
+    ledger.reload()
+    assert sum(item.postings.get("expense:fees", 0) for item in ledger.entries) == Decimal(
+        "0.00001"
+    )
+    explicit_base_fee = paper_fill(
         order,
         price=payload["price"],
         fee_bps=payload["execution_costs"]["fee_bps"],
         slippage_bps=0,
         fill_fraction=1,
-        fee_asset=payload["accounting_asset"],
-        fee_in_base=payload["fee_in_base"],
+        fee_asset="BTC",
+        fee_in_base=True,
         now=now,
     )
-    assert filled.fee_asset == "BTC"
-    assert filled.fee == pytest.approx(0.00001)
-    assert filled.metadata["base_fee_quantity"] == pytest.approx(0.00001)
+    assert explicit_base_fee.fee_asset == "BTC"
+    assert explicit_base_fee.fee == pytest.approx(0.00001)
+    assert explicit_base_fee.metadata["base_fee_quantity"] == pytest.approx(0.00001)
+    database.dispose()
+
+
+def test_panel_execution_applies_signed_funding_once_and_distinguishes_leg_capacity():
+    import datetime as dt
+
+    from src.research.executors import _semantic_panel_series_context
+    from src.research.funding import FundingUnavailable
+
+    opens = [dt.datetime(2026, 9, 7, hour, tzinfo=dt.UTC) for hour in range(3)]
+    times = [(time + dt.timedelta(hours=1, milliseconds=-1)).isoformat() for time in opens]
+    values = {"A": {"momentum": 1, "close": 100}, "B": {"momentum": -1, "close": 100}}
+    funding = [
+        {
+            "type": "funding",
+            "symbol": symbol,
+            "timestamp": "2026-09-07T01:30:00+00:00",
+            "event_id": f"{symbol}-settlement",
+            "mark_price": 100,
+            "funding_rate": rate,
+        }
+        for symbol, rate in (("A", 0.001), ("B", 0.002))
+    ]
+    rows = [
+        {
+            "instrument_id": symbol,
+            "timestamp": time,
+            "open_timestamp": opens[bar_index].isoformat(),
+            "open": 100,
+            "close": 100,
+            "funding_events": [funding[index], funding[index]] if time == times[1] else [],
+        }
+        for bar_index, time in enumerate(times)
+        for index, symbol in enumerate(("A", "B"))
+    ]
+    context = {
+        "initial_cash": 1000,
+        "funding_available": True,
+        "market_frame": rows,
+        "cross_sectional_history": [
+            {
+                "information_time": time,
+                "cross_sectional_values": values,
+                "forward_returns": {"A": 0, "B": 0},
+            }
+            for time in times
+        ],
+    }
+    series, outputs = _semantic_panel_series_context(
+        name="relative_momentum", model={}, context=context, instrument_id="A"
+    )
+    assert (
+        min(event["timestamp"] for event in series["futures_events"] if event["type"] == "fill")
+        == opens[1].isoformat()
+    )
+    assert outputs[0].target_fractions == {"A": 0.5, "B": -0.5}
+    report = FuturesResearchAccounting().evaluate(
+        initial_cash=1000, events=series["futures_events"]
+    )
+    assert report.funding_pnl == pytest.approx(0.5)
+    assert report.final_equity == pytest.approx(1000.5)
+    assert report.capacity_violations == 0
+    assert sum(event["type"] == "funding" for event in series["futures_events"]) == 2
+    with pytest.raises(FundingUnavailable, match="coverage"):
+        _semantic_panel_series_context(
+            name="relative_momentum",
+            model={},
+            context={**context, "funding_available": False},
+            instrument_id="A",
+        )
+    empty, _ = _semantic_panel_series_context(
+        name="relative_momentum",
+        model={},
+        context={**context, "market_frame": [{**row, "funding_events": []} for row in rows]},
+        instrument_id="A",
+    )
+    no_settlement = FuturesResearchAccounting().evaluate(
+        initial_cash=1000, events=empty["futures_events"]
+    )
+    assert no_settlement.funding_pnl == 0
+
+
+def test_panel_decisions_fill_at_next_open_and_final_signal_cannot_trade():
+    import copy
+
+    from src.research.executors import DataUnavailableError, _semantic_panel_series_context
+
+    times = ["2026-09-07T00:59:59.999000+00:00", "2026-09-07T01:59:59.999000+00:00"]
+    history = [
+        {
+            "information_time": time,
+            "cross_sectional_values": {
+                "A": {"momentum": 1, "close": a},
+                "B": {"momentum": -1, "close": b},
+            },
+            "forward_returns": {"A": 0.8, "B": -0.4},
+        }
+        for time, a, b in ((times[0], 100, 100), (times[1], 180, 60))
+    ]
+    rows = [
+        {
+            "instrument_id": symbol,
+            "timestamp": times[index],
+            "open_timestamp": f"2026-09-07T0{index}:00:00+00:00",
+            "open": opened,
+            "close": closed,
+            "funding_events": [],
+        }
+        for index, symbol, opened, closed in (
+            (0, "A", 100, 100),
+            (0, "B", 100, 100),
+            (1, "A", 120, 180),
+            (1, "B", 80, 60),
+        )
+    ]
+    context = {
+        "initial_cash": 1000,
+        "funding_available": True,
+        "market_frame": rows,
+        "cross_sectional_history": history,
+    }
+    series, _ = _semantic_panel_series_context(
+        name="relative_momentum", model={}, context=context, instrument_id="A"
+    )
+    fills = [event for event in series["futures_events"] if event["type"] == "fill"]
+    assert [(event["symbol"], event["price"]) for event in fills] == [("A", 120), ("B", 80)]
+    assert [event["quantity"] for event in fills] == pytest.approx([500 / 120, 500 / 80])
+    assert {event["timestamp"] for event in fills} == {"2026-09-07T01:00:00+00:00"}
+    assert FuturesResearchAccounting().evaluate(
+        initial_cash=1000, events=series["futures_events"]
+    ).final_equity == pytest.approx(1375)
+    changed = copy.deepcopy(context)
+    changed["cross_sectional_history"][-1]["cross_sectional_values"]["A"]["momentum"] = -2
+    changed_series, _ = _semantic_panel_series_context(
+        name="relative_momentum", model={}, context=changed, instrument_id="A"
+    )
+    assert changed_series["futures_events"] == series["futures_events"]
+    for row in changed["market_frame"]:
+        row.pop("open_timestamp")
+    with pytest.raises(DataUnavailableError, match="opening price and time"):
+        _semantic_panel_series_context(
+            name="relative_momentum", model={}, context=changed, instrument_id="A"
+        )

@@ -11,9 +11,8 @@ from src.domain._codec import canonical_hash, json_value, non_empty, to_primitiv
 from src.strategies.position_state import (
     PositionPath,
     PositionRules,
-    PositionState,
     position_path,
-    position_step,
+    resume_position_path,
 )
 
 
@@ -449,19 +448,9 @@ class RegisteredStrategyBehaviour:
 
     def _resume_path(self, frame: Any, prior: Mapping[str, Any]) -> PositionPath:
         rows = self.frame_payload(frame)
-        state, actions = position_step(
-            PositionState(**prior["state"]),
-            entry_signal=int(prior["entry_signal"]),
-            bar=rows[-1],
-            index=len(rows) - 1,
-            rules=self.position_rules(),
+        return resume_position_path(
+            rows, self.generate_signals(frame)[-1], self.position_rules(), prior
         )
-        decision = (
-            0
-            if any(action.kind == "exit" for action in actions)
-            else state.direction or self.generate_signals(frame)[-1]
-        )
-        return PositionPath((decision,), actions, state)
 
     @staticmethod
     def _signal(value: Any) -> int:

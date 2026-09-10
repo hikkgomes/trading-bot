@@ -38,6 +38,32 @@ class SqlPortfolioRepository:
         self.engine = engine
         self.require_pipeline_identity = require_pipeline_identity
 
+    def prior_decision_state(self, *, assignment_id: str, version_id: str, before: str):
+        owners = financial_assignment_ids(self.engine, assignment_id, at=before) or (assignment_id,)
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(alpha_forecast_table.c.payload)
+                .where(
+                    alpha_forecast_table.c.payload["strategy_version_id"].as_string() == version_id,
+                    alpha_forecast_table.c.payload["metadata"]["assignment_id"]
+                    .as_string()
+                    .in_(owners),
+                    alpha_forecast_table.c.created_at < before,
+                )
+                .order_by(
+                    alpha_forecast_table.c.created_at.desc(), alpha_forecast_table.c.id.desc()
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+        empty = {"state": {"direction": 0, "entry_price": 0.0, "age": 0}, "entry_signal": 0}
+        if row is None or not row["metadata"].get("position_state"):
+            return empty
+        return {
+            "state": row["metadata"]["position_state"],
+            "entry_signal": {"long": 1, "short": -1, "flat": 0}[row["direction"]],
+            "state_basis": "strategy_cycle",
+        }
+
     def prior_strategy_state(
         self,
         *,
@@ -67,9 +93,15 @@ class SqlPortfolioRepository:
         payload = row["payload"]
         result["position_event_id"] = row["id"]
         quantity = float(payload["quantity"])
-        if not quantity:
-            return result
         metadata = payload.get("metadata", {})
+        if not quantity:
+            if metadata.get("last_fill_id") and interval_seconds:
+                elapsed = (
+                    dt.datetime.fromisoformat(before)
+                    - dt.datetime.fromisoformat(payload["updated_at"])
+                ).total_seconds()
+                result["exited_current_interval"] = 0 <= elapsed < interval_seconds
+            return result
         if metadata.get("assignment_id") != assignment_id and metadata.get(
             "assignment_id"
         ) not in financial_assignment_ids(self.engine, assignment_id, at=before):

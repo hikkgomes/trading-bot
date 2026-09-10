@@ -240,6 +240,9 @@ def _portfolio_state_cycle(
             state_policies=policies,
             now=now,
         )
+        scheduled += _schedule_paper_book_states(
+            database, configuration, queue, worker_id, products, accounts, now
+        )
         if not scheduled:
             return {
                 "reason_code": worker.last_schedule_reason,
@@ -248,6 +251,49 @@ def _portfolio_state_cycle(
         return worker.run_once(now=now)
 
     return run_once
+
+
+def _schedule_paper_book_states(database, configuration, queue, worker_id, products, accounts, now):
+    from src.portfolio.books import active_paper_book_views
+    from src.risk.engine import SqlRiskPolicyStore
+    from src.risk.policies import install_product_risk_policies
+
+    scheduled = 0
+    for book, product, account in active_paper_book_views(
+        database.engine, products, accounts, at=now
+    ):
+        scoped_products = {book["product_id"]: product}
+        scoped_accounts = {book["account_id"]: account}
+        risk = {
+            **configuration["risk"],
+            "accounts": {
+                **configuration["risk"]["accounts"],
+                book["account_id"]: configuration["risk"]["accounts"][book["execution_account_id"]],
+            },
+        }
+        scoped_configuration = {**configuration, "risk": risk}
+        install_product_risk_policies(
+            SqlRiskPolicyStore(database.engine), risk_configuration=risk, products=scoped_products
+        )
+        AccountReconciliationService(
+            engine=database.engine, products=scoped_products, accounts=scoped_accounts
+        ).reconcile_once(now=now)
+        snapshots = SqlRiskSnapshotStore(database.engine, book_id=book["book_id"])
+        sources = DatabasePortfolioSourceService(
+            engine=database.engine,
+            store=snapshots,
+            products=scoped_products,
+            accounts=scoped_accounts,
+        )
+        worker = DatabasePortfolioStateWorker(
+            queue=queue, worker_id=worker_id, store=snapshots, refresh_sources=sources.refresh
+        )
+        scheduled += worker.schedule_from_latest(
+            products=scoped_products,
+            state_policies=portfolio_state_policies(scoped_configuration, scoped_products),
+            now=now,
+        )
+    return scheduled
 
 
 def _execution_cycle(
@@ -335,6 +381,7 @@ def _execution_cycle(
     protective_service = live_components["protective_service"]
     live_product_ids = live_components["live_product_ids"]
     approved_live = live_components["approved_live"]
+    worker.plan_authority = getattr(approved_live, "authorise_plan", None)
 
     def on_live_fill(product_id: str, order, quantity: float, at: str) -> object:
         if protective_service is None or product_id not in live_product_ids:
@@ -556,6 +603,7 @@ def _paper_cycle(
         capabilities=(
             "paper_order_submit",
             "paper_order_continue",
+            "paper_protection_evaluate",
             "diagnostic_paper_open",
             "diagnostic_paper_close",
         ),
@@ -900,6 +948,7 @@ def _platform_scheduler_cycle(
 ) -> Callable[[], dict[str, Any]]:
     scheduler = PlatformScheduler(
         engine=database.engine,
+        research_configuration=configuration["research"],
         products=_by_id(configuration["products"], collection="products", identity="product_id"),
         node_id=node_id,
         bootstrap=PlatformBootstrap(
@@ -1192,6 +1241,10 @@ def _research_cycle(
         dataset_bundle_service=DatabaseDatasetBundleService(
             database.engine,
             parquet_root,
+            **research_configuration.get("data_resource_limits", {}),
+            warmup_bars=int(
+                research_configuration.get("data_requirements", {}).get("warmup_bars", 200)
+            ),
             minimum_history_days=int(
                 research_configuration.get("data_requirements", {}).get("minimum_history_days", 0)
             ),

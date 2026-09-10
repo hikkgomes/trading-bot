@@ -5,17 +5,19 @@ from __future__ import annotations
 import json
 import math
 import os
-from dataclasses import asdict, dataclass, replace
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from sqlalchemy import func, insert, select
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from src.data.database import protective_stop as protective_stop_table
+from src.data.transactions import connection_scope
 from src.domain._codec import canonical_hash, non_empty, timestamp, to_primitive
-from src.domain.orders import OrderSide
+from src.domain.orders import OrderSide, ProtectionKind
 
 
 class StopStatus(StrEnum):
@@ -49,11 +51,17 @@ class ProtectiveStop:
     replacement_version: int = 0
     submission_attempted: bool = False
     entry_quantity: float | None = None
+    kind: ProtectionKind = ProtectionKind.STOP
+    execution_mode: str = "live"
+    paper_parameters: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _validate_stop_quantities(self)
         object.__setattr__(self, "exit_side", OrderSide(self.exit_side))
         object.__setattr__(self, "status", StopStatus(self.status))
+        object.__setattr__(self, "kind", ProtectionKind(self.kind))
+        if self.execution_mode not in {"paper", "live"}:
+            raise ValueError("protection execution mode is invalid")
         for field_name in ("stop_id", "portfolio_id", "instrument_id"):
             object.__setattr__(
                 self, field_name, non_empty(getattr(self, field_name), field=field_name)
@@ -96,11 +104,8 @@ class ProtectiveStop:
             StopStatus.CONFIRMATION_FAILED,
         }:
             return False
-        return (
-            price <= self.trigger_price
-            if self.exit_side is OrderSide.SELL
-            else price >= self.trigger_price
-        )
+        below = (self.exit_side is OrderSide.SELL) == (self.kind is ProtectionKind.STOP)
+        return price <= self.trigger_price if below else price >= self.trigger_price
 
 
 class JsonlStopStore:
@@ -139,13 +144,14 @@ class StopStore(Protocol):
 
 
 class SqlStopStore:
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: Engine, *, connection: Connection | None = None):
         self.engine = engine
+        self.connection = connection
 
     def append(self, stop: ProtectiveStop) -> None:
         payload = to_primitive(stop)
         event_id = canonical_hash(payload)
-        with self.engine.begin() as connection:
+        with connection_scope(self.engine, self.connection, write=True) as connection:
             if connection.execute(
                 select(protective_stop_table.c.id).where(protective_stop_table.c.id == event_id)
             ).first():
@@ -172,7 +178,7 @@ class SqlStopStore:
             )
 
     def read(self) -> tuple[ProtectiveStop, ...]:
-        with self.engine.connect() as connection:
+        with connection_scope(self.engine, self.connection, write=False) as connection:
             payloads = connection.execute(
                 select(protective_stop_table.c.payload).order_by(
                     protective_stop_table.c.created_at,
@@ -207,6 +213,25 @@ class StopManager:
 
     def get(self, stop_id: str) -> ProtectiveStop:
         return self._stops[stop_id]
+
+    def reprice_unsubmitted(
+        self, stop_id: str, trigger_price: float, *, quantity: float | None = None
+    ) -> ProtectiveStop:
+        current = self._stops[stop_id]
+        if (
+            current.status is not StopStatus.ACTIVE
+            or current.submission_attempted
+            or current.native_order_id
+            or current.protected_quantity
+        ):
+            raise ValueError("submitted protection cannot be repriced as a new entry")
+        quantity = current.quantity if quantity is None else quantity
+        updated = replace(
+            current, trigger_price=trigger_price, quantity=quantity, entry_quantity=quantity
+        )
+        self.store.append(updated)
+        self._stops[stop_id] = updated
+        return updated
 
     def for_entry_order(self, entry_order_id: str) -> tuple[ProtectiveStop, ...]:
         return tuple(

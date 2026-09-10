@@ -200,10 +200,13 @@ class SqlRiskSnapshotStore:
     PostgreSQL and are therefore not producer-controlled job results.
     """
 
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: Engine, *, book_id: str | None = None):
         self.engine = engine
+        self.book_id = book_id
 
     def save(self, payload: dict[str, object], *, created_at: str) -> str:
+        if self.book_id is not None:
+            payload = {**payload, "book_id": self.book_id}
         clean = json_value(payload, field="risk snapshot")
         snapshot_id = canonical_hash(clean)
         created_at = timestamp(created_at, field="created_at")
@@ -246,7 +249,12 @@ class SqlRiskSnapshotStore:
                     risk_snapshot_table.c.created_at,
                     risk_snapshot_table.c.payload,
                 )
-                .where(risk_snapshot_table.c.created_at <= at)
+                .where(
+                    risk_snapshot_table.c.created_at <= at,
+                    risk_snapshot_table.c.payload["kind"].as_string() == kind,
+                    risk_snapshot_table.c.payload["product_id"].as_string() == product_id,
+                    risk_snapshot_table.c.payload["book_id"].as_string() == self.book_id,
+                )
                 .order_by(risk_snapshot_table.c.created_at.desc(), risk_snapshot_table.c.id.desc())
             ).mappings()
             for row in rows:

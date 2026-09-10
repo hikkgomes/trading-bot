@@ -293,6 +293,7 @@ def _generated_dsl(features: Mapping[str, float], artefact: Mapping[str, Any]) -
             behaviour = TypedRuleBehaviour.from_definition(_definition(artefact))
             signal = behaviour.signal(features)
             result = dict(_forecast(float(signal), artefact))
+            result = _managed_dsl_forecast(features, artefact, signal, result)
     except (StrategyBehaviourError, KeyError, TypeError, ValueError) as exc:
         raise ArtefactDispatchError(str(exc)) from exc
     result["behaviour_hash"] = behaviour.behaviour_hash
@@ -300,6 +301,34 @@ def _generated_dsl(features: Mapping[str, float], artefact: Mapping[str, Any]) -
         {"behaviour_hash": behaviour.behaviour_hash, "features": dict(features)}
     )
     return result
+
+
+def _managed_dsl_forecast(features, artefact, signal, forecast):
+    from src.strategies.position_state import PositionRules, PositionState, resume_position_path
+
+    model = _definition(artefact).get("position_model", {})
+    if not model.get("execution_policy"):
+        if _definition(artefact).get("product") == "btc_accumulation":
+            return forecast
+        raise ArtefactDispatchError(
+            "directional DSL requires an explicit protective execution policy"
+        )
+    rules = PositionRules.from_model(model)
+    rows = features.get("market_frame")
+    if not isinstance(rows, list | tuple) or not rows:
+        raise ArtefactDispatchError("directional position management needs current market bars")
+    prior = features.get("prior_strategy_state") or {
+        "state": PositionState().__dict__,
+        "entry_signal": 0,
+    }
+    path = resume_position_path(rows, signal, rules, prior)
+    return {
+        **_forecast(float(path.decisions[-1]), artefact),
+        "position_rules": rules.__dict__,
+        "position_state": path.state.__dict__,
+        "entry_signal": signal,
+        "position_actions": [action.__dict__ for action in path.actions],
+    }
 
 
 def _machine_learning(

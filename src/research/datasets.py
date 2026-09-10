@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, text
 from sqlalchemy.engine import Engine
 
 from src.data.database import dataset_bundle, dataset_snapshot, universe_snapshot
@@ -161,6 +161,7 @@ class CandidateDatasetPlan:
     parameter_set_id: str
     forward_snapshot_ids: tuple[str, ...] = ()
     timeframe: str | None = None
+    data_plan_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "product_id", non_empty(self.product_id, field="product_id"))
@@ -222,6 +223,7 @@ class CandidateDatasetPlan:
     def to_payload(self) -> dict[str, Any]:
         return {
             **({"timeframe": self.timeframe} if self.timeframe is not None else {}),
+            **({"data_plan_id": self.data_plan_id} if self.data_plan_id is not None else {}),
             "screening_snapshot_ids": list(self.screening_snapshot_ids),
             "development_snapshot_ids": list(self.development_snapshot_ids),
             "robustness_snapshot_ids": list(self.robustness_snapshot_ids),
@@ -258,6 +260,7 @@ class CandidateDatasetPlan:
             cost_model_id=bundle.cost_model_id,
             parameter_set_id=bundle.parameter_set_id,
             timeframe=bundle.timeframe,
+            data_plan_id=bundle.data_plan_id,
         )
 
     @classmethod
@@ -276,6 +279,7 @@ class CandidateDatasetPlan:
             cost_model_id=str(payload["cost_model_id"]),
             parameter_set_id=str(payload["parameter_set_id"]),
             timeframe=payload.get("timeframe"),
+            data_plan_id=payload.get("data_plan_id"),
         )
 
 
@@ -296,6 +300,7 @@ class DatasetBundle:
     lifecycle_state: DatasetLifecycleState = DatasetLifecycleState.READY
     source_partition_hashes: tuple[str, ...] = ()
     timeframe: str | None = None
+    data_plan_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "bundle_id", _identity(self.bundle_id, field="bundle_id"))
@@ -346,6 +351,7 @@ class DatasetBundle:
     def content(self) -> dict[str, Any]:
         return {
             **({"timeframe": self.timeframe} if self.timeframe is not None else {}),
+            **({"data_plan_id": self.data_plan_id} if self.data_plan_id is not None else {}),
             "schema": "platform.dataset_bundle/v1",
             "product_id": self.product_id,
             "stage_snapshot_ids": dict(self.stage_snapshot_ids),
@@ -368,6 +374,14 @@ class DatasetBundle:
         return {"bundle_id": self.bundle_id, "content_hash": self.content_hash, **self.content}
 
 
+def _snapshot_source(payload):
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in {"snapshot_id", "availability_timestamp", "payload"}
+    }
+
+
 def _bundle_timing(payloads: Mapping[str, Any]) -> dict[str, Any]:
     timeframes = {
         data.get("timeframe") if isinstance(data, Mapping) else None for data in payloads.values()
@@ -378,7 +392,11 @@ def _bundle_timing(payloads: Mapping[str, Any]) -> dict[str, Any]:
     if timeframe is None:
         return {}
     timeframe_seconds(timeframe)
-    return {"timeframe": timeframe}
+    plans = {data.get("data_plan_id") for data in payloads.values()}
+    if len(plans) != 1:
+        raise DatasetResolutionError("dataset bundle data plans must agree")
+    plan = next(iter(plans))
+    return {"timeframe": timeframe, **({"data_plan_id": plan} if plan else {})}
 
 
 def _bar_timestamp(value: Any, *, field: str) -> str:
@@ -386,14 +404,10 @@ def _bar_timestamp(value: Any, *, field: str) -> str:
         raise DatasetResolutionError(f"{field} must be a timestamp")
     if isinstance(value, int | float):
         try:
-            return (
-                dt.datetime.fromtimestamp(float(value) / 1_000, dt.UTC)
-                .replace(microsecond=0)
-                .isoformat()
-            )
+            return dt.datetime.fromtimestamp(float(value) / 1_000, dt.UTC).isoformat()
         except (OverflowError, OSError, ValueError) as exc:
             raise DatasetResolutionError(f"{field} is invalid") from exc
-    return timestamp(str(value), field=field)
+    return timestamp(str(value), field=field, preserve_subseconds=True)
 
 
 class CanonicalResearchDatasetBuilder:
@@ -514,15 +528,22 @@ class CanonicalResearchDatasetBuilder:
             lifecycle_state=state,
             source_partition_hashes=tuple(source_partition_hashes),
             timeframe=bundle_payload.get("timeframe"),
+            data_plan_id=bundle_payload.get("data_plan_id"),
         )
+        return self._publish(bundle, snapshot_payloads)
+
+    def _publish(self, bundle, snapshot_payloads):
         with self.engine.begin() as connection:
-            for role in sorted(roles):
+            reused = self._reusable_bundle(connection, bundle, snapshot_payloads)
+            if reused is not None:
+                return SqlDatasetBundleRepository(self.engine).get(reused)
+            for role in sorted(snapshot_payloads):
                 self._insert_immutable(
                     connection,
                     dataset_snapshot,
                     {
-                        "id": snapshots[role],
-                        "created_at": created,
+                        "id": bundle.stage_snapshot_ids[role],
+                        "created_at": bundle.created_at,
                         "payload": snapshot_payloads[role],
                     },
                 )
@@ -539,8 +560,41 @@ class CanonicalResearchDatasetBuilder:
             )
         return bundle
 
-    def build_bundle(self, product_id: str, **kwargs: Any) -> DatasetBundle:
-        return self.build(product_id, **kwargs)
+    @staticmethod
+    def _reusable_bundle(connection, bundle, snapshots):
+        ignored = {"bundle_id", "content_hash", "created_at", "stage_snapshot_ids"}
+        source = {key: value for key, value in bundle.content.items() if key not in ignored}
+        expected = {role: _snapshot_source(row) for role, row in snapshots.items()}
+        identity = canonical_hash({"source": source, "snapshots": expected})
+        if connection.dialect.name == "postgresql":
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:identity))"),
+                {"identity": "dataset-content:" + identity},
+            )
+        rows = connection.execute(
+            select(dataset_bundle.c.payload)
+            .where(
+                dataset_bundle.c.product_id == bundle.product_id,
+                dataset_bundle.c.created_at <= bundle.created_at,
+                dataset_bundle.c.payload["universe_snapshot_id"].as_string()
+                == bundle.universe_snapshot_id,
+            )
+            .order_by(dataset_bundle.c.created_at, dataset_bundle.c.id)
+        ).scalars()
+        for row in rows:
+            if {key: value for key, value in row.items() if key not in ignored} != source:
+                continue
+            previous = {
+                item["role"]: _snapshot_source(item)
+                for item in connection.execute(
+                    select(dataset_snapshot.c.payload).where(
+                        dataset_snapshot.c.id.in_(row["stage_snapshot_ids"].values())
+                    )
+                ).scalars()
+            }
+            if previous == expected:
+                return row["bundle_id"]
+        return None
 
     def build_from_bars(
         self,
@@ -852,8 +906,8 @@ class CanonicalResearchDatasetBuilder:
     def _interval(value: Mapping[str, str], *, field: str) -> dict[str, str]:
         if not isinstance(value, Mapping) or set(value) != {"start", "end"}:
             raise DatasetResolutionError(f"{field} must contain start and end")
-        start = timestamp(str(value["start"]), field=f"{field}.start")
-        end = timestamp(str(value["end"]), field=f"{field}.end")
+        start = timestamp(str(value["start"]), field=f"{field}.start", preserve_subseconds=True)
+        end = timestamp(str(value["end"]), field=f"{field}.end", preserve_subseconds=True)
         if start >= end:
             raise DatasetResolutionError(f"{field} must be chronological")
         return {"start": start, "end": end}
@@ -1136,14 +1190,22 @@ class SqlDatasetBundleRepository:
     def __init__(self, engine: Engine):
         self.engine = engine
 
-    def latest_ready(self, product_id: str, *, at: str) -> DatasetBundle | None:
+    def latest_ready(
+        self, product_id: str, *, at: str, data_plan_id: str | None = None
+    ) -> DatasetBundle | None:
         at = timestamp(at, field="at")
         with self.engine.connect() as connection:
+            plan_filter = (
+                dataset_bundle.c.payload["data_plan_id"].as_string() == data_plan_id
+                if data_plan_id is not None
+                else True
+            )
             rows = connection.execute(
                 select(dataset_bundle.c.id)
                 .where(
                     dataset_bundle.c.product_id == product_id,
                     dataset_bundle.c.created_at <= at,
+                    plan_filter,
                 )
                 .order_by(dataset_bundle.c.created_at.desc(), dataset_bundle.c.id.desc())
             ).scalars()
@@ -1223,6 +1285,7 @@ class SqlDatasetBundleRepository:
             lifecycle_state=DatasetLifecycleState(str(record.get("lifecycle_state", "ready"))),
             source_partition_hashes=tuple(record.get("source_partition_hashes", ())),
             timeframe=record.get("timeframe"),
+            data_plan_id=record.get("data_plan_id"),
         )
         if bundle.bundle_id != bundle_id or bundle.content_hash != str(payload["content_hash"]):
             raise DatasetResolutionError("dataset bundle content hash is invalid")

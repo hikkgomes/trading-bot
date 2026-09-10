@@ -185,7 +185,11 @@ class PositionManager:
             else -(fill.quantity + base_fee_quantity)
         )
         quantity = current.quantity + signed_fill
-        reference_fill_price = float(fill.metadata.get("reference_price") or fill.price)
+        reference_fill_price = float(
+            fill.metadata.get("entry_reference_price")
+            or fill.metadata.get("reference_price")
+            or fill.price
+        )
         current_reference_price = float(
             current.metadata.get("reference_entry_price") or current.average_entry_price
         )
@@ -226,6 +230,7 @@ class PositionManager:
             metadata={
                 **dict(current.metadata),
                 "reference_entry_price": reference_average,
+                "last_fill_id": fill.fill_id,
                 "opened_at": (
                     fill.occurred_at
                     if quantity and current.quantity * quantity <= 0

@@ -71,12 +71,27 @@ class ExposureBudgetGuard:
         order: OrderIntent,
         positions: Iterable[Position],
         orders: Iterable[OrderIntent],
+        book_resources: Mapping[str, Any] | None = None,
     ) -> ExposureBudgetAssessment:
         if order.portfolio_id != str(product.get("portfolio_id") or ""):
             raise ExposureBudgetError("live order portfolio does not match product")
-        position_rows = tuple(item for item in positions if item.portfolio_id == order.portfolio_id)
+        all_positions = tuple(positions)
+        position_rows = tuple(
+            item for item in all_positions if item.portfolio_id == order.portfolio_id
+        )
         order_rows = tuple(orders)
         price = _order_reference_price(order)
+        if product_id == "btc_accumulation":
+            return _btc_assessment(
+                product,
+                account,
+                assignment,
+                risk_configuration,
+                account_payload,
+                order,
+                order_rows,
+                book_resources,
+            )
         if order.reduce_only:
             return _reduction_assessment(product_id, order, position_rows, price)
         price_by_instrument = _known_prices(
@@ -124,6 +139,7 @@ class ExposureBudgetGuard:
             gross,
             reserved_net,
             proposed,
+            all_positions,
         )
         assessment = ExposureBudgetAssessment(
             product_id=product_id,
@@ -223,7 +239,15 @@ def _reduction_assessment(product_id: str, order: OrderIntent, positions, price:
 
 
 def _scoped_values(
-    order, positions, orders, prices, assignment, gross: float, reserved_net: float, proposed: float
+    order,
+    positions,
+    orders,
+    prices,
+    assignment,
+    gross: float,
+    reserved_net: float,
+    proposed: float,
+    all_positions=(),
 ):
     values = {
         scope: 0.0
@@ -243,6 +267,9 @@ def _scoped_values(
                 assignment,
             )
     _add_scoped(values, order, proposed, order, assignment)
+    metadata = order.metadata.get("target_metadata", order.metadata)
+    if metadata.get("book_contributions"):
+        values.update(_book_scoped_values(order, orders, all_positions, prices, assignment))
     return {
         **values,
         ExposureScope.PRODUCT_GROSS: gross,
@@ -250,6 +277,82 @@ def _scoped_values(
         ExposureScope.ACCOUNT: gross,
         ExposureScope.ORDER: proposed,
     }
+
+
+def _book_scoped_values(order, orders, positions, prices, assignment):
+    metadata = order.metadata["target_metadata"]
+    book_id = assignment["payload"]["book_id"]
+    sleeves = {
+        row["book_id"]
+        for row in metadata["book_authorities"]
+        if row["sleeve_id"] == assignment["sleeve_id"]
+    }
+    values = {ExposureScope.ASSIGNMENT: 0.0, ExposureScope.SLEEVE: 0.0}
+    for scope, books in ((ExposureScope.ASSIGNMENT, {book_id}), (ExposureScope.SLEEVE, sleeves)):
+        values[scope] = sum(
+            abs(row.quantity) * prices[row.instrument_id]
+            for row in positions
+            if row.portfolio_id in books and row.quantity
+        )
+        for pending in (*tuple(orders), order):
+            if pending is not order and _skip_pending_order(order, pending):
+                continue
+            contributions = pending.metadata.get("target_metadata", {}).get("book_contributions")
+            if not contributions:
+                raise ExposureBudgetError("pending account order lacks book allocations")
+            total = sum(abs(row["signed_quantity"]) for row in contributions)
+            weight = sum(
+                abs(row["signed_quantity"]) for row in contributions if row["book_id"] in books
+            )
+            values[scope] += (
+                pending.remaining_quantity
+                * _order_valuation_price(pending, prices[pending.instrument_id])
+                * weight
+                / total
+            )
+    return values
+
+
+def enforce_book_plan(plan, assignments, product, account, risk_configuration, account_payload):
+    """Internal netting must satisfy virtual strategy and sleeve risk as well."""
+    # Validate frozen target budgets at their decision cutoff. Venue admission
+    # separately checks every actual book and reservation at the current quote.
+    prices = dict(plan["prices"])
+    equity = _account_equity(
+        product_id=plan["product_id"],
+        account=account,
+        account_payload=account_payload,
+        price=next(iter(prices.values())),
+        positions=(),
+        prices=prices,
+    )
+    gross = {
+        book: sum(abs(quantity) * prices[symbol] for symbol, quantity in targets.items())
+        for book, targets in plan["book_targets"].items()
+    }
+    if plan["product_id"] == "btc_accumulation":
+        gross = _btc_plan_risk(plan)
+    for assignment in assignments:
+        limits = _limits(
+            product_id=plan["product_id"],
+            product=product,
+            account=account,
+            assignment=assignment,
+            risk_configuration=risk_configuration,
+            equity=equity,
+        )
+        scopes = {
+            ExposureScope.ASSIGNMENT: gross[assignment["payload"]["book_id"]],
+            ExposureScope.SLEEVE: sum(
+                value
+                for book, value in gross.items()
+                if plan["books"][book]["sleeve_id"] == assignment["sleeve_id"]
+            ),
+        }
+        try:
+            assert_exposure_limits(scopes, (limit for limit in limits if limit.scope in scopes))
+        except ValueError as exc:
+            raise ExposureBudgetError(str(exc)) from exc
 
 
 def _add_scoped(values, item, notional: float, order, assignment) -> None:
@@ -262,6 +365,121 @@ def _add_scoped(values, item, notional: float, order, assignment) -> None:
         values[ExposureScope.ASSIGNMENT] += notional
     if sleeve is None or sleeve == assignment.get("sleeve_id"):
         values[ExposureScope.SLEEVE] += notional
+
+
+def _btc_plan_risk(plan):
+    price = plan["prices"]["binance:spot:BTCUSDT"]
+    result = {}
+    for book, targets in plan["book_targets"].items():
+        resource = plan["book_resources"][book]
+        balances = resource["balances"]
+        quantity = targets.get("binance:spot:BTCUSDT", 0)
+        core = resource["capital"]["btc_capital_baseline"]["core_btc_quantity"]
+        cash = balances.get("USDT", 0) + (balances.get("BTC", 0) - quantity) * price
+        if quantity < core - 1e-12 or cash < -1e-8:
+            raise ExposureBudgetError("BTC book plan breaches its core or settled cash")
+        result[book] = max(0.0, cash)
+    return result
+
+
+def _btc_reservations(order, orders, resources, price, fee_fraction):
+    cash = {book: float(row["balances"].get("USDT", 0)) for book, row in resources.items()}
+    sells, buys = dict.fromkeys(resources, 0.0), dict.fromkeys(resources, 0.0)
+    pending = [
+        row
+        for row in orders
+        if row.order_id != order.order_id
+        and row.portfolio_id == order.portfolio_id
+        and not row.is_terminal
+    ]
+    for item in (*pending, order):
+        if item.instrument_id != "binance:spot:BTCUSDT":
+            raise ExposureBudgetError("BTC book reservations require BTC spot only")
+        contributions = item.metadata.get("target_metadata", {}).get("book_contributions")
+        if not contributions:
+            raise ExposureBudgetError("BTC reservation lacks authoritative book contributions")
+        total = sum(abs(float(row["signed_quantity"])) for row in contributions)
+        for row in contributions:
+            quantity = item.remaining_quantity * abs(float(row["signed_quantity"])) / total
+            (buys if item.side is OrderSide.BUY else sells)[row["book_id"]] += quantity
+    for book, resource in resources.items():
+        balance = resource["balances"]
+        core = float(resource["capital"]["btc_capital_baseline"]["core_btc_quantity"])
+        if sells[book] and sells[book] > float(balance.get("BTC", 0)) - core + 1e-12:
+            raise ExposureBudgetError("BTC sale and reservations would consume protected core")
+        if buys[book] * price * (1 + fee_fraction) > cash[book] + 1e-8:
+            raise ExposureBudgetError("BTC purchase and reservations exceed owned settled cash")
+    reserved = {book: value + sells[book] * price for book, value in cash.items()}
+    return _btc_cash_after_purchase(reserved, order, price)
+
+
+def _btc_cash_after_purchase(cash, order, price):
+    from src.portfolio.book_plans import allocate_book_fill
+
+    if order.side is OrderSide.BUY:
+        contributions = order.metadata["target_metadata"]["book_contributions"]
+        for row in allocate_book_fill(order.remaining_quantity, 0, contributions):
+            cash[row["book_id"]] -= float(row["signed_quantity"]) * price
+    return cash
+
+
+def _btc_assessment(product, account, assignment, risk, snapshot, order, orders, resources):
+    if not resources or account.get("market") != "spot":
+        raise ExposureBudgetError("BTC live admission requires owned spot book resources")
+    prices = _known_prices(order=order, account_payload=snapshot, orders=orders)
+    price = _order_valuation_price(order, prices[order.instrument_id])
+    equity = _account_equity(
+        product_id="btc_accumulation",
+        account=account,
+        account_payload=snapshot,
+        price=price,
+        positions=(),
+        prices=prices,
+    )
+    reserved = _btc_reservations(
+        order, orders, resources, price, float(product["execution_costs"]["fee_bps"]) / 10000
+    )
+    book_id = assignment["payload"]["book_id"]
+    owners = order.metadata["target_metadata"]["book_authorities"]
+    values = {
+        ExposureScope.ASSIGNMENT: reserved[book_id],
+        ExposureScope.SLEEVE: sum(
+            reserved[row["book_id"]]
+            for row in owners
+            if row["sleeve_id"] == assignment["sleeve_id"]
+        ),
+        ExposureScope.INSTRUMENT: sum(reserved.values()),
+        ExposureScope.PRODUCT_GROSS: equity,
+        ExposureScope.PRODUCT_NET: equity,
+        ExposureScope.ACCOUNT: equity,
+        ExposureScope.ORDER: order.quantity * price,
+    }
+    limits = _limits(
+        product_id="btc_accumulation",
+        product=product,
+        account=account,
+        assignment=assignment,
+        risk_configuration=risk,
+        equity=equity,
+    )
+    for limit in limits:
+        value = equity if limit.name == "instrument_absolute_notional" else values[limit.scope]
+        if value > limit.maximum + 1e-8:
+            raise ExposureBudgetError(f"{limit.name} exceeds its BTC book budget")
+    return ExposureBudgetAssessment(
+        "btc_accumulation",
+        order.portfolio_id,
+        order.instrument_id,
+        equity,
+        price,
+        equity,
+        0,
+        order.quantity * price,
+        equity,
+        equity,
+        {limit.name: limit.maximum for limit in limits},
+        {scope.value: value for scope, value in values.items()},
+    )
 
 
 def _account_equity(
@@ -313,6 +531,11 @@ def _known_prices(
     prices.update(_account_market_prices(account_payload))
     prices.update(_account_position_prices(account_payload, prices))
     prices.update(_order_prices(orders, prices))
+    entry_reference = order.metadata.get("entry_reference")
+    if isinstance(entry_reference, Mapping):
+        prices[order.instrument_id] = _finite(
+            entry_reference.get("price"), field="entry quote", positive=True
+        )
     return prices
 
 
@@ -358,7 +581,12 @@ def _order_prices(orders: Iterable[OrderIntent], existing: Mapping[str, float]) 
 
 
 def _order_valuation_price(order: OrderIntent, mark: float) -> float:
-    return max(_order_reference_price(order), mark, float(order.limit_price or 0))
+    return max(
+        _order_reference_price(order),
+        mark,
+        float(order.limit_price or 0),
+        float(order.metadata.get("entry_reference", {}).get("price", 0)),
+    )
 
 
 def _order_reference_price(order: OrderIntent) -> float:

@@ -22,7 +22,9 @@ from src.data.database import (
 from src.domain._codec import canonical_hash
 from src.research.economic_series import ECONOMIC_ENGINE_VERSION
 from src.research.executors import DataUnavailableError
+from src.research.outcomes import terminal_trial_disposition
 from src.research.protected_exposure import legacy_exposure_conflicts
+from src.research.rounds import assert_epoch_closed
 from src.research.selection import FrozenCohort, selection_adjusted_block_bootstrap
 
 
@@ -129,6 +131,7 @@ def _lock(connection, scope: str) -> None:
 
 
 def _freeze(connection, candidate, snapshot_id, scope, now, policy_hash):
+    assert_epoch_closed(connection, candidate.dataset_bundle_id)
     metadata = (
         connection.execute(
             select(
@@ -218,12 +221,9 @@ def _disposition(trial, stages) -> str:
         return "finalist"
     if any(not stage["accepted"] for stage in stages.values()):
         return "rejected"
-    deferred = trial["metadata"].get("evaluation_deferred", {})
-    category = deferred.get("outcome_category")
-    if category in {"blocked_data", "inconclusive", "unsupported"}:
-        return str(category)
-    if trial["state"] == "unsupported" or str(trial["state"]).endswith("_dead_letter"):
-        return str(trial["state"])
+    terminal = terminal_trial_disposition(str(trial["state"]), trial["metadata"])
+    if terminal is not None:
+        return terminal.value
     return "pending"
 
 
