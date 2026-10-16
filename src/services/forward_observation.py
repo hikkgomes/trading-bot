@@ -10,6 +10,7 @@ from sqlalchemy import select
 from src.data.assignment_scope import financial_assignment_ids
 from src.data.database import (
     alpha_forecast,
+    evidence_invalidation,
     position,
     position_event,
     strategy_artefact,
@@ -18,6 +19,7 @@ from src.data.database import (
 from src.data.universe import SqlUniverseStore
 from src.domain._codec import timestamp
 from src.research.canonical import (
+    CanonicalEvidenceError,
     SqlActiveStrategyAssignmentRepository,
     SqlForwardEvidenceRepository,
     SqlStrategyArtefactRepository,
@@ -71,49 +73,12 @@ class DatabaseForwardObservationWorker:
             ):
                 raise ValueError("forward observation command has an invalid field set")
             evaluation_time = timestamp(str(payload["evaluation_time"]), field="evaluation_time")
-            assignment = self.assignments.by_id(str(payload["assignment_id"]))
-            if assignment is not None and self._superseded_by_live(
-                assignment=assignment,
-                product_id=str(payload["product_id"]),
-                at=now,
-            ):
-                self.queue.complete(claimed, completed_at=now)
-                return {
-                    "reason_code": "forward_observation_stopped_after_live_activation",
-                    "job_id": claimed.job_id,
-                }
-            if payload.get("waiting_reason") is not None:
-                if (
-                    assignment is None
-                    or assignment.get("active") is not True
-                    or assignment.get("execution_mode") != "paper"
-                    or assignment.get("strategy_version_id") != payload["strategy_version_id"]
-                    or assignment.get("product_id") != payload["product_id"]
-                    or assignment.get("artefact_hash") != payload["artefact_hash"]
-                    or assignment.get("instrument_id") is not None
-                ):
-                    raise ValueError("forward waiting assignment binding is invalid")
-                self.queue.complete(claimed, completed_at=now)
-                return {
-                    "reason_code": "forward_waiting_for_universe_data",
-                    "job_id": claimed.job_id,
-                    "waiting_reason": str(payload["waiting_reason"]),
-                }
-            if (
-                assignment is None
-                or assignment.get("active") is not True
-                or assignment.get("execution_mode") != "paper"
-                or assignment.get("strategy_version_id") != payload["strategy_version_id"]
-                or assignment.get("product_id") != payload["product_id"]
-                or assignment.get("artefact_hash") != payload["artefact_hash"]
-                or not _assignment_allows_instrument(
-                    self.engine,
-                    assignment,
-                    instrument_id=str(payload["instrument_id"]),
-                    at=evaluation_time,
-                )
-            ):
-                raise ValueError("forward observation assignment binding is invalid")
+            assignment, stopped = self._prepare_assignment(
+                claimed, payload, evaluation_time=evaluation_time, now=now
+            )
+            if stopped is not None:
+                return stopped
+            assert assignment is not None
             artefact = self.artefacts.get(str(payload["artefact_hash"]))
             window = self._current_window(payload, now=now)
             if evaluation_time <= window["opened_at"]:
@@ -203,6 +168,8 @@ class DatabaseForwardObservationWorker:
                 },
             )
         except Exception as exc:
+            if _invalidated_artefact_error(exc):
+                return self._complete_invalidated(claimed, now)
             self.queue.fail(
                 claimed,
                 completed_at=now,
@@ -222,6 +189,94 @@ class DatabaseForwardObservationWorker:
             "observation_id": observation_id,
             "observed_at": observed_at,
         }
+
+    def _prepare_assignment(
+        self,
+        claimed,
+        payload: Mapping[str, Any],
+        *,
+        evaluation_time: str,
+        now: str,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        assignment = self.assignments.by_id(str(payload["assignment_id"]))
+        if assignment is not None and self._superseded_by_live(
+            assignment=assignment, product_id=str(payload["product_id"]), at=now
+        ):
+            self.queue.complete(claimed, completed_at=now)
+            return None, {
+                "reason_code": "forward_observation_stopped_after_live_activation",
+                "job_id": claimed.job_id,
+            }
+        waiting = payload.get("waiting_reason") is not None
+        self._assert_assignment_binding(
+            assignment,
+            payload,
+            evaluation_time=evaluation_time,
+            waiting=waiting,
+        )
+        if self._artefact_invalidated(str(payload["artefact_hash"])):
+            return None, self._complete_invalidated(claimed, now)
+        if waiting:
+            self.queue.complete(claimed, completed_at=now)
+            return None, {
+                "reason_code": "forward_waiting_for_universe_data",
+                "job_id": claimed.job_id,
+                "waiting_reason": str(payload["waiting_reason"]),
+            }
+        return assignment, None
+
+    def _assert_assignment_binding(
+        self,
+        assignment: Mapping[str, Any] | None,
+        payload: Mapping[str, Any],
+        *,
+        evaluation_time: str,
+        waiting: bool,
+    ) -> None:
+        if (
+            assignment is None
+            or assignment.get("active") is not True
+            or assignment.get("execution_mode") != "paper"
+            or assignment.get("strategy_version_id") != payload["strategy_version_id"]
+            or assignment.get("product_id") != payload["product_id"]
+            or assignment.get("artefact_hash") != payload["artefact_hash"]
+        ):
+            message = (
+                "forward waiting assignment binding is invalid"
+                if waiting
+                else "forward observation assignment binding is invalid"
+            )
+            raise ValueError(message)
+        if waiting:
+            if assignment.get("instrument_id") is not None:
+                raise ValueError("forward waiting assignment binding is invalid")
+        elif not _assignment_allows_instrument(
+            self.engine,
+            assignment,
+            instrument_id=str(payload["instrument_id"]),
+            at=evaluation_time,
+        ):
+            raise ValueError("forward observation assignment binding is invalid")
+
+    def _artefact_invalidated(self, artefact_hash: str) -> bool:
+        with self.engine.connect() as connection:
+            return (
+                connection.execute(
+                    select(evidence_invalidation.c.id).where(
+                        evidence_invalidation.c.id == f"artefact:{artefact_hash}"
+                    )
+                ).first()
+                is not None
+            )
+
+    def _complete_invalidated(self, claimed, now: str) -> dict[str, Any]:
+        reason_code = "forward_observation_stopped_artefact_invalidated"
+        self.queue.complete(
+            claimed,
+            completed_at=now,
+            outcome={"reason_code": reason_code},
+        )
+        return {"reason_code": reason_code, "job_id": claimed.job_id}
 
     def _superseded_by_live(
         self, *, assignment: Mapping[str, Any], product_id: str, at: str
@@ -346,6 +401,12 @@ def _assignment_allows_instrument(
             observed_at=at,
             eligible_only=True,
         )
+    )
+
+
+def _invalidated_artefact_error(error: Exception) -> bool:
+    return isinstance(error, CanonicalEvidenceError) and str(error) == (
+        "strategy artefact economic evidence was invalidated"
     )
 
 

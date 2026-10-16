@@ -16,10 +16,12 @@ from sqlalchemy.engine import Engine
 
 from src.data.database import (
     dataset_snapshot,
+    evidence_invalidation,
     experiment,
     forward_paper_observation,
     job,
     job_attempt,
+    job_quarantine,
     paper_eligibility_event,
     platform_schedule,
     strategy_artefact,
@@ -47,6 +49,19 @@ def _legacy_risk_fixture(payload: object) -> bool:
         return False
     scopes = {"strategy", "instrument", "sleeve", "product", "account", "global"}
     return set(payload) == scopes | {"product_id", "assessment_id"}
+
+
+def _diagnostic_candidate(
+    candidate_metadata: Mapping[str, Any], definition_metadata: Mapping[str, Any]
+) -> bool:
+    return (
+        candidate_metadata.get("diagnostic") is True
+        or definition_metadata.get("diagnostic") is True
+    )
+
+
+def _non_promotable_artefact(metadata: Mapping[str, Any]) -> bool:
+    return metadata.get("diagnostic") is True or metadata.get("promotable") is False
 
 
 def _plus_seconds(value: str, seconds: int) -> str:
@@ -383,9 +398,24 @@ class PlatformScheduler:
         self, product_id: str, now: str, due_at: str
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
         jobs: list[tuple[str, str, dict[str, Any]]] = []
-        for candidate in SqlResearchStore(self.engine).load_candidates():
-            if candidate.definition.product != product_id or not candidate.dataset_snapshot_hashes:
-                continue
+        product_candidates = tuple(
+            candidate
+            for candidate in SqlResearchStore(self.engine).load_candidates()
+            if candidate.definition.product == product_id
+        )
+        diagnostic_ids = {
+            candidate.candidate_id
+            for candidate in product_candidates
+            if _diagnostic_candidate(candidate.metadata, candidate.definition.metadata)
+        }
+        if diagnostic_ids:
+            self._quarantine_diagnostic_evaluation_jobs(diagnostic_ids, now)
+        candidates = tuple(
+            candidate
+            for candidate in product_candidates
+            if candidate.candidate_id not in diagnostic_ids and candidate.dataset_snapshot_hashes
+        )
+        for candidate in candidates:
             with self.engine.connect() as connection:
                 state = connection.execute(
                     select(experiment.c.state).where(experiment.c.id == candidate.candidate_id)
@@ -405,6 +435,9 @@ class PlatformScheduler:
                 requested_stage = state_value.removeprefix("waiting_for_dataset:")
             if requested_stage is None:
                 continue
+            if self._candidate_stage_dead_letter(candidate.candidate_id, requested_stage):
+                self._mark_candidate_dead_letter(candidate.candidate_id, requested_stage, now)
+                continue
             expected_role = {
                 "screening": "screening",
                 "development": "development",
@@ -422,9 +455,6 @@ class PlatformScheduler:
             )
             if snapshot_id is None or snapshot_payload is None:
                 self._mark_dataset_waiting(candidate.candidate_id, requested_stage, now)
-                continue
-            if self._candidate_stage_dead_letter(candidate.candidate_id, requested_stage):
-                self._mark_candidate_dead_letter(candidate.candidate_id, requested_stage, now)
                 continue
             if self._candidate_stage_job_pending(candidate.candidate_id, requested_stage):
                 continue
@@ -463,6 +493,67 @@ class PlatformScheduler:
                 )
             )
         return tuple(jobs)
+
+    def _quarantine_diagnostic_evaluation_jobs(self, candidate_ids: set[str], now: str) -> None:
+        reason = "non_promotable_diagnostic_excluded_from_autonomous_evaluation"
+        with self.engine.begin() as connection:
+            statement = (
+                select(job)
+                .where(
+                    job.c.name == "evaluate_candidate",
+                    job.c.state == "pending",
+                    job.c.producer_identity.like("platform-scheduler:%"),
+                    job.c.payload["candidate_id"].as_string().in_(candidate_ids),
+                )
+                .order_by(job.c.id)
+            )
+            if self.engine.dialect.name == "postgresql":
+                statement = statement.with_for_update(skip_locked=True)
+            pending = connection.execute(statement).mappings()
+            for row in pending:
+                payload = row["payload"]
+                if (
+                    not isinstance(payload, Mapping)
+                    or str(payload.get("candidate_id") or "") not in candidate_ids
+                ):
+                    continue
+                job_id = str(row["id"])
+                transitioned = connection.execute(
+                    update(job)
+                    .where(job.c.id == job_id, job.c.state == "pending")
+                    .values(
+                        state="quarantined",
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        terminal_reason=reason,
+                    )
+                )
+                if transitioned.rowcount != 1:
+                    continue
+                audit = {
+                    "job_id": job_id,
+                    "name": str(row["name"]),
+                    "state": str(row["state"]),
+                    "content_hash": str(row["content_hash"]),
+                    "payload": payload,
+                    "reason": reason,
+                    "quarantined_at": now,
+                }
+                prior = connection.execute(
+                    select(job_quarantine.c.job_id).where(job_quarantine.c.job_id == job_id)
+                ).first()
+                if prior is None:
+                    connection.execute(
+                        insert(job_quarantine).values(
+                            id=canonical_hash(audit),
+                            job_id=job_id,
+                            quarantined_at=now,
+                            original_state=str(row["state"]),
+                            reason=reason,
+                            content_hash=str(row["content_hash"]),
+                            payload=json_value(audit, field="quarantined job"),
+                        )
+                    )
 
     def _mark_dataset_waiting(self, candidate_id: str, stage: str, now: str) -> None:
         with self.engine.begin() as connection:
@@ -744,7 +835,7 @@ class PlatformScheduler:
             if (
                 artefact.get("product_id") != product_id
                 or isinstance(metadata, Mapping)
-                and metadata.get("promotable") is False
+                and _non_promotable_artefact(metadata)
             ):
                 continue
             strategy_version_id = str(artefact.get("strategy_version_id") or "")
@@ -873,6 +964,9 @@ class PlatformScheduler:
             )
             if assignment["execution_mode"] == "paper"
         )
+        invalidated = self._invalidated_artefacts(
+            {str(assignment["artefact_hash"]) for assignment in assignments}
+        )
         jobs: list[tuple[str, str, dict[str, Any]]] = []
         pending = {
             (
@@ -882,6 +976,8 @@ class PlatformScheduler:
             for payload in self._pending_payloads("forward_paper_observation")
         }
         for assignment in assignments:
+            if str(assignment["artefact_hash"]) in invalidated:
+                continue
             payload = assignment.get("payload")
             if isinstance(payload, Mapping) and payload.get("promotable") is False:
                 continue
@@ -919,6 +1015,18 @@ class PlatformScheduler:
                     )
                 )
         return tuple(jobs)
+
+    def _invalidated_artefacts(self, artefact_hashes: set[str]) -> set[str]:
+        if not artefact_hashes:
+            return set()
+        invalidation_ids = {f"artefact:{identity}" for identity in artefact_hashes}
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(evidence_invalidation.c.id).where(
+                    evidence_invalidation.c.id.in_(invalidation_ids)
+                )
+            ).scalars()
+        return {str(identity).removeprefix("artefact:") for identity in rows}
 
     def _summary_jobs(
         self, product_id: str, now: str, due_at: str
@@ -962,6 +1070,7 @@ class PlatformScheduler:
                     }
                 )
             )
+        invalidated = self._invalidated_artefacts({group[2] for group in groups})
         return tuple(
             (
                 immutable_work_id(
@@ -983,6 +1092,7 @@ class PlatformScheduler:
             )
             for strategy_version_id, group_product_id, artefact_hash, evaluation_time in groups
             if (strategy_version_id, artefact_hash, evaluation_time) not in pending
+            and artefact_hash not in invalidated
         )
 
     def _pending_payloads(self, name: str) -> tuple[Mapping[str, Any], ...]:

@@ -83,3 +83,71 @@ def test_new_public_batch_job_is_explicitly_tagged_for_retention(tmp_path) -> No
         ).scalar_one()
     assert "queue_retention_policy" not in replayed_payload
     engine.dispose()
+
+
+def test_history_starts_despite_market_backlog_and_leaves_capture_running(tmp_path):
+    from concurrent.futures import Future
+    from unittest.mock import Mock
+
+    from src.data.database import PlatformDatabase
+    from src.domain._codec import canonical_hash
+    from src.services.data_writer import DatabaseMarketDataWriter
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'history-fairness.sqlite3'}")
+    database.create_schema()
+    queue = DatabaseJobQueue(database.engine)
+    now = "2026-10-16T00:00:00+00:00"
+    queue.register_worker(
+        worker_id="writer",
+        node_id="linux-optiplex",
+        role="data-writer",
+        capabilities=("historical_bootstrap", "market_event_batch_write"),
+        observed_at=now,
+    )
+    spool = DurableMarketBatchSpool(tmp_path / "spool", max_rows=1, max_bytes=10_000)
+    sink = DatabaseGatewaySink(queue, spool=spool)
+    segment = spool.append(_event(1), venue="binance", market="futures", symbol="BTCUSDT")
+    sink._enqueue_segment(segment)
+    with database.engine.begin() as connection:
+        connection.execute(job.update().values(available_at=now))
+    for identity in ("first-history", "second-history"):
+        payload = {
+            "product_id": "active_income",
+            "producer_identity": identity,
+            "market_type": "futures",
+            "timeframe": "1h",
+            "symbols": ["BTCUSDT"],
+            "minimum_history_days": 365,
+        }
+        queue.enqueue(
+            job_id=identity,
+            name="historical_bootstrap",
+            payload={**payload, "content_hash": canonical_hash(payload)},
+            available_at=now,
+            priority=0,
+        )
+    pending = Future()
+    executor = Mock()
+    executor.submit.return_value = pending
+    writer = DatabaseMarketDataWriter(
+        queue=queue,
+        worker_id="writer",
+        root=tmp_path / "market",
+        historical_bootstrap_service=Mock(),
+        historical_executor=executor,
+    )
+    assert writer.run_once(now=now)["reason_code"] == "historical_bootstrap_started"
+    assert executor.submit.call_args.args[1].job_id == "first-history"
+    result = writer.run_once(now=now)
+    assert result["reason_code"] == "market_event_batch_written"
+    assert result["events"] == 1
+    executor.submit.assert_called_once()
+    with database.engine.connect() as connection:
+        states = dict(connection.execute(select(job.c.id, job.c.state)).all())
+    assert states["second-history"] == "pending"
+    assert states["first-history"] == "running"
+    assert (
+        states[f"work:market_event_batch:{segment.content_hash.removeprefix('sha256:')}"]
+        == "completed"
+    )
+    database.dispose()

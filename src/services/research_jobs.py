@@ -8,7 +8,7 @@ from typing import Any
 
 from sqlalchemy import select
 
-from src.data.database import paper_eligibility_event, validation_stage
+from src.data.database import job, paper_eligibility_event, validation_stage
 from src.data.parquet_store import PartitionedBacktestStore
 from src.domain._codec import canonical_hash
 from src.domain.strategies import StrategySourceType
@@ -70,7 +70,7 @@ from src.research.theses import SqlThesisRegistry, StrategyThesisFactory, Thesis
 from src.services.historical_bootstrap import HistoricalBootstrapService
 from src.services.job_schemas import JobSchemaError, ResearchJobRequest
 from src.services.runtime import utc_now
-from src.services.scheduler import ClaimedJob
+from src.services.scheduler import ClaimedJob, _diagnostic_candidate
 
 _REQUIRED_EVIDENCE: dict[str, frozenset[str]] = {
     "screening": frozenset(
@@ -1178,10 +1178,11 @@ class DatabaseResearchJobHandlers:
         renew()
         ResearchJobRequest.from_mapping(claimed.payload, require_dataset_roles=True)
         request = EvaluationRequest.from_payload(claimed.payload)
-        if self.dataset_resolver is None:
-            raise JobSchemaError("candidate evaluation requires a canonical dataset resolver")
-        resolver = self.dataset_resolver
         candidate = self.store.get_candidate(request.candidate_id)
+        stopped = self._skip_autonomous_diagnostic_evaluation(claimed, request, candidate)
+        if stopped is not None:
+            return stopped
+        resolver = self._require_dataset_resolver()
         cohort = None
         if request.requested_stage == "protected":
             execution_time = utc_now()
@@ -1344,6 +1345,33 @@ class DatabaseResearchJobHandlers:
             complete_cohort(self.store.engine, cohort, now=utc_now())
         self._record_agent_evaluation(candidate, result)
         return self._finalise_evaluation(candidate, request, result)
+
+    def _scheduler_owned_evaluation_job(self, job_id: str) -> bool:
+        with self.store.engine.connect() as connection:
+            producer = connection.execute(
+                select(job.c.producer_identity).where(job.c.id == job_id)
+            ).scalar_one_or_none()
+        return isinstance(producer, str) and producer.startswith("platform-scheduler:")
+
+    def _skip_autonomous_diagnostic_evaluation(
+        self, claimed: ClaimedJob, request: EvaluationRequest, candidate: Candidate
+    ) -> dict[str, Any] | None:
+        if not _diagnostic_candidate(candidate.metadata, candidate.definition.metadata):
+            return None
+        if not self._scheduler_owned_evaluation_job(claimed.job_id):
+            return None
+        return {
+            "candidate_id": candidate.candidate_id,
+            "stage": request.requested_stage,
+            "accepted": False,
+            "deferred": False,
+            "reason_code": "non_promotable_diagnostic_excluded_from_autonomous_evaluation",
+        }
+
+    def _require_dataset_resolver(self) -> CanonicalDatasetResolver:
+        if self.dataset_resolver is None:
+            raise JobSchemaError("candidate evaluation requires a canonical dataset resolver")
+        return self.dataset_resolver
 
     def _record_agent_evaluation(self, candidate: Candidate, result: Any) -> None:
         from src.agents.store import SqlAgentStore

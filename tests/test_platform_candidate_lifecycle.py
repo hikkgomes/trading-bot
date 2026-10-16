@@ -63,6 +63,247 @@ NOW = "2026-09-07T00:00:00+00:00"
 INSTRUMENT = "binance:futures:BTCUSDT:USDT"
 
 
+def test_invalidated_forward_assignment_completes_without_retry_or_reschedule(tmp_path):
+    from sqlalchemy import insert
+
+    from src.data.database import (
+        active_strategy_assignment,
+        evidence_invalidation,
+        forward_paper_observation,
+        job,
+        job_attempt,
+        strategy_definition,
+        strategy_version,
+    )
+    from src.services.forward_observation import DatabaseForwardObservationWorker
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'invalidated-forward.sqlite3'}")
+    database.create_schema()
+    definition_id = canonical_hash("invalidated-definition")
+    version_id = canonical_hash("invalidated-version")
+    artefact_hash = canonical_hash("invalidated-artefact")
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(strategy_definition).values(
+                id=definition_id,
+                identity="invalidated-fixture",
+                product_id="active_income",
+                source_type="generated_dsl",
+                source_hash=definition_id,
+                definition={"product": "active_income"},
+            )
+        )
+        connection.execute(
+            insert(strategy_version).values(
+                id=version_id,
+                definition_id=definition_id,
+                version="1",
+                created_at=NOW,
+                payload={},
+            )
+        )
+    assignment_id = "fixture-assignment"
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(active_strategy_assignment).values(
+                id=assignment_id,
+                product_id="active_income",
+                portfolio_id="fixture-portfolio",
+                sleeve_id="default",
+                strategy_version_id=version_id,
+                instrument_id=INSTRUMENT,
+                universe_id=None,
+                assignment_scope_id=f"instrument:{INSTRUMENT}",
+                artefact_hash=artefact_hash,
+                lifecycle_state="forward_paper",
+                execution_mode="paper",
+                capital_limit=100.0,
+                risk_budget=1.0,
+                assigned_at=NOW,
+                active_until=None,
+                assigned_by="fixture operator",
+                assignment_reason="fixture history",
+                active=True,
+                payload={},
+            )
+        )
+    with database.engine.begin() as connection:
+        connection.execute(
+            forward_paper_observation.insert().values(
+                id=canonical_hash("old-forward-observation"),
+                strategy_version_id=version_id,
+                product_id="active_income",
+                instrument_id=INSTRUMENT,
+                observed_at=NOW,
+                artefact_hash=artefact_hash,
+                observation_hash=canonical_hash("old-forward-observation-content"),
+                payload={},
+            )
+        )
+        connection.execute(
+            evidence_invalidation.insert().values(
+                id=f"artefact:{artefact_hash}",
+                created_at=NOW,
+                payload={"reason_code": "stale_economic_evidence"},
+            )
+        )
+    product = {"product_id": "active_income"}
+    scheduler = PlatformScheduler(
+        engine=database.engine, products={"active_income": product}, node_id="fixture"
+    )
+    assert scheduler._forward_jobs("active_income", NOW, NOW) == ()
+    assert scheduler._summary_jobs("active_income", NOW, NOW) == ()
+
+    queue = DatabaseJobQueue(database.engine)
+    queue.register_worker(
+        worker_id="forward-worker",
+        node_id="fixture",
+        role="runtime",
+        capabilities=("forward_paper_observation",),
+        observed_at=NOW,
+    )
+    queue.enqueue(
+        job_id="invalidated-forward-observation",
+        name="forward_paper_observation",
+        payload={
+            "assignment_id": assignment_id,
+            "strategy_version_id": version_id,
+            "product_id": "active_income",
+            "instrument_id": INSTRUMENT,
+            "artefact_hash": artefact_hash,
+            "evaluation_time": NOW,
+        },
+        available_at=NOW,
+    )
+    result = DatabaseForwardObservationWorker(
+        engine=database.engine, queue=queue, worker_id="forward-worker"
+    ).run_once(now=NOW)
+
+    assert result["reason_code"] == "forward_observation_stopped_artefact_invalidated"
+    with database.engine.connect() as connection:
+        job_state = connection.execute(
+            select(job.c.state).where(job.c.id == "invalidated-forward-observation")
+        ).scalar_one()
+        attempt = connection.execute(
+            select(job_attempt.c.status, job_attempt.c.error).where(
+                job_attempt.c.job_id == "invalidated-forward-observation"
+            )
+        ).one()
+    assert job_state == "completed"
+    assert attempt.status == "completed" and attempt.error is None
+    assert scheduler._forward_jobs("active_income", NOW, NOW) == ()
+    database.dispose()
+
+
+def test_scheduler_quarantines_nonpromotable_diagnostics_but_keeps_explicit_work(tmp_path):
+    from sqlalchemy import insert, update
+
+    from src.data.database import (
+        dataset_snapshot,
+        experiment,
+        job,
+        job_quarantine,
+        strategy_artefact,
+    )
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'diagnostic-scheduler.sqlite3'}")
+    database.create_schema()
+    bundle = _bundle(database)
+    candidate = _candidate(database, bundle)
+    with database.engine.begin() as connection:
+        connection.execute(
+            update(experiment)
+            .where(experiment.c.id == candidate.candidate_id)
+            .values(state="legacy_import")
+        )
+    diagnostic = replace(
+        candidate,
+        dataset_bundle_id=None,
+        dataset_plan=None,
+        metadata={**dict(candidate.metadata), "diagnostic": True, "promotable": False},
+        definition=replace(
+            candidate.definition,
+            metadata={
+                **dict(candidate.definition.metadata),
+                "diagnostic": True,
+                "promotable": False,
+            },
+        ),
+    )
+    ResearchCoordinator(SqlResearchStore(database.engine)).submit(diagnostic)
+    stored = next(
+        item
+        for item in SqlResearchStore(database.engine).load_candidates()
+        if item.candidate_id == diagnostic.candidate_id
+    )
+    assert stored.metadata.get("diagnostic") is True
+    snapshot_id = bundle.stage_snapshot_ids["screening"]
+    with database.engine.connect() as connection:
+        snapshot_payload = connection.execute(
+            select(dataset_snapshot.c.payload).where(dataset_snapshot.c.id == snapshot_id)
+        ).scalar_one()
+    scheduler = PlatformScheduler(
+        engine=database.engine,
+        products={"active_income": {"product_id": "active_income"}},
+        node_id="fixture",
+    )
+    evaluation_payload = scheduler._research_request(
+        candidate_id=diagnostic.candidate_id,
+        snapshot_id=snapshot_id,
+        snapshot_payload=snapshot_payload,
+        requested_stage="screening",
+        evaluated_at=NOW,
+    )
+    queue = DatabaseJobQueue(database.engine)
+    for job_id, producer in (
+        ("automatic-diagnostic", "platform-scheduler:fixture"),
+        ("explicit-diagnostic", "operator-diagnostic"),
+    ):
+        queue.enqueue(
+            job_id=job_id,
+            name="evaluate_candidate",
+            payload=evaluation_payload,
+            available_at=NOW,
+            producer_identity=producer,
+        )
+    artefact_hash = canonical_hash("diagnostic-artefact")
+    with database.engine.begin() as connection:
+        connection.execute(
+            insert(strategy_artefact).values(
+                id=artefact_hash,
+                created_at=NOW,
+                payload={
+                    "product_id": "active_income",
+                    "strategy_version_id": diagnostic.definition.strategy_version_id,
+                    "artefact_hash": artefact_hash,
+                    "metadata": {"diagnostic": True, "promotable": False},
+                },
+            )
+        )
+
+    assert scheduler._candidate_evaluation_jobs("active_income", NOW, NOW) == ()
+    assert scheduler._promotion_jobs("active_income", NOW, NOW) == ()
+    with database.engine.connect() as connection:
+        state = connection.execute(
+            select(experiment.c.state).where(experiment.c.id == diagnostic.candidate_id)
+        ).scalar_one()
+        queued = {
+            row.id: row.state
+            for row in connection.execute(
+                select(job.c.id, job.c.state).where(
+                    job.c.id.in_(("automatic-diagnostic", "explicit-diagnostic"))
+                )
+            )
+        }
+        quarantine_reason = connection.execute(
+            select(job_quarantine.c.reason).where(job_quarantine.c.job_id == "automatic-diagnostic")
+        ).scalar_one()
+    assert state == "queued"
+    assert queued == {"automatic-diagnostic": "quarantined", "explicit-diagnostic": "pending"}
+    assert quarantine_reason == "non_promotable_diagnostic_excluded_from_autonomous_evaluation"
+    database.dispose()
+
+
 @pytest.fixture(params=["sqlite", "postgresql"])
 def lifecycle_database(request, tmp_path):
     if request.param == "sqlite":

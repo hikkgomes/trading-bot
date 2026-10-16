@@ -84,7 +84,7 @@ class DatabaseMarketDataWriter:
             completed, self._history_future = self._history_future, None
             return completed.result()
         self._cleanup_completed_spool_segments()
-        claimed = self.queue.claim(
+        claimed = self._claim_history(now) or self.queue.claim(
             worker_id=self.worker_id,
             now=now,
             lease_seconds=self.lease_seconds,
@@ -114,6 +114,21 @@ class DatabaseMarketDataWriter:
         if claimed.name == "market_event_batch_write":
             return self._run_batch_write(claimed, now=now)
         return self._run_single_event_write(claimed, now=now)
+
+    def _claim_history(self, now: str):
+        if (
+            self.historical_bootstrap_service is None
+            or self.historical_executor is None
+            or self._history_future is not None
+        ):
+            return None
+        # Reserve the independent download slot even while the live queue stays busy.
+        return self.queue.claim(
+            worker_id=self.worker_id,
+            now=now,
+            lease_seconds=self.lease_seconds,
+            names=("historical_bootstrap",),
+        )
 
     def __call__(self) -> dict[str, Any]:
         return self.run_once(now=self.clock())

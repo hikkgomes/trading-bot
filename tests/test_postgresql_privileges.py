@@ -110,7 +110,13 @@ def test_evaluator_completes_research_without_runtime_membership(monkeypatch, tm
 
         from sqlalchemy import select, update
 
-        from src.data.database import experiment, research_epoch
+        from src.data.database import (
+            dataset_snapshot,
+            experiment,
+            job,
+            job_quarantine,
+            research_epoch,
+        )
         from src.research.coordinator import ResearchCoordinator
         from src.research.rounds import ResearchRoundCoordinator
 
@@ -329,6 +335,121 @@ def test_evaluator_completes_research_without_runtime_membership(monkeypatch, tm
             )
             assert claimed is not None
             public_queue.complete(claimed, completed_at=NOW)
+
+            with database.engine.connect() as connection:
+                diagnostic_metadata = dict(
+                    connection.execute(
+                        select(experiment.c.metadata).where(
+                            experiment.c.id == candidate.candidate_id
+                        )
+                    ).scalar_one()
+                )
+            diagnostic_metadata.update({"diagnostic": True, "promotable": False})
+            with database.engine.begin() as connection:
+                connection.execute(
+                    update(experiment)
+                    .where(experiment.c.id == candidate.candidate_id)
+                    .values(metadata=diagnostic_metadata)
+                )
+            diagnostic_scheduler = PlatformScheduler(
+                engine=database.engine,
+                products={"active_income": product},
+                node_id="fixture",
+            )
+            snapshot_id = bundle.stage_snapshot_ids["screening"]
+            with database.engine.connect() as connection:
+                snapshot = connection.execute(
+                    select(dataset_snapshot.c.payload).where(dataset_snapshot.c.id == snapshot_id)
+                ).scalar_one()
+            diagnostic_payload = diagnostic_scheduler._research_request(
+                candidate_id=candidate.candidate_id,
+                snapshot_id=snapshot_id,
+                snapshot_payload=snapshot,
+                requested_stage="screening",
+                evaluated_at=NOW,
+            )
+            queue.enqueue(
+                job_id="diagnostic-pending",
+                name="evaluate_candidate",
+                payload=diagnostic_payload,
+                available_at=NOW,
+                producer_identity="platform-scheduler:fixture",
+            )
+            queue.enqueue(
+                job_id="diagnostic-explicit",
+                name="evaluate_candidate",
+                payload=diagnostic_payload,
+                available_at=NOW,
+                producer_identity="operator-diagnostic",
+            )
+            assert diagnostic_scheduler._candidate_evaluation_jobs("active_income", NOW, NOW) == ()
+            assert handlers._scheduler_owned_evaluation_job("diagnostic-explicit") is False
+            queue.enqueue(
+                job_id="diagnostic-race",
+                name="evaluate_candidate",
+                payload=diagnostic_payload,
+                available_at=NOW,
+                producer_identity="platform-scheduler:fixture",
+            )
+            import threading
+            from concurrent.futures import ThreadPoolExecutor
+
+            start = threading.Barrier(2)
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                quarantine = workers.submit(
+                    lambda: (
+                        start.wait(),
+                        diagnostic_scheduler._quarantine_diagnostic_evaluation_jobs(
+                            {candidate.candidate_id}, NOW
+                        ),
+                    )[1]
+                )
+                claim_race = workers.submit(
+                    lambda: (
+                        start.wait(),
+                        queue.claim(
+                            worker_id="evaluation",
+                            now=NOW,
+                            lease_seconds=60,
+                            names=("evaluate_candidate",),
+                            producer_identity="platform-scheduler:fixture",
+                        ),
+                    )[1]
+                )
+                quarantine.result()
+                raced_claim = claim_race.result()
+            if raced_claim is not None:
+                stopped = handlers.evaluate_candidate(raced_claim, lambda: raced_claim)
+                assert (
+                    stopped["reason_code"]
+                    == "non_promotable_diagnostic_excluded_from_autonomous_evaluation"
+                )
+                queue.complete(raced_claim, completed_at=NOW, outcome=stopped)
+            with database.engine.connect() as connection:
+                diagnostic_states = {
+                    row.id: row.state
+                    for row in connection.execute(
+                        select(job.c.id, job.c.state).where(
+                            job.c.id.in_(
+                                ("diagnostic-pending", "diagnostic-race", "diagnostic-explicit")
+                            )
+                        )
+                    )
+                }
+                quarantine_reasons = set(
+                    connection.execute(
+                        select(job_quarantine.c.reason).where(
+                            job_quarantine.c.job_id.in_(("diagnostic-pending", "diagnostic-race"))
+                        )
+                    ).scalars()
+                )
+            assert diagnostic_states["diagnostic-pending"] == "quarantined"
+            assert diagnostic_states["diagnostic-explicit"] == "pending"
+            assert diagnostic_states["diagnostic-race"] in {"quarantined", "completed"}
+            assert quarantine_reasons == {
+                "non_promotable_diagnostic_excluded_from_autonomous_evaluation"
+            }
+
         finally:
             adaptive.dispose()
     finally:
