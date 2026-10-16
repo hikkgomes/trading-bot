@@ -21,6 +21,7 @@ StateDirectoryMode=0700
 UMask=0007
 ExecStartPre=/opt/trading-bot/.venv-agent/bin/python -m src.agents.model_broker --validate --socket /run/trading-platform-model-broker/model.sock --ledger /var/lib/trading-platform-model-broker/ledger.sqlite3 --prompt /opt/trading-bot/config/openclaw_daily_review_prompt.md --agent research --allowed-user trading-agent
 ExecStart=/opt/trading-bot/.venv-agent/bin/python -m src.agents.model_broker --socket /run/trading-platform-model-broker/model.sock --ledger /var/lib/trading-platform-model-broker/ledger.sqlite3 --prompt /opt/trading-bot/config/openclaw_daily_review_prompt.md --agent research --allowed-user trading-agent
+TimeoutStartSec=300
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=30

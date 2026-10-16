@@ -21,6 +21,7 @@ Environment=OPENBLAS_NUM_THREADS=2
 Environment=NUMBA_CACHE_DIR=/opt/trading-bot/runtime/research/numba-cache
 ExecStartPre=/opt/trading-bot/.venv-research/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process research-runtime --validate
 ExecStart=/opt/trading-bot/.venv-research/bin/python -m src.services.process --config /opt/trading-bot/config/platform.json --node linux-optiplex --process research-runtime
+TimeoutStartSec=300
 Restart=always
 RestartSec=10
 TimeoutStopSec=30

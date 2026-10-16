@@ -384,6 +384,60 @@ def test_every_platform_role_has_only_its_declared_authority() -> None:
             "trading_research", "DELETE FROM market_input_buffer WHERE id=:id", {"id": buffer_id}
         )
     _as_role("trading_runtime", "DELETE FROM market_input_buffer WHERE id=:id", {"id": buffer_id})
+    from concurrent.futures import ThreadPoolExecutor
+
+    from src.risk.engine import SqlRiskSnapshotStore
+
+    runtime = create_engine(
+        os.environ["TRADING_PLATFORM_DATABASE_URL"],
+        connect_args={"options": "-c role=trading_runtime"},
+    )
+    store = SqlRiskSnapshotStore(runtime)
+    observed_at = dt.datetime.now(dt.UTC).isoformat()
+    pinned_payload = {**market_payload, "fixture": run_id, "values": {"price": 100}}
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            publications = [
+                pool.submit(
+                    store.save_market_input,
+                    pinned_payload,
+                    created_at=observed_at,
+                    retention_at=observed_at,
+                )
+                for _ in range(2)
+            ]
+            identities = {publication.result() for publication in publications}
+        assert len(identities) == 1
+        pinned_id = identities.pop()
+        assert (
+            store.save_market_input(
+                pinned_payload, created_at=observed_at, retention_at=observed_at
+            )
+            == pinned_id
+        )
+        transient_id = store.save_market_input(
+            {**pinned_payload, "values": {"price": 101}},
+            created_at=observed_at,
+            retention_at=observed_at,
+        )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reads = [pool.submit(store.get, pinned_id) for _ in range(2)]
+            assert all(read.result() == pinned_payload for read in reads)
+        store.expire_market_inputs(
+            at=(dt.datetime.fromisoformat(observed_at) + dt.timedelta(minutes=16)).isoformat()
+        )
+        assert store.get(pinned_id) == pinned_payload
+        with pytest.raises(KeyError):
+            store.get(transient_id)
+    finally:
+        runtime.dispose()
+        cleanup = create_engine(os.environ["TRADING_PLATFORM_DATABASE_URL"])
+        with cleanup.begin() as connection:
+            connection.execute(
+                text("DELETE FROM market_input_buffer WHERE payload->>'fixture'=:fixture"),
+                {"fixture": run_id},
+            )
+        cleanup.dispose()
     _as_role("trading_research", "SELECT id FROM instrument LIMIT 1")
     with pytest.raises(DBAPIError):
         _as_role("trading_research", "SELECT id FROM balance_snapshot LIMIT 1")

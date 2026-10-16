@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from sqlalchemy import delete, insert, select
+from sqlalchemy import delete, insert, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
@@ -217,6 +217,14 @@ class SqlRiskSnapshotStore:
         self.engine = engine
         self.book_id = book_id
 
+    @staticmethod
+    def _lock_identity(connection, snapshot_id: str) -> None:
+        if connection.dialect.name == "postgresql":
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:identity, 0))"),
+                {"identity": f"risk-snapshot:{snapshot_id}"},
+            )
+
     def save(self, payload: dict[str, object], *, created_at: str) -> str:
         if self.book_id is not None:
             payload = {**payload, "book_id": self.book_id}
@@ -224,6 +232,7 @@ class SqlRiskSnapshotStore:
         snapshot_id = canonical_hash(clean)
         created_at = timestamp(created_at, field="created_at")
         with self.engine.begin() as connection:
+            self._lock_identity(connection, snapshot_id)
             existing = connection.execute(
                 select(risk_snapshot_table.c.payload).where(risk_snapshot_table.c.id == snapshot_id)
             ).scalar_one_or_none()
@@ -255,6 +264,7 @@ class SqlRiskSnapshotStore:
         )
         cutoff = (dt.datetime.fromisoformat(retained_at) - _MARKET_INPUT_RETENTION).isoformat()
         with self.engine.begin() as connection:
+            self._lock_identity(connection, snapshot_id)
             existing = connection.execute(
                 select(risk_snapshot_table.c.payload).where(risk_snapshot_table.c.id == snapshot_id)
             ).scalar_one_or_none()
@@ -269,9 +279,9 @@ class SqlRiskSnapshotStore:
                 self._expire_unpinned_market_inputs(connection, cutoff)
                 return snapshot_id
             buffered = connection.execute(
-                select(market_input_buffer_table.c.payload)
-                .where(market_input_buffer_table.c.id == snapshot_id)
-                .with_for_update()
+                select(market_input_buffer_table.c.payload).where(
+                    market_input_buffer_table.c.id == snapshot_id
+                )
             ).scalar_one_or_none()
             if buffered is not None:
                 if dict(buffered) != clean:
@@ -359,6 +369,7 @@ class SqlRiskSnapshotStore:
 
     def get(self, snapshot_id: str) -> dict[str, object]:
         with self.engine.begin() as connection:
+            self._lock_identity(connection, snapshot_id)
             payload = connection.execute(
                 select(risk_snapshot_table.c.payload).where(risk_snapshot_table.c.id == snapshot_id)
             ).scalar_one_or_none()
@@ -371,9 +382,9 @@ class SqlRiskSnapshotStore:
                 )
                 return clean
             buffered = connection.execute(
-                select(market_input_buffer_table.c.created_at, market_input_buffer_table.c.payload)
-                .where(market_input_buffer_table.c.id == snapshot_id)
-                .with_for_update()
+                select(
+                    market_input_buffer_table.c.created_at, market_input_buffer_table.c.payload
+                ).where(market_input_buffer_table.c.id == snapshot_id)
             ).one_or_none()
             if buffered is None:
                 payload = connection.execute(
