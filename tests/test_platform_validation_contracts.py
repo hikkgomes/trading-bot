@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -26,7 +27,12 @@ from src.research.selection import FrozenCohort, selection_adjusted_block_bootst
 
 
 def _approval_calibration_fixture(configuration):
-    from src.research.calibration import CASES, GENERATOR_VERSION, _case_summary
+    from src.research.calibration import (
+        CASES,
+        GENERATOR_VERSION,
+        _case_summary,
+        calibration_runtime,
+    )
     from src.research.policy_approval import calibration_source_hashes
     from src.research.selection import METHOD
 
@@ -70,6 +76,7 @@ def _approval_calibration_fixture(configuration):
         "generator_version": GENERATOR_VERSION,
         "policy_hash": canonical_hash(configuration),
         "source_hashes": calibration_source_hashes(),
+        "runtime": calibration_runtime(),
         "qualification_authority": False,
         "policy_approval_required": True,
         "candidates": candidates,
@@ -184,6 +191,10 @@ def test_research_policy_approval_binds_reviewed_receipt_configuration_code_and_
     )
     with database.engine.connect() as connection:
         assert current_approval(connection, **query) is None
+    with pytest.raises(ValueError, match="binding"):
+        validate_calibration(
+            {**receipt, "runtime": {"python": "other", "numpy": "other"}}, configuration
+        )
     receipt["summary"]["null"]["qualification_rate"] = 0.5
     with pytest.raises(ValueError, match="summary"):
         validate_calibration(receipt, configuration)
@@ -502,3 +513,45 @@ def test_joint_bootstrap_t_matches_bartlett_quadratic_form_reference():
     result = _bootstrap_length(values, block, seed, draws)
     assert result is not None
     np.testing.assert_array_equal(result["pvalues"], (exceedances + 1) / (draws + 1))
+
+
+def test_calibration_resumes_identical_trials_and_rejects_changed_checkpoints(tmp_path):
+    from unittest.mock import patch
+
+    from src.research.calibration import _calibration_trial, calibrate
+
+    arguments = {
+        "seed": 731,
+        "replicates": 1,
+        "policy_hash": "checkpoint-contract",
+        "maximum_seconds": 60,
+        "candidates": 2,
+    }
+    expected = calibrate(**arguments)
+    directory = tmp_path / "calibration"
+    with patch(
+        "src.research.calibration._calibration_trial",
+        side_effect=[expected["trials"][0], TimeoutError("interrupted")],
+    ):
+        with pytest.raises(TimeoutError, match="interrupted"):
+            calibrate(**arguments, checkpoint_dir=directory)
+    assert len(list(directory.glob("null-*.json"))) == 1
+    with patch("src.research.calibration._calibration_trial", wraps=_calibration_trial) as trial:
+        resumed = calibrate(**arguments, checkpoint_dir=directory)
+    assert trial.call_count == 5
+    assert resumed["summary"] == expected["summary"]
+    assert canonical_hash(resumed["trials"]) == canonical_hash(expected["trials"])
+    with patch("src.research.calibration._calibration_trial") as trial:
+        repeated = calibrate(**arguments, checkpoint_dir=directory)
+    trial.assert_not_called()
+    assert canonical_hash(repeated["trials"]) == canonical_hash(expected["trials"])
+    with pytest.raises(ValueError, match="different design or runtime"):
+        calibrate(**{**arguments, "seed": 732}, checkpoint_dir=directory)
+    path = directory / "null-731.json"
+    checkpoint = json.loads(path.read_text())
+    checkpoint["trial"]["qualified_in_simulation"] = not checkpoint["trial"][
+        "qualified_in_simulation"
+    ]
+    path.write_text(json.dumps(checkpoint))
+    with pytest.raises(ValueError, match="content or trial binding"):
+        calibrate(**arguments, checkpoint_dir=directory)

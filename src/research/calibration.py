@@ -4,13 +4,17 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import sys
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from src.data.atomic import write_json_atomic
+from src.data.locking import acquire_file_update_lock
 from src.domain._codec import canonical_hash
 from src.research.selection import METHOD, FrozenCohort, selection_adjusted_block_bootstrap
 
@@ -103,6 +107,7 @@ def calibrate(
     test_alpha: float = 0.1,
     observations: int = 256,
     candidates: int = 3,
+    checkpoint_dir: Path | None = None,
 ) -> dict[str, Any]:
     if (
         not 1 <= candidates <= 100
@@ -116,20 +121,30 @@ def calibrate(
     if not 0 < test_alpha < 1:
         raise ValueError("nominal test cutoff must be in (0, 1)")
     started = time.monotonic()
-    trials = []
-    for case_index, case in enumerate(CASES):
-        for replicate in range(replicates):
-            if time.monotonic() - started > maximum_seconds:
-                raise TimeoutError("calibration exceeded its declared time budget")
-            trials.append(
-                _calibration_trial(
-                    case,
-                    seed + case_index * 10000 + replicate,
-                    observations,
-                    test_alpha,
-                    candidates,
-                )
-            )
+    source_hashes = _source_hashes()
+    design = {
+        "method": METHOD,
+        "generator_version": GENERATOR_VERSION,
+        "source_hashes": source_hashes,
+        "runtime": calibration_runtime(),
+        "policy_hash": policy_hash,
+        "seed": seed,
+        "replicates": replicates,
+        "observations": observations,
+        "candidates": candidates,
+        "proposed_alpha": proposed_alpha,
+        "test_alpha": test_alpha,
+    }
+    lock = (
+        acquire_file_update_lock(checkpoint_dir / "manifest.json", label="calibration")
+        if checkpoint_dir is not None
+        else nullcontext()
+    )
+    with lock:
+        _bind_checkpoint(checkpoint_dir, design)
+        trials = _run_trials(design, checkpoint_dir, started, maximum_seconds)
+    if _source_hashes() != source_hashes:
+        raise ValueError("calibration source changed during execution")
     summary = {
         case: _case_summary([trial for trial in trials if trial["case"] == case]) for case in CASES
     }
@@ -138,10 +153,8 @@ def calibrate(
         "method": METHOD,
         "generator_version": GENERATOR_VERSION,
         "policy_hash": policy_hash,
-        "source_hashes": {
-            name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-            for name in ("selection.py", "calibration.py")
-        },
+        "source_hashes": source_hashes,
+        "runtime": design["runtime"],
         "seed": seed,
         "candidates": candidates,
         "calibration_scope": "selection_inference_kernel",
@@ -162,6 +175,72 @@ def calibrate(
             "economic_execution_and_lifecycle_require_separate_contract_validation",
         ],
     }
+
+
+def calibration_runtime() -> dict[str, str]:
+    return {"python": sys.version, "numpy": np.__version__}
+
+
+def _source_hashes() -> dict[str, str]:
+    return {
+        name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+        for name in ("selection.py", "calibration.py")
+    }
+
+
+def _bind_checkpoint(directory: Path | None, design: dict[str, Any]) -> None:
+    if directory is None:
+        return
+    manifest = directory / "manifest.json"
+    if manifest.exists():
+        if json.loads(manifest.read_text()) != design:
+            raise ValueError("calibration checkpoint belongs to a different design or runtime")
+    else:
+        write_json_atomic(manifest, design)
+
+
+def _run_trials(design, directory, started, maximum_seconds):
+    trials = []
+    design_hash = canonical_hash(design)
+    for case_index, case in enumerate(CASES):
+        for replicate in range(design["replicates"]):
+            if time.monotonic() - started > maximum_seconds:
+                raise TimeoutError(
+                    "calibration exceeded its declared time budget; resume its checkpoints"
+                )
+            seed = design["seed"] + case_index * 10000 + replicate
+            path = directory / f"{case}-{seed}.json" if directory is not None else None
+            trial = _load_trial(path, design_hash, case, seed)
+            if trial is None:
+                trial = _calibration_trial(
+                    case, seed, design["observations"], design["test_alpha"], design["candidates"]
+                )
+                if path is not None:
+                    write_json_atomic(
+                        path,
+                        {
+                            "design_hash": design_hash,
+                            "trial_hash": canonical_hash(trial),
+                            "trial": trial,
+                        },
+                    )
+            trials.append(trial)
+    return trials
+
+
+def _load_trial(path, design_hash, case, seed):
+    if path is None or not path.exists():
+        return None
+    payload = json.loads(path.read_text())
+    trial = payload["trial"]
+    if (
+        payload["design_hash"] != design_hash
+        or payload["trial_hash"] != canonical_hash(trial)
+        or trial["case"] != case
+        or trial["seed"] != seed
+    ):
+        raise ValueError("calibration checkpoint content or trial binding is invalid")
+    return trial
 
 
 def _case_summary(trials: list[dict[str, Any]]) -> dict[str, Any]:
@@ -196,14 +275,21 @@ def main() -> None:
     parser.add_argument("--test-alpha", type=float, default=0.05)
     args = parser.parse_args()
     policy = json.loads(args.policy.read_text())
-    result = calibrate(
-        seed=args.seed,
-        replicates=args.replicates,
-        policy_hash=canonical_hash(policy),
-        candidates=int(policy["search_budgets"]["maximum_candidates_per_epoch"]),
-        maximum_seconds=args.maximum_seconds,
-        test_alpha=args.test_alpha,
-    )
+    try:
+        result = calibrate(
+            seed=args.seed,
+            replicates=args.replicates,
+            policy_hash=canonical_hash(policy),
+            candidates=int(policy["search_budgets"]["maximum_candidates_per_epoch"]),
+            maximum_seconds=args.maximum_seconds,
+            test_alpha=args.test_alpha,
+            checkpoint_dir=args.output / "checkpoints",
+        )
+    except TimeoutError:
+        print(
+            json.dumps({"status": "incomplete", "checkpoint_dir": str(args.output / "checkpoints")})
+        )
+        raise SystemExit(75) from None
     encoded = json.dumps(result, sort_keys=True, indent=2)
     args.output.mkdir(parents=True, exist_ok=True)
     path = args.output / (hashlib.sha256(encoded.encode()).hexdigest() + ".json")

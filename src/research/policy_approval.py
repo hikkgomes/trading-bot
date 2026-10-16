@@ -11,7 +11,7 @@ from sqlalchemy import exists, insert, or_, select
 
 from src.data.database import PlatformDatabase, research_calibration, research_policy_approval
 from src.domain._codec import canonical_hash, non_empty, timestamp
-from src.research.calibration import CASES, GENERATOR_VERSION, _case_summary
+from src.research.calibration import CASES, GENERATOR_VERSION, _case_summary, calibration_runtime
 from src.research.policy_identity import research_policy_engine_digest
 from src.research.selection import METHOD
 
@@ -143,6 +143,7 @@ def validate_calibration(receipt, configuration):
         "generator_version": GENERATOR_VERSION,
         "policy_hash": canonical_hash(configuration),
         "source_hashes": calibration_source_hashes(),
+        "runtime": calibration_runtime(),
         "qualification_authority": False,
         "policy_approval_required": True,
         "calibration_scope": "selection_inference_kernel",
