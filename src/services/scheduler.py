@@ -128,6 +128,7 @@ AUTONOMOUS_SCHEDULES = (
     ScheduleSpec("forward_paper_summary", 900),
     ScheduleSpec("promotion_evaluation", 900),
     ScheduleSpec("live_account_backfill", 300),
+    ScheduleSpec("reporting", 300),
     ScheduleSpec("agent_review", 3600),
     ScheduleSpec("maintenance", 3600),
     ScheduleSpec("historical_bootstrap", 3600),
@@ -183,7 +184,12 @@ class PlatformScheduler:
                     due_at = timestamp(str(row["next_run_at"]), field="next_run_at")
             scheduled_job_ids: list[str] = []
             if queue_name is not None:
-                for product_id, product in sorted(self.products.items()):
+                products = (
+                    (("global", {}),)
+                    if spec.name == "reporting"
+                    else tuple(sorted(self.products.items()))
+                )
+                for product_id, product in products:
                     for job_id, job_name, payload in self._jobs(
                         spec.name, product_id, product, due_at, due_at
                     ):
@@ -256,6 +262,7 @@ class PlatformScheduler:
             "forward_paper_summary": "forward_paper_summary",
             "promotion_evaluation": "promotion_evaluation",
             "live_account_backfill": "live_account_backfill",
+            "reporting": "reporting",
             "agent_review": "agent_review",
             "maintenance": "maintenance",
             "historical_bootstrap": "historical_bootstrap",
@@ -297,6 +304,16 @@ class PlatformScheduler:
         now: str,
         due_at: str,
     ) -> tuple[tuple[str, str, dict[str, Any]], ...]:
+        if schedule_name == "reporting":
+            if self._pending_payloads("reporting"):
+                return ()
+            return (
+                (
+                    f"scheduled:reporting:global:{due_at}",
+                    "reporting",
+                    {"producer_identity": "platform-scheduler", "scheduled_at": due_at},
+                ),
+            )
         if schedule_name == "maintenance" and product_id != min(self.products):
             return ()
         if schedule_name == "historical_bootstrap":

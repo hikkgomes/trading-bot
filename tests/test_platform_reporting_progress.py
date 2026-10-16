@@ -125,6 +125,15 @@ def test_report_exposes_latest_universe_attrition(tmp_path) -> None:
             )
         )
         connection.execute(
+            insert(universe_snapshot).values(
+                id="universe-snapshot-report-old",
+                universe_id="universe-report",
+                observed_at="2026-08-30T10:00:00+00:00",
+                content_hash="sha256:" + "b" * 64,
+                payload={},
+            )
+        )
+        connection.execute(
             insert(universe_member).values(
                 id="universe-member-report",
                 snapshot_id="universe-snapshot-report",
@@ -134,10 +143,30 @@ def test_report_exposes_latest_universe_attrition(tmp_path) -> None:
                 payload={},
             )
         )
+        connection.execute(
+            insert(universe_member).values(
+                id="universe-member-report-old-a",
+                snapshot_id="universe-snapshot-report-old",
+                instrument_id="instrument-report",
+                eligible=True,
+                reason_code=None,
+                payload={},
+            )
+        )
+        connection.execute(
+            insert(universe_member).values(
+                id="universe-member-report-old-b",
+                snapshot_id="universe-snapshot-report-old",
+                instrument_id="instrument-report",
+                eligible=False,
+                reason_code="old_exclusion",
+                payload={},
+            )
+        )
 
     attrition = DatabasePlatformReport(database.engine).build()["research"]["universe_attrition"]
 
-    assert attrition["snapshot_count"] == 1
+    assert attrition["snapshot_count"] == 2
     latest = attrition["latest_by_universe"]["universe-report"]
     assert latest["total_members"] == 1
     assert latest["eligible_members"] == 0
@@ -329,3 +358,227 @@ def test_report_worker_alerts_on_funnel_and_live_safety_slis(tmp_path) -> None:
     }
     assert len(result["alert_ids"]) == 9
     database.dispose()
+
+
+def test_scheduler_process_report_keeps_diagnostics_separate_and_replaces_latest(
+    tmp_path, monkeypatch
+) -> None:
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from sqlalchemy import select
+    from test_platform_candidate_lifecycle import _bundle, _candidate
+
+    from src.data.database import experiment, experiment_run, strategy_definition, strategy_version
+    from src.domain._codec import canonical_hash
+    from src.research.economic_series import ECONOMIC_ENGINE_VERSION
+    from src.services.process import _build_trading_work
+    from src.services.scheduler import PlatformScheduler
+    from src.services.supervisor import _service_work
+
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'report-pipeline.sqlite3'}")
+    database.create_schema()
+    now = NOW
+    bundle = _bundle(database)
+    regular_candidate = _candidate(database, bundle)
+    diagnostic_definition = canonical_hash("definition-diagnostic-report-definition")
+    diagnostic_version = canonical_hash("definition-diagnostic-report-version")
+    with database.engine.begin() as connection:
+        candidate_metadata = dict(
+            connection.execute(
+                select(experiment.c.metadata).where(
+                    experiment.c.id == regular_candidate.candidate_id
+                )
+            ).scalar_one()
+        )
+        candidate_metadata.update(
+            {"promotable": False, "blocked_reason": "waiting for fixture data"}
+        )
+        connection.execute(
+            experiment.update()
+            .where(experiment.c.id == regular_candidate.candidate_id)
+            .values(metadata=candidate_metadata)
+        )
+    with database.engine.begin() as connection:
+        connection.execute(
+            strategy_definition.insert().values(
+                id=diagnostic_definition,
+                identity="definition-diagnostic-report",
+                product_id="active_income",
+                source_type="generated_dsl",
+                source_hash=diagnostic_definition,
+                definition={"metadata": {"diagnostic": True}},
+            )
+        )
+        connection.execute(
+            strategy_version.insert().values(
+                id=diagnostic_version,
+                definition_id=diagnostic_definition,
+                version="1",
+                created_at=now,
+                payload={},
+            )
+        )
+        for experiment_id, version_id, metadata, dataset_hashes, bundle_id in (
+            (
+                "experiment-diagnostic-candidate",
+                regular_candidate.definition.strategy_version_id,
+                {"diagnostic": True, "promotable": False},
+                list(regular_candidate.dataset_snapshot_hashes),
+                bundle.bundle_id,
+            ),
+            ("definition-diagnostic-candidate", diagnostic_version, {}, [], None),
+        ):
+            connection.execute(
+                experiment.insert().values(
+                    id=experiment_id,
+                    strategy_version_id=version_id,
+                    provider="fixture",
+                    state="queued",
+                    submitted_at=now,
+                    dataset_snapshot_hashes=dataset_hashes,
+                    dataset_bundle_id=bundle_id,
+                    metadata=metadata,
+                )
+            )
+        for run_id, candidate_id in (
+            ("regular-run", regular_candidate.candidate_id),
+            ("diagnostic-run", "experiment-diagnostic-candidate"),
+        ):
+            connection.execute(
+                experiment_run.insert().values(
+                    id=run_id,
+                    created_at=now,
+                    payload={
+                        "candidate_id": candidate_id,
+                        "run_name": "screening",
+                        "evidence": {},
+                        "metrics": {"net_return": 0.01},
+                        "receipt": {
+                            "candidate_id": candidate_id,
+                            "dataset_snapshot_ids": ["sha256:" + "c" * 64],
+                            "executor_version": ECONOMIC_ENGINE_VERSION,
+                            "input_hash": "sha256:" + "d" * 64,
+                        },
+                    },
+                )
+            )
+    parquet_root = tmp_path / "data"
+    parquet_root.mkdir()
+    (tmp_path / "runtime").mkdir()
+    reports_root = tmp_path / "runtime" / "reports"
+    reports_root.mkdir(mode=0o755)
+    config = SimpleNamespace(
+        paths={
+            "parquet": str(parquet_root),
+            "artefacts": str(tmp_path / "data" / "artefacts"),
+            "backups": str(tmp_path / "missing-backups"),
+        },
+        alerting={"minimum_valid_screenings_before_progress": 10},
+        backup={"maximum_age_seconds": 172_800, "minimum_free_bytes": 0},
+    )
+    alerts = SqlAlertService(database.engine, default_cooldown_seconds=0)
+    scheduler = PlatformScheduler(engine=database.engine, products={}, node_id="fixture")
+    scheduler.run_once(now=now)
+    scheduler.run_once(now="2026-08-31T10:05:00+00:00")
+    with database.engine.connect() as connection:
+        reporting_jobs = connection.execute(
+            select(job.c.id, job.c.state).where(job.c.name == "reporting")
+        ).all()
+    assert len(reporting_jobs) == 1
+    assert reporting_jobs[0].id.startswith("scheduled:reporting:global:")
+    work = _build_trading_work(
+        database=database,
+        config=config,
+        node_id="fixture",
+        configuration={},
+        alerts=alerts,
+        selected_services=("report-worker",),
+    )
+    queued_result = work["report-worker"]()
+    assert queued_result["reason_code"] == "operator_report_written"
+    latest_path = Path(queued_result["path"])
+    assert latest_path.name == "latest.json"
+    assert latest_path.parent.stat().st_mode & 0o777 == 0o700
+    assert latest_path.stat().st_mode & 0o777 == 0o600
+    report = json.loads(latest_path.read_text())
+    research = report["research"]
+    assert research["diagnostic_candidate_count"] == 2
+    assert set(research["diagnostic_candidate_ids"]) == {
+        "experiment-diagnostic-candidate",
+        "definition-diagnostic-candidate",
+    }
+    assert [item["id"] for item in research["candidate_queue"]] == [regular_candidate.candidate_id]
+    funnel = research["funnel"]
+    assert funnel["candidates_generated"] == 1
+    assert funnel["diagnostic_candidates_excluded"] == 2
+    assert funnel["unique_measured_evaluations"] == 1
+    assert funnel["diagnostic_run_count"] == 1
+    assert funnel["candidates_without_job_or_reason"] == []
+    assert alerts.events()[0].event_type == "backup_failure_or_stale"
+
+    from src.services import supervisor
+
+    monkeypatch.setattr(supervisor, "utc_now", lambda: now)
+    direct_args = SimpleNamespace(service="report-worker", once=True, node="fixture")
+    direct_work = _service_work(
+        direct_args,
+        {
+            "database": database,
+            "config": config,
+            "split": {},
+            "runtime": SimpleNamespace(),
+            "alerts": alerts,
+            "control_plane": SimpleNamespace(),
+        },
+    )
+    direct_result = direct_work()
+    assert direct_result["reason_code"] == "operator_report_written"
+    assert direct_result["path"] == queued_result["path"]
+    assert list(latest_path.parent.iterdir()) == [latest_path]
+    for terminal_state in (
+        "screening_rejected",
+        "infrastructure_exhausted",
+        "unsupported",
+        "protected",
+    ):
+        with database.engine.begin() as connection:
+            connection.execute(
+                experiment.update()
+                .where(experiment.c.id == regular_candidate.candidate_id)
+                .values(state=terminal_state, metadata={})
+            )
+        direct_work()
+        terminal_report = json.loads(latest_path.read_text())["research"]
+        assert terminal_report["candidate_queue"] == []
+        assert terminal_report["funnel"]["candidates_without_job_or_reason"] == []
+    database.dispose()
+
+
+def test_report_storage_inventory_is_bounded_and_metrics_name_its_scope(tmp_path) -> None:
+    from src.observability.metrics import DatabaseMetricsProvider
+    from src.observability.reports import _storage_health
+
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    spool_root = tmp_path / "events" / "spool"
+    pending = spool_root / "pending"
+    pending.mkdir(parents=True)
+    for index in range(260):
+        (pending / f"segment-{index:03d}.jsonl").write_text("{}\n")
+
+    storage = _storage_health(data_root, spool_root)
+    inventory = storage["spool_inventory"]
+    assert inventory["scope"] == "bounded_inventory_sample"
+    assert inventory["entry_limit_per_directory"] == 256
+    assert inventory["files_observed"] == 256
+    assert inventory["truncated"] is True
+    rendered = DatabaseMetricsProvider(lambda: {"operations": {"storage_health": storage}}).render()
+    assert (
+        'platform_storage_filesystem_inode_stats_available{scope="backing_filesystem"}' in rendered
+    )
+    assert 'platform_storage_spool_files_observed{scope="bounded_inventory_sample"} 256' in rendered
+    assert (
+        'platform_storage_spool_inventory_truncated{scope="bounded_inventory_sample"} 1' in rendered
+    )

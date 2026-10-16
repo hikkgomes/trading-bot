@@ -554,6 +554,23 @@ def test_every_platform_role_has_only_its_declared_authority() -> None:
             store.get(transient_id)
         with pytest.raises(KeyError):
             store.get(batch_peer_id)
+        source = {
+            "kind": "role_source_probe",
+            "product_id": run_id,
+            "observed_at": observed_at,
+            "values": {"price": 100},
+        }
+        source_id = store.save(source, created_at=observed_at)
+        after_source = (
+            dt.datetime.fromisoformat(observed_at) + dt.timedelta(seconds=1)
+        ).isoformat()
+        store.save({**source, "values": [100]}, created_at=after_source)
+        assert store.latest(
+            kind="role_source_probe",
+            product_id=run_id,
+            at=after_source,
+            require_source_envelope=True,
+        ) == (source_id, source)
     finally:
         runtime.dispose()
         cleanup = create_engine(os.environ["TRADING_PLATFORM_DATABASE_URL"])

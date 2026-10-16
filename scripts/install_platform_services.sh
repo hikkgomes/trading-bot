@@ -274,6 +274,14 @@ if [[ "$NODE" == "linux-optiplex" ]]; then
   done
   install -d -m 2770 -o trading-runtime -g trading-runtime "$REPO/runtime/backups"
   setfacl -m u:trading-research:---,u:trading-evaluator:--- "$REPO/runtime/backups"
+  install -d -m 0700 -o trading-runtime -g trading-runtime "$REPO/runtime/reports"
+  setfacl -b "$REPO/runtime/reports"
+  setfacl -k "$REPO/runtime/reports"
+  chmod 0700 "$REPO/runtime/reports"
+  if [[ -f "$REPO/runtime/reports/latest.json" && ! -L "$REPO/runtime/reports/latest.json" ]]; then
+    chown trading-runtime:trading-runtime "$REPO/runtime/reports/latest.json"
+    chmod 0600 "$REPO/runtime/reports/latest.json"
+  fi
   for directory in research; do
     install -d -m 2770 -o trading-research -g trading-research "$REPO/data/$directory"
   done

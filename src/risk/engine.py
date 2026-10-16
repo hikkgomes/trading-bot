@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from sqlalchemy import delete, insert, select, text
+from sqlalchemy import delete, func, insert, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
@@ -455,44 +455,35 @@ class SqlRiskSnapshotStore:
     ) -> tuple[str, dict[str, object]]:
         at = timestamp(at, field="at")
         source = market_input_sources if kind == "market_data_input" else risk_snapshot_table
+        statement = select(source.c.id, source.c.payload).where(
+            source.c.created_at <= at,
+            source.c.payload["kind"].as_string() == kind,
+            source.c.payload["product_id"].as_string() == product_id,
+            source.c.payload["book_id"].as_string() == self.book_id,
+        )
+        if require_source_envelope:
+            statement = statement.where(*self._source_envelope_conditions(source.c.payload))
+        statement = statement.order_by(source.c.created_at.desc(), source.c.id.desc()).limit(1)
         with self.engine.connect() as connection:
-            rows = (
-                connection.execute(
-                    select(
-                        source.c.id,
-                        source.c.created_at,
-                        source.c.payload,
-                    )
-                    .where(
-                        source.c.created_at <= at,
-                        source.c.payload["kind"].as_string() == kind,
-                        source.c.payload["product_id"].as_string() == product_id,
-                        source.c.payload["book_id"].as_string() == self.book_id,
-                    )
-                    .order_by(source.c.created_at.desc(), source.c.id.desc())
-                )
-                .mappings()
-                .all()
+            row = connection.execute(statement).mappings().first()
+        if row is None:
+            raise KeyError(f"no {kind} snapshot exists for product {product_id} at {at}")
+        payload = row["payload"]
+        if canonical_hash(payload) != str(row["id"]):
+            raise ValueError("risk snapshot content hash does not match its identity")
+        identity = str(row["id"])
+        return identity, self.get(identity) if kind == "market_data_input" else dict(payload)
+
+    def _source_envelope_conditions(self, payload):
+        if self.engine.dialect.name == "postgresql":
+            return (
+                func.jsonb_typeof(payload["values"]) == "object",
+                func.jsonb_typeof(payload["observed_at"]) == "string",
             )
-            for row in rows:
-                payload = row["payload"]
-                if (
-                    isinstance(payload, dict)
-                    and payload.get("kind") == kind
-                    and payload.get("product_id") == product_id
-                    and (
-                        not require_source_envelope
-                        or isinstance(payload.get("values"), dict)
-                        and isinstance(payload.get("observed_at"), str)
-                    )
-                ):
-                    if canonical_hash(payload) != str(row["id"]):
-                        raise ValueError("risk snapshot content hash does not match its identity")
-                    identity = str(row["id"])
-                    return identity, self.get(identity) if kind == "market_data_input" else dict(
-                        payload
-                    )
-        raise KeyError(f"no {kind} snapshot exists for product {product_id} at {at}")
+        return (
+            func.json_type(payload, "$.values") == "object",
+            func.json_type(payload, "$.observed_at") == "text",
+        )
 
 
 @dataclass(frozen=True)

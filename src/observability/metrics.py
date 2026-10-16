@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -119,29 +120,65 @@ class DatabaseMetricsProvider:
             registry.set_gauge(metric, _numeric(value))
         storage = operations.get("storage_health")
         if isinstance(storage, Mapping):
-            for field_name in (
-                "active_inode_count",
-                "spool_inode_count",
-                "spool_bytes",
-                "stale_spool_files",
-            ):
-                registry.set_gauge(
-                    f"platform_storage_{field_name}",
-                    _numeric(storage.get(field_name)),
-                )
+            _record_storage_metrics(registry, storage)
+
+
+def _record_storage_metrics(registry: MetricsRegistry, storage: Mapping[str, Any]) -> None:
+    filesystem = storage.get("filesystem")
+    if isinstance(filesystem, Mapping):
+        scope = str(filesystem.get("scope") or "unknown")
+        registry.set_gauge(
+            "platform_storage_filesystem_inode_stats_available",
+            float(filesystem.get("available") is True),
+            scope=scope,
+        )
+        for field_name in ("total_inodes", "free_inodes", "available_inodes"):
+            value = filesystem.get(field_name)
+            if isinstance(value, int | float) and not isinstance(value, bool):
+                registry.set_gauge(f"platform_storage_filesystem_{field_name}", value, scope=scope)
+    spool = storage.get("spool_inventory")
+    if isinstance(spool, Mapping):
+        scope = str(spool.get("scope") or "unknown")
+        for field_name in (
+            "files_observed",
+            "bytes_observed",
+            "stale_files_over_7_days",
+            "unreadable_entries",
+            "entry_limit_per_directory",
+        ):
+            registry.set_gauge(
+                f"platform_storage_spool_{field_name}",
+                _numeric(spool.get(field_name)),
+                scope=scope,
+            )
+        registry.set_gauge(
+            "platform_storage_spool_inventory_truncated",
+            float(spool.get("truncated") is True),
+            scope=scope,
+        )
 
 
 def build_metrics_server(
     *,
     bind: tuple[str, int],
     provider: Callable[[], str],
+    bearer_token: str,
 ) -> ThreadingHTTPServer:
-    """Build a local Prometheus HTTP server for the platform report."""
+    """Build an operator-authenticated local Prometheus HTTP server."""
+    if not bearer_token:
+        raise ValueError("metrics bearer token cannot be empty")
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             if self.path != "/metrics":
                 self.send_response(HTTPStatus.NOT_FOUND)
+                self.end_headers()
+                return
+            if not hmac.compare_digest(
+                self.headers.get("Authorization", ""), f"Bearer {bearer_token}"
+            ):
+                self.send_response(HTTPStatus.UNAUTHORIZED)
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             body = provider().encode("utf-8")

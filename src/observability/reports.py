@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.engine import Engine
 
 from src.accounting.btc_performance import build_btc_performance_report
@@ -52,6 +53,7 @@ from src.data.database import (
     strategy_definition,
     strategy_identity,
     strategy_lineage,
+    strategy_version,
     target_position,
     thesis_trial,
     universe_member,
@@ -68,6 +70,7 @@ from src.observability.research_progress import (
     epoch_progress,
     measured_progress,
 )
+from src.research.outcomes import terminal_trial_disposition
 from src.services.health import DatabaseHeartbeatStore
 
 
@@ -142,10 +145,16 @@ class DatabasePlatformReport:
 
     def _research(self, *, now: str) -> dict[str, Any]:
         experiments = self._rows(experiment, order_by=experiment.c.submitted_at.desc())
+        diagnostic_ids = self._diagnostic_candidate_ids(experiments)
+        production_candidates = [row for row in experiments if str(row["id"]) not in diagnostic_ids]
         results = self._rows(validation_result)
         report = {
-            "candidate_queue": [item for item in experiments if _candidate_is_active(item)],
+            "candidate_queue": [
+                item for item in production_candidates if _candidate_is_active(item)
+            ],
             "experiments": experiments,
+            "diagnostic_candidate_count": len(diagnostic_ids),
+            "diagnostic_candidate_ids": sorted(diagnostic_ids),
             "validation_results": results,
             "validation_stages": self._rows(validation_stage),
             "holdout_claims": self._rows(holdout_claim),
@@ -175,8 +184,49 @@ class DatabasePlatformReport:
                 agent_action, order_by=agent_action.c.created_at.desc()
             ),
         }
-        report["funnel"] = self._research_funnel(experiments, results, report, now=now)
+        report["funnel"] = self._research_funnel(
+            production_candidates,
+            results,
+            report,
+            now=now,
+            diagnostic_candidate_ids=diagnostic_ids,
+        )
         return report
+
+    def _diagnostic_candidate_ids(self, experiments: list[dict[str, Any]]) -> set[str]:
+        diagnostic_ids = {
+            str(row["id"])
+            for row in experiments
+            if isinstance(row.get("metadata"), Mapping)
+            and row["metadata"].get("diagnostic") is True
+        }
+        versions = {str(row["strategy_version_id"]) for row in experiments}
+        if not versions:
+            return diagnostic_ids
+        statement = (
+            select(strategy_version.c.id, strategy_definition.c.definition)
+            .select_from(
+                strategy_version.join(
+                    strategy_definition,
+                    strategy_version.c.definition_id == strategy_definition.c.id,
+                )
+            )
+            .where(strategy_version.c.id.in_(versions))
+        )
+        with self.engine.connect() as connection:
+            definitions = connection.execute(statement).all()
+        diagnostic_versions = set()
+        for version_id, raw_definition in definitions:
+            if not isinstance(raw_definition, Mapping):
+                continue
+            metadata = raw_definition.get("metadata")
+            if isinstance(metadata, Mapping) and metadata.get("diagnostic") is True:
+                diagnostic_versions.add(str(version_id))
+        return diagnostic_ids | {
+            str(row["id"])
+            for row in experiments
+            if str(row["strategy_version_id"]) in diagnostic_versions
+        }
 
     def _research_funnel(
         self,
@@ -185,8 +235,15 @@ class DatabasePlatformReport:
         research: dict[str, Any],
         *,
         now: str,
+        diagnostic_candidate_ids: set[str],
     ) -> dict[str, Any]:
-        stages = current_stages(research["validation_stages"], self._rows(evidence_invalidation))
+        all_stages = current_stages(
+            research["validation_stages"], self._rows(evidence_invalidation)
+        )
+        stages = [
+            row for row in all_stages if str(row["experiment_id"]) not in diagnostic_candidate_ids
+        ]
+        diagnostic_stage_count = len(all_stages) - len(stages)
         identities = list(research["strategy_identities"])
         schedules = self._rows(platform_schedule)
         rejection_by_stage: dict[str, int] = {}
@@ -255,17 +312,24 @@ class DatabasePlatformReport:
             for row in identities
             if isinstance(row.get("metadata"), dict)
         )
+        runs = self._rows(experiment_run)
+        diagnostic_run_ids = _diagnostic_run_ids(runs, diagnostic_candidate_ids)
+        measured_runs = [row for row in runs if str(row["id"]) not in diagnostic_run_ids]
         return {
-            **measured_progress(self._rows(experiment_run), ()),
+            **measured_progress(measured_runs, ()),
             **queue_progress(self.engine, now=now),
             **epoch_progress(self._rows(research_epoch), self._rows(research_round)),
             "theses_generated": self._count(research_thesis),
             "candidates_generated": len(experiments),
+            "diagnostic_candidates_excluded": len(diagnostic_candidate_ids),
+            "diagnostic_run_count": len(diagnostic_run_ids),
+            "diagnostic_validation_stage_count": diagnostic_stage_count,
             "candidates_compiled": sum(
                 row["stage"] == "screening" and row["accepted"] for row in stages
             ),
             "candidates_evaluated": len(evaluated_ids),
-            "historical_validation_stage_count": len(research["validation_stages"]) - len(stages),
+            "historical_validation_stage_count": len(research["validation_stages"])
+            - len(all_stages),
             "candidates_rejected_by_stage": rejection_by_stage,
             "candidates_deferred_by_stage": deferred_by_stage,
             "top_rejection_reasons": dict(
@@ -388,43 +452,81 @@ class DatabasePlatformReport:
         return products
 
     def _universe_attrition(self) -> dict[str, Any]:
-        snapshots = self._rows(universe_snapshot, order_by=universe_snapshot.c.observed_at)
-        members = self._rows(universe_member, order_by=universe_member.c.id)
-        by_snapshot: dict[str, dict[str, Any]] = {}
-        for snapshot in snapshots:
-            snapshot_id = str(snapshot.get("id") or "")
-            if snapshot_id:
-                by_snapshot[snapshot_id] = {
-                    "universe_id": snapshot.get("universe_id"),
-                    "observed_at": snapshot.get("observed_at"),
-                    "total_members": 0,
-                    "eligible_members": 0,
-                    "excluded_members": 0,
-                    "exclusion_reasons": {},
-                }
-        for member in members:
-            snapshot_id = str(member.get("snapshot_id") or "")
-            summary = by_snapshot.get(snapshot_id)
-            if summary is None:
-                continue
-            summary["total_members"] += 1
-            if member.get("eligible") is True:
-                summary["eligible_members"] += 1
-                continue
-            summary["excluded_members"] += 1
-            reason = str(member.get("reason_code") or "unknown")
-            reasons = summary["exclusion_reasons"]
-            reasons[reason] = int(reasons.get(reason, 0)) + 1
-        latest: dict[str, dict[str, Any]] = {}
-        for snapshot in by_snapshot.values():
-            universe_id = str(snapshot.get("universe_id") or "")
-            previous = latest.get(universe_id)
-            if previous is None or str(snapshot.get("observed_at")) > str(
-                previous.get("observed_at")
-            ):
-                latest[universe_id] = snapshot
+        ranked = select(
+            universe_snapshot.c.id,
+            universe_snapshot.c.universe_id,
+            universe_snapshot.c.observed_at,
+            func.row_number()
+            .over(
+                partition_by=universe_snapshot.c.universe_id,
+                order_by=(
+                    universe_snapshot.c.observed_at.desc(),
+                    universe_snapshot.c.id.desc(),
+                ),
+            )
+            .label("recency"),
+        ).subquery()
+        with self.engine.connect() as connection:
+            snapshot_count = int(
+                connection.execute(select(func.count()).select_from(universe_snapshot)).scalar_one()
+            )
+            snapshots = (
+                connection.execute(
+                    select(ranked.c.id, ranked.c.universe_id, ranked.c.observed_at).where(
+                        ranked.c.recency == 1
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            latest_ids = [str(row["id"]) for row in snapshots]
+            member_rows = []
+            if latest_ids:
+                member_rows = (
+                    connection.execute(
+                        select(
+                            universe_member.c.snapshot_id,
+                            universe_member.c.reason_code,
+                            func.count(universe_member.c.id).label("total_members"),
+                            func.sum(
+                                case((universe_member.c.eligible.is_(True), 1), else_=0)
+                            ).label("eligible_members"),
+                            func.sum(
+                                case((universe_member.c.eligible.is_(True), 0), else_=1)
+                            ).label("excluded_members"),
+                        )
+                        .where(universe_member.c.snapshot_id.in_(latest_ids))
+                        .group_by(universe_member.c.snapshot_id, universe_member.c.reason_code)
+                    )
+                    .mappings()
+                    .all()
+                )
+        by_snapshot = {
+            str(row["id"]): {
+                "universe_id": row["universe_id"],
+                "observed_at": row["observed_at"],
+                "total_members": 0,
+                "eligible_members": 0,
+                "excluded_members": 0,
+                "exclusion_reasons": {},
+            }
+            for row in snapshots
+        }
+        for row in member_rows:
+            summary = by_snapshot[str(row["snapshot_id"])]
+            total = int(row["total_members"] or 0)
+            eligible = int(row["eligible_members"] or 0)
+            excluded = int(row["excluded_members"] or 0)
+            summary["total_members"] += total
+            summary["eligible_members"] += eligible
+            summary["excluded_members"] += excluded
+            if excluded:
+                reason = str(row["reason_code"] or "unknown")
+                reasons = summary["exclusion_reasons"]
+                reasons[reason] = int(reasons.get(reason, 0)) + excluded
+        latest = {str(row["universe_id"]): by_snapshot[str(row["id"])] for row in snapshots}
         return {
-            "snapshot_count": len(by_snapshot),
+            "snapshot_count": snapshot_count,
             "latest_by_universe": {key: latest[key] for key in sorted(latest) if key},
         }
 
@@ -652,44 +754,86 @@ def _age_seconds(observed_at: str, now: str) -> float:
 
 
 def _storage_health(data_root: Path, spool_root: Path) -> dict[str, Any]:
-    kinds = ("raw", "bars", "features", "funding", "metadata")
-    active = {
-        kind: sum(
-            1
-            for path in (data_root / kind).rglob(
-                "metadata-*.json" if kind == "metadata" else "*.parquet"
-            )
-            if path.is_file() and not path.is_symlink()
-        )
-        if (data_root / kind).is_dir()
-        else 0
-        for kind in kinds
-    }
-    feature_spool = spool_root.parent / "feature-spool"
-    spool_paths = tuple(
-        path
-        for state in ("pending", "claimed", "committed", "deleted")
-        for root in (spool_root, feature_spool)
-        for path in (root / state).glob("segment-*.jsonl")
-        if path.is_file() and not path.is_symlink()
-    )
-    stale_cutoff = dt.datetime.now(dt.UTC).timestamp() - 7 * 86_400
     return {
-        "active_files_by_kind": active,
-        "active_inode_count": sum(active.values()),
-        "active_file_count": sum(active.values()),
-        "spool_inode_count": len(spool_paths),
-        "spool_files_by_state": {
-            state: sum(
-                1
-                for root in (spool_root, feature_spool)
-                for path in (root / state).glob("segment-*.jsonl")
-                if path.is_file() and not path.is_symlink()
-            )
-            for state in ("pending", "claimed", "committed", "deleted")
-        },
-        "spool_bytes": sum(path.stat().st_size for path in spool_paths),
-        "stale_spool_files": sum(path.stat().st_mtime < stale_cutoff for path in spool_paths),
+        "filesystem": _filesystem_inode_health(data_root),
+        "spool_inventory": _spool_inventory(
+            spool_root,
+            spool_root.parent / "feature-spool",
+            stale_cutoff=dt.datetime.now(dt.UTC).timestamp() - 7 * 86_400,
+        ),
+    }
+
+
+def _filesystem_inode_health(path: Path) -> dict[str, Any]:
+    try:
+        stats = os.statvfs(path)
+    except OSError as exc:
+        return {
+            "path": str(path),
+            "scope": "backing_filesystem",
+            "available": False,
+            "reason": f"statvfs_failed:{type(exc).__name__}",
+        }
+    available = stats.f_files > 0
+    return {
+        "path": str(path),
+        "scope": "backing_filesystem",
+        "available": available,
+        "total_inodes": int(stats.f_files) if available else None,
+        "free_inodes": int(stats.f_ffree) if available else None,
+        "available_inodes": int(stats.f_favail) if available else None,
+    }
+
+
+def _spool_inventory(
+    spool_root: Path,
+    feature_spool: Path,
+    *,
+    stale_cutoff: float,
+    entry_limit_per_directory: int = 256,
+) -> dict[str, Any]:
+    states = ("pending", "claimed", "committed", "deleted")
+    counts = dict.fromkeys(states, 0)
+    observed_bytes = 0
+    stale_files = 0
+    unreadable_directories = 0
+    truncated = False
+    for state in states:
+        for root in (spool_root, feature_spool):
+            try:
+                entries = os.scandir(root / state)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                unreadable_directories += 1
+                continue
+            with entries:
+                for index, entry in enumerate(entries):
+                    if index >= entry_limit_per_directory:
+                        truncated = True
+                        break
+                    if not entry.name.startswith("segment-") or not entry.name.endswith(".jsonl"):
+                        continue
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            details = entry.stat(follow_symlinks=False)
+                        else:
+                            continue
+                    except OSError:
+                        unreadable_directories += 1
+                        continue
+                    counts[state] += 1
+                    observed_bytes += details.st_size
+                    stale_files += int(details.st_mtime < stale_cutoff)
+    return {
+        "scope": "bounded_inventory_sample",
+        "entry_limit_per_directory": entry_limit_per_directory,
+        "files_observed": sum(counts.values()),
+        "files_observed_by_state": counts,
+        "bytes_observed": observed_bytes,
+        "stale_files_over_7_days": stale_files,
+        "unreadable_entries": unreadable_directories,
+        "truncated": truncated,
     }
 
 
@@ -737,8 +881,11 @@ def _missing_stage_datasets(
     }
     for candidate in experiments:
         state = str(candidate.get("state") or "")
-        role = state.removeprefix("waiting_for_dataset:")
-        role = role or required_roles.get(state, "")
+        role = (
+            state.removeprefix("waiting_for_dataset:")
+            if state.startswith("waiting_for_dataset:")
+            else required_roles.get(state, "")
+        )
         if not role:
             continue
         stage_ids: Mapping[str, Any] = {}
@@ -774,24 +921,15 @@ def _candidates_without_job_or_reason(
         candidate_id = str(row["id"])
         metadata = row.get("metadata")
         has_reason = isinstance(metadata, dict) and bool(
-            metadata.get("dataset_waiting") or metadata.get("blocked_reason")
+            metadata.get("dataset_waiting")
+            or metadata.get("blocked_reason")
+            or metadata.get("evaluation_deferred")
         )
-        state = str(row.get("state") or "")
         if (
-            candidate_id not in candidate_job_ids
+            _candidate_is_active(row)
+            and candidate_id not in candidate_job_ids
             and not has_reason
-            and state
-            not in {
-                "completed",
-                "rejected",
-                "retired",
-                "forward_paper",
-                "live_ready",
-                "live_canary",
-                "live",
-                "suspended",
-            }
-            and not state.startswith(("waiting_", "blocked_"))
+            and not str(row.get("state") or "").startswith("waiting_")
         ):
             missing.append(candidate_id)
     return sorted(missing)
@@ -799,7 +937,43 @@ def _candidates_without_job_or_reason(
 
 def _candidate_is_active(row: Mapping[str, Any]) -> bool:
     state = str(row.get("state") or "queued")
-    return state not in {"completed", "rejected", "retired"} and not state.startswith("blocked_")
+    metadata = row.get("metadata")
+    disposition = terminal_trial_disposition(
+        state, metadata if isinstance(metadata, Mapping) else None
+    )
+    return (
+        disposition is None
+        and state
+        not in {
+            "completed",
+            "rejected",
+            "retired",
+            "protected",
+            "forward",
+            "forward_paper",
+            "live_ready",
+            "live_canary",
+            "live",
+            "suspended",
+        }
+        and not state.endswith("_rejected")
+        and not state.startswith("blocked_")
+    )
+
+
+def _diagnostic_run_ids(runs: list[dict[str, Any]], diagnostic_candidate_ids: set[str]) -> set[str]:
+    result: set[str] = set()
+    for row in runs:
+        raw_payload = row.get("payload")
+        if not isinstance(raw_payload, Mapping):
+            continue
+        candidate_id = str(raw_payload.get("candidate_id") or "")
+        receipt = raw_payload.get("receipt")
+        if not candidate_id and isinstance(receipt, Mapping):
+            candidate_id = str(receipt.get("candidate_id") or "")
+        if candidate_id in diagnostic_candidate_ids:
+            result.add(str(row["id"]))
+    return result
 
 
 def _latest_statuses(rows: list[dict[str, Any]], *, key: str, status: str) -> list[dict[str, Any]]:

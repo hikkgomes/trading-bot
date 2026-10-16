@@ -861,3 +861,36 @@ def test_new_mark_cannot_refresh_stale_book_fields(tmp_path):
     )
     assert source._market("btc", now)[0][base["instrument_id"]]["price"] == 101
     database.dispose()
+
+
+def test_latest_source_ignores_newer_non_envelopes_and_respects_book_and_time(tmp_path):
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'source-query.sqlite3'}")
+    database.create_schema()
+    store = SqlRiskSnapshotStore(database.engine)
+    at = "2026-10-16T00:00:00+00:00"
+    payload = {
+        "kind": "market",
+        "product_id": "active_income",
+        "observed_at": at,
+        "values": {"price": 100},
+    }
+    identity = store.save(payload, created_at=at)
+    store.save({**payload, "values": [200]}, created_at="2026-10-16T00:00:01+00:00")
+    store.save({**payload, "observed_at": 123}, created_at="2026-10-16T00:00:02+00:00")
+    store.save({**payload, "book_id": "another-book"}, created_at="2026-10-16T00:00:03+00:00")
+    store.save({**payload, "values": {"price": 300}}, created_at="2026-10-16T00:00:05+00:00")
+    found, source = store.latest(
+        kind="market",
+        product_id="active_income",
+        at="2026-10-16T00:00:04+00:00",
+        require_source_envelope=True,
+    )
+    assert (found, source) == (identity, payload)
+    with pytest.raises(KeyError):
+        store.latest(
+            kind="market",
+            product_id="active_income",
+            at="2026-10-15T23:59:59+00:00",
+            require_source_envelope=True,
+        )
+    database.dispose()

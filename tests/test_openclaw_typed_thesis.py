@@ -556,6 +556,143 @@ def test_data_blocked_agent_job_resumes_with_a_later_bundle_without_spending_ret
     database.dispose()
 
 
+def test_control_api_heartbeats_and_closes_both_servers_on_sigterm(tmp_path, monkeypatch) -> None:
+    import os
+    import signal
+    import socket
+    from unittest.mock import Mock
+
+    from src.services import supervisor
+
+    ports = []
+    for _ in range(2):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        ports.append(probe.getsockname()[1])
+        probe.close()
+    control_port, metrics_port = ports
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'control-api-lifecycle.sqlite3'}")
+    database.create_schema()
+    original_dispose = database.dispose
+    dispose = Mock(wraps=original_dispose)
+    monkeypatch.setattr(database, "dispose", dispose)
+    heartbeats = []
+    runtime = Mock()
+    runtime.heartbeat.side_effect = lambda *, payload: (
+        heartbeats.append(payload),
+        os.kill(os.getpid(), signal.SIGTERM) if len(heartbeats) == 2 else None,
+    )
+
+    monkeypatch.setenv("CONTROL_API_TEST_TOKEN", "operator-test-token")
+    context = {
+        "database": database,
+        "config": SimpleNamespace(
+            paths={"parquet": str(tmp_path)},
+            metrics={
+                "bind": f"127.0.0.1:{metrics_port}",
+                "heartbeat_seconds": 0.05,
+            },
+        ),
+        "heartbeat_store": DatabaseHeartbeatStore(database.engine),
+        "runtime": runtime,
+        "split": {},
+        "alerts": None,
+    }
+    args = SimpleNamespace(
+        control_bind=f"127.0.0.1:{control_port}",
+        control_token_env="CONTROL_API_TEST_TOKEN",
+        node="fixture",
+    )
+
+    assert supervisor._serve_control_api(args, context) == 0
+    assert [item["reason_code"] for item in heartbeats] == [
+        "control_api_started",
+        "control_api_serving",
+    ]
+    assert runtime.heartbeat.call_count == 2
+    assert dispose.call_count == 1
+    for port in (control_port, metrics_port):
+        with socket.socket() as probe:
+            assert probe.connect_ex(("127.0.0.1", port)) != 0
+
+
+def test_metrics_server_requires_the_operator_bearer_token() -> None:
+    from unittest.mock import Mock
+    from urllib.error import HTTPError
+
+    from src.observability.metrics import build_metrics_server
+
+    provider = Mock(return_value="private_research_metric 1\n")
+    server = build_metrics_server(
+        bind=("127.0.0.1", 0),
+        provider=provider,
+        bearer_token="operator-metrics-test-token",
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/metrics"
+    try:
+        with pytest.raises(HTTPError) as denied:
+            urlopen(url, timeout=2)
+        assert denied.value.code == 401
+        provider.assert_not_called()
+        request = Request(url, headers={"Authorization": "Bearer operator-metrics-test-token"})
+        with urlopen(request, timeout=2) as response:
+            assert response.status == 200
+            assert response.read().decode() == "private_research_metric 1\n"
+        provider.assert_called_once_with()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_control_api_metrics_server_failure_closes_control_socket_and_database(
+    tmp_path, monkeypatch
+) -> None:
+    import socket
+    from unittest.mock import Mock
+
+    from src.services import supervisor
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    control_port = probe.getsockname()[1]
+    probe.close()
+    database = PlatformDatabase(f"sqlite+pysqlite:///{tmp_path / 'metrics-bind-failure.sqlite3'}")
+    database.create_schema()
+    dispose = Mock(wraps=database.dispose)
+    monkeypatch.setattr(database, "dispose", dispose)
+    monkeypatch.setattr(
+        supervisor, "build_metrics_server", Mock(side_effect=OSError("bind failed"))
+    )
+    monkeypatch.setenv("CONTROL_API_TEST_TOKEN", "operator-test-token")
+    config = SimpleNamespace(
+        paths={"parquet": str(tmp_path)},
+        metrics={"bind": "127.0.0.1:9108", "heartbeat_seconds": 1},
+    )
+    context = {
+        "database": database,
+        "config": config,
+        "heartbeat_store": DatabaseHeartbeatStore(database.engine),
+        "runtime": Mock(),
+        "split": {},
+        "alerts": None,
+    }
+    args = SimpleNamespace(
+        control_bind=f"127.0.0.1:{control_port}",
+        control_token_env="CONTROL_API_TEST_TOKEN",
+        node="fixture",
+    )
+
+    with pytest.raises(OSError, match="bind failed"):
+        supervisor._serve_control_api(args, context)
+
+    assert dispose.call_count == 1
+    with socket.socket() as closed_probe:
+        assert closed_probe.connect_ex(("127.0.0.1", control_port)) != 0
+
+
 def test_scheduled_review_producer_reader_and_retry_share_one_context_identity(
     tmp_path, monkeypatch
 ):

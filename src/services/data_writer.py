@@ -237,8 +237,8 @@ class DatabaseMarketDataWriter:
 
     def _cleanup_completed_spool_segments(self) -> None:
         spool = DurableMarketBatchSpool(self.store.root.parent / "runtime" / "events" / "spool")
-        for path in spool.recoverable():
-            if path.parent.name != "committed":
+        for path in (spool.root / "committed").glob("segment-*.jsonl"):
+            if not path.is_file() or path.is_symlink():
                 continue
             job_id = f"work:market_event_batch:{path.stem.removeprefix('segment-')}"
             if self.queue.state(job_id) == "completed":

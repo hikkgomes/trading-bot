@@ -131,6 +131,8 @@ def test_deployment_runbook_targets_the_actual_optiplex_checkout() -> None:
     reason="requires the installed Linux platform and root user",
 )
 def test_installed_service_users_can_traverse_and_write_their_real_paths() -> None:
+    import pwd
+
     checks = {
         "trading-runtime": (
             str(INSTALLED_ROOT / "data/raw"),
@@ -239,6 +241,7 @@ def test_installed_service_users_can_traverse_and_write_their_real_paths() -> No
             INSTALLED_ROOT / ".git/config",
             INSTALLED_ROOT / "runtime/research",
             INSTALLED_ROOT / "runtime/backups",
+            INSTALLED_ROOT / "runtime/reports",
             Path("/etc/trading-platform/runtime.env"),
             Path("/etc/trading-platform/research.env"),
             Path("/etc/trading-platform/evaluator.env"),
@@ -246,6 +249,7 @@ def test_installed_service_users_can_traverse_and_write_their_real_paths() -> No
         "trading-research": (
             INSTALLED_ROOT / "data/artefacts",
             INSTALLED_ROOT / "runtime/backups",
+            INSTALLED_ROOT / "runtime/reports",
             Path("/etc/trading-platform/runtime.env"),
             Path("/etc/trading-platform/evaluator.env"),
         ),
@@ -254,6 +258,15 @@ def test_installed_service_users_can_traverse_and_write_their_real_paths() -> No
             Path("/etc/trading-platform/runtime.env"),
         ),
     }
+    reports_directory = INSTALLED_ROOT / "runtime/reports"
+    assert reports_directory.is_dir()
+    assert reports_directory.stat().st_mode & 0o777 == 0o700
+    assert reports_directory.stat().st_uid == pwd.getpwnam("trading-runtime").pw_uid
+    latest_report = reports_directory / "latest.json"
+    if latest_report.is_file():
+        assert latest_report.stat().st_mode & 0o777 == 0o600
+        private_paths["trading-agent"] += (latest_report,)
+        private_paths["trading-research"] += (latest_report,)
     for user, paths in private_paths.items():
         for path in paths:
             result = subprocess.run(

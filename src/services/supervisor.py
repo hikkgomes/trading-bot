@@ -93,6 +93,7 @@ from src.services.promotion import (
     SqlPromotionStore,
 )
 from src.services.protective_stops import LiveProtectiveStopService
+from src.services.report_worker import DatabaseReportWorker
 from src.services.research_jobs import DatabaseResearchJobHandlers
 from src.services.research_worker import ResearchWorker
 from src.services.risk_service import DatabaseRiskWorker
@@ -990,6 +991,41 @@ def _platform_scheduler_cycle(
     return run_once
 
 
+def _report_cycle(
+    *,
+    database: PlatformDatabase,
+    config: Any,
+    node_id: str,
+    alerts: SqlAlertService | None,
+    queued: bool,
+) -> Callable[[], dict[str, Any]]:
+    queue = DatabaseJobQueue(database.engine) if queued else None
+    worker_id = f"{node_id}:report-worker" if queue is not None else None
+    if queue is not None and worker_id is not None:
+        queue.register_worker(
+            worker_id=worker_id,
+            node_id=node_id,
+            role="report-worker",
+            capabilities=("reporting",),
+            observed_at=utc_now(),
+        )
+    worker = DatabaseReportWorker(
+        engine=database.engine,
+        root=Path(config.paths["parquet"]).parent / "runtime" / "reports",
+        queue=queue,
+        worker_id=worker_id,
+        alerts=alerts,
+        minimum_valid_screenings_before_progress=int(
+            config.alerting.get("minimum_valid_screenings_before_progress", 10)
+        ),
+        backup_root=Path(config.paths["backups"]),
+        backup_max_age_seconds=int(config.backup["maximum_age_seconds"]),
+        minimum_free_bytes=int(config.backup.get("minimum_free_bytes", 0)),
+        storage_root=Path(config.paths["parquet"]),
+    )
+    return lambda: worker.run_once(now=utc_now())
+
+
 def _promotion_cycle(
     *,
     database: PlatformDatabase,
@@ -1427,6 +1463,13 @@ def _service_work(args: argparse.Namespace, context: Mapping[str, Any]) -> Calla
         "platform-scheduler": lambda: _platform_scheduler_cycle(
             database=database, node_id=args.node, configuration=split
         ),
+        "report-worker": lambda: _report_cycle(
+            database=database,
+            config=config,
+            node_id=args.node,
+            alerts=alerts,
+            queued=not args.once,
+        ),
         "data-writer": lambda: _data_writer_cycle(
             database=database,
             node_id=args.node,
@@ -1519,7 +1562,11 @@ def _serve_service(
 def _serve_control_api(args: argparse.Namespace, context: Mapping[str, Any]) -> int:
     database = context["database"]
     config = context["config"]
+    heartbeat_interval = float(config.metrics.get("heartbeat_seconds", 15))
+    if heartbeat_interval <= 0:
+        raise ValueError("control API heartbeat interval must be positive")
     agent_key = os.environ.get("TRADING_PLATFORM_AGENT_TRANSPORT_KEY")
+    bearer_token = os.environ.get(args.control_token_env, "")
     server = build_control_server(
         bind=_parse_bind(args.control_bind),
         control_plane=DatabaseControlPlane(
@@ -1528,7 +1575,7 @@ def _serve_control_api(args: argparse.Namespace, context: Mapping[str, Any]) -> 
             configuration=context["split"],
             alerts=context["alerts"],
         ),
-        bearer_token=os.environ.get(args.control_token_env, ""),
+        bearer_token=bearer_token,
         agent_transport_key=bytes.fromhex(agent_key) if agent_key else None,
         node_id=args.node,
     )
@@ -1538,29 +1585,82 @@ def _serve_control_api(args: argparse.Namespace, context: Mapping[str, Any]) -> 
             storage_root=Path(config.paths["parquet"]),
         ).build()
     )
-    metrics_server = build_metrics_server(
-        bind=_parse_bind(str(config.metrics.get("bind", "127.0.0.1:9108"))),
-        provider=metrics_provider.render,
+    try:
+        metrics_server = build_metrics_server(
+            bind=_parse_bind(str(config.metrics.get("bind", "127.0.0.1:9108"))),
+            provider=metrics_provider.render,
+            bearer_token=bearer_token,
+        )
+    except BaseException:
+        try:
+            server.server_close()
+        finally:
+            database.dispose()
+        raise
+    stopping = threading.Event()
+    control_thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.5},
+        name="control-api-http",
+        daemon=True,
     )
     metrics_thread = threading.Thread(
         target=metrics_server.serve_forever,
         kwargs={"poll_interval": 0.5},
+        name="control-api-metrics",
         daemon=True,
     )
-    metrics_thread.start()
-    context["runtime"].heartbeat(payload={"reason_code": "control_api_started"})
 
     def stop_server(_signum: int, _frame: object) -> None:
-        metrics_server.shutdown()
-        server.shutdown()
+        stopping.set()
 
-    signal.signal(signal.SIGTERM, stop_server)
-    signal.signal(signal.SIGINT, stop_server)
-    server.serve_forever(poll_interval=0.5)
-    metrics_server.shutdown()
-    metrics_thread.join(timeout=2.0)
-    database.dispose()
+    previous_handlers = {}
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(signum, stop_server)
+        metrics_thread.start()
+        control_thread.start()
+        context["runtime"].heartbeat(payload={"reason_code": "control_api_started"})
+        _monitor_control_api(
+            context["runtime"],
+            stopping,
+            control_thread,
+            metrics_thread,
+            heartbeat_interval,
+        )
+    finally:
+        stopping.set()
+        try:
+            for active_server, thread in (
+                (server, control_thread),
+                (metrics_server, metrics_thread),
+            ):
+                if thread.is_alive():
+                    active_server.shutdown()
+        finally:
+            server.server_close()
+            metrics_server.server_close()
+            if control_thread.ident is not None:
+                control_thread.join()
+            if metrics_thread.ident is not None:
+                metrics_thread.join()
+            for signum, previous_handler in previous_handlers.items():
+                signal.signal(signum, previous_handler)
+            database.dispose()
     return 0
+
+
+def _monitor_control_api(
+    runtime: ServiceRuntime,
+    stopping: threading.Event,
+    control_thread: threading.Thread,
+    metrics_thread: threading.Thread,
+    interval: float,
+) -> None:
+    while not stopping.wait(interval):
+        if not control_thread.is_alive() or not metrics_thread.is_alive():
+            raise RuntimeError("control API HTTP server stopped unexpectedly")
+        runtime.heartbeat(payload={"reason_code": "control_api_serving"})
 
 
 def _serve_once(

@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import datetime as dt
-import json
-import os
 import shutil
-import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy.engine import Engine
 
+from src.data.atomic import write_json_atomic
 from src.domain._codec import canonical_hash, timestamp
 from src.observability.reports import DatabasePlatformReport
 from src.services.alerting import AlertSeverity, SqlAlertService
@@ -35,11 +33,15 @@ class DatabaseReportWorker:
         backup_root: Path | None = None,
         backup_max_age_seconds: int = 172_800,
         minimum_free_bytes: int = 536_870_912,
+        storage_root: Path | None = None,
+        spool_root: Path | None = None,
     ) -> None:
         self.report = DatabasePlatformReport(
             engine,
             account_stale_after_seconds=account_stale_after_seconds,
             market_data_stale_after_seconds=market_data_stale_after_seconds,
+            storage_root=storage_root,
+            spool_root=spool_root,
         )
         self.root = root.resolve()
         self.queue = queue
@@ -69,29 +71,17 @@ class DatabaseReportWorker:
             )
             if claimed is None:
                 return {"reason_code": "report_queue_empty"}
+        self.root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.root.chmod(0o700)
         report = {**self.report.build(now=now), "generated_at": now}
         operations = report.setdefault("operations", {})
         operations["disk"] = self._disk_status()
         if self.backup_root is not None:
             operations["backups"] = self._backup_status(now)
         report_hash = canonical_hash(report)
-        date = now[:10]
-        destination = self.root / date / f"{report_hash.removeprefix('sha256:')}.json"
-        if not destination.exists():
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
-            try:
-                with temporary.open("x", encoding="utf-8") as handle:
-                    json.dump(report, handle, indent=2, sort_keys=True)
-                    handle.write("\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                try:
-                    os.link(temporary, destination)
-                except FileExistsError:
-                    pass
-            finally:
-                temporary.unlink(missing_ok=True)
+        destination = self.root / "latest.json"
+        write_json_atomic(destination, report)
+        destination.chmod(0o600)
         emitted_alerts = self._emit_sli_alerts(report, now=now)
         result = {
             "reason_code": "operator_report_written",

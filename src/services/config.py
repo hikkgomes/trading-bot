@@ -27,6 +27,7 @@ LINUX_SERVICES = frozenset(
         "accounting-service",
         "account-reconciliation",
         "promotion-engine",
+        "report-worker",
         "control-api",
         "strategy-evaluator",
         "universe-service",
@@ -63,6 +64,7 @@ PLATFORM_PROCESS_SERVICES: dict[str, tuple[str, ...]] = {
         "universe-service",
         "platform-scheduler",
         "promotion-engine",
+        "report-worker",
     ),
     "research-runtime": (
         "research-worker",

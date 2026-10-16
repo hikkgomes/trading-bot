@@ -37,6 +37,7 @@ from src.services.supervisor import (
     _portfolio_state_cycle,
     _product_coordination_cycle,
     _promotion_cycle,
+    _report_cycle,
     _research_cycle,
     _risk_cycle,
     _strategy_evaluator_cycle,
@@ -127,6 +128,13 @@ def _build_trading_work(
         ),
         "promotion-engine": lambda: _promotion_cycle(
             database=database, node_id=node_id, configuration=configuration
+        ),
+        "report-worker": lambda: _report_cycle(
+            database=database,
+            config=config,
+            node_id=node_id,
+            alerts=alerts,
+            queued=True,
         ),
     }
     return {name: builders[name]() for name in selected if name in builders}

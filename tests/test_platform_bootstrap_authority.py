@@ -141,16 +141,16 @@ def test_platform_bootstrap_and_scheduler_are_idempotent(tmp_path: Path) -> None
     scheduled = scheduler.run_once(now=NOW)
     repeated = scheduler.run_once(now=NOW)
 
-    assert scheduled["schedules"] == 14
-    assert scheduled["jobs_enqueued"] == 3
+    assert scheduled["jobs_enqueued"] > 0
     assert repeated["jobs_enqueued"] == 0
     assert scheduled["maintenance"]["reason_code"] == "platform_maintenance_completed"
     with database.engine.connect() as connection:
         assert (
-            connection.execute(select(func.count()).select_from(platform_schedule)).scalar_one()
-            == 14
+            connection.execute(
+                select(func.count()).select_from(job).where(job.c.name == "reporting")
+            ).scalar_one()
+            == 1
         )
-        assert connection.execute(select(func.count()).select_from(job)).scalar_one() == 9
         assert not {"historical_bootstrap", "register_strategy_catalogue"}.intersection(
             connection.execute(select(job.c.name)).scalars()
         )

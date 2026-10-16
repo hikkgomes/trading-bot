@@ -29,7 +29,8 @@
         "agent-coordinator",
         "feature-build-worker",
         "migration-service",
-        "evaluation-worker"
+        "evaluation-worker",
+        "report-worker"
       ]
     }
   ],
@@ -89,7 +90,8 @@
       "control-api",
       "universe-service",
       "platform-scheduler",
-      "promotion-engine"
+      "promotion-engine",
+      "report-worker"
     ],
     "trading-research": [
       "research-worker",
@@ -130,7 +132,8 @@
     "scheduler-operations": [
       "universe-service",
       "platform-scheduler",
-      "promotion-engine"
+      "promotion-engine",
+      "report-worker"
     ],
     "research-runtime": [
       "research-worker",
